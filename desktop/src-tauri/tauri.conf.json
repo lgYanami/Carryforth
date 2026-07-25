@@ -1,0 +1,89 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Buzz",
+  "version": "0.4.25",
+  "identifier": "xyz.block.buzz.app",
+  "build": {
+    "beforeDevCommand": {
+      "script": "exec ./node_modules/.bin/vite",
+      "cwd": "..",
+      "wait": false
+    },
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "",
+        "width": 800,
+        "height": 600,
+        "maximized": true,
+        "visible": false,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "dragDropEnabled": false,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 25
+        },
+        "backgroundThrottling": "disabled",
+        "minWidth": 800,
+        "minHeight": 500
+      }
+    ],
+    "macOSPrivateApi": true,
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": []
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["buzz"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": [
+      "binaries/buzz-acp",
+      "binaries/buzz-agent",
+      "binaries/buzz-dev-mcp",
+      "binaries/git-credential-nostr",
+      "binaries/buzz"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "infoPlist": "Info.plist",
+      "entitlements": "Entitlements.plist",
+      "dmg": {
+        "background": "icons/dmg-background.png",
+        "windowSize": {
+          "width": 660,
+          "height": 532
+        },
+        "appPosition": {
+          "x": 191,
+          "y": 330
+        },
+        "applicationFolderPosition": {
+          "x": 469,
+          "y": 330
+        }
+      }
+    }
+  }
+}

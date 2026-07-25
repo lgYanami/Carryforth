@@ -1,0 +1,19 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./globals/scrollbars.css";
+@import "./globals/motion.css";
+@import "./globals/animations.css";
+@import "./globals/composer.css";
+@import "./globals/markdown.css";
+@import "./globals/theme.css";
+@import "./globals/skeleton.css";
+@import "./globals/spoilers.css";
+@import "./globals/components.css";
+@import "./globals/utilities.css";
+@import "./globals/media-controls.css";
+@import "./globals/avatar-framing.css";
+@import "./globals/image-lightbox.css";
+@import "./globals/video-review.css";
+@import "./globals/progress.css";
+
+@config "../../../tailwind.config.js";
