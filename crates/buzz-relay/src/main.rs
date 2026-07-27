@@ -1497,6 +1497,12 @@ async fn emit_db_usage_metrics(
     let relay_member_rows = state.db.usage_relay_member_counts().await?;
     let workflow_rows = state.db.usage_workflow_counts().await?;
     let git_repo_rows = state.db.usage_git_repo_counts().await?;
+    let project_view_schema_ready = state.db.project_view_schema_ready().await?;
+    let project_view_object_rows = if project_view_schema_ready {
+        state.db.usage_project_view_object_counts().await?
+    } else {
+        Vec::new()
+    };
     let active_users_1d = state.db.usage_active_user_counts("1 day").await?;
     let active_users_7d = state.db.usage_active_user_counts("7 days").await?;
     let active_users_30d = state.db.usage_active_user_counts("30 days").await?;
@@ -1721,6 +1727,50 @@ async fn emit_db_usage_metrics(
             let count = rows.get(&id).copied().unwrap_or(0);
             metrics::gauge!("buzz_community_git_repos", "community" => community.clone())
                 .set(count as f64);
+        }
+    }
+
+    // Project View is intentionally fleet-wide and low-cardinality: object
+    // type is a closed nine-value enum, never a Community or object identifier.
+    metrics::gauge!("buzz_project_view_schema_ready").set(if project_view_schema_ready {
+        1.0
+    } else {
+        0.0
+    });
+    {
+        const PROJECT_VIEW_OBJECT_TYPES: &[&str] = &[
+            "project_profile",
+            "goal",
+            "role",
+            "plan",
+            "stage",
+            "requirement",
+            "issue",
+            "work",
+            "resource",
+        ];
+        let rows: HashMap<&str, i64> = project_view_object_rows
+            .iter()
+            .filter_map(|row| {
+                let object_type = PROJECT_VIEW_OBJECT_TYPES
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate == row.object_type.as_str());
+                if object_type.is_none() {
+                    warn!(
+                        object_type = %row.object_type,
+                        "Project View metrics skipped an unknown object type"
+                    );
+                }
+                object_type.map(|object_type| (object_type, row.count))
+            })
+            .collect();
+        for object_type in PROJECT_VIEW_OBJECT_TYPES {
+            metrics::gauge!(
+                "buzz_project_view_objects",
+                "type" => *object_type
+            )
+            .set(rows.get(*object_type).copied().unwrap_or(0) as f64);
         }
     }
 

@@ -98,8 +98,22 @@ run_unit_tests() {
   run_test_step "buzz-conformance tests" \
     cargo test -p buzz-conformance -- --nocapture
 
-  run_test_step "buzz-project-view tests" \
+  # Keep the fallback path equivalent to `just project-view-test-unit`.
+  # `just test-unit` uses this function only when cargo-nextest is unavailable.
+  run_test_step "Project View domain tests" \
     cargo test -p buzz-project-view -- --nocapture
+
+  run_test_step "Project View core protocol tests" \
+    cargo test -p buzz-core --lib project_view -- --nocapture
+
+  run_test_step "Project View SDK tests" \
+    cargo test -p buzz-sdk --lib project_view -- --nocapture
+
+  run_test_step "Project View Relay adapter tests" \
+    cargo test -p buzz-relay --lib project_view -- --nocapture
+
+  run_test_step "Project View CLI tests" \
+    cargo test -p buzz-cli --lib project_view -- --nocapture
 
   run_test_step "buzz-push-gateway tests" \
     cargo test -p buzz-push-gateway -- --nocapture

@@ -620,6 +620,13 @@ impl Db {
         usage::git_repo_counts(&self.pool).await
     }
 
+    /// Return fleet-wide active Project View object counts by canonical type.
+    pub async fn usage_project_view_object_counts(
+        &self,
+    ) -> Result<Vec<usage::ProjectViewObjectCount>> {
+        usage::project_view_object_counts(&self.pool).await
+    }
+
     /// Return per-community distinct active-user counts for a given SQL interval.
     ///
     /// `interval_sql` must be a trusted literal such as `"1 day"` or `"7 days"`.

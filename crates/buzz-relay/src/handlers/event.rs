@@ -12,6 +12,7 @@ use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_project_view_protocol_kind, is_unshared_persona_event,
     AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -62,6 +63,12 @@ fn event_frame_for_sub(sub_id: &str, event_json: &str) -> String {
 
 fn event_frame_bytes_for_sub(sub_id: &str, event_json: &str) -> Arc<Bytes> {
     Arc::new(Bytes::from(event_frame_for_sub(sub_id, event_json)))
+}
+
+fn record_project_view_projection_dispatch_error(kind: u32) {
+    if matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META) {
+        metrics::counter!("buzz_project_view_projection_dispatch_errors_total").increment(1);
+    }
 }
 
 fn fanout_frame_cache<'a, I>(sub_ids: I, event_json: &str) -> HashMap<&'a str, Arc<Bytes>>
@@ -517,6 +524,7 @@ async fn dispatch_persistent_event_inner(
         state
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
+        record_project_view_projection_dispatch_error(kind_u32);
         warn!(event_id = %event_id_hex, "Redis publish failed: {e}");
     }
 
@@ -545,6 +553,7 @@ async fn dispatch_persistent_event_inner(
             error!(event_id = %event_id_hex, "Failed to serialize event for fan-out: {e}");
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
+            record_project_view_projection_dispatch_error(kind_u32);
             return 0;
         }
     };

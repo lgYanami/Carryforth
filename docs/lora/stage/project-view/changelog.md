@@ -1,5 +1,78 @@
 # Project View 变更记录
 
+## 2026-07-27 — Slice 5：CI、可观测性与发布
+
+### 专用质量门
+
+- 新增 `project-view-test-unit`、`project-view-test-db`、
+  `project-view-test-e2e`、`project-view-test` 与 `test-migrations` Just
+  recipes。`test-unit` 和无 nextest 的 `scripts/run-tests.sh unit` 都显式覆盖领域
+  crate、kind registry、SDK、Relay adapter 与 CLI；领域 crate 的 property、关系和
+  wire integration targets 不会被 `--lib` 误过滤。
+- 新增隔离 PostgreSQL 脚本。DB 测试各自创建/删除 scratch database；migration gate
+  使用另一个精确命名的临时数据库，执行 fresh、0024→0025、ledgerless schema、
+  populated upgrade、并发 migrator，并用 `pgschema plan` 阻断 migration 25 与
+  `schema/schema.sql` 的 Project View 漂移。
+- Project View E2E 现在启动独立数据库和 Relay，使用 packaged
+  `buzz-admin project-view enable` 开启中心 DB flag，并由真实 `buzz` 子进程完成一次
+  typed create。测试继续覆盖 NIP-11 signer/capability、WS/HTTP、COUNT、revision-pinned
+  pagination、冲突、projection 签名、mixed query 隐藏和 live membership 撤权。
+- 新增真实 pre-feature rollback smoke：CI 固定从 `ab3af828` 构建 Project View
+  出现前的 Relay，在已由当前 `buzz-admin` 迁移到 25、全部开关为 false 的数据库上以
+  `BUZZ_AUTO_MIGRATE=false` 启动，验证 readiness 与既有 NIP-11 路径。该测试不会用
+  当前 Relay 模拟旧版本。
+- 新增 post-mutation compatible rollback smoke：先由当前 Relay 接受初始化，再用同一
+  migration 25 数据库启动固定 `8ef125c1`（Slice 4）Relay，验证 capability、稳定
+  signer、revision 1 完整快照和 Project View 专属非成员拒绝。由此分别覆盖首次
+  mutation 前的 pre-feature 回滚与已有数据后的兼容回滚边界。
+
+### CI 与制品
+
+- backend nextest archive 加入 `buzz-db`、`e2e_project_view`、`buzz` 和
+  `buzz-admin`；独立 Project View integration job 顺序执行 DB transaction、
+  migration/schema drift 与真实 Relay/CLI E2E。rollback job 使用固定 pre-feature
+  与 compatible 源码 binary cache，避免用当前 binary 模拟旧版本，也避免把 ignored
+  migration tests 留在非必经路径。
+- Docker PR path filter 新增 `migrations/**` 与 `schema/**`。Relay release
+  `LOG_PATHS` 新增 Project View crate、CLI/admin、schema、协议/运维文档、Chart、
+  Compose 和专用测试脚本。
+- Sprig archive 新增实际 `buzz -> sprig` symlink 与 manifest entry；Sprig workflow
+  增加 CLI/SDK/Project View 相关 PR 构建路径，使 managed Agent 拿到与 Relay
+  capability 对应的 typed CLI。
+- 新增 package/deploy contract，静态验证 Relay image 含 `buzz-admin`、CI archive
+  含真实 CLI/admin/E2E、完整 metrics 名称、Chart 使用稳定 signer，并禁止 Chart 或
+  Compose 引入 Pod-local `BUZZ_PROJECT_VIEW_ENABLED`。
+
+### 可观测性与运维
+
+- 新增八组低基数指标：mutation count/duration/conflict、snapshot
+  duration/revision retry、按闭集 type 的 active object gauge、projection dispatch
+  error 与 schema readiness。operation、result、type、reason 都来自闭集，不使用
+  Community/object/event ID 作为 label。
+- mutation 结果日志包含 `community_host`、command/actor 坐标、operation、
+  object type/id、expected/committed revision 与 result code；正文、patch、title 和
+  Resource locator 不进入普通日志。
+- 新增 `docs/project-view-operations.md`，固化 server-first 顺序：全部 Pod 先以
+  auto-migrate false 升级，再运行 migration 25，验证 schema/signer/read gate 后由
+  admin 开启。Runbook 同时记录 disable、诊断 SQL、告警信号、signer rotation、
+  首次 mutation 前与之后两种不同的回滚边界；Chart/Compose 文档与 Helm NOTES
+  指向同一流程。
+
+### 验证
+
+- `just project-view-test-unit`：59 项 Project View 定向测试通过；其中领域层 36 项，
+  关系设计 21 条清单全部自动测试。
+- `just project-view-test-db`：14 项隔离 PostgreSQL 测试通过。
+- `just test-migrations`：6 项 migration 测试与 Project View schema drift gate
+  通过。
+- `just project-view-test-e2e`：真实 Relay、admin 与 CLI E2E 通过。
+- 固定 `ab3af828` pre-feature Relay + migration 25 rollback smoke，以及当前 Relay
+  写入后切换到固定 `8ef125c1` compatible Relay 的 post-mutation smoke 均通过。
+- 实际构建 Sprig archive，确认包含 `buzz -> sprig` 和 manifest entry。
+- `just test` 13 组 unit/integration tests 全部通过；仓库级 `just ci` 全部通过。
+- 受影响 Rust packages 的 `cargo check --all-targets`、workflow YAML 解析、
+  shell syntax、release contract 与 `git diff --check` 通过。
+
 ## 2026-07-27 — Slice 4：Typed SDK 与 Agent CLI
 
 ### SDK command 与 projection 契约

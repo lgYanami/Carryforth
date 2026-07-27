@@ -4,6 +4,7 @@
 //! 0025, and an explicit `BUZZ_RELAY_PRIVATE_KEY`. It creates an isolated
 //! `*.localhost` Community by default so initialization is repeatable.
 
+use std::process::Command;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -17,7 +18,7 @@ use buzz_project_view::{
     NewProjectViewObject, ProjectProfile,
 };
 use buzz_test_client::{BuzzTestClient, RelayMessage, TestClientError};
-use nostr::{Event, EventBuilder, Filter, Keys, Kind, PublicKey, Tag};
+use nostr::{Event, EventBuilder, Filter, Keys, Kind, PublicKey, Tag, ToBech32};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -60,15 +61,15 @@ async fn setup() -> TestContext {
         .expect("connect Project View E2E database");
     let community_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO communities (id, host, project_view_enabled) \
-         VALUES ($1, $2, true) \
-         ON CONFLICT (lower(host)) DO UPDATE SET project_view_enabled = true",
+        "INSERT INTO communities (id, host) \
+         VALUES ($1, $2) \
+         ON CONFLICT (lower(host)) DO NOTHING",
     )
     .bind(community_id)
     .bind(&host)
     .execute(&pool)
     .await
-    .expect("seed Project View E2E Community");
+    .expect("resolve admin-enabled Project View E2E Community");
     let community_id: Uuid =
         sqlx::query_scalar("SELECT id FROM communities WHERE lower(host) = lower($1)")
             .bind(&host)
@@ -286,6 +287,63 @@ async fn current_meta(
     .expect("parse metadata content")
 }
 
+fn create_goal_with_real_cli(
+    context: &TestContext,
+    writer: &Keys,
+    expected_project_revision: u64,
+) -> Value {
+    let buzz = std::env::var("PROJECT_VIEW_E2E_BUZZ_BIN")
+        .expect("PROJECT_VIEW_E2E_BUZZ_BIN must point at the real buzz CLI");
+    let input_path = std::env::temp_dir().join(format!(
+        "buzz-project-view-cli-{}.json",
+        Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &input_path,
+        serde_json::to_vec(&json!({
+            "title": "Created by the real buzz CLI",
+            "desired_outcome": "The packaged agent surface exercises typed Project View writes",
+            "directions": ["Do not hand-write kind or tags"]
+        }))
+        .expect("serialize CLI fixture"),
+    )
+    .expect("write CLI fixture");
+
+    let expected_revision = expected_project_revision.to_string();
+    let output = Command::new(buzz)
+        .args([
+            "--format",
+            "compact",
+            "project-view",
+            "create",
+            "goal",
+            "--expected-project-revision",
+            &expected_revision,
+            "--data",
+        ])
+        .arg(&input_path)
+        .env("BUZZ_RELAY_URL", &context.http_url)
+        .env(
+            "BUZZ_PRIVATE_KEY",
+            writer
+                .secret_key()
+                .to_bech32()
+                .expect("encode E2E writer nsec"),
+        )
+        .env_remove("BUZZ_AUTH_TAG")
+        .output()
+        .expect("run real buzz CLI");
+    let _ = std::fs::remove_file(&input_path);
+    assert!(
+        output.status.success(),
+        "real buzz CLI failed (status={}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse real buzz CLI JSON output")
+}
+
 #[tokio::test]
 #[ignore = "requires running Relay, Postgres, Redis, and stable relay signer"]
 async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
@@ -441,16 +499,25 @@ async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     assert_eq!(status, StatusCode::OK, "Project View count failed: {count}");
     assert_eq!(count["count"], 3);
 
+    let cli_result = create_goal_with_real_cli(&context, &writer, 2);
+    assert_eq!(cli_result["accepted"], true);
+    assert!(cli_result["object_id"].as_str().is_some());
+    let revision_three = collect_live_revision(&mut subscriber, &sub_id, 3, 2).await;
+    verify_projection_events(&revision_three, relay_pubkey);
+    let meta = current_meta(&http, &context, &writer, relay_pubkey).await;
+    assert_eq!(meta["project_revision"], 3);
+    assert_eq!(meta["active_object_count"], 4);
+
     sqlx::query("DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(context.community_id)
         .bind(reader.public_key().to_hex())
         .execute(&context.pool)
         .await
         .expect("revoke Project View reader");
-    let revision_three_event =
-        mutation_event(&writer, &create_goal_mutation(2, "Verify live revocation"));
-    let (status, response) = submit_http(&http, &context, &writer, &revision_three_event).await;
-    assert_eq!(status, StatusCode::OK, "revision three failed: {response}");
+    let revision_four_event =
+        mutation_event(&writer, &create_goal_mutation(3, "Verify live revocation"));
+    let (status, response) = submit_http(&http, &context, &writer, &revision_four_event).await;
+    assert_eq!(status, StatusCode::OK, "revision four failed: {response}");
     assert!(matches!(
         subscriber.recv_event(Duration::from_millis(750)).await,
         Err(TestClientError::Timeout)
@@ -526,7 +593,7 @@ async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     .fetch_one(&context.pool)
     .await
     .expect("read final Project View state");
-    assert_eq!(row.get::<i64, _>("project_revision"), 3);
+    assert_eq!(row.get::<i64, _>("project_revision"), 4);
     assert_eq!(row.get::<i64, _>("projection_generation"), 1);
 
     ws_writer.disconnect().await.expect("disconnect writer");

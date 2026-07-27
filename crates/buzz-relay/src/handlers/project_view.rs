@@ -5,7 +5,7 @@
 //! Relay-specific security gates, signing, error mapping, and post-commit
 //! delivery policy.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use buzz_auth::Scope;
 use buzz_core::kind::{
@@ -16,8 +16,11 @@ use buzz_core::{StoredEvent, TenantContext};
 use buzz_db::project_view::{
     PreparedObjectProjection, PreparedProjectViewCommit, ProjectViewWriteError,
 };
-use buzz_project_view::{DomainError, Mutation, ProjectViewEntry, ProjectionPlan};
+use buzz_project_view::{
+    DomainError, Mutation, ProjectViewEntry, ProjectionPlan, MAX_MUTATION_CONTENT_BYTES,
+};
 use nostr::{Event, Filter};
+use tracing::{info, warn};
 
 use crate::state::AppState;
 
@@ -69,6 +72,70 @@ pub(crate) fn filter_is_project_view_search(filter: &Filter) -> bool {
 
 /// Apply one signed member mutation and publish its committed projections.
 pub(crate) async fn handle_mutation(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let started = Instant::now();
+    let telemetry = MutationTelemetry::from_content(&event.content);
+    let event_id = event.id.to_hex();
+    let actor_pubkey = event.pubkey.to_hex();
+    let result = handle_mutation_inner(tenant, state, event, auth).await;
+    let result_code = mutation_result_code(&result);
+    let committed_project_revision = committed_project_revision(&result);
+
+    metrics::counter!(
+        "buzz_project_view_mutations_total",
+        "operation" => telemetry.operation,
+        "result" => result_code
+    )
+    .increment(1);
+    metrics::histogram!(
+        "buzz_project_view_mutation_duration_seconds",
+        "operation" => telemetry.operation
+    )
+    .record(started.elapsed().as_secs_f64());
+    if matches!(&result, Err(IngestError::Conflict(_))) {
+        metrics::counter!(
+            "buzz_project_view_conflicts_total",
+            "operation" => telemetry.operation
+        )
+        .increment(1);
+    }
+
+    if result.is_ok() {
+        info!(
+            community_host = %tenant.host(),
+            command_event_id = %event_id,
+            actor_pubkey = %actor_pubkey,
+            operation = telemetry.operation,
+            object_type = ?telemetry.object_type,
+            object_id = ?telemetry.object_id,
+            expected_project_revision = ?telemetry.expected_project_revision,
+            committed_project_revision = ?committed_project_revision,
+            result_code,
+            "Project View mutation completed"
+        );
+    } else {
+        warn!(
+            community_host = %tenant.host(),
+            command_event_id = %event_id,
+            actor_pubkey = %actor_pubkey,
+            operation = telemetry.operation,
+            object_type = ?telemetry.object_type,
+            object_id = ?telemetry.object_id,
+            expected_project_revision = ?telemetry.expected_project_revision,
+            committed_project_revision = ?committed_project_revision,
+            result_code,
+            "Project View mutation rejected"
+        );
+    }
+
+    result
+}
+
+async fn handle_mutation_inner(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     event: Event,
@@ -237,6 +304,114 @@ pub(crate) async fn handle_mutation(
         accepted: true,
         message,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MutationTelemetry {
+    operation: &'static str,
+    object_type: Option<&'static str>,
+    object_id: Option<uuid::Uuid>,
+    expected_project_revision: Option<u64>,
+}
+
+impl MutationTelemetry {
+    fn from_content(content: &str) -> Self {
+        if content.len() > MAX_MUTATION_CONTENT_BYTES {
+            return Self::unknown();
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+            return Self::unknown();
+        };
+        let request = value.get("request");
+        let operation = request
+            .and_then(|request| request.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_operation)
+            .unwrap_or("unknown");
+        let raw_object_type = match operation {
+            "initialize" => None,
+            "create" => request
+                .and_then(|request| request.get("object"))
+                .and_then(|object| object.get("object_type"))
+                .and_then(serde_json::Value::as_str),
+            "update" | "delete" => request
+                .and_then(|request| request.get("object_type"))
+                .and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        let object_id = match operation {
+            "create" => request
+                .and_then(|request| request.get("object"))
+                .and_then(|object| object.get("id")),
+            "update" | "delete" => request.and_then(|request| request.get("object_id")),
+            _ => None,
+        }
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok());
+
+        Self {
+            operation,
+            object_type: raw_object_type.map(bounded_object_type),
+            object_id,
+            expected_project_revision: value
+                .get("expected_project_revision")
+                .and_then(serde_json::Value::as_u64),
+        }
+    }
+
+    const fn unknown() -> Self {
+        Self {
+            operation: "unknown",
+            object_type: None,
+            object_id: None,
+            expected_project_revision: None,
+        }
+    }
+}
+
+fn bounded_operation(operation: &str) -> &'static str {
+    match operation {
+        "initialize" => "initialize",
+        "create" => "create",
+        "update" => "update",
+        "delete" => "delete",
+        _ => "unknown",
+    }
+}
+
+fn bounded_object_type(object_type: &str) -> &'static str {
+    match object_type {
+        "project_profile" => "project_profile",
+        "goal" => "goal",
+        "role" => "role",
+        "plan" => "plan",
+        "stage" => "stage",
+        "requirement" => "requirement",
+        "issue" => "issue",
+        "work" => "work",
+        "resource" => "resource",
+        _ => "unknown",
+    }
+}
+
+fn mutation_result_code(result: &Result<IngestResult, IngestError>) -> &'static str {
+    match result {
+        Ok(_) => "accepted",
+        Err(IngestError::Rejected(_)) => "invalid",
+        Err(IngestError::AuthFailed(_)) => "restricted",
+        Err(IngestError::Conflict(_)) => "conflict",
+        Err(IngestError::Unsupported(_)) => "unsupported",
+        Err(IngestError::Unavailable(_)) => "unavailable",
+        Err(IngestError::Internal(_)) => "internal",
+    }
+}
+
+fn committed_project_revision(result: &Result<IngestResult, IngestError>) -> Option<u64> {
+    let message = result.as_ref().ok()?.message.strip_prefix("response:")?;
+    serde_json::from_str::<serde_json::Value>(message)
+        .ok()?
+        .get("project_revision")?
+        .as_u64()
 }
 
 fn validate_mutation_tags(event: &Event) -> Result<(), IngestError> {
@@ -425,5 +600,57 @@ mod tests {
 
         assert!(filter_can_match(&Filter::new()));
         assert!(!filter_is_exclusively_project_view(&Filter::new()));
+    }
+
+    #[test]
+    fn mutation_telemetry_is_bounded_and_omits_payloads() {
+        let object_id = uuid::Uuid::new_v4();
+        let telemetry = MutationTelemetry::from_content(
+            &serde_json::json!({
+                "schema_version": 1,
+                "expected_project_revision": 7,
+                "request": {
+                    "type": "update",
+                    "object_type": "issue",
+                    "object_id": object_id,
+                    "patch": {
+                        "title": "must not become a metric label",
+                        "locator": "must not become a log field"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            telemetry,
+            MutationTelemetry {
+                operation: "update",
+                object_type: Some("issue"),
+                object_id: Some(object_id),
+                expected_project_revision: Some(7),
+            }
+        );
+
+        let unknown = MutationTelemetry::from_content(
+            r#"{"request":{"type":"attacker-operation","object_type":"attacker-type"}}"#,
+        );
+        assert_eq!(unknown.operation, "unknown");
+        assert_eq!(unknown.object_type, None);
+        assert_eq!(MutationTelemetry::from_content("{").operation, "unknown");
+    }
+
+    #[test]
+    fn mutation_result_labels_are_closed() {
+        let accepted = Ok(IngestResult {
+            event_id: "event".to_owned(),
+            accepted: true,
+            message: r#"response:{"project_revision":9}"#.to_owned(),
+        });
+        assert_eq!(mutation_result_code(&accepted), "accepted");
+        assert_eq!(committed_project_revision(&accepted), Some(9));
+
+        let conflict = Err(IngestError::Conflict("details".to_owned()));
+        assert_eq!(mutation_result_code(&conflict), "conflict");
+        assert_eq!(committed_project_revision(&conflict), None);
     }
 }

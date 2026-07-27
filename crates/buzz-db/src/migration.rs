@@ -1212,6 +1212,23 @@ mod tests {
                 .expect("read upgraded feature flags");
         assert_eq!(flags.len(), 2);
         assert!(flags.iter().all(|(_, enabled)| !enabled));
+        let legacy_rows: Vec<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT id, host FROM communities ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("pre-feature community projection remains readable");
+        assert_eq!(legacy_rows.len(), 2);
+        let legacy_insert_id = uuid::Uuid::new_v4();
+        let legacy_insert_flag: bool = sqlx::query_scalar(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) \
+             RETURNING project_view_enabled",
+        )
+        .bind(legacy_insert_id)
+        .bind(format!("legacy-insert-{}.test", legacy_insert_id.simple()))
+        .fetch_one(&pool)
+        .await
+        .expect("pre-feature insert shape remains compatible");
+        assert!(!legacy_insert_flag);
         for table in [
             "project_view_state",
             "project_view_objects",
@@ -1232,6 +1249,57 @@ mod tests {
         .execute(&admin)
         .await
         .expect("drop migration scratch database");
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn concurrent_migrators_reach_project_view_schema_once() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!(
+            "buzz_pv_concurrent_migrate_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create concurrent-migration scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let first = PgPool::connect(&database_url)
+            .await
+            .expect("connect first migrator");
+        let second = PgPool::connect(&database_url)
+            .await
+            .expect("connect second migrator");
+
+        let (first_result, second_result) =
+            tokio::join!(run_migrations(&first), run_migrations(&second));
+        first_result.expect("first concurrent migrator succeeds");
+        second_result.expect("second concurrent migrator succeeds");
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(25));
+        let project_view_migration_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM _sqlx_migrations \
+             WHERE version = 25 AND success",
+        )
+        .fetch_one(&first)
+        .await
+        .expect("count Project View migration ledger entries");
+        assert_eq!(project_view_migration_count, 1);
+
+        first.close().await;
+        second.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop concurrent-migration scratch database");
         admin.close().await;
     }
 

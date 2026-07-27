@@ -227,6 +227,37 @@ pub async fn git_repo_counts(pool: &PgPool) -> Result<Vec<CommunityGitRepoCount>
         .collect())
 }
 
+/// Fleet-wide active Project View object count by the closed object type.
+#[derive(Debug)]
+pub struct ProjectViewObjectCount {
+    /// Canonical Project View object type.
+    pub object_type: String,
+    /// Number of active objects of this type across all Communities.
+    pub count: i64,
+}
+
+/// Return active Project View object counts grouped by canonical type.
+///
+/// Callers must first verify that migration 25 is present; this query
+/// intentionally fails if the canonical table is absent.
+pub async fn project_view_object_counts(pool: &PgPool) -> Result<Vec<ProjectViewObjectCount>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT object_type, COUNT(*) AS count
+        FROM project_view_objects
+        WHERE deleted_at IS NULL
+        GROUP BY object_type
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(object_type, count)| ProjectViewObjectCount { object_type, count })
+        .collect())
+}
+
 /// Per-community active-user counts for a given window (e.g. 1d, 7d, 30d),
 /// split by human/agent.
 #[derive(Debug)]

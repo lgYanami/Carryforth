@@ -1235,7 +1235,8 @@ async fn query_events_authed(
                 "unavailable:project_view:stable_signer",
             ));
         }
-        let page = state
+        let snapshot_started = std::time::Instant::now();
+        let page_result = state
             .db
             .project_view_snapshot_page(
                 tenant.community(),
@@ -1245,18 +1246,27 @@ async fn query_events_authed(
                 page.after,
                 page.limit,
             )
-            .await
-            .map_err(|error| match error {
-                buzz_db::project_view::ProjectViewReadError::Conflict => api_error(
+            .await;
+        metrics::histogram!("buzz_project_view_snapshot_duration_seconds")
+            .record(snapshot_started.elapsed().as_secs_f64());
+        let page = page_result.map_err(|error| match error {
+            buzz_db::project_view::ProjectViewReadError::Conflict => {
+                metrics::counter!(
+                    "buzz_project_view_snapshot_retries_total",
+                    "reason" => "revision_changed"
+                )
+                .increment(1);
+                api_error(
                     StatusCode::CONFLICT,
                     "conflict:project_view:snapshot_changed",
-                ),
-                buzz_db::project_view::ProjectViewReadError::Database(_)
-                | buzz_db::project_view::ProjectViewReadError::Sqlx(_)
-                | buzz_db::project_view::ProjectViewReadError::Inconsistent(_) => {
-                    internal_error("Project View snapshot is unavailable")
-                }
-            })?;
+                )
+            }
+            buzz_db::project_view::ProjectViewReadError::Database(_)
+            | buzz_db::project_view::ProjectViewReadError::Sqlx(_)
+            | buzz_db::project_view::ProjectViewReadError::Inconsistent(_) => {
+                internal_error("Project View snapshot is unavailable")
+            }
+        })?;
         let events = page
             .events
             .into_iter()
