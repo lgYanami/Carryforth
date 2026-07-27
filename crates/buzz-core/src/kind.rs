@@ -763,6 +763,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_DM_HIDE
             | KIND_MEETING_CREATE
             | KIND_MEETING_END
+            | KIND_MEETING_FLOOR_CLAIM
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY

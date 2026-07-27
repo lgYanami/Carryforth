@@ -719,11 +719,65 @@ pub enum MeetingsCmd {
         #[arg(long)]
         meeting: String,
     },
+    /// Read the canonical meeting speech history
+    History {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Maximum number of speech events to return
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+    },
+    /// Send one message using the current identity's active Grant
+    Say {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Message text; use '-' to read from stdin
+        #[arg(long)]
+        content: String,
+    },
+    /// Inspect or claim the relay-authoritative speech floor
+    Floor {
+        #[command(subcommand)]
+        command: MeetingFloorCmd,
+    },
     /// End a meeting and make its room read-only
     End {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MeetingFloorCmd {
+    /// Show the highest-revision floor state
+    Status {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Read Claim and Round State control history
+    History {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Maximum number of control events to return
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+    },
+    /// Submit one Claim for the current open/claiming round
+    Claim {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Wait until this round is granted or advances
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+        /// Maximum seconds to wait for the round result
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
     },
 }
 
@@ -1969,7 +2023,16 @@ mod tests {
         assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
         assert_eq!(
             names(&cmd, "meetings"),
-            vec!["create", "end", "list", "participants", "show"]
+            vec![
+                "create",
+                "end",
+                "floor",
+                "history",
+                "list",
+                "participants",
+                "say",
+                "show"
+            ]
         );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
@@ -2061,7 +2124,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
-            ("meetings", 5),
+            ("meetings", 8),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

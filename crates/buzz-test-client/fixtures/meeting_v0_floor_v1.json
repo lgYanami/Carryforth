@@ -1,0 +1,348 @@
+{
+  "fixture_version": 1,
+  "protocol": {
+    "meeting_version": "1",
+    "floor_policy": "uniform-v0",
+    "kinds": {
+      "speech": 9,
+      "claim": 42102,
+      "round_state": 42103
+    },
+    "round_state_required_tags": [
+      "h",
+      "meeting-round",
+      "floor-revision",
+      "phase",
+      "policy"
+    ],
+    "note": "Reducer fixture: signatures are intentionally omitted; event_id values remain Nostr-shaped hex identifiers."
+  },
+  "meeting_id": "00000000-0000-4000-8000-000000000001",
+  "participants": {
+    "human_1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "human_2": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "agent_1": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "agent_2": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "scenarios": [
+    {
+      "name": "normal",
+      "viewer": "human_1",
+      "delivery": [
+        {
+          "event_id": "0000000000000000000000000000000000000000000000000000000000000001",
+          "round": 1,
+          "revision": 1,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {}
+        },
+        {
+          "event_id": "0000000000000000000000000000000000000000000000000000000000000002",
+          "round": 1,
+          "revision": 2,
+          "phase": "claiming",
+          "policy": "uniform-v0",
+          "content": {
+            "claim_event_ids": [
+              "1111111111111111111111111111111111111111111111111111111111111111"
+            ],
+            "claimants": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
+            "claim_deadline_ms": 1730000003000
+          }
+        },
+        {
+          "event_id": "0000000000000000000000000000000000000000000000000000000000000003",
+          "round": 1,
+          "revision": 3,
+          "phase": "granted",
+          "policy": "uniform-v0",
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "content": {
+            "claim_event_ids": [
+              "1111111111111111111111111111111111111111111111111111111111111111"
+            ],
+            "claimants": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
+            "lease_expires_at_ms": 1730000013000
+          }
+        },
+        {
+          "event_id": "0000000000000000000000000000000000000000000000000000000000000004",
+          "round": 1,
+          "revision": 4,
+          "phase": "closed",
+          "policy": "uniform-v0",
+          "content": {
+            "outcome": "spoken",
+            "speech_event_id": "6666666666666666666666666666666666666666666666666666666666666666"
+          }
+        },
+        {
+          "event_id": "0000000000000000000000000000000000000000000000000000000000000005",
+          "round": 2,
+          "revision": 5,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {
+            "previous_round": 1,
+            "previous_outcome": "spoken",
+            "previous_speech_event_id": "6666666666666666666666666666666666666666666666666666666666666666"
+          }
+        }
+      ],
+      "speech_event_ids": [
+        "6666666666666666666666666666666666666666666666666666666666666666"
+      ],
+      "expected": {
+        "round": 2,
+        "revision": 5,
+        "phase": "open",
+        "viewer_claim_result": "won",
+        "claim_enabled": true,
+        "requires_reconcile": false
+      }
+    },
+    {
+      "name": "lost",
+      "viewer": "human_1",
+      "delivery": [
+        {
+          "event_id": "1000000000000000000000000000000000000000000000000000000000000001",
+          "round": 1,
+          "revision": 1,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {}
+        },
+        {
+          "event_id": "1000000000000000000000000000000000000000000000000000000000000002",
+          "round": 1,
+          "revision": 2,
+          "phase": "claiming",
+          "policy": "uniform-v0",
+          "content": {
+            "claim_event_ids": [
+              "1111111111111111111111111111111111111111111111111111111111111111",
+              "2222222222222222222222222222222222222222222222222222222222222222"
+            ],
+            "claimants": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ],
+            "claim_deadline_ms": 1730000003000
+          }
+        },
+        {
+          "event_id": "1000000000000000000000000000000000000000000000000000000000000003",
+          "round": 1,
+          "revision": 3,
+          "phase": "granted",
+          "policy": "uniform-v0",
+          "holder": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "content": {
+            "claim_event_ids": [
+              "1111111111111111111111111111111111111111111111111111111111111111",
+              "2222222222222222222222222222222222222222222222222222222222222222"
+            ],
+            "claimants": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ],
+            "lease_expires_at_ms": 1730000013000
+          }
+        }
+      ],
+      "speech_event_ids": [],
+      "expected": {
+        "round": 1,
+        "revision": 3,
+        "phase": "granted",
+        "holder": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "viewer_claim_result": "lost",
+        "claim_enabled": false,
+        "requires_reconcile": false
+      }
+    },
+    {
+      "name": "expired",
+      "viewer": "human_2",
+      "delivery": [
+        {
+          "event_id": "2000000000000000000000000000000000000000000000000000000000000001",
+          "round": 1,
+          "revision": 1,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {}
+        },
+        {
+          "event_id": "2000000000000000000000000000000000000000000000000000000000000002",
+          "round": 1,
+          "revision": 2,
+          "phase": "claiming",
+          "policy": "uniform-v0",
+          "content": {
+            "claim_event_ids": [
+              "2222222222222222222222222222222222222222222222222222222222222222"
+            ],
+            "claimants": [
+              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ],
+            "claim_deadline_ms": 1730000003000
+          }
+        },
+        {
+          "event_id": "2000000000000000000000000000000000000000000000000000000000000003",
+          "round": 1,
+          "revision": 3,
+          "phase": "granted",
+          "policy": "uniform-v0",
+          "holder": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "content": {
+            "claim_event_ids": [
+              "2222222222222222222222222222222222222222222222222222222222222222"
+            ],
+            "claimants": [
+              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ],
+            "lease_expires_at_ms": 1730000013000
+          }
+        },
+        {
+          "event_id": "2000000000000000000000000000000000000000000000000000000000000004",
+          "round": 1,
+          "revision": 4,
+          "phase": "closed",
+          "policy": "uniform-v0",
+          "content": {
+            "outcome": "expired"
+          }
+        },
+        {
+          "event_id": "2000000000000000000000000000000000000000000000000000000000000005",
+          "round": 2,
+          "revision": 5,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {
+            "previous_round": 1,
+            "previous_outcome": "expired"
+          }
+        }
+      ],
+      "speech_event_ids": [],
+      "expected": {
+        "round": 2,
+        "revision": 5,
+        "phase": "open",
+        "viewer_claim_result": "expired",
+        "claim_enabled": true,
+        "requires_reconcile": false
+      }
+    },
+    {
+      "name": "reconnect",
+      "viewer": "agent_2",
+      "delivery": [
+        {
+          "event_id": "3000000000000000000000000000000000000000000000000000000000000001",
+          "round": 1,
+          "revision": 1,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {}
+        },
+        {
+          "event_id": "3000000000000000000000000000000000000000000000000000000000000003",
+          "round": 1,
+          "revision": 3,
+          "phase": "granted",
+          "policy": "uniform-v0",
+          "holder": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "content": {
+            "claim_event_ids": [
+              "3333333333333333333333333333333333333333333333333333333333333333"
+            ],
+            "claimants": [
+              "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ],
+            "lease_expires_at_ms": 1730000013000
+          }
+        },
+        {
+          "event_id": "3000000000000000000000000000000000000000000000000000000000000002",
+          "round": 1,
+          "revision": 2,
+          "phase": "claiming",
+          "policy": "uniform-v0",
+          "content": {
+            "claim_event_ids": [
+              "3333333333333333333333333333333333333333333333333333333333333333"
+            ],
+            "claimants": [
+              "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ],
+            "claim_deadline_ms": 1730000003000
+          }
+        },
+        {
+          "event_id": "3000000000000000000000000000000000000000000000000000000000000005",
+          "round": 2,
+          "revision": 5,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {
+            "previous_round": 1,
+            "previous_outcome": "spoken",
+            "previous_speech_event_id": "6666666666666666666666666666666666666666666666666666666666666666"
+          }
+        },
+        {
+          "event_id": "3000000000000000000000000000000000000000000000000000000000000004",
+          "round": 1,
+          "revision": 4,
+          "phase": "closed",
+          "policy": "uniform-v0",
+          "content": {
+            "outcome": "spoken",
+            "speech_event_id": "6666666666666666666666666666666666666666666666666666666666666666"
+          }
+        },
+        {
+          "event_id": "3000000000000000000000000000000000000000000000000000000000000005",
+          "round": 2,
+          "revision": 5,
+          "phase": "open",
+          "policy": "uniform-v0",
+          "content": {
+            "previous_round": 1,
+            "previous_outcome": "spoken",
+            "previous_speech_event_id": "6666666666666666666666666666666666666666666666666666666666666666"
+          }
+        }
+      ],
+      "speech_event_ids": [
+        "6666666666666666666666666666666666666666666666666666666666666666"
+      ],
+      "expected": {
+        "round": 2,
+        "revision": 5,
+        "phase": "open",
+        "viewer_claim_result": "won",
+        "claim_enabled": true,
+        "requires_reconcile": false,
+        "reconcile_requested_after_revisions": [
+          3,
+          5
+        ],
+        "ignored_duplicate_event_ids": [
+          "3000000000000000000000000000000000000000000000000000000000000005"
+        ]
+      }
+    }
+  ]
+}

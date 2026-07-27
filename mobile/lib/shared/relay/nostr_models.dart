@@ -26,6 +26,10 @@ abstract final class EventKind {
   static const streamMessageEdit = 40003;
   static const streamMessageDiff = 40008;
   static const systemMessage = 40099;
+  static const meetingCreate = 42100;
+  static const meetingEnd = 42101;
+  static const meetingFloorClaim = 42102;
+  static const meetingRoundState = 42103;
   static const jobRequest = 43001;
   static const jobAccepted = 43002;
   static const jobProgress = 43003;

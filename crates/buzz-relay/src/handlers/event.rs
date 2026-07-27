@@ -392,6 +392,42 @@ pub(crate) async fn dispatch_persistent_event(
     0
 }
 
+/// Deliver a durable event before acknowledging its transactional outbox row.
+///
+/// Meeting runtime events are recovered from a database-backed outbox. Unlike
+/// the normal ingest path, the worker must not mark the outbox row delivered
+/// while fan-out is still only scheduled in a detached task.
+pub(crate) async fn dispatch_persistent_event_now(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    stored_event: &StoredEvent,
+    kind_u32: u32,
+    actor_pubkey_hex: &str,
+    threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
+) -> usize {
+    let event_id_hex = stored_event.event.id.to_hex();
+    enqueue_event_created_audit(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        &event_id_hex,
+    )
+    .await;
+
+    dispatch_persistent_event_inner(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        false,
+        threaded_visibility,
+    )
+    .await
+}
+
 /// Run post-commit delivery/side effects for a stored event.
 async fn dispatch_persistent_event_inner(
     tenant: &TenantContext,

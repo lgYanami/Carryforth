@@ -23,6 +23,7 @@ use buzz_core::StoredEvent;
 use buzz_db::meeting::{
     CreateMeetingParams, EndMeetingOutcome, EndMeetingParams, MAX_MEETING_PARTICIPANTS,
 };
+use buzz_db::meeting_floor::{ClaimFloorOutcome, WinnerSelector};
 use buzz_db::workflow::{ApprovalStatus, RunStatus};
 use buzz_db::DbError;
 use buzz_workflow::executor::TriggerContext;
@@ -72,6 +73,7 @@ pub async fn handle_command(
         KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
         KIND_MEETING_CREATE => handle_meeting_create(tenant, state, &event, &auth).await,
         KIND_MEETING_END => handle_meeting_end(tenant, state, &event, &auth).await,
+        KIND_MEETING_FLOOR_CLAIM => handle_meeting_floor_claim(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
@@ -424,6 +426,14 @@ async fn handle_meeting_create(
     )
     .await
     .map_err(map_meeting_db_error)?;
+    buzz_db::meeting_floor::initialize_floor_tx(
+        &mut tx,
+        tenant.community(),
+        session_id,
+        &state.relay_keypair,
+    )
+    .await
+    .map_err(map_meeting_db_error)?;
 
     tx.commit()
         .await
@@ -551,6 +561,15 @@ async fn handle_meeting_end(
         });
     }
 
+    buzz_db::meeting_floor::close_floor_for_end_tx(
+        &mut tx,
+        tenant.community(),
+        session_id,
+        &state.relay_keypair,
+    )
+    .await
+    .map_err(map_meeting_db_error)?;
+
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit meeting end: {e}")))?;
@@ -574,6 +593,89 @@ async fn handle_meeting_end(
     })
 }
 
+async fn handle_meeting_floor_claim(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    if !event.content.is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: meeting floor Claim content must be empty".into(),
+        ));
+    }
+    validate_meeting_tag_vocabulary(event, &["h", "meeting-round"], &[])?;
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if auth
+        .channel_ids()
+        .is_some_and(|ids| !ids.contains(&session_id))
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: token not authorized for this meeting".into(),
+        ));
+    }
+    let round_number = parse_positive_round(event)?;
+    let config = crate::meeting_runtime::floor_config_from_env();
+    let outcome = buzz_db::meeting_floor::claim_floor(
+        &state.db,
+        tenant.community(),
+        session_id,
+        round_number,
+        event,
+        &state.relay_keypair,
+        config,
+        WinnerSelector::UniformRandom,
+    )
+    .await
+    .map_err(map_meeting_db_error)?;
+
+    match outcome {
+        ClaimFloorOutcome::Accepted {
+            round_number,
+            floor_revision,
+            claim_event_id,
+        } => Ok(IngestResult {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::json!({
+                    "meeting_id": session_id,
+                    "round_number": round_number,
+                    "floor_revision": floor_revision,
+                    "claim_event_id": hex::encode(claim_event_id),
+                    "canonical": true,
+                })
+            ),
+        }),
+        ClaimFloorOutcome::Duplicate {
+            round_number,
+            floor_revision,
+            claim_event_id,
+        } => Ok(IngestResult {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::json!({
+                    "meeting_id": session_id,
+                    "round_number": round_number,
+                    "floor_revision": floor_revision,
+                    "claim_event_id": hex::encode(claim_event_id),
+                    "canonical": true,
+                    "duplicate": true,
+                })
+            ),
+        }),
+        ClaimFloorOutcome::Conflict {
+            canonical_claim_event_id,
+        } => Err(IngestError::Rejected(format!(
+            "conflict: meeting round already has a canonical Claim for this participant: {}",
+            hex::encode(canonical_claim_event_id)
+        ))),
+    }
+}
+
 async fn dispatch_meeting_command_event(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -592,7 +694,7 @@ async fn dispatch_meeting_command_event(
     .await;
 }
 
-fn map_meeting_db_error(error: DbError) -> IngestError {
+pub(crate) fn map_meeting_db_error(error: DbError) -> IngestError {
     match error {
         DbError::AccessDenied(_)
         | DbError::InvalidData(_)
@@ -600,6 +702,91 @@ fn map_meeting_db_error(error: DbError) -> IngestError {
         | DbError::ChannelNotFound(_) => IngestError::Rejected(format!("invalid: {error}")),
         other => IngestError::Internal(format!("error: meeting persistence: {other}")),
     }
+}
+
+pub(crate) fn validate_meeting_tag_vocabulary(
+    event: &Event,
+    required: &[&str],
+    repeatable: &[&str],
+) -> Result<(), IngestError> {
+    let mut seen = std::collections::HashSet::with_capacity(event.tags.len());
+    let mut repeatable_count = std::collections::HashMap::<&str, usize>::new();
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        let Some(name) = parts.first().map(String::as_str) else {
+            return Err(IngestError::Rejected(
+                "invalid: meeting events cannot contain empty tags".into(),
+            ));
+        };
+        if name == "auth" {
+            if !seen.insert(name) {
+                return Err(IngestError::Rejected(
+                    "invalid: duplicate meeting auth tag".into(),
+                ));
+            }
+            continue;
+        }
+        if repeatable.contains(&name) {
+            if parts.len() != 2 {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: meeting {name} tag must contain exactly two values"
+                )));
+            }
+            if name == "p"
+                && (parts[1].len() != 64
+                    || !parts[1]
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit()))
+            {
+                return Err(IngestError::Rejected(
+                    "invalid: meeting p tag must contain a 64-character pubkey".into(),
+                ));
+            }
+            let count = repeatable_count.entry(name).or_default();
+            *count += 1;
+            if name == "p" && *count > buzz_sdk::mentions::MENTION_CAP {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: meeting speech exceeds {} p mentions",
+                    buzz_sdk::mentions::MENTION_CAP
+                )));
+            }
+            continue;
+        }
+        if !required.contains(&name) {
+            return Err(IngestError::Rejected(format!(
+                "invalid: tag {name} is not allowed on this Meeting V0 event"
+            )));
+        }
+        if parts.len() != 2 {
+            return Err(IngestError::Rejected(format!(
+                "invalid: meeting {name} tag must contain exactly two values"
+            )));
+        }
+        if !seen.insert(name) {
+            return Err(IngestError::Rejected(format!(
+                "invalid: duplicate meeting {name} tag"
+            )));
+        }
+    }
+    for name in required {
+        if !seen.contains(name) {
+            return Err(IngestError::Rejected(format!(
+                "invalid: missing {name} tag"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_positive_round(event: &Event) -> Result<i64, IngestError> {
+    let value = require_single_tag(event, "meeting-round")?;
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|round| *round > 0)
+        .ok_or_else(|| {
+            IngestError::Rejected("invalid: meeting-round must be a positive integer".into())
+        })
 }
 
 fn tag_values(event: &Event, tag_name: &str) -> Vec<String> {

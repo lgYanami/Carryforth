@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 25);
+        assert_eq!(migrations.len(), 26);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -891,6 +891,16 @@ mod tests {
         assert!(meeting_v0.contains("CREATE TABLE meeting_sessions"));
         assert!(meeting_v0.contains("PRIMARY KEY (community_id, session_id)"));
         assert!(!migrations[0].sql.as_str().contains("meeting_sessions"));
+
+        // Meeting V0 stage 2 persists the complete floor state machine and its
+        // transactional delivery outbox in the next additive migration.
+        assert_eq!(migrations[25].version, 27);
+        let meeting_floor = migrations[25].sql.as_str();
+        assert!(meeting_floor.contains("CREATE TABLE meeting_rounds"));
+        assert!(meeting_floor.contains("CREATE TABLE meeting_floor_claims"));
+        assert!(meeting_floor.contains("CREATE TABLE meeting_event_outbox"));
+        assert!(meeting_floor
+            .contains("PRIMARY KEY (community_id, session_id, round_number, claimant_pubkey)"));
     }
 
     #[test]

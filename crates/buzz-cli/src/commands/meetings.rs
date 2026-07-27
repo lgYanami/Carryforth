@@ -8,11 +8,14 @@ use crate::client::{
     print_create_response, BuzzClient,
 };
 use crate::error::CliError;
-use crate::validate::{parse_uuid, sdk_err, validate_hex64};
+use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_hex64};
 use crate::OutputFormat;
 
 const KIND_GROUP_METADATA: u32 = 39000;
 const KIND_GROUP_MEMBERS: u32 = 39002;
+const KIND_MEETING_SPEECH: u32 = 9;
+const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
+const KIND_MEETING_ROUND_STATE: u32 = 42103;
 
 #[derive(Debug, Serialize)]
 struct MeetingSummary {
@@ -22,6 +25,140 @@ struct MeetingSummary {
     room_kind: String,
     status: &'static str,
     updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FloorState {
+    meeting_id: String,
+    round_number: u64,
+    floor_revision: u64,
+    phase: String,
+    policy_version: String,
+    state_event_id: String,
+    holder_pubkey: Option<String>,
+    grant_event_id: Option<String>,
+    claim_deadline_ms: Option<i64>,
+    lease_expires_at_ms: Option<i64>,
+    outcome: Option<String>,
+    speech_event_id: Option<String>,
+    previous_round_number: Option<u64>,
+    previous_outcome: Option<String>,
+    previous_speech_event_id: Option<String>,
+    claim_event_ids: Vec<String>,
+    claimant_pubkeys: Vec<String>,
+    created_at: u64,
+}
+
+fn parse_floor_state(event: &serde_json::Value) -> Option<FloorState> {
+    if event.get("kind").and_then(serde_json::Value::as_u64)
+        != Some(KIND_MEETING_ROUND_STATE as u64)
+    {
+        return None;
+    }
+    let meeting_id = extract_tag_value(event, "h");
+    let round_number = extract_tag_value(event, "meeting-round").parse().ok()?;
+    let floor_revision = extract_tag_value(event, "floor-revision").parse().ok()?;
+    let phase = extract_tag_value(event, "phase");
+    let policy_version = extract_tag_value(event, "policy");
+    let state_event_id = event.get("id")?.as_str()?.to_string();
+    if meeting_id.is_empty() || phase.is_empty() || policy_version.is_empty() {
+        return None;
+    }
+    let content = event
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let string_array = |field: &str| {
+        content
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Some(FloorState {
+        meeting_id,
+        round_number,
+        floor_revision,
+        phase: phase.clone(),
+        policy_version,
+        state_event_id: state_event_id.clone(),
+        holder_pubkey: {
+            let holder = extract_tag_value(event, "holder");
+            (!holder.is_empty()).then_some(holder)
+        },
+        grant_event_id: (phase == "granted").then_some(state_event_id),
+        claim_deadline_ms: content
+            .get("claim_deadline_ms")
+            .and_then(serde_json::Value::as_i64),
+        lease_expires_at_ms: content
+            .get("lease_expires_at_ms")
+            .and_then(serde_json::Value::as_i64),
+        outcome: content
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        speech_event_id: content
+            .get("speech_event_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        previous_round_number: content
+            .get("previous_round")
+            .and_then(serde_json::Value::as_u64),
+        previous_outcome: content
+            .get("previous_outcome")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        previous_speech_event_id: content
+            .get("previous_speech_event_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        claim_event_ids: string_array("claim_event_ids"),
+        claimant_pubkeys: string_array("claimants"),
+        created_at: event
+            .get("created_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+async fn fetch_floor_states(
+    client: &BuzzClient,
+    meeting_id: &str,
+    limit: u32,
+) -> Result<Vec<FloorState>, CliError> {
+    let filter = serde_json::json!({
+        "kinds": [KIND_MEETING_ROUND_STATE],
+        "#h": [meeting_id],
+    });
+    let events = client.query_paginated(filter, limit).await?;
+    let mut states: Vec<FloorState> = events.iter().filter_map(parse_floor_state).collect();
+    states.sort_by(|left, right| {
+        left.floor_revision
+            .cmp(&right.floor_revision)
+            .then_with(|| left.state_event_id.cmp(&right.state_event_id))
+    });
+    Ok(states)
+}
+
+async fn fetch_current_floor(
+    client: &BuzzClient,
+    meeting_id: &str,
+) -> Result<Option<FloorState>, CliError> {
+    Ok(fetch_floor_states(client, meeting_id, 1000)
+        .await?
+        .into_iter()
+        .max_by(|left, right| {
+            left.floor_revision
+                .cmp(&right.floor_revision)
+                .then_with(|| left.state_event_id.cmp(&right.state_event_id))
+        }))
 }
 
 fn is_meeting_metadata(event: &serde_json::Value) -> bool {
@@ -170,6 +307,11 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
             "#h": [&meeting_id],
             "limit": 20,
         }),
+        serde_json::json!({
+            "kinds": [KIND_MEETING_ROUND_STATE],
+            "#h": [&meeting_id],
+            "limit": 1000,
+        }),
     ];
     let response = client.query_multi(&filters).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap_or_default();
@@ -194,6 +336,14 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
         event.get("kind").and_then(serde_json::Value::as_u64)
             == Some(buzz_sdk::kind::KIND_MEETING_END as u64)
     });
+    let floor = events
+        .iter()
+        .filter_map(parse_floor_state)
+        .max_by(|left, right| {
+            left.floor_revision
+                .cmp(&right.floor_revision)
+                .then_with(|| left.state_event_id.cmp(&right.state_event_id))
+        });
 
     let output = serde_json::json!({
         "meeting_id": metadata.meeting_id,
@@ -225,6 +375,7 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
         "ended_by": end
             .and_then(|event| event.get("pubkey"))
             .and_then(serde_json::Value::as_str),
+        "floor": floor,
     });
     println!("{output}");
     Ok(())
@@ -252,6 +403,257 @@ pub async fn cmd_list_participants(client: &BuzzClient, meeting_id: &str) -> Res
     Ok(())
 }
 
+pub async fn cmd_meeting_history(
+    client: &BuzzClient,
+    meeting_id: &str,
+    limit: u32,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?.to_string();
+    let filter = serde_json::json!({
+        "kinds": [KIND_MEETING_SPEECH],
+        "#h": [&meeting_id],
+    });
+    let mut events = client.query_paginated(filter, limit).await?;
+    events.sort_by(|left, right| {
+        event_round(left)
+            .cmp(&event_round(right))
+            .then_with(|| event_id(left).cmp(event_id(right)))
+    });
+
+    let output = match format {
+        OutputFormat::Json => events,
+        OutputFormat::Compact => events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "event_id": event_id(event),
+                    "round_number": event_round(event),
+                    "author_pubkey": event.get("pubkey").and_then(serde_json::Value::as_str),
+                    "content": event.get("content").and_then(serde_json::Value::as_str),
+                })
+            })
+            .collect(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())
+    );
+    Ok(())
+}
+
+pub async fn cmd_floor_status(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?.to_string();
+    match fetch_current_floor(client, &meeting_id).await? {
+        Some(state) => println!(
+            "{}",
+            serde_json::to_string(&state).unwrap_or_else(|_| "null".to_string())
+        ),
+        None => println!("null"),
+    }
+    Ok(())
+}
+
+pub async fn cmd_floor_history(
+    client: &BuzzClient,
+    meeting_id: &str,
+    limit: u32,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?.to_string();
+    let filter = serde_json::json!({
+        "kinds": [KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_ROUND_STATE],
+        "#h": [&meeting_id],
+    });
+    let mut events = client.query_paginated(filter, limit).await?;
+    events.sort_by(|left, right| {
+        event_round(left)
+            .cmp(&event_round(right))
+            .then_with(|| event_floor_revision(left).cmp(&event_floor_revision(right)))
+            .then_with(|| event_id(left).cmp(event_id(right)))
+    });
+    let output = match format {
+        OutputFormat::Json => events,
+        OutputFormat::Compact => events
+            .iter()
+            .map(|event| {
+                let phase = extract_tag_value(event, "phase");
+                serde_json::json!({
+                    "event_id": event_id(event),
+                    "kind": event.get("kind").and_then(serde_json::Value::as_u64),
+                    "round_number": event_round(event),
+                    "floor_revision": event_floor_revision(event),
+                    "phase": (!phase.is_empty()).then_some(phase),
+                    "author_pubkey": event.get("pubkey").and_then(serde_json::Value::as_str),
+                })
+            })
+            .collect(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())
+    );
+    Ok(())
+}
+
+pub async fn cmd_claim_floor(
+    client: &BuzzClient,
+    meeting_id: &str,
+    wait: bool,
+    timeout_secs: u64,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let meeting_id_text = meeting_id.to_string();
+    let state = fetch_current_floor(client, &meeting_id_text)
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
+    if !matches!(state.phase.as_str(), "open" | "claiming") {
+        return Err(CliError::Usage(format!(
+            "meeting round {} is {}; Claim is only allowed while open or claiming",
+            state.round_number, state.phase
+        )));
+    }
+    let self_pubkey = client.keys().public_key().to_hex();
+    if let Some(index) = state
+        .claimant_pubkeys
+        .iter()
+        .position(|claimant| claimant == &self_pubkey)
+    {
+        let canonical = state
+            .claim_event_ids
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
+        return Err(CliError::Conflict(format!(
+            "already claimed round {} with event {}",
+            state.round_number, canonical
+        )));
+    }
+
+    let builder =
+        buzz_sdk::build_meeting_floor_claim(meeting_id, state.round_number).map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let claim_event_id = event.id.to_hex();
+    let write_response = client.submit_event(event).await?;
+    if !wait {
+        println!("{}", normalize_write_response(&write_response));
+        return Ok(());
+    }
+    if timeout_secs == 0 {
+        return Err(CliError::Usage("--timeout must be positive".into()));
+    }
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.min(300));
+    loop {
+        let states = fetch_floor_states(client, &meeting_id_text, 2000).await?;
+        let latest = states
+            .iter()
+            .filter(|candidate| candidate.round_number == state.round_number)
+            .max_by_key(|candidate| candidate.floor_revision);
+        if latest.is_some_and(|candidate| {
+            candidate.phase == "closed" && candidate.outcome.as_deref() == Some("ended")
+        }) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "meeting_id": meeting_id_text,
+                    "round_number": state.round_number,
+                    "claim_event_id": claim_event_id,
+                    "result": "ended",
+                    "write": serde_json::from_str::<serde_json::Value>(
+                        &normalize_write_response(&write_response)
+                    ).unwrap_or(serde_json::Value::String(write_response.clone())),
+                })
+            );
+            return Ok(());
+        }
+        let grant = states
+            .iter()
+            .filter(|candidate| {
+                candidate.round_number == state.round_number && candidate.phase == "granted"
+            })
+            .max_by_key(|candidate| candidate.floor_revision);
+        if let (Some(latest), Some(grant)) = (latest, grant) {
+            if !matches!(latest.phase.as_str(), "granted" | "closed") {
+                continue;
+            }
+            let result = if grant.holder_pubkey.as_deref() == Some(self_pubkey.as_str()) {
+                "won"
+            } else {
+                "lost"
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "meeting_id": meeting_id_text,
+                    "round_number": state.round_number,
+                    "claim_event_id": claim_event_id,
+                    "result": result,
+                    "holder_pubkey": grant.holder_pubkey,
+                    "grant_event_id": grant.grant_event_id,
+                    "lease_expires_at_ms": grant.lease_expires_at_ms,
+                    "active": latest.phase == "granted",
+                    "settled_phase": latest.phase,
+                    "outcome": latest.outcome,
+                    "write": serde_json::from_str::<serde_json::Value>(
+                        &normalize_write_response(&write_response)
+                    ).unwrap_or(serde_json::Value::String(write_response.clone())),
+                })
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::Other(format!(
+                "timed out waiting for round {} arbitration",
+                state.round_number
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+pub async fn cmd_say_meeting(
+    client: &BuzzClient,
+    meeting_id: &str,
+    content: &str,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_current_floor(client, &meeting_id.to_string())
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
+    if state.phase != "granted" {
+        return Err(CliError::Usage(format!(
+            "meeting round {} is {}; no active Grant can be used",
+            state.round_number, state.phase
+        )));
+    }
+    let self_pubkey = client.keys().public_key().to_hex();
+    if state.holder_pubkey.as_deref() != Some(self_pubkey.as_str()) {
+        return Err(CliError::Usage(format!(
+            "current Grant belongs to {}, not the current identity",
+            state.holder_pubkey.as_deref().unwrap_or("unknown")
+        )));
+    }
+    let grant_event_id = state
+        .grant_event_id
+        .as_deref()
+        .ok_or_else(|| CliError::Other("granted floor state has no Grant event ID".into()))?;
+    let content = read_or_stdin(content)?;
+    let builder = buzz_sdk::build_meeting_speech(
+        meeting_id,
+        state.round_number,
+        grant_event_id,
+        &content,
+        &[],
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
 pub async fn cmd_end_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
     let filter = serde_json::json!({
@@ -272,6 +674,25 @@ pub async fn cmd_end_meeting(client: &BuzzClient, meeting_id: &str) -> Result<()
     let response = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&response));
     Ok(())
+}
+
+fn event_round(event: &serde_json::Value) -> u64 {
+    extract_tag_value(event, "meeting-round")
+        .parse()
+        .unwrap_or(u64::MAX)
+}
+
+fn event_floor_revision(event: &serde_json::Value) -> u64 {
+    extract_tag_value(event, "floor-revision")
+        .parse()
+        .unwrap_or(u64::MAX)
+}
+
+fn event_id(event: &serde_json::Value) -> &str {
+    event
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 pub async fn dispatch(
@@ -302,6 +723,24 @@ pub async fn dispatch(
         } => cmd_list_meetings(client, include_ended, limit, format).await,
         MeetingsCmd::Show { meeting } => cmd_show_meeting(client, &meeting).await,
         MeetingsCmd::Participants { meeting } => cmd_list_participants(client, &meeting).await,
+        MeetingsCmd::History { meeting, limit } => {
+            cmd_meeting_history(client, &meeting, limit, format).await
+        }
+        MeetingsCmd::Say { meeting, content } => cmd_say_meeting(client, &meeting, &content).await,
+        MeetingsCmd::Floor { command } => {
+            use crate::MeetingFloorCmd;
+            match command {
+                MeetingFloorCmd::Status { meeting } => cmd_floor_status(client, &meeting).await,
+                MeetingFloorCmd::History { meeting, limit } => {
+                    cmd_floor_history(client, &meeting, limit, format).await
+                }
+                MeetingFloorCmd::Claim {
+                    meeting,
+                    wait,
+                    timeout,
+                } => cmd_claim_floor(client, &meeting, wait, timeout).await,
+            }
+        }
         MeetingsCmd::End { meeting } => cmd_end_meeting(client, &meeting).await,
     }
 }

@@ -22,14 +22,15 @@ use buzz_core::kind::{
     KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
     KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEETING_CREATE,
-    KIND_MEETING_END, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
-    KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-    KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP,
-    KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA,
-    KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
-    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
-    KIND_PRESENCE_UPDATE, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE,
-    KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
+    KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
+    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
+    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
+    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
+    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
+    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_REPORT,
+    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
     KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
@@ -276,7 +277,11 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
                 Ok(Scope::ChannelsWrite)
             }
         }
-        KIND_NIP29_CREATE_GROUP | KIND_CANVAS | KIND_MEETING_CREATE | KIND_MEETING_END => {
+        KIND_NIP29_CREATE_GROUP
+        | KIND_CANVAS
+        | KIND_MEETING_CREATE
+        | KIND_MEETING_END
+        | KIND_MEETING_FLOOR_CLAIM => {
             Ok(Scope::ChannelsWrite)
         }
         KIND_NIP29_JOIN_REQUEST | KIND_NIP29_LEAVE_REQUEST | KIND_NIP43_LEAVE_REQUEST => {
@@ -1830,6 +1835,29 @@ async fn ingest_event_inner(
             );
             auth_result.map_err(IngestError::Rejected)?;
         }
+    }
+
+    if channel_row
+        .as_ref()
+        .is_some_and(|channel| channel.room_kind == "meeting")
+    {
+        if kind_u32 == KIND_STREAM_MESSAGE {
+            if channel_row
+                .as_ref()
+                .is_some_and(|channel| channel.archived_at.is_some())
+            {
+                return Err(IngestError::Rejected("invalid: channel is archived".into()));
+            }
+            return super::meeting::handle_speech(tenant, state, &event).await;
+        }
+        if crate::handlers::side_effects::is_admin_kind(kind_u32) {
+            crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
+                .await
+                .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        }
+        return Err(IngestError::Rejected(format!(
+            "invalid: kind {kind_u32} is not part of the Meeting V0 canonical log"
+        )));
     }
 
     // Handled directly — these mutate relay_members and do NOT get stored.

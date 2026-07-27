@@ -70,6 +70,12 @@ pub struct MeetingRecord {
     pub ended_by: Option<Vec<u8>>,
     /// Event id of the Meeting End command.
     pub end_event_id: Option<Vec<u8>>,
+    /// Current speech round, starting at 1.
+    pub current_round: i64,
+    /// Monotonic session-wide floor revision.
+    pub floor_revision: i64,
+    /// Persisted winner-selection policy version.
+    pub floor_policy_version: String,
 }
 
 /// Outcome of an idempotent Meeting End mutation.
@@ -307,6 +313,9 @@ pub async fn create_meeting_tx(
             ended_at: None,
             ended_by: None,
             end_event_id: None,
+            current_round: 1,
+            floor_revision: 0,
+            floor_policy_version: "uniform-v0".to_string(),
         },
         participants,
     ))
@@ -414,7 +423,8 @@ pub async fn get_meeting(
 ) -> Result<MeetingRecord> {
     let row = sqlx::query(
         "SELECT session_id, create_event_id, host_pubkey, source_channel_id, \
-                schema_version, status, created_at, ended_at, ended_by, end_event_id \
+                schema_version, status, created_at, ended_at, ended_by, end_event_id, \
+                current_round, floor_revision, floor_policy_version \
          FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2",
     )
@@ -435,6 +445,9 @@ pub async fn get_meeting(
         ended_at: row.try_get("ended_at")?,
         ended_by: row.try_get("ended_by")?,
         end_event_id: row.try_get("end_event_id")?,
+        current_round: row.try_get("current_round")?,
+        floor_revision: row.try_get("floor_revision")?,
+        floor_policy_version: row.try_get("floor_policy_version")?,
     })
 }
 

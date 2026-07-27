@@ -29,6 +29,8 @@ pub mod feed;
 pub mod git_repo;
 /// Meeting V0 lifecycle persistence.
 pub mod meeting;
+/// Meeting V0 speech-floor state machine and delivery outbox.
+pub mod meeting_floor;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.

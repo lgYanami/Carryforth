@@ -1,6 +1,6 @@
 # Meeting V0 分阶段开发计划
 
-> 状态：阶段 1 已完成，阶段 2 未开始
+> 状态：阶段 1–2 已完成，阶段 3 未开始
 >
 > 本文只规划 Meeting V0 的开发阶段、阶段交付物和完成条件。
 > 产品与协议语义以 [Meeting V0 设计](./meeting-v0.md)为准；具体代码方案在进入对应阶段
@@ -181,7 +181,7 @@ Human 与 Agent 共同使用的共享文字会议室。
 | 阶段 | 状态 | 主要交付证据 |
 |---|---|---|
 | 1. 会议身份与生命周期 | 已完成 | `e2e_meeting`、数据库事务测试、双身份 CLI 生命周期演示 |
-| 2. 发言权与共享文字协议 | 未开始 | CLI 多方抢夺与发言 E2E |
+| 2. 发言权与共享文字协议 | 已完成 | `e2e_meeting_floor`、数据库重启/原子性测试、共享协议夹具、双身份 CLI 抢夺与发言演示 |
 | 3. Agent 会议模式 | 未开始 | 真实 ACP/Agent 会议演示与测试 |
 | 4. Desktop 会议产品面 | 未开始 | Desktop 可操作流程与 E2E |
 | 5. 集成验收与发布 | 未开始 | 2 Human + 2 real ACP Agent 验收报告与发布候选 |
@@ -248,7 +248,67 @@ buzz meetings show --meeting <UUID>
 阶段 1 只交付会议身份、名单和生命周期基座。它尚未启用 Claim、Grant、轮次或规范会议
 发言；这些能力属于阶段 2，因此阶段 1 完成不等于 Meeting V0 已可面向用户启用。
 
-## 7. V0 总体完成条件
+## 7. 阶段 2 交付记录
+
+阶段 2 已于 2026-07-27 完成交付，形成以下 CLI-only 共享文字会议链路：
+
+- 启用 `42102` Claim；`42103` Round State 仍只允许 Relay 签发；
+- 建立 `open → claiming → granted → closed/expired → next open` 的持久化 Floor
+  状态机，默认 Claim 窗口为 3 秒、Grant 租约为 10 秒，选择策略版本为
+  `uniform-v0`；
+- 每名参会者每轮只能提交一个规范 Claim，同一事件重试幂等，第二个不同 Claim 会被
+  拒绝；每轮最多生成一个 winner 和一个 Grant；
+- 会议发言复用 kind `9`，但必须绑定当前 `round + grant`；允许规范 `p` mention，
+  禁止 `e`、`q` 和 thread/reply 标签，非 holder、过期 Grant 和重复消费均被拒绝；
+- Claim、Round State、发言和发言权推进在数据库事务中提交，并通过持久 outbox
+  分发；Relay 重启后会从数据库时间和已提交状态恢复过期窗口、租约与待分发事件；
+- 会议结束会把 Floor 收敛到 `closed/ended`，之后不能再 Claim 或发言；
+- `buzz meetings` 扩展为
+  `create|list|show|participants|history|say|floor|end`，其中 Floor 提供
+  `status|history|claim`，Claim 支持等待并返回 `won|lost|ended`；
+- 增加版本化共享夹具
+  `crates/buzz-test-client/fixtures/meeting_v0_floor_v1.json`，覆盖
+  `normal`、`lost`、`expired` 和乱序/缺口/重复事件下的 `reconnect`。
+
+迁移使用 `0027_meeting_v0_floor.sql`，新增轮次、Claim 和持久 outbox 表，并给
+`meeting_sessions` 增加当前轮次、Floor revision 和策略版本投影。
+
+自动化验证：
+
+```text
+just ci
+# passed
+
+BUZZ_TEST_DATABASE_URL=postgres://.../buzz_meeting_v0_stage2_test \
+  cargo test -p buzz-db \
+  meeting_floor::tests::claim_grant_say_expiry_restart_and_idempotency_are_atomic \
+  -- --ignored --nocapture --test-threads=1
+# 1 passed
+
+DATABASE_URL=postgres://.../buzz_meeting_v0_stage2_test RELAY_URL=ws://localhost:3000 \
+  cargo test -p buzz-test-client \
+  --test e2e_meeting --test e2e_meeting_floor \
+  -- --ignored --nocapture --test-threads=1
+# stage 1: 1 passed; stage 2: 1 passed
+```
+
+`e2e_meeting_floor` 使用两名 Human 与两名 Agent 的固定名单，覆盖四方并发 Claim、
+唯一 Grant、同事件重试、重复 Claim 冲突、非 winner 发言、非法 thread 标签、合法
+`p` mention、Grant 单次消费、窗口/租约超时、下一轮推进、伪造 Relay 状态、非参会者
+隔离、结束后拒绝，以及所有参会者观察到相同且单调连续的 Floor revision。
+
+数据库原子性测试额外覆盖并发双写和在 `claiming`、`granted` 两个阶段断开并重建
+数据库连接后的恢复。共享夹具的版本与四类场景也由非 ignored 测试固定。
+
+CLI 实机验证使用两个独立身份完成：两者并发 Claim 后看到同一个 winner；首轮
+Grant 主动过期后，另一身份在下一轮获权并通过 `meetings say` 写入
+`The CLI-only shared floor works.`；两个身份读取到相同作者和历史，最后结束会议并
+共同观察到 `closed/ended`。
+
+本阶段尚未把真实 ACP Agent 或 Desktop 接入会议。它们分别属于阶段 3 和阶段 4，
+但现在可以共同基于本阶段的 Relay 权威协议、CLI 行为和版本化夹具并行开发。
+
+## 8. V0 总体完成条件
 
 Meeting V0 只有在以下结果同时成立时才算完成：
 
@@ -261,7 +321,7 @@ Meeting V0 只有在以下结果同时成立时才算完成：
 - Desktop、CLI 和 ACP 使用同一套 Relay 权威协议；
 - 会议结束后不可继续 Claim 或发言，原参会者仍可读取归档记录。
 
-## 8. 不纳入本计划
+## 9. 不纳入本计划
 
 以下能力不进入 Meeting V0 的任何开发阶段：
 

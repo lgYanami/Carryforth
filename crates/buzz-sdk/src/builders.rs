@@ -10,9 +10,10 @@ use buzz_core::{
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-        KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT,
-        KIND_PRESENCE_UPDATE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MODERATION_BAN,
+        KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+        KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1644,6 +1645,67 @@ pub fn build_meeting_end(
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), "").tags(tags))
 }
 
+/// Build a Meeting V0 floor claim (kind 42102).
+pub fn build_meeting_floor_claim(
+    session_id: Uuid,
+    round_number: u64,
+) -> Result<EventBuilder, SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    if round_number == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting round must be positive".into(),
+        ));
+    }
+    let tags = vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["meeting-round", &round_number.to_string()])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_FLOOR_CLAIM as u16), "").tags(tags))
+}
+
+/// Build a Grant-bound Meeting V0 speech message (kind 9).
+pub fn build_meeting_speech(
+    session_id: Uuid,
+    round_number: u64,
+    grant_event_id: &str,
+    content: &str,
+    mentions: &[&str],
+) -> Result<EventBuilder, SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    if round_number == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting round must be positive".into(),
+        ));
+    }
+    let grant_event_id = check_hex_exact(grant_event_id, 64, "meeting grant event id")?;
+    if content.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "meeting speech content is required".into(),
+        ));
+    }
+    check_content(content, 256 * 1024)?;
+    let mut tags = vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["meeting-round", &round_number.to_string()])?,
+        tag(&["meeting-grant", &grant_event_id])?,
+    ];
+    let mentions = mentions
+        .iter()
+        .map(|mention| check_pubkey_hex(mention, "meeting mention"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mention_refs = mentions.iter().map(String::as_str).collect::<Vec<_>>();
+    mention_tags(&mention_refs, &mut tags)?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content).tags(tags))
+}
+
 /// Build a presence update event (kind 20001).
 ///
 /// `status` must be one of: `"online"`, `"away"`, `"offline"`.
@@ -2740,6 +2802,36 @@ mod tests {
         assert!(has_tag(&event, "h", &session_id.to_string()));
         assert!(has_tag(&event, "e", &create_event_id));
         assert!(has_tag(&event, "reason", "manual"));
+    }
+
+    #[test]
+    fn meeting_floor_claim_and_speech_have_strict_round_shapes() {
+        let session_id = uuid();
+        let grant_event_id = "cd".repeat(32);
+
+        let claim = sign(build_meeting_floor_claim(session_id, 7).unwrap());
+        assert_eq!(claim.kind.as_u16(), KIND_MEETING_FLOOR_CLAIM as u16);
+        assert!(has_tag(&claim, "h", &session_id.to_string()));
+        assert!(has_tag(&claim, "meeting-round", "7"));
+        assert!(claim.content.is_empty());
+
+        let mention = "ab".repeat(32);
+        let speech = sign(
+            build_meeting_speech(
+                session_id,
+                7,
+                &grant_event_id,
+                "I have a proposal.",
+                &[mention.as_str()],
+            )
+            .unwrap(),
+        );
+        assert_eq!(speech.kind.as_u16(), KIND_STREAM_MESSAGE as u16);
+        assert!(has_tag(&speech, "h", &session_id.to_string()));
+        assert!(has_tag(&speech, "meeting-round", "7"));
+        assert!(has_tag(&speech, "meeting-grant", &grant_event_id));
+        assert!(has_tag(&speech, "p", &mention));
+        assert_eq!(speech.tags.len(), 4);
     }
 
     #[test]
