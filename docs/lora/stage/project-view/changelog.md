@@ -1,5 +1,68 @@
 # Project View 变更记录
 
+## 2026-07-27 — Slice 3：Relay 原生协议接入
+
+### 写入、签名与原子提交
+
+- 将 kind `44300` 接入 WebSocket `EVENT` 与 HTTP `POST /events` 的统一 ingest
+  管线。命令必须具备协议规定的精确 tags，并依次通过全局凭证、`MessagesWrite`
+  scope、当前 Community 成员身份与 ban 检查。
+- Relay 在回执前完成 mutation 解析、领域归约、projection 规划与稳定密钥签名，再由
+  `ProjectViewWriteTx` 原子提交 command、receipt、规范状态和全部新 head；幂等重放
+  返回既有 receipt，不重复分配 revision 或 fan-out。
+- 新增 SDK projection builder，严格构造 object/meta projection 的 kinds、坐标、tags
+  与 content；数据库边界再次验证覆盖集合、事件签名、稳定 signer、revision 和
+  generation，避免把内部自洽但不对应命令的投影写入规范状态。
+- Project View command 只进入 command audit，不触发通用 workflow；Relay 生成的
+  projection 不重复进入 audit/workflow。kind `40903`、`40904`、`44300` 使用显式的
+  有界 metrics 标签。
+
+### 统一读取、分页与实时撤权
+
+- WS `REQ`/`COUNT` 与 HTTP `/query`/`count` 共用严格 reader gate：允许当前 Relay
+  member，或 owner 仍是当前 member 的 persisted managed agent；actor ban 总是拒绝，
+  owner ban 在 managed-agent 路径拒绝，且全部查询以 Community 为租户边界。
+- 未授权的 Project View-only filter 明确拒绝；mixed filter 在 SQL `LIMIT`/COUNT 和
+  普通查询前排除 Project View kinds，防止分页与数量侧信道；NIP-50 的现有正向索引
+  allowlist 不包含这些 kinds，并在返回端继续 fail closed。授权后的返回结果仍执行末端
+  防御检查。
+- HTTP `/query` 支持 revision/generation 固定的 active snapshot 分页。首屏返回规范
+  游标，续页必须携带相同 revision、generation 与 canonical cursor；并发 mutation
+  后的旧游标返回 `409 Conflict`，不会拼接跨 revision 页面。
+- 本机与 Redis 跨 pod 的 live fan-out 都在实际发送 chokepoint 重新查询当前授权。
+  reader 被移出 Community 或被 ban 后，无需重连即可停止接收后续 projection。
+
+### Capability 与 signer rotation
+
+- NIP-11 仅在 Community 显式开启、数据库 schema 完整、稳定 signer 已配置且规范状态
+  可读取时声明 `buzz-project-view-v1`；deployment readiness 只在至少一个 Community
+  开启 Project View 时要求全局前置条件。
+- `buzz-admin project-view enable` 改为 checked enable，在持锁状态下验证 schema、
+  signer 与完整性；`disable` 保持无需私钥。
+- 新增 `project-view reproject --community|--all --expected-pubkey
+  [--relay-key-file]`。operator 轮换顺序固定为先 disable，再运行只允许 disabled 状态的
+  重签，验证后显式执行 checked enable；重签只递增 projection generation，不改变
+  project revision，并原子退休全部旧 head。
+- 私钥不接受 argv 传入；key file 必须是普通文件，Unix 下拒绝 group/world 权限。
+  `--all` 在写入前先验证全部目标均 disabled，避免只完成部分 Community。
+
+### 验证
+
+- `cargo test -p buzz-sdk -p buzz-project-view`：SDK 237 个测试、领域层 36 个测试通过。
+- Relay Project View handler/filter 测试与 admin 测试通过；两个真实 PostgreSQL
+  integration test 通过，覆盖成员/managed-agent reader gate、ban、tombstone 重签、
+  generation CAS、旧 signer 拒绝和新 signer checked enable。
+- 新增真实 Relay 协议 E2E，并在本地 Postgres/Redis 上显式运行通过：覆盖 WS/HTTP
+  写入与读取、projection 签名、NIP-11 capability、COUNT、revision-pinned pagination、
+  stale mutation/page `409`、mixed historical 隐藏，以及 membership 撤销后的 live
+  fail-closed。
+
+### 范围边界
+
+- 本阶段完成 Relay、数据库、SDK projection 与 operator rotation 闭环；面向人和 Agent
+  的 typed `buzz project-view` CLI 读写命令、客户端 read-model 组装及契约化输出属于
+  Slice 4。
+
 ## 2026-07-27 — Slice 2：数据库规范状态与原子写事务
 
 ### Migration 与规范状态

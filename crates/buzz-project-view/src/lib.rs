@@ -11,6 +11,7 @@ mod error;
 mod model;
 mod mutation;
 mod patch;
+mod projection;
 mod read_model;
 mod state;
 mod validation;
@@ -29,6 +30,7 @@ pub use mutation::{
     MAX_MUTATION_CONTENT_BYTES, MAX_MUTATION_JSON_DEPTH, MUTATION_SCHEMA_VERSION,
 };
 pub use patch::Patch;
+pub use projection::ProjectionPlan;
 pub use read_model::{GoalView, IssueView, PlanView, ProjectView, RequirementView, StageView};
 pub use state::{ProjectViewEntry, ProjectViewState, ProjectViewTombstone};
 

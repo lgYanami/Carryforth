@@ -739,6 +739,24 @@ pub const fn has_indexed_d_tag(kind: u32) -> bool {
         || matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META)
 }
 
+/// Returns `true` for relay-signed Project View current-state projections.
+pub const fn is_project_view_projection_kind(kind: u32) -> bool {
+    matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META)
+}
+
+/// Returns `true` for the member-signed Project View mutation command.
+pub const fn is_project_view_mutation_kind(kind: u32) -> bool {
+    kind == KIND_PROJECT_VIEW_MUTATION
+}
+
+/// Returns `true` for every event kind in the Project View wire protocol.
+///
+/// These Community-global events require Project View's stricter member-only
+/// read gate instead of the ordinary `channel_id IS NULL` visibility rule.
+pub const fn is_project_view_protocol_kind(kind: u32) -> bool {
+    is_project_view_projection_kind(kind) || is_project_view_mutation_kind(kind)
+}
+
 /// Returns `true` if `kind` is a workflow execution event (46001–46012).
 /// These must not trigger workflows (prevents infinite loops).
 pub const fn is_workflow_execution_kind(kind: u32) -> bool {
@@ -777,6 +795,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
+            | KIND_PROJECT_VIEW_MUTATION
     )
 }
 
@@ -823,6 +842,12 @@ const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_META));
 const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_OBJECT));
 const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_META));
 const _: () = assert!(!has_indexed_d_tag(KIND_PROJECT_VIEW_MUTATION));
+const _: () = assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_OBJECT));
+const _: () = assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_META));
+const _: () = assert!(is_project_view_mutation_kind(KIND_PROJECT_VIEW_MUTATION));
+const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_OBJECT));
+const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_META));
+const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_MUTATION));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -902,6 +927,19 @@ mod tests {
         assert!(is_relay_only_kind(KIND_PROJECT_VIEW_OBJECT));
         assert!(is_relay_only_kind(KIND_PROJECT_VIEW_META));
         assert!(!is_relay_only_kind(KIND_PROJECT_VIEW_MUTATION));
+    }
+
+    #[test]
+    fn project_view_protocol_classifiers_cover_commands_and_projections() {
+        assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_OBJECT));
+        assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_META));
+        assert!(!is_project_view_projection_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(is_project_view_mutation_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(is_command_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_OBJECT));
+        assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_META));
+        assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(!is_project_view_protocol_kind(KIND_TEXT_NOTE));
     }
 
     #[test]

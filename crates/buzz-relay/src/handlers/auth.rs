@@ -275,10 +275,17 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
+            let project_view_read_eligible = crate::handlers::project_view::credential_can_read(
+                &auth_ctx.scopes,
+                auth_ctx.channel_ids.as_deref(),
+            );
             *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
             state
                 .conn_manager
                 .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());
+            state
+                .conn_manager
+                .set_project_view_read_eligible(conn_id, project_view_read_eligible);
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
         }
         Err(e) => {

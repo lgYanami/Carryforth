@@ -216,6 +216,12 @@ pub async fn validate_standard_deletion_event(
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
 
+        if buzz_core::kind::is_project_view_protocol_kind(target_event.event.kind.as_u16() as u32) {
+            return Err(anyhow::anyhow!(
+                "Project View commands and projections cannot be deleted via NIP-09"
+            ));
+        }
+
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
         if target_author != actor_bytes

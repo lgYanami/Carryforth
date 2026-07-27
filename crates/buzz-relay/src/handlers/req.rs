@@ -47,7 +47,7 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
-    let (conn_id, pubkey_bytes, token_channel_ids) = {
+    let (conn_id, pubkey_bytes, token_channel_ids, auth_scopes) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => {
@@ -71,7 +71,12 @@ pub async fn handle_req(
                     return;
                 }
 
-                (conn.conn_id, pk_bytes, ctx.channel_ids.clone())
+                (
+                    conn.conn_id,
+                    pk_bytes,
+                    ctx.channel_ids.clone(),
+                    ctx.scopes.clone(),
+                )
             }
             _ => {
                 conn.send(RelayMessage::notice(
@@ -85,6 +90,48 @@ pub async fn handle_req(
             }
         }
     };
+
+    let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(super::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match
+        && super::project_view::credential_can_read(&auth_scopes, token_channel_ids.as_deref())
+    {
+        match state
+            .db
+            .project_view_authorized_pubkey(conn.tenant.community(), &pubkey_bytes)
+            .await
+        {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                warn!(conn_id = %conn_id, "Project View read authorization failed: {error}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "restricted: Project View requires current Community membership and a global read credential",
+        ));
+        return;
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(super::project_view::filter_is_project_view_search)
+    {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_view:search",
+        ));
+        return;
+    }
 
     let mut accessible_channels = if filters_are_nip43_membership_only(&filters) {
         metrics::counter!("buzz_req_global_access_resolution_skips_total", "kind" => "13534")
@@ -227,6 +274,7 @@ pub async fn handle_req(
             &conn,
             &state,
             trace_state.as_ref(),
+            project_view_read_allowed,
         )
         .await;
         return;
@@ -295,6 +343,13 @@ pub async fn handle_req(
             // personas from starving older shared ones off the page.
             if filter_can_match_persona_shared_kinds(filter) {
                 params.persona_reader = Some(pubkey_bytes.clone());
+            }
+            if !project_view_read_allowed && super::project_view::filter_can_match(filter) {
+                params.excluded_kinds = Some(vec![
+                    buzz_core::kind::KIND_PROJECT_VIEW_MUTATION as i32,
+                    buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+                    buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+                ]);
             }
             (idx, per_filter_channel, params)
         })
@@ -386,6 +441,11 @@ pub async fn handle_req(
             // shared-gate (kind:30175 without ["shared","true"]). Single call
             // covers all three gated event classes.
             if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
+                continue;
+            }
+            if !project_view_read_allowed
+                && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
+            {
                 continue;
             }
 
@@ -512,6 +572,7 @@ async fn handle_search_req(
     conn: &ConnectionState,
     state: &AppState,
     trace_state: Option<&crate::conformance::AbstractState>,
+    project_view_read_allowed: bool,
 ) {
     // The community-wide channel scope (no #h tag on the filter). `None` means
     // "no accessible channels and no global access" → EOSE, exactly as the
@@ -703,6 +764,13 @@ async fn handle_search_req(
                     // Result-level gate: covers author-only, persona shared-gate,
                     // and result-gated kinds in one call.
                     if !event_visible_to_reader(&stored.event, reader_pubkey_bytes) {
+                        continue;
+                    }
+                    if !project_view_read_allowed
+                        && buzz_core::kind::is_project_view_protocol_kind(
+                            stored.event.kind.as_u16() as u32,
+                        )
+                    {
                         continue;
                     }
                     // Dedup AFTER acceptance — an event that fails filter A's constraints

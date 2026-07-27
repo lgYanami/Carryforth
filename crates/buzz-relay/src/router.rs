@@ -362,22 +362,35 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 
     let check = async {
-        let (pg_ok, redis_ok) = tokio::join!(state.db.ping(), async {
-            state.redis_pool.get().await.is_ok()
-        },);
-        (pg_ok, redis_ok)
+        let (pg_ok, redis_ok, project_view_ok) = tokio::join!(
+            state.db.ping(),
+            async { state.redis_pool.get().await.is_ok() },
+            async {
+                state
+                    .db
+                    .project_view_deployment_ready(state.config.relay_private_key.is_some())
+                    .await
+                    .unwrap_or(false)
+            },
+        );
+        (pg_ok, redis_ok, project_view_ok)
     };
 
-    let (pg_ok, redis_ok) = tokio::time::timeout(Duration::from_secs(2), check)
+    let (pg_ok, redis_ok, project_view_ok) = tokio::time::timeout(Duration::from_secs(2), check)
         .await
-        .unwrap_or((false, false));
+        .unwrap_or((false, false, false));
 
-    if pg_ok && redis_ok {
+    if pg_ok && redis_ok && project_view_ok {
         (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "not_ready", "postgres": pg_ok, "redis": redis_ok})),
+            Json(json!({
+                "status": "not_ready",
+                "postgres": pg_ok,
+                "redis": redis_ok,
+                "project_view": project_view_ok
+            })),
         )
             .into_response()
     }

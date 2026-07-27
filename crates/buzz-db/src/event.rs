@@ -26,6 +26,12 @@ pub struct EventQuery {
     pub channel_id: Option<Uuid>,
     /// Restrict results to these kind values (stored as `i32` in Postgres).
     pub kinds: Option<Vec<i32>>,
+    /// Exclude these kind values before ordering, limiting, or counting.
+    ///
+    /// Used by mixed-kind Project View reads when the caller lacks the
+    /// protocol's stricter Community-member access. Applying the exclusion in
+    /// SQL prevents private global rows from consuming a public result page.
+    pub excluded_kinds: Option<Vec<i32>>,
     /// Restrict results to events from this pubkey.
     pub pubkey: Option<Vec<u8>>,
     /// Return events created at or after this time.
@@ -100,6 +106,7 @@ impl EventQuery {
             community_id,
             channel_id: None,
             kinds: None,
+            excluded_kinds: None,
             pubkey: None,
             since: None,
             until: None,
@@ -473,6 +480,14 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
         }
         qb.push(")");
     }
+    if let Some(ks) = q.excluded_kinds.as_deref().filter(|k| !k.is_empty()) {
+        qb.push(format!(" AND {col_prefix}kind NOT IN ("));
+        let mut sep = qb.separated(", ");
+        for k in ks {
+            sep.push_bind(*k);
+        }
+        qb.push(")");
+    }
 
     if let Some(ref pk) = q.pubkey {
         qb.push(format!(" AND {col_prefix}pubkey = "))
@@ -717,6 +732,14 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
 
     if let Some(ks) = q.kinds.as_deref().filter(|k| !k.is_empty()) {
         qb.push(format!(" AND {col_prefix}kind IN ("));
+        let mut sep = qb.separated(", ");
+        for k in ks {
+            sep.push_bind(*k);
+        }
+        qb.push(")");
+    }
+    if let Some(ks) = q.excluded_kinds.as_deref().filter(|k| !k.is_empty()) {
+        qb.push(format!(" AND {col_prefix}kind NOT IN ("));
         let mut sep = qb.separated(", ");
         for k in ks {
             sep.push_bind(*k);
@@ -1073,6 +1096,43 @@ pub async fn get_events_by_ids(
     for row in rows {
         if let Some(ev) = row_to_stored_event(row)? {
             out.push(ev);
+        }
+    }
+    Ok(out)
+}
+
+/// Batch-fetch non-deleted events inside a caller-owned transaction.
+///
+/// Project View snapshot reads use this variant while holding their shared
+/// Community advisory lock, so the canonical object pointers and the event
+/// rows they reference are observed in one transaction.
+pub(crate) async fn get_events_by_ids_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    ids: &[&[u8]],
+) -> Result<Vec<StoredEvent>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    debug_assert!(ids.len() <= 500, "batch fetch should be bounded by caller");
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id \
+         FROM events WHERE community_id = ",
+    );
+    qb.push_bind(community_id.as_uuid());
+    qb.push(" AND deleted_at IS NULL AND id IN (");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id.to_vec());
+    }
+    qb.push(")");
+
+    let rows = qb.build().fetch_all(&mut **tx).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(event) = row_to_stored_event(row)? {
+            out.push(event);
         }
     }
     Ok(out)

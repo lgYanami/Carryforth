@@ -407,6 +407,12 @@ async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
         Keys::parse(&hex).map_err(|e| anyhow::anyhow!("invalid BUZZ_RELAY_PRIVATE_KEY: {e}"))?
     };
 
+    let pubsub = connect_pubsub().await?;
+
+    Ok((db, pubsub, relay_keypair))
+}
+
+pub(crate) async fn connect_pubsub() -> Result<Arc<PubSubManager>> {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
@@ -422,7 +428,7 @@ async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
             .map_err(|e| anyhow::anyhow!("PubSub init failed: {e}"))?,
     );
 
-    Ok((db, pubsub, relay_keypair))
+    Ok(pubsub)
 }
 
 pub(crate) async fn connect_db() -> Result<Db> {

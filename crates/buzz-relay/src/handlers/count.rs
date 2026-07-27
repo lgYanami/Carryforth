@@ -34,12 +34,14 @@ pub async fn handle_count(
     state: Arc<AppState>,
 ) {
     // Require auth
-    let (pubkey_bytes, token_channel_ids) = {
+    let (pubkey_bytes, token_channel_ids, auth_scopes) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
-            AuthState::Authenticated(ctx) => {
-                (ctx.pubkey.to_bytes().to_vec(), ctx.channel_ids.clone())
-            }
+            AuthState::Authenticated(ctx) => (
+                ctx.pubkey.to_bytes().to_vec(),
+                ctx.channel_ids.clone(),
+                ctx.scopes.clone(),
+            ),
             _ => {
                 conn.send(RelayMessage::closed(
                     &sub_id,
@@ -49,6 +51,48 @@ pub async fn handle_count(
             }
         }
     };
+
+    let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(super::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match
+        && super::project_view::credential_can_read(&auth_scopes, token_channel_ids.as_deref())
+    {
+        match state
+            .db
+            .project_view_authorized_pubkey(conn.tenant.community(), &pubkey_bytes)
+            .await
+        {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                warn!(sub_id = %sub_id, "Project View COUNT authorization failed: {error}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "restricted: Project View requires current Community membership and a global read credential",
+        ));
+        return;
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(super::project_view::filter_is_project_view_search)
+    {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_view:search",
+        ));
+        return;
+    }
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
@@ -157,6 +201,7 @@ pub async fn handle_count(
                 conn.tenant.community(),
             )
             .await;
+            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
             // Persona visibility pushdown: pre-filter the fallback query_events
             // candidate page before ORDER/LIMIT.
             if needs_persona_filtering {
@@ -202,6 +247,13 @@ pub async fn handle_count(
                             if !event_visible_to_reader(&se.event, &pubkey_bytes) {
                                 continue;
                             }
+                            if !project_view_read_allowed
+                                && buzz_core::kind::is_project_view_protocol_kind(
+                                    se.event.kind.as_u16() as u32,
+                                )
+                            {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -225,6 +277,7 @@ pub async fn handle_count(
                 conn.tenant.community(),
             )
             .await;
+            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
             query.channel_ids = Some(accessible_channels.to_vec());
             // Persona visibility pushdown for the fallback query_events path.
             if needs_persona_filtering {
@@ -271,6 +324,13 @@ pub async fn handle_count(
                             if !event_visible_to_reader(&se.event, &pubkey_bytes) {
                                 continue;
                             }
+                            if !project_view_read_allowed
+                                && buzz_core::kind::is_project_view_protocol_kind(
+                                    se.event.kind.as_u16() as u32,
+                                )
+                            {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -283,4 +343,18 @@ pub async fn handle_count(
         }
     }
     conn.send(RelayMessage::count(&sub_id, total));
+}
+
+fn exclude_project_view_if_unauthorized(
+    query: &mut buzz_db::EventQuery,
+    filter: &Filter,
+    project_view_read_allowed: bool,
+) {
+    if !project_view_read_allowed && super::project_view::filter_can_match(filter) {
+        query.excluded_kinds = Some(vec![
+            buzz_core::kind::KIND_PROJECT_VIEW_MUTATION as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+        ]);
+    }
 }

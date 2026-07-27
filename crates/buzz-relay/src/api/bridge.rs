@@ -251,6 +251,174 @@ fn extract_channel_from_filter(filter: &nostr::Filter) -> Option<uuid::Uuid> {
 const BRIDGE_FEED_MAX_LIMIT: i64 = 100;
 const BRIDGE_THREAD_MAX_LIMIT: u32 = 500;
 
+struct ProjectViewPageRequest {
+    revision: u64,
+    projection_generation: u64,
+    after: Option<buzz_db::project_view::ProjectViewSnapshotCursor>,
+    limit: u16,
+}
+
+fn parse_project_view_page_request(
+    raw_filters: &[Value],
+    relay_pubkey: &nostr::PublicKey,
+) -> Result<Option<ProjectViewPageRequest>, (StatusCode, Json<Value>)> {
+    let extension_count = raw_filters
+        .iter()
+        .filter(|filter| filter.get("buzz_project_view").is_some())
+        .count();
+    if extension_count == 0 {
+        return Ok(None);
+    }
+    if extension_count != 1 || raw_filters.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination requires exactly one filter",
+        ));
+    }
+
+    let raw = raw_filters[0].as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view filter must be a JSON object",
+        )
+    })?;
+    const ALLOWED_OUTER: &[&str] = &["kinds", "authors", "#t", "limit", "buzz_project_view"];
+    if raw.keys().any(|key| !ALLOWED_OUTER.contains(&key.as_str())) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination contains an unsupported outer field",
+        ));
+    }
+    if raw.get("kinds")
+        != Some(&serde_json::json!([
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT
+        ]))
+        || raw.get("#t") != Some(&serde_json::json!(["buzz-project-view-active"]))
+        || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination requires exact kinds, authors, and #t filters",
+        ));
+    }
+
+    let limit = raw
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| (1..=500).contains(value))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view limit must be in 1..=500",
+            )
+        })?;
+    let extension = raw
+        .get("buzz_project_view")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view must be an object",
+            )
+        })?;
+    const ALLOWED_EXTENSION: &[&str] = &["revision", "projection_generation", "after"];
+    if extension
+        .keys()
+        .any(|key| !ALLOWED_EXTENSION.contains(&key.as_str()))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view contains an unsupported field",
+        ));
+    }
+    let revision = project_view_safe_revision(extension, "revision")?;
+    let projection_generation = project_view_safe_revision(extension, "projection_generation")?;
+    let after = extension
+        .get("after")
+        .map(parse_project_view_cursor)
+        .transpose()?;
+
+    Ok(Some(ProjectViewPageRequest {
+        revision,
+        projection_generation,
+        after,
+        limit,
+    }))
+}
+
+fn project_view_safe_revision(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<u64, (StatusCode, Json<Value>)> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=buzz_project_view::MAX_SAFE_REVISION).contains(value))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("buzz_project_view {field} is outside the supported range"),
+            )
+        })
+}
+
+fn parse_project_view_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewSnapshotCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after must be an object",
+        )
+    })?;
+    if object.len() != 2 || !object.contains_key("object_type") || !object.contains_key("object_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after requires exactly object_type and object_id",
+        ));
+    }
+    let object_type = match object.get("object_type").and_then(Value::as_str) {
+        Some("project_profile") => buzz_project_view::ProjectViewObjectType::ProjectProfile,
+        Some("goal") => buzz_project_view::ProjectViewObjectType::Goal,
+        Some("role") => buzz_project_view::ProjectViewObjectType::Role,
+        Some("plan") => buzz_project_view::ProjectViewObjectType::Plan,
+        Some("stage") => buzz_project_view::ProjectViewObjectType::Stage,
+        Some("requirement") => buzz_project_view::ProjectViewObjectType::Requirement,
+        Some("issue") => buzz_project_view::ProjectViewObjectType::Issue,
+        Some("work") => buzz_project_view::ProjectViewObjectType::Work,
+        Some("resource") => buzz_project_view::ProjectViewObjectType::Resource,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view after.object_type is invalid",
+            ));
+        }
+    };
+    let object_id = object
+        .get("object_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view after.object_id must be a canonical UUID",
+            )
+        })?;
+    let canonical_object_id = object_id.to_string();
+    if object.get("object_id").and_then(Value::as_str) != Some(canonical_object_id.as_str()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after.object_id must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(buzz_db::project_view::ProjectViewSnapshotCursor {
+        object_type,
+        object_id,
+    })
+}
+
 /// The `before_id` extension field, with "present but malformed" kept distinct
 /// from "absent": NIP-CW's cursor grammar says a malformed value MUST reject
 /// the request, never silently demote it to a half cursor or a head request.
@@ -587,6 +755,20 @@ fn event_in_accessible_channel(se: &buzz_core::StoredEvent, accessible: &[uuid::
     }
 }
 
+fn exclude_project_view_if_unauthorized(
+    query: &mut buzz_db::EventQuery,
+    filter: &nostr::Filter,
+    project_view_read_allowed: bool,
+) {
+    if !project_view_read_allowed && crate::handlers::project_view::filter_can_match(filter) {
+        query.excluded_kinds = Some(vec![
+            buzz_core::kind::KIND_PROJECT_VIEW_MUTATION as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+        ]);
+    }
+}
+
 /// Hard cap on the `reason` field logged for a rejected `/events` request.
 ///
 /// The reject message can embed event-controlled content (e.g. a submitted
@@ -863,6 +1045,30 @@ async fn submit_event_authed(
                 response: e,
             }
         }
+        Err(IngestError::Conflict(msg)) => {
+            crate::handlers::ingest::reject_with_transport("http", "conflict");
+            let e = api_error(StatusCode::CONFLICT, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
+        Err(IngestError::Unsupported(msg)) => {
+            crate::handlers::ingest::reject_with_transport("http", "unsupported");
+            let e = api_error(StatusCode::BAD_REQUEST, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
+        Err(IngestError::Unavailable(msg)) => {
+            crate::handlers::ingest::reject_with_transport("http", "unavailable");
+            let e = api_error(StatusCode::SERVICE_UNAVAILABLE, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
         Err(IngestError::Internal(msg)) => {
             crate::handlers::ingest::reject_with_transport("http", "error");
             let e = internal_error(&msg);
@@ -957,13 +1163,23 @@ async fn query_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    super::relay_members::enforce_relay_membership(
+    let nip_oa_owner = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
     )
-    .await?;
+    .await?
+    .or_else(|| {
+        if !state.config.require_relay_membership {
+            super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+        } else {
+            None
+        }
+    });
+    if let Some(owner) = nip_oa_owner {
+        super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
+    }
 
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
@@ -974,6 +1190,83 @@ async fn query_events_authed(
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    let project_view_can_match = filters
+        .iter()
+        .any(crate::handlers::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(crate::handlers::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match {
+        state
+            .db
+            .project_view_authorized_pubkey(tenant.community(), &pubkey_bytes)
+            .await
+            .map_err(|error| {
+                internal_error(&format!("Project View authorization lookup: {error}"))
+            })?
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: Project View requires current Community membership",
+        ));
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::project_view::filter_is_project_view_search)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_view:search",
+        ));
+    }
+
+    if let Some(page) =
+        parse_project_view_page_request(&raw_filters, &state.relay_keypair.public_key())?
+    {
+        if state.config.relay_private_key.is_none() {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:project_view:stable_signer",
+            ));
+        }
+        let page = state
+            .db
+            .project_view_snapshot_page(
+                tenant.community(),
+                &state.relay_keypair.public_key(),
+                page.revision,
+                page.projection_generation,
+                page.after,
+                page.limit,
+            )
+            .await
+            .map_err(|error| match error {
+                buzz_db::project_view::ProjectViewReadError::Conflict => api_error(
+                    StatusCode::CONFLICT,
+                    "conflict:project_view:snapshot_changed",
+                ),
+                buzz_db::project_view::ProjectViewReadError::Database(_)
+                | buzz_db::project_view::ProjectViewReadError::Sqlx(_)
+                | buzz_db::project_view::ProjectViewReadError::Inconsistent(_) => {
+                    internal_error("Project View snapshot is unavailable")
+                }
+            })?;
+        let events = page
+            .events
+            .into_iter()
+            .map(|stored| serde_json::to_value(stored.event))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                internal_error(&format!("Project View snapshot serialization: {error}"))
+            })?;
+        return Ok(Json(Value::Array(events)));
+    }
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
@@ -1010,16 +1303,13 @@ async fn query_events_authed(
                 "mixed search and non-search filters not supported",
             ));
         }
-        return handle_bridge_search(
-            state,
-            &raw_filters,
-            &filters,
-            &accessible_channels,
-            tenant,
-            &authed_pubkey_hex,
-            &pubkey_bytes,
-        )
-        .await;
+        let reader = BridgeSearchReader {
+            accessible_channels: &accessible_channels,
+            pubkey_hex: &authed_pubkey_hex,
+            pubkey_bytes: &pubkey_bytes,
+            project_view_read_allowed,
+        };
+        return handle_bridge_search(state, &raw_filters, &filters, tenant, &reader).await;
     }
 
     if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await {
@@ -1229,6 +1519,7 @@ async fn query_events_authed(
         if crate::handlers::req::filter_can_match_persona_shared_kinds(filter) {
             query.persona_reader = Some(pubkey_bytes.clone());
         }
+        exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
 
         match extract_before_id(raw) {
             BeforeId::Malformed => {
@@ -1293,6 +1584,13 @@ async fn query_events_authed(
                     // shared-gate (kind:30175 without ["shared","true"]). Single call
                     // covers all three gated event classes.
                     if !crate::handlers::req::event_visible_to_reader(&se.event, &pubkey_bytes) {
+                        continue;
+                    }
+                    if !project_view_read_allowed
+                        && buzz_core::kind::is_project_view_protocol_kind(
+                            se.event.kind.as_u16() as u32
+                        )
+                    {
                         continue;
                     }
                     if let Ok(v) = serde_json::to_value(&se.event) {
@@ -1390,16 +1688,61 @@ async fn count_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    super::relay_members::enforce_relay_membership(
+    let nip_oa_owner = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
     )
-    .await?;
+    .await?
+    .or_else(|| {
+        if !state.config.require_relay_membership {
+            super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+        } else {
+            None
+        }
+    });
+    if let Some(owner) = nip_oa_owner {
+        super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
+    }
 
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    let project_view_can_match = filters
+        .iter()
+        .any(crate::handlers::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(crate::handlers::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match {
+        state
+            .db
+            .project_view_authorized_pubkey(tenant.community(), &pubkey_bytes)
+            .await
+            .map_err(|error| {
+                internal_error(&format!("Project View authorization lookup: {error}"))
+            })?
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: Project View requires current Community membership",
+        ));
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::project_view::filter_is_project_view_search)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_view:search",
+        ));
+    }
 
     // P-gated kinds enforcement — same as WS REQ and /query.
     let authed_pubkey_hex = pubkey.to_hex();
@@ -1460,6 +1803,7 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
             // Persona visibility pushdown: same as REQ and /query paths, so the
             // fallback's query_events call doesn't over-fetch private persona rows.
             if needs_persona_filtering {
@@ -1506,6 +1850,13 @@ async fn count_events_authed(
                             ) {
                                 continue;
                             }
+                            if !project_view_read_allowed
+                                && buzz_core::kind::is_project_view_protocol_kind(
+                                    se.event.kind.as_u16() as u32,
+                                )
+                            {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -1524,6 +1875,7 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
             query.channel_ids = Some(accessible_channels.to_vec());
             // Persona visibility pushdown: pre-filter before ORDER/LIMIT on the
             // fallback query_events path.
@@ -1570,6 +1922,13 @@ async fn count_events_authed(
                                 &se.event,
                                 &pubkey_bytes,
                             ) {
+                                continue;
+                            }
+                            if !project_view_read_allowed
+                                && buzz_core::kind::is_project_view_protocol_kind(
+                                    se.event.kind.as_u16() as u32,
+                                )
+                            {
                                 continue;
                             }
                             total += 1;
@@ -1622,22 +1981,27 @@ fn search_hit_accepted(
     true
 }
 
+struct BridgeSearchReader<'a> {
+    accessible_channels: &'a [uuid::Uuid],
+    pubkey_hex: &'a str,
+    pubkey_bytes: &'a [u8],
+    project_view_read_allowed: bool,
+}
+
 /// Handle search filters by routing to Postgres FTS, then fetching full events
 /// from DB. Supports a bridge-only `page` extension over the FTS result set.
 async fn handle_bridge_search(
     state: &AppState,
     raw_filters: &[Value],
     filters: &[nostr::Filter],
-    accessible_channels: &[uuid::Uuid],
     tenant: &buzz_core::tenant::TenantContext,
-    reader_pubkey_hex: &str,
-    pubkey_bytes: &[u8],
+    reader: &BridgeSearchReader<'_>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Bridge always includes global (channel-less) events — same as WS with
     // full scopes. `None` means no accessible channels and no global access →
     // empty result set (the caller short-circuits exactly as the WS door EOSEs).
     let channel_scope = match crate::handlers::req::build_search_channel_scope_filter(
-        accessible_channels,
+        reader.accessible_channels,
         true, // include_global
     ) {
         Some(scope) => scope,
@@ -1668,7 +2032,7 @@ async fn handle_bridge_search(
                 let valid: Vec<uuid::Uuid> = vs
                     .iter()
                     .filter_map(|v| v.parse::<uuid::Uuid>().ok())
-                    .filter(|id| accessible_channels.contains(id))
+                    .filter(|id| reader.accessible_channels.contains(id))
                     .collect();
                 if valid.is_empty() {
                     continue; // All #h values inaccessible — skip filter.
@@ -1740,7 +2104,12 @@ async fn handle_bridge_search(
                 Some(ev) => ev,
                 None => continue,
             };
-            if !search_hit_accepted(filter, stored, accessible_channels, reader_pubkey_hex) {
+            if !search_hit_accepted(
+                filter,
+                stored,
+                reader.accessible_channels,
+                reader.pubkey_hex,
+            ) {
                 continue;
             }
             // Defense-in-depth: apply the full per-event visibility gate, which
@@ -1750,7 +2119,12 @@ async fn handle_bridge_search(
             // branch cannot currently return unshared persona content — but the
             // check here ensures that a future FTS allowlist change cannot silently
             // reopen the bypass.
-            if !crate::handlers::req::event_visible_to_reader(&stored.event, pubkey_bytes) {
+            if !crate::handlers::req::event_visible_to_reader(&stored.event, reader.pubkey_bytes) {
+                continue;
+            }
+            if !reader.project_view_read_allowed
+                && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
+            {
                 continue;
             }
             // Dedup across filters.

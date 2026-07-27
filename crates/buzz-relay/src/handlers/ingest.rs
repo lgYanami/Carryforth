@@ -12,27 +12,28 @@ use uuid::Uuid;
 use buzz_auth::Scope;
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
-    is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
-    KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
-    KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
-    KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT,
-    KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-    KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE,
-    KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
-    KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
-    KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_REPORT,
-    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
-    KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
-    KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
-    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    is_project_view_mutation_kind, is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE,
+    KIND_AGENT_TURN_METRIC, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST,
+    KIND_BOOKMARK_SET, KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
+    KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
+    KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
+    KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+    KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES,
+    KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED,
+    KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
+    KIND_PRESENCE_UPDATE, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT_VIEW_MUTATION,
+    KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
+    KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
     RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
@@ -179,6 +180,12 @@ pub enum IngestError {
     Rejected(String),
     /// Auth/scope error — WS: OK false, HTTP: 401/403.
     AuthFailed(String),
+    /// Optimistic-concurrency/state conflict — WS: OK false, HTTP: 409.
+    Conflict(String),
+    /// Known protocol feature/version is unsupported — WS: OK false, HTTP: 400.
+    Unsupported(String),
+    /// Project View is configured but not currently ready — WS: OK false, HTTP: 503.
+    Unavailable(String),
     /// Server error — WS: OK false, HTTP: 500.
     Internal(String),
 }
@@ -205,7 +212,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
             Ok(Scope::UsersWrite)
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
-        KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
+        KIND_AGENT_TURN_METRIC | KIND_PROJECT_VIEW_MUTATION => Ok(Scope::MessagesWrite),
         // NIP-56 reports are ordinary member writes into the mod-only queue.
         // Ingest persists them to `moderation_reports` and suppresses public
         // storage/fanout; reports are signals, never enforcement triggers.
@@ -446,6 +453,9 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // NIP-AM: agent turn metrics are owner-scoped global events.
             // Channel identity is encrypted inside the payload — no `h` tag.
             | KIND_AGENT_TURN_METRIC
+            // Project View commands are Community-global and intentionally
+            // forbid any client-selected `h` scope.
+            | KIND_PROJECT_VIEW_MUTATION
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
     )
@@ -1557,7 +1567,7 @@ async fn ingest_event_inner(
 
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
-    if buzz_core::kind::is_command_kind(kind_u32) {
+    if buzz_core::kind::is_command_kind(kind_u32) && !is_project_view_mutation_kind(kind_u32) {
         return super::command_executor::handle_command(tenant, state, event, auth).await;
     }
 
@@ -1752,6 +1762,20 @@ async fn ingest_event_inner(
         return Err(IngestError::AuthFailed(
             "restricted: channel-scoped tokens cannot publish global events".into(),
         ));
+    }
+
+    if is_project_view_mutation_kind(kind_u32) {
+        let project_view_event_id = event.id.to_bytes();
+        let result = super::project_view::handle_mutation(tenant, state, event, &auth).await?;
+        emit(
+            tracer,
+            TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(&project_view_event_id),
+                claimed_community: None,
+            },
+            state_for_request(tenant, auth.pubkey()),
+        );
+        return Ok(result);
     }
 
     let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
