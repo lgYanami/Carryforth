@@ -10,7 +10,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_EVENT_REMINDER,
+    event_kind_i32, has_indexed_d_tag, is_ephemeral, KIND_AUTH, KIND_EVENT_REMINDER,
     KIND_HUDDLE_STARTED,
 };
 use buzz_core::{CommunityId, StoredEvent};
@@ -39,11 +39,12 @@ pub struct EventQuery {
     /// Restrict to events with a `p` tag mentioning this hex pubkey.
     /// Joins against `event_mentions` table (indexed).
     pub p_tag_hex: Option<String>,
-    /// Restrict to events with this exact `d_tag` value (NIP-33).
-    /// Pushed into SQL via the `idx_events_parameterized` index.
+    /// Restrict results to events with this exact indexed `d_tag` value.
+    /// Pushed into SQL before ordering and limiting.
     pub d_tag: Option<String>,
-    /// Restrict to events with any of these `d_tag` values (multi-value NIP-33 pushdown).
-    /// Used when a filter has multiple `#d` values and targets only NIP-33 kinds.
+    /// Restrict results to events with any of these indexed `d_tag` values.
+    /// Used when a filter has multiple `#d` values and every requested kind
+    /// materializes its `d` tag.
     pub d_tags: Option<Vec<String>>,
     /// Composite keyset cursor: exclude events at or "after" this (created_at, id) pair.
     /// Used with `until` for stable pagination: events where
@@ -135,8 +136,10 @@ pub enum ReactionEventInsertOutcome {
     },
 }
 
-/// Maximum length for a `d_tag` value (bytes). NIP-33 d-tags are short identifiers;
-/// anything beyond this is either a bug or abuse.
+/// Maximum length for a materialized `d_tag` value (bytes).
+///
+/// NIP-33 identifiers and relay-managed Project View coordinates are both
+/// expected to remain short; anything beyond this is either a bug or abuse.
 pub const D_TAG_MAX_LEN: usize = 1024;
 
 /// Maximum huddle-start content bytes considered by the parent-link lookup.
@@ -151,12 +154,14 @@ const HUDDLE_LINK_CANDIDATE_LIMIT: i64 = 32;
 
 /// Extract the `d_tag` value for storage.
 ///
-/// For NIP-33 parameterized replaceable events (kind 30000–39999): returns the first
-/// `d` tag's value, or `""` if no `d` tag is present (per NIP-33 spec).
-/// For all other events: returns `None` (column stays NULL).
+/// For kinds classified by [`has_indexed_d_tag`], returns the first `d` tag's
+/// value. A missing value becomes `""`, as required for NIP-33; Project View's
+/// relay-owned projection builder separately requires exactly one non-empty
+/// protocol coordinate before storage. For all other events, returns `None`
+/// and the column stays `NULL`.
 pub fn extract_d_tag(event: &Event) -> Option<String> {
     let kind_u32 = event.kind.as_u16() as u32;
-    if !is_parameterized_replaceable(kind_u32) {
+    if !has_indexed_d_tag(kind_u32) {
         return None;
     }
     let val = event
@@ -1470,6 +1475,9 @@ pub async fn release_due_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_core::kind::{
+        KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION, KIND_PROJECT_VIEW_OBJECT,
+    };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
@@ -1856,6 +1864,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn indexed_d_tag_is_applied_before_project_view_point_read_limit() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let keys = Keys::generate();
+        let base = 1_800_100_000;
+        let target_coordinate = format!("project-view:{community_uuid}:issue:{}", Uuid::new_v4());
+
+        let target = EventBuilder::new(
+            Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16),
+            "target projection",
+        )
+        .tags(vec![
+            Tag::parse(["d", target_coordinate.as_str()]).expect("target d tag")
+        ])
+        .custom_created_at(nostr::Timestamp::from(base))
+        .sign_with_keys(&keys)
+        .expect("sign target projection");
+        insert_event(&pool, community, &target, None)
+            .await
+            .expect("insert target projection");
+
+        // Newer rows outnumber the point-read limit. If #d were left to a
+        // post-filter, the older target would disappear behind these rows.
+        for offset in 10..13 {
+            let coordinate = format!("project-view:{community_uuid}:issue:{}", Uuid::new_v4());
+            let event = EventBuilder::new(
+                Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16),
+                "newer projection",
+            )
+            .tags(vec![
+                Tag::parse(["d", coordinate.as_str()]).expect("distractor d tag")
+            ])
+            .custom_created_at(nostr::Timestamp::from(base + offset))
+            .sign_with_keys(&keys)
+            .expect("sign distractor projection");
+            insert_event(&pool, community, &event, None)
+                .await
+                .expect("insert distractor projection");
+        }
+
+        let events = query_events(
+            &pool,
+            &EventQuery {
+                kinds: Some(vec![KIND_PROJECT_VIEW_OBJECT as i32]),
+                d_tag: Some(target_coordinate),
+                limit: Some(1),
+                ..EventQuery::for_community(community)
+            },
+        )
+        .await
+        .expect("query Project View object by coordinate");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.id, target.id);
+    }
+
     fn make_text_event(content: &str) -> nostr::Event {
         let keys = Keys::generate();
         EventBuilder::new(Kind::Custom(9), content)
@@ -2168,6 +2235,33 @@ mod tests {
         let event =
             make_event_with_kind_and_tags(39000, vec![Tag::parse(["d", "group-id"]).unwrap()]);
         assert_eq!(extract_d_tag(&event), Some("group-id".to_string()));
+    }
+
+    #[test]
+    fn extract_d_tag_from_project_view_projection_kinds() {
+        let object_coordinate =
+            "project-view:00000000-0000-0000-0000-000000000001:issue:00000000-0000-4000-8000-000000000002";
+        let object = make_event_with_kind_and_tags(
+            KIND_PROJECT_VIEW_OBJECT as u16,
+            vec![Tag::parse(["d", object_coordinate]).unwrap()],
+        );
+        assert_eq!(extract_d_tag(&object), Some(object_coordinate.to_owned()));
+
+        let meta_coordinate = "project-view:00000000-0000-0000-0000-000000000001:meta";
+        let meta = make_event_with_kind_and_tags(
+            KIND_PROJECT_VIEW_META as u16,
+            vec![Tag::parse(["d", meta_coordinate]).unwrap()],
+        );
+        assert_eq!(extract_d_tag(&meta), Some(meta_coordinate.to_owned()));
+    }
+
+    #[test]
+    fn project_view_mutation_d_tag_is_not_materialized() {
+        let event = make_event_with_kind_and_tags(
+            KIND_PROJECT_VIEW_MUTATION as u16,
+            vec![Tag::parse(["d", "must-not-be-indexed"]).unwrap()],
+        );
+        assert_eq!(extract_d_tag(&event), None);
     }
 
     #[test]
