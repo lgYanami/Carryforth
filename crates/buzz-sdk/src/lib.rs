@@ -110,4 +110,7 @@ pub enum SdkError {
     /// Input failed validation (e.g. malformed pubkey).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A Relay-authored Project View projection failed strict verification.
+    #[error("invalid Project View projection: {0}")]
+    InvalidProjection(String),
 }

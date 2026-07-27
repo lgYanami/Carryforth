@@ -1129,10 +1129,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-view"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-project-view",
+ "chrono",
+ "hex",
  "nostr",
  "serde",
  "serde_json",

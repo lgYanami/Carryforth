@@ -889,6 +889,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",
  "bytes",

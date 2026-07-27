@@ -1,12 +1,14 @@
 //! Field, relation-shape, and whole-state validation.
 
+use std::collections::HashSet;
+
 use url::Url;
 use uuid::{Uuid, Variant};
 
 use crate::{
-    DomainError, DomainResult, LocatorType, ProjectViewEntry, ProjectViewObject,
-    ProjectViewObjectData, ProjectViewObjectType, ProjectViewState, ResourceLocator,
-    MAX_SAFE_REVISION,
+    DomainError, DomainResult, LocatorType, MutationRequest, Patch, ProjectViewEntry,
+    ProjectViewObject, ProjectViewObjectData, ProjectViewObjectType, ProjectViewState,
+    ResourceLocator, UpdateMutation, MAX_INITIAL_GOALS, MAX_SAFE_REVISION,
 };
 
 const SHORT_TEXT_MAX_BYTES: usize = 256;
@@ -23,6 +25,255 @@ pub(crate) fn validate_client_object_id(project_id: Uuid, object_id: Uuid) -> Do
         return Err(DomainError::InvalidObjectId { object_id });
     }
     Ok(())
+}
+
+pub(crate) fn validate_mutation_input(request: &MutationRequest) -> DomainResult<()> {
+    match request {
+        MutationRequest::Initialize(initialize) => {
+            if !(1..=MAX_INITIAL_GOALS).contains(&initialize.goals.len()) {
+                return Err(DomainError::InvalidInitialGoalCount {
+                    min: 1,
+                    max: MAX_INITIAL_GOALS,
+                    actual: initialize.goals.len(),
+                });
+            }
+            validate_data(&ProjectViewObjectData::ProjectProfile(
+                initialize.profile.clone(),
+            ))?;
+            let mut ids = HashSet::with_capacity(initialize.goals.len());
+            for goal in &initialize.goals {
+                validate_client_generated_id(goal.id)?;
+                if !ids.insert(goal.id) {
+                    return Err(DomainError::ObjectIdAlreadyUsed { object_id: goal.id });
+                }
+                validate_data(&ProjectViewObjectData::Goal(goal.clone().into_goal()))?;
+            }
+            Ok(())
+        }
+        MutationRequest::Create(create) => {
+            validate_client_generated_id(create.object.id())?;
+            let (object_id, data, relations) = create.object.clone().into_parts();
+            validate_data(&data)?;
+            validate_relation_shape(data.object_type(), &relations)?;
+            match &data {
+                ProjectViewObjectData::Issue(_)
+                    if relations
+                        .about
+                        .is_some_and(|reference| reference.object_id == object_id) =>
+                {
+                    return Err(DomainError::SelfReference {
+                        relation: "about",
+                        object_id,
+                    });
+                }
+                ProjectViewObjectData::Work(_) => {
+                    if let Some(reference) = relations.handles {
+                        validate_work_target(reference.object_type)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        MutationRequest::Update(update) => validate_update_input(update),
+        MutationRequest::Delete(delete) => {
+            if delete.object_type == ProjectViewObjectType::ProjectProfile {
+                return Err(DomainError::ProfileDeletionForbidden);
+            }
+            validate_client_generated_id(delete.object_id)
+        }
+    }
+}
+
+fn validate_client_generated_id(object_id: Uuid) -> DomainResult<()> {
+    if object_id.get_version_num() != 4 || object_id.get_variant() != Variant::RFC4122 {
+        return Err(DomainError::InvalidObjectId { object_id });
+    }
+    Ok(())
+}
+
+fn validate_update_input(update: &UpdateMutation) -> DomainResult<()> {
+    if update.object_type() != ProjectViewObjectType::ProjectProfile {
+        validate_client_generated_id(update.object_id())?;
+    }
+
+    let changed = match update {
+        UpdateMutation::ProjectProfile { patch, .. } => {
+            validate_short_patch(&patch.name, "name")?;
+            validate_long_patch(&patch.positioning, "positioning")?;
+            validate_long_patch(&patch.purpose, "purpose")?;
+            validate_long_patch(&patch.problem, "problem")?;
+            validate_long_patch(&patch.scope, "scope")?;
+            !patch.name.is_unchanged()
+                || !patch.positioning.is_unchanged()
+                || !patch.purpose.is_unchanged()
+                || !patch.problem.is_unchanged()
+                || !patch.scope.is_unchanged()
+        }
+        UpdateMutation::Goal { patch, .. } => {
+            validate_short_patch(&patch.title, "title")?;
+            validate_long_patch(&patch.desired_outcome, "desired_outcome")?;
+            validate_list_patch(&patch.directions, "directions")?;
+            !patch.title.is_unchanged()
+                || !patch.desired_outcome.is_unchanged()
+                || !patch.directions.is_unchanged()
+        }
+        UpdateMutation::Role { patch, .. } => {
+            validate_short_patch(&patch.name, "name")?;
+            validate_long_patch(&patch.purpose, "purpose")?;
+            validate_list_patch(&patch.responsibilities, "responsibilities")?;
+            validate_list_patch(&patch.boundaries, "boundaries")?;
+            validate_required_patch(&patch.active, "active")?;
+            !patch.name.is_unchanged()
+                || !patch.purpose.is_unchanged()
+                || !patch.responsibilities.is_unchanged()
+                || !patch.boundaries.is_unchanged()
+                || !patch.active.is_unchanged()
+        }
+        UpdateMutation::Plan { patch, .. } => {
+            validate_short_patch(&patch.title, "title")?;
+            validate_long_patch(&patch.description, "description")?;
+            validate_required_patch(&patch.status, "status")?;
+            !patch.title.is_unchanged()
+                || !patch.description.is_unchanged()
+                || !patch.status.is_unchanged()
+                || !patch.under_goal_id.is_unchanged()
+        }
+        UpdateMutation::Stage { patch, .. } => {
+            validate_short_patch(&patch.title, "title")?;
+            validate_long_patch(&patch.description, "description")?;
+            validate_required_patch(&patch.status, "status")?;
+            validate_required_relation_patch(&patch.under_plan_id, "under_plan_id")?;
+            !patch.title.is_unchanged()
+                || !patch.description.is_unchanged()
+                || !patch.status.is_unchanged()
+                || !patch.under_plan_id.is_unchanged()
+        }
+        UpdateMutation::Requirement { patch, .. } => {
+            validate_short_patch(&patch.title, "title")?;
+            validate_long_patch(&patch.description, "description")?;
+            validate_required_patch(&patch.status, "status")?;
+            validate_required_patch(&patch.priority, "priority")?;
+            !patch.title.is_unchanged()
+                || !patch.description.is_unchanged()
+                || !patch.status.is_unchanged()
+                || !patch.priority.is_unchanged()
+                || !patch.planned_in_stage_id.is_unchanged()
+        }
+        UpdateMutation::Issue {
+            object_id, patch, ..
+        } => {
+            validate_short_patch(&patch.title, "title")?;
+            validate_long_patch(&patch.description, "description")?;
+            validate_required_patch(&patch.status, "status")?;
+            validate_required_patch(&patch.priority, "priority")?;
+            if let Patch::Set(reference) = patch.about {
+                if reference.object_id == *object_id {
+                    return Err(DomainError::SelfReference {
+                        relation: "about",
+                        object_id: *object_id,
+                    });
+                }
+            }
+            !patch.title.is_unchanged()
+                || !patch.description.is_unchanged()
+                || !patch.status.is_unchanged()
+                || !patch.priority.is_unchanged()
+                || !patch.planned_in_stage_id.is_unchanged()
+                || !patch.about.is_unchanged()
+        }
+        UpdateMutation::Work { patch, .. } => {
+            validate_short_patch(&patch.title, "title")?;
+            validate_long_patch(&patch.description, "description")?;
+            validate_required_patch(&patch.status, "status")?;
+            validate_required_patch(&patch.priority, "priority")?;
+            validate_required_relation_patch(&patch.handles, "handles")?;
+            if let Patch::Set(reference) = patch.handles {
+                validate_work_target(reference.object_type)?;
+            }
+            !patch.title.is_unchanged()
+                || !patch.description.is_unchanged()
+                || !patch.status.is_unchanged()
+                || !patch.priority.is_unchanged()
+                || !patch.handles.is_unchanged()
+        }
+        UpdateMutation::Resource { patch, .. } => {
+            validate_short_patch(&patch.name, "name")?;
+            validate_required_patch(&patch.resource_type, "resource_type")?;
+            match &patch.locator {
+                Patch::Clear => {
+                    return Err(DomainError::RequiredField { field: "locator" });
+                }
+                Patch::Set(locator) => validate_locator(locator)?,
+                Patch::Unchanged => {}
+            }
+            validate_long_patch(&patch.description, "description")?;
+            !patch.name.is_unchanged()
+                || !patch.resource_type.is_unchanged()
+                || !patch.locator.is_unchanged()
+                || !patch.description.is_unchanged()
+        }
+    };
+
+    if changed {
+        Ok(())
+    } else {
+        Err(DomainError::NoChanges)
+    }
+}
+
+fn validate_short_patch(patch: &Patch<String>, field: &'static str) -> DomainResult<()> {
+    match patch {
+        Patch::Unchanged => Ok(()),
+        Patch::Clear => Err(DomainError::RequiredField { field }),
+        Patch::Set(value) => validate_required_short(field, value),
+    }
+}
+
+fn validate_long_patch(patch: &Patch<String>, field: &'static str) -> DomainResult<()> {
+    match patch {
+        Patch::Unchanged => Ok(()),
+        Patch::Clear => Err(DomainError::RequiredField { field }),
+        Patch::Set(value) => validate_required_long(field, value),
+    }
+}
+
+fn validate_list_patch(patch: &Patch<Vec<String>>, field: &'static str) -> DomainResult<()> {
+    match patch {
+        Patch::Unchanged => Ok(()),
+        Patch::Clear => Err(DomainError::RequiredField { field }),
+        Patch::Set(values) => validate_string_list(field, values),
+    }
+}
+
+fn validate_required_patch<T>(patch: &Patch<T>, field: &'static str) -> DomainResult<()> {
+    if patch.is_clear() {
+        Err(DomainError::RequiredField { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_required_relation_patch<T>(
+    patch: &Patch<T>,
+    relation: &'static str,
+) -> DomainResult<()> {
+    if patch.is_clear() {
+        Err(DomainError::MissingRequiredRelation { relation })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_work_target(actual: ProjectViewObjectType) -> DomainResult<()> {
+    if matches!(
+        actual,
+        ProjectViewObjectType::Requirement | ProjectViewObjectType::Issue
+    ) {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidWorkTarget { actual })
+    }
 }
 
 pub(crate) fn validate_object(object: &ProjectViewObject) -> DomainResult<()> {

@@ -1,5 +1,55 @@
 # Project View 变更记录
 
+## 2026-07-27 — Slice 4：Typed SDK 与 Agent CLI
+
+### SDK command 与 projection 契约
+
+- `buzz-sdk::project_view` 新增 `build_initialize`、`build_create`、`build_update`、
+  `build_delete`。Builder 只接受领域层 typed input，不接收 project/community ID，
+  并固定生成 `44300` 的精确 `-`、`t` tags。
+- 领域层新增不依赖当前服务端状态的 submission validation：在签名前检查 revision safe
+  range、UUID v4、初始 Goal 基数与去重、字符串/list/locator 限制、required-field
+  `null`、空 patch、Issue 自引用和 Work target 类型；Relay 仍在归约时重复校验当前状态、
+  CAS、对象存在性和关系目标。
+- 新增 `parse_meta_projection`、`parse_object_projection` 与
+  `verify_projection`。读取端验证事件签名、NIP-11 Relay signer、kind、精确 tag 顺序、
+  规范 UUID/hex/RFC3339/decimal、content/tag/coordinate 一致性、revision/generation
+  范围，以及 reset/source 和 active/tombstone 互斥；未知 projection 可选 content
+  字段保持向前兼容，tombstone 明确拒绝业务正文。
+
+### `buzz project-view` Agent 操作面
+
+- 新增 `get`、`get-object`、`init`、`create`、`update`、`delete` 六个子命令。
+  Profile、Goal、create data 与 update patch 均从 JSON file/stdin 进入 typed
+  deserialization；Create 的对象 UUID 在签名前由 CLI 生成，调用者不能覆盖
+  `id`/`object_type`。
+- 所有命令先读取 NIP-11 并要求 `buzz-project-view-v1` 与规范 `self` signer。Project
+  View mutation 使用 closed-tag 精确签名；NIP-OA 仍通过独立 `x-auth-tag` header
+  传递，不污染 mutation tags。网络重试复用同一 signed event bytes。
+- `get` 先验证 meta，再按 `(generation, revision)` 使用 `/query` 扩展分页读取 active
+  heads，检查排序、唯一 ID、数量、generation/revision 和全部 projection，最后重读
+  同一 meta 后才交给 `ProjectView::assemble`。并发变化触发有界重试，无法取得一致快照
+  时返回 conflict，不输出混合 revision。
+- `get-object` 使用规范 `d` coordinate、`limit:2` 和 Relay signer 做 point read，
+  同时支持 active object 与 tombstone。写命令保留调用者显式
+  `expected_project_revision`，成功后回读 meta/object 确认；HTTP `409` 映射
+  `CliError::Conflict` 与 exit code `5`。
+- 默认 `get` JSON 一次返回 project、Goals/Plans/Stages、未规划 Requirements/Issues、
+  Roles、Resources 和 Issue reverse references；未初始化状态明确输出
+  `initialized:false`、revision `0` 与空集合。全局 `--format compact` 保留同一逻辑
+  结构，但移除每个对象的 provenance/revision 冗余字段。
+
+### 验证
+
+- SDK 协议测试覆盖四类 mutation builder、projection round-trip、错误 signer、未知可选
+  字段和 tombstone 正文拒绝。
+- CLI HTTP integration test 使用真实 `BuzzClient` 与本地 Axum bridge，覆盖
+  meta → revision-pinned page → meta 的一致快照组装，以及 revision conflict 的进程
+  exit `5`；命令 inventory 与 typed input/null semantics 同步受单测保护。
+- `cargo clippy -p buzz-project-view -p buzz-sdk -p buzz-cli --all-targets -- -D warnings`
+  通过；`cargo test -p buzz-cli commands::project_view --lib` 9 项测试全部通过；
+  仓库级 `just ci` 全部通过。
+
 ## 2026-07-27 — Slice 3：Relay 原生协议接入
 
 ### 写入、签名与原子提交

@@ -230,12 +230,116 @@ enum Cmd {
     /// Agent engram management — persistent memory per NIP-AE
     #[command(subcommand)]
     Mem(MemCmd),
+    /// Read and mutate the Community's canonical Project View
+    #[command(subcommand, name = "project-view")]
+    ProjectView(ProjectViewCmd),
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+}
+
+/// Project View object type accepted by CLI commands.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProjectViewObjectTypeArg {
+    /// The unique project profile.
+    #[value(name = "project_profile")]
+    ProjectProfile,
+    /// A desired project outcome.
+    Goal,
+    /// A stable semantic responsibility.
+    Role,
+    /// A body of planning logic.
+    Plan,
+    /// A segment within a plan.
+    Stage,
+    /// Something the project intends to satisfy.
+    Requirement,
+    /// A discovered problem or gap.
+    Issue,
+    /// A unit of execution.
+    Work,
+    /// A stable project resource.
+    Resource,
+}
+
+impl From<ProjectViewObjectTypeArg> for buzz_project_view::ProjectViewObjectType {
+    fn from(value: ProjectViewObjectTypeArg) -> Self {
+        match value {
+            ProjectViewObjectTypeArg::ProjectProfile => Self::ProjectProfile,
+            ProjectViewObjectTypeArg::Goal => Self::Goal,
+            ProjectViewObjectTypeArg::Role => Self::Role,
+            ProjectViewObjectTypeArg::Plan => Self::Plan,
+            ProjectViewObjectTypeArg::Stage => Self::Stage,
+            ProjectViewObjectTypeArg::Requirement => Self::Requirement,
+            ProjectViewObjectTypeArg::Issue => Self::Issue,
+            ProjectViewObjectTypeArg::Work => Self::Work,
+            ProjectViewObjectTypeArg::Resource => Self::Resource,
+        }
+    }
+}
+
+/// Commands for the Community-global Project View.
+#[derive(Subcommand)]
+pub enum ProjectViewCmd {
+    /// Read and assemble one consistent logical Project View snapshot
+    Get,
+    /// Read one active object or tombstone by stable coordinate
+    GetObject {
+        /// Canonical Project View object type.
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Stable object UUID.
+        id: Uuid,
+    },
+    /// Atomically create the profile and initial goals
+    Init {
+        /// JSON file containing the Project Profile, or `-` for stdin.
+        #[arg(long)]
+        profile: String,
+        /// JSON file containing one initial Goal; repeat for multiple goals.
+        #[arg(long, required = true)]
+        goal: Vec<String>,
+    },
+    /// Create one typed object with a CLI-generated UUID v4
+    Create {
+        /// Object type to create (the project profile is not creatable here).
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Project revision on which this intent was based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// JSON file containing the typed object body and relations, or `-`.
+        #[arg(long)]
+        data: String,
+    },
+    /// Apply one closed, typed patch to an active object
+    Update {
+        /// Canonical Project View object type.
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Stable object UUID.
+        id: Uuid,
+        /// Project revision on which this intent was based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// JSON file containing the typed patch, or `-` for stdin.
+        #[arg(long)]
+        patch: String,
+    },
+    /// Tombstone one active object
+    Delete {
+        /// Canonical Project View object type.
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Stable object UUID.
+        id: Uuid,
+        /// Project revision on which this intent was based.
+        #[arg(long)]
+        expected_project_revision: u64,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1787,6 +1891,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
+        Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
@@ -1821,6 +1926,7 @@ mod tests {
             "pack",
             "patches",
             "pr",
+            "project-view",
             "reactions",
             "repos",
             "social",
@@ -1890,6 +1996,10 @@ mod tests {
                 "thread",
                 "vote"
             ]
+        );
+        assert_eq!(
+            names(&cmd, "project-view"),
+            vec!["create", "delete", "get", "get-object", "init", "update"]
         );
         assert_eq!(
             names(&cmd, "channels"),
@@ -2007,6 +2117,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
+            ("project-view", 6),
             ("reactions", 3),
             ("repos", 4),
             ("social", 7),

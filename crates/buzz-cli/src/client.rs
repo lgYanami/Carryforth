@@ -741,6 +741,15 @@ impl BuzzClient {
     /// silently drop the caller's owner attestation or double up an
     /// unrelated tag.
     pub fn sign_event_unchecked(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        self.sign_event_exact(builder)
+    }
+
+    /// Sign an event builder without adding a content-level `auth` tag.
+    ///
+    /// This is required by protocols whose outer tag sequence is closed, such
+    /// as Project View mutations. NIP-OA delegation is still sent separately
+    /// as the `x-auth-tag` HTTP header by [`submit_event`].
+    pub fn sign_event_exact(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
         builder
             .sign_with_keys(&self.keys)
             .map_err(|e| CliError::Other(format!("signing failed: {e}")))

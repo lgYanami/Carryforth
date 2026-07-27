@@ -75,6 +75,22 @@ impl Mutation {
         crate::validation::validate_revision(mutation.expected_project_revision)?;
         Ok(mutation)
     }
+
+    /// Validates mutation input that does not depend on current server state.
+    ///
+    /// Typed SDK builders use this to reject malformed fields before signing.
+    /// The Relay repeats these checks and additionally validates the current
+    /// revision, object existence, relation targets, and aggregate invariants.
+    pub fn validate_for_submission(&self) -> DomainResult<()> {
+        if self.schema_version != MUTATION_SCHEMA_VERSION {
+            return Err(DomainError::UnsupportedSchemaVersion {
+                got: u32::from(self.schema_version),
+                supported: u32::from(MUTATION_SCHEMA_VERSION),
+            });
+        }
+        crate::validation::validate_revision(self.expected_project_revision)?;
+        crate::validation::validate_mutation_input(&self.request)
+    }
 }
 
 fn json_depth(value: &Value) -> usize {

@@ -38,3 +38,12 @@ pub use state::{ProjectViewEntry, ProjectViewState, ProjectViewTombstone};
 pub const MAX_SAFE_REVISION: u64 = 9_007_199_254_740_991;
 /// Maximum number of goals accepted by Project View initialization.
 pub const MAX_INITIAL_GOALS: usize = 32;
+
+/// Validates one active projection object without requiring the rest of its
+/// project snapshot.
+///
+/// Cross-object relation targets and aggregate invariants are intentionally
+/// checked later by [`ProjectViewState::from_snapshot`].
+pub fn validate_projected_object(object: &ProjectViewObject) -> DomainResult<()> {
+    validation::validate_object(object)
+}
