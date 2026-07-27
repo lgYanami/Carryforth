@@ -1,6 +1,6 @@
 //! Command executor — transactional event processing for command kinds.
 //!
-//! Command kinds (41010–41012, 30620, 46020, 46030–46031) are processed
+//! Command kinds (41010–41012, 42100–42101, 30620, 46020, 46030–46031) are processed
 //! transactionally: validate → begin tx → insert event → execute mutations → commit.
 //!
 //! SECURITY: This module is only reachable AFTER the ingest pipeline has verified:
@@ -19,6 +19,10 @@ use uuid::Uuid;
 
 use buzz_core::kind::*;
 use buzz_core::tenant::{CommunityId, TenantContext};
+use buzz_core::StoredEvent;
+use buzz_db::meeting::{
+    CreateMeetingParams, EndMeetingOutcome, EndMeetingParams, MAX_MEETING_PARTICIPANTS,
+};
 use buzz_db::workflow::{ApprovalStatus, RunStatus};
 use buzz_db::DbError;
 use buzz_workflow::executor::TriggerContext;
@@ -26,6 +30,7 @@ use buzz_workflow::executor::TriggerContext;
 use crate::state::AppState;
 use crate::webhook_secret;
 
+use super::event::dispatch_persistent_event;
 use super::ingest::{extract_channel_id, IngestAuth, IngestError, IngestResult};
 use super::side_effects::{
     emit_group_discovery_events, emit_membership_notification, emit_system_message,
@@ -65,6 +70,8 @@ pub async fn handle_command(
         KIND_DM_OPEN => handle_dm_open(tenant, state, &event, &auth).await,
         KIND_DM_ADD_MEMBER => handle_dm_add_member(tenant, state, &event, &auth).await,
         KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
+        KIND_MEETING_CREATE => handle_meeting_create(tenant, state, &event, &auth).await,
+        KIND_MEETING_END => handle_meeting_end(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
@@ -91,12 +98,10 @@ enum PersistResult {
 /// If the event is a duplicate (ON CONFLICT DO NOTHING), the transaction is
 /// rolled back and `PersistResult::Duplicate` is returned — no mutations needed.
 ///
-/// NOTE: Domain mutations (open_dm, upsert_workflow, etc.) execute on the
-/// connection pool, NOT inside this transaction. The pattern is idempotent but
-/// not strictly atomic: if a mutation succeeds but commit fails, the mutation
-/// persists without the event record. On retry, the event INSERT succeeds
-/// (no conflict), and the mutation re-executes — which is safe for idempotent
-/// operations (open_dm, hide_dm, update_approval, upsert_workflow).
+/// Meeting create/end handlers execute their domain mutations through this
+/// returned transaction, so their event and lifecycle projection are atomic.
+/// Some older command handlers still execute idempotent mutations through the
+/// connection pool before committing this event guard.
 async fn persist_command_event(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -305,6 +310,355 @@ fn decode_pubkey(hex_str: &str) -> Result<Vec<u8>, IngestError> {
 /// Compute SHA-256 hash of a string, returning raw bytes.
 fn compute_definition_hash(json_str: &str) -> Vec<u8> {
     Sha256::digest(json_str.as_bytes()).to_vec()
+}
+
+async fn handle_meeting_create(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    if auth.channel_ids().is_some() {
+        return Err(IngestError::AuthFailed(
+            "restricted: meeting creation requires a global token".into(),
+        ));
+    }
+    if !event.content.is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: meeting create content must be empty".into(),
+        ));
+    }
+
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if session_id.is_nil() {
+        return Err(IngestError::Rejected(
+            "invalid: meeting session id must not be nil".into(),
+        ));
+    }
+    let title = require_single_tag(event, "name")?;
+    if buzz_core::channel::canonical_channel_name(&title)
+        .trim()
+        .is_empty()
+    {
+        return Err(IngestError::Rejected(
+            "invalid: meeting title is required".into(),
+        ));
+    }
+    if buzz_core::channel::canonical_channel_name(&title)
+        .chars()
+        .count()
+        > 255
+    {
+        return Err(IngestError::Rejected(
+            "invalid: meeting title exceeds 255 characters".into(),
+        ));
+    }
+    let version = require_single_tag(event, "v")?;
+    if version != "1" {
+        return Err(IngestError::Rejected(format!(
+            "invalid: unsupported meeting schema version {version}"
+        )));
+    }
+    let description = optional_single_tag(event, "about")?;
+    let source_channel_id = optional_single_tag(event, "source")?
+        .map(|source| {
+            Uuid::parse_str(&source)
+                .map_err(|_| IngestError::Rejected("invalid: bad source channel id".into()))
+        })
+        .transpose()?;
+    if source_channel_id == Some(session_id) {
+        return Err(IngestError::Rejected(
+            "invalid: meeting cannot use itself as its source channel".into(),
+        ));
+    }
+
+    let host_pubkey = auth.pubkey().to_bytes().to_vec();
+    let mut participant_pubkeys = Vec::with_capacity(MAX_MEETING_PARTICIPANTS);
+    participant_pubkeys.push(host_pubkey.clone());
+    for pubkey_hex in tag_values(event, "p") {
+        let pubkey = decode_pubkey(&pubkey_hex)?;
+        if pubkey == host_pubkey {
+            return Err(IngestError::Rejected(
+                "invalid: meeting create p tags must not repeat the event author".into(),
+            ));
+        }
+        if participant_pubkeys
+            .iter()
+            .any(|existing| existing == &pubkey)
+        {
+            return Err(IngestError::Rejected(format!(
+                "invalid: duplicate meeting participant {pubkey_hex}"
+            )));
+        }
+        participant_pubkeys.push(pubkey);
+    }
+    if !(2..=MAX_MEETING_PARTICIPANTS).contains(&participant_pubkeys.len()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: meeting requires 2-{MAX_MEETING_PARTICIPANTS} participants"
+        )));
+    }
+
+    let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    let (_, participants) = buzz_db::meeting::create_meeting_tx(
+        &mut tx,
+        CreateMeetingParams {
+            community_id: tenant.community(),
+            session_id,
+            title: &title,
+            description: description.as_deref(),
+            source_channel_id,
+            host_pubkey: &host_pubkey,
+            create_event_id: event.id.as_bytes(),
+            participant_pubkeys: &participant_pubkeys,
+        },
+    )
+    .await
+    .map_err(map_meeting_db_error)?;
+
+    tx.commit()
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: commit meeting create: {e}")))?;
+
+    metrics::counter!(
+        "buzz_channels_created_total",
+        "community" => tenant.host().to_owned(),
+        "type" => "meeting"
+    )
+    .increment(1);
+
+    for participant in &participants {
+        state.invalidate_membership(tenant, session_id, &participant.pubkey);
+    }
+
+    dispatch_meeting_command_event(tenant, state, event, session_id).await;
+
+    if let Err(error) = emit_group_discovery_events(tenant, state, session_id).await {
+        warn!(meeting = %session_id, "meeting create: discovery emission failed: {error}");
+    }
+    for participant in &participants {
+        if let Err(error) = emit_membership_notification(
+            tenant,
+            state,
+            session_id,
+            &participant.pubkey,
+            &host_pubkey,
+            KIND_MEMBER_ADDED_NOTIFICATION,
+        )
+        .await
+        {
+            warn!(
+                meeting = %session_id,
+                participant = %hex::encode(&participant.pubkey),
+                "meeting create: membership notification failed: {error}"
+            );
+        }
+    }
+
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "meeting_id": session_id.to_string(),
+                "room_kind": "meeting",
+                "status": "active",
+                "participant_count": participants.len(),
+            })
+        ),
+    })
+}
+
+async fn handle_meeting_end(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    if !event.content.is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: meeting end content must be empty".into(),
+        ));
+    }
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if auth
+        .channel_ids()
+        .is_some_and(|ids| !ids.contains(&session_id))
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: token not authorized for this meeting".into(),
+        ));
+    }
+    let create_event_id_hex = require_single_tag(event, "e")?;
+    let create_event_id = decode_event_id(&create_event_id_hex, "meeting create event id")?;
+    let reason = require_single_tag(event, "reason")?;
+    if reason != "manual" {
+        return Err(IngestError::Rejected(
+            "invalid: client meeting end reason must be manual".into(),
+        ));
+    }
+
+    let actor_pubkey = auth.pubkey().to_bytes().to_vec();
+    let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    let outcome = buzz_db::meeting::end_meeting_tx(
+        &mut tx,
+        EndMeetingParams {
+            community_id: tenant.community(),
+            session_id,
+            actor_pubkey: &actor_pubkey,
+            create_event_id: &create_event_id,
+            end_event_id: event.id.as_bytes(),
+        },
+    )
+    .await
+    .map_err(map_meeting_db_error)?;
+
+    if outcome == EndMeetingOutcome::AlreadyEnded {
+        tx.rollback()
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: rollback duplicate end: {e}")))?;
+        return Ok(IngestResult {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::json!({
+                    "meeting_id": session_id.to_string(),
+                    "status": "ended",
+                    "already_ended": true,
+                })
+            ),
+        });
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: commit meeting end: {e}")))?;
+
+    dispatch_meeting_command_event(tenant, state, event, session_id).await;
+    if let Err(error) = emit_group_discovery_events(tenant, state, session_id).await {
+        warn!(meeting = %session_id, "meeting end: discovery emission failed: {error}");
+    }
+
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "meeting_id": session_id.to_string(),
+                "status": "ended",
+                "already_ended": false,
+            })
+        ),
+    })
+}
+
+async fn dispatch_meeting_command_event(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    session_id: Uuid,
+) {
+    let stored = StoredEvent::with_received_at(event.clone(), Utc::now(), Some(session_id), true);
+    dispatch_persistent_event(
+        tenant,
+        state,
+        &stored,
+        event.kind.as_u16() as u32,
+        &event.pubkey.to_hex(),
+        None,
+    )
+    .await;
+}
+
+fn map_meeting_db_error(error: DbError) -> IngestError {
+    match error {
+        DbError::AccessDenied(_)
+        | DbError::InvalidData(_)
+        | DbError::NotFound(_)
+        | DbError::ChannelNotFound(_) => IngestError::Rejected(format!("invalid: {error}")),
+        other => IngestError::Internal(format!("error: meeting persistence: {other}")),
+    }
+}
+
+fn tag_values(event: &Event, tag_name: &str) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            if tag.kind().to_string() == tag_name {
+                tag.content().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn require_single_tag(event: &Event, tag_name: &str) -> Result<String, IngestError> {
+    let values = tag_values(event, tag_name);
+    match values.as_slice() {
+        [value] if !value.is_empty() => Ok(value.clone()),
+        [] => Err(IngestError::Rejected(format!(
+            "invalid: missing {tag_name} tag"
+        ))),
+        [_] => Err(IngestError::Rejected(format!(
+            "invalid: {tag_name} tag must not be empty"
+        ))),
+        _ => Err(IngestError::Rejected(format!(
+            "invalid: expected exactly one {tag_name} tag"
+        ))),
+    }
+}
+
+fn optional_single_tag(event: &Event, tag_name: &str) -> Result<Option<String>, IngestError> {
+    let values = tag_values(event, tag_name);
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.clone())),
+        _ => Err(IngestError::Rejected(format!(
+            "invalid: expected at most one {tag_name} tag"
+        ))),
+    }
+}
+
+fn parse_single_uuid_tag(
+    event: &Event,
+    tag_name: &str,
+    field_name: &str,
+) -> Result<Uuid, IngestError> {
+    let value = require_single_tag(event, tag_name)?;
+    Uuid::parse_str(&value).map_err(|_| IngestError::Rejected(format!("invalid: bad {field_name}")))
+}
+
+fn decode_event_id(value: &str, field_name: &str) -> Result<Vec<u8>, IngestError> {
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field_name} must be 64 hex characters"
+        )));
+    }
+    hex::decode(value).map_err(|_| IngestError::Rejected(format!("invalid: bad {field_name} hex")))
 }
 
 async fn handle_dm_open(

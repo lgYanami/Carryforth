@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 24);
+        assert_eq!(migrations.len(), 25);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -879,6 +879,18 @@ mod tests {
             .to_lowercase()
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
+
+        // Meeting V0 lifecycle projection is additive and keeps 0001
+        // checksum-stable for brownfield deployments.
+        // Version 25 is reserved by the independently developed Project View
+        // migration. Keeping Meeting V0 at 26 lets the two feature branches
+        // merge without reusing a migration version already applied elsewhere.
+        assert_eq!(migrations[24].version, 26);
+        let meeting_v0 = migrations[24].sql.as_str();
+        assert!(meeting_v0.contains("ADD COLUMN room_kind"));
+        assert!(meeting_v0.contains("CREATE TABLE meeting_sessions"));
+        assert!(meeting_v0.contains("PRIMARY KEY (community_id, session_id)"));
+        assert!(!migrations[0].sql.as_str().contains("meeting_sessions"));
     }
 
     #[test]

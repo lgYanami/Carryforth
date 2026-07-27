@@ -215,6 +215,14 @@ pub async fn validate_standard_deletion_event(
             .get_event_by_id_including_deleted(tenant.community(), &target_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+        if let Some(channel_id) = target_event.channel_id {
+            let channel = state.db.get_channel(tenant.community(), channel_id).await?;
+            if channel.room_kind == "meeting" {
+                return Err(anyhow::anyhow!(
+                    "meeting history cannot be deleted through generic event deletion"
+                ));
+            }
+        }
 
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
@@ -280,6 +288,33 @@ pub async fn validate_admin_event(
         .get_channel(tenant.community(), channel_id)
         .await
         .map_err(|_| anyhow::anyhow!("channel not found"))?;
+    if channel.room_kind == "meeting" {
+        match kind {
+            9000 | 9001 | 9021 | 9022 => {
+                return Err(anyhow::anyhow!("meeting participant roster is frozen"));
+            }
+            9005 => {
+                return Err(anyhow::anyhow!(
+                    "meeting history cannot be deleted through generic event deletion"
+                ));
+            }
+            9008 => {
+                return Err(anyhow::anyhow!(
+                    "meeting rooms can only end through kind 42101"
+                ));
+            }
+            9002 if event
+                .tags
+                .iter()
+                .any(|tag| tag.kind().to_string() == "archived") =>
+            {
+                return Err(anyhow::anyhow!(
+                    "meeting archive state can only change through kind 42101"
+                ));
+            }
+            _ => {}
+        }
+    }
     let is_unarchive_request = kind == 9002
         && event.tags.iter().any(|t| {
             let parts = t.as_slice();
@@ -1000,6 +1035,9 @@ pub async fn emit_group_discovery_events(
         tags.push(Tag::parse(["closed"])?);
         // Channel type tag so clients can distinguish stream/forum/dm without inference
         tags.push(Tag::parse(["t", &channel.channel_type])?);
+        // Stable domain purpose. Meeting clients must never infer identity from
+        // a title prefix or other free-form metadata.
+        tags.push(Tag::parse(["room_kind", &channel.room_kind])?);
         // Optional topic / purpose for richer client UX
         if let Some(ref topic) = channel.topic {
             if !topic.is_empty() {
@@ -2937,14 +2975,16 @@ pub async fn publish_nip43_member_removed(
     publish_nip43_delta(tenant, state, 8001, target_pubkey_hex, "member-removed").await
 }
 
-/// Reconcile channels that exist in the DB but don't have kind:39000 events.
+/// Reconcile channels missing any relay-authored NIP-29 discovery projection.
 ///
 /// This handles the case where channels were created via direct SQL inserts
-/// (e.g. test seed scripts) rather than through the Nostr event pipeline.
-/// Emits kind:39000 (metadata) and kind:39002 (members) for each channel
-/// that is missing its discovery events.
+/// (e.g. test seed scripts), or where the relay committed a channel and
+/// stopped between post-commit discovery emissions. Emits a fresh complete
+/// kind:39000/39001/39002 set whenever any member of the set is absent.
 ///
-/// Idempotent: checks for existing kind:39000 events before emitting.
+/// This startup scan is the durable recovery path for Meeting V0 discovery;
+/// membership notifications are useful wake-ups, never the sole source of
+/// truth.
 pub async fn reconcile_channel_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -2958,14 +2998,15 @@ pub async fn reconcile_channel_events(
 
     let mut reconciled = 0u32;
     for channel in &channels {
-        // Check if kind:39000 event already exists for this channel.
+        // A crash may leave only a prefix of the three discovery snapshots.
+        // Re-emit the complete replaceable set unless all three are present.
         let channel_id_str = channel.id.to_string();
         let existing = match state
             .db
             .query_events(&EventQuery {
-                kinds: Some(vec![39000]),
+                kinds: Some(vec![39000, 39001, 39002]),
                 d_tag: Some(channel_id_str.clone()),
-                limit: Some(1),
+                limit: Some(3),
                 ..EventQuery::for_community(tenant.community())
             })
             .await
@@ -2981,8 +3022,14 @@ pub async fn reconcile_channel_events(
             }
         };
 
-        if existing.is_empty() {
-            // No discovery event — emit one.
+        let existing_kinds: std::collections::HashSet<u32> = existing
+            .iter()
+            .map(|event| event.event.kind.as_u16() as u32)
+            .collect();
+        let discovery_complete = [39000, 39001, 39002]
+            .iter()
+            .all(|kind| existing_kinds.contains(kind));
+        if !discovery_complete {
             if let Err(e) = emit_group_discovery_events(tenant, state, channel.id).await {
                 tracing::warn!(
                     channel_id = %channel.id,

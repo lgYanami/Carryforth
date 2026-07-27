@@ -452,6 +452,16 @@ pub const KIND_DM_HIDE: u32 = 41012;
 /// A new direct-message conversation was created.
 pub const KIND_DM_CREATED: u32 = 41001;
 
+// Meeting protocol (42100–42199)
+/// Create a Meeting V0 session and its complete frozen participant roster.
+pub const KIND_MEETING_CREATE: u32 = 42100;
+/// End a Meeting V0 session and archive its backing channel.
+pub const KIND_MEETING_END: u32 = 42101;
+/// Apply for the current Meeting V0 speech round.
+pub const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
+/// Relay-signed authoritative Meeting V0 round/floor state.
+pub const KIND_MEETING_ROUND_STATE: u32 = 42103;
+
 // Agent job protocol (43000–43999)
 // Not using NIP-90 kinds (5000–6999) — Buzz requires auth chains (depth ≤ 3, breadth ≤ 10).
 /// An agent job was requested.
@@ -645,6 +655,10 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_DM_ADD_MEMBER,
     KIND_DM_HIDE,
     KIND_DM_CREATED,
+    KIND_MEETING_CREATE,
+    KIND_MEETING_END,
+    KIND_MEETING_FLOOR_CLAIM,
+    KIND_MEETING_ROUND_STATE,
     KIND_JOB_REQUEST,
     KIND_JOB_ACCEPTED,
     KIND_JOB_PROGRESS,
@@ -747,6 +761,8 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_DM_OPEN
             | KIND_DM_ADD_MEMBER
             | KIND_DM_HIDE
+            | KIND_MEETING_CREATE
+            | KIND_MEETING_END
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
@@ -764,6 +780,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            | KIND_MEETING_ROUND_STATE
     )
 }
 

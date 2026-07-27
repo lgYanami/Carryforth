@@ -182,6 +182,9 @@ enum Cmd {
     /// Create, configure, and manage channels
     #[command(subcommand)]
     Channels(ChannelsCmd),
+    /// Create, inspect, and end shared Meeting V0 rooms
+    #[command(subcommand)]
+    Meetings(MeetingsCmd),
     /// Get and set channel canvas documents
     #[command(subcommand)]
     Canvas(CanvasCmd),
@@ -672,6 +675,55 @@ pub enum ChannelsCmd {
         /// Policy: anyone | owner_only | nobody
         #[arg(long)]
         policy: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MeetingsCmd {
+    /// Create a private meeting with a frozen initial roster
+    #[command(
+        after_help = "Example:\n  buzz meetings create --title \"Design review\" --participant <PUBKEY> --participant <PUBKEY>"
+    )]
+    Create {
+        /// Meeting title
+        #[arg(long)]
+        title: String,
+        /// Optional meeting description
+        #[arg(long)]
+        description: Option<String>,
+        /// Optional source channel UUID; every participant must already be able to read it
+        #[arg(long)]
+        source: Option<String>,
+        /// Other participant pubkeys (repeat once per participant; the creator is implicit)
+        #[arg(long = "participant", required = true)]
+        participants: Vec<String>,
+    },
+    /// List meetings visible to the current identity
+    List {
+        /// Include meetings that have ended
+        #[arg(long, default_value_t = false)]
+        include_ended: bool,
+        /// Maximum number of meeting metadata events to scan
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+    },
+    /// Show one meeting's identity and lifecycle
+    Show {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// List the meeting's complete participant roster
+    Participants {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// End a meeting and make its room read-only
+    End {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
     },
 }
 
@@ -1771,6 +1823,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
+        Cmd::Meetings(sub) => commands::meetings::dispatch(sub, &client, &cli.format).await,
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,
         Cmd::Emoji(sub) => commands::emoji::dispatch(sub, &client).await,
@@ -1814,6 +1867,7 @@ mod tests {
             "feed",
             "issues",
             "media",
+            "meetings",
             "mem",
             "messages",
             "moderation",
@@ -1913,6 +1967,10 @@ mod tests {
             ]
         );
         assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
+        assert_eq!(
+            names(&cmd, "meetings"),
+            vec!["create", "end", "list", "participants", "show"]
+        );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
             names(&cmd, "emoji"),
@@ -2003,6 +2061,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
+            ("meetings", 5),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

@@ -10,9 +10,9 @@ use buzz_core::{
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_WORKFLOW_DEF,
-        KIND_WORKFLOW_TRIGGER,
+        KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+        KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT,
+        KIND_PRESENCE_UPDATE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1562,6 +1562,88 @@ pub fn build_dm_add_member(channel_id: Uuid, pubkey: &str) -> Result<EventBuilde
     Ok(EventBuilder::new(Kind::Custom(KIND_DM_ADD_MEMBER as u16), "").tags(tags))
 }
 
+/// Build a Meeting V0 create command (kind 42100).
+///
+/// `participant_pubkeys` contains every participant except the event author.
+/// The relay inserts the author into the complete frozen roster and validates
+/// all identities against the current community.
+pub fn build_meeting_create(
+    session_id: Uuid,
+    title: &str,
+    description: Option<&str>,
+    source_channel_id: Option<Uuid>,
+    participant_pubkeys: &[&str],
+) -> Result<EventBuilder, SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    let title = buzz_core::channel::canonical_channel_name(title);
+    if title.trim().is_empty() {
+        return Err(SdkError::InvalidInput("meeting title is required".into()));
+    }
+    if title.chars().count() > 255 {
+        return Err(SdkError::InvalidInput(
+            "meeting title exceeds 255 characters".into(),
+        ));
+    }
+    if participant_pubkeys.is_empty() || participant_pubkeys.len() > 11 {
+        return Err(SdkError::InvalidInput(
+            "meeting create requires 1-11 other participant pubkeys".into(),
+        ));
+    }
+
+    let mut tags = vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["name", title])?,
+        tag(&["v", "1"])?,
+    ];
+    if let Some(description) = description {
+        tags.push(tag(&["about", description])?);
+    }
+    if let Some(source_channel_id) = source_channel_id {
+        if source_channel_id.is_nil() {
+            return Err(SdkError::InvalidInput(
+                "source channel id must not be nil".into(),
+            ));
+        }
+        tags.push(tag(&["source", &source_channel_id.to_string()])?);
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(participant_pubkeys.len());
+    for pubkey in participant_pubkeys {
+        let normalized = check_pubkey_hex(pubkey, "participant pubkey")?;
+        if !seen.insert(normalized.clone()) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate meeting participant: {normalized}"
+            )));
+        }
+        tags.push(tag(&["p", &normalized])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), "").tags(tags))
+}
+
+/// Build a Meeting V0 end command (kind 42101).
+pub fn build_meeting_end(
+    session_id: Uuid,
+    create_event_id: &str,
+) -> Result<EventBuilder, SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    let create_event_id = check_hex_exact(create_event_id, 64, "meeting create event id")?;
+    let tags = vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["e", &create_event_id])?,
+        tag(&["reason", "manual"])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), "").tags(tags))
+}
+
 /// Build a presence update event (kind 20001).
 ///
 /// `status` must be one of: `"online"`, `"away"`, `"offline"`.
@@ -2610,6 +2692,54 @@ mod tests {
             .sign_with_keys(&keys())
             .unwrap();
         assert_eq!(extract_channel_id(&ev), None);
+    }
+
+    #[test]
+    fn meeting_create_emits_versioned_frozen_roster_shape() {
+        let session_id = uuid();
+        let participant_a = "11".repeat(32);
+        let participant_b = "22".repeat(32);
+        let source_id = uuid();
+        let event = sign(
+            build_meeting_create(
+                session_id,
+                "# Design review",
+                Some("Stage one"),
+                Some(source_id),
+                &[&participant_a, &participant_b],
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(event.kind.as_u16(), KIND_MEETING_CREATE as u16);
+        assert!(has_tag(&event, "h", &session_id.to_string()));
+        assert!(has_tag(&event, "name", "Design review"));
+        assert!(has_tag(&event, "about", "Stage one"));
+        assert!(has_tag(&event, "source", &source_id.to_string()));
+        assert!(has_tag(&event, "v", "1"));
+        assert_eq!(tag_values(&event, "p"), vec![participant_a, participant_b]);
+    }
+
+    #[test]
+    fn meeting_create_rejects_duplicate_or_empty_rosters() {
+        let participant = "11".repeat(32);
+        assert!(build_meeting_create(uuid(), "review", None, None, &[]).is_err());
+        assert!(
+            build_meeting_create(uuid(), "review", None, None, &[&participant, &participant])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn meeting_end_references_create_event_and_manual_reason() {
+        let session_id = uuid();
+        let create_event_id = "ab".repeat(32);
+        let event = sign(build_meeting_end(session_id, &create_event_id).unwrap());
+
+        assert_eq!(event.kind.as_u16(), KIND_MEETING_END as u16);
+        assert!(has_tag(&event, "h", &session_id.to_string()));
+        assert!(has_tag(&event, "e", &create_event_id));
+        assert!(has_tag(&event, "reason", "manual"));
     }
 
     #[test]
