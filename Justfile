@@ -288,6 +288,9 @@ test-unit:
         # replay — so it belongs in the unit job. Run all targets (lib + the
         # tests/replay_fixtures.rs integration test), not just --lib.
         cargo nextest run -p buzz-conformance
+        # Project View is a pure domain state machine; run its contract and
+        # property tests in the infra-free unit gate.
+        cargo nextest run -p buzz-project-view
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway

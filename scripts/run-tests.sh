@@ -98,6 +98,9 @@ run_unit_tests() {
   run_test_step "buzz-conformance tests" \
     cargo test -p buzz-conformance -- --nocapture
 
+  run_test_step "buzz-project-view tests" \
+    cargo test -p buzz-project-view -- --nocapture
+
   run_test_step "buzz-push-gateway tests" \
     cargo test -p buzz-push-gateway -- --nocapture
 }

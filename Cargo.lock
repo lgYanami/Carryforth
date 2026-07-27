@@ -1064,6 +1064,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-view"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-pubsub"
 version = "0.1.0"
 dependencies = [
