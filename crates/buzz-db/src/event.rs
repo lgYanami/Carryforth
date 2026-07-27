@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use nostr::Event;
-use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use buzz_core::kind::{
@@ -264,6 +264,33 @@ pub async fn insert_event(
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
+    insert_event_with_executor(pool, community_id, event, channel_id).await
+}
+
+/// Insert an event using a caller-owned transaction.
+///
+/// Project View uses this helper to commit its accepted command, canonical
+/// state, idempotency receipt, and relay-signed projections atomically. It is
+/// crate-private so ordinary callers cannot accidentally hold open an event
+/// transaction across unrelated work.
+pub(crate) async fn insert_event_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event: &Event,
+    channel_id: Option<Uuid>,
+) -> Result<(StoredEvent, bool)> {
+    insert_event_with_executor(&mut **tx, community_id, event, channel_id).await
+}
+
+async fn insert_event_with_executor<'executor, E>(
+    executor: E,
+    community_id: CommunityId,
+    event: &Event,
+    channel_id: Option<Uuid>,
+) -> Result<(StoredEvent, bool)>
+where
+    E: Executor<'executor, Database = Postgres>,
+{
     let kind_u16 = event.kind.as_u16();
     let kind_u32 = u32::from(kind_u16);
 
@@ -305,7 +332,7 @@ pub async fn insert_event(
     .bind(channel_id)
     .bind(d_tag.as_deref())
     .bind(not_before)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     let was_inserted = result.rows_affected() > 0;
@@ -314,6 +341,33 @@ pub async fn insert_event(
         StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
         was_inserted,
     ))
+}
+
+/// Soft-retire one exact relay-owned projection head in a caller transaction.
+///
+/// Project View replacement is keyed by its canonical object/state pointer,
+/// not by NIP-33 timestamp ordering. The exact event ID therefore comes from
+/// `project_view_objects` or `project_view_state`.
+pub(crate) async fn retire_projection_head_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event_id: &[u8],
+    expected_kind: u32,
+) -> Result<bool> {
+    let expected_kind = i32::try_from(expected_kind).map_err(|_| {
+        DbError::InvalidData("projection kind does not fit PostgreSQL INT".to_owned())
+    })?;
+    let result = sqlx::query(
+        "UPDATE events SET deleted_at = clock_timestamp() \
+         WHERE community_id = $1 AND id = $2 AND kind = $3 AND deleted_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event_id)
+    .bind(expected_kind)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 /// Query events with optional filters. Results ordered by `created_at DESC`.

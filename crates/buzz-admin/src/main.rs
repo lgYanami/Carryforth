@@ -20,6 +20,8 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod project_view;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -80,6 +82,11 @@ enum Command {
     ProductFeedback {
         #[command(subcommand)]
         command: ProductFeedbackCommand,
+    },
+    /// Inspect or change the centralized Project View feature gate.
+    ProjectView {
+        #[command(subcommand)]
+        command: project_view::ProjectViewCommand,
     },
     /// Emit kind:39000/39002 events for channels missing them.
     ///
@@ -148,6 +155,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::ProductFeedback {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
+        Command::ProjectView { command } => project_view::run(command).await,
         Command::ReconcileChannels { relay_key } => {
             reconcile_channels(relay_key).await?;
             Ok(0)
@@ -417,7 +425,7 @@ async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
     Ok((db, pubsub, relay_keypair))
 }
 
-async fn connect_db() -> Result<Db> {
+pub(crate) async fn connect_db() -> Result<Db> {
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
     let db = Db::new(&DbConfig {
