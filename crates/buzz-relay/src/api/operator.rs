@@ -426,6 +426,12 @@ pub async fn transfer_community(
                 "limit_reached: transferee already owns the maximum number of communities",
             ));
         }
+        buzz_db::relay_members::TransferResult::ManagedAgentIneligible => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "forbidden:managed_agent:owner_ineligible",
+            ));
+        }
     };
 
     // Best-effort NIP-43 membership snapshot publication — same pattern as

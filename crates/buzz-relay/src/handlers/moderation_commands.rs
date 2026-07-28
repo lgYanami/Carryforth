@@ -174,7 +174,10 @@ async fn handle_ban(
             expires_at,
         )
         .await
-        .map_err(|e| error(format!("database error: {e}")))?;
+        .map_err(|database_error| match database_error {
+            buzz_db::DbError::AccessDenied(message) => format!("restricted: {message}"),
+            other => error(format!("database error: {other}")),
+        })?;
 
     let action_id = insert_audit(
         state,

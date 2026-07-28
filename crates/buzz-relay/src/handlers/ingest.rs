@@ -1928,6 +1928,16 @@ async fn ingest_event_inner(
                     "unexpected RoleMismatch from remove_relay_member".into(),
                 ));
             }
+            buzz_db::relay_members::RemoveResult::AssignmentActive => {
+                return Err(IngestError::Rejected(
+                    "forbidden:membership:assignment_active".into(),
+                ));
+            }
+            buzz_db::relay_members::RemoveResult::ManagedAgentAssignmentActive => {
+                return Err(IngestError::Rejected(
+                    "forbidden:membership:managed_agent_assignment_active".into(),
+                ));
+            }
         }
 
         // Publish NIP-43 announcements — fire-and-forget.

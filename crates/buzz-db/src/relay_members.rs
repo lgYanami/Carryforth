@@ -7,10 +7,314 @@
 //! lowercase hex strings.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row as _};
+use sqlx::{PgPool, Postgres, Row as _, Transaction};
 
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::CommunityId;
+
+/// Acquire the exclusive Community/Project lock used by every membership
+/// writer.
+pub(crate) async fn acquire_membership_write_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+) -> Result<()> {
+    crate::community_lock::acquire(tx, community, false).await?;
+    Ok(())
+}
+
+async fn begin_membership_write(
+    pool: &PgPool,
+    community: CommunityId,
+) -> Result<Transaction<'_, Postgres>> {
+    let mut tx = pool.begin().await?;
+    acquire_membership_write_lock(&mut tx, community).await?;
+    Ok(tx)
+}
+
+pub(crate) async fn project_view_schema_version_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+) -> Result<i16> {
+    let column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_attribute \
+             WHERE attrelid = 'communities'::regclass \
+               AND attname = 'project_view_schema_version' \
+               AND NOT attisdropped \
+         )",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !column_exists {
+        return Ok(1);
+    }
+    // The caller already holds the Community/Project advisory lock. Taking a
+    // row-level UPDATE lock here would unnecessarily block unrelated event
+    // inserts whose Community foreign key needs a KEY SHARE lock.
+    sqlx::query_scalar("SELECT project_view_schema_version FROM communities WHERE id = $1")
+        .bind(community.as_uuid())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("community {community}")))
+}
+
+/// Return one Community's Project View schema version.
+///
+/// Before migration 0026 exists, the established schema is v1. This fallback
+/// keeps server-first rollouts and migration-disabled deployments compatible.
+pub async fn project_view_schema_version(pool: &PgPool, community: CommunityId) -> Result<i16> {
+    let column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_attribute \
+             WHERE attrelid = 'communities'::regclass \
+               AND attname = 'project_view_schema_version' \
+               AND NOT attisdropped \
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !column_exists {
+        return Ok(1);
+    }
+    sqlx::query_scalar("SELECT project_view_schema_version FROM communities WHERE id = $1")
+        .bind(community.as_uuid())
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("community {community}")))
+}
+
+async fn is_v2_in_tx(tx: &mut Transaction<'_, Postgres>, community: CommunityId) -> Result<bool> {
+    Ok(project_view_schema_version_in_tx(tx, community).await? == 2)
+}
+
+fn v2_membership_coordinator_unavailable() -> DbError {
+    DbError::AccessDenied("unavailable:project_view_v2:membership_coordinator".to_owned())
+}
+
+pub(crate) async fn insert_relay_member_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    pubkey: &str,
+    role: &str,
+    added_by: Option<&str>,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, pubkey) DO NOTHING",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .bind(role)
+    .bind(added_by)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub(crate) async fn has_active_assignment_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM project_role_assignments \
+             WHERE community_id = $1 AND member_pubkey = $2 AND ended_at IS NULL \
+         )",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+pub(crate) async fn has_owned_managed_agent_assignment_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    owner_pubkey: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 \
+             FROM users agent \
+             JOIN project_role_assignments assignment \
+               ON assignment.community_id = agent.community_id \
+              AND assignment.member_pubkey = encode(agent.pubkey, 'hex') \
+              AND assignment.ended_at IS NULL \
+             WHERE agent.community_id = $1 \
+               AND encode(agent.agent_owner_pubkey, 'hex') = $2 \
+         )",
+    )
+    .bind(community.as_uuid())
+    .bind(owner_pubkey)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// Derive the non-owner Community level implied by a Member's active Role
+/// Assignment inside an already locked membership transaction.
+///
+/// The v2 coordinator uses this when an owner is transferred or an Assignment
+/// ends; Community `owner` itself remains an out-of-band governance root.
+pub async fn assignment_derived_member_role_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<String> {
+    sqlx::query_scalar(
+        "SELECT CASE WHEN EXISTS ( \
+             SELECT 1 \
+             FROM project_role_assignments assignment \
+             JOIN project_view_objects role_object \
+               ON role_object.community_id = assignment.community_id \
+              AND role_object.object_id = assignment.role_id \
+             WHERE assignment.community_id = $1 \
+               AND assignment.member_pubkey = $2 \
+               AND assignment.ended_at IS NULL \
+               AND role_object.role_level = 'admin' \
+         ) THEN 'admin' ELSE 'member' END",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(DbError::from)
+}
+
+async fn known_managed_agent_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM users \
+             WHERE community_id = $1 \
+               AND encode(pubkey, 'hex') = $2 \
+               AND agent_owner_pubkey IS NOT NULL \
+         )",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// One atomic Relay-membership view of a principal.
+///
+/// For a known managed Agent, `managed_owner_eligible` includes both
+/// principals' persistent-ban state, the owner's current Community
+/// membership, and the requirement that the owner is not itself a managed
+/// Agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayMembershipIdentity {
+    /// Whether the principal has a direct `relay_members` row.
+    pub direct_member: bool,
+    /// Persisted owner of a known managed Agent.
+    pub managed_owner_pubkey: Option<Vec<u8>>,
+    /// Whether the managed Agent and owner currently satisfy the complete
+    /// owner-backed membership rule.
+    pub managed_owner_eligible: bool,
+}
+
+/// Resolve one principal's direct and managed-Agent membership state in one
+/// database snapshot.
+pub async fn relay_membership_identity(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<RelayMembershipIdentity> {
+    let (direct_member, managed_owner_pubkey, managed_owner_eligible): (
+        bool,
+        Option<Vec<u8>>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT \
+             EXISTS ( \
+                 SELECT 1 FROM relay_members direct_member \
+                 WHERE direct_member.community_id = $1 \
+                   AND direct_member.pubkey = encode($2::bytea, 'hex') \
+             ), \
+             agent.agent_owner_pubkey, \
+             COALESCE( \
+                 agent.agent_owner_pubkey IS NOT NULL \
+                 AND EXISTS ( \
+                     SELECT 1 FROM relay_members owner_member \
+                     WHERE owner_member.community_id = $1 \
+                       AND owner_member.pubkey = encode(agent.agent_owner_pubkey, 'hex') \
+                 ) \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM users owner_actor \
+                     WHERE owner_actor.community_id = $1 \
+                       AND owner_actor.pubkey = agent.agent_owner_pubkey \
+                       AND owner_actor.agent_owner_pubkey IS NOT NULL \
+                 ) \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM community_bans restriction \
+                     WHERE restriction.community_id = $1 \
+                       AND restriction.pubkey IN (agent.pubkey, agent.agent_owner_pubkey) \
+                       AND restriction.banned \
+                       AND ( \
+                           restriction.ban_expires_at IS NULL \
+                           OR restriction.ban_expires_at > clock_timestamp() \
+                       ) \
+                 ), \
+                 FALSE \
+             ) \
+         FROM (VALUES (1)) AS singleton(dummy) \
+         LEFT JOIN users agent \
+           ON agent.community_id = $1 AND agent.pubkey = $2",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_one(pool)
+    .await?;
+    Ok(RelayMembershipIdentity {
+        direct_member,
+        managed_owner_pubkey,
+        managed_owner_eligible,
+    })
+}
+
+/// Check a self-proving NIP-OA Agent/owner pair against the same eligibility
+/// rule used for a persisted managed Agent.
+pub async fn delegated_agent_owner_is_eligible(
+    pool: &PgPool,
+    community: CommunityId,
+    agent_pubkey: &[u8],
+    owner_pubkey: &[u8],
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT \
+             EXISTS ( \
+                 SELECT 1 FROM relay_members owner_member \
+                 WHERE owner_member.community_id = $1 \
+                   AND owner_member.pubkey = encode($3::bytea, 'hex') \
+             ) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM users owner_actor \
+                 WHERE owner_actor.community_id = $1 \
+                   AND owner_actor.pubkey = $3 \
+                   AND owner_actor.agent_owner_pubkey IS NOT NULL \
+             ) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM community_bans restriction \
+                 WHERE restriction.community_id = $1 \
+                   AND restriction.pubkey IN ($2, $3) \
+                   AND restriction.banned \
+                   AND ( \
+                       restriction.ban_expires_at IS NULL \
+                       OR restriction.ban_expires_at > clock_timestamp() \
+                   ) \
+             )",
+    )
+    .bind(community.as_uuid())
+    .bind(agent_pubkey)
+    .bind(owner_pubkey)
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::from)
+}
 
 /// A single relay member record.
 #[derive(Debug, Clone)]
@@ -101,17 +405,18 @@ pub async fn add_relay_member(
     role: &str,
     added_by: Option<&str>,
 ) -> Result<bool> {
-    let result = sqlx::query(
-        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, pubkey) DO NOTHING",
-    )
-    .bind(community.as_uuid())
-    .bind(pubkey)
-    .bind(role)
-    .bind(added_by)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    let mut tx = begin_membership_write(pool, community).await?;
+    if is_v2_in_tx(&mut tx, community).await? {
+        if matches!(role, "admin" | "owner") {
+            return Err(DbError::AccessDenied(
+                "forbidden:membership:role_requires_governance".to_owned(),
+            ));
+        }
+        return Err(v2_membership_coordinator_unavailable());
+    }
+    let inserted = insert_relay_member_in_tx(&mut tx, community, pubkey, role, added_by).await?;
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 /// Claims relay membership via an invite and atomically persists policy evidence.
@@ -126,19 +431,17 @@ pub async fn claim_relay_membership(
     role: &str,
     policy_version: Option<&str>,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
-    let inserted = sqlx::query(
-        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
-         VALUES ($1, $2, $3, 'invite') \
-         ON CONFLICT (community_id, pubkey) DO NOTHING",
-    )
-    .bind(community.as_uuid())
-    .bind(pubkey)
-    .bind(role)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected()
-        > 0;
+    let mut tx = begin_membership_write(pool, community).await?;
+    if is_v2_in_tx(&mut tx, community).await? {
+        if role != "member" {
+            return Err(DbError::AccessDenied(
+                "forbidden:membership:invite_cannot_grant_role".to_owned(),
+            ));
+        }
+        return Err(v2_membership_coordinator_unavailable());
+    }
+    let inserted =
+        insert_relay_member_in_tx(&mut tx, community, pubkey, role, Some("invite")).await?;
 
     if let Some(version) = policy_version {
         sqlx::query(
@@ -186,6 +489,10 @@ pub enum RemoveResult {
     NotFound,
     /// The member exists but their role doesn't match the expected role.
     RoleMismatch,
+    /// Project View v2 still has an active Assignment for this Member.
+    AssignmentActive,
+    /// The Human owns a managed Agent with an active Assignment.
+    ManagedAgentAssignmentActive,
 }
 
 /// Removes a relay member atomically, refusing to delete the owner.
@@ -198,16 +505,28 @@ pub async fn remove_relay_member(
     community: CommunityId,
     pubkey: &str,
 ) -> Result<RemoveResult> {
+    let mut tx = begin_membership_write(pool, community).await?;
+    if is_v2_in_tx(&mut tx, community).await? {
+        if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
+            return Ok(RemoveResult::AssignmentActive);
+        }
+        if has_owned_managed_agent_assignment_in_tx(&mut tx, community, pubkey).await? {
+            return Ok(RemoveResult::ManagedAgentAssignmentActive);
+        }
+        return Err(v2_membership_coordinator_unavailable());
+    }
+
     let result = sqlx::query(
         "DELETE FROM relay_members \
          WHERE community_id = $1 AND pubkey = $2 AND role <> 'owner'",
     )
     .bind(community.as_uuid())
     .bind(pubkey)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() > 0 {
+        tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
 
@@ -216,14 +535,16 @@ pub async fn remove_relay_member(
     let exists = sqlx::query("SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
-    if exists.is_some() {
+    let result = if exists.is_some() {
         Ok(RemoveResult::IsOwner)
     } else {
         Ok(RemoveResult::NotFound)
-    }
+    };
+    tx.rollback().await?;
+    result
 }
 
 /// Removes a relay member only if their current role matches `expected_role`.
@@ -245,16 +566,28 @@ pub async fn remove_relay_member_if_role(
     pubkey: &str,
     expected_role: &str,
 ) -> Result<RemoveResult> {
+    let mut tx = begin_membership_write(pool, community).await?;
+    if is_v2_in_tx(&mut tx, community).await? {
+        if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
+            return Ok(RemoveResult::AssignmentActive);
+        }
+        if has_owned_managed_agent_assignment_in_tx(&mut tx, community, pubkey).await? {
+            return Ok(RemoveResult::ManagedAgentAssignmentActive);
+        }
+        return Err(v2_membership_coordinator_unavailable());
+    }
+
     let result = sqlx::query(
         "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3",
     )
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(expected_role)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() > 0 {
+        tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
 
@@ -263,10 +596,10 @@ pub async fn remove_relay_member_if_role(
     let row = sqlx::query("SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
-    match row {
+    let result = match row {
         None => Ok(RemoveResult::NotFound),
         Some(r) => {
             let role: String = r.try_get("role")?;
@@ -279,7 +612,9 @@ pub async fn remove_relay_member_if_role(
                 Ok(RemoveResult::RoleMismatch)
             }
         }
-    }
+    };
+    tx.rollback().await?;
+    result
 }
 
 /// Updates the role of an existing relay member in `community`. Returns `true`
@@ -290,6 +625,30 @@ pub async fn update_relay_member_role(
     pubkey: &str,
     new_role: &str,
 ) -> Result<bool> {
+    let mut tx = begin_membership_write(pool, community).await?;
+    if is_v2_in_tx(&mut tx, community).await? {
+        let current_role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2 FOR UPDATE",
+        )
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if new_role == "admin" {
+            return Err(DbError::AccessDenied(
+                "forbidden:membership:leader_assignment_required".to_owned(),
+            ));
+        }
+        if current_role.as_deref() == Some("admin")
+            && has_active_assignment_in_tx(&mut tx, community, pubkey).await?
+        {
+            return Err(DbError::AccessDenied(
+                "forbidden:membership:assignment_active".to_owned(),
+            ));
+        }
+        return Err(v2_membership_coordinator_unavailable());
+    }
+
     let result = sqlx::query(
         "UPDATE relay_members SET role = $1, updated_at = now() \
          WHERE community_id = $2 AND pubkey = $3 AND role <> 'owner'",
@@ -297,16 +656,18 @@ pub async fn update_relay_member_role(
     .bind(new_role)
     .bind(community.as_uuid())
     .bind(pubkey)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let updated = result.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(updated)
 }
 
-/// Ensures the configured owner pubkey holds the `"owner"` role *in
-/// `community`*, and demotes any other owners in that community to `"admin"`.
-/// This handles owner rotation: if `RELAY_OWNER_PUBKEY` changes, the old owner
-/// is automatically demoted. Scoped to one community — an owner of community A
-/// is never bootstrapped into community B.
+/// Ensures the configured owner pubkey holds the `"owner"` role in
+/// `community`. In v1, any former owner becomes `admin`. A v2 call is a no-op
+/// when the configured owner already matches and otherwise fails closed until
+/// the source/audit/projection coordinator can perform the rotation. The
+/// operation remains scoped to one Community.
 ///
 /// Runs in a single transaction. Safe to call at every startup — idempotent.
 ///
@@ -323,7 +684,27 @@ pub async fn bootstrap_owner(
     owner_pubkey: &str,
 ) -> Result<()> {
     let pubkey = owner_pubkey.to_ascii_lowercase();
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_membership_write(pool, community).await?;
+    let is_v2 = is_v2_in_tx(&mut tx, community).await?;
+    if is_v2 && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
+        return Err(DbError::AccessDenied(
+            "forbidden:managed_agent:owner_ineligible".to_owned(),
+        ));
+    }
+    if is_v2 {
+        let current_owners: Vec<String> = sqlx::query_scalar(
+            "SELECT pubkey FROM relay_members \
+             WHERE community_id = $1 AND role = 'owner' FOR UPDATE",
+        )
+        .bind(community.as_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        if current_owners.as_slice() == [pubkey.as_str()] {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        return Err(v2_membership_coordinator_unavailable());
+    }
 
     // 1. Upsert the configured owner for this community.
     sqlx::query(
@@ -336,7 +717,9 @@ pub async fn bootstrap_owner(
     .execute(&mut *tx)
     .await?;
 
-    // 2. Demote any other owners in this community to admin.
+    // 2. v1 preserves the existing bootstrap behaviour. A v2 owner change
+    // returned above because it requires the future source/audit/projection
+    // coordinator.
     sqlx::query(
         "UPDATE relay_members SET role = 'admin', updated_at = now() \
          WHERE community_id = $1 AND role = 'owner' AND pubkey <> $2",
@@ -354,7 +737,7 @@ pub async fn bootstrap_owner(
 #[derive(Debug, PartialEq)]
 pub enum TransferResult {
     /// Transfer completed: the new owner was upserted and the previous
-    /// owner(s) demoted to `member`.
+    /// owner(s) were demoted to `member`.
     Transferred {
         /// Pubkey of the previous sole owner, if exactly one existed.
         previous_owner: Option<String>,
@@ -371,6 +754,8 @@ pub enum TransferResult {
     /// Enforced atomically inside the transfer transaction so concurrent
     /// transfers to the same recipient cannot both pass the limit.
     LimitReached,
+    /// The requested owner is a known managed Agent identity.
+    ManagedAgentIneligible,
 }
 
 /// Maximum number of communities a single pubkey can own. Enforced at the
@@ -403,11 +788,11 @@ pub fn owner_count_advisory_lock_key(pubkey_hex: &str) -> i64 {
 /// 3. Enforces the [`MAX_COMMUNITIES_PER_OWNER`] limit on the transferee by
 ///    counting owned communities inside the same transaction.
 /// 4. Upserts `new_owner_pubkey` as `owner` (insert or promote).
-/// 5. Demotes every other owner in this community to `member` — **not**
-///    `admin`, per product decision: the former owner retains no management
-///    capabilities.
+/// 5. Demotes every other owner in this Community to `member`.
 ///
 /// Scoped to one community — an ownership transfer in A never touches B.
+/// A v2 Community fails closed until the source/audit/projection coordinator
+/// can commit the ownership change and its derived old-owner level together.
 pub async fn transfer_ownership(
     pool: &PgPool,
     community: CommunityId,
@@ -416,7 +801,14 @@ pub async fn transfer_ownership(
 ) -> Result<TransferResult> {
     let pubkey = new_owner_pubkey.to_ascii_lowercase();
     let expected_owner = expected_owner_pubkey.to_ascii_lowercase();
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_membership_write(pool, community).await?;
+    let is_v2 = is_v2_in_tx(&mut tx, community).await?;
+    if is_v2 && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
+        return Ok(TransferResult::ManagedAgentIneligible);
+    }
+    if is_v2 {
+        return Err(v2_membership_coordinator_unavailable());
+    }
 
     // 1. Serialize on the transferee so concurrent transfers to the same
     //    recipient cannot both pass the ownership count check.
@@ -488,7 +880,7 @@ pub async fn transfer_ownership(
     .execute(&mut *tx)
     .await?;
 
-    // 5. Demote all other owners to member (not admin).
+    // 5. This path is v1-only; v2 returned above.
     sqlx::query(
         "UPDATE relay_members SET role = 'member', updated_at = now() \
          WHERE community_id = $1 AND role = 'owner' AND pubkey <> $2",
@@ -526,16 +918,24 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
         return Ok(0);
     }
 
+    let mut tx = begin_membership_write(pool, community).await?;
+    if is_v2_in_tx(&mut tx, community).await? {
+        return Err(DbError::AccessDenied(
+            "forbidden:membership:v2_backfill".to_owned(),
+        ));
+    }
+
     // Only backfill if this community's relay_members is empty — once it has
     // rows (from a previous backfill or manual admin commands), we must not
     // re-add members that were intentionally removed.
     let has_members: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)")
             .bind(community.as_uuid())
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     if has_members {
+        tx.rollback().await?;
         return Ok(0);
     }
 
@@ -547,10 +947,12 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
          ON CONFLICT (community_id, pubkey) DO NOTHING",
     )
     .bind(community.as_uuid())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(result.rows_affected())
+    let inserted = result.rows_affected();
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 #[cfg(test)]

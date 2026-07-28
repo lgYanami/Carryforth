@@ -23,8 +23,6 @@ use uuid::Uuid;
 
 use crate::{Db, DbError};
 
-const PROJECT_VIEW_LOCK_NAMESPACE: &str = "buzz_project_view:";
-
 /// Errors specific to preparing or committing one Project View mutation.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectViewWriteError {
@@ -322,10 +320,13 @@ impl Db {
              LEFT JOIN users actor \
                ON actor.community_id = $1 AND actor.pubkey = requested.pubkey \
              WHERE ( \
-                 EXISTS ( \
-                     SELECT 1 FROM relay_members direct_member \
-                     WHERE direct_member.community_id = $1 \
-                       AND direct_member.pubkey = encode(requested.pubkey, 'hex') \
+                 ( \
+                     actor.agent_owner_pubkey IS NULL \
+                     AND EXISTS ( \
+                         SELECT 1 FROM relay_members direct_member \
+                         WHERE direct_member.community_id = $1 \
+                           AND direct_member.pubkey = encode(requested.pubkey, 'hex') \
+                     ) \
                  ) \
                  OR ( \
                      actor.agent_owner_pubkey IS NOT NULL \
@@ -341,6 +342,12 @@ impl Db {
                            AND owner_ban.banned \
                            AND (owner_ban.ban_expires_at IS NULL \
                                 OR owner_ban.ban_expires_at > clock_timestamp()) \
+                     ) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM users owner_actor \
+                         WHERE owner_actor.community_id = $1 \
+                           AND owner_actor.pubkey = actor.agent_owner_pubkey \
+                           AND owner_actor.agent_owner_pubkey IS NOT NULL \
                      ) \
                  ) \
              ) \
@@ -460,6 +467,11 @@ impl Db {
         relay_pubkey: &PublicKey,
     ) -> crate::Result<bool> {
         if !self.project_view_schema_ready().await? {
+            return Ok(false);
+        }
+        if crate::relay_members::project_view_schema_version(&self.pool, community_id).await? != 1 {
+            // This reader only understands NIP-PV v1. A v2 Community must
+            // never be advertised through the v1 capability.
             return Ok(false);
         }
 
@@ -663,6 +675,11 @@ impl Db {
     ) -> ProjectViewWriteResult<ProjectViewReprojectTx> {
         let mut tx = self.pool.begin().await?;
         acquire_project_view_lock(&mut tx, community_id, false).await?;
+        if crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id).await?
+            != 1
+        {
+            return Err(ProjectViewWriteError::Unavailable { community_id });
+        }
         let enabled = sqlx::query_scalar::<_, bool>(
             "SELECT project_view_enabled FROM communities \
              WHERE id = $1 AND archived_at IS NULL FOR UPDATE",
@@ -694,6 +711,11 @@ impl Db {
     ) -> ProjectViewWriteResult<ProjectViewWriteTx> {
         let mut tx = self.pool.begin().await?;
         acquire_project_view_lock(&mut tx, community_id, false).await?;
+        if crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id).await?
+            != 1
+        {
+            return Err(ProjectViewWriteError::Unavailable { community_id });
+        }
 
         let enabled = sqlx::query_scalar::<_, bool>(
             "SELECT project_view_enabled FROM communities \
@@ -764,6 +786,15 @@ impl Db {
         acquire_project_view_lock(&mut tx, community_id, false)
             .await
             .map_err(project_view_error_to_db)?;
+        if enabled
+            && crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
+                .await?
+                != 1
+        {
+            return Err(DbError::InvalidData(
+                "the v1 Project View switch cannot enable a v2 Community".to_owned(),
+            ));
+        }
         let result = sqlx::query(
             "UPDATE communities SET project_view_enabled = $2 \
              WHERE id = $1 AND archived_at IS NULL",
@@ -832,6 +863,19 @@ impl Db {
             acquire_project_view_lock(&mut tx, CommunityId::from_uuid(*community_id), false)
                 .await
                 .map_err(project_view_error_to_db)?;
+        }
+        if enabled {
+            for community_id in &community_ids {
+                let community_id = CommunityId::from_uuid(*community_id);
+                if crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
+                    .await?
+                    != 1
+                {
+                    return Err(DbError::InvalidData(format!(
+                        "the v1 Project View switch cannot enable v2 Community {community_id}"
+                    )));
+                }
+            }
         }
 
         let result = sqlx::query(
@@ -1251,8 +1295,9 @@ impl ProjectViewWriteTx {
                 "INSERT INTO project_view_state \
                     (community_id, project_revision, active_object_count, \
                      initialized_at, updated_at, last_event_id, last_actor_pubkey, \
-                     meta_projection_event_id, projection_pubkey, projection_generation) \
-                 VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9)",
+                     meta_projection_event_id, projection_pubkey, projection_generation, \
+                     schema_version, last_change_id, last_source_event_id) \
+                 VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, 1, $5, $5)",
             )
             .bind(self.community_id.as_uuid())
             .bind(next_revision_i64)
@@ -1361,6 +1406,7 @@ impl ProjectViewWriteTx {
             let result = sqlx::query(
                 "UPDATE project_view_state \
                  SET project_revision = $2, updated_at = $3, last_event_id = $4, \
+                     last_change_id = $4, last_source_event_id = $4, \
                      last_actor_pubkey = $5, meta_projection_event_id = $6, \
                      projection_pubkey = $7, projection_generation = $8 \
                  WHERE community_id = $1 AND project_revision = $9",
@@ -1848,19 +1894,7 @@ async fn acquire_project_view_lock(
     community_id: CommunityId,
     shared: bool,
 ) -> ProjectViewWriteResult<()> {
-    let function = if shared {
-        "pg_advisory_xact_lock_shared"
-    } else {
-        "pg_advisory_xact_lock"
-    };
-    let sql = format!("SELECT {function}(hashtextextended($1, 0))");
-    sqlx::query(sqlx::AssertSqlSafe(sql))
-        .bind(format!(
-            "{PROJECT_VIEW_LOCK_NAMESPACE}{}",
-            community_id.as_uuid()
-        ))
-        .execute(&mut **tx)
-        .await?;
+    crate::community_lock::acquire(tx, community_id, shared).await?;
     Ok(())
 }
 
@@ -1901,6 +1935,9 @@ async fn project_view_enable_ready_in_tx(
     relay_pubkey: &PublicKey,
 ) -> ProjectViewWriteResult<bool> {
     if !project_view_schema_ready_in_tx(tx).await? {
+        return Ok(false);
+    }
+    if crate::relay_members::project_view_schema_version_in_tx(tx, community_id).await? != 1 {
         return Ok(false);
     }
 
@@ -2436,6 +2473,22 @@ mod tests {
         )
     }
 
+    fn create_role_mutation(expected_revision: u64, role_id: Uuid, name: &str) -> Mutation {
+        Mutation::new(
+            expected_revision,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Role {
+                    id: role_id,
+                    name: name.to_owned(),
+                    purpose: format!("Own {name}"),
+                    responsibilities: vec![format!("Keep {name} moving")],
+                    boundaries: vec!["Stay within the Project scope".to_owned()],
+                    active: true,
+                },
+            }),
+        )
+    }
+
     fn signed_event(
         keys: &Keys,
         kind: u32,
@@ -2615,6 +2668,145 @@ mod tests {
         tx.commit_mutation(prepared)
             .await
             .expect("commit test mutation")
+    }
+
+    async fn cutover_role_continuity_fixture(
+        db: &Db,
+        pool: &PgPool,
+        community_id: CommunityId,
+        owner: &Keys,
+        relay: &Keys,
+        member: &Keys,
+    ) -> (Uuid, Uuid) {
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap fixture owner");
+        db.add_relay_member(
+            community_id,
+            &member.public_key().to_hex(),
+            "member",
+            Some(&owner.public_key().to_hex()),
+        )
+        .await
+        .expect("add fixture member");
+
+        initialize(db, community_id, owner, relay).await;
+        let member_role_id = Uuid::new_v4();
+        commit_for_test(
+            db,
+            community_id,
+            owner,
+            relay,
+            create_role_mutation(1, member_role_id, "Builder"),
+        )
+        .await;
+        let admin_role_id = Uuid::new_v4();
+        commit_for_test(
+            db,
+            community_id,
+            owner,
+            relay,
+            create_role_mutation(2, admin_role_id, "Leader"),
+        )
+        .await;
+        db.set_project_view_enabled(community_id, false)
+            .await
+            .expect("pause v1 before fixture cutover");
+
+        let mut tx = pool.begin().await.expect("begin fixture cutover");
+        crate::relay_members::acquire_membership_write_lock(&mut tx, community_id)
+            .await
+            .expect("lock fixture Project");
+        let project_revision: i64 = sqlx::query_scalar(
+            "SELECT project_revision FROM project_view_state WHERE community_id = $1 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read fixture revision");
+        let change_id = [0x26_u8; 32];
+        let now = Utc::now();
+
+        sqlx::query(
+            "UPDATE project_view_objects \
+             SET schema_version = 2, \
+                 role_level = CASE \
+                     WHEN object_id = $2 THEN 'admin' \
+                     WHEN object_type = 'role' THEN 'member' \
+                     ELSE NULL \
+                 END, \
+                 body = CASE \
+                     WHEN object_type = 'role' THEN \
+                         jsonb_set( \
+                             body, '{level}', \
+                             to_jsonb(CASE WHEN object_id = $2 THEN 'admin' ELSE 'member' END::text), \
+                             true \
+                         ) \
+                     ELSE body \
+                 END \
+             WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(admin_role_id)
+        .execute(&mut *tx)
+        .await
+        .expect("convert fixture objects to v2");
+        sqlx::query(
+            "UPDATE project_view_state \
+             SET schema_version = 2, last_change_id = $2, last_source_event_id = NULL \
+             WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(change_id.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("convert fixture state to v2");
+        sqlx::query(
+            "INSERT INTO project_view_changes ( \
+                 community_id, change_id, source_type, source_event_id, \
+                 actor_pubkey, operation, subject, \
+                 project_revision, result, accepted_at \
+             ) VALUES ($1, $2, 'nostr_event', $2, $3, 'test_cutover', \
+                       '{}'::jsonb, $4, '{}'::jsonb, $5)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(change_id.as_slice())
+        .bind(owner.public_key().as_bytes())
+        .bind(project_revision)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .expect("insert fixture change source");
+        for (role_id, assignee) in [
+            (admin_role_id, owner.public_key()),
+            (member_role_id, member.public_key()),
+        ] {
+            sqlx::query(
+                "INSERT INTO project_role_assignments ( \
+                     community_id, assignment_id, role_id, member_pubkey, \
+                     started_at, started_by, source_change_id, project_revision \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(Uuid::new_v4())
+            .bind(role_id)
+            .bind(assignee.to_hex())
+            .bind(now)
+            .bind(owner.public_key().as_bytes())
+            .bind(change_id.as_slice())
+            .bind(project_revision)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixture Assignment");
+        }
+        sqlx::query("UPDATE communities SET project_view_schema_version = 2 WHERE id = $1")
+            .bind(community_id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("cut fixture Community to v2");
+        tx.commit().await.expect("commit fixture v2 cutover");
+
+        (member_role_id, admin_role_id)
     }
 
     #[tokio::test]
@@ -3304,8 +3496,10 @@ mod tests {
         let agent = Keys::generate();
         let outsider = Keys::generate();
         let cross_community_agent = Keys::generate();
+        let nested_owner_agent = Keys::generate();
+        let nested_agent = Keys::generate();
 
-        for member in [&direct, &owner] {
+        for member in [&direct, &owner, &nested_owner_agent, &nested_agent] {
             sqlx::query(
                 "INSERT INTO relay_members (community_id, pubkey, role) \
                  VALUES ($1, $2, 'member')",
@@ -3333,6 +3527,35 @@ mod tests {
         .execute(&scratch.pool)
         .await
         .expect("insert managed agent");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(nested_owner_agent.public_key().as_bytes())
+        .bind(direct.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("insert managed Agent used as a nested owner");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(nested_agent.public_key().as_bytes())
+        .bind(nested_owner_agent.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("insert Agent whose owner is itself a managed Agent");
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role) \
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(community_id.as_uuid())
+        .bind(agent.public_key().to_hex())
+        .execute(&scratch.pool)
+        .await
+        .expect("materialize managed agent as a direct member");
 
         sqlx::query(
             "INSERT INTO relay_members (community_id, pubkey, role) \
@@ -3354,12 +3577,48 @@ mod tests {
         .await
         .expect("insert cross-Community managed agent");
 
+        let direct_identity = db
+            .relay_membership_identity(community_id, direct.public_key().as_bytes())
+            .await
+            .expect("resolve direct Human identity");
+        assert!(direct_identity.direct_member);
+        assert!(direct_identity.managed_owner_pubkey.is_none());
+        assert!(!direct_identity.managed_owner_eligible);
+
+        let agent_identity = db
+            .relay_membership_identity(community_id, agent.public_key().as_bytes())
+            .await
+            .expect("resolve direct managed-Agent identity");
+        assert!(agent_identity.direct_member);
+        assert_eq!(
+            agent_identity.managed_owner_pubkey.as_deref(),
+            Some(owner.public_key().as_bytes().as_slice())
+        );
+        assert!(agent_identity.managed_owner_eligible);
+        assert!(db
+            .delegated_agent_owner_is_eligible(
+                community_id,
+                agent.public_key().as_bytes(),
+                owner.public_key().as_bytes(),
+            )
+            .await
+            .expect("resolve verified NIP-OA owner eligibility"));
+
+        let nested_identity = db
+            .relay_membership_identity(community_id, nested_agent.public_key().as_bytes())
+            .await
+            .expect("resolve nested managed-Agent identity");
+        assert!(nested_identity.direct_member);
+        assert!(!nested_identity.managed_owner_eligible);
+
         let requested = vec![
             direct.public_key().to_bytes().to_vec(),
             owner.public_key().to_bytes().to_vec(),
             agent.public_key().to_bytes().to_vec(),
             outsider.public_key().to_bytes().to_vec(),
             cross_community_agent.public_key().to_bytes().to_vec(),
+            nested_owner_agent.public_key().to_bytes().to_vec(),
+            nested_agent.public_key().to_bytes().to_vec(),
         ];
         let authorized = db
             .project_view_authorized_pubkeys(community_id, &requested)
@@ -3370,6 +3629,8 @@ mod tests {
         assert!(authorized.contains(agent.public_key().as_bytes().as_slice()));
         assert!(!authorized.contains(outsider.public_key().as_bytes().as_slice()));
         assert!(!authorized.contains(cross_community_agent.public_key().as_bytes().as_slice()));
+        assert!(authorized.contains(nested_owner_agent.public_key().as_bytes().as_slice()));
+        assert!(!authorized.contains(nested_agent.public_key().as_bytes().as_slice()));
 
         let moderator = Keys::generate();
         sqlx::query(
@@ -3383,6 +3644,20 @@ mod tests {
         .execute(&scratch.pool)
         .await
         .expect("ban managed-agent owner");
+        assert!(
+            !db.relay_membership_identity(community_id, agent.public_key().as_bytes())
+                .await
+                .expect("resolve managed Agent after owner ban")
+                .managed_owner_eligible
+        );
+        assert!(!db
+            .delegated_agent_owner_is_eligible(
+                community_id,
+                agent.public_key().as_bytes(),
+                owner.public_key().as_bytes(),
+            )
+            .await
+            .expect("resolve delegated Agent after owner ban"));
         let authorized = db
             .project_view_authorized_pubkeys(community_id, &requested)
             .await
@@ -3390,6 +3665,316 @@ mod tests {
         assert!(authorized.contains(direct.public_key().as_bytes().as_slice()));
         assert!(!authorized.contains(owner.public_key().as_bytes().as_slice()));
         assert!(!authorized.contains(agent.public_key().as_bytes().as_slice()));
+        assert!(authorized.contains(nested_owner_agent.public_key().as_bytes().as_slice()));
+        assert!(!authorized.contains(nested_agent.public_key().as_bytes().as_slice()));
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn project_view_v2_membership_kernel_blocks_assignment_bypasses() {
+        let scratch = ScratchDatabase::create("buzz_pv_v2_membership").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let member = Keys::generate();
+        let relay = Keys::generate();
+        let (_member_role_id, _admin_role_id) = cutover_role_continuity_fixture(
+            &db,
+            &scratch.pool,
+            community_id,
+            &owner,
+            &relay,
+            &member,
+        )
+        .await;
+
+        assert!(
+            !db.project_view_capability_ready(community_id, &relay.public_key())
+                .await
+                .expect("v1 capability check must understand the v2 boundary"),
+            "a v2 Community must never advertise buzz-project-view-v1"
+        );
+        assert!(matches!(
+            db.begin_project_view_write(community_id).await,
+            Err(ProjectViewWriteError::Unavailable { .. })
+        ));
+        let bulk_enable = db
+            .set_all_project_views_enabled(true)
+            .await
+            .expect_err("the bulk v1 switch must not enable a v2 Community");
+        assert!(matches!(bulk_enable, DbError::InvalidData(_)));
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT project_view_enabled FROM communities WHERE id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read Project View flag after rejected bulk enable"));
+
+        let promotion = db
+            .update_relay_member_role(community_id, &member.public_key().to_hex(), "admin")
+            .await
+            .expect_err("direct admin promotion must require a Leader Assignment transaction");
+        assert!(matches!(promotion, DbError::AccessDenied(_)));
+
+        assert_eq!(
+            db.remove_relay_member(community_id, &member.public_key().to_hex())
+                .await
+                .expect("guard member removal"),
+            crate::relay_members::RemoveResult::AssignmentActive
+        );
+
+        let direct_promotion = sqlx::query(
+            "UPDATE relay_members SET role = 'admin' \
+             WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(member.public_key().to_hex())
+        .execute(&scratch.pool)
+        .await
+        .expect_err("deferred guard must reject raw admin promotion");
+        assert_eq!(
+            direct_promotion
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        let direct_remove =
+            sqlx::query("DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2")
+                .bind(community_id.as_uuid())
+                .bind(member.public_key().to_hex())
+                .execute(&scratch.pool)
+                .await
+                .expect_err("deferred guard must reject raw removal with an active Assignment");
+        assert_eq!(
+            direct_remove
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        let other_community = seed_community(&scratch.pool, false).await;
+        let direct_move = sqlx::query(
+            "UPDATE relay_members SET community_id = $3 \
+             WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(member.public_key().to_hex())
+        .bind(other_community.as_uuid())
+        .execute(&scratch.pool)
+        .await
+        .expect_err("deferred guard must validate the old Community when a row is moved");
+        assert_eq!(
+            direct_move
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        let ban = db
+            .ban_community_member(
+                community_id,
+                member.public_key().as_bytes(),
+                owner.public_key().as_bytes(),
+                Some("test"),
+                None,
+            )
+            .await
+            .expect_err("ban must not strand an active Assignment");
+        assert!(matches!(ban, DbError::AccessDenied(_)));
+        assert!(
+            !db.moderation_restriction_state(community_id, member.public_key().as_bytes())
+                .await
+                .expect("read rejected ban state")
+                .banned
+        );
+
+        let observer = Keys::generate();
+        let admission = db
+            .add_relay_member(
+                community_id,
+                &observer.public_key().to_hex(),
+                "member",
+                Some(&owner.public_key().to_hex()),
+            )
+            .await
+            .expect_err("v2 admission requires a typed source and atomic projections");
+        assert!(
+            matches!(&admission, DbError::AccessDenied(message) if message.starts_with("unavailable:"))
+        );
+        assert!(matches!(
+            db.add_relay_member(
+                community_id,
+                &Keys::generate().public_key().to_hex(),
+                "admin",
+                Some(&owner.public_key().to_hex()),
+            )
+            .await,
+            Err(DbError::AccessDenied(_))
+        ));
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("an unchanged v2 startup owner is an idempotent no-op");
+
+        let mut role_tx = scratch.pool.begin().await.expect("begin role derivation");
+        crate::relay_members::acquire_membership_write_lock(&mut role_tx, community_id)
+            .await
+            .expect("lock role derivation");
+        assert_eq!(
+            crate::relay_members::assignment_derived_member_role_in_tx(
+                &mut role_tx,
+                community_id,
+                &owner.public_key().to_hex(),
+            )
+            .await
+            .expect("derive former-owner level"),
+            "admin",
+            "former owner retains admin only because its active Role is admin"
+        );
+        role_tx.rollback().await.expect("rollback role derivation");
+
+        let managed_agent = Keys::generate();
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("materialize current owner user");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(managed_agent.public_key().as_bytes())
+        .bind(owner.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("materialize known managed Agent");
+        assert_eq!(
+            db.transfer_ownership(
+                community_id,
+                &managed_agent.public_key().to_hex(),
+                &owner.public_key().to_hex(),
+            )
+            .await
+            .expect("reject managed-Agent ownership transfer"),
+            crate::relay_members::TransferResult::ManagedAgentIneligible
+        );
+        let future_owner = Keys::generate();
+        let transfer = db
+            .transfer_ownership(
+                community_id,
+                &future_owner.public_key().to_hex(),
+                &owner.public_key().to_hex(),
+            )
+            .await
+            .expect_err("v2 ownership transfer requires the atomic coordinator");
+        assert!(
+            matches!(&transfer, DbError::AccessDenied(message) if message.starts_with("unavailable:"))
+        );
+
+        let owner_ban = db
+            .ban_community_member(
+                community_id,
+                owner.public_key().as_bytes(),
+                member.public_key().as_bytes(),
+                Some("test"),
+                None,
+            )
+            .await
+            .expect_err("Community owner cannot be banned before ownership transfer");
+        assert!(matches!(owner_ban, DbError::AccessDenied(_)));
+        let direct_owner_ban = sqlx::query(
+            "INSERT INTO community_bans \
+                 (community_id, pubkey, banned, actor_pubkey) \
+             VALUES ($1, $2, true, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .bind(member.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect_err("deferred guard must reject a raw ban of the current owner");
+        assert_eq!(
+            direct_owner_ban
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn project_view_membership_and_nip43_snapshot_share_one_lock_order() {
+        let scratch = ScratchDatabase::create("buzz_pv_membership_snapshot_lock").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, false).await;
+        let owner = Keys::generate();
+        let member = Keys::generate();
+        let relay = Keys::generate();
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap lock-test owner");
+
+        let mut membership_tx = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin locked membership write");
+        crate::relay_members::acquire_membership_write_lock(&mut membership_tx, community_id)
+            .await
+            .expect("acquire shared Community/Project lock");
+        crate::relay_members::insert_relay_member_in_tx(
+            &mut membership_tx,
+            community_id,
+            &member.public_key().to_hex(),
+            "member",
+            Some(&owner.public_key().to_hex()),
+        )
+        .await
+        .expect("stage member beneath Project lock");
+
+        let publisher_db = db.clone();
+        let publisher_relay = relay.clone();
+        let mut publisher = tokio::spawn(async move {
+            publisher_db
+                .publish_nip43_membership_locked(community_id, &publisher_relay)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut publisher)
+                .await
+                .is_err(),
+            "snapshot publication must wait for the membership transaction's Project lock"
+        );
+
+        membership_tx
+            .commit()
+            .await
+            .expect("commit locked membership write");
+        let (snapshot, _, member_count) = publisher
+            .await
+            .expect("snapshot publisher task")
+            .expect("publish snapshot after membership commit");
+        assert_eq!(member_count, 2);
+        assert!(snapshot.event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("member")
+                && parts.get(1).map(String::as_str) == Some(member.public_key().to_hex().as_str())
+        }));
 
         scratch.cleanup().await;
     }

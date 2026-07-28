@@ -245,6 +245,16 @@ async fn cmd_remove_member(pubkey_arg: String, role_filter: Option<String>) -> R
             eprintln!("error: role mismatch — {pubkey_hex} is not currently '{role_str}'");
             return Ok(4);
         }
+        Ok(RemoveResult::AssignmentActive) => {
+            eprintln!(
+                "error: {pubkey_hex} has an active Role Assignment; end the Assignment first"
+            );
+            return Ok(4);
+        }
+        Ok(RemoveResult::ManagedAgentAssignmentActive) => {
+            eprintln!("error: {pubkey_hex} owns a managed Agent with an active Role Assignment");
+            return Ok(4);
+        }
         Err(e) => {
             eprintln!("error: DB write failed: {e}");
             return Ok(5);

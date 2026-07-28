@@ -340,7 +340,10 @@ pub async fn claim_invite(
                 .map(|policy| policy.version.as_str()),
         )
         .await
-        .map_err(|e| internal_error(&format!("invite claim insert: {e}")))?;
+        .map_err(|error| match error {
+            buzz_db::DbError::AccessDenied(message) => api_error(StatusCode::FORBIDDEN, &message),
+            other => internal_error(&format!("invite claim insert: {other}")),
+        })?;
 
     if was_inserted {
         tracing::info!(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the last pre-Project-View Relay against a database migrated to v25.
+# Start the last pre-Project-View Relay against a database migrated to v26.
 # This proves the only permitted pre-feature rollback boundary: migration has
 # run, every Community remains disabled, and no Project View mutation exists.
 
@@ -74,6 +74,8 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   -c "SELECT CASE WHEN
         (SELECT count(*) FROM _sqlx_migrations WHERE version = 25 AND success) = 1
         AND
+        (SELECT count(*) FROM _sqlx_migrations WHERE version = 26 AND success) = 1
+        AND
         (SELECT bool_and(NOT project_view_enabled) FROM communities)
       THEN 'ok' ELSE 'bad' END" |
   grep -qx ok
@@ -124,4 +126,4 @@ if jq -e '.supported_extensions[]? == "buzz-project-view-v1"' <<<"${info}" >/dev
 fi
 kill -0 "${relay_pid}"
 
-echo "Project View pre-feature rollback smoke passed on migration 25."
+echo "Project View pre-feature rollback smoke passed on migration 26."

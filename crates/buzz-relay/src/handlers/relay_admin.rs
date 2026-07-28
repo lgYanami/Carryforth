@@ -263,6 +263,15 @@ pub async fn handle_relay_admin_event(
                 RemoveResult::RoleMismatch => {
                     return Err("actor not authorized: admins can only remove members".to_string());
                 }
+                RemoveResult::AssignmentActive => {
+                    return Err(
+                        "forbidden:membership:assignment_active: end the Role Assignment first"
+                            .to_string(),
+                    );
+                }
+                RemoveResult::ManagedAgentAssignmentActive => {
+                    return Err("forbidden:membership:managed_agent_assignment_active".to_string());
+                }
             }
 
             info!(

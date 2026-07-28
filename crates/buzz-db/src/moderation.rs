@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::CommunityId;
 
 /// What a report points at. Exactly one target class per report row.
@@ -319,6 +319,48 @@ pub async fn ban_member(
     reason: Option<&str>,
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::relay_members::acquire_membership_write_lock(&mut tx, community).await?;
+    let schema_version =
+        crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await?;
+    if schema_version == 2 {
+        let target_hex = hex::encode(pubkey);
+        let target_is_owner: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM relay_members \
+                 WHERE community_id = $1 AND pubkey = $2 AND role = 'owner' \
+             )",
+        )
+        .bind(community.as_uuid())
+        .bind(&target_hex)
+        .fetch_one(&mut *tx)
+        .await?;
+        if target_is_owner {
+            return Err(DbError::AccessDenied(
+                "forbidden:membership:owner_transfer_required".to_owned(),
+            ));
+        }
+        if crate::relay_members::has_active_assignment_in_tx(&mut tx, community, &target_hex)
+            .await?
+            || crate::relay_members::has_owned_managed_agent_assignment_in_tx(
+                &mut tx,
+                community,
+                &target_hex,
+            )
+            .await?
+        {
+            // Until the Assignment command/projection transaction lands in
+            // Stage 2, fail closed instead of committing a ban that would make
+            // canonical continuity state invalid.
+            return Err(DbError::AccessDenied(
+                "forbidden:membership:assignment_active".to_owned(),
+            ));
+        }
+        return Err(DbError::AccessDenied(
+            "unavailable:project_view_v2:membership_coordinator".to_owned(),
+        ));
+    }
+
     sqlx::query(
         r#"
         INSERT INTO community_bans (
@@ -337,9 +379,10 @@ pub async fn ban_member(
     .bind(expires_at)
     .bind(reason)
     .bind(actor)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -350,6 +393,14 @@ pub async fn unban_member(
     pubkey: &[u8],
     actor: &[u8],
 ) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::relay_members::acquire_membership_write_lock(&mut tx, community).await?;
+    if crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await? == 2 {
+        return Err(DbError::AccessDenied(
+            "unavailable:project_view_v2:membership_coordinator".to_owned(),
+        ));
+    }
+
     let result = sqlx::query(
         r#"
         UPDATE community_bans
@@ -361,10 +412,12 @@ pub async fn unban_member(
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(actor)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(result.rows_affected() > 0)
+    let lifted = result.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(lifted)
 }
 
 /// Upsert a timeout: sets `muted_until` + reason.
@@ -376,6 +429,10 @@ pub async fn timeout_member(
     muted_until: DateTime<Utc>,
     reason: Option<&str>,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::relay_members::acquire_membership_write_lock(&mut tx, community).await?;
+    crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await?;
+
     sqlx::query(
         r#"
         INSERT INTO community_bans (
@@ -393,9 +450,10 @@ pub async fn timeout_member(
     .bind(muted_until)
     .bind(reason)
     .bind(actor)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -406,6 +464,10 @@ pub async fn untimeout_member(
     pubkey: &[u8],
     actor: &[u8],
 ) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::relay_members::acquire_membership_write_lock(&mut tx, community).await?;
+    crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await?;
+
     let result = sqlx::query(
         r#"
         UPDATE community_bans
@@ -417,10 +479,12 @@ pub async fn untimeout_member(
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(actor)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(result.rows_affected() > 0)
+    let lifted = result.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(lifted)
 }
 
 /// Restriction snapshot consumed by the auth-seam gate (L4) and write gates.

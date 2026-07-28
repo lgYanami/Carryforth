@@ -14,6 +14,8 @@ mod patch;
 mod projection;
 mod read_model;
 mod state;
+/// Project View v2 role-continuity primitives.
+pub mod v2;
 mod validation;
 
 pub use error::{DomainError, DomainResult};

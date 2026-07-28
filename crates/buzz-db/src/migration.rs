@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 25);
+        assert_eq!(migrations.len(), 26);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -899,6 +899,28 @@ mod tests {
         assert!(project_view.contains("project_view_validate_object"));
         assert!(!project_view.contains("SELECT count(*) INTO actual_count"));
         assert!(!migrations[0].sql.as_str().contains("project_view_objects"));
+
+        // Role continuity is another additive, disabled-by-default layer.
+        // Community schema version 1 remains the default, while the v2 tables,
+        // partial uniqueness constraints, and deferred cross-table guard land
+        // before any Community can be cut over.
+        assert_eq!(migrations[25].version, 26);
+        let role_continuity = migrations[25].sql.as_str();
+        assert!(role_continuity.contains("ADD COLUMN project_view_schema_version"));
+        assert!(role_continuity.contains("DEFAULT 1"));
+        assert!(role_continuity.contains("CREATE TABLE project_view_changes"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_assignments"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_assignment_proposals"));
+        assert!(role_continuity.contains("CREATE TABLE project_work_commitments"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_checkpoints"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_handoffs"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_continuity_references"));
+        assert!(role_continuity
+            .contains("CREATE UNIQUE INDEX idx_project_role_assignments_active_role"));
+        assert!(role_continuity
+            .contains("CREATE UNIQUE INDEX idx_project_role_assignments_active_member"));
+        assert!(role_continuity.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(role_continuity.contains("project_role_continuity_validate_community"));
     }
 
     #[test]
@@ -913,6 +935,12 @@ mod tests {
             "project_view_validate_object",
             "project_view_state_validate",
             "project_view_objects_validate",
+            "project_view_schema_version SMALLINT NOT NULL DEFAULT 1",
+            "CREATE TABLE project_view_changes",
+            "CREATE TABLE project_role_assignments",
+            "idx_project_role_assignments_active_role",
+            "idx_project_role_assignments_active_member",
+            "project_role_continuity_validate_community",
         ] {
             assert!(
                 schema.contains(fragment),
@@ -1203,8 +1231,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database to 0025");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
+            .expect("upgrade scratch database through 0026");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1229,10 +1257,64 @@ mod tests {
         .await
         .expect("pre-feature insert shape remains compatible");
         assert!(!legacy_insert_flag);
+        let legacy_event_id = vec![0x25_u8; 32];
+        let legacy_actor = vec![0x26_u8; 32];
+        let legacy_meta_id = vec![0x27_u8; 32];
+        let legacy_signer = vec![0x28_u8; 32];
+        let mut legacy_tx = pool
+            .begin()
+            .await
+            .expect("begin legacy v1 write-shape transaction");
+        let legacy_state: (i16, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+            "INSERT INTO project_view_state ( \
+                 community_id, project_revision, active_object_count, \
+                 initialized_at, updated_at, last_event_id, last_actor_pubkey, \
+                 meta_projection_event_id, projection_pubkey, projection_generation \
+             ) VALUES ($1, 1, 0, now(), now(), $2, $3, $4, $5, 1) \
+             RETURNING schema_version, last_change_id, last_source_event_id",
+        )
+        .bind(legacy_insert_id)
+        .bind(&legacy_event_id)
+        .bind(&legacy_actor)
+        .bind(&legacy_meta_id)
+        .bind(&legacy_signer)
+        .fetch_one(&mut *legacy_tx)
+        .await
+        .expect("migration 0026 accepts the exact v1 state insert shape");
+        assert_eq!(
+            legacy_state,
+            (1, legacy_event_id.clone(), Some(legacy_event_id))
+        );
+
+        let next_legacy_event_id = vec![0x29_u8; 32];
+        let mirrored_change_id: Vec<u8> = sqlx::query_scalar(
+            "UPDATE project_view_state \
+             SET project_revision = 2, updated_at = now(), last_event_id = $2 \
+             WHERE community_id = $1 \
+             RETURNING last_change_id",
+        )
+        .bind(legacy_insert_id)
+        .bind(&next_legacy_event_id)
+        .fetch_one(&mut *legacy_tx)
+        .await
+        .expect("migration 0026 accepts the exact v1 state update shape");
+        assert_eq!(mirrored_change_id, next_legacy_event_id);
+        legacy_tx
+            .rollback()
+            .await
+            .expect("rollback isolated v1 write-shape probe");
+
         for table in [
             "project_view_state",
             "project_view_objects",
             "project_view_mutations",
+            "project_view_changes",
+            "project_role_assignments",
+            "project_role_assignment_proposals",
+            "project_work_commitments",
+            "project_role_checkpoints",
+            "project_role_handoffs",
+            "project_role_continuity_references",
         ] {
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                 .bind(format!("public.{table}"))
@@ -1282,15 +1364,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(25));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(26));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version = 25 AND success",
+             WHERE version IN (25, 26) AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 1);
+        assert_eq!(project_view_migration_count, 2);
 
         first.close().await;
         second.close().await;
@@ -1370,7 +1452,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
     }
 
     #[tokio::test]

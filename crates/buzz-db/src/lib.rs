@@ -17,6 +17,7 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+mod community_lock;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -898,6 +899,13 @@ impl Db {
         let (id, host) = if let Some(row) = row {
             let id: Uuid = row.try_get("id")?;
             let host: String = row.try_get("host")?;
+            let community_id = CommunityId::from_uuid(id);
+
+            // Membership and Project View share one Community-scoped lock.
+            // Even though a fresh Community is schema v1, using the common
+            // primitive here prevents provisioning from becoming a future
+            // bypass when defaults or cutover tooling evolve.
+            relay_members::acquire_membership_write_lock(&mut tx, community_id).await?;
 
             // Enforce the limit before inserting the new owner row.
             let owned_count: i64 = sqlx::query_scalar(
@@ -912,12 +920,13 @@ impl Db {
                 return Ok(CreateCommunityWithOwnerResult::LimitReached);
             }
 
-            sqlx::query(
-                "INSERT INTO relay_members (community_id, pubkey, role, added_by) VALUES ($1, $2, 'owner', NULL)",
+            relay_members::insert_relay_member_in_tx(
+                &mut tx,
+                community_id,
+                &owner_pubkey,
+                "owner",
+                None,
             )
-            .bind(id)
-            .bind(&owner_pubkey)
-            .execute(&mut *tx)
             .await?;
             (id, host)
         } else {
@@ -2926,6 +2935,33 @@ impl Db {
         relay_members::get_relay_member(&self.pool, community, pubkey).await
     }
 
+    /// Resolve direct and managed-Agent membership state in one database
+    /// snapshot.
+    pub async fn relay_membership_identity(
+        &self,
+        community: CommunityId,
+        pubkey: &[u8],
+    ) -> Result<relay_members::RelayMembershipIdentity> {
+        relay_members::relay_membership_identity(&self.pool, community, pubkey).await
+    }
+
+    /// Check a self-proving NIP-OA Agent/owner pair against current membership
+    /// and persistent-ban state.
+    pub async fn delegated_agent_owner_is_eligible(
+        &self,
+        community: CommunityId,
+        agent_pubkey: &[u8],
+        owner_pubkey: &[u8],
+    ) -> Result<bool> {
+        relay_members::delegated_agent_owner_is_eligible(
+            &self.pool,
+            community,
+            agent_pubkey,
+            owner_pubkey,
+        )
+        .await
+    }
+
     /// Returns all relay members of `community` ordered by `created_at` ascending.
     pub async fn list_relay_members(
         &self,
@@ -3010,8 +3046,10 @@ impl Db {
         relay_members::bootstrap_owner(&self.pool, community, owner_pubkey).await
     }
 
-    /// Atomically transfers ownership of `community` to `new_owner_pubkey`,
-    /// demoting the previous owner(s) to `member`. Verifies
+    /// Atomically transfers ownership of a v1 `community` to
+    /// `new_owner_pubkey`, demoting previous owners to `member`. A v2
+    /// Community fails closed until its source/audit/projection coordinator is
+    /// available. Verifies
     /// `expected_owner_pubkey` matches the current owner inside the same
     /// transaction to prevent stale-owner races.
     pub async fn transfer_ownership(
@@ -3449,40 +3487,63 @@ impl Db {
         community_id: CommunityId,
         relay_pubkey: &nostr::PublicKey,
     ) -> Result<bool> {
-        let snapshot = self
-            .query_events(&crate::event::EventQuery {
-                kinds: Some(vec![buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32]),
-                pubkey: Some(relay_pubkey.to_bytes().to_vec()),
-                global_only: true,
-                limit: Some(1),
-                ..crate::event::EventQuery::for_community(community_id)
-            })
-            .await?
-            .into_iter()
-            .next();
-        let members = self.list_relay_members(community_id).await?;
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
 
-        let Some(snapshot) = snapshot else {
+        let snapshot_tags: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT tags FROM events \
+             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
+               AND channel_id IS NULL AND deleted_at IS NULL \
+             ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32)
+        .bind(relay_pubkey.as_bytes())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let rows = sqlx::query(
+            "SELECT pubkey, role FROM relay_members \
+             WHERE community_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let Some(snapshot_tags) = snapshot_tags else {
+            tx.rollback().await?;
             return Ok(true);
         };
-        let mut snapshot_members = snapshot
-            .event
-            .tags
-            .iter()
+        let mut snapshot_members = snapshot_tags
+            .as_array()
+            .into_iter()
+            .flatten()
             .filter_map(|tag| {
-                let parts = tag.as_slice();
-                (parts.first().map(String::as_str) == Some("member") && parts.len() >= 3)
-                    .then(|| (parts[1].to_ascii_lowercase(), parts[2].clone()))
+                let parts = tag.as_array()?;
+                if parts.first()?.as_str()? != "member" || parts.len() < 3 {
+                    return None;
+                }
+                Some((
+                    parts.get(1)?.as_str()?.to_ascii_lowercase(),
+                    parts.get(2)?.as_str()?.to_owned(),
+                ))
             })
             .collect::<Vec<_>>();
-        let mut canonical_members = members
+        let mut canonical_members = rows
             .into_iter()
-            .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
-            .collect::<Vec<_>>();
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("pubkey")?.to_ascii_lowercase(),
+                    row.try_get::<String, _>("role")?,
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
         snapshot_members.sort_unstable();
         canonical_members.sort_unstable();
 
-        Ok(snapshot_members != canonical_members)
+        let needs_reconciliation = snapshot_members != canonical_members;
+        tx.rollback().await?;
+        Ok(needs_reconciliation)
     }
 
     /// Atomically publish a NIP-43 membership snapshot under a single
@@ -3508,6 +3569,12 @@ impl Db {
             event_replacement_lock_key(community_id, kind_i32, pubkey_bytes.as_slice(), None);
 
         let mut tx = self.pool.begin().await?;
+
+        // Lock order is shared with Project View and every membership writer:
+        // Community/Project first, then the NIP-43 replacement coordinate.
+        // This makes a snapshot read from the same serialized membership state
+        // that role-continuity transactions protect.
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
 
         // Acquire the per-community snapshot lock BEFORE reading members.
         // This serializes the entire read-build-write cycle: a concurrent
