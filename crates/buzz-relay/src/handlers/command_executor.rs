@@ -23,7 +23,9 @@ use buzz_core::StoredEvent;
 use buzz_db::meeting::{
     CreateMeetingParams, EndMeetingOutcome, EndMeetingParams, MAX_MEETING_PARTICIPANTS,
 };
-use buzz_db::meeting_floor::{ClaimFloorOutcome, WinnerSelector};
+use buzz_db::meeting_floor::{
+    ClaimFloorOutcome, FloorSignalAction, FloorSignalOutcome, WinnerSelector, YieldOutcome,
+};
 use buzz_db::workflow::{ApprovalStatus, RunStatus};
 use buzz_db::DbError;
 use buzz_workflow::executor::TriggerContext;
@@ -74,6 +76,9 @@ pub async fn handle_command(
         KIND_MEETING_CREATE => handle_meeting_create(tenant, state, &event, &auth).await,
         KIND_MEETING_END => handle_meeting_end(tenant, state, &event, &auth).await,
         KIND_MEETING_FLOOR_CLAIM => handle_meeting_floor_claim(tenant, state, &event, &auth).await,
+        KIND_MEETING_FLOOR_SIGNAL => {
+            handle_meeting_floor_signal(tenant, state, &event, &auth).await
+        }
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
@@ -673,6 +678,171 @@ async fn handle_meeting_floor_claim(
             "conflict: meeting round already has a canonical Claim for this participant: {}",
             hex::encode(canonical_claim_event_id)
         ))),
+    }
+}
+
+async fn handle_meeting_floor_signal(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    if !event.content.is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: meeting floor signal content must be empty".into(),
+        ));
+    }
+    let action = require_single_tag(event, "action")?;
+    match action.as_str() {
+        "ready" | "pass" => validate_meeting_tag_vocabulary(
+            event,
+            &["h", "meeting-round", "action", "intent-basis"],
+            &[],
+        )?,
+        "yield" => validate_meeting_tag_vocabulary(
+            event,
+            &["h", "meeting-round", "action", "meeting-grant"],
+            &[],
+        )?,
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: meeting floor action must be ready, pass, or yield".into(),
+            ));
+        }
+    }
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if auth
+        .channel_ids()
+        .is_some_and(|ids| !ids.contains(&session_id))
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: token not authorized for this meeting".into(),
+        ));
+    }
+    let round_number = parse_positive_round(event)?;
+    let config = crate::meeting_runtime::floor_config_from_env();
+
+    if action == "yield" {
+        let grant_event_id = decode_event_id(
+            &require_single_tag(event, "meeting-grant")?,
+            "meeting Grant event id",
+        )?;
+        let outcome = buzz_db::meeting_floor::yield_floor(
+            &state.db,
+            tenant.community(),
+            session_id,
+            round_number,
+            &grant_event_id,
+            event,
+            &state.relay_keypair,
+            config,
+            WinnerSelector::UniformRandom,
+        )
+        .await
+        .map_err(map_meeting_db_error)?;
+        return match outcome {
+            YieldOutcome::Accepted {
+                round_number,
+                signal_event_id,
+                next_round_number,
+                floor_revision,
+            } => Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::json!({
+                        "meeting_id": session_id,
+                        "round_number": round_number,
+                        "action": "yield",
+                        "signal_event_id": hex::encode(signal_event_id),
+                        "next_round_number": next_round_number,
+                        "floor_revision": floor_revision,
+                    })
+                ),
+            }),
+            YieldOutcome::Duplicate {
+                round_number,
+                signal_event_id,
+            } => Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::json!({
+                        "meeting_id": session_id,
+                        "round_number": round_number,
+                        "action": "yield",
+                        "signal_event_id": hex::encode(signal_event_id),
+                        "duplicate": true,
+                    })
+                ),
+            }),
+        };
+    }
+
+    let intent_basis = require_single_tag(event, "intent-basis")?;
+    let signal_action = if action == "ready" {
+        FloorSignalAction::Ready
+    } else {
+        FloorSignalAction::Pass
+    };
+    let outcome = buzz_db::meeting_floor::signal_intent(
+        &state.db,
+        tenant.community(),
+        session_id,
+        round_number,
+        signal_action,
+        &intent_basis,
+        event,
+        &state.relay_keypair,
+        config,
+        WinnerSelector::UniformRandom,
+    )
+    .await
+    .map_err(map_meeting_db_error)?;
+    match outcome {
+        FloorSignalOutcome::Accepted {
+            round_number,
+            floor_revision,
+            signal_event_id,
+        } => Ok(IngestResult {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::json!({
+                    "meeting_id": session_id,
+                    "round_number": round_number,
+                    "action": action,
+                    "intent_basis": intent_basis,
+                    "floor_revision": floor_revision,
+                    "signal_event_id": hex::encode(signal_event_id),
+                    "canonical": true,
+                })
+            ),
+        }),
+        FloorSignalOutcome::Duplicate {
+            round_number,
+            floor_revision,
+            signal_event_id,
+        } => Ok(IngestResult {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::json!({
+                    "meeting_id": session_id,
+                    "round_number": round_number,
+                    "action": action,
+                    "intent_basis": intent_basis,
+                    "floor_revision": floor_revision,
+                    "signal_event_id": hex::encode(signal_event_id),
+                    "canonical": true,
+                    "duplicate": true,
+                })
+            ),
+        }),
     }
 }
 

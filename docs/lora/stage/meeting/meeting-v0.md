@@ -4,6 +4,9 @@
 >
 > 本文定义 Meeting V0 的产品边界、核心语义、Buzz 映射、Agent 行为和验收标准。
 > 它不定义候选决议、人类确认、决定写回或其他正式治理程序。
+>
+> 阶段 3 的 Agent 上下文、提示词、工具和恢复协议见
+> [Meeting V0 阶段 3：Agent 会议模式设计](./meeting-v0-stage3-agent-mode.md)。
 
 ## 1. 文档目的
 
@@ -98,8 +101,9 @@ Human 与 Agent 拥有相同的基础抢夺资格，但不拥有绕过发言权�
 2. **发言权执行**：只有 `CLAIM` 抢夺成功后，Harness 才允许 Agent 发布一条签名消息。
 
 Agent 的 `PASS` 是明确、可由 Harness/Observer 观察并恢复的调度结果，不再依赖“模型也许
-会保持沉默”；它不是其他参会者可见的会议事件。发言权控制谁可以进入公开时间线，发言
-意图判断控制 Agent 是否应当参与本轮抢夺。
+会保持沉默”。Ready/Pass 只进入共享 floor control log，不进入会议 speech timeline；
+模型的 reason、speaking goal 和隐藏推理仍只保存在 Agent 私有账本。发言权控制谁可以
+进入公开时间线，发言意图判断控制 Agent 是否应当参与本轮抢夺。
 
 ## 4. MeetingSession 模型
 
@@ -148,12 +152,16 @@ SpeechRound
 - session_id
 - round_number
 - phase: open | claiming | granted | closed
+- decision_cohort[]
+- ready_participants[]
+- passed_participants[]
 - claims[]
+- settle_not_before?
 - claim_deadline?
 - holder_pubkey?
 - grant_event_id?
 - lease_expires_at?
-- outcome?: spoken | expired | ended
+- outcome?: spoken | yielded | expired | ended
 - speech_event_id?
 - policy_version: uniform-v0
 ```
@@ -233,8 +241,9 @@ Participant
             └── meeting-grant = relay-signed grant event ID
 ```
 
-V0 不引入会议专用正文消息 kind。主消息时间线只写入、查询和订阅 kind `9`；Claim 和
-Round State 使用独立控制事件。会议身份来自消息所属会议室。kind `40002` 不属于
+V0 不引入会议专用正文消息 kind。主消息时间线只写入、查询和订阅 kind `9`；Claim、
+Floor Signal 和 Round State 使用独立控制事件。会议身份来自消息所属会议室。
+kind `40002` 不属于
 Meeting V0 的规范消息集合，也不能由通用客户端写入会议室。由于 V0 会议室都是新建的，
 不需要承担旧消息 kind 的历史兼容。
 
@@ -244,8 +253,9 @@ Relay 的 meeting policy 必须把允许写入的消息集合限制为不带 thr
 kind `9`，并拒绝 kind `40002`、编辑、删除、Diff、定时消息以及其他通用 Channel
 消息变体，避免不同客户端得到不同的规范日志。
 
-kind `9` 只是最终发言。Claim、Round State 和 Grant 属于独立的会议控制日志，不混入
-主消息时间线；所有参会者仍能查询这些事件并看到当前轮次、抢夺状态和发言权持有者。
+kind `9` 只是最终发言。Claim、Floor Signal、Round State 和 Grant 属于独立的会议控制
+日志，不混入主消息时间线；所有参会者仍能查询这些事件并看到当前轮次、抢夺状态和发言
+权持有者。
 
 ### 6.2 “完整消息”的准确含义
 
@@ -254,9 +264,9 @@ V0 对完整消息作如下定义：
 > 会议稳定后，每名参会者都能查询到从会议开始到当前为止相同的、Relay 已接受的会议
 > 消息 event ID 集合，并能按相同规则形成确定的显示顺序。
 
-这里的“消息记录”特指成功获得发言权后写入的 canonical speech log。Claim、Round State、
-Grant 及超时转换形成另一份同样共享、可恢复的 floor control log；控制日志不计作参会者
-发言，但可以用于解释每条消息为何有权进入时间线。
+这里的“消息记录”特指成功获得发言权后写入的 canonical speech log。Claim、Floor
+Signal、Round State、Grant 及超时转换形成另一份同样共享、可恢复的 floor control log；
+控制日志不计作参会者发言，但可以用于解释每条消息为何有权进入时间线。
 
 它不承诺网络传输层的 exactly-once。客户端必须：
 
@@ -323,7 +333,8 @@ Relay 要么一次接受完整 Session，要么拒绝整个创建事件：
 - Relay 回执必须指出失败身份和原因，便于发起者调整名单后重新提交。
 
 Session 本身不设置活动 TTL。文字会议允许异步参与，“一段时间没有消息”不等于会议
-已经结束；但 Claim 竞争窗口和已授予的发言权必须分别具有短 deadline 和 lease。
+已经结束；但 Claim 竞争窗口和已授予的发言权必须分别具有明确的 deadline 和 lease。
+这些时间都是故障上限，满足提前结算条件或成功发言时立即推进。
 
 ### 7.2 创建提交
 
@@ -393,6 +404,7 @@ V0 由会议 Owner 结束；Community 管理员保留恢复性结束能力。
 | 激活 | `KIND_MEETING_CREATE` 与完整名单原子提交 |
 | 当前会议状态 | `room_kind=meeting` 与 Channel `archived_at` 的持久投影 |
 | 发言权申请 | participant-signed `KIND_MEETING_FLOOR_CLAIM` |
+| Ready / Pass / Yield | participant-signed `KIND_MEETING_FLOOR_SIGNAL` |
 | 轮次与授权 | Relay-signed `KIND_MEETING_ROUND_STATE` 与持久 Round 投影 |
 | 当前发言权读取 | 现有 Channel Detail 中的 Floor 投影 + kind `42103` 历史/实时事件 |
 | 结束 | `KIND_MEETING_END` 与 `archived_at` 原子提交 |
@@ -409,18 +421,19 @@ Relay 从 Meeting Create 事件产生这个投影，Channel Detail、Channel Sum
 会议。
 
 Meeting Channel Detail 还必须返回当前 `round_number`、`floor_revision`、phase、
-deadline、canonical Claim IDs/claimants、当前查看者的 canonical Claim ID（若有）、
-holder、Grant ID、lease 和前序 Round 结果引用。CLI、ACP 与 Desktop 用这份权威快照完成
-同步，再用 kind `42103` 增量推进；这只是扩展现有读取模型，不增加会议专用 HTTP
-endpoint。
+decision cohort、Ready/Pass 集合、`settle_not_before`、deadline、canonical Claim
+IDs/claimants、当前查看者的 canonical Claim ID（若有）、holder、Grant ID、lease 和
+前序 Round 结果引用。CLI、ACP 与 Desktop 用这份权威快照完成同步，再用 kind `42103`
+增量推进；这只是扩展现有读取模型，不增加会议专用 HTTP endpoint。
 
-V0 分配四个新事件 kind，并首先登记到 `buzz-core/src/kind.rs`：
+V0 分配五个会议事件 kind，并首先登记到 `buzz-core/src/kind.rs`：
 
 ```text
 KIND_MEETING_CREATE      = 42100
 KIND_MEETING_END         = 42101
 KIND_MEETING_FLOOR_CLAIM = 42102
 KIND_MEETING_ROUND_STATE = 42103
+KIND_MEETING_FLOOR_SIGNAL = 42104
 ```
 
 原子创建事件形状：
@@ -478,6 +491,29 @@ ended  = valid MeetingEnd exists    && archived_at != null
 
 Claim 不携带候选发言内容；草稿在获权并形成 kind `9` 之前只保留在参与者本地。
 
+Agent 会议模式使用 participant-signed Floor Signal 表达不进入 speech timeline 的控制
+动作：
+
+```json
+{
+  "kind": 42104,
+  "tags": [
+    ["h", "<session-uuid>"],
+    ["meeting-round", "<round-number>"],
+    ["action", "ready|pass|yield"],
+    ["intent-basis", "<opaque-basis-id>"],
+    ["meeting-grant", "<required-for-yield>"]
+  ],
+  "content": ""
+}
+```
+
+`ready` 表示 Agent 已同步当前轮并将产生 Claim/Pass，`pass` 表示本轮不申请，
+`yield` 表示当前 holder 主动释放有效 Grant。Signal 不携带候选正文、reason 或模型
+隐藏推理。Ready/Pass 必须携带 `intent-basis` 且只接受名单中的 Agent 身份；Yield
+必须携带当前 `meeting-grant` 且只接受当前 holder。首次接受的 Ready/Pass 更新持久
+control log、Round 投影和 `floor_revision`，同一 signed event 重试不产生新 revision。
+
 Relay-signed Round State 使用 kind `42103` 表达 `open`、`claiming`、`granted` 和
 `closed` 转换。`granted` 状态事件的 event ID 同时作为不可伪造的 Grant ID：
 
@@ -496,8 +532,10 @@ Relay-signed Round State 使用 kind `42103` 表达 `open`、`claiming`、`grant
 }
 ```
 
-所有 Round State 都携带 `floor-revision`。`closed` 事件在 content 中记录
-`outcome=spoken | expired | ended`，并在 `spoken` 时记录 accepted speech event ID；
+所有 Round State 都携带 `floor-revision`。`claiming` 状态还记录本轮冻结的
+`decision_cohort`、`settle_not_before`、`claim_deadline` 和已完成的 Claim/Pass 集合。
+`closed` 事件在 content 中记录 `outcome=spoken | yielded | expired | ended`，并在
+`spoken` 时记录 accepted speech event ID；
 后续 `open` 使用更大的 revision，并重复 `previous_round`、`previous_outcome` 和可选
 `previous_speech_event_id`。因此即使 outbox 乱序，客户端也知道开放 Claim 前必须补齐
 哪条前序发言。
@@ -517,16 +555,18 @@ V0 采用以下权威状态机：
 ```text
 open
   ↓ 第一份有效 Claim
-claiming（短竞争窗口）
-  ↓ Relay 在有效 Claim 中等概率选出一人
-granted（唯一 holder + 限时 lease）
+claiming（最短 3 秒、最长 5 分钟；Agent 全部完成决定时可提前结算）
+  ↓ Relay 在 canonical Claim 中等概率选出一人
+granted（唯一 holder + 最长 5 分钟 lease）
   ├── holder 发出一条有效消息 ──→ closed/spoken ──→ 下一轮 open
+  ├── holder 主动放弃 Grant ────→ closed/yielded ─→ 下一轮 open
   └── lease 到期未发言 ─────────→ closed/expired ─→ 下一轮 open
 ```
 
-V0 把“抢夺”明确解释为“短窗口报名 + 有效 Claim 等概率仲裁”，不是网络包最先到者直接
-获权。这样可以降低纯网络延迟造成的偏置，并为后续 Leader 权重、身份权重和 Human 直获
-策略保留同一套 Claim/Grant 协议。
+V0 把“抢夺”明确解释为“有上限、可提前完成的报名窗口 + 有效 Claim 等概率仲裁”，不是
+网络包最先到者直接获权。这样既不会固定等待 5 分钟，也给较慢的 Agent Intent Turn
+实际完成机会，并为后续 Leader 权重、身份权重和 Human 直获策略保留同一套
+Claim/Grant 协议。
 
 具体规则：
 
@@ -534,41 +574,49 @@ V0 把“抢夺”明确解释为“短窗口报名 + 有效 Claim 等概率仲�
 2. `open` 没有 Claim 时可以无限保持安静；
 3. 有效 Claim 必须来自活动参会者，并且指向当前 `open` 或尚未截止的 `claiming`
    Round；旧轮、未来轮和截止后的 Claim 都被拒绝；
-4. 第一份有效 Claim 启动默认 3 秒、Relay 可配置的竞争窗口，使 Human 和较慢 Agent
-   都有实际参加机会；
-5. deadline 边界只使用 Claim 事务锁定 Round 后取得的数据库 receive time：
+4. Agent 在同步当前 Round 且存在未处理 IntentBasis 时，先提交 Ready，再运行 Intent
+   Turn；第一份有效 Claim 到达时，Relay 冻结已经 Ready 的 Agent 为
+   `decision_cohort`；
+5. 第一份 Claim 同时设置 `settle_not_before=received_at+3s` 和
+   `claim_deadline=received_at+5min`；3 秒是 Human 与并发 Claim 的最短竞争窗口，
+   5 分钟是慢模型或故障的最长等待上限；
+6. `settle_not_before` 到达且 cohort 中每个 Agent 都已有 canonical Claim 或 Pass 时
+   立即仲裁；尚未全部完成时最多等到 `claim_deadline`；
+7. deadline 边界只使用 Claim 事务锁定 Round 后取得的数据库 receive time：
    `received_at < claim_deadline` 才进入候选集合；到达 deadline 的请求先触发本轮结算
    再被拒绝；
-6. 每名参会者每轮最多提交一份 Claim；相同 signed event ID 重试返回原 accepted 结果，
+8. 每名参会者每轮最多提交一份 Claim；相同 signed event ID 重试返回原 accepted 结果，
    同一身份提交第二个不同 event ID 时返回 conflict 和 canonical Claim ID；每份新的
    canonical Claim 都在同一事务中保存 Claim event/投影、递增 `floor_revision` 并保存
    携带最新 Claim 集合的 Relay-signed `claiming` State 与 outbox 记录；
-7. deadline 到达时冻结候选集合，Relay 使用安全随机源按 `uniform-v0` 等概率选择一名
+9. Relay 使用安全随机源按 `uniform-v0` 从 canonical Claim 中等概率选择一名
    持有者，并在同一事务中持久化候选集合与 winner；测试环境可以注入确定性选择器；
-   “等概率”只针对 deadline 前已进入候选集合的有效 Claim，不承诺不同延迟的参会者具有
-   相同入选机会；
-8. 未获选 Claim 不自动进入下一轮，参会者必须基于最新上下文重新判断；
-9. Claim 前应已准备草稿，因此 Grant 默认租约为 10 秒、Relay 可配置；持有者未在租约内
-   发出有效消息时，本轮进入
-   `closed/expired`；
-10. 只有 holder 可以消费 Grant，且每个 Grant 最多接受一条消息；Say 同样以数据库
+   “等概率”只针对结算前已进入候选集合的有效 Claim；
+10. Claim 不携带候选正文。只有 winner 在获得 Grant 后才生成完整发言；未获选者不得
+    发送，若原 Intent 在无新 speech 的下一轮仍然有效，可以重新建立 ClaimAttempt；
+11. Grant 默认最长租约为 5 分钟、Relay 可配置；它是 deadline 而不是固定时长，speech
+    成功或 holder Yield 时立即结束本轮；
+12. 只有 holder 可以消费 Grant，且每个 Grant 最多接受一条消息；Say 同样以数据库
     事务锁定 Round 后取得的 receive time 判断，只有
     `received_at < lease_expires_at` 才能接受；
-11. 消息接受、Grant 消费、当前轮 `closed/spoken` 和下一轮 `open` 必须在同一个事务中
+13. 消息接受、Grant 消费、当前轮 `closed/spoken` 和下一轮 `open` 必须在同一个事务中
     完成；
-12. Grant 过期、当前轮 `closed/expired` 和下一轮 `open` 也必须在同一个事务中完成；
-13. winner 与 `claiming → granted` 必须在同一事务中用数据库锁或 CAS 原子提交；
-14. Claim 窗口、租约 deadline 和选择结果使用数据库时间并持久化，Relay 重启后不得
-    重新打开窗口或抽取新的 winner；
-15. deadline 由持久 sweeper 推进，并在下一次相关请求到达时先执行 lazy recovery，
+14. holder Yield、当前轮 `closed/yielded` 和下一轮 `open` 必须在一个事务中完成；
+    Grant 过期、`closed/expired` 和下一轮 `open` 同样原子完成；
+15. winner 与 `claiming → granted` 必须在同一事务中用数据库锁或 CAS 原子提交；
+16. cohort、提前结算状态、Claim 窗口、租约 deadline 和选择结果使用数据库时间并
+    持久化，Relay 重启后不得重新打开窗口、改变 cohort 或抽取新的 winner；
+17. Ready/Pass/Yield 的作者、round、basis/Grant 引用和当前 phase 必须由 Relay 校验；
+    Pass 不进入抽签，Yield 只允许当前 holder；
+18. deadline 由持久 sweeper 推进，并在下一次相关请求到达时先执行 lazy recovery，
     不能只依赖进程内 timer；
-16. 每次状态变化都先确定并签名唯一的 Round State event ID，再在同一事务中保存 Round
+19. 每次状态变化都先确定并签名唯一的 Round State event ID，再在同一事务中保存 Round
     投影、signed event、递增后的 `floor_revision` 和 transactional outbox 记录；outbox
     只负责提交后的可靠 fan-out，commit 后不得重新生成或重签 Round State；
-17. 所有状态转换 CAS 都必须同时校验 `session.status=active` 和预期的
+20. 所有状态转换 CAS 都必须同时校验 `session.status=active` 和预期的
     `(round_number, phase, floor_revision)`；Meeting End 提交后，延迟的仲裁器或
     sweeper 只能 no-op；
-18. 客户端只应用更大的 `floor_revision` 并验证合法状态转换；发现 revision 跳号时先
+21. 客户端只应用更大的 `floor_revision` 并验证合法状态转换；发现 revision 跳号时先
     进入 reconcile 补齐缺口，不能让事件乱序回退或跳过必要上下文后直接开放发言。
 
 V0 的选择策略对所有身份等权，不提供连续发言优先、Leader 权重或 Human 直获发言权。
@@ -577,9 +625,10 @@ V0 的选择策略对所有身份等权，不提供连续发言优先、Leader �
 Relay 的持久投影至少保存：
 
 ```text
-session_id, round_number, floor_revision, phase, claim_deadline,
-canonical_claim_ids, holder_pubkey, grant_event_id, lease_expires_at,
-outcome, speech_event_id, policy_version
+session_id, round_number, floor_revision, phase, decision_cohort,
+ready_participants, passed_participants, settle_not_before, claim_deadline,
+canonical_claim_ids, holder_pubkey, grant_event_id, lease_expires_at, outcome,
+speech_event_id, policy_version
 ```
 
 Claims 对 `(session_id, round_number, claimant_pubkey)` 唯一；Grant 对
@@ -657,7 +706,7 @@ Meeting Event
     ↓ 验证签名、房间和作者
 Session Inbox
     ├── 持久游标 / event ID 去重
-    └── Speech Intent
+    └── Ready → Speech Intent
             ├── PASS
             └── CLAIM
                     ↓ 抢夺成功
@@ -666,7 +715,9 @@ Session Inbox
 ```
 
 所有 speech 和 floor control 事件都先进入 Inbox。Agent 可以持续观察，但观察本身不
-产生公开消息；只有结构化意图为 `CLAIM` 且 Relay 授权成功，才创建 Granted Turn。
+产生公开消息；同步当前 Round 且存在未处理 basis 时自动提交 Ready，只有结构化意图为
+`CLAIM` 且 Relay 授权成功，才创建 Granted Turn。详细状态、上下文和提示词协议见
+[阶段 3 Agent 会议模式设计](./meeting-v0-stage3-agent-mode.md)。
 
 ### 9.2 会议级订阅
 
@@ -678,7 +729,7 @@ Agent 通过两条路径发现会议：
 任何一条路径发现活动 Meeting Channel 后，都建立专用订阅：
 
 ```text
-kinds = [9, 42101, 42102, 42103]
+kinds = [9, 42101, 42102, 42103, 42104]
 #h    = [session_id]
 #p    = omitted
 ```
@@ -688,7 +739,7 @@ author gate。
 
 会议 author gate 应当只接受：
 
-- 固定参会者签名的规范 speech 和 Claim；
+- 固定参会者签名的规范 speech、Claim 和 Floor Signal；
 - 当前 Community 配置的 Relay/system pubkey 签名的 Round State；
 - 有权身份签名的 Meeting End。
 
@@ -715,7 +766,8 @@ Agent 在首次进入和每次重连时必须经过同步屏障：
 4. 合并缓存事件，再读取一次 Floor 投影并应用到最高 `floor_revision`；
 5. 只有历史无缺口、当前状态已对齐后才标记 `meeting_synced=true`。
 
-在同步完成前，Agent 可以缓存事件，但不能执行 Speech Intent、提交 Claim 或发送消息。
+在同步完成前，Agent 可以缓存事件，但不能提交 Ready/Pass、执行 Speech Intent、提交
+Claim 或发送消息。
 这防止 Agent 因先看到一个 `open` 事件、尚未看到此前会议内容而抢夺发言权。
 同步屏障在运行期间也持续生效：若 `closed/spoken` 引用的 speech event 尚未进入 Inbox，
 Agent 必须先按 event ID 补齐，再处理更高 revision 的 `open`。
@@ -724,7 +776,8 @@ Agent 必须先按 event ID 补齐，再处理更高 revision 的 `open`。
 
 - Session ID、标题和状态；
 - 完整参会者名单及 Human/Agent 类型；
-- 当前 round number、floor revision、phase、竞争 deadline、holder 和 lease；
+- 当前 round number、floor revision、phase、decision cohort、竞争 deadline、holder
+  和 lease；
 - 本轮尚未处理的消息；
 - 近期上下文窗口；
 - 完整历史的读取入口和游标。
@@ -752,16 +805,17 @@ SpeechIntent
 - intent_basis_id
 - decision: CLAIM | PASS
 - reason
+- speaking_goal?
+- evidence_needs[]
 - based_on_speech_cursor
 - observed_floor_revision
-- candidate_draft?
 ```
 
 Harness 把结果持久化为按 `(session_id, agent_pubkey, intent_basis_id)` 唯一的
-`IntentResult`，其生命周期为 `pending | resolved`。`PASS` 创建后即为 `resolved`，只
-进入这份私有运行账本与 Observer，不产生共享 Claim 事件；`CLAIM` 先进入 `pending`，
-只有在具体 Round 提交 kind `42102` 才参加抢夺。进程重启必须先恢复 IntentResult，不能
-对同一 basis 重复推理。
+`IntentResult`，其生命周期为 `running | pending | resolved | stale`。模型的 reason、
+speaking goal 和 evidence needs 只进入私有账本与 Observer；`PASS` 另外提交不含这些
+内容的 kind `42104 action=pass`，`CLAIM` 只有在具体 Round 提交 kind `42102` 才参加
+抢夺。进程重启必须先恢复 IntentResult，不能对同一 basis 重复推理。
 
 V0 的默认 Agent 规则：
 
@@ -769,21 +823,22 @@ V0 的默认 Agent 规则：
    应选择 `CLAIM`；
 2. 仅表示收到、重复他人观点、没有足够把握或没有新增价值时应选择 `PASS`；
 3. `@mention` 可以提高 Agent 选择 `CLAIM` 的意愿，但仍不能直接授予发言权；
-4. Agent 应在 Claim 前准备候选内容，避免抢到发言权后才开始长时间推理；
+4. Agent 在 Claim 前只形成 decision、reason、speaking goal 和 evidence needs，不生成
+   完整候选发言；完整内容只由 winner 在 Grant 内生成；
 5. `PASS` 终结当前 basis；没有新 basis 时，即使 Floor 多次换相或 Agent 重启也不会
    再次判断；
 6. 每个 Agent 每轮只有一个 ClaimAttempt slot，按
    `(session_id, agent_pubkey, round_number)` 持久唯一；若同时存在多个 pending
-   `CLAIM` IntentResult，调度器必须先选择一个或合并为 `basis_ids[]` 和一个明确的
-   candidate draft，再签名唯一的一份 kind `42102`；
+   `CLAIM` IntentResult，调度器必须选择一个或合并为 `basis_ids[]` 和一个 speaking
+   goal，再签名唯一的一份 kind `42102`；
 7. 抢夺失败后不得发送消息，也不得自动复制上一轮 Claim 事件；下一轮开放时，Harness
    必须基于最新 Inbox 重新确认绑定的 pending IntentResult 仍有效，才能为新 round 建立
    ClaimAttempt；
-8. 抢夺成功后，Agent 先对齐最新 Inbox 与 Floor revision，再快速复验候选内容，只能在
-   租约内提交一条消息；speech 被 Relay 接受后，winning ClaimAttempt 绑定的 basis
-   必须持久标记为 `resolved`；
-9. 候选内容已经过时或不再必要时，Agent 不发送，等待租约超时；
-   该 basis 随后标记为 resolved，不能因超时换轮再次 Claim；
+8. 抢夺成功后，Agent 先对齐最新 Inbox 与 Floor revision，再创建完整 Granted Turn；
+   它可以在 5 分钟 lease 内调用允许的只读工具并提交一条消息；
+9. Agent 在 Granted Turn 中发现内容已经过时或不再必要时，立即提交
+   `42104 action=yield`；Relay 原子换轮，不等待 lease 到期。该 basis 随后标记为
+   resolved，不能因 Yield 或超时换轮再次 Claim；
 10. Grant 始终属于参会者 pubkey，而不是某个 Agent 进程；进程退出不撤销或转移 Grant，
     使用同一身份恢复的实例可以在剩余 lease 内查询并消费，否则由租约自动回收；
 11. 同一 pubkey 的两个运行实例并发发送时，仍只有一个 event 能消费 Grant；
@@ -813,8 +868,14 @@ Relay-signed `granted` 状态把当前 Agent 指定为 holder 后开放，并必
 - 不产生 `e` root/reply、`q` 或其他线程引用；
 - 可以携带合法 `p` mention，但它不影响 Grant 的效力。
 
-模型选择普通回复工具时，Harness 也必须在提交前检查有效 Grant 并规范化到这条路径；
-没有有效 Grant 时应拒绝输出，不能把依赖模型“记得先申请发言权”当作正确性保证。
+模型不能直接调用普通回复工具。Harness 只接受 Granted Turn 的结构化 `SAY | YIELD`
+结果：`SAY` 由专用 sender 规范化并提交，`YIELD` 由专用 Floor Signal 路径提交。没有
+有效 Grant 时必须拒绝，不能把依赖模型“记得先申请发言权”当作正确性保证。
+
+Granted Turn 可以调用只读工具获取讨论所需的上下文，包括 Meeting 历史、Project View、
+项目文档、代码和 Git 历史；不能编辑文件、提交代码、修改 Project View/任务/决定、发送
+外部消息或启动工作流。工具能力由 Harness allowlist 强制，而不是只依赖提示词。工具
+调用和完整发言生成都受 5 分钟 lease 约束；speech 提前提交时立即换轮。
 
 真实 ACP 验收必须覆盖：会议激活、无 mention 的 Human speech 或内部任务结果形成
 IntentBasis，Agent 主动作出 `CLAIM`；抢夺成功后输出带有效 `meeting-round` 和
@@ -833,7 +894,10 @@ buzz meetings participants
 buzz meetings history
 buzz meetings floor status
 buzz meetings floor history
+buzz meetings floor ready
+buzz meetings floor pass
 buzz meetings floor claim [--wait]
+buzz meetings floor yield
 buzz meetings say
 buzz meetings end
 ```
@@ -842,16 +906,18 @@ buzz meetings end
 Agent 自己猜测某个普通 Channel 是否是会议：
 
 - `history` 只分页返回 canonical speech log；
-- `floor history` 分页返回 Claim 与 Round State control log；
-- `floor status` 返回当前 round、phase、`floor_revision`、deadline、Claim 集合、
-  `viewer_claim_event_id`、holder 和 lease；
+- `floor history` 分页返回 Claim、Ready/Pass/Yield 与 Round State control log；
+- `floor status` 返回当前 round、phase、`floor_revision`、decision cohort、
+  `settle_not_before`、deadline、Claim/Pass 集合、`viewer_claim_event_id`、holder 和
+  lease；
+- `floor ready` 只允许同步完成的 Agent 声明当前轮已经就绪；
+- `floor pass` 提交当前 basis 的明确沉默结果，但不进入 Claim 候选集合；
 - `floor claim` 只为当前轮提交 Claim；`--wait` 必须先建立状态等待再提交，直到输出
   `won | lost | ended`，并返回 round、最新 `floor_revision`、Grant ID 与 lease
   （若获胜），避免“先 Claim、后订阅”丢失结果；
+- `floor yield` 只允许当前 holder 在有效 lease 内主动释放 Grant，并立即打开下一轮；
 - `say` 必须读取或接收当前身份持有的有效 Grant，并由 Relay 再次校验，不能成为直接
   绕过发言权的发送入口。
-
-V0 不提供 `yield`：不发言时由短租约回收发言权。
 
 ## 10. Desktop V0
 
@@ -928,8 +994,9 @@ Meeting V0 必须持续满足：
 10. 每轮最多产生一个 Grant，并且最多只有一名 holder。
 11. 只有 holder 能在租约内消费 Grant，且一个 Grant 最多接受一条消息。
 12. 每轮最多向规范会议日志写入一条发言。
-13. 发言接受或 Grant 过期时，当前轮关闭与下一轮开放原子发生。
-14. Relay 重启不能重开竞争窗口、重新抽取 winner 或遗失有效 deadline。
+13. 发言接受、holder Yield 或 Grant 过期时，当前轮关闭与下一轮开放原子发生。
+14. Relay 重启不能改变 decision cohort、重开竞争窗口、重新抽取 winner 或遗失有效
+    deadline。
 15. 发言权状态只能按 `floor_revision` 单调前进，旧事件晚到不能造成状态回退。
 16. 所有参会者最终收敛到同一组会议消息和发言权控制事件。
 17. 在线订阅丢失可以由持久历史恢复。
@@ -1007,7 +1074,8 @@ V0 的主验收场景为：
 - 在事务提交点之前没有任何一方能发现房间或提交 Claim；
 - 在 `claiming` 期间重启 Relay，窗口按持久 deadline 继续且最终只产生一名 winner；
 - 在 `granted` 期间重启 Relay，winner 和剩余 lease 不变，不重新抽取；
-- holder 崩溃或选择不发言时，Grant 到期后自动进入下一轮；
+- holder 主动选择不发言时提交 Yield 并立即进入下一轮；holder 崩溃时 Grant 最迟在
+  5 分钟 lease 到期后自动进入下一轮；
 - 同一 Grant 的两个并发发送请求中最多一个成功；
 - 消息发送与 Owner 结束并发时，按 Relay 的事务线性化顺序恰有一种结果生效；
 - Claim 与 End、仲裁器与 End、lease sweeper 与 End 并发时，End 之后都不会再产生
@@ -1025,8 +1093,10 @@ V0 的主验收场景为：
 
 ### 12.6 发言权与 Agent 控制
 
-- Agent 的 `PASS` 不产生 Claim 或公开消息；
-- 历史和 Floor 同步屏障完成前，Agent 不执行 Intent、Claim 或 Say；
+- Agent 的 `PASS` 产生 floor control signal，但不产生 Claim、候选稿或公开消息；
+- 历史和 Floor 同步屏障完成前，Agent 不提交 Ready/Pass，不执行 Intent、Claim 或 Say；
+- 第一份 Claim 后，cohort 全部 Claim/Pass 且最短窗口到达时立即仲裁；只有未完成 Agent
+  才可能使竞争等待到最长 5 分钟；
 - 延迟发现或重启后，Agent 仍用同一个 `activation:<session_id>` basis，不重复创建激活
   Intent；
 - 相同 `intent_basis_id` 只产生一份持久 IntentResult；ACP 重启不会重复执行；
@@ -1042,7 +1112,10 @@ V0 的主验收场景为：
 - speech 被接受后，winning ClaimAttempt 绑定的 IntentBasis 全部 resolved；没有新 basis
   时下一轮不再 Claim；
 - Agent 获得 Grant 后崩溃不会阻塞会议，租约到期后自动换轮；
-- Agent 因候选内容过时而让 Grant 到期后，不会用相同 IntentBasis 再次 Claim；
+- Agent 在 Granted Turn 中发现内容过时或不再必要时主动 Yield 并立即换轮，不会用相同
+  IntentBasis 再次 Claim；
+- 只有 winner 运行完整发言生成；loser 不生成待丢弃的候选发言；
+- Granted Turn 可以调用允许的只读工具，但写工具和普通消息 sender 被 Harness 拒绝；
 - ACP 在 Agent 获得 Grant 后重启时，同一 pubkey 可以在剩余 lease 内恢复并消费；
 - 同一 pubkey 的两个实例同时恢复并发送时，仍最多接受一条消息；
 - 真实 ACP 输出始终是带正确 `meeting-round`、`meeting-grant` 且无 thread/reply tags
@@ -1076,9 +1149,11 @@ Grant、同轮双 speech、无/他人/过期 Grant 被接受、Floor revision �
 - 增加 room-scoped 无 mention 订阅；
 - 增加参会者 author gate；
 - 增加历史补齐、Inbox 和游标；
+- 增加 kind `42104` Ready/Pass/Yield、decision cohort、提前仲裁和最长 5 分钟窗口；
 - 增加结构化 `CLAIM | PASS` Speech Intent、同步屏障，以及持久 IntentResult /
   ClaimAttempt 去重；
-- 订阅 Relay Round State，并在赢得 Grant 后创建 Granted Turn；
+- 订阅 Relay Round State，并在赢得 Grant 后创建带 5 分钟上限的 Granted Turn；
+- 增加 meeting-specific system policy、只读工具 allowlist 和结构化 `SAY | YIELD`；
 - 强制 Meeting Turn 使用 Grant-bound 平铺 kind `9` sender。
 
 ### 13.3 第三段：Desktop 会议室
@@ -1097,11 +1172,11 @@ Grant、同轮双 speech、无/他人/过期 Grant 被接受、Floor revision �
 
 | 区域 | V0 主要变化 |
 |---|---|
-| `buzz-core` / `buzz-sdk` | kind `42100–42103` 常量与 builders、完整 `p` tags、Claim/Round State 和 Grant-bound kind `9` builder |
-| `buzz-db` | `room_kind` migration、会议/轮次/Claim 投影、唯一约束、deadline 与原子事务 |
-| `buzz-relay` | 原子创建、名单冻结、仲裁器、lease sweeper、Grant 校验、outbox 和权限测试 |
-| `buzz-cli` | `meetings`、`floor status/history/claim --wait`、Grant-bound `say` 及双日志分页 |
-| `buzz-acp` | 会议识别、全事件订阅、同步屏障、IntentResult/ClaimAttempt 账本、Roster 注入和平铺 sender |
+| `buzz-core` / `buzz-sdk` | kind `42100–42104` 常量与 builders、完整 `p` tags、Floor Signal/Claim/Round State 和 Grant-bound kind `9` builder |
+| `buzz-db` | `room_kind` migration、会议/轮次/Claim/Signal/cohort 投影、唯一约束、提前结算、deadline 与原子事务 |
+| `buzz-relay` | 原子创建、名单冻结、事件驱动仲裁器、lease sweeper、Grant/Yield 校验、outbox 和权限测试 |
+| `buzz-cli` | `meetings`、`floor status/history/ready/pass/claim/yield`、Grant-bound `say` 及双日志分页 |
+| `buzz-acp` | MeetingController、全事件订阅、同步屏障、持久 Agent Ledger、分阶段提示词、只读工具策略和平铺 sender |
 | `desktop/src-tauri` | 原子创建、Floor status/claim、Grant-bound say、会议查询与结束命令 |
 | `desktop/src/features/meetings` | 会议列表、创建弹窗、轮次/Claim/Grant UI、会议外壳和归档状态 |
 | `buzz-test-client` | `e2e_meeting.rs`，覆盖原子创建、抢夺、双花、超时、重启、权限和结束竞争 |
@@ -1115,7 +1190,7 @@ Grant、同轮双 speech、无/他人/过期 Grant 被接受、Floor revision �
 - 当前 holder 自动续得下一轮发言权；
 - 按 Owner、Leader、Human、Agent 或其他身份设置不同抢夺权重；
 - Human 直接取得或抢占发言权；
-- Claim 撤回、主动让出 Grant 和复杂排队策略；
+- Claim 撤回和复杂排队策略；
 - 跨轮等待时长上界、饥饿防护和统计公平性承诺；
 - 基于语义相关性、置信度或历史发言次数的 Relay 仲裁；
 - Agent-only 对话的全局 causal-hop 上限、自动主持和自动休会；

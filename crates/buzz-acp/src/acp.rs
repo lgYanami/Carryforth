@@ -19,6 +19,8 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+/// Maximum visible response retained for controller-owned structured turns.
+const MAX_AGENT_MESSAGE_SIZE: usize = 1_048_576;
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -200,6 +202,11 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Visible Agent message chunks accumulated for the current prompt.
+    ///
+    /// Ordinary Buzz turns publish through tools and ignore this buffer.
+    /// Meeting turns consume it as their strict structured controller result.
+    current_agent_message: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -496,6 +503,7 @@ impl AcpClient {
             active_run_id: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            current_agent_message: String::new(),
         })
     }
 
@@ -688,6 +696,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.current_agent_message.clear();
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -782,6 +791,14 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Consume the visible Agent message assembled during the latest prompt.
+    ///
+    /// The buffer is reset before every `session/prompt` request and bounded
+    /// while chunks arrive, so callers cannot observe text from an older turn.
+    pub fn take_agent_message(&mut self) -> String {
+        std::mem::take(&mut self.current_agent_message)
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1535,6 +1552,21 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    let remaining =
+                        MAX_AGENT_MESSAGE_SIZE.saturating_sub(self.current_agent_message.len());
+                    if remaining > 0 {
+                        let end = text
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .take_while(|index| *index <= remaining)
+                            .last()
+                            .unwrap_or(0);
+                        if text.len() <= remaining {
+                            self.current_agent_message.push_str(text);
+                        } else if end > 0 {
+                            self.current_agent_message.push_str(&text[..end]);
+                        }
+                    }
                 }
                 false
             }
@@ -3088,6 +3120,49 @@ mod tests {
                 },
             }
         })
+    }
+
+    fn agent_message_chunk(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": text,
+                    },
+                },
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn visible_agent_message_chunks_are_assembled_once_per_turn() {
+        let mut client = spawn_inert_client().await;
+        let _ = client.handle_session_update(&agent_message_chunk("{\"decision\":"));
+        let _ = client.handle_session_update(&agent_message_chunk("\"PASS\"}"));
+
+        assert_eq!(client.take_agent_message(), r#"{"decision":"PASS"}"#);
+        assert!(
+            client.take_agent_message().is_empty(),
+            "consuming a Meeting result must clear the per-turn buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_agent_message_capture_is_byte_bounded_and_utf8_safe() {
+        let mut client = spawn_inert_client().await;
+        let prefix = "a".repeat(MAX_AGENT_MESSAGE_SIZE - 1);
+        let _ = client.handle_session_update(&agent_message_chunk(&prefix));
+        let _ = client.handle_session_update(&agent_message_chunk("étail"));
+
+        let captured = client.take_agent_message();
+        assert_eq!(captured.len(), MAX_AGENT_MESSAGE_SIZE - 1);
+        assert!(captured.is_char_boundary(captured.len()));
+        assert_eq!(captured, prefix);
     }
 
     #[tokio::test]

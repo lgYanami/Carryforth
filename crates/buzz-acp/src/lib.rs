@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod meeting;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1435,6 +1436,10 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
+    let meeting_channel_ids: Vec<Uuid> = channel_info_map
+        .iter()
+        .filter_map(|(channel_id, info)| (info.room_kind == "meeting").then_some(*channel_id))
+        .collect();
 
     let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
         SubscribeMode::Mentions => {
@@ -1473,7 +1478,10 @@ async fn tokio_main() -> Result<()> {
         }
     };
 
-    let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    let mut channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    for channel_id in &meeting_channel_ids {
+        channel_filters.insert(*channel_id, meeting::subscription_filter());
+    }
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
@@ -1527,8 +1535,9 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    let mcp_servers = build_mcp_servers(&config);
     let ctx = Arc::new(PromptContext {
-        mcp_servers: build_mcp_servers(&config),
+        mcp_servers: mcp_servers.clone(),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
@@ -1553,6 +1562,7 @@ async fn tokio_main() -> Result<()> {
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
+        require_permission_mode: false,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
             .as_deref()
@@ -1561,6 +1571,47 @@ async fn tokio_main() -> Result<()> {
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
+    let meeting_mcp_servers = build_meeting_mcp_servers(&mcp_servers);
+    if !mcp_servers.is_empty() && meeting_mcp_servers.is_empty() {
+        tracing::warn!(
+            "Meeting turns will not receive the configured MCP server because only buzz-dev-mcp \
+             has an enforced read-only profile in Meeting V0"
+        );
+    }
+    let meeting_ctx = Arc::new(PromptContext {
+        mcp_servers: meeting_mcp_servers,
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: config::PermissionMode::Plan,
+        require_permission_mode: true,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let mut meeting_controller = meeting::MeetingCoordinator::new(
+        ctx.rest_client.clone(),
+        config.keys.clone(),
+        observer.clone(),
+    );
+    for channel_id in meeting_channel_ids {
+        meeting_controller.register(channel_id).await;
+    }
+    let mut meeting_tick = tokio::time::interval(Duration::from_secs(2));
+    meeting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -1705,6 +1756,9 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        if pool_ready {
+            dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
+        }
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -1712,7 +1766,7 @@ async fn tokio_main() -> Result<()> {
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            lazy_wake_work_pending = queue.has_flushable_work() || meeting_controller.has_pending();
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -1811,6 +1865,7 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
+            dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                 typing_channels.insert(channel_id, thread_tags);
             }
@@ -1901,6 +1956,11 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
+                _ = meeting_tick.tick() => {
+                    let _ = result_rx;
+                    meeting_controller.tick().await;
+                    None
+                }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
                 buzz_event = relay.next_event() => {
                     let _ = result_rx; // end split borrow before relay handling
@@ -1965,8 +2025,31 @@ async fn tokio_main() -> Result<()> {
                                     // stripped for a legitimately re-added channel.
                                     removed_channels.remove(&ch);
 
+                                    let is_meeting = ctx
+                                        .channel_info
+                                        .resolve(ch)
+                                        .await
+                                        .is_some_and(|info| info.room_kind == "meeting");
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
+                                        if is_meeting && !meeting_controller.contains(ch) {
+                                            meeting_controller.register(ch).await;
+                                        }
+                                    } else if is_meeting {
+                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to Meeting V0 room");
+                                        if let Err(e) = relay
+                                            .subscribe_channel_from(
+                                                ch,
+                                                meeting::subscription_filter(),
+                                                Some(ts),
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!("failed to subscribe to meeting {ch}: {e}");
+                                        } else {
+                                            subscribed_channel_ids.insert(ch);
+                                            meeting_controller.register(ch).await;
+                                        }
                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
@@ -1996,6 +2079,7 @@ async fn tokio_main() -> Result<()> {
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
+                                    meeting_controller.remove(ch);
                                     typing_channels.remove(&ch);
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
@@ -2020,6 +2104,25 @@ async fn tokio_main() -> Result<()> {
                                             "cleaned up after membership removal"
                                         );
                                     }
+                                }
+                                continue;
+                            }
+
+                            let is_meeting_event = if meeting_controller
+                                .contains(buzz_event.channel_id)
+                            {
+                                true
+                            } else {
+                                ctx.channel_info
+                                    .resolve(buzz_event.channel_id)
+                                    .await
+                                    .is_some_and(|info| info.room_kind == "meeting")
+                            };
+                            if is_meeting_event {
+                                if !meeting_controller.contains(buzz_event.channel_id) {
+                                    meeting_controller.register(buzz_event.channel_id).await;
+                                } else {
+                                    meeting_controller.handle_event(&buzz_event).await;
                                 }
                                 continue;
                             }
@@ -2272,6 +2375,7 @@ async fn tokio_main() -> Result<()> {
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 break;
                             }
+                            meeting_controller.mark_all_for_resync();
                         }
                     }
                     None
@@ -2351,15 +2455,20 @@ async fn tokio_main() -> Result<()> {
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
+                let mut result = *result;
                 // Stop typing indicator for the completed channel.
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                let meeting_turn = meeting_controller.owns_turn(&result.turn_id);
+                let meeting_turn_id = result.turn_id.clone();
+                let meeting_output = meeting_turn.then(|| result.agent.acp.take_agent_message());
+                let meeting_succeeded = matches!(&result.outcome, PromptOutcome::Ok(_));
+                let loop_action = handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
-                    *result,
+                    result,
                     &mut heartbeat_in_flight,
                     &removed_channels,
                     &mut crash_history,
@@ -2367,11 +2476,16 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
-                {
+                );
+                if let Some(output) = meeting_output {
+                    meeting_controller
+                        .handle_turn_result(&meeting_turn_id, output, meeting_succeeded)
+                        .await;
+                }
+                if loop_action == LoopAction::Exit {
                     break;
                 }
-                if drain_ready_join_results(
+                let (drain_action, failed_meeting_turns) = drain_ready_join_results(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -2382,16 +2496,26 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                ) == LoopAction::Exit
-                {
+                    &meeting_controller,
+                );
+                for turn_id in failed_meeting_turns {
+                    meeting_controller.handle_turn_failure(&turn_id).await;
+                }
+                if drain_action == LoopAction::Exit {
                     break;
                 }
+                dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
+                let failed_meeting_turn = pool
+                    .task_map()
+                    .get(&join_error.id())
+                    .map(|meta| meta.turn_id.clone())
+                    .filter(|turn_id| meeting_controller.owns_turn(turn_id));
                 recover_panicked_agent(
                     &mut pool,
                     &mut queue,
@@ -2405,10 +2529,14 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if let Some(turn_id) = failed_meeting_turn {
+                    meeting_controller.handle_turn_failure(&turn_id).await;
+                }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
+                dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -2555,6 +2683,7 @@ async fn tokio_main() -> Result<()> {
                             "ready",
                             None,
                         );
+                        dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
                         {
@@ -2885,6 +3014,77 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+/// Dispatch controller-owned Meeting turns before ordinary channel work.
+///
+/// The empty batch supplies channel/session affinity without leaking meeting
+/// events into the ordinary prompt formatter. The controller owns retries and
+/// durable recovery, so the queue-recovery copy is intentionally absent.
+fn dispatch_meeting_pending(
+    pool: &mut AgentPool,
+    controller: &mut meeting::MeetingCoordinator,
+    ctx: &Arc<PromptContext>,
+) {
+    while let Some(request) = controller.pop_pending() {
+        let channel_id = request.session_id;
+        let mut agent = match pool.try_claim(Some(channel_id)) {
+            Some(agent) => agent,
+            None => {
+                controller.requeue_front(request);
+                break;
+            }
+        };
+        let result_tx = pool.result_tx();
+        let ctx = Arc::clone(ctx);
+        let agent_index = agent.index;
+        let prompt = request.prompt.clone();
+        let batch = FlushBatch {
+            channel_id,
+            events: Vec::new(),
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
+        agent.acp.install_steer_rx(steer_rx);
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
+        let absolute_hard_deadline =
+            tokio::time::Instant::now() + meeting::remaining_before(request.hard_deadline_unix_ms);
+        let abort_handle = pool.join_set.spawn(async move {
+            pool::run_prompt_task(
+                agent,
+                Some(batch),
+                Some(prompt),
+                ctx,
+                result_tx,
+                pool::PromptExecution {
+                    control_rx: Some(control_rx),
+                    absolute_hard_deadline: Some(absolute_hard_deadline),
+                    turn_id: task_turn_id,
+                },
+            )
+            .await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(channel_id),
+                turn_id: turn_id.clone(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: Some(steer_tx),
+            },
+        );
+        controller.mark_dispatched(turn_id, request);
+        tracing::info!(
+            agent = agent_index,
+            meeting = %channel_id,
+            "meeting_turn_dispatched"
+        );
+    }
+}
+
 /// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
@@ -2951,8 +3151,11 @@ fn dispatch_pending(
                 None,
                 ctx_clone,
                 result_tx,
-                Some(control_rx),
-                task_turn_id,
+                pool::PromptExecution {
+                    control_rx: Some(control_rx),
+                    absolute_hard_deadline: None,
+                    turn_id: task_turn_id,
+                },
             )
             .await;
         });
@@ -3509,10 +3712,20 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) -> LoopAction {
+    meeting_controller: &meeting::MeetingCoordinator,
+) -> (LoopAction, Vec<String>) {
+    let mut failed_meeting_turns = Vec::new();
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
+            if let Some(turn_id) = pool
+                .task_map()
+                .get(&join_error.id())
+                .map(|meta| meta.turn_id.clone())
+                .filter(|turn_id| meeting_controller.owns_turn(turn_id))
+            {
+                failed_meeting_turns.push(turn_id);
+            }
             recover_panicked_agent(
                 pool,
                 queue,
@@ -3527,11 +3740,11 @@ fn drain_ready_join_results(
                 observer.clone(),
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                return LoopAction::Exit;
+                return (LoopAction::Exit, failed_meeting_turns);
             }
         }
     }
-    LoopAction::Continue
+    (LoopAction::Continue, failed_meeting_turns)
 }
 
 fn dispatch_heartbeat(
@@ -3564,8 +3777,11 @@ fn dispatch_heartbeat(
             Some(prompt_text),
             ctx_clone,
             result_tx,
-            None,
-            task_turn_id,
+            pool::PromptExecution {
+                control_rx: None,
+                absolute_hard_deadline: None,
+                turn_id: task_turn_id,
+            },
         )
         .await;
     });
@@ -4183,9 +4399,55 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
     }]
 }
 
+fn build_meeting_mcp_servers(servers: &[McpServer]) -> Vec<McpServer> {
+    servers
+        .iter()
+        .filter(|server| server.name == "buzz-dev-mcp")
+        .cloned()
+        .map(|mut server| {
+            server
+                .env
+                .retain(|variable| variable.name != "BUZZ_DEV_MCP_READ_ONLY");
+            server.env.push(EnvVar {
+                name: "BUZZ_DEV_MCP_READ_ONLY".to_string(),
+                value: "1".to_string(),
+            });
+            server
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod heartbeat_base_prompt_tests {
     use super::*;
+
+    #[test]
+    fn meeting_mcp_allowlist_keeps_only_enforced_read_only_dev_mcp() {
+        let servers = vec![
+            McpServer {
+                name: "buzz-dev-mcp".into(),
+                command: "/tmp/buzz-dev-mcp".into(),
+                args: Vec::new(),
+                env: vec![EnvVar {
+                    name: "BUZZ_DEV_MCP_READ_ONLY".into(),
+                    value: "0".into(),
+                }],
+            },
+            McpServer {
+                name: "untrusted-writer".into(),
+                command: "/tmp/untrusted-writer".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+        ];
+
+        let allowed = build_meeting_mcp_servers(&servers);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].name, "buzz-dev-mcp");
+        assert!(allowed[0].env.iter().any(|variable| {
+            variable.name == "BUZZ_DEV_MCP_READ_ONLY" && variable.value == "1"
+        }));
+    }
 
     // Pins the heartbeat dispatch path (dispatch_heartbeat, ~line 2359): a
     // legacy agent WITH a base_prompt must get [Base] prepended to the
@@ -4608,6 +4870,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    room_kind: "community".into(),
                 },
             ),
             (
@@ -4615,6 +4878,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    room_kind: "community".into(),
                 },
             ),
         ]);
@@ -4631,6 +4895,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                room_kind: "unknown".into(),
             },
         )]);
         assert!(

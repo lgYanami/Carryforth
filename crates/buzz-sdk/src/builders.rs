@@ -10,10 +10,10 @@ use buzz_core::{
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MODERATION_BAN,
-        KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
-        KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF,
-        KIND_WORKFLOW_TRIGGER,
+        KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
+        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
+        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
+        KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1667,6 +1667,94 @@ pub fn build_meeting_floor_claim(
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_FLOOR_CLAIM as u16), "").tags(tags))
 }
 
+fn build_meeting_floor_intent_signal(
+    session_id: Uuid,
+    round_number: u64,
+    action: &str,
+    intent_basis: &str,
+) -> Result<EventBuilder, SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    if round_number == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting round must be positive".into(),
+        ));
+    }
+    let intent_basis = intent_basis.trim();
+    if intent_basis.is_empty() {
+        return Err(SdkError::InvalidInput(
+            "meeting intent basis is required".into(),
+        ));
+    }
+    if intent_basis.len() > 512 || intent_basis.chars().any(char::is_control) {
+        return Err(SdkError::InvalidInput(
+            "meeting intent basis must be at most 512 bytes without control characters".into(),
+        ));
+    }
+    let tags = vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["meeting-round", &round_number.to_string()])?,
+        tag(&["action", action])?,
+        tag(&["intent-basis", intent_basis])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_FLOOR_SIGNAL as u16), "").tags(tags))
+}
+
+/// Build a Meeting V0 Ready signal (kind 42104).
+///
+/// Ready declares that the Agent has synchronized the current round and will
+/// resolve `intent_basis` to either a Claim or a Pass.
+pub fn build_meeting_floor_ready(
+    session_id: Uuid,
+    round_number: u64,
+    intent_basis: &str,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_floor_intent_signal(session_id, round_number, "ready", intent_basis)
+}
+
+/// Build a Meeting V0 Pass signal (kind 42104).
+///
+/// Pass contains no model reasoning; `intent_basis` is an opaque idempotency
+/// key shared with the preceding Ready signal.
+pub fn build_meeting_floor_pass(
+    session_id: Uuid,
+    round_number: u64,
+    intent_basis: &str,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_floor_intent_signal(session_id, round_number, "pass", intent_basis)
+}
+
+/// Build a Meeting V0 Yield signal (kind 42104).
+///
+/// Yield may only be accepted from the holder of `grant_event_id`.
+pub fn build_meeting_floor_yield(
+    session_id: Uuid,
+    round_number: u64,
+    grant_event_id: &str,
+) -> Result<EventBuilder, SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    if round_number == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting round must be positive".into(),
+        ));
+    }
+    let grant_event_id = check_hex_exact(grant_event_id, 64, "meeting grant event id")?;
+    let tags = vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["meeting-round", &round_number.to_string()])?,
+        tag(&["action", "yield"])?,
+        tag(&["meeting-grant", &grant_event_id])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_FLOOR_SIGNAL as u16), "").tags(tags))
+}
+
 /// Build a Grant-bound Meeting V0 speech message (kind 9).
 pub fn build_meeting_speech(
     session_id: Uuid,
@@ -2805,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn meeting_floor_claim_and_speech_have_strict_round_shapes() {
+    fn meeting_floor_claim_signals_and_speech_have_strict_round_shapes() {
         let session_id = uuid();
         let grant_event_id = "cd".repeat(32);
 
@@ -2814,6 +2902,19 @@ mod tests {
         assert!(has_tag(&claim, "h", &session_id.to_string()));
         assert!(has_tag(&claim, "meeting-round", "7"));
         assert!(claim.content.is_empty());
+
+        let ready = sign(build_meeting_floor_ready(session_id, 7, "speech:abc").unwrap());
+        assert_eq!(ready.kind.as_u16(), KIND_MEETING_FLOOR_SIGNAL as u16);
+        assert!(has_tag(&ready, "action", "ready"));
+        assert!(has_tag(&ready, "intent-basis", "speech:abc"));
+
+        let pass = sign(build_meeting_floor_pass(session_id, 7, "speech:abc").unwrap());
+        assert!(has_tag(&pass, "action", "pass"));
+        assert!(has_tag(&pass, "intent-basis", "speech:abc"));
+
+        let yielded = sign(build_meeting_floor_yield(session_id, 7, &grant_event_id).unwrap());
+        assert!(has_tag(&yielded, "action", "yield"));
+        assert!(has_tag(&yielded, "meeting-grant", &grant_event_id));
 
         let mention = "ab".repeat(32);
         let speech = sign(
@@ -2832,6 +2933,14 @@ mod tests {
         assert!(has_tag(&speech, "meeting-grant", &grant_event_id));
         assert!(has_tag(&speech, "p", &mention));
         assert_eq!(speech.tags.len(), 4);
+    }
+
+    #[test]
+    fn meeting_floor_signals_reject_invalid_basis_and_grant() {
+        let session_id = uuid();
+        assert!(build_meeting_floor_ready(session_id, 1, "").is_err());
+        assert!(build_meeting_floor_pass(session_id, 1, "line\nbreak").is_err());
+        assert!(build_meeting_floor_yield(session_id, 1, "bad").is_err());
     }
 
     #[test]

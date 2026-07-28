@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 27);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -901,6 +901,16 @@ mod tests {
         assert!(meeting_floor.contains("CREATE TABLE meeting_event_outbox"));
         assert!(meeting_floor
             .contains("PRIMARY KEY (community_id, session_id, round_number, claimant_pubkey)"));
+
+        // Meeting V0 stage 3 adds agent decision signals and enables early
+        // cohort settlement without changing either prior Meeting migration.
+        assert_eq!(migrations[26].version, 28);
+        let meeting_agent_floor = migrations[26].sql.as_str();
+        assert!(meeting_agent_floor.contains("CREATE TABLE meeting_floor_signals"));
+        assert!(meeting_agent_floor.contains("action IN ('ready', 'pass', 'yield')"));
+        assert!(meeting_agent_floor.contains("CREATE TABLE meeting_round_decision_cohort"));
+        assert!(meeting_agent_floor
+            .contains("PRIMARY KEY (community_id, session_id, round_number, participant_pubkey)"));
     }
 
     #[test]

@@ -15,13 +15,17 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_OUTBOX_LEASE: Duration = Duration::from_secs(30);
 const DEFAULT_BATCH_LIMIT: i64 = 100;
 
-/// Load the configured Claim window and Grant lease.
+/// Load the configured Claim settle delay, maximum window, and Grant lease.
 ///
 /// Values are milliseconds so integration tests can exercise deadlines without
 /// waiting for production defaults. Invalid or out-of-range values fall back to
 /// the protocol defaults enforced by `buzz-db`.
 pub(crate) fn floor_config_from_env() -> FloorConfig {
     FloorConfig {
+        claim_settle_delay: env_duration_ms(
+            "BUZZ_MEETING_CLAIM_SETTLE_DELAY_MS",
+            buzz_db::meeting_floor::DEFAULT_CLAIM_SETTLE_DELAY,
+        ),
         claim_window: env_duration_ms(
             "BUZZ_MEETING_CLAIM_WINDOW_MS",
             buzz_db::meeting_floor::DEFAULT_CLAIM_WINDOW,
@@ -46,6 +50,7 @@ pub async fn run(state: Arc<AppState>) {
     let worker_id = Uuid::new_v4();
 
     info!(
+        claim_settle_delay_ms = floor_config.claim_settle_delay.as_millis(),
         claim_window_ms = floor_config.claim_window.as_millis(),
         grant_lease_ms = floor_config.grant_lease.as_millis(),
         sweep_interval_ms = sweep_interval.as_millis(),

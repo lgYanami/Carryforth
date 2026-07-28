@@ -1,15 +1,15 @@
 //! End-to-end proof for the Meeting V0 speech-floor protocol.
 //!
-//! Requires a running relay, Postgres, and Redis. Shortening
-//! `BUZZ_MEETING_CLAIM_WINDOW_MS` and `BUZZ_MEETING_GRANT_LEASE_MS` keeps the
-//! ignored test fast, but the polling bounds also cover protocol defaults.
+//! Requires a running relay, Postgres, and Redis. Expiry coverage advances the
+//! persisted test lease after observing the Grant, so the test remains fast
+//! with the five-minute production lease.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use buzz_core::kind::{
-    KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_ROUND_STATE, KIND_NIP29_GROUP_METADATA,
-    KIND_STREAM_MESSAGE_V2,
+    KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL, KIND_MEETING_ROUND_STATE,
+    KIND_NIP29_GROUP_METADATA, KIND_STREAM_MESSAGE_V2,
 };
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
@@ -55,6 +55,27 @@ async fn ensure_community(pool: &PgPool) -> Uuid {
         .fetch_one(pool)
         .await
         .expect("resolve relay community")
+}
+
+async fn expire_test_grant(pool: &PgPool, community_id: Uuid, meeting_id: Uuid, round: u64) {
+    let round = i64::try_from(round).expect("test round fits i64");
+    let result = sqlx::query(
+        "UPDATE meeting_rounds \
+         SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND phase = 'granted'",
+    )
+    .bind(community_id)
+    .bind(meeting_id)
+    .bind(round)
+    .execute(pool)
+    .await
+    .expect("advance granted test lease to expiry");
+    assert_eq!(
+        result.rows_affected(),
+        1,
+        "exactly one granted test round must be advanced"
+    );
 }
 
 async fn seed_identity(
@@ -163,7 +184,11 @@ async fn floor_events(keys: &Keys, meeting_id: Uuid) -> Vec<Value> {
     query(
         keys,
         json!([{
-            "kinds": [KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_ROUND_STATE],
+            "kinds": [
+                KIND_MEETING_FLOOR_CLAIM,
+                KIND_MEETING_ROUND_STATE,
+                KIND_MEETING_FLOOR_SIGNAL
+            ],
             "#h": [meeting_id.to_string()],
             "limit": 500
         }]),
@@ -220,7 +245,12 @@ fn shared_floor_v1_fixture_is_versioned_and_complete() {
     );
     assert_eq!(
         fixture["protocol"]["kinds"],
-        json!({"speech": 9, "claim": 42102, "round_state": 42103})
+        json!({
+            "speech": 9,
+            "claim": 42102,
+            "round_state": 42103,
+            "floor_signal": 42104
+        })
     );
 
     let scenarios = fixture["scenarios"].as_array().expect("fixture scenarios");
@@ -251,6 +281,126 @@ fn shared_floor_v1_fixture_is_versioned_and_complete() {
             );
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a running relay, Postgres, and Redis"]
+async fn agent_ready_pass_settles_early_and_yield_immediately_opens_the_next_round() {
+    let pool = test_pool().await;
+    let community_id = ensure_community(&pool).await;
+    let host = Keys::generate();
+    let agent_a = Keys::generate();
+    let agent_b = Keys::generate();
+    seed_identity(&pool, community_id, &host, "owner", None).await;
+    seed_identity(&pool, community_id, &agent_a, "member", Some(&host)).await;
+    seed_identity(&pool, community_id, &agent_b, "member", Some(&host)).await;
+
+    let meeting_id = Uuid::new_v4();
+    let agent_pubkeys = [agent_a.public_key().to_hex(), agent_b.public_key().to_hex()];
+    let participant_refs: Vec<&str> = agent_pubkeys.iter().map(String::as_str).collect();
+    let create = buzz_sdk::build_meeting_create(
+        meeting_id,
+        "Stage Three Agent Floor E2E",
+        Some("Ready, Pass, early settlement, and Yield"),
+        None,
+        &participant_refs,
+    )
+    .expect("build meeting create")
+    .sign_with_keys(&host)
+    .expect("sign meeting create");
+    let (status, body) = post_event(&host, &create).await;
+    assert_accepted(status, &body);
+    wait_for_state(&host, meeting_id, 1, "open", Duration::from_secs(2)).await;
+
+    let basis_a = "activation:agent-a";
+    let basis_b = "activation:agent-b";
+    let ready_a = buzz_sdk::build_meeting_floor_ready(meeting_id, 1, basis_a)
+        .expect("build Agent A Ready")
+        .sign_with_keys(&agent_a)
+        .expect("sign Agent A Ready");
+    let ready_b = buzz_sdk::build_meeting_floor_ready(meeting_id, 1, basis_b)
+        .expect("build Agent B Ready")
+        .sign_with_keys(&agent_b)
+        .expect("sign Agent B Ready");
+    for (keys, event) in [(&agent_a, &ready_a), (&agent_b, &ready_b)] {
+        let (status, body) = post_event(keys, event).await;
+        assert_accepted(status, &body);
+    }
+    let (status, body) = post_event(&agent_a, &ready_a).await;
+    assert_accepted(status, &body);
+
+    let human_ready = buzz_sdk::build_meeting_floor_ready(meeting_id, 1, "activation:human")
+        .expect("build Human Ready")
+        .sign_with_keys(&host)
+        .expect("sign Human Ready");
+    let (status, body) = post_event(&host, &human_ready).await;
+    assert_rejected(status, &body, "only an Agent participant");
+
+    let claim = buzz_sdk::build_meeting_floor_claim(meeting_id, 1)
+        .expect("build Agent A Claim")
+        .sign_with_keys(&agent_a)
+        .expect("sign Agent A Claim");
+    let (status, body) = post_event(&agent_a, &claim).await;
+    assert_accepted(status, &body);
+    let claiming = wait_for_state(&host, meeting_id, 1, "claiming", Duration::from_secs(2)).await;
+    let claiming_content = content_json(&claiming);
+    assert_eq!(
+        claiming_content["decision_cohort"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let settle_not_before = claiming_content["settle_not_before_ms"]
+        .as_i64()
+        .expect("settle boundary");
+    let claim_deadline = claiming_content["claim_deadline_ms"]
+        .as_i64()
+        .expect("Claim deadline");
+    assert!(
+        claim_deadline > settle_not_before,
+        "early-settlement boundary must precede the configured deadline"
+    );
+
+    let pass = buzz_sdk::build_meeting_floor_pass(meeting_id, 1, basis_b)
+        .expect("build Agent B Pass")
+        .sign_with_keys(&agent_b)
+        .expect("sign Agent B Pass");
+    let (status, body) = post_event(&agent_b, &pass).await;
+    assert_accepted(status, &body);
+    let grant = wait_for_state(&host, meeting_id, 1, "granted", Duration::from_secs(8)).await;
+    assert_eq!(
+        tag_value(&grant, "holder"),
+        Some(agent_a.public_key().to_hex().as_str())
+    );
+    let grant_id = grant["id"].as_str().expect("Grant event ID").to_string();
+
+    let yield_event = buzz_sdk::build_meeting_floor_yield(meeting_id, 1, &grant_id)
+        .expect("build Yield")
+        .sign_with_keys(&agent_a)
+        .expect("sign Yield");
+    let (status, body) = post_event(&agent_a, &yield_event).await;
+    assert_accepted(status, &body);
+    let (status, body) = post_event(&agent_a, &yield_event).await;
+    assert_accepted(status, &body);
+    wait_for_state(&host, meeting_id, 2, "open", Duration::from_secs(2)).await;
+
+    let round_one_closed =
+        wait_for_state(&host, meeting_id, 1, "closed", Duration::from_secs(2)).await;
+    assert_eq!(
+        content_json(&round_one_closed)["outcome"].as_str(),
+        Some("yielded")
+    );
+    let speeches = query(
+        &host,
+        json!([{
+            "kinds": [9],
+            "#h": [meeting_id.to_string()],
+            "limit": 10
+        }]),
+    )
+    .await;
+    assert!(
+        speeches.is_empty(),
+        "PASS and Yield must not create a candidate or public speech"
+    );
 }
 
 #[tokio::test]
@@ -434,7 +584,8 @@ async fn meeting_floor_is_unique_grant_bound_recoverable_and_shared() {
     let (status, body) = post_event(&agent_b, &round_two_claim).await;
     assert_accepted(status, &body);
     wait_for_state(&host, meeting_id, 2, "granted", Duration::from_secs(5)).await;
-    let expired = wait_for_state(&host, meeting_id, 2, "closed", Duration::from_secs(12)).await;
+    expire_test_grant(&pool, community_id, meeting_id, 2).await;
+    let expired = wait_for_state(&host, meeting_id, 2, "closed", Duration::from_secs(5)).await;
     assert_eq!(content_json(&expired)["outcome"].as_str(), Some("expired"));
     wait_for_state(&host, meeting_id, 3, "open", Duration::from_secs(2)).await;
 

@@ -451,6 +451,7 @@ impl ChannelInfoResolver {
                     PromptChannelInfo {
                         name: info.name,
                         channel_type: info.channel_type,
+                        room_kind: info.room_kind,
                     },
                 ))
             })
@@ -510,6 +511,11 @@ pub struct PromptContext {
     pub max_turns_per_session: u32,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
+    /// Fail session creation unless the requested permission mode is enforced.
+    ///
+    /// Meeting turns set this for read-only Plan mode; ordinary channel turns
+    /// retain the historical best-effort fallback.
+    pub require_permission_mode: bool,
     /// Agent identity — used to derive the NIP-AE conversation key at
     /// session creation for core injection.
     pub agent_keys: nostr::Keys,
@@ -921,10 +927,18 @@ async fn create_session_and_apply_model(
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
     // are safely skipped — the harness auto-approves via handle_permission_request.
-    if !ctx.permission_mode.is_default()
+    let permission_mode_applied = if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?
+    } else {
+        ctx.permission_mode.is_default()
+    };
+    if ctx.require_permission_mode && !permission_mode_applied {
+        return Err(AcpError::Protocol(format!(
+            "Agent cannot enforce required permission mode {:?}",
+            ctx.permission_mode.as_wire_str()
+        )));
     }
 
     Ok(resp.session_id)
@@ -1033,7 +1047,7 @@ async fn apply_permission_mode(
     acp: &mut AcpClient,
     session_id: &str,
     mode: &PermissionMode,
-) -> Result<(), AcpError> {
+) -> Result<bool, AcpError> {
     let wire = mode.as_wire_str();
     let result = tokio::time::timeout(PERMISSION_MODE_TIMEOUT, async {
         acp.session_set_config_option(session_id, "mode", wire)
@@ -1047,6 +1061,7 @@ async fn apply_permission_mode(
                 target: "pool::permission",
                 "applied permission mode {wire:?} on session {session_id}"
             );
+            Ok(true)
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent.
@@ -1059,7 +1074,7 @@ async fn apply_permission_mode(
                 target: "pool::permission",
                 "fatal error setting permission mode {wire:?}: {e}"
             );
-            return Err(e);
+            Err(e)
         }
         // Application-level errors — agent is fine, just uses default permission mode.
         Ok(Err(e)) => {
@@ -1067,6 +1082,7 @@ async fn apply_permission_mode(
                 target: "pool::permission",
                 "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
             );
+            Ok(false)
         }
         Err(_) => {
             // Outer timeout fired — stream may be in unknown state.
@@ -1074,10 +1090,9 @@ async fn apply_permission_mode(
                 target: "pool::permission",
                 "permission mode set timed out ({PERMISSION_MODE_TIMEOUT:?}) — treating as fatal"
             );
-            return Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT));
+            Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT))
         }
     }
-    Ok(())
 }
 
 /// Prepend the `[Base]` section to a user-message body for legacy agents.
@@ -1262,15 +1277,38 @@ fn send_prompt_result(
 ///
 /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
 /// abort and the caller uses `task_map` to recover the agent index.
+fn bounded_turn_duration(
+    configured_max: Duration,
+    absolute_hard_deadline: Option<tokio::time::Instant>,
+) -> Duration {
+    absolute_hard_deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(configured_max)
+        })
+        .unwrap_or(configured_max)
+}
+
+pub(crate) struct PromptExecution {
+    pub(crate) control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
+    pub(crate) absolute_hard_deadline: Option<tokio::time::Instant>,
+    pub(crate) turn_id: String,
+}
+
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
     prompt_text: Option<String>,
     ctx: Arc<PromptContext>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
-    control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
-    turn_id: String,
+    execution: PromptExecution,
 ) {
+    let PromptExecution {
+        control_rx,
+        absolute_hard_deadline,
+        turn_id,
+    } = execution;
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.channel_id),
@@ -1608,13 +1646,15 @@ pub async fn run_prompt_task(
                 agent_canvas.as_deref(),
                 &init_msg,
             );
+            let init_max_duration =
+                bounded_turn_duration(ctx.max_turn_duration, absolute_hard_deadline);
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
                     &session_id,
                     &init_msg,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    init_max_duration,
                 )
                 .await;
 
@@ -1686,7 +1726,7 @@ pub async fn run_prompt_task(
                     tracing::error!(
                         target: "pool::session",
                         "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for channel {cid} — agent process is unrecoverable",
-                        ctx.max_turn_duration.as_secs()
+                        init_max_duration.as_secs()
                     );
                     agent.state.invalidate_all();
                     send_prompt_result(
@@ -1824,6 +1864,7 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    let prompt_max_duration = bounded_turn_duration(ctx.max_turn_duration, absolute_hard_deadline);
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -1833,7 +1874,7 @@ pub async fn run_prompt_task(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    prompt_max_duration,
                 ) => result,
             }
         }
@@ -1844,7 +1885,7 @@ pub async fn run_prompt_task(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    prompt_max_duration,
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
@@ -2158,7 +2199,7 @@ pub async fn run_prompt_task(
             tracing::error!(
                 target: "pool::prompt",
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
-                ctx.max_turn_duration.as_secs()
+                prompt_max_duration.as_secs()
             );
             agent.state.invalidate_all();
             let usage = agent.acp.take_turn_usage();
@@ -2259,10 +2300,13 @@ pub(crate) async fn fetch_channel_info(
                 let ev = events.first()?;
                 let tags = ev.get("tags")?.as_array()?;
                 let mut name = None;
+                let mut room_kind = None;
                 for tag in tags {
                     if let Some(arr) = tag.as_array() {
-                        if arr.first().and_then(|v| v.as_str()) == Some("name") {
-                            name = arr.get(1).and_then(|v| v.as_str());
+                        match arr.first().and_then(|v| v.as_str()) {
+                            Some("name") => name = arr.get(1).and_then(|v| v.as_str()),
+                            Some("room_kind") => room_kind = arr.get(1).and_then(|v| v.as_str()),
+                            _ => {}
                         }
                     }
                 }
@@ -2270,6 +2314,7 @@ pub(crate) async fn fetch_channel_info(
                 Some(PromptChannelInfo {
                     name: name.unwrap_or("unknown").to_string(),
                     channel_type,
+                    room_kind: room_kind.unwrap_or("community").to_string(),
                 })
             }
             Ok(Err(e)) => {
@@ -3656,6 +3701,20 @@ mod tests {
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
     // a legacy agent WITH a base_prompt must get [Base] prepended to the user
     // message. This is the exact regression that shipped in the round-2 bug.
+
+    #[test]
+    fn absolute_turn_deadline_can_only_shorten_the_configured_cap() {
+        let configured = Duration::from_secs(120);
+        assert_eq!(bounded_turn_duration(configured, None), configured);
+
+        let expired = tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test Instant supports subtraction");
+        assert_eq!(
+            bounded_turn_duration(configured, Some(expired)),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn test_initial_message_legacy_agent_gets_base_prepended() {
@@ -5302,6 +5361,7 @@ mod tests {
             context_message_limit: 0,
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,
+            require_permission_mode: false,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,

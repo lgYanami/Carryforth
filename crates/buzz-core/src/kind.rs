@@ -461,6 +461,8 @@ pub const KIND_MEETING_END: u32 = 42101;
 pub const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
 /// Relay-signed authoritative Meeting V0 round/floor state.
 pub const KIND_MEETING_ROUND_STATE: u32 = 42103;
+/// Participant-signed Meeting V0 Ready, Pass, or Yield floor signal.
+pub const KIND_MEETING_FLOOR_SIGNAL: u32 = 42104;
 
 // Agent job protocol (43000–43999)
 // Not using NIP-90 kinds (5000–6999) — Buzz requires auth chains (depth ≤ 3, breadth ≤ 10).
@@ -659,6 +661,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEETING_END,
     KIND_MEETING_FLOOR_CLAIM,
     KIND_MEETING_ROUND_STATE,
+    KIND_MEETING_FLOOR_SIGNAL,
     KIND_JOB_REQUEST,
     KIND_JOB_ACCEPTED,
     KIND_JOB_PROGRESS,
@@ -764,6 +767,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_MEETING_CREATE
             | KIND_MEETING_END
             | KIND_MEETING_FLOOR_CLAIM
+            | KIND_MEETING_FLOOR_SIGNAL
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY

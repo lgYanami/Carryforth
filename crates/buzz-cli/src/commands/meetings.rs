@@ -16,6 +16,7 @@ const KIND_GROUP_MEMBERS: u32 = 39002;
 const KIND_MEETING_SPEECH: u32 = 9;
 const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
 const KIND_MEETING_ROUND_STATE: u32 = 42103;
+const KIND_MEETING_FLOOR_SIGNAL: u32 = 42104;
 
 #[derive(Debug, Serialize)]
 struct MeetingSummary {
@@ -37,6 +38,7 @@ struct FloorState {
     state_event_id: String,
     holder_pubkey: Option<String>,
     grant_event_id: Option<String>,
+    settle_not_before_ms: Option<i64>,
     claim_deadline_ms: Option<i64>,
     lease_expires_at_ms: Option<i64>,
     outcome: Option<String>,
@@ -46,6 +48,9 @@ struct FloorState {
     previous_speech_event_id: Option<String>,
     claim_event_ids: Vec<String>,
     claimant_pubkeys: Vec<String>,
+    decision_cohort_pubkeys: Vec<String>,
+    ready_pubkeys: Vec<String>,
+    passer_pubkeys: Vec<String>,
     created_at: u64,
 }
 
@@ -94,6 +99,9 @@ fn parse_floor_state(event: &serde_json::Value) -> Option<FloorState> {
             (!holder.is_empty()).then_some(holder)
         },
         grant_event_id: (phase == "granted").then_some(state_event_id),
+        settle_not_before_ms: content
+            .get("settle_not_before_ms")
+            .and_then(serde_json::Value::as_i64),
         claim_deadline_ms: content
             .get("claim_deadline_ms")
             .and_then(serde_json::Value::as_i64),
@@ -121,6 +129,9 @@ fn parse_floor_state(event: &serde_json::Value) -> Option<FloorState> {
             .map(str::to_string),
         claim_event_ids: string_array("claim_event_ids"),
         claimant_pubkeys: string_array("claimants"),
+        decision_cohort_pubkeys: string_array("decision_cohort"),
+        ready_pubkeys: string_array("ready"),
+        passer_pubkeys: string_array("passed"),
         created_at: event
             .get("created_at")
             .and_then(serde_json::Value::as_u64)
@@ -462,7 +473,11 @@ pub async fn cmd_floor_history(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
     let filter = serde_json::json!({
-        "kinds": [KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_ROUND_STATE],
+        "kinds": [
+            KIND_MEETING_FLOOR_CLAIM,
+            KIND_MEETING_ROUND_STATE,
+            KIND_MEETING_FLOOR_SIGNAL
+        ],
         "#h": [&meeting_id],
     });
     let mut events = client.query_paginated(filter, limit).await?;
@@ -478,12 +493,16 @@ pub async fn cmd_floor_history(
             .iter()
             .map(|event| {
                 let phase = extract_tag_value(event, "phase");
+                let action = extract_tag_value(event, "action");
+                let intent_basis = extract_tag_value(event, "intent-basis");
                 serde_json::json!({
                     "event_id": event_id(event),
                     "kind": event.get("kind").and_then(serde_json::Value::as_u64),
                     "round_number": event_round(event),
                     "floor_revision": event_floor_revision(event),
                     "phase": (!phase.is_empty()).then_some(phase),
+                    "action": (!action.is_empty()).then_some(action),
+                    "intent_basis": (!intent_basis.is_empty()).then_some(intent_basis),
                     "author_pubkey": event.get("pubkey").and_then(serde_json::Value::as_str),
                 })
             })
@@ -493,6 +512,84 @@ pub async fn cmd_floor_history(
         "{}",
         serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())
     );
+    Ok(())
+}
+
+async fn current_open_floor(
+    client: &BuzzClient,
+    meeting_id: Uuid,
+    operation: &str,
+) -> Result<FloorState, CliError> {
+    let state = fetch_current_floor(client, &meeting_id.to_string())
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
+    if !matches!(state.phase.as_str(), "open" | "claiming") {
+        return Err(CliError::Usage(format!(
+            "meeting round {} is {}; {operation} is only allowed while open or claiming",
+            state.round_number, state.phase
+        )));
+    }
+    Ok(state)
+}
+
+pub async fn cmd_floor_ready(
+    client: &BuzzClient,
+    meeting_id: &str,
+    intent_basis: &str,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = current_open_floor(client, meeting_id, "Ready").await?;
+    let builder = buzz_sdk::build_meeting_floor_ready(meeting_id, state.round_number, intent_basis)
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+pub async fn cmd_floor_pass(
+    client: &BuzzClient,
+    meeting_id: &str,
+    intent_basis: &str,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = current_open_floor(client, meeting_id, "Pass").await?;
+    let builder = buzz_sdk::build_meeting_floor_pass(meeting_id, state.round_number, intent_basis)
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+pub async fn cmd_floor_yield(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_current_floor(client, &meeting_id.to_string())
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
+    if state.phase != "granted" {
+        return Err(CliError::Usage(format!(
+            "meeting round {} is {}; Yield requires an active Grant",
+            state.round_number, state.phase
+        )));
+    }
+    let self_pubkey = client.keys().public_key().to_hex();
+    if state.holder_pubkey.as_deref() != Some(self_pubkey.as_str()) {
+        return Err(CliError::Usage(format!(
+            "current Grant belongs to {}, not the current identity",
+            state.holder_pubkey.as_deref().unwrap_or("unknown")
+        )));
+    }
+    let grant_event_id = state
+        .grant_event_id
+        .as_deref()
+        .ok_or_else(|| CliError::Other("granted floor state has no Grant event ID".into()))?;
+    let builder =
+        buzz_sdk::build_meeting_floor_yield(meeting_id, state.round_number, grant_event_id)
+            .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&response));
     Ok(())
 }
 
@@ -739,6 +836,13 @@ pub async fn dispatch(
                     wait,
                     timeout,
                 } => cmd_claim_floor(client, &meeting, wait, timeout).await,
+                MeetingFloorCmd::Ready { meeting, basis } => {
+                    cmd_floor_ready(client, &meeting, &basis).await
+                }
+                MeetingFloorCmd::Pass { meeting, basis } => {
+                    cmd_floor_pass(client, &meeting, &basis).await
+                }
+                MeetingFloorCmd::Yield { meeting } => cmd_floor_yield(client, &meeting).await,
             }
         }
         MeetingsCmd::End { meeting } => cmd_end_meeting(client, &meeting).await,

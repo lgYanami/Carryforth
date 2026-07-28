@@ -24,6 +24,7 @@ mod view_image;
 struct DevMcp {
     state: Arc<shell::SharedState>,
     todos: Arc<todo::TodoState>,
+    read_only: bool,
     tool_router: ToolRouter<DevMcp>,
 }
 
@@ -33,6 +34,8 @@ impl DevMcp {
         Self {
             state,
             todos: Arc::new(todo::TodoState::new()),
+            read_only: std::env::var("BUZZ_DEV_MCP_READ_ONLY")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             tool_router: Self::tool_router(),
         }
     }
@@ -46,6 +49,7 @@ impl DevMcp {
         Parameters(p): Parameters<shell::ShellParams>,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        enforce_mutation_allowed(self.read_only, "shell")?;
         shell::run(&self.state, p, context.ct).await
     }
 
@@ -79,6 +83,7 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<str_replace::StrReplaceParams>,
     ) -> Result<String, ErrorData> {
+        enforce_mutation_allowed(self.read_only, "str_replace")?;
         str_replace::run(&self.state, p)
     }
 
@@ -90,6 +95,9 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<todo::TodoParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if p.todos.is_some() {
+            enforce_mutation_allowed(self.read_only, "todo update")?;
+        }
         match self.todos.handle_todo(p) {
             Ok(text) => todo::text_result(text),
             Err(e) => todo::error_result(format!("Error: {e}")),
@@ -121,6 +129,18 @@ impl DevMcp {
     ) -> Result<CallToolResult, ErrorData> {
         todo::text_result(self.todos.post_compact())
     }
+}
+
+fn enforce_mutation_allowed(read_only: bool, operation: &str) -> Result<(), ErrorData> {
+    if read_only {
+        return Err(ErrorData::invalid_request(
+            format!(
+                "{operation} is disabled: this MCP session is enforced read-only for a Meeting turn"
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -210,4 +230,33 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod meeting_policy_tests {
+    use super::*;
+
+    #[test]
+    fn meeting_read_only_policy_rejects_every_mutating_tool_class() {
+        for operation in ["shell", "str_replace", "todo update"] {
+            let error = enforce_mutation_allowed(true, operation)
+                .expect_err("Meeting read-only mode must reject mutations");
+            assert!(
+                error.message.contains(operation),
+                "error must identify the rejected operation"
+            );
+            assert!(
+                error.message.contains("Meeting turn"),
+                "error must identify the enforced Meeting boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sessions_keep_mutating_tools_available() {
+        for operation in ["shell", "str_replace", "todo update"] {
+            enforce_mutation_allowed(false, operation)
+                .expect("ordinary MCP sessions must preserve existing tools");
+        }
+    }
 }

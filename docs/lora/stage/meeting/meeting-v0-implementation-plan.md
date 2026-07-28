@@ -1,6 +1,6 @@
 # Meeting V0 分阶段开发计划
 
-> 状态：阶段 1–2 已完成，阶段 3 未开始
+> 状态：阶段 1–3 已完成，阶段 4–5 未开始
 >
 > 本文只规划 Meeting V0 的开发阶段、阶段交付物和完成条件。
 > 产品与协议语义以 [Meeting V0 设计](./meeting-v0.md)为准；具体代码方案在进入对应阶段
@@ -43,7 +43,8 @@ Human 与 Agent 共同使用的共享文字会议室。
 ```
 
 阶段 3 和阶段 4 都以阶段 2 的版本化协议基线、CLI 行为和跨客户端一致性测试夹具为共同
-输入，之后可以并行开发。
+输入，之后可以并行开发。阶段 3 增加的 Ready/Pass/Yield 与提前仲裁是对 Floor 控制面的
+加法扩展，不改变 Desktop 已经依赖的 Meeting、Claim、Grant 和 kind `9` speech 主路径。
 
 ## 4. 分阶段计划
 
@@ -109,20 +110,26 @@ Human 与 Agent 共同使用的共享文字会议室。
 本阶段做什么：
 
 - 让 ACP/Harness 发现会议、同步完整上下文并跟踪当前 Floor；
-- 接入持久 Speech Intent、Claim 调度和 Grant-bound 发送路径；
+- 接入 Ready、持久 Speech Intent、`CLAIM/PASS`、Claim 调度和 Grant-bound 发送路径；
+- 让 Claim 竞争在 Agent 全部完成决定后提前仲裁，以 5 分钟作为最长等待而非固定等待；
+- 只让 winner 在最长 5 分钟 Grant 内使用只读工具生成完整发言，成功发言或 Yield 时
+  立即换轮；
+- 提供 Meeting 专用上下文、提示词协议、严格结构化输出和工具权限边界；
 - 保证 Agent 重启、重复事件和 Floor 状态变化不会造成重复发言；
 - 让 Agent 与 Human、其他 Agent 使用同一份名单和消息记录。
 
 阶段交付：
 
-- 真实 ACP 与 Agent Harness 的会议模式 PR；
+- [阶段 3 Agent 会议模式设计](./meeting-v0-stage3-agent-mode.md)；
+- Floor Signal、提前仲裁、真实 ACP 与 Agent Harness 的会议模式 PR；
 - Human 发言、Agent 主动 Claim、Agent PASS 和 Agent 获权发言的可运行演示；
-- Agent 历史补齐、重启恢复、意图去重和专用发送路径的自动化测试通过。
+- Agent 历史补齐、重启恢复、意图去重、只读工具、提前 Say/Yield 和专用发送路径的
+  自动化测试通过。
 
 完成标志：
 
-> 至少一个真实 Agent 能在会议中可靠地观察、保持沉默或申请发言，并且无法绕过 Grant
-> 直接写入会议消息。
+> 至少一个真实 Agent 能在会议中可靠地观察、保持沉默或申请发言，获权后能读取项目
+> 上下文形成发言，并且无法绕过 Grant 或工具权限直接写入会议消息或修改项目。
 
 ### 阶段 4：Desktop 会议产品面
 
@@ -182,7 +189,7 @@ Human 与 Agent 共同使用的共享文字会议室。
 |---|---|---|
 | 1. 会议身份与生命周期 | 已完成 | `e2e_meeting`、数据库事务测试、双身份 CLI 生命周期演示 |
 | 2. 发言权与共享文字协议 | 已完成 | `e2e_meeting_floor`、数据库重启/原子性测试、共享协议夹具、双身份 CLI 抢夺与发言演示 |
-| 3. Agent 会议模式 | 未开始 | 真实 ACP/Agent 会议演示与测试 |
+| 3. Agent 会议模式 | 已完成 | `meeting-v0-stage3-agent-mode.md`、Ready/Pass/Yield 与提前仲裁 E2E、真实 ACP Agent CLAIM/SAY 与 PASS 演示 |
 | 4. Desktop 会议产品面 | 未开始 | Desktop 可操作流程与 E2E |
 | 5. 集成验收与发布 | 未开始 | 2 Human + 2 real ACP Agent 验收报告与发布候选 |
 
@@ -254,8 +261,9 @@ buzz meetings show --meeting <UUID>
 
 - 启用 `42102` Claim；`42103` Round State 仍只允许 Relay 签发；
 - 建立 `open → claiming → granted → closed/expired → next open` 的持久化 Floor
-  状态机，默认 Claim 窗口为 3 秒、Grant 租约为 10 秒，选择策略版本为
-  `uniform-v0`；
+  状态机；阶段 2 交付时默认 Claim 窗口为 3 秒、Grant 租约为 10 秒，选择策略版本为
+  `uniform-v0`。阶段 3 已将其扩展为最短 3 秒、最长 5 分钟的事件驱动 Claim 窗口和
+  最长 5 分钟 Grant；
 - 每名参会者每轮只能提交一个规范 Claim，同一事件重试幂等，第二个不同 Claim 会被
   拒绝；每轮最多生成一个 winner 和一个 Grant；
 - 会议发言复用 kind `9`，但必须绑定当前 `round + grant`；允许规范 `p` mention，
@@ -308,7 +316,67 @@ Grant 主动过期后，另一身份在下一轮获权并通过 `meetings say` �
 本阶段尚未把真实 ACP Agent 或 Desktop 接入会议。它们分别属于阶段 3 和阶段 4，
 但现在可以共同基于本阶段的 Relay 权威协议、CLI 行为和版本化夹具并行开发。
 
-## 8. V0 总体完成条件
+## 8. 阶段 3 交付记录
+
+阶段 3 已于 2026-07-28 完成交付，真实 ACP Agent 已接入阶段 2 的共享会议协议：
+
+- 新增 participant-signed kind `42104`，提供 `ready`、`pass`、`yield` 三种 Floor
+  Signal；SDK 与 CLI 提供 `meetings floor ready|pass|yield|status`；
+- 新增 `meeting_floor_signals` 和 `meeting_round_decision_cohort` 持久投影。第一份
+  Claim 冻结已 Ready 的 Agent cohort；最短 3 秒后，cohort 全部完成 Claim/Pass 即
+  提前仲裁，最长窗口和 Grant lease 均为 5 分钟；
+- ACP 增加独立 `MeetingCoordinator`，自动发现活动会议，分页补齐完整会议历史，验证
+  签名并按 event ID 去重，不把 Meeting 事件送入普通 mention/reply 队列；
+- Intent Turn 只输出严格的 `CLAIM/PASS` 决定；只有 winner 才运行 Granted Turn 并
+  生成完整 speech。结构化输出仅允许一次格式纠正，第二次失败会安全地 Pass/Yield；
+- Agent 私有持久账本记录 basis、Intent、Claim、Grant 和预签名事件。进程恢复时复用
+  原逻辑记录和同一 signed event，不重新生成内容，也不重复 Claim 或 speech；
+- Intent 使用 Relay Claim deadline 与本地 5 分钟上限的较早者；Granted Turn 使用
+  lease 减 30 秒安全余量。绝对 deadline 从排队和会话建立阶段开始扣减；
+- Meeting Turn 强制 ACP `Plan` 模式，只挂载 allowlist 中的 `buzz-dev-mcp`，并由 MCP
+  再次拒绝 shell、文件替换和 todo 写操作。正式发言只能经过专用 Meeting sender，
+  Relay 仍以当前 round、holder、Grant 和单次消费作最终授权；
+- Ready/Pass、speech 和 Yield 一旦被接受就立即推进，不会固定等待完整 5 分钟；
+- 迁移使用 `0028_meeting_v0_agent_floor.sql`，共享协议夹具同步登记 kind `42104`。
+
+自动化验证：
+
+```text
+just ci
+# passed
+
+just test
+# 8 groups passed
+
+cargo test -p buzz-db meeting_floor::tests:: \
+  -- --ignored --nocapture --test-threads=1
+# 2 passed
+
+cargo test -p buzz-test-client --test e2e_meeting_floor \
+  -- --ignored --nocapture --test-threads=1
+# 2 passed
+```
+
+数据库测试覆盖 Ready cohort、提前结算、唯一 Grant、Say、Yield、过期、重启恢复和幂等；
+Relay E2E 覆盖 Agent Ready/Pass 后提前仲裁、Yield 立即换轮，以及既有四方竞争和共享
+历史路径。E2E 在观察到有效 Grant 后只推进测试投影的 lease 来验证过期，因此无需把
+生产 5 分钟配置缩短为测试值。
+
+真实 Agent 验证使用 `claude-agent-acp`：
+
+- 在会议 `77b68261-57f3-47db-ac89-ffcb4ea4c9c9` 中，Agent 自动同步上下文、读取
+  `docs/lora/project-positioning.md`、选择 CLAIM、获权，并在约 13 秒内提交 speech
+  `d91f8cb4e6204985eb48b10856e94f060875aa98e746d0170718c87ed0f13afb`；
+- 数据库核验该 speech 只有规范的 `h`、`meeting-round=4` 和 `meeting-grant` 绑定，
+  没有 `e`、`q` 或 thread 标签；提交后立即进入下一轮；
+- 在空会议 `0bd057ab-14ee-49c2-8d6a-68238888a2d6` 中，同一 Agent 自动选择 PASS。
+  Floor 记录包含 Ready/Pass，但没有 Claim、holder 或公开 speech。
+
+阶段 3 已证明 Agent 能自动观察、主动沉默或争取发言，并在获权后使用只读工具形成正式
+发言。Desktop 产品面和 `2 Human + 2 real ACP Agent` 的发布级组合验收仍分别属于阶段
+4、阶段 5，因此阶段 3 完成不等于 Meeting V0 已面向用户启用。
+
+## 9. V0 总体完成条件
 
 Meeting V0 只有在以下结果同时成立时才算完成：
 
@@ -316,12 +384,14 @@ Meeting V0 只有在以下结果同时成立时才算完成：
 - 所有参会者都可以申请发言权，但每轮最多一个 holder 和一条规范发言；
 - 所有参会者最终看到相同消息、作者和 Floor 状态；
 - Agent 可以主动 `CLAIM`，也可以产生可恢复的 `PASS`；
+- Agent 完成决定或发言时立即推进，5 分钟 Claim/Grant 只作为故障上限；
+- 只有 winner 生成完整发言，并且会议 Turn 只允许读取上下文而不执行项目修改；
 - 断线和进程重启不会造成记录缺失、重复发言或发言权分叉；
 - 非参会者不能发现、读取或写入会议；
 - Desktop、CLI 和 ACP 使用同一套 Relay 权威协议；
 - 会议结束后不可继续 Claim 或发言，原参会者仍可读取归档记录。
 
-## 9. 不纳入本计划
+## 10. 不纳入本计划
 
 以下能力不进入 Meeting V0 的任何开发阶段：
 

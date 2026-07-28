@@ -214,11 +214,12 @@ CREATE TABLE meeting_rounds (
     phase             TEXT NOT NULL
         CHECK (phase IN ('open', 'claiming', 'granted', 'closed')),
     state_event_id    BYTEA NOT NULL,
+    settle_not_before TIMESTAMPTZ,
     claim_deadline    TIMESTAMPTZ,
     holder_pubkey     BYTEA,
     grant_event_id    BYTEA,
     lease_expires_at  TIMESTAMPTZ,
-    outcome           TEXT CHECK (outcome IN ('spoken', 'expired', 'ended')),
+    outcome           TEXT CHECK (outcome IN ('spoken', 'yielded', 'expired', 'ended')),
     speech_event_id   BYTEA,
     policy_version    TEXT NOT NULL DEFAULT 'uniform-v0'
         CHECK (policy_version = 'uniform-v0'),
@@ -242,6 +243,7 @@ CREATE TABLE meeting_rounds (
         CHECK (speech_event_id IS NULL OR LENGTH(speech_event_id) = 32),
     CONSTRAINT chk_meeting_round_phase_shape CHECK (
         (phase = 'open'
+            AND settle_not_before IS NULL
             AND claim_deadline IS NULL
             AND holder_pubkey IS NULL
             AND grant_event_id IS NULL
@@ -250,7 +252,9 @@ CREATE TABLE meeting_rounds (
             AND speech_event_id IS NULL)
         OR
         (phase = 'claiming'
+            AND settle_not_before IS NOT NULL
             AND claim_deadline IS NOT NULL
+            AND settle_not_before <= claim_deadline
             AND holder_pubkey IS NULL
             AND grant_event_id IS NULL
             AND lease_expires_at IS NULL
@@ -258,7 +262,9 @@ CREATE TABLE meeting_rounds (
             AND speech_event_id IS NULL)
         OR
         (phase = 'granted'
+            AND settle_not_before IS NOT NULL
             AND claim_deadline IS NOT NULL
+            AND settle_not_before <= claim_deadline
             AND holder_pubkey IS NOT NULL
             AND grant_event_id IS NOT NULL
             AND lease_expires_at IS NOT NULL
@@ -270,13 +276,19 @@ CREATE TABLE meeting_rounds (
             AND (
                 (outcome = 'spoken' AND speech_event_id IS NOT NULL)
                 OR
-                (outcome IN ('expired', 'ended') AND speech_event_id IS NULL)
+                (outcome IN ('yielded', 'expired', 'ended') AND speech_event_id IS NULL)
             ))
     )
 );
 
 CREATE INDEX idx_meeting_rounds_due
-    ON meeting_rounds (community_id, phase, claim_deadline, lease_expires_at)
+    ON meeting_rounds (
+        community_id,
+        phase,
+        settle_not_before,
+        claim_deadline,
+        lease_expires_at
+    )
     WHERE phase IN ('claiming', 'granted');
 
 CREATE TABLE meeting_floor_claims (
@@ -298,6 +310,79 @@ CREATE TABLE meeting_floor_claims (
 
 CREATE INDEX idx_meeting_floor_claims_round
     ON meeting_floor_claims (community_id, session_id, round_number, claim_event_id);
+
+CREATE TABLE meeting_floor_signals (
+    community_id       UUID NOT NULL REFERENCES communities(id),
+    session_id         UUID NOT NULL,
+    round_number       BIGINT NOT NULL,
+    participant_pubkey BYTEA NOT NULL,
+    action             TEXT NOT NULL CHECK (action IN ('ready', 'pass', 'yield')),
+    intent_basis        TEXT,
+    grant_event_id      BYTEA,
+    signal_event_id     BYTEA NOT NULL,
+    floor_revision      BIGINT NOT NULL,
+    received_at         TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (community_id, signal_event_id),
+    FOREIGN KEY (community_id, session_id, round_number)
+        REFERENCES meeting_rounds (community_id, session_id, round_number),
+    CONSTRAINT chk_meeting_signal_pubkey_len
+        CHECK (LENGTH(participant_pubkey) = 32),
+    CONSTRAINT chk_meeting_signal_event_id_len
+        CHECK (LENGTH(signal_event_id) = 32),
+    CONSTRAINT chk_meeting_signal_grant_id_len
+        CHECK (grant_event_id IS NULL OR LENGTH(grant_event_id) = 32),
+    CONSTRAINT chk_meeting_signal_revision_positive CHECK (floor_revision > 0),
+    CONSTRAINT chk_meeting_signal_shape CHECK (
+        (action IN ('ready', 'pass')
+            AND intent_basis IS NOT NULL
+            AND LENGTH(intent_basis) BETWEEN 1 AND 512
+            AND grant_event_id IS NULL)
+        OR
+        (action = 'yield'
+            AND intent_basis IS NULL
+            AND grant_event_id IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX uq_meeting_floor_intent_signal
+    ON meeting_floor_signals (
+        community_id,
+        session_id,
+        round_number,
+        participant_pubkey,
+        action,
+        intent_basis
+    )
+    WHERE action IN ('ready', 'pass');
+
+CREATE UNIQUE INDEX uq_meeting_floor_yield_signal
+    ON meeting_floor_signals (community_id, grant_event_id)
+    WHERE action = 'yield';
+
+CREATE INDEX idx_meeting_floor_signals_round
+    ON meeting_floor_signals (
+        community_id,
+        session_id,
+        round_number,
+        action,
+        participant_pubkey
+    );
+
+CREATE TABLE meeting_round_decision_cohort (
+    community_id       UUID NOT NULL REFERENCES communities(id),
+    session_id         UUID NOT NULL,
+    round_number       BIGINT NOT NULL,
+    participant_pubkey BYTEA NOT NULL,
+    ready_event_id     BYTEA NOT NULL,
+    frozen_at          TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (community_id, session_id, round_number, participant_pubkey),
+    FOREIGN KEY (community_id, session_id, round_number)
+        REFERENCES meeting_rounds (community_id, session_id, round_number),
+    CONSTRAINT chk_meeting_cohort_pubkey_len
+        CHECK (LENGTH(participant_pubkey) = 32),
+    CONSTRAINT chk_meeting_cohort_ready_event_id_len
+        CHECK (LENGTH(ready_event_id) = 32)
+);
 
 CREATE TABLE meeting_event_outbox (
     community_id      UUID NOT NULL REFERENCES communities(id),

@@ -17,15 +17,19 @@ use crate::{Db, DbError, Result};
 /// The arbitration policy persisted on every Meeting V0 round.
 pub const FLOOR_POLICY_VERSION: &str = "uniform-v0";
 
-/// Default duration of the Claim competition window.
-pub const DEFAULT_CLAIM_WINDOW: StdDuration = StdDuration::from_secs(3);
+/// Default minimum delay before an otherwise-complete Claim cohort settles.
+pub const DEFAULT_CLAIM_SETTLE_DELAY: StdDuration = StdDuration::from_secs(3);
+/// Default maximum duration of the Claim competition window.
+pub const DEFAULT_CLAIM_WINDOW: StdDuration = StdDuration::from_secs(300);
 /// Default duration of a granted speech lease.
-pub const DEFAULT_GRANT_LEASE: StdDuration = StdDuration::from_secs(10);
+pub const DEFAULT_GRANT_LEASE: StdDuration = StdDuration::from_secs(300);
 
 /// Runtime timing configuration for the Meeting V0 floor.
 #[derive(Debug, Clone, Copy)]
 pub struct FloorConfig {
-    /// Time from the first Claim until winner selection.
+    /// Minimum time from the first Claim until winner selection.
+    pub claim_settle_delay: StdDuration,
+    /// Maximum time from the first Claim until winner selection.
     pub claim_window: StdDuration,
     /// Time a winner has to publish one valid speech.
     pub grant_lease: StdDuration,
@@ -34,6 +38,7 @@ pub struct FloorConfig {
 impl Default for FloorConfig {
     fn default() -> Self {
         Self {
+            claim_settle_delay: DEFAULT_CLAIM_SETTLE_DELAY,
             claim_window: DEFAULT_CLAIM_WINDOW,
             grant_lease: DEFAULT_GRANT_LEASE,
         }
@@ -101,7 +106,9 @@ pub struct FloorSnapshot {
     pub phase: FloorPhase,
     /// Relay-signed state event representing this snapshot.
     pub state_event_id: Vec<u8>,
-    /// Claim deadline, when in `claiming`.
+    /// Earliest cohort-complete settlement time, when in `claiming` or later.
+    pub settle_not_before: Option<DateTime<Utc>>,
+    /// Maximum Claim deadline, when in `claiming` or later.
     pub claim_deadline: Option<DateTime<Utc>>,
     /// Current holder, when in `granted`.
     pub holder_pubkey: Option<Vec<u8>>,
@@ -117,6 +124,30 @@ pub struct FloorSnapshot {
     pub claim_event_ids: Vec<Vec<u8>>,
     /// Claimant pubkeys ordered alongside [`Self::claim_event_ids`].
     pub claimant_pubkeys: Vec<Vec<u8>>,
+    /// Agent pubkeys frozen into the first-Claim decision cohort.
+    pub decision_cohort_pubkeys: Vec<Vec<u8>>,
+    /// Agent pubkeys that have declared Ready in the current round.
+    pub ready_pubkeys: Vec<Vec<u8>>,
+    /// Agent pubkeys that have declared Pass in the current round.
+    pub passer_pubkeys: Vec<Vec<u8>>,
+}
+
+/// Participant action carried by a Meeting V0 floor signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorSignalAction {
+    /// An Agent has synchronized the round and will decide Claim or Pass.
+    Ready,
+    /// An Agent has completed its decision without claiming.
+    Pass,
+}
+
+impl FloorSignalAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Pass => "pass",
+        }
+    }
 }
 
 /// Result of submitting a Meeting V0 floor Claim.
@@ -175,6 +206,52 @@ pub enum SayOutcome {
     },
 }
 
+/// Result of submitting an Agent Ready or Pass signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorSignalOutcome {
+    /// A new canonical signal was committed.
+    Accepted {
+        /// Round signalled.
+        round_number: i64,
+        /// Revision assigned to the signal's Round State.
+        floor_revision: i64,
+        /// Canonical signal event ID.
+        signal_event_id: Vec<u8>,
+    },
+    /// The same logical action was already committed.
+    Duplicate {
+        /// Round originally signalled.
+        round_number: i64,
+        /// Revision assigned to the canonical signal.
+        floor_revision: i64,
+        /// Canonical signal event ID.
+        signal_event_id: Vec<u8>,
+    },
+}
+
+/// Result of submitting a holder-authored Yield signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YieldOutcome {
+    /// The Grant was yielded and the next round was opened.
+    Accepted {
+        /// Yielded round.
+        round_number: i64,
+        /// Canonical Yield event ID.
+        signal_event_id: Vec<u8>,
+        /// Newly opened round.
+        next_round_number: i64,
+        /// Revision of the newly opened round.
+        floor_revision: i64,
+    },
+    /// This Grant was already yielded by the same canonical signal.
+    Duplicate {
+        /// Yielded round.
+        round_number: i64,
+        /// Canonical Yield event ID.
+        signal_event_id: Vec<u8>,
+    },
+}
+
 /// One outbox event claimed for post-commit dispatch.
 #[derive(Debug, Clone)]
 pub struct MeetingOutboxEvent {
@@ -203,6 +280,7 @@ struct RoundRow {
     floor_revision: i64,
     phase: FloorPhase,
     state_event_id: Vec<u8>,
+    settle_not_before: Option<DateTime<Utc>>,
     claim_deadline: Option<DateTime<Utc>>,
     holder_pubkey: Option<Vec<u8>>,
     grant_event_id: Option<Vec<u8>>,
@@ -215,6 +293,13 @@ struct RoundRow {
 struct CanonicalClaim {
     event_id: Vec<u8>,
     claimant_pubkey: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct FloorControlSets {
+    decision_cohort_pubkeys: Vec<Vec<u8>>,
+    ready_pubkeys: Vec<Vec<u8>>,
+    passer_pubkeys: Vec<Vec<u8>>,
 }
 
 /// Create Round 1 and its relay-signed `open` event inside an existing Meeting
@@ -265,8 +350,7 @@ pub async fn claim_floor(
     config: FloorConfig,
     selector: WinnerSelector,
 ) -> Result<ClaimFloorOutcome> {
-    validate_duration(config.claim_window, "meeting claim window")?;
-    validate_duration(config.grant_lease, "meeting grant lease")?;
+    validate_floor_config(config)?;
     validate_event_identity(event, session_id, round_number)?;
 
     let mut tx = db.begin_transaction().await?;
@@ -364,12 +448,25 @@ pub async fn claim_floor(
         ));
     }
 
+    let first_claim = round.phase == FloorPhase::Open;
+    let settle_not_before = match round.phase {
+        FloorPhase::Open => Some(now + chrono_duration(config.claim_settle_delay)?),
+        FloorPhase::Claiming => round.settle_not_before,
+        _ => None,
+    }
+    .ok_or_else(|| {
+        DbError::InvalidData("claiming round is missing its settle boundary".to_string())
+    })?;
     let claim_deadline = match round.phase {
         FloorPhase::Open => Some(now + chrono_duration(config.claim_window)?),
         FloorPhase::Claiming => round.claim_deadline,
         _ => None,
     }
     .ok_or_else(|| DbError::InvalidData("claiming round is missing its deadline".to_string()))?;
+
+    if first_claim {
+        freeze_decision_cohort_tx(&mut tx, community_id, session_id, round_number, now).await?;
+    }
 
     persist_meeting_event_tx(&mut tx, community_id, session_id, event, now).await?;
 
@@ -391,6 +488,7 @@ pub async fn claim_floor(
     .await?;
 
     let claims = load_claims_tx(&mut tx, community_id, session_id, round_number).await?;
+    let controls = load_control_sets_tx(&mut tx, community_id, session_id, round_number).await?;
     let state_event = build_round_state_event(
         relay_keys,
         session_id,
@@ -399,9 +497,13 @@ pub async fn claim_floor(
         FloorPhase::Claiming,
         None,
         serde_json::json!({
+            "settle_not_before_ms": settle_not_before.timestamp_millis(),
             "claim_deadline_ms": claim_deadline.timestamp_millis(),
             "claim_event_ids": claim_ids_hex(&claims),
             "claimants": claimant_hex(&claims),
+            "decision_cohort": pubkeys_hex(&controls.decision_cohort_pubkeys),
+            "ready": pubkeys_hex(&controls.ready_pubkeys),
+            "passed": pubkeys_hex(&controls.passer_pubkeys),
         }),
         now,
     )?;
@@ -410,7 +512,7 @@ pub async fn claim_floor(
     sqlx::query(
         "UPDATE meeting_rounds \
          SET phase = 'claiming', floor_revision = $4, state_event_id = $5, \
-             claim_deadline = $6, updated_at = $7 \
+             settle_not_before = $6, claim_deadline = $7, updated_at = $8 \
          WHERE community_id = $1 AND session_id = $2 AND round_number = $3",
     )
     .bind(community_id.as_uuid())
@@ -418,6 +520,7 @@ pub async fn claim_floor(
     .bind(round_number)
     .bind(next_revision)
     .bind(state_event.id.as_bytes().as_slice())
+    .bind(settle_not_before)
     .bind(claim_deadline)
     .bind(now)
     .execute(tx.as_mut())
@@ -430,12 +533,442 @@ pub async fn claim_floor(
         next_revision,
     )
     .await?;
+    session.floor_revision = next_revision;
+
+    let claiming_round = RoundRow {
+        round_number,
+        floor_revision: next_revision,
+        phase: FloorPhase::Claiming,
+        state_event_id: state_event.id.as_bytes().to_vec(),
+        settle_not_before: Some(settle_not_before),
+        claim_deadline: Some(claim_deadline),
+        holder_pubkey: None,
+        grant_event_id: None,
+        lease_expires_at: None,
+        outcome: None,
+        speech_event_id: None,
+    };
+    advance_due_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        &claiming_round,
+        now,
+        relay_keys,
+        config,
+        selector,
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(ClaimFloorOutcome::Accepted {
         round_number,
         floor_revision: next_revision,
         claim_event_id: event.id.as_bytes().to_vec(),
+    })
+}
+
+/// Submit one Agent-authored Ready or Pass signal.
+///
+/// Signals are logically idempotent by meeting, round, Agent, action, and
+/// intent basis. A Pass is accepted only after the same Agent's Ready and
+/// cannot withdraw an already-canonical Claim.
+#[allow(clippy::too_many_arguments)]
+pub async fn signal_intent(
+    db: &Db,
+    community_id: CommunityId,
+    session_id: Uuid,
+    round_number: i64,
+    action: FloorSignalAction,
+    intent_basis: &str,
+    event: &Event,
+    relay_keys: &Keys,
+    config: FloorConfig,
+    selector: WinnerSelector,
+) -> Result<FloorSignalOutcome> {
+    validate_floor_config(config)?;
+    validate_event_identity(event, session_id, round_number)?;
+    validate_intent_signal_event(event, action, intent_basis)?;
+
+    let mut tx = db.begin_transaction().await?;
+    let mut session = lock_session(&mut tx, community_id, session_id).await?;
+
+    if let Some(row) = sqlx::query(
+        "SELECT round_number, floor_revision, signal_event_id \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 \
+           AND (signal_event_id = $2 OR ( \
+             session_id = $3 AND round_number = $4 \
+             AND participant_pubkey = $5 AND action = $6 \
+             AND intent_basis = $7 \
+           )) \
+         ORDER BY (signal_event_id = $2) DESC \
+         LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event.id.as_bytes().as_slice())
+    .bind(session_id)
+    .bind(round_number)
+    .bind(event.pubkey.as_bytes())
+    .bind(action.as_str())
+    .bind(intent_basis)
+    .fetch_optional(tx.as_mut())
+    .await?
+    {
+        let outcome = FloorSignalOutcome::Duplicate {
+            round_number: row.try_get("round_number")?,
+            floor_revision: row.try_get("floor_revision")?,
+            signal_event_id: row.try_get("signal_event_id")?,
+        };
+        tx.rollback().await?;
+        return Ok(outcome);
+    }
+
+    if session.status != "active" {
+        return Err(DbError::InvalidData("meeting has ended".to_string()));
+    }
+    ensure_active_agent_participant(&mut tx, community_id, session_id, event.pubkey.as_bytes())
+        .await?;
+
+    let now = database_now(&mut tx).await?;
+    let mut round = ensure_current_round_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        now,
+        relay_keys,
+    )
+    .await?;
+    if advance_due_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        &round,
+        now,
+        relay_keys,
+        config,
+        selector,
+    )
+    .await?
+    {
+        round = load_current_round_required(&mut tx, community_id, session_id, &session).await?;
+    }
+    if round_number != session.current_round {
+        return Err(DbError::InvalidData(format!(
+            "floor signal targets round {round_number}, current round is {}",
+            session.current_round
+        )));
+    }
+    if !matches!(round.phase, FloorPhase::Open | FloorPhase::Claiming) {
+        return Err(DbError::InvalidData(
+            "floor signal arrived after the round settled".to_string(),
+        ));
+    }
+    if round.claim_deadline.is_some_and(|deadline| now >= deadline) {
+        return Err(DbError::InvalidData(
+            "floor signal arrived at or after the competition deadline".to_string(),
+        ));
+    }
+
+    if action == FloorSignalAction::Pass {
+        let was_ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM meeting_floor_signals \
+                 WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+                   AND participant_pubkey = $4 AND action = 'ready' \
+                   AND intent_basis = $5 \
+             )",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(round_number)
+        .bind(event.pubkey.as_bytes())
+        .bind(intent_basis)
+        .fetch_one(tx.as_mut())
+        .await?;
+        if !was_ready {
+            return Err(DbError::InvalidData(
+                "meeting Pass requires a matching Ready signal".to_string(),
+            ));
+        }
+        let already_claimed: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM meeting_floor_claims \
+                 WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+                   AND claimant_pubkey = $4 \
+             )",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(round_number)
+        .bind(event.pubkey.as_bytes())
+        .fetch_one(tx.as_mut())
+        .await?;
+        if already_claimed {
+            return Err(DbError::InvalidData(
+                "a canonical Claim cannot be withdrawn with Pass".to_string(),
+            ));
+        }
+    }
+
+    persist_meeting_event_tx(&mut tx, community_id, session_id, event, now).await?;
+    let next_revision = session.floor_revision + 1;
+    sqlx::query(
+        "INSERT INTO meeting_floor_signals \
+             (community_id, session_id, round_number, participant_pubkey, action, \
+              intent_basis, signal_event_id, floor_revision, received_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .bind(event.pubkey.as_bytes())
+    .bind(action.as_str())
+    .bind(intent_basis)
+    .bind(event.id.as_bytes().as_slice())
+    .bind(next_revision)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+
+    let claims = load_claims_tx(&mut tx, community_id, session_id, round_number).await?;
+    let controls = load_control_sets_tx(&mut tx, community_id, session_id, round_number).await?;
+    let state_event = build_round_state_event(
+        relay_keys,
+        session_id,
+        round_number,
+        next_revision,
+        round.phase,
+        None,
+        round_state_content(&round, &claims, &controls),
+        now,
+    )?;
+    persist_meeting_event_tx(&mut tx, community_id, session_id, &state_event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_rounds \
+         SET floor_revision = $4, state_event_id = $5, updated_at = $6 \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND phase IN ('open', 'claiming')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .bind(next_revision)
+    .bind(state_event.id.as_bytes().as_slice())
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    set_session_floor(
+        &mut tx,
+        community_id,
+        session_id,
+        round_number,
+        next_revision,
+    )
+    .await?;
+    session.floor_revision = next_revision;
+
+    let signalled_round = RoundRow {
+        floor_revision: next_revision,
+        state_event_id: state_event.id.as_bytes().to_vec(),
+        ..round
+    };
+    advance_due_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        &signalled_round,
+        now,
+        relay_keys,
+        config,
+        selector,
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(FloorSignalOutcome::Accepted {
+        round_number,
+        floor_revision: next_revision,
+        signal_event_id: event.id.as_bytes().to_vec(),
+    })
+}
+
+/// Yield one active Grant and atomically open the next round.
+#[allow(clippy::too_many_arguments)]
+pub async fn yield_floor(
+    db: &Db,
+    community_id: CommunityId,
+    session_id: Uuid,
+    round_number: i64,
+    grant_event_id: &[u8],
+    event: &Event,
+    relay_keys: &Keys,
+    config: FloorConfig,
+    selector: WinnerSelector,
+) -> Result<YieldOutcome> {
+    validate_floor_config(config)?;
+    validate_32(grant_event_id, "meeting Grant event id")?;
+    validate_event_identity(event, session_id, round_number)?;
+    validate_yield_event(event, grant_event_id)?;
+
+    let mut tx = db.begin_transaction().await?;
+    let mut session = lock_session(&mut tx, community_id, session_id).await?;
+    if let Some(row) = sqlx::query(
+        "SELECT round_number, signal_event_id \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 AND action = 'yield' \
+           AND (signal_event_id = $2 OR grant_event_id = $3) \
+         ORDER BY (signal_event_id = $2) DESC \
+         LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event.id.as_bytes().as_slice())
+    .bind(grant_event_id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    {
+        let outcome = YieldOutcome::Duplicate {
+            round_number: row.try_get("round_number")?,
+            signal_event_id: row.try_get("signal_event_id")?,
+        };
+        tx.rollback().await?;
+        return Ok(outcome);
+    }
+    if session.status != "active" {
+        return Err(DbError::InvalidData("meeting has ended".to_string()));
+    }
+
+    let now = database_now(&mut tx).await?;
+    let mut round = ensure_current_round_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        now,
+        relay_keys,
+    )
+    .await?;
+    if advance_due_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        &round,
+        now,
+        relay_keys,
+        config,
+        selector,
+    )
+    .await?
+    {
+        round = load_current_round_required(&mut tx, community_id, session_id, &session).await?;
+    }
+    if round_number != session.current_round {
+        return Err(DbError::InvalidData(format!(
+            "Yield targets round {round_number}, current round is {}",
+            session.current_round
+        )));
+    }
+    if round.phase != FloorPhase::Granted {
+        return Err(DbError::InvalidData(
+            "meeting round does not have an active Grant".to_string(),
+        ));
+    }
+    if round.grant_event_id.as_deref() != Some(grant_event_id) {
+        return Err(DbError::InvalidData(
+            "Yield references the wrong meeting Grant".to_string(),
+        ));
+    }
+    if round.holder_pubkey.as_deref() != Some(event.pubkey.as_bytes()) {
+        return Err(DbError::AccessDenied(
+            "only the current floor holder may Yield this Grant".to_string(),
+        ));
+    }
+    if round
+        .lease_expires_at
+        .is_none_or(|lease_expires_at| now >= lease_expires_at)
+    {
+        return Err(DbError::InvalidData(
+            "meeting Grant lease has expired".to_string(),
+        ));
+    }
+
+    ensure_active_participant(&mut tx, community_id, session_id, event.pubkey.as_bytes()).await?;
+    persist_meeting_event_tx(&mut tx, community_id, session_id, event, now).await?;
+    let closed_revision = session.floor_revision + 1;
+    sqlx::query(
+        "INSERT INTO meeting_floor_signals \
+             (community_id, session_id, round_number, participant_pubkey, action, \
+              grant_event_id, signal_event_id, floor_revision, received_at) \
+         VALUES ($1, $2, $3, $4, 'yield', $5, $6, $7, $8)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .bind(event.pubkey.as_bytes())
+    .bind(grant_event_id)
+    .bind(event.id.as_bytes().as_slice())
+    .bind(closed_revision)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+
+    let closed_event = build_round_state_event(
+        relay_keys,
+        session_id,
+        round_number,
+        closed_revision,
+        FloorPhase::Closed,
+        None,
+        serde_json::json!({
+            "outcome": "yielded",
+            "yield_event_id": event.id.to_hex(),
+        }),
+        now,
+    )?;
+    persist_meeting_event_tx(&mut tx, community_id, session_id, &closed_event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_rounds \
+         SET phase = 'closed', floor_revision = $4, state_event_id = $5, \
+             outcome = 'yielded', updated_at = $6 \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND phase = 'granted'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .bind(closed_revision)
+    .bind(closed_event.id.as_bytes().as_slice())
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    session.floor_revision = closed_revision;
+    session.current_round = round_number + 1;
+    let opened = create_open_round_locked(
+        &mut tx,
+        community_id,
+        session_id,
+        &mut session,
+        now,
+        relay_keys,
+        Some(PreviousRound {
+            round_number,
+            outcome: "yielded",
+            speech_event_id: None,
+        }),
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(YieldOutcome::Accepted {
+        round_number,
+        signal_event_id: event.id.as_bytes().to_vec(),
+        next_round_number: opened.round_number,
+        floor_revision: opened.floor_revision,
     })
 }
 
@@ -453,8 +986,7 @@ pub async fn say(
     config: FloorConfig,
     selector: WinnerSelector,
 ) -> Result<SayOutcome> {
-    validate_duration(config.claim_window, "meeting claim window")?;
-    validate_duration(config.grant_lease, "meeting grant lease")?;
+    validate_floor_config(config)?;
     validate_32(grant_event_id, "meeting grant event id")?;
     validate_event_identity(event, session_id, round_number)?;
 
@@ -699,8 +1231,7 @@ pub async fn recover_due_floors(
     selector: WinnerSelector,
     limit: i64,
 ) -> Result<usize> {
-    validate_duration(config.claim_window, "meeting claim window")?;
-    validate_duration(config.grant_lease, "meeting grant lease")?;
+    validate_floor_config(config)?;
     if limit <= 0 {
         return Ok(0);
     }
@@ -715,10 +1246,16 @@ pub async fn recover_due_floors(
          WHERE ms.status = 'active' \
            AND ( \
              mr.session_id IS NULL \
-             OR (mr.phase = 'claiming' AND mr.claim_deadline <= clock_timestamp()) \
+             OR (mr.phase = 'claiming' AND ( \
+               mr.claim_deadline <= clock_timestamp() \
+               OR mr.settle_not_before <= clock_timestamp() \
+             )) \
              OR (mr.phase = 'granted' AND mr.lease_expires_at <= clock_timestamp()) \
            ) \
-         ORDER BY COALESCE(mr.claim_deadline, mr.lease_expires_at, ms.created_at), \
+         ORDER BY COALESCE( \
+                    mr.settle_not_before, mr.claim_deadline, \
+                    mr.lease_expires_at, ms.created_at \
+                  ), \
                   ms.community_id, ms.session_id \
          LIMIT $1",
     )
@@ -975,6 +1512,7 @@ async fn load_round_tx(
 ) -> Result<Option<RoundRow>> {
     let row = sqlx::query(
         "SELECT round_number, floor_revision, phase, state_event_id, \
+                settle_not_before, \
                 claim_deadline, holder_pubkey, grant_event_id, lease_expires_at, \
                 outcome, speech_event_id \
          FROM meeting_rounds \
@@ -996,6 +1534,7 @@ async fn load_round_pool(
 ) -> Result<Option<RoundRow>> {
     let row = sqlx::query(
         "SELECT round_number, floor_revision, phase, state_event_id, \
+                settle_not_before, \
                 claim_deadline, holder_pubkey, grant_event_id, lease_expires_at, \
                 outcome, speech_event_id \
          FROM meeting_rounds \
@@ -1016,6 +1555,7 @@ fn round_from_row(row: sqlx::postgres::PgRow) -> Result<RoundRow> {
         floor_revision: row.try_get("floor_revision")?,
         phase: FloorPhase::parse(&phase)?,
         state_event_id: row.try_get("state_event_id")?,
+        settle_not_before: row.try_get("settle_not_before")?,
         claim_deadline: row.try_get("claim_deadline")?,
         holder_pubkey: row.try_get("holder_pubkey")?,
         grant_event_id: row.try_get("grant_event_id")?,
@@ -1077,6 +1617,169 @@ async fn load_claims_pool(
             })
         })
         .collect()
+}
+
+async fn load_control_sets_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    round_number: i64,
+) -> Result<FloorControlSets> {
+    let cohort = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT participant_pubkey \
+         FROM meeting_round_decision_cohort \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+         ORDER BY participant_pubkey",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_all(tx.as_mut())
+    .await?;
+    let ready = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT DISTINCT participant_pubkey \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND action = 'ready' \
+         ORDER BY participant_pubkey",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_all(tx.as_mut())
+    .await?;
+    let passed = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT DISTINCT participant_pubkey \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND action = 'pass' \
+         ORDER BY participant_pubkey",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_all(tx.as_mut())
+    .await?;
+    Ok(FloorControlSets {
+        decision_cohort_pubkeys: cohort,
+        ready_pubkeys: ready,
+        passer_pubkeys: passed,
+    })
+}
+
+async fn load_control_sets_pool(
+    db: &Db,
+    community_id: CommunityId,
+    session_id: Uuid,
+    round_number: i64,
+) -> Result<FloorControlSets> {
+    let cohort = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT participant_pubkey \
+         FROM meeting_round_decision_cohort \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+         ORDER BY participant_pubkey",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_all(&db.pool)
+    .await?;
+    let ready = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT DISTINCT participant_pubkey \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND action = 'ready' \
+         ORDER BY participant_pubkey",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_all(&db.pool)
+    .await?;
+    let passed = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT DISTINCT participant_pubkey \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND action = 'pass' \
+         ORDER BY participant_pubkey",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(FloorControlSets {
+        decision_cohort_pubkeys: cohort,
+        ready_pubkeys: ready,
+        passer_pubkeys: passed,
+    })
+}
+
+async fn freeze_decision_cohort_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    round_number: i64,
+    frozen_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO meeting_round_decision_cohort \
+             (community_id, session_id, round_number, participant_pubkey, \
+              ready_event_id, frozen_at) \
+         SELECT DISTINCT ON (participant_pubkey) \
+                community_id, session_id, round_number, participant_pubkey, \
+                signal_event_id, $4 \
+         FROM meeting_floor_signals \
+         WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+           AND action = 'ready' \
+         ORDER BY participant_pubkey, received_at, signal_event_id \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .bind(frozen_at)
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+async fn decision_cohort_complete_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    round_number: i64,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS( \
+             SELECT 1 \
+             FROM meeting_round_decision_cohort cohort \
+             WHERE cohort.community_id = $1 \
+               AND cohort.session_id = $2 \
+               AND cohort.round_number = $3 \
+               AND NOT EXISTS( \
+                 SELECT 1 FROM meeting_floor_claims claim \
+                 WHERE claim.community_id = cohort.community_id \
+                   AND claim.session_id = cohort.session_id \
+                   AND claim.round_number = cohort.round_number \
+                   AND claim.claimant_pubkey = cohort.participant_pubkey \
+               ) \
+               AND NOT EXISTS( \
+                 SELECT 1 FROM meeting_floor_signals signal \
+                 WHERE signal.community_id = cohort.community_id \
+                   AND signal.session_id = cohort.session_id \
+                   AND signal.round_number = cohort.round_number \
+                   AND signal.participant_pubkey = cohort.participant_pubkey \
+                   AND signal.action = 'pass' \
+               ) \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(round_number)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(Into::into)
 }
 
 struct PreviousRound<'a> {
@@ -1144,6 +1847,7 @@ async fn create_open_round_locked(
         floor_revision: next_revision,
         phase: FloorPhase::Open,
         state_event_id: state_event.id.as_bytes().to_vec(),
+        settle_not_before: None,
         claim_deadline: None,
         holder_pubkey: None,
         grant_event_id: None,
@@ -1169,7 +1873,16 @@ async fn advance_due_locked(
         return Ok(false);
     }
     match round.phase {
-        FloorPhase::Claiming if round.claim_deadline.is_some_and(|deadline| now >= deadline) => {
+        FloorPhase::Claiming => {
+            let deadline_due = round.claim_deadline.is_some_and(|deadline| now >= deadline);
+            let cohort_due = round
+                .settle_not_before
+                .is_some_and(|boundary| now >= boundary)
+                && decision_cohort_complete_tx(tx, community_id, session_id, round.round_number)
+                    .await?;
+            if !deadline_due && !cohort_due {
+                return Ok(false);
+            }
             grant_round_locked(
                 tx,
                 community_id,
@@ -1218,6 +1931,7 @@ async fn grant_round_locked(
     selector: WinnerSelector,
 ) -> Result<RoundRow> {
     let claims = load_claims_tx(tx, community_id, session_id, round.round_number).await?;
+    let controls = load_control_sets_tx(tx, community_id, session_id, round.round_number).await?;
     if claims.is_empty() {
         return Err(DbError::InvalidData(
             "claiming round has no canonical Claims".to_string(),
@@ -1244,9 +1958,18 @@ async fn grant_round_locked(
         FloorPhase::Granted,
         Some(&winner.claimant_pubkey),
         serde_json::json!({
+            "settle_not_before_ms": round
+                .settle_not_before
+                .map(|value| value.timestamp_millis()),
+            "claim_deadline_ms": round
+                .claim_deadline
+                .map(|value| value.timestamp_millis()),
             "lease_expires_at_ms": lease_expires_at.timestamp_millis(),
             "claim_event_ids": claim_ids_hex(&claims),
             "claimants": claimant_hex(&claims),
+            "decision_cohort": pubkeys_hex(&controls.decision_cohort_pubkeys),
+            "ready": pubkeys_hex(&controls.ready_pubkeys),
+            "passed": pubkeys_hex(&controls.passer_pubkeys),
         }),
         now,
     )?;
@@ -1283,6 +2006,7 @@ async fn grant_round_locked(
         floor_revision: next_revision,
         phase: FloorPhase::Granted,
         state_event_id: grant_event.id.as_bytes().to_vec(),
+        settle_not_before: round.settle_not_before,
         claim_deadline: round.claim_deadline,
         holder_pubkey: Some(winner.claimant_pubkey.clone()),
         grant_event_id: Some(grant_event.id.as_bytes().to_vec()),
@@ -1393,6 +2117,32 @@ async fn ensure_active_participant(
     if !member {
         return Err(DbError::AccessDenied(
             "only a meeting participant may use the speech floor".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_active_agent_participant(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    pubkey: &[u8],
+) -> Result<()> {
+    let agent: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM channel_members \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3 \
+               AND role = 'bot' AND removed_at IS NULL \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(pubkey)
+    .fetch_one(tx.as_mut())
+    .await?;
+    if !agent {
+        return Err(DbError::AccessDenied(
+            "only an Agent participant may submit Ready or Pass".to_string(),
         ));
     }
     Ok(())
@@ -1509,6 +2259,78 @@ fn validate_event_identity(event: &Event, session_id: Uuid, round_number: i64) -
     Ok(())
 }
 
+fn validate_intent_signal_event(
+    event: &Event,
+    action: FloorSignalAction,
+    intent_basis: &str,
+) -> Result<()> {
+    if event.kind.as_u16() as u32 != buzz_core::kind::KIND_MEETING_FLOOR_SIGNAL {
+        return Err(DbError::InvalidData(
+            "meeting floor signal has the wrong event kind".to_string(),
+        ));
+    }
+    if !event.content.is_empty() {
+        return Err(DbError::InvalidData(
+            "meeting floor signal content must be empty".to_string(),
+        ));
+    }
+    if intent_basis.is_empty()
+        || intent_basis.len() > 512
+        || intent_basis.trim() != intent_basis
+        || intent_basis.chars().any(char::is_control)
+    {
+        return Err(DbError::InvalidData(
+            "meeting intent basis must be 1-512 bytes without surrounding whitespace or control characters"
+                .to_string(),
+        ));
+    }
+    if event_tag_values(event, "action").as_slice() != [action.as_str()] {
+        return Err(DbError::InvalidData(
+            "meeting floor signal has the wrong action tag".to_string(),
+        ));
+    }
+    if event_tag_values(event, "intent-basis").as_slice() != [intent_basis] {
+        return Err(DbError::InvalidData(
+            "meeting floor signal has the wrong intent basis".to_string(),
+        ));
+    }
+    if !event_tag_values(event, "meeting-grant").is_empty() {
+        return Err(DbError::InvalidData(
+            "Ready and Pass must not reference a meeting Grant".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_yield_event(event: &Event, grant_event_id: &[u8]) -> Result<()> {
+    if event.kind.as_u16() as u32 != buzz_core::kind::KIND_MEETING_FLOOR_SIGNAL {
+        return Err(DbError::InvalidData(
+            "meeting Yield has the wrong event kind".to_string(),
+        ));
+    }
+    if !event.content.is_empty() {
+        return Err(DbError::InvalidData(
+            "meeting Yield content must be empty".to_string(),
+        ));
+    }
+    if event_tag_values(event, "action").as_slice() != ["yield"] {
+        return Err(DbError::InvalidData(
+            "meeting Yield has the wrong action tag".to_string(),
+        ));
+    }
+    if !event_tag_values(event, "intent-basis").is_empty() {
+        return Err(DbError::InvalidData(
+            "meeting Yield must not contain an intent basis".to_string(),
+        ));
+    }
+    if event_tag_values(event, "meeting-grant").as_slice() != [hex::encode(grant_event_id)] {
+        return Err(DbError::InvalidData(
+            "meeting Yield has the wrong Grant tag".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn event_tag_values(event: &Event, name: &str) -> Vec<String> {
     event
         .tags
@@ -1528,6 +2350,18 @@ fn validate_duration(duration: StdDuration, field: &str) -> Result<()> {
         return Err(DbError::InvalidData(format!(
             "{field} must not exceed 300 seconds"
         )));
+    }
+    Ok(())
+}
+
+fn validate_floor_config(config: FloorConfig) -> Result<()> {
+    validate_duration(config.claim_settle_delay, "meeting Claim settle delay")?;
+    validate_duration(config.claim_window, "meeting Claim window")?;
+    validate_duration(config.grant_lease, "meeting Grant lease")?;
+    if config.claim_settle_delay > config.claim_window {
+        return Err(DbError::InvalidData(
+            "meeting Claim settle delay must not exceed the Claim window".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1561,6 +2395,31 @@ fn claimant_hex(claims: &[CanonicalClaim]) -> Vec<String> {
         .collect()
 }
 
+fn pubkeys_hex(pubkeys: &[Vec<u8>]) -> Vec<String> {
+    pubkeys.iter().map(hex::encode).collect()
+}
+
+fn round_state_content(
+    round: &RoundRow,
+    claims: &[CanonicalClaim],
+    controls: &FloorControlSets,
+) -> serde_json::Value {
+    let mut content = serde_json::json!({
+        "claim_event_ids": claim_ids_hex(claims),
+        "claimants": claimant_hex(claims),
+        "decision_cohort": pubkeys_hex(&controls.decision_cohort_pubkeys),
+        "ready": pubkeys_hex(&controls.ready_pubkeys),
+        "passed": pubkeys_hex(&controls.passer_pubkeys),
+    });
+    if let Some(settle_not_before) = round.settle_not_before {
+        content["settle_not_before_ms"] = serde_json::json!(settle_not_before.timestamp_millis());
+    }
+    if let Some(claim_deadline) = round.claim_deadline {
+        content["claim_deadline_ms"] = serde_json::json!(claim_deadline.timestamp_millis());
+    }
+    content
+}
+
 async fn snapshot_from_round(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -1568,7 +2427,8 @@ async fn snapshot_from_round(
     round: RoundRow,
 ) -> Result<FloorSnapshot> {
     let claims = load_claims_tx(tx, community_id, session_id, round.round_number).await?;
-    Ok(snapshot(round, session_id, claims))
+    let controls = load_control_sets_tx(tx, community_id, session_id, round.round_number).await?;
+    Ok(snapshot(round, session_id, claims, controls))
 }
 
 async fn snapshot_from_round_pool(
@@ -1578,16 +2438,23 @@ async fn snapshot_from_round_pool(
     round: RoundRow,
 ) -> Result<FloorSnapshot> {
     let claims = load_claims_pool(db, community_id, session_id, round.round_number).await?;
-    Ok(snapshot(round, session_id, claims))
+    let controls = load_control_sets_pool(db, community_id, session_id, round.round_number).await?;
+    Ok(snapshot(round, session_id, claims, controls))
 }
 
-fn snapshot(round: RoundRow, session_id: Uuid, claims: Vec<CanonicalClaim>) -> FloorSnapshot {
+fn snapshot(
+    round: RoundRow,
+    session_id: Uuid,
+    claims: Vec<CanonicalClaim>,
+    controls: FloorControlSets,
+) -> FloorSnapshot {
     FloorSnapshot {
         session_id,
         round_number: round.round_number,
         floor_revision: round.floor_revision,
         phase: round.phase,
         state_event_id: round.state_event_id,
+        settle_not_before: round.settle_not_before,
         claim_deadline: round.claim_deadline,
         holder_pubkey: round.holder_pubkey,
         grant_event_id: round.grant_event_id,
@@ -1599,6 +2466,9 @@ fn snapshot(round: RoundRow, session_id: Uuid, claims: Vec<CanonicalClaim>) -> F
             .into_iter()
             .map(|claim| claim.claimant_pubkey)
             .collect(),
+        decision_cohort_pubkeys: controls.decision_cohort_pubkeys,
+        ready_pubkeys: controls.ready_pubkeys,
+        passer_pubkeys: controls.passer_pubkeys,
     }
 }
 
@@ -1663,7 +2533,7 @@ mod tests {
             .bind(community_uuid)
             .bind(session_id)
             .bind(participant.public_key().as_bytes())
-            .bind(if index == 0 { "owner" } else { "member" })
+            .bind(if index == 0 { "owner" } else { "bot" })
             .bind(&host)
             .execute(&pool)
             .await
@@ -1730,12 +2600,209 @@ mod tests {
             .expect("sign speech")
     }
 
+    fn intent_signal_event(
+        keys: &Keys,
+        session_id: Uuid,
+        round_number: i64,
+        action: &str,
+        intent_basis: &str,
+    ) -> Event {
+        EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_FLOOR_SIGNAL as u16),
+            "",
+        )
+        .tags([
+            Tag::parse(["h", &session_id.to_string()]).expect("h tag"),
+            Tag::parse(["meeting-round", &round_number.to_string()]).expect("round tag"),
+            Tag::parse(["action", action]).expect("action tag"),
+            Tag::parse(["intent-basis", intent_basis]).expect("basis tag"),
+        ])
+        .sign_with_keys(keys)
+        .expect("sign intent signal")
+    }
+
+    fn yield_event(keys: &Keys, session_id: Uuid, round_number: i64, grant_id: &[u8]) -> Event {
+        EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_FLOOR_SIGNAL as u16),
+            "",
+        )
+        .tags([
+            Tag::parse(["h", &session_id.to_string()]).expect("h tag"),
+            Tag::parse(["meeting-round", &round_number.to_string()]).expect("round tag"),
+            Tag::parse(["action", "yield"]).expect("action tag"),
+            Tag::parse(["meeting-grant", &hex::encode(grant_id)]).expect("grant tag"),
+        ])
+        .sign_with_keys(keys)
+        .expect("sign Yield")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_cohort_settles_early_and_yield_opens_the_next_round() {
+        let (db, community_id, session_id, relay_keys, participants) = setup_meeting().await;
+        let config = FloorConfig {
+            claim_settle_delay: StdDuration::from_millis(30),
+            claim_window: StdDuration::from_secs(2),
+            grant_lease: StdDuration::from_secs(2),
+        };
+        let basis_a = "speech:first";
+        let basis_b = "speech:second";
+        let ready_a = intent_signal_event(&participants[1], session_id, 1, "ready", basis_a);
+        let ready_b = intent_signal_event(&participants[2], session_id, 1, "ready", basis_b);
+        assert!(matches!(
+            signal_intent(
+                &db,
+                community_id,
+                session_id,
+                1,
+                FloorSignalAction::Ready,
+                basis_a,
+                &ready_a,
+                &relay_keys,
+                config,
+                WinnerSelector::FixedIndex(0),
+            )
+            .await
+            .expect("Ready A"),
+            FloorSignalOutcome::Accepted { .. }
+        ));
+        signal_intent(
+            &db,
+            community_id,
+            session_id,
+            1,
+            FloorSignalAction::Ready,
+            basis_b,
+            &ready_b,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+        )
+        .await
+        .expect("Ready B");
+
+        let human_ready =
+            intent_signal_event(&participants[0], session_id, 1, "ready", "activation:human");
+        assert!(matches!(
+            signal_intent(
+                &db,
+                community_id,
+                session_id,
+                1,
+                FloorSignalAction::Ready,
+                "activation:human",
+                &human_ready,
+                &relay_keys,
+                config,
+                WinnerSelector::FixedIndex(0),
+            )
+            .await,
+            Err(DbError::AccessDenied(_))
+        ));
+
+        let claim = claim_event(&participants[1], session_id, 1);
+        claim_floor(
+            &db,
+            community_id,
+            session_id,
+            1,
+            &claim,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+        )
+        .await
+        .expect("Agent A Claim");
+        let claiming = get_floor_snapshot(&db, community_id, session_id)
+            .await
+            .expect("claiming floor");
+        assert_eq!(claiming.phase, FloorPhase::Claiming);
+        assert_eq!(claiming.decision_cohort_pubkeys.len(), 2);
+        assert!(claiming
+            .claim_deadline
+            .zip(claiming.settle_not_before)
+            .is_some_and(|(deadline, settle)| deadline > settle));
+
+        let pass = intent_signal_event(&participants[2], session_id, 1, "pass", basis_b);
+        signal_intent(
+            &db,
+            community_id,
+            session_id,
+            1,
+            FloorSignalAction::Pass,
+            basis_b,
+            &pass,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+        )
+        .await
+        .expect("Agent B Pass");
+        tokio::time::sleep(StdDuration::from_millis(40)).await;
+        recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10)
+            .await
+            .expect("settle complete cohort");
+        let granted = get_floor_snapshot(&db, community_id, session_id)
+            .await
+            .expect("granted floor");
+        assert_eq!(granted.phase, FloorPhase::Granted);
+        assert_eq!(
+            granted.holder_pubkey.as_deref(),
+            Some(participants[1].public_key().as_bytes().as_slice())
+        );
+        assert_eq!(granted.passer_pubkeys.len(), 1);
+
+        let grant_id = granted.grant_event_id.expect("Grant ID");
+        let yielded = yield_event(&participants[1], session_id, 1, &grant_id);
+        assert!(matches!(
+            yield_floor(
+                &db,
+                community_id,
+                session_id,
+                1,
+                &grant_id,
+                &yielded,
+                &relay_keys,
+                config,
+                WinnerSelector::FixedIndex(0),
+            )
+            .await
+            .expect("Yield"),
+            YieldOutcome::Accepted {
+                next_round_number: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            yield_floor(
+                &db,
+                community_id,
+                session_id,
+                1,
+                &grant_id,
+                &yielded,
+                &relay_keys,
+                config,
+                WinnerSelector::FixedIndex(0),
+            )
+            .await
+            .expect("duplicate Yield"),
+            YieldOutcome::Duplicate { .. }
+        ));
+        let next = get_floor_snapshot(&db, community_id, session_id)
+            .await
+            .expect("next floor");
+        assert_eq!(next.round_number, 2);
+        assert_eq!(next.phase, FloorPhase::Open);
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn claim_grant_say_expiry_restart_and_idempotency_are_atomic() {
         let (db, community_id, session_id, relay_keys, participants) = setup_meeting().await;
         let config = FloorConfig {
-            claim_window: StdDuration::from_millis(80),
+            claim_settle_delay: StdDuration::from_millis(200),
+            claim_window: StdDuration::from_millis(500),
             grant_lease: StdDuration::from_secs(2),
         };
         let claim_a = claim_event(&participants[0], session_id, 1);
@@ -1842,7 +2909,7 @@ mod tests {
             claiming_before_restart.claim_event_ids
         );
 
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        tokio::time::sleep(StdDuration::from_millis(550)).await;
         assert!(
             recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10,)
                 .await
@@ -2047,7 +3114,7 @@ mod tests {
         )
         .await
         .expect("Claim Round 2");
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        tokio::time::sleep(StdDuration::from_millis(550)).await;
         recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10)
             .await
             .expect("grant Round 2");

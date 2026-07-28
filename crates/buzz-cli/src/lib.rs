@@ -779,6 +779,30 @@ pub enum MeetingFloorCmd {
         #[arg(long, default_value_t = 20)]
         timeout: u64,
     },
+    /// Declare that this Agent will resolve one intent basis for the round
+    Ready {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Opaque intent basis id, such as speech:<event-id>
+        #[arg(long)]
+        basis: String,
+    },
+    /// Complete a previously Ready intent without claiming
+    Pass {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Opaque intent basis id used by the matching Ready
+        #[arg(long)]
+        basis: String,
+    },
+    /// Yield the current identity's active Grant and immediately open a new round
+    Yield {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
 }
 
 #[derive(Subcommand)]

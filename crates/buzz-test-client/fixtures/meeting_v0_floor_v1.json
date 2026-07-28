@@ -6,7 +6,8 @@
     "kinds": {
       "speech": 9,
       "claim": 42102,
-      "round_state": 42103
+      "round_state": 42103,
+      "floor_signal": 42104
     },
     "round_state_required_tags": [
       "h",
