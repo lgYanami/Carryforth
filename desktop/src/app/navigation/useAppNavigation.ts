@@ -90,6 +90,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goView = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/view",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProject = React.useCallback(
     (
       projectId: string,
@@ -306,6 +317,7 @@ export function useAppNavigation() {
     goSettings,
     goWorkflow,
     goWorkflows,
+    goView,
     openSearchHit,
   };
 }

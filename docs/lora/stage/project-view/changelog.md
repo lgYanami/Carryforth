@@ -1,5 +1,65 @@
 # Project View 变更记录
 
+## 2026-07-27 — Client Slice 1：可信读取与 View 页面
+
+### 客户端可信边界
+
+- Desktop 新增单一 `get_project_view` Tauri 读命令。命令先读取 NIP-11
+  `supported_extensions` 与规范小写 `self`，只信任该 Relay identity 签名的
+  `40903`/`40904` projection；前端不接收或自行解释原始事件。
+- 快照读取复用 CLI 已建立的协议约束：先读 meta，再以
+  `project_revision + projection_generation` 扩展过滤器分页读取 active object，
+  逐事件验证签名、signer、project、generation、revision、严格游标顺序、对象 ID
+  唯一性与 active count，最后重读同一 meta。快照竞争最多有界重试三次，仍不稳定则
+  不展示混合 revision。
+- 验证后的对象先经 `ProjectViewState::from_snapshot()` 复核完整领域不变量，再由
+  `ProjectView::assemble()` 生成唯一规范层级。错误 signer、tombstone 混入、重复 head、
+  缺失关系目标和不一致计数都 fail closed。
+- Native command 明确返回 `unsupported`、`forbidden`、`uninitialized` 和 `ready`
+  四态；TypeScript 边界只负责 snake_case DTO 到 camelCase UI model 的机械转换，并再次
+  拒绝 outer/inner object type 不一致。
+- React Query key 包含当前 Community ID；本 Slice 只在窗口重新获得焦点时重取完整可信
+  快照，没有增加 module-level Community cache，也没有直接访问数据库或调用 CLI
+  子进程。
+
+### View 页面
+
+- 新增预览入口 `View` 与 `/view` 路由，位置在 `Pulse` 和现有 `Projects` 之间。
+  `Projects` 的名称、路由、目录和行为保持不变，避免本阶段引入 Git Repository
+  概念迁移。
+- 只读页面呈现 Project Profile、由明确状态推导的 Current Focus、唯一规范
+  `Goal → Plan → Stage → Requirement/Issue → Work` 地图、Unbound Plan、
+  Unplanned Requirement/Issue、Roles 和 Resources；未归属对象不会因无法放进主树而
+  消失。
+- Issue 完整对象只出现在其规范 planned/unplanned 位置；`about` 关系仅在目标对象卡片和
+  Inspector 中显示轻量引用，没有复制第二份 Issue 状态。
+- 任意对象可打开响应式 Object Inspector；选择写入 `/view?object=<uuid>`，因此前进、
+  后退和页面内关系跳转可恢复。Inspector 展示 typed 正文、关系目标、object/project
+  revision、规范时间和 actor 公钥。
+- 不支持、无权限、未初始化、加载和完整性/网络失败均有独立状态。未初始化页不提供尚未
+  交付的初始化按钮；错误页只允许重新执行可信读取。
+
+### 验证
+
+- Tauri Rust 新增 3 个真实 HTTP fixture 测试：完整签名 projection 能验证并组装，NIP-11
+  未声明的 signer 会被拒绝，并覆盖 unsupported、uninitialized、forbidden
+  状态映射；`cargo clippy --all-targets -D warnings` 通过。
+- Desktop 3,492 个 unit test 全部通过；新增 normalization、规范对象索引、Current Focus
+  与 `/view`/`/projects` 路由区分回归测试。
+- 新增 4 个 Playwright smoke 测试，覆盖侧栏进入 View、规范地图、未规划区域、URL
+  Inspector、现有 Projects 入口保留，以及 unsupported、uninitialized、forbidden
+  Community 状态。
+- Desktop typecheck、Vite E2E build、Biome、文件大小、可缩放文本和公钥展示守卫通过。
+
+### 范围边界
+
+- 本 Slice 完成的是 Human 可用的可信只读 Project View，不包含初始化、Create/Update/
+  Delete、关系选择器、引用感知删除或 revision conflict 表单；这些属于 Client Slice 2。
+- 本 Slice 不订阅 projection 实时变化，也不处理编辑草稿与并发冲突；Human/Agent
+  修改后的实时恢复、断线重连与来源展示属于 Client Slice 3。
+- Current Focus 只汇总领域对象的显式 status，不引入“当前 Stage”、隐式状态推进、排序或
+  Kanban 语义。
+
 ## 2026-07-27 — Slice 5：CI、可观测性与发布
 
 ### 专用质量门

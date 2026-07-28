@@ -51,6 +51,7 @@ import type {
   RawInstallRuntimeResult,
   RuntimeFileConfigSubset,
 } from "@/shared/api/tauri";
+import type { RawProjectViewLoadResult } from "@/shared/api/tauriProjectView";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -281,6 +282,10 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    /** Verified Project View command result returned to the View screen. */
+    projectView?: RawProjectViewLoadResult;
+    projectViewReadDelayMs?: number;
+    projectViewReadError?: string;
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -10932,6 +10937,19 @@ export function maybeInstallE2eTauriMocks() {
           );
         }
         return activeConfig?.mock?.relaySelf ?? null;
+      case "get_project_view":
+        if ((activeConfig?.mock?.projectViewReadDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectViewReadDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectViewReadError) {
+          throw new Error(activeConfig.mock.projectViewReadError);
+        }
+        return activeConfig?.mock?.projectView ?? { status: "unsupported" };
       case "archive_identity":
       case "unarchive_identity":
         // The spec only verifies UI state, not the submitted request shape;
