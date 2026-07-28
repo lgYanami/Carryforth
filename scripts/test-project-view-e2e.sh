@@ -137,6 +137,9 @@ fi
 export DATABASE_URL="${database_url}"
 export PROJECT_VIEW_E2E_RELAY_URL="${relay_url}"
 export PROJECT_VIEW_E2E_BUZZ_BIN="${bin_dir}/buzz"
+export PROJECT_VIEW_E2E_ADMIN_BIN="${bin_dir}/buzz-admin"
+export PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY="${relay_private_key}"
+export REDIS_URL=redis://localhost:6379
 
 if [[ -n "${PROJECT_VIEW_TEST_ARCHIVE:-}" ]]; then
   cargo nextest run \

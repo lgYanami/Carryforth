@@ -1,5 +1,81 @@
 # 角色连续性变更记录
 
+## 2026-07-28 — 阶段 2：Proposal、Assignment 与 CLI 纵向闭环
+
+### Role Continuity 状态机
+
+- 增加 closed `RoleCommand` 与纯领域 reducer，覆盖
+  `request/offer/accept/reject/withdraw/expire/authorize` Proposal、人工结束
+  Assignment、`request_replacement` 和 `report_unable_to_continue`。
+- Proposal 创建时同时记录目标 Role 和候选 Member 的 active Assignment fence；最后一个
+  必要确认到达时重新验证候选资格、授权者资格和两段 fence。任一条件变化都会拒绝整个
+  command，不会先消费 Proposal 再留下半套状态。
+- Assignment 激活或替换是一次 project revision 内的 compound transition。候选者原有
+  Role 与目标 Role 的旧任期会一起结束，新任期只创建一次，并为每条被替换任期生成最小
+  Handoff。
+- 固定治理边界：assignee 不能主动结束自己的 Assignment；owner 可以治理所有层级；
+  active Leader 只能治理普通 Role，并且必须携带与 signer 完全一致的当前
+  `acting_assignment_id`；verified human owner 可以结束自己名下 managed Agent 的普通
+  Assignment。
+- 普通 Role 对应 Community `member`，Leader Role 对应 Community `admin`。Assignment
+  变化产生期望等级，由同一事务更新 canonical membership 和 NIP-43 snapshot。
+
+### v2 原子协调器与 cutover
+
+- 增加 additive migration `0027_project_role_assignment_state.sql` 并同步
+  `schema/schema.sql`：补齐连续性实体 revision/change pointer、Assignment 的替换请求与
+  unable report、最小 Handoff，以及 v2 meta 的实体计数和 membership snapshot pointer。
+- 增加统一 v2 write transaction：在 Community Project lock 内完成 command receipt、
+  canonical Proposal/Assignment/Handoff、Community 等级、NIP-43 snapshot、`40903`
+  entity heads、`40904` meta 和旧 head retirement。签名投影在 commit 前会被重新解析并与
+  canonical state 对照，任一步失败全部回滚。
+- 增加显式 `buzz-admin project-view cutover-v2`。cutover 只接受 disabled、已初始化的
+  v1 Community；现有非 owner admin 必须逐一显式映射到唯一 Leader Role 或显式降级，
+  不能按名称猜测。操作绑定 hash-chain audit、稳定 idempotency hash，并原子提升 schema、
+  project revision 和 projection generation。
+- cutover 会把全部 v1 当前对象与 tombstone 重投影为 v2 head，而不是只迁移 Role；旧
+  current heads 同事务退休。重复相同 operator idempotency key 返回原 receipt。
+- `buzz-project-view-v2` 只在 feature enabled、Relay signer 一致、meta/membership/counts
+  完整、全部 canonical current rows 都有同 generation 的 live projection head 时由
+  NIP-11 宣告；残缺 cutover 或手工退休任一 head 都保持 fail closed。
+
+### Relay、SDK 与 CLI
+
+- Relay 按 Community 的 schema version 分派 v1 mutation 或 v2 Role command，并在 receipt
+  lookup 前执行当前 membership、ban、feature、signer 与 Assignment fence 检查。已接受
+  event 不能借重放绕过后续卸任或权限变化。
+- SDK 增加 v2 command、Role continuity entity、普通 Project object、membership 和 meta
+  的 typed builder/parser。parser 校验 kind、Relay signer、签名、closed content、精确
+  tag 顺序、schema、project/generation coordinate 与 source pointer。
+- 增加 `buzz roles list/get/current/proposals/request/offer/proposal/assignment`。CLI
+  先从 NIP-11 固定 Relay identity，再验证 meta、全部 Role continuity heads 和 meta 指向
+  的唯一 membership snapshot；Assignment、Role level 与 Community 等级不一致时拒绝
+  展示快照。
+
+### 验证
+
+- 纯领域测试覆盖双旧任期原子替换、授权者在最终确认前失权不产生部分消费、assignee
+  自卸任禁令与 replacement request、Leader 的精确 active Assignment fence。
+- 13 项 Project View PostgreSQL 测试全部通过，包含显式 v1→v2 cutover、cutover
+  idempotency、残缺 generation 启用拒绝、owner 首次指派、A→B 替换、唯一 active
+  Assignment、最小 Handoff、自卸任拒绝和旧 Assignment 延迟命令拒绝。
+- 真实进程 E2E 使用隔离 PostgreSQL/Redis、真实 Relay、`buzz-admin` 和 `buzz` CLI，完成
+  v1 对象写入、停用、v2 cutover、NIP-11 capability 切换、Agent A 接受 Offer、自卸任
+  拒绝和 A→B 替换；最终 CLI 读取到两条任期历史与一条 Handoff。
+- 9 项 `buzz-project-view`、243 项 `buzz-sdk`、259 项 `buzz-cli`、6 项 Relay
+  Project View、13 项 Project View 实库事务、6 项 migration/schema-drift 测试及相关
+  crates 的 `clippy --all-targets -D warnings` 均通过。
+
+### 范围边界
+
+- cutover 是显式 operator 动作，不会自动迁移或启用任何现有 Community；阶段 2 只适合
+  受控 CLI pilot。
+- v2 普通 Project View 对象已有完整 cutover/read projection，但 v2
+  `initialize/create/update/delete` 写入尚未开放；schema-v2 Community 会明确拒绝旧 v1
+  mutation，避免被旧客户端误写。恢复普通对象写入是 Desktop 阶段开始前的后端前置项。
+- 本阶段不包含 Desktop Human 治理、managed Agent 自动携带 Assignment、Work
+  Commitment、完整 Checkpoint/Role Brief 或可信 runtime 自动故障恢复。
+
 ## 2026-07-28 — 阶段 1：Membership 一致性内核
 
 ### v2 边界与变更来源

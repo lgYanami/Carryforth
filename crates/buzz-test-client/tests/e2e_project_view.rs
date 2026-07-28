@@ -133,6 +133,22 @@ fn create_goal_mutation(expected_revision: u64, title: &str) -> Mutation {
     )
 }
 
+fn create_role_mutation(expected_revision: u64, role_id: Uuid) -> Mutation {
+    Mutation::new(
+        expected_revision,
+        MutationRequest::Create(CreateMutation {
+            object: NewProjectViewObject::Role {
+                id: role_id,
+                name: "Module maintainer".to_owned(),
+                purpose: "Own one bounded implementation area".to_owned(),
+                responsibilities: vec!["Keep the module healthy".to_owned()],
+                boundaries: vec!["Does not govern Leader roles".to_owned()],
+                active: true,
+            },
+        }),
+    )
+}
+
 fn mutation_event(keys: &Keys, mutation: &Mutation) -> Event {
     EventBuilder::new(
         Kind::Custom(KIND_PROJECT_VIEW_MUTATION as u16),
@@ -353,15 +369,92 @@ fn create_goal_with_real_cli(
     serde_json::from_slice(&output.stdout).expect("parse real buzz CLI JSON output")
 }
 
+fn run_real_buzz(context: &TestContext, keys: &Keys, args: &[&str]) -> Value {
+    let buzz = std::env::var("PROJECT_VIEW_E2E_BUZZ_BIN")
+        .expect("PROJECT_VIEW_E2E_BUZZ_BIN must point at the real buzz CLI");
+    let output = Command::new(buzz)
+        .args(["--format", "compact"])
+        .args(args)
+        .env("BUZZ_RELAY_URL", &context.http_url)
+        .env(
+            "BUZZ_PRIVATE_KEY",
+            keys.secret_key()
+                .to_bech32()
+                .expect("encode E2E command signer nsec"),
+        )
+        .env_remove("BUZZ_AUTH_TAG")
+        .output()
+        .expect("run real buzz CLI");
+    assert!(
+        output.status.success(),
+        "real buzz CLI failed (status={}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse real buzz CLI JSON output")
+}
+
+fn run_real_buzz_rejected(context: &TestContext, keys: &Keys, args: &[&str]) -> String {
+    let buzz = std::env::var("PROJECT_VIEW_E2E_BUZZ_BIN")
+        .expect("PROJECT_VIEW_E2E_BUZZ_BIN must point at the real buzz CLI");
+    let output = Command::new(buzz)
+        .args(["--format", "compact"])
+        .args(args)
+        .env("BUZZ_RELAY_URL", &context.http_url)
+        .env(
+            "BUZZ_PRIVATE_KEY",
+            keys.secret_key()
+                .to_bech32()
+                .expect("encode E2E command signer nsec"),
+        )
+        .env_remove("BUZZ_AUTH_TAG")
+        .output()
+        .expect("run rejected real buzz CLI command");
+    assert!(
+        !output.status.success(),
+        "expected real buzz CLI command to fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn run_real_admin(args: &[&str]) -> String {
+    let admin = std::env::var("PROJECT_VIEW_E2E_ADMIN_BIN")
+        .expect("PROJECT_VIEW_E2E_ADMIN_BIN must point at the real buzz-admin CLI");
+    let relay_private_key = std::env::var("PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY")
+        .expect("PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY must match the running Relay");
+    let output = Command::new(admin)
+        .args(args)
+        .env(
+            "DATABASE_URL",
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+        )
+        .env("BUZZ_RELAY_PRIVATE_KEY", relay_private_key)
+        .output()
+        .expect("run real buzz-admin");
+    assert!(
+        output.status.success(),
+        "real buzz-admin failed (status={}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[tokio::test]
 #[ignore = "requires running Relay, Postgres, Redis, and stable relay signer"]
 async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     let context = setup().await;
     let writer = Keys::generate();
     let agent = Keys::generate();
+    let successor = Keys::generate();
     let reader = Keys::generate();
     seed_member(&context, &writer).await;
     seed_member(&context, &agent).await;
+    seed_member(&context, &successor).await;
     seed_member(&context, &reader).await;
     let http = Client::new();
 
@@ -614,6 +707,182 @@ async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     .expect("read final Project View state");
     assert_eq!(row.get::<i64, _>("project_revision"), 4);
     assert_eq!(row.get::<i64, _>("projection_generation"), 1);
+
+    let role_id = Uuid::new_v4();
+    let role_event = mutation_event(&writer, &create_role_mutation(4, role_id));
+    let (status, response) = submit_http(&http, &context, &writer, &role_event).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "v1 Role creation failed: {response}"
+    );
+    assert_eq!(response["accepted"], true);
+
+    run_real_admin(&["project-view", "disable", "--community", &context.host]);
+    let relay_owner = Keys::parse(
+        &std::env::var("PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY")
+            .expect("PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY must be set"),
+    )
+    .expect("parse Relay owner key");
+    let relay_pubkey_hex = relay_pubkey.to_hex();
+    let cutover = run_real_admin(&[
+        "project-view",
+        "cutover-v2",
+        "--community",
+        &context.host,
+        "--idempotency-key",
+        "project-view-role-continuity-e2e",
+        "--expected-pubkey",
+        &relay_pubkey_hex,
+    ]);
+    let cutover: Value = serde_json::from_str(&cutover).expect("parse v2 cutover result");
+    assert_eq!(cutover["project_revision"], 6);
+    assert_eq!(cutover["projection_generation"], 2);
+    run_real_admin(&["project-view", "enable", "--community", &context.host]);
+
+    let info: Value = http
+        .get(format!("{}/info", context.http_url))
+        .send()
+        .await
+        .expect("fetch v2 NIP-11")
+        .json()
+        .await
+        .expect("parse v2 NIP-11");
+    assert!(
+        info["supported_extensions"]
+            .as_array()
+            .is_some_and(|extensions| {
+                extensions
+                    .iter()
+                    .any(|value| value == "buzz-project-view-v2")
+            }),
+        "Project View v2 capability was not advertised: {info}"
+    );
+
+    let role_id_text = role_id.to_string();
+    let agent_pubkey = agent.public_key().to_hex();
+    let offered = run_real_buzz(
+        &context,
+        &relay_owner,
+        &[
+            "roles",
+            "offer",
+            "--role",
+            &role_id_text,
+            "--member",
+            &agent_pubkey,
+            "--expected-project-revision",
+            "6",
+        ],
+    );
+    assert_eq!(offered["accepted"], true);
+    let proposals = run_real_buzz(
+        &context,
+        &agent,
+        &["roles", "proposals", "--status", "open"],
+    );
+    let proposal_id = proposals["proposals"]
+        .as_array()
+        .and_then(|proposals| {
+            proposals
+                .iter()
+                .find(|proposal| proposal["role_id"] == role_id_text)
+        })
+        .and_then(|proposal| proposal["proposal_id"].as_str())
+        .expect("find open Role offer")
+        .to_owned();
+    let accepted = run_real_buzz(
+        &context,
+        &agent,
+        &[
+            "roles",
+            "proposal",
+            "accept",
+            &proposal_id,
+            "--expected-project-revision",
+            "7",
+        ],
+    );
+    assert_eq!(accepted["accepted"], true);
+
+    let current = run_real_buzz(&context, &agent, &["roles", "current"]);
+    assert_eq!(current["project_revision"], 8);
+    assert_eq!(current["assigned"], true);
+    assert_eq!(current["role"]["role_id"], role_id_text);
+    let first_assignment_id = current["assignment"]["assignment_id"]
+        .as_str()
+        .expect("first active Assignment ID")
+        .to_owned();
+    let rejection = run_real_buzz_rejected(
+        &context,
+        &agent,
+        &[
+            "roles",
+            "assignment",
+            "end",
+            &first_assignment_id,
+            "--expected-project-revision",
+            "8",
+        ],
+    );
+    assert!(
+        rejection.contains("restricted:project_view:self_end"),
+        "unexpected self-end rejection: {rejection}"
+    );
+
+    let successor_pubkey = successor.public_key().to_hex();
+    let offered = run_real_buzz(
+        &context,
+        &relay_owner,
+        &[
+            "roles",
+            "offer",
+            "--role",
+            &role_id_text,
+            "--member",
+            &successor_pubkey,
+            "--expected-project-revision",
+            "8",
+        ],
+    );
+    assert_eq!(offered["accepted"], true);
+    let proposals = run_real_buzz(
+        &context,
+        &successor,
+        &["roles", "proposals", "--status", "open"],
+    );
+    let replacement_proposal_id = proposals["proposals"]
+        .as_array()
+        .and_then(|proposals| {
+            proposals
+                .iter()
+                .find(|proposal| proposal["role_id"] == role_id_text)
+        })
+        .and_then(|proposal| proposal["proposal_id"].as_str())
+        .expect("find replacement Role offer")
+        .to_owned();
+    let accepted = run_real_buzz(
+        &context,
+        &successor,
+        &[
+            "roles",
+            "proposal",
+            "accept",
+            &replacement_proposal_id,
+            "--expected-project-revision",
+            "9",
+        ],
+    );
+    assert_eq!(accepted["accepted"], true);
+
+    let role = run_real_buzz(&context, &successor, &["roles", "get", &role_id_text]);
+    assert_eq!(role["project_revision"], 10);
+    assert_eq!(
+        role["current_assignment"]["member_pubkey"],
+        successor_pubkey
+    );
+    assert_eq!(role["assignment_history"].as_array().map(Vec::len), Some(2));
+    assert_eq!(role["handoffs"].as_array().map(Vec::len), Some(1));
 
     ws_writer.disconnect().await.expect("disconnect writer");
     subscriber

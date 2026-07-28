@@ -827,10 +827,23 @@ impl Db {
                     "a stable relay signer is required to enable Project View".to_owned(),
                 )
             })?;
-            if !project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
+            let schema_version =
+                crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
+                    .await?;
+            let ready = if schema_version == 2 {
+                crate::project_view_v2::project_view_v2_enable_ready_in_tx(
+                    &mut tx,
+                    community_id,
+                    relay_pubkey,
+                )
                 .await
-                .map_err(project_view_error_to_db)?
-            {
+                .map_err(project_view_v2_error_to_db)?
+            } else {
+                project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
+                    .await
+                    .map_err(project_view_error_to_db)?
+            };
+            if !ready {
                 return Err(DbError::InvalidData(
                     "Project View schema, signer, or projection state is not ready".to_owned(),
                 ));
@@ -913,10 +926,23 @@ impl Db {
             })?;
             for community_id in &community_ids {
                 let community_id = CommunityId::from_uuid(*community_id);
-                if !project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
+                let schema_version =
+                    crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
+                        .await?;
+                let ready = if schema_version == 2 {
+                    crate::project_view_v2::project_view_v2_enable_ready_in_tx(
+                        &mut tx,
+                        community_id,
+                        relay_pubkey,
+                    )
                     .await
-                    .map_err(project_view_error_to_db)?
-                {
+                    .map_err(project_view_v2_error_to_db)?
+                } else {
+                    project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
+                        .await
+                        .map_err(project_view_error_to_db)?
+                };
+                if !ready {
                     return Err(DbError::InvalidData(format!(
                         "Project View is not ready for Community {community_id}"
                     )));
@@ -2064,7 +2090,9 @@ fn state_metadata_from_row(
     })
 }
 
-fn entry_from_row(row: sqlx::postgres::PgRow) -> ProjectViewWriteResult<ProjectViewEntry> {
+pub(crate) fn entry_from_row(
+    row: sqlx::postgres::PgRow,
+) -> ProjectViewWriteResult<ProjectViewEntry> {
     let object_id: Uuid = row.try_get("object_id")?;
     let object_type_text: String = row.try_get("object_type")?;
     let object_type = parse_object_type(&object_type_text)?;
@@ -2224,6 +2252,14 @@ fn project_view_error_to_db(error: ProjectViewWriteError) -> DbError {
     }
 }
 
+fn project_view_v2_error_to_db(error: crate::project_view_v2::ProjectViewV2WriteError) -> DbError {
+    match error {
+        crate::project_view_v2::ProjectViewV2WriteError::Database(error) => error,
+        crate::project_view_v2::ProjectViewV2WriteError::Sqlx(error) => DbError::Sqlx(error),
+        other => DbError::InvalidData(other.to_string()),
+    }
+}
+
 fn project_view_write_to_read(error: ProjectViewWriteError) -> ProjectViewReadError {
     match error {
         ProjectViewWriteError::Database(error) => ProjectViewReadError::Database(error),
@@ -2367,12 +2403,24 @@ fn projection_map(projections: Vec<PreparedObjectProjection>) -> BTreeMap<Uuid, 
 mod tests {
     use super::*;
 
+    use buzz_project_view::v2::{RoleCommand, RoleCommandRequest, RoleContinuityError};
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
         NewProjectViewObject, ProjectProfile,
     };
+    use buzz_sdk::project_view_v2::{
+        build_entity_projection as build_v2_entity_projection,
+        build_meta_projection as build_v2_meta_projection, build_role_command,
+        changed_head_for as v2_changed_head_for, V2EntityCounts, V2ProjectionContext,
+        V2ProjectionSource,
+    };
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
+
+    use crate::project_view_v2::{
+        PreparedV2EntityProjection, PreparedV2RoleCommit, ProjectViewV2CommitOutcome,
+        ProjectViewV2CutoverPlan, ProjectViewV2PrepareOutcome, ProjectViewV2WriteError,
+    };
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
@@ -2670,6 +2718,139 @@ mod tests {
             .expect("commit test mutation")
     }
 
+    async fn commit_v2_role_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        actor: &Keys,
+        relay: &Keys,
+        command: RoleCommand,
+    ) -> ProjectViewV2CommitOutcome {
+        let command_event = build_role_command(command.clone())
+            .expect("build v2 Role command")
+            .sign_with_keys(actor)
+            .expect("sign v2 Role command");
+        let mut write = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin v2 Role command");
+        let prepared = match write
+            .prepare_role_command(&command_event, &command)
+            .await
+            .expect("prepare v2 Role command")
+        {
+            ProjectViewV2PrepareOutcome::Prepared(prepared) => prepared,
+            ProjectViewV2PrepareOutcome::Replayed(_) => {
+                panic!("a fresh v2 Role command must not replay")
+            }
+        };
+        let membership_projection = if prepared.membership_changed() {
+            let mut tags = Vec::with_capacity(prepared.membership_after.len() + 1);
+            tags.push(Tag::parse(["-"]).expect("membership protection tag"));
+            for member in &prepared.membership_after {
+                tags.push(
+                    Tag::parse(["member", member.pubkey.as_str(), member.role.as_str()])
+                        .expect("membership member tag"),
+                );
+            }
+            let seconds = u64::try_from(prepared.canonical_time.timestamp())
+                .expect("positive membership timestamp");
+            Some(
+                EventBuilder::new(
+                    Kind::Custom(buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as u16),
+                    "",
+                )
+                .tags(tags)
+                .custom_created_at(Timestamp::from(seconds))
+                .sign_with_keys(relay)
+                .expect("sign v2 membership projection"),
+            )
+        } else {
+            None
+        };
+        let membership_event_id = membership_projection
+            .as_ref()
+            .map(|event| event.id)
+            .or(prepared.membership_snapshot_event_id)
+            .expect("prepared v2 state has a membership snapshot");
+        let context = V2ProjectionContext {
+            project_id: community_id,
+            projection_generation: prepared.projection_generation,
+            project_revision: prepared.project_revision,
+            source: V2ProjectionSource::NostrEvent {
+                change_id: command_event.id,
+                event_id: command_event.id,
+            },
+            updated_at: prepared.canonical_time,
+        };
+        let mut entity_projections = Vec::with_capacity(prepared.changes.len());
+        let mut changed_heads = Vec::with_capacity(prepared.changes.len());
+        for entity in &prepared.changes {
+            let event = build_v2_entity_projection(&context, entity)
+                .expect("build v2 entity projection")
+                .sign_with_keys(relay)
+                .expect("sign v2 entity projection");
+            changed_heads.push(
+                v2_changed_head_for(&context, entity, &event).expect("bind v2 changed entity head"),
+            );
+            entity_projections.push(PreparedV2EntityProjection {
+                entity_type: entity.entity_type(),
+                entity_id: entity.entity_id(),
+                event,
+            });
+        }
+        let meta_projection = build_v2_meta_projection(
+            &context,
+            V2EntityCounts {
+                active_objects: prepared.counts.active_objects,
+                open_proposals: prepared.counts.open_proposals,
+                active_assignments: prepared.counts.active_assignments,
+                active_commitments: prepared.counts.active_commitments,
+                checkpoints: prepared.counts.checkpoints,
+                handoffs: prepared.counts.handoffs,
+            },
+            membership_event_id,
+            false,
+            &changed_heads,
+        )
+        .expect("build v2 metadata projection")
+        .sign_with_keys(relay)
+        .expect("sign v2 metadata projection");
+        write
+            .commit_role_command(PreparedV2RoleCommit {
+                command_event,
+                entity_projections,
+                meta_projection,
+                membership_projection,
+            })
+            .await
+            .expect("commit v2 Role command")
+    }
+
+    async fn reject_v2_role_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        actor: &Keys,
+        command: RoleCommand,
+    ) -> ProjectViewV2WriteError {
+        let command_event = build_role_command(command.clone())
+            .expect("build rejected v2 Role command")
+            .sign_with_keys(actor)
+            .expect("sign rejected v2 Role command");
+        let mut write = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin rejected v2 Role command");
+        let error = write
+            .prepare_role_command(&command_event, &command)
+            .await
+            .expect_err("v2 Role command must be rejected");
+        write
+            .rollback()
+            .await
+            .expect("roll back rejected v2 Role command");
+        error
+    }
+
     async fn cutover_role_continuity_fixture(
         db: &Db,
         pool: &PgPool,
@@ -2753,7 +2934,8 @@ mod tests {
         .expect("convert fixture objects to v2");
         sqlx::query(
             "UPDATE project_view_state \
-             SET schema_version = 2, last_change_id = $2, last_source_event_id = NULL \
+             SET schema_version = 2, last_change_id = $2, last_source_event_id = NULL, \
+                 active_assignment_count = 2 \
              WHERE community_id = $1",
         )
         .bind(community_id.as_uuid())
@@ -2784,8 +2966,9 @@ mod tests {
             sqlx::query(
                 "INSERT INTO project_role_assignments ( \
                      community_id, assignment_id, role_id, member_pubkey, \
-                     started_at, started_by, source_change_id, project_revision \
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                     started_at, started_by, source_change_id, project_revision, \
+                     updated_at, last_change_id \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $5, $7)",
             )
             .bind(community_id.as_uuid())
             .bind(Uuid::new_v4())
@@ -4134,6 +4317,344 @@ mod tests {
             .await
             .expect("enabled Project View accepts configured signer"));
         assert!(db.begin_project_view_reproject(community_id).await.is_err());
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn v2_cutover_assignment_replacement_and_stale_fence_form_one_vertical_slice() {
+        let scratch = ScratchDatabase::create("buzz_pv_v2_role_slice").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let first_agent = Keys::generate();
+        let second_agent = Keys::generate();
+        let relay = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap v2 slice owner");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, NULL), ($1, $3, $2), ($1, $4, $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .bind(first_agent.public_key().as_bytes())
+        .bind(second_agent.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("register two owner-backed managed Agents");
+
+        initialize(&db, community_id, &owner, &relay).await;
+        let role_id = Uuid::new_v4();
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            create_role_mutation(1, role_id, "Builder"),
+        )
+        .await;
+        db.set_project_view_enabled(community_id, false)
+            .await
+            .expect("pause v1 before v2 cutover");
+
+        sqlx::query(
+            "INSERT INTO audit_log \
+                 (community_id, seq, hash, prev_hash, action, actor_pubkey, detail) \
+             VALUES ($1, 1, $2, NULL, 'project_view_cutover', $3, '{}'::jsonb)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(vec![0xA2_u8; 32])
+        .bind(owner.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("insert cutover audit source");
+        let plan = ProjectViewV2CutoverPlan {
+            admin_assignments: Vec::new(),
+            downgraded_admins: Vec::new(),
+            audit_seq: 1,
+            idempotency_key_hash: [0x52_u8; 32],
+        };
+        let cutover = db
+            .cutover_project_view_v2(community_id, &plan, &relay)
+            .await
+            .expect("cut v1 Project View over to v2");
+        assert_eq!(cutover.project_revision, 3);
+        assert_eq!(cutover.projection_generation, 2);
+        assert!(!cutover.replayed);
+        assert!(
+            cutover.events.iter().any(|event| {
+                event.kind.as_u16() as u32 == buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST
+            }),
+            "cutover must emit the exact membership snapshot referenced by v2 metadata"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM project_view_objects \
+                 WHERE community_id = $1 AND schema_version <> 2",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_one(&scratch.pool)
+            .await
+            .expect("count non-v2 canonical objects"),
+            0
+        );
+        let stale_current_heads: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+             FROM events e \
+             WHERE e.community_id = $1 AND e.deleted_at IS NULL \
+               AND e.id IN ( \
+                   SELECT projection_event_id FROM project_view_objects WHERE community_id = $1 \
+                   UNION ALL \
+                   SELECT meta_projection_event_id FROM project_view_state WHERE community_id = $1 \
+               ) \
+               AND NULLIF(e.content, '')::jsonb->>'schema_version' IS DISTINCT FROM '2'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("check every cutover current head schema");
+        assert_eq!(stale_current_heads, 0);
+
+        let replay = db
+            .cutover_project_view_v2(community_id, &plan, &relay)
+            .await
+            .expect("replay cutover idempotency receipt");
+        assert!(replay.replayed);
+        assert_eq!(replay.project_revision, cutover.project_revision);
+        assert!(replay.events.is_empty());
+
+        let temporarily_missing_head: Vec<u8> = sqlx::query_scalar(
+            "SELECT projection_event_id FROM project_view_objects \
+             WHERE community_id = $1 ORDER BY object_id LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("choose one v2 head for enable preflight");
+        sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&temporarily_missing_head)
+        .execute(&scratch.pool)
+        .await
+        .expect("temporarily retire one v2 head");
+        assert!(
+            db.set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()),)
+                .await
+                .is_err(),
+            "enable preflight must reject an incomplete signed v2 generation"
+        );
+        sqlx::query(
+            "UPDATE events SET deleted_at = NULL \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&temporarily_missing_head)
+        .execute(&scratch.pool)
+        .await
+        .expect("restore v2 head after enable preflight check");
+
+        assert!(db
+            .set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()),)
+            .await
+            .expect("enable verified v2 projection"));
+        assert!(db
+            .project_view_v2_capability_ready(community_id, &relay.public_key())
+            .await
+            .expect("verify initial v2 capability"));
+
+        let first_proposal = Uuid::new_v4();
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            RoleCommand::new(
+                3,
+                None,
+                RoleCommandRequest::OfferRole {
+                    proposal_id: first_proposal,
+                    role_id,
+                    candidate_pubkey: first_agent.public_key(),
+                    expires_at: Utc::now() + chrono::Duration::days(2),
+                    reason: Some("first tenure".to_owned()),
+                },
+            ),
+        )
+        .await;
+        let accepted = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &first_agent,
+            &relay,
+            RoleCommand::new(
+                4,
+                None,
+                RoleCommandRequest::AcceptProposal {
+                    proposal_id: first_proposal,
+                },
+            ),
+        )
+        .await;
+        let first_assignment = Uuid::parse_str(
+            accepted.receipt.result["assignment_id"]
+                .as_str()
+                .expect("accepted Assignment ID"),
+        )
+        .expect("valid accepted Assignment UUID");
+        assert!(
+            accepted.events.iter().any(|event| {
+                event.kind.as_u16() as u32 == buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST
+            }),
+            "activating an owner-backed Agent must atomically materialize membership"
+        );
+        let first_role: String = sqlx::query_scalar(
+            "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(first_agent.public_key().to_hex())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read first Agent Community role");
+        assert_eq!(first_role, "member");
+        assert!(db
+            .project_view_v2_capability_ready(community_id, &relay.public_key())
+            .await
+            .expect("verify capability after first Assignment"));
+
+        let self_end = reject_v2_role_for_test(
+            &db,
+            community_id,
+            &first_agent,
+            RoleCommand::new(
+                5,
+                Some(first_assignment),
+                RoleCommandRequest::EndAssignment {
+                    assignment_id: first_assignment,
+                    reason: Some("raw self-end attempt".to_owned()),
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            self_end,
+            ProjectViewV2WriteError::Domain(RoleContinuityError::SelfEndForbidden)
+        ));
+
+        let second_proposal = Uuid::new_v4();
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            RoleCommand::new(
+                5,
+                None,
+                RoleCommandRequest::OfferRole {
+                    proposal_id: second_proposal,
+                    role_id,
+                    candidate_pubkey: second_agent.public_key(),
+                    expires_at: Utc::now() + chrono::Duration::days(2),
+                    reason: Some("atomic replacement".to_owned()),
+                },
+            ),
+        )
+        .await;
+        let replaced = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &second_agent,
+            &relay,
+            RoleCommand::new(
+                6,
+                None,
+                RoleCommandRequest::AcceptProposal {
+                    proposal_id: second_proposal,
+                },
+            ),
+        )
+        .await;
+        let second_assignment = Uuid::parse_str(
+            replaced.receipt.result["assignment_id"]
+                .as_str()
+                .expect("replacement Assignment ID"),
+        )
+        .expect("valid replacement Assignment UUID");
+        let assignments: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT assignment_id, member_pubkey, ended_reason \
+             FROM project_role_assignments \
+             WHERE community_id = $1 ORDER BY started_at, assignment_id",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_all(&scratch.pool)
+        .await
+        .expect("read replacement Assignment history");
+        assert_eq!(assignments.len(), 2);
+        assert!(assignments.iter().any(|(id, member, reason)| {
+            *id == first_assignment
+                && member == &first_agent.public_key().to_hex()
+                && reason.as_deref() == Some("replaced")
+        }));
+        assert!(assignments.iter().any(|(id, member, reason)| {
+            *id == second_assignment
+                && member == &second_agent.public_key().to_hex()
+                && reason.is_none()
+        }));
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM project_role_assignments \
+             WHERE community_id = $1 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("count active Assignments after replacement");
+        assert_eq!(active_count, 1);
+        let handoff_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM project_role_handoffs WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("count replacement Handoffs");
+        assert_eq!(handoff_count, 1);
+
+        let stale = reject_v2_role_for_test(
+            &db,
+            community_id,
+            &first_agent,
+            RoleCommand::new(
+                7,
+                Some(first_assignment),
+                RoleCommandRequest::ReportUnableToContinue {
+                    assignment_id: first_assignment,
+                    reason: Some("late command from the old Runtime".to_owned()),
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            stale,
+            ProjectViewV2WriteError::Domain(RoleContinuityError::ActingAssignmentInvalid)
+        ));
+        let final_state: (i64, i32, i32, i32) = sqlx::query_as(
+            "SELECT project_revision, open_proposal_count, active_assignment_count, handoff_count \
+             FROM project_view_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read final v2 materialized counts");
+        assert_eq!(final_state, (7, 0, 1, 1));
+        assert!(db
+            .project_view_v2_capability_ready(community_id, &relay.public_key())
+            .await
+            .expect("verify final v2 capability"));
 
         scratch.cleanup().await;
     }

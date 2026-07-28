@@ -15,6 +15,7 @@ pub mod pr;
 pub mod project_view;
 pub mod reactions;
 pub mod repos;
+pub mod roles;
 pub mod social;
 pub mod upload;
 pub mod users;

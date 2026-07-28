@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 27);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -921,6 +921,15 @@ mod tests {
             .contains("CREATE UNIQUE INDEX idx_project_role_assignments_active_member"));
         assert!(role_continuity.contains("DEFERRABLE INITIALLY DEFERRED"));
         assert!(role_continuity.contains("project_role_continuity_validate_community"));
+
+        // Stage 2 adds the lifecycle fields and materialized counts needed by
+        // the first live v2 Proposal / Assignment coordinator.
+        assert_eq!(migrations[26].version, 27);
+        let role_assignment_state = migrations[26].sql.as_str();
+        assert!(role_assignment_state.contains("ADD COLUMN open_proposal_count"));
+        assert!(role_assignment_state.contains("ADD COLUMN entity_revision"));
+        assert!(role_assignment_state.contains("ADD COLUMN replaced_by_assignment_id"));
+        assert!(role_assignment_state.contains("project_role_continuity_validate_counts"));
     }
 
     #[test]
@@ -941,6 +950,8 @@ mod tests {
             "idx_project_role_assignments_active_role",
             "idx_project_role_assignments_active_member",
             "project_role_continuity_validate_community",
+            "open_proposal_count INTEGER NOT NULL DEFAULT 0",
+            "project_role_continuity_validate_counts",
         ] {
             assert!(
                 schema.contains(fragment),
@@ -1231,8 +1242,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0026");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
+            .expect("upgrade scratch database through 0027");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1280,7 +1291,7 @@ mod tests {
         .bind(&legacy_signer)
         .fetch_one(&mut *legacy_tx)
         .await
-        .expect("migration 0026 accepts the exact v1 state insert shape");
+        .expect("migration 0027 accepts the exact v1 state insert shape");
         assert_eq!(
             legacy_state,
             (1, legacy_event_id.clone(), Some(legacy_event_id))
@@ -1297,7 +1308,7 @@ mod tests {
         .bind(&next_legacy_event_id)
         .fetch_one(&mut *legacy_tx)
         .await
-        .expect("migration 0026 accepts the exact v1 state update shape");
+        .expect("migration 0027 accepts the exact v1 state update shape");
         assert_eq!(mirrored_change_id, next_legacy_event_id);
         legacy_tx
             .rollback()
@@ -1364,15 +1375,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(26));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(27));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version IN (25, 26) AND success",
+             WHERE version IN (25, 26, 27) AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 2);
+        assert_eq!(project_view_migration_count, 3);
 
         first.close().await;
         second.close().await;
@@ -1452,7 +1463,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
     }
 
     #[tokio::test]

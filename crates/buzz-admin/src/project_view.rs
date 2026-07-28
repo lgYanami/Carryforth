@@ -3,16 +3,20 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
+use buzz_audit::{AuditAction, AuditService, NewAuditEntry};
 use buzz_core::tenant::{normalize_host, TenantContext};
 use buzz_db::project_view::{
     PreparedObjectProjection, PreparedProjectViewReprojection, ProjectViewFeatureStatus,
 };
+use buzz_db::project_view_v2::{ProjectViewV2AdminAssignment, ProjectViewV2CutoverPlan};
 use buzz_db::Db;
+use buzz_project_view::v2::idempotency_key_hash;
 use buzz_project_view::ProjectionPlan;
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Args, Subcommand};
 use nostr::{Keys, PublicKey};
 use tracing::warn;
+use uuid::Uuid;
 
 /// `buzz-admin project-view` subcommands.
 #[derive(Debug, Subcommand)]
@@ -37,6 +41,27 @@ pub(crate) enum ProjectViewCommand {
     Reproject {
         #[command(flatten)]
         target: ProjectViewTarget,
+        /// File containing the relay private key; must not be group/world accessible.
+        #[arg(long)]
+        relay_key_file: Option<PathBuf>,
+        /// Expected public key of the supplied relay signer (hex or npub).
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Explicitly migrate one disabled initialized Community from v1 to v2.
+    CutoverV2 {
+        /// Normalized Community host.
+        #[arg(long)]
+        community: String,
+        /// Existing admin mapping in `<pubkey>=<role-uuid>` form; repeat as needed.
+        #[arg(long = "admin-assignment")]
+        admin_assignments: Vec<String>,
+        /// Existing admin to explicitly downgrade to member; repeat as needed.
+        #[arg(long = "downgrade-admin")]
+        downgraded_admins: Vec<String>,
+        /// Caller-stable idempotency key. It is hashed before storage/audit.
+        #[arg(long)]
+        idempotency_key: String,
         /// File containing the relay private key; must not be group/world accessible.
         #[arg(long)]
         relay_key_file: Option<PathBuf>,
@@ -78,8 +103,147 @@ pub(crate) async fn run(command: ProjectViewCommand) -> Result<i32> {
         } => {
             reproject(&db, target, relay_key_file.as_deref(), &expected_pubkey).await?;
         }
+        ProjectViewCommand::CutoverV2 {
+            community,
+            admin_assignments,
+            downgraded_admins,
+            idempotency_key,
+            relay_key_file,
+            expected_pubkey,
+        } => {
+            cutover_v2(
+                &db,
+                &community,
+                &admin_assignments,
+                &downgraded_admins,
+                &idempotency_key,
+                relay_key_file.as_deref(),
+                &expected_pubkey,
+            )
+            .await?;
+        }
     }
     Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cutover_v2(
+    db: &Db,
+    community: &str,
+    admin_assignments: &[String],
+    downgraded_admins: &[String],
+    idempotency_key: &str,
+    relay_key_file: Option<&Path>,
+    expected_pubkey: &str,
+) -> Result<()> {
+    if idempotency_key.trim().is_empty() {
+        bail!("--idempotency-key cannot be empty");
+    }
+    let host = normalize_required_host(community)?;
+    let status = db
+        .project_view_status_by_host(&host)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Community host '{host}' was not found"))?;
+    if status.archived {
+        bail!("Community host '{host}' is archived");
+    }
+    if status.enabled {
+        bail!("Project View for '{host}' must be disabled before cutover");
+    }
+    let keys = load_relay_keys(relay_key_file)?;
+    let expected_pubkey = PublicKey::parse(expected_pubkey)
+        .map_err(|error| anyhow::anyhow!("invalid --expected-pubkey: {error}"))?;
+    if keys.public_key() != expected_pubkey {
+        bail!(
+            "relay signer mismatch: expected {}, supplied key resolves to {}",
+            expected_pubkey.to_hex(),
+            keys.public_key().to_hex()
+        );
+    }
+
+    let mappings = admin_assignments
+        .iter()
+        .map(|value| parse_admin_assignment(value))
+        .collect::<Result<Vec<_>>>()?;
+    let downgraded = downgraded_admins
+        .iter()
+        .map(|value| {
+            PublicKey::parse(value)
+                .map_err(|error| anyhow::anyhow!("invalid --downgrade-admin '{value}': {error}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let key_hash = idempotency_key_hash(idempotency_key.as_bytes());
+    if let Some(receipt) = db
+        .project_view_v2_operator_receipt(status.community_id, &key_hash)
+        .await?
+    {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+        return Ok(());
+    }
+
+    let audit = AuditService::new(db.writer().clone());
+    let audit_entry = audit
+        .log(NewAuditEntry {
+            community_id: status.community_id,
+            action: AuditAction::ProjectViewCutover,
+            actor_pubkey: None,
+            object_id: Some(status.community_id.to_string()),
+            detail: serde_json::json!({
+                "from_schema_version": 1,
+                "to_schema_version": 2,
+                "admin_assignment_count": mappings.len(),
+                "downgraded_admin_count": downgraded.len(),
+                "idempotency_key_hash": hex::encode(key_hash),
+            }),
+        })
+        .await?;
+    let outcome = db
+        .cutover_project_view_v2(
+            status.community_id,
+            &ProjectViewV2CutoverPlan {
+                admin_assignments: mappings,
+                downgraded_admins: downgraded,
+                audit_seq: audit_entry.seq,
+                idempotency_key_hash: key_hash,
+            },
+            &keys,
+        )
+        .await?;
+    if !outcome.replayed {
+        let pubsub = super::connect_pubsub().await?;
+        let tenant = TenantContext::resolved(status.community_id, status.host.clone());
+        for event in &outcome.events {
+            if let Err(error) = pubsub
+                .publish_event(&tenant, EventTopic::Global, event)
+                .await
+            {
+                warn!(
+                    community_id = %status.community_id,
+                    event_id = %event.id,
+                    "Project View v2 cutover Redis fan-out failed: {error}"
+                );
+            }
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&outcome.result)?);
+    Ok(())
+}
+
+fn parse_admin_assignment(value: &str) -> Result<ProjectViewV2AdminAssignment> {
+    let (pubkey, role_id) = value.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!("invalid --admin-assignment '{value}'; expected <pubkey>=<role-uuid>")
+    })?;
+    let member_pubkey = PublicKey::parse(pubkey)
+        .map_err(|error| anyhow::anyhow!("invalid admin pubkey '{pubkey}': {error}"))?;
+    let role_id = Uuid::parse_str(role_id)
+        .map_err(|error| anyhow::anyhow!("invalid Leader Role UUID '{role_id}': {error}"))?;
+    if role_id.is_nil() {
+        bail!("Leader Role UUID cannot be nil");
+    }
+    Ok(ProjectViewV2AdminAssignment {
+        member_pubkey,
+        role_id,
+    })
 }
 
 async fn show_status(db: &Db, community: Option<&str>) -> Result<()> {

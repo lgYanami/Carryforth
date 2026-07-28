@@ -9,6 +9,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::num::NonZeroI64;
 
+mod role_continuity;
+
+pub use role_continuity::{
+    AssignmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, MemberGovernance,
+    ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal, RoleCommand,
+    RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity, RoleContinuityError,
+    RoleContinuityOutcome, RoleContinuityState, RoleDefinition, RoleHandoff, RoleSlot,
+    MAX_PROPOSAL_LIFETIME_DAYS,
+};
+
 const CHANGE_ID_DOMAIN: &[u8] = b"buzz-project-view-v2:change-id\0";
 const REQUEST_HASH_DOMAIN: &[u8] = b"buzz-project-view-v2:request\0";
 const IDEMPOTENCY_HASH_DOMAIN: &[u8] = b"buzz-project-view-v2:idempotency-key\0";

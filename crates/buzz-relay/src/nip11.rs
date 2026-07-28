@@ -20,6 +20,7 @@ pub(crate) const SUPPORTED_NIPS: &[u32] = &[1, 2, 10, 11, 16, 17, 23, 25, 29, 33
 /// to be verifiable by clients.
 pub(crate) const NIP_RELAY_MEMBERSHIP: u32 = 43;
 const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
+const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,15 +243,24 @@ fn push_descriptor(
 pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &str) -> RelayInfo {
     let (relay_self, advertise_nip43) = nip11_facts(state);
     let icon = workspace_icon_for_host(state, raw_host).await;
-    let advertise_project_view = project_view_ready_for_host(state, raw_host).await;
+    let project_view_capability = project_view_ready_for_host(state, raw_host).await;
     let mut info = RelayInfo::build(
         relay_self.as_deref(),
         icon.as_deref(),
         advertise_nip43,
-        advertise_project_view,
+        project_view_capability.is_some(),
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
     );
+    if project_view_capability == Some(ProjectViewCapability::V2) {
+        if let Some(extensions) = info.supported_extensions.as_mut() {
+            for extension in extensions {
+                if extension == PROJECT_VIEW_EXTENSION {
+                    *extension = PROJECT_VIEW_V2_EXTENSION.to_owned();
+                }
+            }
+        }
+    }
     let tenant_host = if state.config.push_gateway_delivery_url.is_some() {
         crate::tenant::bind_community(&state.db, raw_host)
             .await
@@ -274,25 +284,57 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     info
 }
 
-async fn project_view_ready_for_host(state: &crate::state::AppState, raw_host: &str) -> bool {
-    if state.config.relay_private_key.is_none() {
-        return false;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectViewCapability {
+    V1,
+    V2,
+}
+
+async fn project_view_ready_for_host(
+    state: &crate::state::AppState,
+    raw_host: &str,
+) -> Option<ProjectViewCapability> {
+    state.config.relay_private_key.as_ref()?;
     let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+        return None;
     };
-    match state
+    let schema_version = match state
         .db
-        .project_view_capability_ready(tenant.community(), &state.relay_keypair.public_key())
+        .project_view_schema_version(tenant.community())
         .await
     {
-        Ok(ready) => ready,
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Project View NIP-11 schema lookup failed closed: {error}"
+            );
+            return None;
+        }
+    };
+    let ready = if schema_version == 2 {
+        state
+            .db
+            .project_view_v2_capability_ready(tenant.community(), &state.relay_keypair.public_key())
+            .await
+    } else if schema_version == 1 {
+        state
+            .db
+            .project_view_capability_ready(tenant.community(), &state.relay_keypair.public_key())
+            .await
+    } else {
+        return None;
+    };
+    match ready {
+        Ok(true) if schema_version == 2 => Some(ProjectViewCapability::V2),
+        Ok(true) => Some(ProjectViewCapability::V1),
+        Ok(false) => None,
         Err(error) => {
             tracing::warn!(
                 community_id = %tenant.community(),
                 "Project View NIP-11 readiness failed closed: {error}"
             );
-            false
+            None
         }
     }
 }

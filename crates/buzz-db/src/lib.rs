@@ -38,6 +38,8 @@ pub mod partition;
 pub mod product_feedback;
 /// Project View canonical state and atomic mutation persistence.
 pub mod project_view;
+/// Project View v2 Role Proposal/Assignment transaction coordinator.
+pub mod project_view_v2;
 /// Community-scoped push lease and durable wake-outbox persistence.
 pub mod push;
 /// Reaction persistence.
@@ -472,6 +474,15 @@ impl Db {
     /// auth/membership checks, locks, and anything inside a transaction do not.
     pub fn read(&self) -> &PgPool {
         self.read_pool.as_ref().unwrap_or(&self.pool)
+    }
+
+    /// The authoritative writer pool.
+    ///
+    /// Control-plane components that must append to another transaction-owning
+    /// subsystem, such as the hash-chain audit service, use this accessor
+    /// instead of the lag-tolerant [`Self::read`] pool.
+    pub fn writer(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Whether a distinct read-replica pool is configured.

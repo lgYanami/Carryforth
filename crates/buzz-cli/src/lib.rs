@@ -233,6 +233,9 @@ enum Cmd {
     /// Read and mutate the Community's canonical Project View
     #[command(subcommand, name = "project-view")]
     ProjectView(ProjectViewCmd),
+    /// Read and govern Project View v2 Roles and Assignments
+    #[command(subcommand)]
+    Roles(RolesCmd),
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
@@ -339,6 +342,218 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
+    },
+}
+
+/// Project View v2 Role continuity commands.
+#[derive(Subcommand)]
+pub enum RolesCmd {
+    /// List canonical Roles with their current assignee or vacancy
+    List,
+    /// Read one canonical Role and its current Assignment
+    Get {
+        /// Stable Role UUID.
+        role: Uuid,
+    },
+    /// Read one Member's current Role Assignment
+    Current {
+        /// Member public key (hex or npub); defaults to the CLI signer.
+        #[arg(long)]
+        member: Option<String>,
+    },
+    /// List Role Assignment Proposals
+    Proposals {
+        /// Limit to one effective status.
+        #[arg(long, value_enum)]
+        status: Option<RoleProposalStatusArg>,
+    },
+    /// Request a Role as the current signer
+    Request {
+        /// Desired Role UUID.
+        #[arg(long)]
+        role: Uuid,
+        /// Project revision on which the request is based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Proposal lifetime in hours.
+        #[arg(long, default_value_t = 168, value_parser = clap::value_parser!(u16).range(1..=720))]
+        expires_in_hours: u16,
+        /// Optional request context.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Current active Assignment fence when already assigned.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Offer a Role to a candidate
+    Offer {
+        /// Offered Role UUID.
+        #[arg(long)]
+        role: Uuid,
+        /// Candidate public key (hex or npub).
+        #[arg(long)]
+        member: String,
+        /// Project revision on which the complete move is based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Proposal lifetime in hours.
+        #[arg(long, default_value_t = 168, value_parser = clap::value_parser!(u16).range(1..=720))]
+        expires_in_hours: u16,
+        /// Optional offer context.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Active Leader Assignment fence when authorizing as a Leader.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Confirm, reject, withdraw, authorize, or expire a Proposal
+    Proposal {
+        #[command(subcommand)]
+        command: RoleProposalCmd,
+    },
+    /// Read or act on one Assignment
+    Assignment {
+        #[command(subcommand)]
+        command: RoleAssignmentCmd,
+    },
+}
+
+/// Effective Proposal status accepted by `buzz roles proposals`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RoleProposalStatusArg {
+    /// Awaiting one or both confirmations.
+    Open,
+    /// Assignment was activated.
+    Consumed,
+    /// Explicitly rejected.
+    Rejected,
+    /// Withdrawn by its creator.
+    Withdrawn,
+    /// Canonical deadline has passed.
+    Expired,
+}
+
+/// Commands targeting one Proposal.
+#[derive(Subcommand)]
+pub enum RoleProposalCmd {
+    /// Accept an offer as its candidate
+    Accept {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Reject an open Proposal
+    Reject {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional explanation.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Withdraw a Proposal created by the signer
+    Withdraw {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional explanation.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Authorize a candidate request as owner or Leader
+    Authorize {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Materialize an already effective Proposal expiration
+    Expire {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+}
+
+/// Commands targeting Assignments.
+#[derive(Subcommand)]
+pub enum RoleAssignmentCmd {
+    /// List Assignment history, optionally narrowed by Role or Member
+    List {
+        /// Role UUID.
+        #[arg(long)]
+        role: Option<Uuid>,
+        /// Member public key (hex or npub).
+        #[arg(long)]
+        member: Option<String>,
+        /// Include ended tenure history.
+        #[arg(long)]
+        include_ended: bool,
+    },
+    /// Read one Assignment by UUID
+    Get {
+        /// Assignment UUID.
+        assignment: Uuid,
+    },
+    /// End another Member's active Assignment
+    End {
+        /// Target Assignment UUID.
+        assignment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional governance explanation.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Ask governance to arrange a replacement without self-ending
+    RequestReplacement {
+        /// Caller's active Assignment UUID.
+        assignment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional context.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Report inability to continue without self-ending
+    ReportUnableToContinue {
+        /// Caller's active Assignment UUID.
+        assignment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional context.
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -1892,6 +2107,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
+        Cmd::Roles(sub) => commands::roles::dispatch(sub, &client, &cli.format).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
@@ -1929,6 +2145,7 @@ mod tests {
             "project-view",
             "reactions",
             "repos",
+            "roles",
             "social",
             "upload",
             "users",
@@ -2000,6 +2217,19 @@ mod tests {
         assert_eq!(
             names(&cmd, "project-view"),
             vec!["create", "delete", "get", "get-object", "init", "update"]
+        );
+        assert_eq!(
+            names(&cmd, "roles"),
+            vec![
+                "assignment",
+                "current",
+                "get",
+                "list",
+                "offer",
+                "proposal",
+                "proposals",
+                "request"
+            ]
         );
         assert_eq!(
             names(&cmd, "channels"),
@@ -2120,6 +2350,7 @@ mod tests {
             ("project-view", 6),
             ("reactions", 3),
             ("repos", 4),
+            ("roles", 8),
             ("social", 7),
             ("upload", 1),
             ("users", 4),

@@ -28,6 +28,8 @@ pub enum AuditAction {
     RateLimitExceeded,
     /// A media file was uploaded via the Blossom endpoint.
     MediaUploaded,
+    /// One Community was explicitly cut over to Project View schema v2.
+    ProjectViewCutover,
 }
 
 impl AuditAction {
@@ -45,6 +47,7 @@ impl AuditAction {
             Self::AuthFailure => "auth_failure",
             Self::RateLimitExceeded => "rate_limit_exceeded",
             Self::MediaUploaded => "media_uploaded",
+            Self::ProjectViewCutover => "project_view_cutover",
         }
     }
 
@@ -60,6 +63,7 @@ impl AuditAction {
         Self::AuthFailure,
         Self::RateLimitExceeded,
         Self::MediaUploaded,
+        Self::ProjectViewCutover,
     ];
 }
 

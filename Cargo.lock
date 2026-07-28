@@ -818,6 +818,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -950,6 +951,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-core",
  "buzz-project-view",
+ "buzz-sdk",
  "chrono",
  "hex",
  "nostr",

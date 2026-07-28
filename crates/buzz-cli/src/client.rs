@@ -529,6 +529,12 @@ pub struct BuzzClient {
 }
 
 impl BuzzClient {
+    /// Return the public key used to sign CLI commands.
+    #[must_use]
+    pub fn public_key(&self) -> nostr::PublicKey {
+        self.keys.public_key()
+    }
+
     /// Create a new client pointing at `relay_url`.
     ///
     /// Timeout defaults are tuned for degraded WAN links and can be overridden
