@@ -24,13 +24,13 @@ use crate::relay::{
     relay_error_message,
 };
 
-const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
+pub(crate) const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
-struct ProjectViewIdentity {
-    relay_pubkey: PublicKey,
+pub(crate) struct ProjectViewIdentity {
+    pub(crate) relay_pubkey: PublicKey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,8 +115,15 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
 }
 
 async fn read_identity(state: &AppState) -> Result<Option<ProjectViewIdentity>, String> {
+    read_identity_at(state, &relay_api_base_url_with_override(state)).await
+}
+
+pub(crate) async fn read_identity_at(
+    state: &AppState,
+    api_base_url: &str,
+) -> Result<Option<ProjectViewIdentity>, String> {
     crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/info", relay_api_base_url_with_override(state));
+    let url = format!("{}/info", api_base_url.trim_end_matches('/'));
     let response = state
         .http_client
         .get(url)

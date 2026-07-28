@@ -1,5 +1,6 @@
-import { CircleDot, Layers3 } from "lucide-react";
+import { CircleDot, Layers3, Plus } from "lucide-react";
 
+import type { ProjectViewCreateContext } from "@/features/project-view/model";
 import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
 import type {
   ProjectView,
@@ -7,13 +8,40 @@ import type {
   ProjectViewPlan,
   ProjectViewRequirement,
   ProjectViewStage,
+  ProjectViewObjectType,
 } from "@/shared/api/tauriProjectView";
+import { Button } from "@/shared/ui/button";
 
 type ProjectViewMapProps = {
+  onCreateObject: (
+    objectType: Exclude<ProjectViewObjectType, "project_profile">,
+    context?: ProjectViewCreateContext,
+  ) => void;
   onSelectObject: (objectId: string) => void;
   selectedObjectId?: string;
   view: ProjectView;
 };
+
+function ContextAddButton({
+  children,
+  onClick,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <Button
+      className="h-7"
+      onClick={onClick}
+      size="sm"
+      type="button"
+      variant="ghost"
+    >
+      <Plus />
+      {children}
+    </Button>
+  );
+}
 
 function ObjectCard({
   object,
@@ -88,6 +116,18 @@ function RequirementColumn({
             <div key={entry.requirement.id}>
               <ObjectCard object={entry.requirement} {...props} />
               <WorkItems items={entry.works} {...props} />
+              <ContextAddButton
+                onClick={() =>
+                  props.onCreateObject("work", {
+                    handles: {
+                      objectId: entry.requirement.id,
+                      objectType: "requirement",
+                    },
+                  })
+                }
+              >
+                Add Work
+              </ContextAddButton>
             </div>
           ))}
         </div>
@@ -101,6 +141,18 @@ function RequirementColumn({
             <div key={entry.issue.id}>
               <ObjectCard object={entry.issue} {...props} />
               <WorkItems items={entry.works} {...props} />
+              <ContextAddButton
+                onClick={() =>
+                  props.onCreateObject("work", {
+                    handles: {
+                      objectId: entry.issue.id,
+                      objectType: "issue",
+                    },
+                  })
+                }
+              >
+                Add Work
+              </ContextAddButton>
             </div>
           ))}
         </div>
@@ -126,6 +178,26 @@ function StageBranch({
           requirements={stage.requirements}
           {...props}
         />
+        <div className="mt-2 flex flex-wrap gap-1">
+          <ContextAddButton
+            onClick={() =>
+              props.onCreateObject("requirement", {
+                plannedInStageId: stage.stage.id,
+              })
+            }
+          >
+            Add Requirement
+          </ContextAddButton>
+          <ContextAddButton
+            onClick={() =>
+              props.onCreateObject("issue", {
+                plannedInStageId: stage.stage.id,
+              })
+            }
+          >
+            Add Issue
+          </ContextAddButton>
+        </div>
       </div>
     </div>
   );
@@ -152,6 +224,15 @@ function PlanBranch({
           No stages in this plan.
         </div>
       )}
+      <div className="mt-2">
+        <ContextAddButton
+          onClick={() =>
+            props.onCreateObject("stage", { underPlanId: plan.plan.id })
+          }
+        >
+          Add Stage
+        </ContextAddButton>
+      </div>
     </div>
   );
 }
@@ -167,6 +248,18 @@ function LooseRequirement({
     <div>
       <ObjectCard object={entry.requirement} {...props} />
       <WorkItems items={entry.works} {...props} />
+      <ContextAddButton
+        onClick={() =>
+          props.onCreateObject("work", {
+            handles: {
+              objectId: entry.requirement.id,
+              objectType: "requirement",
+            },
+          })
+        }
+      >
+        Add Work
+      </ContextAddButton>
     </div>
   );
 }
@@ -182,16 +275,29 @@ function LooseIssue({
     <div>
       <ObjectCard object={entry.issue} {...props} />
       <WorkItems items={entry.works} {...props} />
+      <ContextAddButton
+        onClick={() =>
+          props.onCreateObject("work", {
+            handles: {
+              objectId: entry.issue.id,
+              objectType: "issue",
+            },
+          })
+        }
+      >
+        Add Work
+      </ContextAddButton>
     </div>
   );
 }
 
 export function ProjectViewMap({
+  onCreateObject,
   onSelectObject,
   selectedObjectId,
   view,
 }: ProjectViewMapProps) {
-  const shared = { onSelectObject, selectedObjectId, view };
+  const shared = { onCreateObject, onSelectObject, selectedObjectId, view };
   const hasLooseObjects =
     view.unboundPlans.length > 0 ||
     view.unplannedRequirements.length > 0 ||
@@ -225,6 +331,15 @@ export function ProjectViewMap({
                   This goal has no bound plan.
                 </div>
               )}
+              <div className="mt-2">
+                <ContextAddButton
+                  onClick={() =>
+                    onCreateObject("plan", { underGoalId: goal.id })
+                  }
+                >
+                  Add Plan
+                </ContextAddButton>
+              </div>
             </article>
           ))}
         </div>

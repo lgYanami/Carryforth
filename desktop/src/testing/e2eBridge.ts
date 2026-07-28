@@ -51,7 +51,10 @@ import type {
   RawInstallRuntimeResult,
   RuntimeFileConfigSubset,
 } from "@/shared/api/tauri";
-import type { RawProjectViewLoadResult } from "@/shared/api/tauriProjectView";
+import type {
+  RawProjectViewLoadResult,
+  RawProjectViewMutationResult,
+} from "@/shared/api/tauriProjectView";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -286,6 +289,11 @@ type E2eConfig = {
     projectView?: RawProjectViewLoadResult;
     projectViewReadDelayMs?: number;
     projectViewReadError?: string;
+    projectViewMutationDelayMs?: number;
+    projectViewMutationError?: string;
+    projectViewMutationResult?: RawProjectViewMutationResult;
+    projectViewMutationResults?: RawProjectViewMutationResult[];
+    projectViewAfterMutation?: RawProjectViewLoadResult;
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1160,6 +1168,8 @@ declare global {
     /** Count of `get_event` invocations for the current defer-target ID since
      *  the last time `__BUZZ_E2E_DEFER_GET_EVENT__` was set. */
     __BUZZ_E2E_GET_EVENT_CALL_COUNT__?: number;
+    /** Typed Project View mutation payloads submitted during the current test. */
+    __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: unknown[];
   }
 }
 
@@ -9127,6 +9137,7 @@ export function maybeInstallE2eTauriMocks() {
   };
   // get_event defer/release seam — reset counter and queue on each install.
   window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
+  window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
   window.__BUZZ_E2E_DEFER_GET_EVENT__ = null;
   deferredGetEventQueue = [];
   window.__BUZZ_E2E_RELEASE_GET_EVENT__ = () => {
@@ -10950,6 +10961,41 @@ export function maybeInstallE2eTauriMocks() {
           throw new Error(activeConfig.mock.projectViewReadError);
         }
         return activeConfig?.mock?.projectView ?? { status: "unsupported" };
+      case "mutate_project_view": {
+        window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.push(
+          structuredClone((payload as { input?: unknown }).input ?? payload),
+        );
+        if ((activeConfig?.mock?.projectViewMutationDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectViewMutationDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectViewMutationError) {
+          throw new Error(activeConfig.mock.projectViewMutationError);
+        }
+        const sequence = activeConfig?.mock?.projectViewMutationResults;
+        const result = (sequence && sequence.length > 0
+          ? sequence.shift()
+          : activeConfig?.mock?.projectViewMutationResult) ?? {
+          status: "applied",
+          event_id: "c".repeat(64),
+          project_revision: 8,
+          object_id: "00000000-0000-4000-8000-000000000099",
+          object_revision: 1,
+          deleted: false,
+        };
+        if (
+          result.status === "applied" &&
+          activeConfig?.mock?.projectViewAfterMutation
+        ) {
+          activeConfig.mock.projectView =
+            activeConfig.mock.projectViewAfterMutation;
+        }
+        return result;
+      }
       case "archive_identity":
       case "unarchive_identity":
         // The spec only verifies UI state, not the submitted request shape;

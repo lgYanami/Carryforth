@@ -1,4 +1,11 @@
-import { ArrowRight, Link2, ShieldCheck, X } from "lucide-react";
+import {
+  ArrowRight,
+  Link2,
+  Pencil,
+  ShieldCheck,
+  Trash2,
+  X,
+} from "lucide-react";
 
 import {
   formatProjectViewTerm,
@@ -20,6 +27,8 @@ type ProjectViewInspectorProps = {
   object: ProjectViewObject;
   objectsById: ReadonlyMap<string, ProjectViewObject>;
   onClose: () => void;
+  onDelete: (object: ProjectViewObject) => void;
+  onEdit: (object: ProjectViewObject) => void;
   onSelectObject: (objectId: string) => void;
   view: ProjectView;
 };
@@ -160,6 +169,8 @@ export function ProjectViewInspector({
   object,
   objectsById,
   onClose,
+  onDelete,
+  onEdit,
   onSelectObject,
   view,
 }: ProjectViewInspectorProps) {
@@ -223,6 +234,25 @@ export function ProjectViewInspector({
       </div>
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
+        <section className="grid grid-cols-2 gap-2">
+          <Button
+            onClick={() => onEdit(object)}
+            type="button"
+            variant="outline"
+          >
+            <Pencil />
+            Edit
+          </Button>
+          <Button
+            onClick={() => onDelete(object)}
+            type="button"
+            variant="outline"
+          >
+            <Trash2 />
+            Delete
+          </Button>
+        </section>
+
         <div className="space-y-4">
           <ObjectDetails object={object} />
         </div>

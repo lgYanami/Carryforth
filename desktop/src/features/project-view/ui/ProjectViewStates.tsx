@@ -1,7 +1,6 @@
 import {
   AlertTriangle,
   Ban,
-  Boxes,
   CircleOff,
   LoaderCircle,
   RefreshCw,
@@ -59,16 +58,6 @@ export function ProjectViewForbiddenState() {
       description="Your current identity cannot read this Community's Project View."
       icon={<Ban className="h-5 w-5" />}
       title="View access denied"
-    />
-  );
-}
-
-export function ProjectViewUninitializedState() {
-  return (
-    <ProjectViewState
-      description="This Community supports View, but its project profile and first goal have not been initialized yet. Initialization will arrive in the next delivery slice."
-      icon={<Boxes className="h-5 w-5" />}
-      title="This View has not been initialized"
     />
   );
 }

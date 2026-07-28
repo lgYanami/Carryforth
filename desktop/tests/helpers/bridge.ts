@@ -1,6 +1,9 @@
 import type { Page } from "@playwright/test";
 import type { ChannelTemplate } from "../../src/shared/api/types";
-import type { RawProjectViewLoadResult } from "../../src/shared/api/tauriProjectView";
+import type {
+  RawProjectViewLoadResult,
+  RawProjectViewMutationResult,
+} from "../../src/shared/api/tauriProjectView";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -137,6 +140,11 @@ type MockBridgeOptions = {
   projectView?: RawProjectViewLoadResult;
   projectViewReadDelayMs?: number;
   projectViewReadError?: string;
+  projectViewMutationDelayMs?: number;
+  projectViewMutationError?: string;
+  projectViewMutationResult?: RawProjectViewMutationResult;
+  projectViewMutationResults?: RawProjectViewMutationResult[];
+  projectViewAfterMutation?: RawProjectViewLoadResult;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
   /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */

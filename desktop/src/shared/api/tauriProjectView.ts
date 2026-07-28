@@ -328,6 +328,97 @@ export type ProjectViewLoadResult =
       view: ProjectView;
     };
 
+export type ProjectViewWritableObject =
+  | { objectType: "project_profile"; data: ProjectProfileData }
+  | { objectType: "goal"; data: ProjectGoalData }
+  | { objectType: "role"; data: ProjectRoleData }
+  | {
+      objectType: "plan";
+      data: ProjectPlanData;
+      underGoalId?: string;
+    }
+  | {
+      objectType: "stage";
+      data: ProjectStageData;
+      underPlanId: string;
+    }
+  | {
+      objectType: "requirement";
+      data: ProjectRequirementData;
+      plannedInStageId?: string;
+    }
+  | {
+      objectType: "issue";
+      data: ProjectIssueData;
+      plannedInStageId?: string;
+      about?: ProjectViewObjectRef;
+    }
+  | {
+      objectType: "work";
+      data: ProjectWorkData;
+      handles: ProjectViewObjectRef;
+    }
+  | { objectType: "resource"; data: ProjectResourceData };
+
+export type ProjectViewMutationIntent =
+  | {
+      operation: "initialize";
+      profile: ProjectProfileData;
+      goals: ProjectGoalData[];
+    }
+  | {
+      operation: "create";
+      expectedProjectRevision: number;
+      object: Exclude<
+        ProjectViewWritableObject,
+        { objectType: "project_profile" }
+      >;
+    }
+  | {
+      operation: "update";
+      expectedProjectRevision: number;
+      objectId: string;
+      object: ProjectViewWritableObject;
+    }
+  | {
+      operation: "delete";
+      expectedProjectRevision: number;
+      objectType: Exclude<ProjectViewObjectType, "project_profile">;
+      objectId: string;
+    };
+
+export type RawProjectViewMutationResult =
+  | {
+      status: "applied";
+      event_id: string;
+      project_revision: number;
+      object_id?: string;
+      object_revision?: number;
+      deleted?: boolean;
+    }
+  | {
+      status: "conflict";
+      expected_project_revision: number;
+      current_project_revision?: number;
+      message: string;
+    };
+
+export type ProjectViewMutationResult =
+  | {
+      status: "applied";
+      eventId: string;
+      projectRevision: number;
+      objectId?: string;
+      objectRevision?: number;
+      deleted?: boolean;
+    }
+  | {
+      status: "conflict";
+      expectedProjectRevision: number;
+      currentProjectRevision?: number;
+      message: string;
+    };
+
 function normalizeRef(raw: RawProjectViewObjectRef): ProjectViewObjectRef {
   return {
     objectType: raw.object_type,
@@ -510,4 +601,136 @@ export function normalizeProjectViewLoadResult(
 export async function getProjectView(): Promise<ProjectViewLoadResult> {
   const raw = await invokeTauri<RawProjectViewLoadResult>("get_project_view");
   return normalizeProjectViewLoadResult(raw);
+}
+
+function rawReference(reference: ProjectViewObjectRef) {
+  return {
+    object_type: reference.objectType,
+    object_id: reference.objectId,
+  };
+}
+
+function serializeWritableObject(
+  object: ProjectViewWritableObject,
+): Record<string, unknown> {
+  switch (object.objectType) {
+    case "project_profile":
+      return object.data;
+    case "goal":
+      return {
+        title: object.data.title,
+        desired_outcome: object.data.desiredOutcome,
+        directions: object.data.directions,
+      };
+    case "role":
+      return object.data;
+    case "plan":
+      return {
+        ...object.data,
+        under_goal_id: object.underGoalId ?? null,
+      };
+    case "stage":
+      return {
+        ...object.data,
+        under_plan_id: object.underPlanId,
+      };
+    case "requirement":
+      return {
+        ...object.data,
+        planned_in_stage_id: object.plannedInStageId ?? null,
+      };
+    case "issue":
+      return {
+        ...object.data,
+        planned_in_stage_id: object.plannedInStageId ?? null,
+        about: object.about ? rawReference(object.about) : null,
+      };
+    case "work":
+      return {
+        ...object.data,
+        handles: rawReference(object.handles),
+      };
+    case "resource":
+      return {
+        name: object.data.name,
+        resource_type: object.data.resourceType,
+        locator: {
+          locator_type: object.data.locator.locatorType,
+          value: object.data.locator.value,
+        },
+        description: object.data.description,
+      };
+  }
+}
+
+export function serializeProjectViewMutationIntent(
+  intent: ProjectViewMutationIntent,
+): Record<string, unknown> {
+  switch (intent.operation) {
+    case "initialize":
+      return {
+        operation: intent.operation,
+        profile: intent.profile,
+        goals: intent.goals.map((goal) => ({
+          title: goal.title,
+          desired_outcome: goal.desiredOutcome,
+          directions: goal.directions,
+        })),
+      };
+    case "create":
+      return {
+        operation: intent.operation,
+        expected_project_revision: intent.expectedProjectRevision,
+        object_type: intent.object.objectType,
+        data: serializeWritableObject(intent.object),
+      };
+    case "update":
+      return {
+        operation: intent.operation,
+        expected_project_revision: intent.expectedProjectRevision,
+        object_type: intent.object.objectType,
+        object_id: intent.objectId,
+        patch: serializeWritableObject(intent.object),
+      };
+    case "delete":
+      return {
+        operation: intent.operation,
+        expected_project_revision: intent.expectedProjectRevision,
+        object_type: intent.objectType,
+        object_id: intent.objectId,
+      };
+  }
+}
+
+function normalizeMutationResult(
+  raw: RawProjectViewMutationResult,
+): ProjectViewMutationResult {
+  switch (raw.status) {
+    case "applied":
+      return {
+        status: raw.status,
+        eventId: raw.event_id,
+        projectRevision: raw.project_revision,
+        objectId: raw.object_id,
+        objectRevision: raw.object_revision,
+        deleted: raw.deleted,
+      };
+    case "conflict":
+      return {
+        status: raw.status,
+        expectedProjectRevision: raw.expected_project_revision,
+        currentProjectRevision: raw.current_project_revision,
+        message: raw.message,
+      };
+  }
+}
+
+export async function mutateProjectView(
+  intent: ProjectViewMutationIntent,
+): Promise<ProjectViewMutationResult> {
+  const raw = await invokeTauri<RawProjectViewMutationResult>(
+    "mutate_project_view",
+    { input: serializeProjectViewMutationIntent(intent) },
+  );
+  return normalizeMutationResult(raw);
 }

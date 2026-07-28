@@ -6,30 +6,37 @@ import {
   Flag,
   GitBranch,
   Map as MapIcon,
+  Plus,
   ShieldCheck,
 } from "lucide-react";
 
 import {
   countProjectViewFocus,
   indexProjectViewObjects,
+  type ProjectViewCreateContext,
 } from "@/features/project-view/model";
 import { useProjectViewQuery } from "@/features/project-view/hooks";
+import { ProjectViewDeleteDialog } from "@/features/project-view/ui/ProjectViewDeleteDialog";
 import { ProjectViewInspector } from "@/features/project-view/ui/ProjectViewInspector";
 import { ProjectViewMap } from "@/features/project-view/ui/ProjectViewMap";
+import { ProjectViewObjectDialog } from "@/features/project-view/ui/ProjectViewObjectDialog";
 import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
+import { ProjectViewInitialize } from "@/features/project-view/ui/ProjectViewInitialize";
 import {
   ProjectViewErrorState,
   ProjectViewForbiddenState,
   ProjectViewLoadingState,
-  ProjectViewUninitializedState,
   ProjectViewUnsupportedState,
 } from "@/features/project-view/ui/ProjectViewStates";
 import type {
   ProjectView,
   ProjectViewLoadResult,
+  ProjectViewObject,
+  ProjectViewObjectType,
 } from "@/shared/api/tauriProjectView";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { Badge } from "@/shared/ui/badge";
+import { Button } from "@/shared/ui/button";
 
 type ProjectViewScreenProps = {
   onSelectObject: (objectId: string | undefined) => void;
@@ -126,15 +133,19 @@ function ProjectProfile({
 }
 
 function SupportingObjects({
+  onCreateObject,
   onSelectObject,
   selectedObjectId,
   view,
 }: {
+  onCreateObject: (
+    objectType: "role" | "resource",
+    context?: ProjectViewCreateContext,
+  ) => void;
   onSelectObject: (objectId: string) => void;
   selectedObjectId?: string;
   view: ProjectView;
 }) {
-  if (view.roles.length === 0 && view.resources.length === 0) return null;
   return (
     <section className="grid gap-5 xl:grid-cols-2">
       <div>
@@ -144,6 +155,16 @@ function SupportingObjects({
           <span className="text-xs text-muted-foreground">
             Semantic responsibilities
           </span>
+          <Button
+            className="ml-auto h-7"
+            onClick={() => onCreateObject("role")}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            <Plus />
+            Add Role
+          </Button>
         </div>
         {view.roles.length > 0 ? (
           <div className="grid gap-2 sm:grid-cols-2">
@@ -170,6 +191,16 @@ function SupportingObjects({
           <span className="text-xs text-muted-foreground">
             Stable project entry points
           </span>
+          <Button
+            className="ml-auto h-7"
+            onClick={() => onCreateObject("resource")}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            <Plus />
+            Add Resource
+          </Button>
         </div>
         {view.resources.length > 0 ? (
           <div className="grid gap-2 sm:grid-cols-2">
@@ -199,11 +230,22 @@ function ReadyProjectView({
   projectRevision,
   projectionGeneration,
   relayPubkey,
+  onRefresh,
   selectedObjectId,
   updatedAt,
   view,
 }: Extract<ProjectViewLoadResult, { status: "ready" }> &
-  ProjectViewScreenProps) {
+  ProjectViewScreenProps & { onRefresh: () => void }) {
+  type EditorRequest =
+    | {
+        mode: "create";
+        initialType?: Exclude<ProjectViewObjectType, "project_profile">;
+        context?: ProjectViewCreateContext;
+      }
+    | { mode: "edit"; object: ProjectViewObject };
+
+  const [editor, setEditor] = React.useState<EditorRequest>();
+  const [deleteTarget, setDeleteTarget] = React.useState<ProjectViewObject>();
   const objectsById = React.useMemo(
     () => indexProjectViewObjects(view),
     [view],
@@ -216,11 +258,28 @@ function ReadyProjectView({
     (objectId: string) => onSelectObject(objectId),
     [onSelectObject],
   );
+  const createObject = React.useCallback(
+    (
+      objectType: Exclude<ProjectViewObjectType, "project_profile">,
+      context?: ProjectViewCreateContext,
+    ) => setEditor({ mode: "create", initialType: objectType, context }),
+    [],
+  );
 
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
       <main className="min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-7xl space-y-6 p-5 pb-12">
+          <div className="flex justify-end">
+            <Button
+              data-testid="project-view-add"
+              onClick={() => setEditor({ mode: "create" })}
+              type="button"
+            >
+              <Plus />
+              Add
+            </Button>
+          </div>
           <ProjectProfile
             onSelectObject={selectObject}
             selectedObjectId={selectedObjectId}
@@ -260,11 +319,13 @@ function ReadyProjectView({
           </section>
 
           <ProjectViewMap
+            onCreateObject={createObject}
             onSelectObject={selectObject}
             selectedObjectId={selectedObjectId}
             view={view}
           />
           <SupportingObjects
+            onCreateObject={createObject}
             onSelectObject={selectObject}
             selectedObjectId={selectedObjectId}
             view={view}
@@ -284,10 +345,43 @@ function ReadyProjectView({
           object={selectedObject}
           objectsById={objectsById}
           onClose={() => onSelectObject(undefined)}
+          onDelete={setDeleteTarget}
+          onEdit={(object) => setEditor({ mode: "edit", object })}
           onSelectObject={selectObject}
           view={view}
         />
       ) : null}
+      {editor ? (
+        <ProjectViewObjectDialog
+          context={editor.mode === "create" ? editor.context : undefined}
+          initialType={
+            editor.mode === "create" ? editor.initialType : undefined
+          }
+          mode={editor.mode}
+          object={editor.mode === "edit" ? editor.object : undefined}
+          onApplied={(objectId) => {
+            if (objectId) onSelectObject(objectId);
+          }}
+          onOpenChange={(open) => {
+            if (!open) setEditor(undefined);
+          }}
+          onReviewLatest={onRefresh}
+          open
+          projectRevision={projectRevision}
+          view={view}
+        />
+      ) : null}
+      <ProjectViewDeleteDialog
+        object={deleteTarget}
+        onDeleted={() => onSelectObject(undefined)}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(undefined);
+        }}
+        onReviewLatest={onRefresh}
+        open={Boolean(deleteTarget)}
+        projectRevision={projectRevision}
+        view={view}
+      />
     </div>
   );
 }
@@ -312,7 +406,10 @@ export function ProjectViewScreen({
               Community project context
             </div>
           </div>
-          <Badge variant="outline">Read only</Badge>
+          {query.data?.status === "ready" ||
+          query.data?.status === "uninitialized" ? (
+            <Badge variant="outline">Editable</Badge>
+          ) : null}
           {query.data?.status === "ready" ? (
             <Badge variant="success">
               <ShieldCheck className="mr-1 h-3 w-3" />
@@ -341,11 +438,12 @@ export function ProjectViewScreen({
         <ProjectViewForbiddenState />
       ) : null}
       {query.data?.status === "uninitialized" ? (
-        <ProjectViewUninitializedState />
+        <ProjectViewInitialize onReviewLatest={() => void query.refetch()} />
       ) : null}
       {query.data?.status === "ready" ? (
         <ReadyProjectView
           {...query.data}
+          onRefresh={() => void query.refetch()}
           onSelectObject={onSelectObject}
           selectedObjectId={selectedObjectId}
         />

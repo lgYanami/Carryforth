@@ -210,7 +210,7 @@ test("View renders the verified canonical map and object inspector", async ({
   await expect(page).toHaveURL(/\/view$/);
 });
 
-test("View distinguishes supported but uninitialized Communities", async ({
+test("Human initializes an uninitialized View as one atomic mutation", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -218,18 +218,203 @@ test("View distinguishes supported but uninitialized Communities", async ({
       status: "uninitialized",
       relay_pubkey: "b".repeat(64),
     },
+    projectViewMutationResult: {
+      status: "applied",
+      event_id: "c".repeat(64),
+      project_revision: 1,
+    },
+    projectViewAfterMutation: READY_VIEW,
   });
   await page.goto("/");
   await page.getByTestId("open-view").click();
 
   await expect(
-    page.getByRole("heading", {
-      name: "This View has not been initialized",
-    }),
+    page.getByRole("heading", { name: "Initialize this View" }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: /initialize/i })).toHaveCount(
-    0,
+
+  await page.getByLabel("Project name").fill("Human Project");
+  await page
+    .getByLabel("Positioning")
+    .fill("One shared context for Humans and Agents.");
+  await page.getByLabel("Purpose").fill("Coordinate project work.");
+  await page.getByLabel("Problem").fill("Context is fragmented.");
+  await page.getByLabel("Scope").fill("Project context and execution.");
+  await page.getByLabel("Title").fill("Establish one shared map");
+  await page
+    .getByLabel("Desired outcome")
+    .fill("Everyone reads the same Project View.");
+  await page.getByRole("button", { name: "Review foundation" }).click();
+  await expect(page.getByText("Human Project")).toBeVisible();
+  await page.getByRole("button", { name: "Initialize View" }).click();
+
+  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
+  const mutations = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: Array<Record<string, unknown>>;
+        }
+      ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
   );
+  expect(mutations).toHaveLength(1);
+  expect(mutations?.[0]).toMatchObject({
+    operation: "initialize",
+    profile: { name: "Human Project" },
+    goals: [
+      {
+        title: "Establish one shared map",
+        desired_outcome: "Everyone reads the same Project View.",
+      },
+    ],
+  });
+});
+
+test("context creation preselects only a legal parent relation", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: READY_VIEW,
+    projectViewMutationResult: {
+      status: "applied",
+      event_id: "c".repeat(64),
+      project_revision: 8,
+      object_id: "00000000-0000-4000-8000-000000000099",
+      object_revision: 1,
+      deleted: false,
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await page.getByRole("button", { name: "Add Stage" }).first().click();
+  await expect(
+    page.getByRole("heading", { name: "Add to View" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Parent Plan")).toHaveValue(IDS.plan);
+  await page.getByLabel("Title").fill("Human editing");
+  await page
+    .getByLabel("Description")
+    .fill("Expose typed Project View mutations.");
+  await page.getByRole("button", { name: "Create Stage" }).click();
+
+  const mutations = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: Array<Record<string, unknown>>;
+        }
+      ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations?.[0]).toMatchObject({
+    operation: "create",
+    expected_project_revision: 7,
+    object_type: "stage",
+    data: {
+      title: "Human editing",
+      status: "planned",
+      under_plan_id: IDS.plan,
+    },
+  });
+});
+
+test("a stale edit preserves the Human draft and is never retried", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: READY_VIEW,
+    projectViewMutationResult: {
+      status: "conflict",
+      expected_project_revision: 7,
+      current_project_revision: 8,
+      message: "relay returned 409: project revision conflict",
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
+    .click();
+
+  await page.getByRole("button", { name: "Edit" }).click();
+  const title = page.getByLabel("Title");
+  await title.fill("Projects naming conflict");
+  await page.getByRole("button", { name: "Save changes" }).click();
+
+  await expect(page.getByRole("alert")).toContainText("Project changed");
+  await expect(title).toHaveValue("Projects naming conflict");
+  const mutations = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: unknown[];
+        }
+      ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations).toHaveLength(1);
+});
+
+test("delete is blocked while an active object still references the target", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Plan Deliver Project View" })
+    .click();
+
+  await page.getByRole("button", { name: "Delete" }).click();
+  await expect(
+    page.getByText("Move or unlink these references first"),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/Stage “Read-only client” references this object/),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Delete object" }),
+  ).toBeDisabled();
+});
+
+test("an unreferenced object requires confirmation before deletion", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: READY_VIEW,
+    projectViewMutationResult: {
+      status: "applied",
+      event_id: "c".repeat(64),
+      project_revision: 8,
+      object_id: IDS.resource,
+      object_revision: 2,
+      deleted: true,
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Resource Buzz repository" })
+    .click();
+
+  await page.getByRole("button", { name: "Delete" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Delete Buzz repository?" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Delete object" }).click();
+
+  const mutations = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: Array<Record<string, unknown>>;
+        }
+      ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations?.[0]).toMatchObject({
+    operation: "delete",
+    expected_project_revision: 7,
+    object_type: "resource",
+    object_id: IDS.resource,
+  });
 });
 
 for (const state of [

@@ -1,5 +1,62 @@
 # Project View 变更记录
 
+## 2026-07-28 — Client Slice 2：初始化与类型化修改
+
+### Human 写入边界
+
+- Desktop 新增单一 `mutate_project_view` Tauri command，只接收
+  Initialize/Create/Update/Delete 四类 closed typed intent。UI 不构造事件、不提供原始
+  JSON 编辑，也不调用 CLI；Rust 使用既有 `buzz-sdk::project_view` builder 生成
+  `44300` mutation，并为初始 Goal 与新对象生成 UUID v4。
+- command 在首次异步等待前固定当前 Relay URL 与成员签名身份，随后验证 NIP-11
+  capability/signer，以同一身份签名 mutation 和 NIP-98 请求，避免已开始的意图被后续
+  Community 切换重定向。
+- 成功写入不只相信 HTTP 状态：客户端要求 event ID 相同且回执使用规范
+  `response:<json>`，再重读 Relay 签名的 meta；Create/Update/Delete 还按对象坐标重读
+  projection，验证 signer、generation、revision、对象身份与删除状态。若确认期间已有
+  更晚 revision，则接受能证明该回执已被后续规范状态覆盖的结果，不要求最新 meta
+  仍指向旧 mutation。
+- HTTP 409 转为 typed revision conflict，不自动重试旧 Human intent。只有 Applied
+  才使 React Query 中当前 Community 的可信快照失效并重取；冲突时当前打开表单中的输入
+  保持不变。
+
+### 初始化与对象维护
+
+- Uninitialized View 新增专用初始化流程，一次收集完整 Project Profile 与 1–32 个
+  初始 Goal，并在提交前提供整体 Review；一次 mutation 原子建立合法 View，不产生只有
+  Profile 或没有 Goal 的中间状态。
+- Ready View 新增全局 Add、Inspector Edit/Delete，以及 Goal→Plan、Plan→Stage、
+  Stage→Requirement/Issue、Requirement/Issue→Work、Roles 和 Resources 的上下文 Add。
+  上下文只预填关系，Human 提交前仍可检查和修改。
+- 九类对象均使用业务字段表单；Plan、Stage、Requirement、Issue、Work 使用闭集
+  status，Requirement/Issue/Work 使用闭集 priority。关系选择器只列出合法 active
+  类型，并显示规范结构路径；Stage 与 Work 的必选关系不能清空，Plan、Requirement、
+  Issue 的可选关系可显式解除。
+- 删除前从当前可信 View 扫描全部入向关系并列出引用来源；有引用时禁止提交且不级联。
+  Project Profile 永不可删除，最后一个 Goal 也在客户端直接阻止；无引用对象需要显式
+  确认后才提交 tombstone mutation。
+
+### 验证
+
+- Tauri 新增 7 个 mutation 定向测试，其中真实 HTTP fixture 覆盖原子初始化、对象
+  Create 后的签名 projection 确认、规范回执和 409 单次提交；Tauri 全量测试
+  1,639 项通过、14 项真实系统钥匙串测试按约定忽略，另有 3 项 diagnostic test 通过。
+- Desktop 3,493 个 unit test 全部通过；Project View model/serialization 定向测试覆盖
+  规范路径、入向引用扫描、typed writable object 和可选关系的显式 clear。
+- Project View 8 个 Playwright smoke 全部通过，覆盖原子初始化、上下文 Stage 创建、
+  冲突不重试且保留当前表单输入、引用阻断删除、无引用确认删除，以及 ready、
+  unsupported、forbidden 状态。
+- Desktop typecheck、Biome、文件大小、可缩放文本、公钥展示守卫和 Tauri
+  `clippy --all-targets -D warnings` 均通过。
+
+### 范围边界
+
+- 本 Slice 完成初始化和全部 v0 对象的类型化 Create/Edit/Delete；没有增加数据库读取、
+  UI 专用 HTTP endpoint、CLI 子进程或第二份权威状态。
+- projection 实时订阅、断线恢复、Community 切换后的主动重确认、跨刷新/关闭的草稿
+  保存、最新 revision 对比与显式重基线提交，以及 Human/Agent 身份名称解析仍属于
+  Client Slice 3。
+
 ## 2026-07-27 — Client Slice 1：可信读取与 View 页面
 
 ### 客户端可信边界

@@ -19,11 +19,25 @@ pub async fn submit_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let event = builder
         .sign_with_keys(keys)
         .map_err(|e| format!("failed to sign event: {e}"))?;
+    submit_signed_event_at_with_keys(&event, state, api_base_url, keys).await
+}
+
+/// POST an already-signed event to an explicit Relay using the same identity
+/// for NIP-98 authentication.
+pub async fn submit_signed_event_at_with_keys(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+) -> Result<SubmitEventResponse, String> {
+    if event.pubkey != keys.public_key() {
+        return Err("signed event does not match the publishing identity".to_string());
+    }
+    crate::relay_admission::wait_for_rate_limit().await;
+    let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let body_bytes = event.as_json().into_bytes();
     let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
 
