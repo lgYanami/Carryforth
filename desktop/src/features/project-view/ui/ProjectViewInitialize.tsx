@@ -18,13 +18,15 @@ import {
 import type {
   ProjectGoalData,
   ProjectProfileData,
+  ProjectViewLoadResult,
   ProjectViewMutationResult,
 } from "@/shared/api/tauriProjectView";
+import { getProjectView } from "@/shared/api/tauriProjectView";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 
-type GoalDraft = ProjectGoalData & { key: string };
+export type ProjectViewGoalDraft = ProjectGoalData & { key: string };
 
 const EMPTY_PROFILE: ProjectProfileData = {
   name: "",
@@ -34,7 +36,7 @@ const EMPTY_PROFILE: ProjectProfileData = {
   scope: "",
 };
 
-function newGoal(): GoalDraft {
+function newGoal(): ProjectViewGoalDraft {
   return {
     key: globalThis.crypto.randomUUID(),
     title: "",
@@ -43,7 +45,10 @@ function newGoal(): GoalDraft {
   };
 }
 
-function isComplete(profile: ProjectProfileData, goals: GoalDraft[]) {
+function isComplete(
+  profile: ProjectProfileData,
+  goals: ProjectViewGoalDraft[],
+) {
   return (
     Object.values(profile).every((value) => value.trim().length > 0) &&
     goals.length > 0 &&
@@ -64,7 +69,7 @@ function normalizeProfile(profile: ProjectProfileData): ProjectProfileData {
   };
 }
 
-function normalizeGoal(goal: GoalDraft): ProjectGoalData {
+function normalizeGoal(goal: ProjectViewGoalDraft): ProjectGoalData {
   return {
     title: goal.title.trim(),
     desiredOutcome: goal.desiredOutcome.trim(),
@@ -128,10 +133,10 @@ function GoalsFields({
   goals,
   onChange,
 }: {
-  goals: GoalDraft[];
-  onChange: (goals: GoalDraft[]) => void;
+  goals: ProjectViewGoalDraft[];
+  onChange: (goals: ProjectViewGoalDraft[]) => void;
 }) {
-  const update = (index: number, patch: Partial<GoalDraft>) =>
+  const update = (index: number, patch: Partial<ProjectViewGoalDraft>) =>
     onChange(
       goals.map((goal, goalIndex) =>
         goalIndex === index ? { ...goal, ...patch } : goal,
@@ -208,7 +213,7 @@ function Review({
   goals,
   profile,
 }: {
-  goals: GoalDraft[];
+  goals: ProjectViewGoalDraft[];
   profile: ProjectProfileData;
 }) {
   return (
@@ -252,22 +257,90 @@ function Review({
   );
 }
 
+export type ProjectViewInitializationDraft = {
+  goals: ProjectViewGoalDraft[];
+  profile: ProjectProfileData;
+  reviewing: boolean;
+};
+
+export function createProjectViewInitializationDraft(): ProjectViewInitializationDraft {
+  return {
+    goals: [newGoal()],
+    profile: { ...EMPTY_PROFILE },
+    reviewing: false,
+  };
+}
+
+export function isProjectViewInitializationDraftDirty(
+  draft: ProjectViewInitializationDraft,
+) {
+  return (
+    draft.reviewing ||
+    Object.values(draft.profile).some((value) => value.length > 0) ||
+    draft.goals.length !== 1 ||
+    draft.goals.some(
+      (goal) =>
+        goal.title.length > 0 ||
+        goal.desiredOutcome.length > 0 ||
+        goal.directions.length > 0,
+    )
+  );
+}
+
 export function ProjectViewInitialize({
-  onReviewLatest,
+  draft,
+  onApplied,
+  onChange,
+  onConflict,
+  onDiscardAndOpenLatest,
 }: {
-  onReviewLatest: () => void;
+  draft: ProjectViewInitializationDraft;
+  onApplied: () => void;
+  onChange: (draft: ProjectViewInitializationDraft) => void;
+  onConflict: (
+    conflict: Extract<ProjectViewMutationResult, { status: "conflict" }>,
+  ) => void;
+  onDiscardAndOpenLatest: () => Promise<unknown>;
 }) {
   const mutation = useProjectViewMutation();
-  const [profile, setProfile] =
-    React.useState<ProjectProfileData>(EMPTY_PROFILE);
-  const [goals, setGoals] = React.useState<GoalDraft[]>(() => [newGoal()]);
-  const [reviewing, setReviewing] = React.useState(false);
+  const { goals, profile, reviewing } = draft;
   const [conflict, setConflict] = React.useState<
     Extract<ProjectViewMutationResult, { status: "conflict" }> | undefined
   >();
+  const [latestView, setLatestView] = React.useState<ProjectViewLoadResult>();
+  const [reviewingLatest, setReviewingLatest] = React.useState(false);
+
+  const setProfile = (nextProfile: ProjectProfileData) =>
+    onChange({ ...draft, profile: nextProfile });
+  const setGoals = (nextGoals: ProjectViewGoalDraft[]) =>
+    onChange({ ...draft, goals: nextGoals });
+  const setReviewing = (nextReviewing: boolean) =>
+    onChange({ ...draft, reviewing: nextReviewing });
+
+  const reviewLatest = async () => {
+    if (reviewingLatest) return;
+    setReviewingLatest(true);
+    try {
+      setLatestView(await getProjectView());
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "The latest Project View could not be verified.",
+      );
+    } finally {
+      setReviewingLatest(false);
+    }
+  };
+
+  const discardAndOpenLatest = async () => {
+    setConflict(undefined);
+    setLatestView(undefined);
+    await onDiscardAndOpenLatest();
+  };
 
   const submit = async () => {
-    if (mutation.isPending || !isComplete(profile, goals)) return;
+    if (mutation.isPending || conflict || !isComplete(profile, goals)) return;
     setConflict(undefined);
     try {
       const result = await mutation.mutateAsync({
@@ -277,9 +350,12 @@ export function ProjectViewInitialize({
       });
       if (result.status === "conflict") {
         setConflict(result);
+        onConflict(result);
+        void reviewLatest();
         return;
       }
       toast.success("Project View initialized");
+      onApplied();
     } catch (error) {
       toast.error(
         error instanceof Error
@@ -308,8 +384,22 @@ export function ProjectViewInitialize({
         {conflict ? (
           <div className="mb-5">
             <ProjectViewConflictNotice
+              comparison={
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {latestView?.status === "ready"
+                    ? `“${latestView.view.profile.data.name}” is now initialized. Initialization is atomic, so this preserved draft cannot overwrite it; use the latest View and apply any still-relevant fields individually.`
+                    : "Initialization can only happen once. Keep this input for reference until the latest verified View is available."}
+                </p>
+              }
               conflict={conflict}
-              onReviewLatest={onReviewLatest}
+              latestProjectRevision={
+                latestView?.status === "ready"
+                  ? latestView.projectRevision
+                  : undefined
+              }
+              onDiscardDraft={() => void discardAndOpenLatest()}
+              onReviewLatest={() => void reviewLatest()}
+              refreshing={reviewingLatest}
             />
           </div>
         ) : null}
@@ -338,7 +428,7 @@ export function ProjectViewInitialize({
             ) : null}
             {reviewing ? (
               <Button
-                disabled={mutation.isPending}
+                disabled={mutation.isPending || Boolean(conflict)}
                 onClick={() => void submit()}
                 type="button"
               >

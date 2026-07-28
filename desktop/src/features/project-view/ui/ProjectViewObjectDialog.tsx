@@ -12,12 +12,12 @@ import {
 } from "@/features/project-view/model";
 import {
   PROJECT_VIEW_SELECT_CLASS,
-  ProjectViewConflictNotice,
   ProjectViewEnumSelect,
   ProjectViewField,
   ProjectViewListField,
   ProjectViewSelect,
 } from "@/features/project-view/ui/ProjectViewFormFields";
+import { ProjectViewObjectConflict } from "@/features/project-view/ui/ProjectViewObjectConflict";
 import type {
   ProjectView,
   ProjectViewIssueStatus,
@@ -727,7 +727,7 @@ export function ProjectViewObjectDialog({
   object?: ProjectViewObject;
   onApplied: (objectId?: string) => void;
   onOpenChange: (open: boolean) => void;
-  onReviewLatest: () => void;
+  onReviewLatest: () => Promise<unknown>;
   open: boolean;
   projectRevision: number;
   view: ProjectView;
@@ -744,6 +744,8 @@ export function ProjectViewObjectDialog({
   );
   const [baseRevision, setBaseRevision] = React.useState(projectRevision);
   const [error, setError] = React.useState<string>();
+  const [rebasedRevision, setRebasedRevision] = React.useState<number>();
+  const [reviewingLatest, setReviewingLatest] = React.useState(false);
   const [conflict, setConflict] = React.useState<
     Extract<ProjectViewMutationResult, { status: "conflict" }> | undefined
   >();
@@ -758,6 +760,8 @@ export function ProjectViewObjectDialog({
       setForm(object ? formFromObject(object) : emptyForm(type, context));
       setBaseRevision(projectRevision);
       setError(undefined);
+      setRebasedRevision(undefined);
+      setReviewingLatest(false);
       setConflict(undefined);
       resetMutation();
     }
@@ -784,9 +788,32 @@ export function ProjectViewObjectDialog({
     setError(undefined);
   };
 
+  const reviewLatest = async () => {
+    if (reviewingLatest) return;
+    setReviewingLatest(true);
+    try {
+      await onReviewLatest();
+    } finally {
+      setReviewingLatest(false);
+    }
+  };
+
+  const discardDraft = () => {
+    setConflict(undefined);
+    onOpenChange(false);
+  };
+
+  const useLatestRevision = () => {
+    setBaseRevision(projectRevision);
+    setConflict(undefined);
+    setError(undefined);
+    setRebasedRevision(projectRevision);
+  };
+
   const submit = async () => {
     if (mutation.isPending) return;
     setError(undefined);
+    setRebasedRevision(undefined);
     setConflict(undefined);
     try {
       const writable = writableFromForm(objectType, form, objects);
@@ -818,6 +845,7 @@ export function ProjectViewObjectDialog({
       );
       if (result.status === "conflict") {
         setConflict(result);
+        void reviewLatest();
         return;
       }
       toast.success(
@@ -839,7 +867,9 @@ export function ProjectViewObjectDialog({
   return (
     <Dialog
       onOpenChange={(nextOpen) => {
-        if (!mutation.isPending) onOpenChange(nextOpen);
+        if (!mutation.isPending && (nextOpen || !conflict)) {
+          onOpenChange(nextOpen);
+        }
       }}
       open={open}
     >
@@ -864,15 +894,18 @@ export function ProjectViewObjectDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {conflict ? (
-          <ProjectViewConflictNotice
-            conflict={conflict}
-            onReviewLatest={() => {
-              onOpenChange(false);
-              onReviewLatest();
-            }}
-          />
-        ) : null}
+        <ProjectViewObjectConflict
+          baseObject={object}
+          conflict={conflict}
+          latestObjects={objects}
+          latestProjectRevision={projectRevision}
+          mode={mode}
+          onDiscardDraft={discardDraft}
+          onReviewLatest={() => void reviewLatest()}
+          onUseLatestRevision={useLatestRevision}
+          rebasedRevision={rebasedRevision}
+          reviewingLatest={reviewingLatest}
+        />
 
         {mode === "create" && !initialType ? (
           <ProjectViewField label="Object type" required>
@@ -917,11 +950,11 @@ export function ProjectViewObjectDialog({
         <DialogFooter>
           <Button
             disabled={mutation.isPending}
-            onClick={() => onOpenChange(false)}
+            onClick={conflict ? discardDraft : () => onOpenChange(false)}
             type="button"
             variant="outline"
           >
-            Cancel
+            {conflict ? "Discard draft" : "Cancel"}
           </Button>
           <Button
             disabled={mutation.isPending}

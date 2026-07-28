@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { useProjectViewMutation } from "@/features/project-view/hooks";
 import {
+  indexProjectViewObjects,
   projectViewIncomingReferences,
   projectViewObjectTitle,
   projectViewObjectTypeLabel,
@@ -37,7 +38,7 @@ export function ProjectViewDeleteDialog({
   object?: ProjectViewObject;
   onDeleted: () => void;
   onOpenChange: (open: boolean) => void;
-  onReviewLatest: () => void;
+  onReviewLatest: () => Promise<unknown>;
   open: boolean;
   projectRevision: number;
   view: ProjectView;
@@ -45,6 +46,8 @@ export function ProjectViewDeleteDialog({
   const mutation = useProjectViewMutation();
   const [baseRevision, setBaseRevision] = React.useState(projectRevision);
   const [error, setError] = React.useState<string>();
+  const [rebasedRevision, setRebasedRevision] = React.useState<number>();
+  const [reviewingLatest, setReviewingLatest] = React.useState(false);
   const [conflict, setConflict] = React.useState<
     Extract<ProjectViewMutationResult, { status: "conflict" }> | undefined
   >();
@@ -55,6 +58,8 @@ export function ProjectViewDeleteDialog({
     if (open && !wasOpen.current) {
       setBaseRevision(projectRevision);
       setError(undefined);
+      setRebasedRevision(undefined);
+      setReviewingLatest(false);
       setConflict(undefined);
       resetMutation();
     }
@@ -62,14 +67,40 @@ export function ProjectViewDeleteDialog({
   }, [open, projectRevision, resetMutation]);
 
   if (!object) return null;
+  const objects = indexProjectViewObjects(view);
+  const latestObject = objects.get(object.id);
   const incoming = projectViewIncomingReferences(view, object.id);
   const lastGoal = object.objectType === "goal" && view.goals.length === 1;
   const profile = object.objectType === "project_profile";
-  const blocked = profile || lastGoal || incoming.length > 0;
+  const targetMissing = latestObject === undefined;
+  const blocked = profile || lastGoal || targetMissing || incoming.length > 0;
+
+  const reviewLatest = async () => {
+    if (reviewingLatest) return;
+    setReviewingLatest(true);
+    try {
+      await onReviewLatest();
+    } finally {
+      setReviewingLatest(false);
+    }
+  };
+
+  const discardDraft = () => {
+    setConflict(undefined);
+    onOpenChange(false);
+  };
+
+  const useLatestRevision = () => {
+    setBaseRevision(projectRevision);
+    setConflict(undefined);
+    setError(undefined);
+    setRebasedRevision(projectRevision);
+  };
 
   const submit = async () => {
     if (mutation.isPending || blocked) return;
     setError(undefined);
+    setRebasedRevision(undefined);
     setConflict(undefined);
     try {
       const result = await mutation.mutateAsync({
@@ -80,6 +111,7 @@ export function ProjectViewDeleteDialog({
       });
       if (result.status === "conflict") {
         setConflict(result);
+        void reviewLatest();
         return;
       }
       toast.success(`${projectViewObjectTypeLabel(object.objectType)} deleted`);
@@ -97,7 +129,9 @@ export function ProjectViewDeleteDialog({
   return (
     <AlertDialog
       onOpenChange={(nextOpen) => {
-        if (!mutation.isPending) onOpenChange(nextOpen);
+        if (!mutation.isPending && (nextOpen || !conflict)) {
+          onOpenChange(nextOpen);
+        }
       }}
       open={open}
     >
@@ -115,12 +149,32 @@ export function ProjectViewDeleteDialog({
 
         {conflict ? (
           <ProjectViewConflictNotice
+            comparison={
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {latestObject
+                  ? latestObject.objectRevision === object.objectRevision
+                    ? `The target object is still at object revision ${object.objectRevision}; another project object changed.`
+                    : `The target object changed from object revision ${object.objectRevision} to ${latestObject.objectRevision}. Re-check references before rebasing the delete.`
+                  : "The target no longer exists in the latest verified View, so this delete cannot be rebased."}
+              </p>
+            }
             conflict={conflict}
-            onReviewLatest={() => {
-              onOpenChange(false);
-              onReviewLatest();
-            }}
+            latestProjectRevision={projectRevision}
+            onDiscardDraft={discardDraft}
+            onReviewLatest={() => void reviewLatest()}
+            onUseLatestRevision={latestObject ? useLatestRevision : undefined}
+            refreshing={reviewingLatest}
           />
+        ) : null}
+
+        {rebasedRevision !== undefined ? (
+          <div
+            className="rounded-lg border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs leading-relaxed text-muted-foreground"
+            role="status"
+          >
+            Delete intent now uses verified project revision {rebasedRevision}.
+            Review the target and references, then confirm deletion again.
+          </div>
         ) : null}
 
         {profile ? (
@@ -131,6 +185,11 @@ export function ProjectViewDeleteDialog({
         {lastGoal ? (
           <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
             Every initialized View must retain at least one Goal.
+          </div>
+        ) : null}
+        {targetMissing ? (
+          <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
+            This object is no longer active in the latest verified View.
           </div>
         ) : null}
         {incoming.length > 0 ? (
@@ -159,15 +218,26 @@ export function ProjectViewDeleteDialog({
         ) : null}
 
         <AlertDialogFooter>
-          <AlertDialogCancel asChild>
+          {conflict ? (
             <Button
               disabled={mutation.isPending}
+              onClick={discardDraft}
               type="button"
               variant="outline"
             >
-              Cancel
+              Discard delete
             </Button>
-          </AlertDialogCancel>
+          ) : (
+            <AlertDialogCancel asChild>
+              <Button
+                disabled={mutation.isPending}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+            </AlertDialogCancel>
+          )}
           <Button
             disabled={blocked || mutation.isPending}
             onClick={() => void submit()}

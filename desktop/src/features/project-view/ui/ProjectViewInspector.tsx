@@ -15,15 +15,18 @@ import {
   projectViewObjectTitle,
   projectViewObjectTypeLabel,
 } from "@/features/project-view/model";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
 import type {
   ProjectView,
   ProjectViewObject,
 } from "@/shared/api/tauriProjectView";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
-import { PubKey } from "@/shared/ui/PubKey";
 
 type ProjectViewInspectorProps = {
+  actorProfiles?: UserProfileLookup;
+  currentPubkey?: string;
   object: ProjectViewObject;
   objectsById: ReadonlyMap<string, ProjectViewObject>;
   onClose: () => void;
@@ -166,6 +169,8 @@ function RelationLink({
 }
 
 export function ProjectViewInspector({
+  actorProfiles,
+  currentPubkey,
   object,
   objectsById,
   onClose,
@@ -296,10 +301,11 @@ export function ProjectViewInspector({
             <span>{formatDateTime(object.createdAt)}</span>
             <span className="mt-1 block text-xs text-muted-foreground">
               by{" "}
-              <PubKey
-                className="text-xs"
+              <ProjectViewActor
+                currentPubkey={currentPubkey}
+                profiles={actorProfiles}
                 pubkey={object.createdBy}
-                testId="project-view-created-by"
+                pubkeyTestId="project-view-created-by"
               />
             </span>
           </Detail>
@@ -307,10 +313,11 @@ export function ProjectViewInspector({
             <span>{formatDateTime(object.updatedAt)}</span>
             <span className="mt-1 block text-xs text-muted-foreground">
               by{" "}
-              <PubKey
-                className="text-xs"
+              <ProjectViewActor
+                currentPubkey={currentPubkey}
+                profiles={actorProfiles}
                 pubkey={object.updatedBy}
-                testId="project-view-updated-by"
+                pubkeyTestId="project-view-updated-by"
               />
             </span>
           </Detail>

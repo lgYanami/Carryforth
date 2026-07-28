@@ -1,6 +1,7 @@
 import { CircleDot, Layers3, Plus } from "lucide-react";
 
 import type { ProjectViewCreateContext } from "@/features/project-view/model";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
 import type {
   ProjectView,
@@ -13,6 +14,8 @@ import type {
 import { Button } from "@/shared/ui/button";
 
 type ProjectViewMapProps = {
+  actorProfiles?: UserProfileLookup;
+  currentPubkey?: string;
   onCreateObject: (
     objectType: Exclude<ProjectViewObjectType, "project_profile">,
     context?: ProjectViewCreateContext,
@@ -44,12 +47,16 @@ function ContextAddButton({
 }
 
 function ObjectCard({
+  actorProfiles,
+  currentPubkey,
   object,
   onSelectObject,
   selectedObjectId,
   view,
   size,
 }: {
+  actorProfiles?: UserProfileLookup;
+  currentPubkey?: string;
   object: Parameters<typeof ProjectViewObjectCard>[0]["object"];
   onSelectObject: (objectId: string) => void;
   selectedObjectId?: string;
@@ -58,6 +65,8 @@ function ObjectCard({
 }) {
   return (
     <ProjectViewObjectCard
+      actorProfiles={actorProfiles}
+      currentPubkey={currentPubkey}
       issueReferenceCount={view.issueReferencesByTarget[object.id]?.length ?? 0}
       object={object}
       onSelect={onSelectObject}
@@ -292,12 +301,21 @@ function LooseIssue({
 }
 
 export function ProjectViewMap({
+  actorProfiles,
+  currentPubkey,
   onCreateObject,
   onSelectObject,
   selectedObjectId,
   view,
 }: ProjectViewMapProps) {
-  const shared = { onCreateObject, onSelectObject, selectedObjectId, view };
+  const shared = {
+    actorProfiles,
+    currentPubkey,
+    onCreateObject,
+    onSelectObject,
+    selectedObjectId,
+    view,
+  };
   const hasLooseObjects =
     view.unboundPlans.length > 0 ||
     view.unplannedRequirements.length > 0 ||

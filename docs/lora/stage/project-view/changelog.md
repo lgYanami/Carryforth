@@ -1,5 +1,63 @@
 # Project View 变更记录
 
+## 2026-07-28 — Client Slice 3：实时协作与冲突恢复
+
+### 可信实时刷新
+
+- Desktop 订阅当前 Relay signer 发布的 `40903` Project View Object 与 `40904`
+  Project View Meta。投影事件只作为“权威状态可能变化”的失效信号，事件正文不进入
+  React 状态；每次变化仍通过既有 native `get_project_view` 边界重读、验签并组装完整的
+  revision 一致快照。
+- live filter 从最后一份可信快照时间向前保留短窗口，订阅建立后主动再确认一次快照，
+  关闭初始读取与订阅建立之间的竞态。一次 mutation 产生的多个 projection event 会被
+  合并为一次刷新；刷新期间再次到达的信号会保留一次 trailing refresh，不会因并发请求
+  丢掉更晚 revision。
+- Project View query 纳入 Desktop 既有 Relay auto-heal：断线恢复后统一失效重取。
+  订阅沿用 RelayClient 的重连重放；进入或返回 `/view` 时重新确认快照，Community
+  切换则由既有 keyed QueryClient/remount 与 `relayClient.disconnect()` 清理旧查询、
+  订阅、表单和对象选择，不增加 module-level Community cache。
+- Refreshing 时保留上一份已验证内容并说明正在验证新快照；连接断开、订阅重试或后台
+  重取失败时仍保留已验证 revision，但明确标记可能过期。后台刷新错误不再用全屏错误
+  覆盖已有可信内容，也不会把 projection event 直接显示成部分成功状态。
+
+### revision conflict 与草稿
+
+- Create/Edit/Delete 在打开时固定 `baseRevision`；实时刷新只更新旁边的最新可信 View，
+  不会静默替换写入基线。服务端 conflict 后不自动重试 mutation，而是保留表单、自动
+  获取最新完整快照，并说明项目从哪个 revision 变化到哪个 revision。
+- Edit/Delete 会对比目标的旧、新 object revision，区分“目标未变、项目其他对象变化”、
+  “目标本身变化”和“目标已删除”。只有最新可信 project revision 已达到 conflict
+  revision 时，Human 才能显式选择新基线；选择后仍需再次点击 Save/Delete 才会提交。
+  conflict 中关闭弹窗不会静默丢弃输入，放弃草稿是显式动作。
+- 初始化表单提升到 View 页面生命周期保存。若 Agent 或其他成员先完成初始化，页面会
+  切换到最新 Ready View，同时保留未写入的 Profile/Goal 草稿并展示恢复区；由于
+  Initialize 只能执行一次，旧草稿不能覆盖新 View，只能供 Human 检查后通过普通对象
+  编辑选择性应用。Community 切换会随页面边界清除该草稿，避免跨 Community 泄漏。
+
+### 修改来源
+
+- Project Profile、地图卡片、Role 与 Resource 增加最近修改者和时间的轻量提示；
+  Inspector 继续展示完整 `created_by`/`updated_by` 与时间、公钥。
+- actor 首先通过 Buzz profile 解析；本地 managed Agent 或 Relay Agent 即使还没有可用
+  profile，也会使用其已知名称并标为 Agent。无法解析时只显示缩略公钥，不伪造身份。
+
+### 验证
+
+- 新增 Project View live filter、projection burst 合并、刷新失败后恢复以及 Relay
+  auto-heal query 分类的定向测试。
+- Project View Playwright smoke 扩展到 11 项，新增 Agent 名称来源、projection event
+  驱动完整快照刷新、初始化草稿恢复、旧 revision 显式重基线再提交和离线可信快照保留；
+  既有初始化、类型化创建、删除保护与 capability 状态继续覆盖。
+- Desktop typecheck、Biome、文件大小、可缩放文本和公钥展示守卫通过。
+
+### 范围边界
+
+- 本 Slice 不在 TypeScript 中验签或拼接 projection，不增加数据库读取、专用 HTTP
+  endpoint、CLI 子进程、对象增量缓存或第二份权威状态。
+- 完整历史/diff、跨应用重启持久化草稿、批量协同操作和 Web/Mobile 实时客户端仍不属于
+  Client v0；键盘、可访问性、窄窗口与真实 Relay 交替修改的最终验收属于 Client
+  Slice 4。
+
 ## 2026-07-28 — Client Slice 2：初始化与类型化修改
 
 ### Human 写入边界

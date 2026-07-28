@@ -172,10 +172,33 @@ const READY_VIEW = {
   },
 } as RawProjectViewLoadResult;
 
+function readyViewAtRevision(
+  revision: number,
+  options?: { issueTitle?: string; issueObjectRevision?: number },
+) {
+  const next = structuredClone(READY_VIEW) as Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >;
+  next.project_revision = revision;
+  next.updated_at = `2026-07-27T08:0${revision}:00Z`;
+  const nextIssue = next.view.goals[0]?.plans[0]?.stages[0]?.issues[0]?.issue;
+  if (nextIssue) {
+    nextIssue.project_revision = revision;
+    nextIssue.object_revision =
+      options?.issueObjectRevision ?? nextIssue.object_revision;
+    if (options?.issueTitle) nextIssue.data.data.title = options.issueTitle;
+  }
+  return next;
+}
+
 test("View renders the verified canonical map and object inspector", async ({
   page,
 }) => {
-  await installMockBridge(page, { projectView: READY_VIEW });
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    projectView: READY_VIEW,
+  });
   await page.goto("/");
 
   await expect(page.getByTestId("open-projects-view")).toContainText(
@@ -204,6 +227,12 @@ test("View renders the verified canonical map and object inspector", async ({
   );
   await expect(page.getByTestId("project-view-inspector")).toContainText(
     "Verified projection",
+  );
+  await expect(page.getByTestId("project-view-inspector")).toContainText(
+    "Context Agent",
+  );
+  await expect(page.getByTestId("project-view-inspector")).toContainText(
+    "Agent",
   );
 
   await page.getByRole("button", { name: "Close inspector" }).click();
@@ -317,17 +346,32 @@ test("context creation preselects only a legal parent relation", async ({
   });
 });
 
-test("a stale edit preserves the Human draft and is never retried", async ({
+test("a stale edit preserves its draft and requires an explicit new base", async ({
   page,
 }) => {
+  const revisionEight = readyViewAtRevision(8, {
+    issueObjectRevision: 2,
+    issueTitle: "Agent changed the naming issue",
+  });
   await installMockBridge(page, {
     projectView: READY_VIEW,
-    projectViewMutationResult: {
-      status: "conflict",
-      expected_project_revision: 7,
-      current_project_revision: 8,
-      message: "relay returned 409: project revision conflict",
-    },
+    projectViewMutationResults: [
+      {
+        status: "conflict",
+        expected_project_revision: 7,
+        current_project_revision: 8,
+        message: "relay returned 409: project revision conflict",
+      },
+      {
+        status: "applied",
+        event_id: "c".repeat(64),
+        project_revision: 9,
+        object_id: IDS.issue,
+        object_revision: 3,
+        deleted: false,
+      },
+    ],
+    projectViewAfterMutation: readyViewAtRevision(9),
   });
   await page.goto("/");
   await page.getByTestId("open-view").click();
@@ -338,11 +382,20 @@ test("a stale edit preserves the Human draft and is never retried", async ({
   await page.getByRole("button", { name: "Edit" }).click();
   const title = page.getByLabel("Title");
   await title.fill("Projects naming conflict");
+  await page.evaluate((next) => {
+    window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
+  }, revisionEight);
   await page.getByRole("button", { name: "Save changes" }).click();
 
   await expect(page.getByRole("alert")).toContainText("Project changed");
   await expect(title).toHaveValue("Projects naming conflict");
-  const mutations = await page.evaluate(
+  await expect(page.getByRole("alert")).toContainText(
+    "Latest verified snapshot: revision 8",
+  );
+  await expect(page.getByRole("alert")).toContainText(
+    "changed from object revision 1 to 2",
+  );
+  let mutations = await page.evaluate(
     () =>
       (
         window as typeof window & {
@@ -351,6 +404,106 @@ test("a stale edit preserves the Human draft and is never retried", async ({
       ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
   );
   expect(mutations).toHaveLength(1);
+
+  await page.getByRole("button", { name: "Use revision 8 as base" }).click();
+  await expect(title).toHaveValue("Projects naming conflict");
+  await expect(
+    page.getByText(/Draft now uses verified project revision 8/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Save changes" }).click();
+
+  mutations = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: Array<Record<string, unknown>>;
+        }
+      ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations).toHaveLength(2);
+  expect(mutations?.[0]).toMatchObject({ expected_project_revision: 7 });
+  expect(mutations?.[1]).toMatchObject({ expected_project_revision: 8 });
+});
+
+test("projection events invalidate into a new complete verified snapshot", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await expect(page.getByText("Project revision 7")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?.() ?? false,
+      ),
+    )
+    .toBe(true);
+
+  const revisionEight = readyViewAtRevision(8, {
+    issueTitle: "Agent refreshed this issue",
+    issueObjectRevision: 2,
+  });
+  await page.evaluate((next) => {
+    window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
+    window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.();
+  }, revisionEight);
+
+  await expect(page.getByText("Project revision 8")).toBeVisible();
+  await expect(page.getByTestId("project-view-map")).toContainText(
+    "Agent refreshed this issue",
+  );
+});
+
+test("a live initialization preserves the Human foundation draft", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: {
+      status: "uninitialized",
+      relay_pubkey: "b".repeat(64),
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByLabel("Project name").fill("Human draft");
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?.() ?? false,
+      ),
+    )
+    .toBe(true);
+  await page.evaluate((next) => {
+    window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
+    window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.();
+  }, readyViewAtRevision(8));
+
+  const recovery = page.getByTestId("project-view-initialization-draft");
+  await expect(recovery).toContainText("Initialization draft preserved");
+  await recovery.getByText("Review preserved draft").click();
+  await expect(recovery).toContainText("Human draft");
+  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
+});
+
+test("a disconnected View keeps its verified snapshot and marks it stale", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await expect(page.getByText("Project revision 7")).toBeVisible();
+
+  await page.evaluate(() => {
+    window.__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?.("disconnected");
+  });
+
+  await expect(page.getByText("Offline · may be stale")).toBeVisible();
+  await expect(page.getByTestId("project-view-sync-state")).toContainText(
+    "Showing verified project revision 7",
+  );
+  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
 });
 
 test("delete is blocked while an active object still references the target", async ({

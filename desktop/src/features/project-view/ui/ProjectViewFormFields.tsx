@@ -1,4 +1,4 @@
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, RefreshCw } from "lucide-react";
 import * as React from "react";
 
 import { formatProjectViewTerm } from "@/features/project-view/model";
@@ -123,16 +123,31 @@ export function ProjectViewListField({
 }
 
 export function ProjectViewConflictNotice({
+  comparison,
   conflict,
+  latestProjectRevision,
+  onDiscardDraft,
   onReviewLatest,
+  onUseLatestRevision,
+  refreshing = false,
 }: {
+  comparison?: React.ReactNode;
   conflict: Extract<ProjectViewMutationResult, { status: "conflict" }>;
+  latestProjectRevision?: number;
+  onDiscardDraft?: () => void;
   onReviewLatest: () => void;
+  onUseLatestRevision?: () => void;
+  refreshing?: boolean;
 }) {
   const revision =
     conflict.currentProjectRevision === undefined
       ? "a newer revision"
       : `revision ${conflict.currentProjectRevision}`;
+  const latestIsCurrent =
+    latestProjectRevision !== undefined &&
+    latestProjectRevision > conflict.expectedProjectRevision &&
+    (conflict.currentProjectRevision === undefined ||
+      latestProjectRevision >= conflict.currentProjectRevision);
   return (
     <div
       className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3"
@@ -147,15 +162,47 @@ export function ProjectViewConflictNotice({
             but the Project View is now at {revision}. Nothing was written and
             your input is still here.
           </p>
-          <Button
-            className="mt-2"
-            onClick={onReviewLatest}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            Review latest View
-          </Button>
+          {latestProjectRevision !== undefined ? (
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              Latest verified snapshot: revision {latestProjectRevision}.
+            </p>
+          ) : null}
+          {comparison ? <div className="mt-2">{comparison}</div> : null}
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              disabled={refreshing}
+              onClick={onReviewLatest}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              <RefreshCw className={refreshing ? "animate-spin" : undefined} />
+              {refreshing ? "Checking latest…" : "Check latest View"}
+            </Button>
+            {onUseLatestRevision ? (
+              <Button
+                disabled={!latestIsCurrent || refreshing}
+                onClick={onUseLatestRevision}
+                size="sm"
+                type="button"
+              >
+                {latestIsCurrent
+                  ? `Use revision ${latestProjectRevision} as base`
+                  : "Waiting for verified revision"}
+              </Button>
+            ) : null}
+            {onDiscardDraft ? (
+              <Button
+                disabled={refreshing}
+                onClick={onDiscardDraft}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                Discard draft
+              </Button>
+            ) : null}
+          </div>
         </div>
       </div>
     </div>

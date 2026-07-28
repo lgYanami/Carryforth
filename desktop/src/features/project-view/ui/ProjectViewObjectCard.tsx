@@ -8,6 +8,8 @@ import {
   projectViewObjectTitle,
   projectViewObjectTypeLabel,
 } from "@/features/project-view/model";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
 import type { ProjectViewObject } from "@/shared/api/tauriProjectView";
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
@@ -16,9 +18,20 @@ type ProjectViewObjectCardProps = {
   issueReferenceCount?: number;
   object: ProjectViewObject;
   onSelect: (objectId: string) => void;
+  actorProfiles?: UserProfileLookup;
+  currentPubkey?: string;
   selected?: boolean;
   size?: "default" | "compact";
 };
+
+const updatedAtFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+});
+
+function formatUpdatedAt(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? value : updatedAtFormatter.format(date);
+}
 
 function statusVariant(status: string | undefined) {
   if (status === "active" || status === "in_progress" || status === "ready") {
@@ -38,6 +51,8 @@ function statusVariant(status: string | undefined) {
 }
 
 export function ProjectViewObjectCard({
+  actorProfiles,
+  currentPubkey,
   issueReferenceCount = 0,
   object,
   onSelect,
@@ -102,6 +117,17 @@ export function ProjectViewObjectCard({
               {description}
             </p>
           ) : null}
+          <div className="mt-2 flex min-w-0 items-center gap-1 text-2xs text-muted-foreground">
+            <span className="shrink-0">
+              Updated {formatUpdatedAt(object.updatedAt)} by
+            </span>
+            <ProjectViewActor
+              compact
+              currentPubkey={currentPubkey}
+              profiles={actorProfiles}
+              pubkey={object.updatedBy}
+            />
+          </div>
         </div>
       </div>
       {issueReferenceCount > 0 ? (

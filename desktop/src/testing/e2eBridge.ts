@@ -35,6 +35,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_PROJECT_VIEW_META,
   KIND_REPO_ANNOUNCEMENT,
   KIND_REPO_STATE,
   KIND_STREAM_MESSAGE_EDIT,
@@ -1170,6 +1171,13 @@ declare global {
     __BUZZ_E2E_GET_EVENT_CALL_COUNT__?: number;
     /** Typed Project View mutation payloads submitted during the current test. */
     __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: unknown[];
+    /** Replace the next trusted Project View command result. */
+    __BUZZ_E2E_SET_PROJECT_VIEW__?: (result: RawProjectViewLoadResult) => void;
+    /** Emit one Project View projection signal through the mock live socket. */
+    __BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?: (input?: {
+      kind?: number;
+    }) => RelayEvent;
+    __BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?: () => boolean;
   }
 }
 
@@ -9138,6 +9146,29 @@ export function maybeInstallE2eTauriMocks() {
   // get_event defer/release seam — reset counter and queue on each install.
   window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
   window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
+  window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result) => {
+    if (!config.mock) {
+      throw new Error("Mock Project View is unavailable in relay mode.");
+    }
+    config.mock.projectView = structuredClone(result);
+  };
+  window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__ = (input) => {
+    const projectView = config.mock?.projectView;
+    const relayPubkey =
+      projectView?.status === "ready" || projectView?.status === "uninitialized"
+        ? projectView.relay_pubkey
+        : "b".repeat(64);
+    const event = createMockEvent(
+      input?.kind ?? KIND_PROJECT_VIEW_META,
+      "",
+      [],
+      relayPubkey,
+    );
+    emitMockGlobalEvent(event);
+    return event;
+  };
+  window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__ = () =>
+    hasMockLiveSubscription(GLOBAL_MOCK_SUBSCRIPTION, KIND_PROJECT_VIEW_META);
   window.__BUZZ_E2E_DEFER_GET_EVENT__ = null;
   deferredGetEventQueue = [];
   window.__BUZZ_E2E_RELEASE_GET_EVENT__ = () => {
