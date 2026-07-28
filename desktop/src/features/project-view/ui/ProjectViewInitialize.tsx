@@ -404,7 +404,17 @@ export function ProjectViewInitialize({
           </div>
         ) : null}
 
-        <div className="rounded-2xl border border-border/70 bg-card/60 p-5 shadow-xs">
+        <form
+          className="rounded-2xl border border-border/70 bg-card/60 p-5 shadow-xs"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (reviewing) {
+              void submit();
+            } else if (isComplete(profile, goals)) {
+              setReviewing(true);
+            }
+          }}
+        >
           {reviewing ? (
             <Review goals={goals} profile={profile} />
           ) : (
@@ -429,8 +439,7 @@ export function ProjectViewInitialize({
             {reviewing ? (
               <Button
                 disabled={mutation.isPending || Boolean(conflict)}
-                onClick={() => void submit()}
-                type="button"
+                type="submit"
               >
                 {mutation.isPending ? (
                   <LoaderCircle className="animate-spin" />
@@ -440,16 +449,12 @@ export function ProjectViewInitialize({
                 {mutation.isPending ? "Initializing…" : "Initialize View"}
               </Button>
             ) : (
-              <Button
-                disabled={!isComplete(profile, goals)}
-                onClick={() => setReviewing(true)}
-                type="button"
-              >
+              <Button disabled={!isComplete(profile, goals)} type="submit">
                 Review foundation
               </Button>
             )}
           </div>
-        </div>
+        </form>
       </div>
     </main>
   );

@@ -1,5 +1,9 @@
 import { CircleDot, Layers3, Plus } from "lucide-react";
 
+import {
+  nextProjectViewObjectIndex,
+  type ProjectViewNavigationKey,
+} from "@/features/project-view/keyboardNavigation";
 import type { ProjectViewCreateContext } from "@/features/project-view/model";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
@@ -320,9 +324,49 @@ export function ProjectViewMap({
     view.unboundPlans.length > 0 ||
     view.unplannedRequirements.length > 0 ||
     view.unplannedIssues.length > 0;
+  const onMapKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const navigationKeys: ProjectViewNavigationKey[] = [
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      "ArrowUp",
+      "End",
+      "Home",
+    ];
+    if (!navigationKeys.includes(event.key as ProjectViewNavigationKey)) {
+      return;
+    }
+    const current = (event.target as Element).closest<HTMLButtonElement>(
+      "button[data-object-id]",
+    );
+    if (!current || !event.currentTarget.contains(current)) return;
+    const cards = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        "button[data-object-id]:not(:disabled)",
+      ),
+    );
+    const nextIndex = nextProjectViewObjectIndex(
+      cards.indexOf(current),
+      cards.length,
+      event.key as ProjectViewNavigationKey,
+    );
+    if (nextIndex === undefined) return;
+    event.preventDefault();
+    cards[nextIndex]?.focus();
+  };
 
   return (
-    <div className="space-y-6" data-testid="project-view-map">
+    <section
+      aria-keyshortcuts="ArrowDown ArrowLeft ArrowRight ArrowUp Home End"
+      aria-label="Project map"
+      className="space-y-6"
+      data-testid="project-view-map"
+      onKeyDown={onMapKeyDown}
+    >
+      <p className="sr-only">
+        Use the arrow keys to move between project objects. Use Home or End to
+        jump to the first or last object, then press Enter to inspect it.
+      </p>
       <section>
         <div className="mb-3 flex items-center gap-2">
           <Layers3 className="h-4 w-4 text-muted-foreground" />
@@ -426,6 +470,6 @@ export function ProjectViewMap({
           </div>
         </section>
       ) : null}
-    </div>
+    </section>
   );
 }

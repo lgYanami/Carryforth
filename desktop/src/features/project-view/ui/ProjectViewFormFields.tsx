@@ -15,22 +15,43 @@ export function ProjectViewField({
   label,
   required,
 }: {
-  children: React.ReactElement<{ id?: string }>;
+  children: React.ReactElement<{
+    "aria-describedby"?: string;
+    "aria-required"?: boolean;
+    id?: string;
+    required?: boolean;
+  }>;
   description?: string;
   label: string;
   required?: boolean;
 }) {
   const generatedId = React.useId();
   const controlId = children.props.id ?? generatedId;
+  const descriptionId = description ? `${controlId}-description` : undefined;
+  const describedBy = [children.props["aria-describedby"], descriptionId]
+    .filter(Boolean)
+    .join(" ");
   return (
     <label className="block space-y-1.5" htmlFor={controlId}>
       <span className="text-sm font-medium">
         {label}
-        {required ? <span className="ml-1 text-destructive">*</span> : null}
+        {required ? (
+          <span aria-hidden="true" className="ml-1 text-destructive">
+            *
+          </span>
+        ) : null}
       </span>
-      {React.cloneElement(children, { id: controlId })}
+      {React.cloneElement(children, {
+        "aria-describedby": describedBy || undefined,
+        "aria-required": required || undefined,
+        id: controlId,
+        required: required || children.props.required || undefined,
+      })}
       {description ? (
-        <span className="block text-xs leading-relaxed text-muted-foreground">
+        <span
+          className="block text-xs leading-relaxed text-muted-foreground"
+          id={descriptionId}
+        >
           {description}
         </span>
       ) : null}

@@ -6,6 +6,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import * as React from "react";
 
 import {
   formatProjectViewTerm,
@@ -21,8 +22,16 @@ import type {
   ProjectView,
   ProjectViewObject,
 } from "@/shared/api/tauriProjectView";
+import { useIsAuxiliaryPanelOverlay } from "@/shared/hooks/use-mobile";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/shared/ui/sheet";
 
 type ProjectViewInspectorProps = {
   actorProfiles?: UserProfileLookup;
@@ -168,7 +177,7 @@ function RelationLink({
   );
 }
 
-export function ProjectViewInspector({
+function ProjectViewInspectorContent({
   actorProfiles,
   currentPubkey,
   object,
@@ -203,10 +212,7 @@ export function ProjectViewInspector({
   );
 
   return (
-    <aside
-      className="absolute inset-y-0 right-0 z-30 flex w-full max-w-sm shrink-0 flex-col border-l border-border bg-background shadow-xl lg:static lg:w-96 lg:shadow-none"
-      data-testid="project-view-inspector"
-    >
+    <>
       <div className="flex items-start gap-3 border-b border-border/70 p-4">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -326,6 +332,62 @@ export function ProjectViewInspector({
           </Detail>
         </section>
       </div>
+    </>
+  );
+}
+
+export function ProjectViewInspector(props: ProjectViewInspectorProps) {
+  const isOverlay = useIsAuxiliaryPanelOverlay();
+
+  React.useEffect(() => {
+    if (isOverlay) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      event.preventDefault();
+      props.onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [isOverlay, props.onClose]);
+
+  const content = <ProjectViewInspectorContent {...props} />;
+  const title = projectViewObjectTitle(props.object);
+
+  if (isOverlay) {
+    return (
+      <Sheet
+        onOpenChange={(open) => {
+          if (!open) props.onClose();
+        }}
+        open
+      >
+        <SheetContent
+          className="flex w-full! max-w-none! flex-col gap-0 overflow-hidden bg-background p-0 sm:max-w-sm!"
+          data-presentation="drawer"
+          data-testid="project-view-inspector"
+          showCloseButton={false}
+          side="right"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>{title}</SheetTitle>
+            <SheetDescription>
+              Inspect and edit this Project View object.
+            </SheetDescription>
+          </SheetHeader>
+          {content}
+        </SheetContent>
+      </Sheet>
+    );
+  }
+
+  return (
+    <aside
+      aria-label={`${title} inspector`}
+      className="static flex w-96 shrink-0 flex-col border-l border-border bg-background"
+      data-presentation="panel"
+      data-testid="project-view-inspector"
+    >
+      {content}
     </aside>
   );
 }

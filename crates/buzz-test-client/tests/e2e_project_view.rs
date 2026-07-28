@@ -258,6 +258,15 @@ fn verify_projection_events(events: &[Event], relay_pubkey: PublicKey) {
     }
 }
 
+fn projection_has_actor(events: &[Event], actor: PublicKey) -> bool {
+    events.iter().any(|event| {
+        serde_json::from_str::<Value>(&event.content)
+            .ok()
+            .and_then(|content| content["object"]["updated_by"].as_str().map(str::to_owned))
+            .is_some_and(|updated_by| updated_by == actor.to_hex())
+    })
+}
+
 async fn current_meta(
     client: &Client,
     context: &TestContext,
@@ -349,8 +358,10 @@ fn create_goal_with_real_cli(
 async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     let context = setup().await;
     let writer = Keys::generate();
+    let agent = Keys::generate();
     let reader = Keys::generate();
     seed_member(&context, &writer).await;
+    seed_member(&context, &agent).await;
     seed_member(&context, &reader).await;
     let http = Client::new();
 
@@ -418,14 +429,18 @@ async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     verify_projection_events(&revision_one, relay_pubkey);
 
     let create_revision_two = mutation_event(
-        &writer,
+        &agent,
         &create_goal_mutation(1, "Exercise HTTP mutation path"),
     );
-    let (status, response) = submit_http(&http, &context, &writer, &create_revision_two).await;
+    let (status, response) = submit_http(&http, &context, &agent, &create_revision_two).await;
     assert_eq!(status, StatusCode::OK, "HTTP mutation failed: {response}");
     assert_eq!(response["accepted"], true);
     let revision_two = collect_live_revision(&mut subscriber, &sub_id, 2, 2).await;
     verify_projection_events(&revision_two, relay_pubkey);
+    assert!(
+        projection_has_actor(&revision_two, agent.public_key()),
+        "revision two did not preserve the Agent mutation source"
+    );
 
     let meta = current_meta(&http, &context, &writer, relay_pubkey).await;
     assert_eq!(meta["project_revision"], 2);
@@ -504,6 +519,10 @@ async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
     assert!(cli_result["object_id"].as_str().is_some());
     let revision_three = collect_live_revision(&mut subscriber, &sub_id, 3, 2).await;
     verify_projection_events(&revision_three, relay_pubkey);
+    assert!(
+        projection_has_actor(&revision_three, writer.public_key()),
+        "revision three did not return authorship to the Human CLI writer"
+    );
     let meta = current_meta(&http, &context, &writer, relay_pubkey).await;
     assert_eq!(meta["project_revision"], 3);
     assert_eq!(meta["active_object_count"], 4);
@@ -515,8 +534,8 @@ async fn project_view_ws_http_read_write_pagination_and_live_revocation() {
         .await
         .expect("revoke Project View reader");
     let revision_four_event =
-        mutation_event(&writer, &create_goal_mutation(3, "Verify live revocation"));
-    let (status, response) = submit_http(&http, &context, &writer, &revision_four_event).await;
+        mutation_event(&agent, &create_goal_mutation(3, "Verify live revocation"));
+    let (status, response) = submit_http(&http, &context, &agent, &revision_four_event).await;
     assert_eq!(status, StatusCode::OK, "revision four failed: {response}");
     assert!(matches!(
         subscriber.recv_event(Duration::from_millis(750)).await,

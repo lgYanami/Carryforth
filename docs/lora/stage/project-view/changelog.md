@@ -1,5 +1,85 @@
 # Project View 变更记录
 
+## 2026-07-28 — Client Slice 4：验收与体验收口
+
+### 完整状态与失败收口
+
+- 首次可信读取使用与 Profile、统计和地图结构接近的稳定骨架；Loading 不再表现成容易与
+  空 View 混淆的单个转圈，也不会在验证完成前提前渲染项目正文。稀疏但合法的 View 会
+  分别说明空 Goal、Role、Resource 以及未关联/未规划区域，不把“没有内容”和读取失败
+  混为一谈。
+- Desktop TypeScript command 边界增加防御性 DTO 完整性检查，拒绝重复对象、非法
+  revision、active object count 不一致、规范位置与关系不一致、失效 Issue 引用等
+  自相矛盾结果。签名、Relay signer、projection generation 和领域不变量的权威验证仍
+  完全由 native Rust 边界负责；前端不验签、不解释原始 projection，也不建立第二套
+  权威模型。
+- 普通读取失败与完整性失败使用不同界面。完整性失败 fail closed，不展示任何可疑的
+  Profile 或部分地图，只提供重新执行完整可信读取和可展开的安全诊断原因；诊断不包含
+  event content、Resource locator 或数据库内容。
+
+### 键盘、可访问性与窄窗口
+
+- Project Map 支持方向键循环遍历对象卡片，`Home`/`End` 跳到首尾，`Enter` 使用按钮
+  原生语义打开 Inspector；关闭 Inspector 后焦点返回来源对象。地图、加载状态和宽屏
+  Inspector 增加可识别的区域/状态语义，状态与优先级继续同时显示文字而不只依赖颜色。
+- 初始化与对象修改都使用原生 form submit，键盘可从字段直接进入 Review 或提交；
+  required 字段同时具有原生 `required`、`aria-required`、关联 label 与说明文本，
+  Role active switch 具有可读名称。conflict 出现后提交键保持禁用，Human 必须先显式
+  选择最新可信 revision，避免 Enter 绕过冲突确认。
+- 窄于共享辅助面板断点时 Inspector 使用 modal Sheet：遮罩、焦点约束、Escape 关闭和
+  焦点恢复由同一可访问组件负责；宽屏仍保留固定侧栏，并补齐 Escape 关闭。标题、动作和
+  页面间距在窄窗口收缩，文本继续使用现有 rem 尺度。
+
+### Community 隔离与 Human/Agent 验收
+
+- 浏览器测试桥只在 E2E 环境按已 apply 的 Relay URL 提供独立 Project View fixture，
+  从而真实经过 Community apply、keyed remount、React Query key 和 `/view` 导航，
+  验证 A→B→A 不携带对象选择、URL 定位或 Human 草稿，返回 A 后重新读取其可信状态。
+  该接缝不进入发布 bundle，也没有新增生产 module-level cache。
+- Desktop 场景覆盖 Human 保存后 Agent projection 信号触发下一份完整可信快照，并同时
+  检查 revision、正文和修改来源。真实 Relay E2E 扩展为 Human 初始化、Agent 通过
+  HTTP 写入、Human 通过真实 `buzz` CLI 写入、Agent 再写入的交替序列；每一步都重新
+  确认 Relay revision，HTTP/CLI 两次交接后的 object projection 分别验证 Agent/Human
+  actor，最后一次 Agent 写入继续验证成员撤权后 live fan-out fail closed。
+
+### 客户端发布、兼容与运维
+
+- 发布继续采用 server-first：先完成 Relay binary、migration 25、稳定 signer、
+  capability/readiness 与 Community checked enable，再发布包含 View UI 的 Desktop。
+  新 Desktop 连接旧版、未迁移或未开启 Relay 时只显示 Unsupported，不发送未知
+  mutation；现有 `Projects` 与其他 Buzz 功能保持不变。旧 Desktop 会忽略新增入口，
+  Project View 数据与 additive migration 保留在 Relay 侧。
+- signer rotation 继续遵循后端 runbook 的 disable → reproject → checked enable。
+  generation 变化或 Community/连接恢复只触发客户端重新读取完整快照，不增量拼接旧、新
+  signer 的 projection；维护窗口内 capability 不可用时按 Unsupported/重试处理。
+- 若单个客户端出现完整性失败，先重试完整读取并检查 Desktop/Relay 安全日志；若多个
+  客户端持续失败，operator 应停止该 Community 的 Project View 写入/宣告，按既有
+  `docs/project-view-operations.md` 检查 schema、meta/object revision、active count、
+  signer 与 projection generation，再执行 repair/reproject。不得用未验证 JSON、
+  本地缓存或数据库直读绕过失败界面。
+- 客户端 v0 不持久化权威快照，也不跨应用重启保存编辑草稿；回滚 Desktop 不删除 Relay
+  数据，回滚 Relay 继续遵守“应用可回滚、数据库只前进”和已有数据后的 compatible
+  rollback 边界。
+
+### 验证
+
+- 新增 Project View 键盘导航与 native DTO 完整性定向测试，并保留 live filter、刷新
+  合并和断线恢复测试。
+- Project View Playwright smoke 扩展到 19 项，覆盖稳定 Loading、稀疏合法 View、
+  普通可信读取失败、完整性 fail-closed、键盘遍历/焦点恢复、窄窗口焦点约束抽屉、
+  Human/Agent 交替修改和跨 Relay Community 隔离；既有初始化、类型化创建、conflict、
+  实时刷新、删除保护与 capability 状态继续覆盖。
+- 真实 Relay/HTTP/CLI Project View E2E 保留为发布门禁；Desktop typecheck、unit、
+  Biome、文件大小、可缩放文本、公钥展示守卫和 E2E build 共同作为客户端 v0 验收门。
+
+### 范围边界
+
+- Client Slice 4 没有增加对象类型、关系、event kind、HTTP endpoint、数据库读取、
+  TypeScript 签名验证、CLI 子进程调用、跨 Community cache 或 `Projects` 迁移。
+- 至此 Desktop Client v0 的四个 Slice 完成：Human 与 Agent 可以从各自操作面读取和
+  修改同一幅 Relay 权威 Project View；Web、Mobile、完整历史/diff、跨重启草稿和大型
+  View 搜索/虚拟化仍属于后续范围。
+
 ## 2026-07-28 — Client Slice 3：实时协作与冲突恢复
 
 ### 可信实时刷新

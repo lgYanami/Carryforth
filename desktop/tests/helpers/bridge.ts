@@ -138,6 +138,8 @@ type MockBridgeOptions = {
   relaySelf?: string | null;
   /** Verified Project View command result returned to the View screen. */
   projectView?: RawProjectViewLoadResult;
+  /** Community-isolated Project View results keyed by applied Relay URL. */
+  projectViewsByRelayUrl?: Record<string, RawProjectViewLoadResult>;
   projectViewReadDelayMs?: number;
   projectViewReadError?: string;
   projectViewMutationDelayMs?: number;

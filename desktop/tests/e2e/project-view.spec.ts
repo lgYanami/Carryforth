@@ -8,7 +8,20 @@ import type {
 import { installMockBridge } from "../helpers/bridge";
 
 const ACTOR = "a".repeat(64);
+const HUMAN = "deadbeef".repeat(8);
 const NOW = "2026-07-27T08:00:00Z";
+const COMMUNITY_A = {
+  id: "project-view-a",
+  name: "Alpha",
+  relayUrl: "ws://localhost:3000",
+  addedAt: "2026-07-27T00:00:00.000Z",
+};
+const COMMUNITY_B = {
+  id: "project-view-b",
+  name: "Bravo",
+  relayUrl: "ws://localhost:3001",
+  addedAt: "2026-07-27T00:01:00.000Z",
+};
 const IDS = {
   profile: "00000000-0000-4000-8000-000000000001",
   goal: "00000000-0000-4000-8000-000000000002",
@@ -174,7 +187,11 @@ const READY_VIEW = {
 
 function readyViewAtRevision(
   revision: number,
-  options?: { issueTitle?: string; issueObjectRevision?: number },
+  options?: {
+    issueTitle?: string;
+    issueObjectRevision?: number;
+    issueUpdatedBy?: string;
+  },
 ) {
   const next = structuredClone(READY_VIEW) as Extract<
     RawProjectViewLoadResult,
@@ -188,8 +205,64 @@ function readyViewAtRevision(
     nextIssue.object_revision =
       options?.issueObjectRevision ?? nextIssue.object_revision;
     if (options?.issueTitle) nextIssue.data.data.title = options.issueTitle;
+    if (options?.issueUpdatedBy) {
+      nextIssue.updated_by = options.issueUpdatedBy;
+    }
   }
   return next;
+}
+
+function minimalReadyView(name: string, revision = 7) {
+  const minimalProfile = object(
+    "project_profile",
+    "10000000-0000-4000-8000-000000000001",
+    {
+      name,
+      positioning: "A separate Community-scoped project.",
+      purpose: "Prove Project View isolation.",
+      problem: "State must not cross Relay boundaries.",
+      scope: "This Community only.",
+    },
+  );
+  const minimalGoal = object("goal", "10000000-0000-4000-8000-000000000002", {
+    title: `${name} goal`,
+    desired_outcome: "One isolated verified View.",
+    directions: [],
+  });
+  return {
+    status: "ready",
+    relay_pubkey: "c".repeat(64),
+    project_revision: revision,
+    projection_generation: 1,
+    active_object_count: 2,
+    updated_at: NOW,
+    view: {
+      profile: minimalProfile,
+      goals: [{ goal: minimalGoal, plans: [] }],
+      unbound_plans: [],
+      unplanned_requirements: [],
+      unplanned_issues: [],
+      roles: [],
+      resources: [],
+      issue_references_by_target: {},
+    },
+  } as RawProjectViewLoadResult;
+}
+
+async function seedCommunities(
+  page: import("@playwright/test").Page,
+  activeId = COMMUNITY_A.id,
+) {
+  await page.addInitScript(
+    ({ active, communities }) => {
+      window.localStorage.setItem(
+        "buzz-communities",
+        JSON.stringify(communities),
+      );
+      window.localStorage.setItem("buzz-active-community-id", active);
+    },
+    { active: activeId, communities: [COMMUNITY_A, COMMUNITY_B] },
+  );
 }
 
 test("View renders the verified canonical map and object inspector", async ({
@@ -237,6 +310,117 @@ test("View renders the verified canonical map and object inspector", async ({
 
   await page.getByRole("button", { name: "Close inspector" }).click();
   await expect(page).toHaveURL(/\/view$/);
+});
+
+test("View keeps a stable skeleton until the first snapshot is verified", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: READY_VIEW,
+    projectViewReadDelayMs: 500,
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await expect(page.getByTestId("project-view-loading-skeleton")).toBeVisible();
+  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-profile")).toContainText("Lora", {
+    timeout: 5_000,
+  });
+});
+
+test("View rejects a self-contradictory snapshot without rendering partial data", async ({
+  page,
+}) => {
+  const invalid = structuredClone(READY_VIEW) as Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >;
+  invalid.active_object_count = 11;
+  await installMockBridge(page, { projectView: invalid });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await expect(
+    page.getByRole("heading", { name: "View integrity check failed" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+  await page.getByText("Diagnostic detail").click();
+  await expect(page.getByText(/active object count 11/)).toBeVisible();
+});
+
+test("View explains a trusted-read failure without rendering project data", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectViewReadError: "Relay snapshot verification timed out",
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await expect(
+    page.getByRole("heading", { name: "View could not be verified" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Relay snapshot verification timed out"),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
+  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+});
+
+test("an intentionally sparse View explains every major empty section", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: minimalReadyView("Sparse") });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await expect(page.getByTestId("project-view-profile")).toContainText(
+    "Sparse",
+  );
+  await expect(page.getByText("This goal has no bound plan.")).toBeVisible();
+  await expect(page.getByText("No semantic roles declared.")).toBeVisible();
+  await expect(page.getByText("No resources declared.")).toBeVisible();
+});
+
+test("arrow keys traverse the project map and Escape restores card focus", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  const goalCard = page.locator(`button[data-object-id="${IDS.goal}"]`);
+  const planCard = page.locator(`button[data-object-id="${IDS.plan}"]`);
+  const lastCard = page.locator(`button[data-object-id="${IDS.looseIssue}"]`);
+  await goalCard.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(planCard).toBeFocused();
+  await page.keyboard.press("End");
+  await expect(lastCard).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
+  await expect(lastCard).toBeFocused();
+});
+
+test("the Inspector becomes a focus-trapped drawer in a narrow window", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.setViewportSize({ width: 560, height: 720 });
+
+  const issueCard = page.locator(`button[data-object-id="${IDS.issue}"]`);
+  await issueCard.click();
+  const inspector = page.getByTestId("project-view-inspector");
+  await expect(inspector).toHaveAttribute("data-presentation", "drawer");
+  await expect(inspector).toHaveAttribute("role", "dialog");
+  await page.keyboard.press("Escape");
+  await expect(inspector).toHaveCount(0);
+  await expect(issueCard).toBeFocused();
 });
 
 test("Human initializes an uninitialized View as one atomic mutation", async ({
@@ -455,6 +639,61 @@ test("projection events invalidate into a new complete verified snapshot", async
   );
 });
 
+test("Human and Agent changes alternate through one trusted View", async ({
+  page,
+}) => {
+  const humanRevision = readyViewAtRevision(8, {
+    issueObjectRevision: 2,
+    issueTitle: "Human clarified the naming issue",
+    issueUpdatedBy: HUMAN,
+  });
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    projectView: READY_VIEW,
+    projectViewAfterMutation: humanRevision,
+    projectViewMutationResult: {
+      status: "applied",
+      event_id: "c".repeat(64),
+      project_revision: 8,
+      object_id: IDS.issue,
+      object_revision: 2,
+      deleted: false,
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
+    .click();
+  await page.getByRole("button", { name: "Edit" }).click();
+  await page.getByLabel("Title").fill("Human clarified the naming issue");
+  await page.getByRole("button", { name: "Save changes" }).click();
+
+  await expect(page.getByText("Project revision 8")).toBeVisible();
+  await expect(page.getByTestId("project-view-inspector")).toContainText(
+    "Human clarified the naming issue",
+  );
+  await expect(page.getByTestId("project-view-inspector")).toContainText("You");
+
+  const agentRevision = readyViewAtRevision(9, {
+    issueObjectRevision: 3,
+    issueTitle: "Agent incorporated the Human decision",
+    issueUpdatedBy: ACTOR,
+  });
+  await page.evaluate((next) => {
+    window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
+    window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.();
+  }, agentRevision);
+
+  await expect(page.getByText("Project revision 9")).toBeVisible();
+  await expect(page.getByTestId("project-view-inspector")).toContainText(
+    "Agent incorporated the Human decision",
+  );
+  await expect(page.getByTestId("project-view-inspector")).toContainText(
+    "Context Agent",
+  );
+});
+
 test("a live initialization preserves the Human foundation draft", async ({
   page,
 }) => {
@@ -485,6 +724,53 @@ test("a live initialization preserves the Human foundation draft", async ({
   await recovery.getByText("Review preserved draft").click();
   await expect(recovery).toContainText("Human draft");
   await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
+});
+
+test("Community switching does not carry View data, selection, or drafts across Relays", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    {
+      projectViewsByRelayUrl: {
+        [COMMUNITY_A.relayUrl]: {
+          status: "uninitialized",
+          relay_pubkey: "b".repeat(64),
+        },
+        [COMMUNITY_B.relayUrl]: minimalReadyView("Bravo project", 12),
+      },
+    },
+    { skipCommunitySeed: true },
+  );
+  await seedCommunities(page);
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByLabel("Project name").fill("Alpha-only unsaved draft");
+
+  await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+  await expect(
+    page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
+  ).toHaveAttribute("aria-current", "true");
+  await page.getByTestId("open-view").click();
+  await expect(page.getByTestId("project-view-profile")).toContainText(
+    "Bravo project",
+  );
+  await expect(page.getByText("Alpha-only unsaved draft")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
+  await expect(page).not.toHaveURL(/object=/);
+  await page
+    .getByRole("button", { name: "Inspect Project Profile Bravo project" })
+    .click();
+  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+
+  await page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`).click();
+  await page.getByTestId("open-view").click();
+  await expect(
+    page.getByRole("heading", { name: "Initialize this View" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Project name")).toHaveValue("");
+  await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
+  await expect(page).not.toHaveURL(/object=/);
 });
 
 test("a disconnected View keeps its verified snapshot and marks it stale", async ({

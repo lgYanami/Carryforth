@@ -328,6 +328,30 @@ export type ProjectViewLoadResult =
       view: ProjectView;
     };
 
+const PROJECT_VIEW_INTEGRITY_PREFIX = "Project View integrity error:";
+
+/**
+ * A defensive client-boundary failure raised when the native command returns
+ * a self-contradictory Project View DTO. The native layer remains responsible
+ * for signature and projection verification; this guard prevents an
+ * accidentally mixed or malformed result from reaching React.
+ */
+export class ProjectViewIntegrityError extends Error {
+  constructor(reason: string) {
+    super(`${PROJECT_VIEW_INTEGRITY_PREFIX} ${reason}`);
+    this.name = "ProjectViewIntegrityError";
+  }
+}
+
+/** Returns whether an unknown command/query failure represents integrity. */
+export function isProjectViewIntegrityError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    error instanceof ProjectViewIntegrityError ||
+    message.includes(PROJECT_VIEW_INTEGRITY_PREFIX)
+  );
+}
+
 export type ProjectViewWritableObject =
   | { objectType: "project_profile"; data: ProjectProfileData }
   | { objectType: "goal"; data: ProjectGoalData }
@@ -442,9 +466,7 @@ function commonObjectFields<T extends ProjectViewObjectType>(
   raw: RawProjectViewObjectOf<T>,
 ) {
   if (raw.data.object_type !== raw.object_type) {
-    throw new Error(
-      "Project View integrity error: object type does not match its data",
-    );
+    throw new ProjectViewIntegrityError("object type does not match its data");
   }
   return {
     id: raw.id,
@@ -573,6 +595,157 @@ export function normalizeProjectView(raw: RawProjectView): ProjectView {
   };
 }
 
+function assertProjectViewSnapshotIntegrity(
+  view: ProjectView,
+  projectRevision: number,
+  activeObjectCount: number,
+): void {
+  if (!Number.isSafeInteger(projectRevision) || projectRevision < 1) {
+    throw new ProjectViewIntegrityError(
+      "the verified project revision is invalid",
+    );
+  }
+  if (view.goals.length === 0) {
+    throw new ProjectViewIntegrityError(
+      "an initialized View must contain at least one Goal",
+    );
+  }
+
+  const objects = new Map<string, ProjectViewObject>();
+  const register = (object: ProjectViewObject, location: string) => {
+    if (objects.has(object.id)) {
+      throw new ProjectViewIntegrityError(
+        `object ${object.id} appears more than once`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(object.objectRevision) ||
+      object.objectRevision < 1
+    ) {
+      throw new ProjectViewIntegrityError(
+        `${location} has an invalid object revision`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(object.projectRevision) ||
+      object.projectRevision < 1 ||
+      object.projectRevision > projectRevision
+    ) {
+      throw new ProjectViewIntegrityError(
+        `${location} belongs to an impossible project revision`,
+      );
+    }
+    objects.set(object.id, object);
+  };
+  const registerWork = (
+    work: ProjectViewObjectOf<"work">,
+    parent: ProjectViewObjectOf<"requirement"> | ProjectViewObjectOf<"issue">,
+  ) => {
+    register(work, `Work ${work.id}`);
+    if (
+      work.relations.handles?.objectId !== parent.id ||
+      work.relations.handles.objectType !== parent.objectType
+    ) {
+      throw new ProjectViewIntegrityError(
+        `Work ${work.id} is not placed under its Handles target`,
+      );
+    }
+  };
+  const registerRequirement = (
+    entry: ProjectViewRequirement,
+    stageId?: string,
+  ) => {
+    register(entry.requirement, `Requirement ${entry.requirement.id}`);
+    if (entry.requirement.relations.plannedInStageId !== stageId) {
+      throw new ProjectViewIntegrityError(
+        `Requirement ${entry.requirement.id} is in the wrong Stage`,
+      );
+    }
+    for (const work of entry.works) {
+      registerWork(work, entry.requirement);
+    }
+  };
+  const registerIssue = (entry: ProjectViewIssue, stageId?: string) => {
+    register(entry.issue, `Issue ${entry.issue.id}`);
+    if (entry.issue.relations.plannedInStageId !== stageId) {
+      throw new ProjectViewIntegrityError(
+        `Issue ${entry.issue.id} is in the wrong Stage`,
+      );
+    }
+    for (const work of entry.works) {
+      registerWork(work, entry.issue);
+    }
+  };
+  const registerPlan = (entry: ProjectViewPlan, goalId?: string) => {
+    register(entry.plan, `Plan ${entry.plan.id}`);
+    if (entry.plan.relations.underGoalId !== goalId) {
+      throw new ProjectViewIntegrityError(
+        `Plan ${entry.plan.id} is under the wrong Goal`,
+      );
+    }
+    for (const stage of entry.stages) {
+      register(stage.stage, `Stage ${stage.stage.id}`);
+      if (stage.stage.relations.underPlanId !== entry.plan.id) {
+        throw new ProjectViewIntegrityError(
+          `Stage ${stage.stage.id} is under the wrong Plan`,
+        );
+      }
+      for (const requirement of stage.requirements) {
+        registerRequirement(requirement, stage.stage.id);
+      }
+      for (const issue of stage.issues) {
+        registerIssue(issue, stage.stage.id);
+      }
+    }
+  };
+
+  register(view.profile, "Project Profile");
+  for (const { goal, plans } of view.goals) {
+    register(goal, `Goal ${goal.id}`);
+    for (const plan of plans) {
+      registerPlan(plan, goal.id);
+    }
+  }
+  for (const plan of view.unboundPlans) {
+    registerPlan(plan);
+  }
+  for (const requirement of view.unplannedRequirements) {
+    registerRequirement(requirement);
+  }
+  for (const issue of view.unplannedIssues) {
+    registerIssue(issue);
+  }
+  for (const role of view.roles) {
+    register(role, `Role ${role.id}`);
+  }
+  for (const resource of view.resources) {
+    register(resource, `Resource ${resource.id}`);
+  }
+
+  if (objects.size !== activeObjectCount) {
+    throw new ProjectViewIntegrityError(
+      `active object count ${activeObjectCount} does not match the ${objects.size} assembled objects`,
+    );
+  }
+  for (const [targetId, references] of Object.entries(
+    view.issueReferencesByTarget,
+  )) {
+    if (!objects.has(targetId)) {
+      throw new ProjectViewIntegrityError(
+        `issue reference target ${targetId} is not active`,
+      );
+    }
+    for (const reference of references) {
+      const source = objects.get(reference.objectId);
+      if (source?.objectType !== "issue") {
+        throw new ProjectViewIntegrityError(
+          `issue reference source ${reference.objectId} is not an active Issue`,
+        );
+      }
+    }
+  }
+}
+
 export function normalizeProjectViewLoadResult(
   raw: RawProjectViewLoadResult,
 ): ProjectViewLoadResult {
@@ -585,7 +758,13 @@ export function normalizeProjectViewLoadResult(
         status: raw.status,
         relayPubkey: raw.relay_pubkey,
       };
-    case "ready":
+    case "ready": {
+      const view = normalizeProjectView(raw.view);
+      assertProjectViewSnapshotIntegrity(
+        view,
+        raw.project_revision,
+        raw.active_object_count,
+      );
       return {
         status: raw.status,
         relayPubkey: raw.relay_pubkey,
@@ -593,8 +772,9 @@ export function normalizeProjectViewLoadResult(
         projectionGeneration: raw.projection_generation,
         activeObjectCount: raw.active_object_count,
         updatedAt: raw.updated_at,
-        view: normalizeProjectView(raw.view),
+        view,
       };
+    }
   }
 }
 

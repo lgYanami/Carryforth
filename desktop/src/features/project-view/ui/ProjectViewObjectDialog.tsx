@@ -497,6 +497,7 @@ function TextFields({
             </div>
           </div>
           <Switch
+            aria-label="Active role"
             checked={form.active}
             onCheckedChange={(value) => set("active", value)}
           />
@@ -877,104 +878,111 @@ export function ProjectViewObjectDialog({
         className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-2xl"
         data-testid="project-view-object-dialog"
       >
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            {mode === "create" ? (
-              <Plus className="h-4 w-4" />
-            ) : (
-              <Save className="h-4 w-4" />
-            )}
-            {mode === "create"
-              ? "Add to View"
-              : `Edit ${projectViewObjectTypeLabel(objectType)}`}
-          </DialogTitle>
-          <DialogDescription>
-            This revision-checked change will be signed by your current Buzz
-            identity. Base revision: {baseRevision}.
-          </DialogDescription>
-        </DialogHeader>
+        <form
+          className="contents"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              {mode === "create" ? (
+                <Plus className="h-4 w-4" />
+              ) : (
+                <Save className="h-4 w-4" />
+              )}
+              {mode === "create"
+                ? "Add to View"
+                : `Edit ${projectViewObjectTypeLabel(objectType)}`}
+            </DialogTitle>
+            <DialogDescription>
+              This revision-checked change will be signed by your current Buzz
+              identity. Base revision: {baseRevision}.
+            </DialogDescription>
+          </DialogHeader>
 
-        <ProjectViewObjectConflict
-          baseObject={object}
-          conflict={conflict}
-          latestObjects={objects}
-          latestProjectRevision={projectRevision}
-          mode={mode}
-          onDiscardDraft={discardDraft}
-          onReviewLatest={() => void reviewLatest()}
-          onUseLatestRevision={useLatestRevision}
-          rebasedRevision={rebasedRevision}
-          reviewingLatest={reviewingLatest}
-        />
-
-        {mode === "create" && !initialType ? (
-          <ProjectViewField label="Object type" required>
-            <select
-              className={PROJECT_VIEW_SELECT_CLASS}
-              onChange={(event) =>
-                changeType(event.target.value as CreatableObjectType)
-              }
-              value={objectType}
-            >
-              {CREATE_TYPES.map((type) => (
-                <option key={type} value={type}>
-                  {projectViewObjectTypeLabel(type)}
-                </option>
-              ))}
-            </select>
-          </ProjectViewField>
-        ) : null}
-
-        <div className="space-y-4">
-          <TextFields form={form} set={set} type={objectType} />
-          <LifecycleFields form={form} set={set} type={objectType} />
-          <RelationFields
-            editingId={object?.id}
-            form={form}
-            objects={objects}
-            paths={paths}
-            set={set}
-            type={objectType}
+          <ProjectViewObjectConflict
+            baseObject={object}
+            conflict={conflict}
+            latestObjects={objects}
+            latestProjectRevision={projectRevision}
+            mode={mode}
+            onDiscardDraft={discardDraft}
+            onReviewLatest={() => void reviewLatest()}
+            onUseLatestRevision={useLatestRevision}
+            rebasedRevision={rebasedRevision}
+            reviewingLatest={reviewingLatest}
           />
-        </div>
 
-        {error ? (
-          <div
-            className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-            role="alert"
-          >
-            {error}
+          {mode === "create" && !initialType ? (
+            <ProjectViewField label="Object type" required>
+              <select
+                className={PROJECT_VIEW_SELECT_CLASS}
+                onChange={(event) =>
+                  changeType(event.target.value as CreatableObjectType)
+                }
+                value={objectType}
+              >
+                {CREATE_TYPES.map((type) => (
+                  <option key={type} value={type}>
+                    {projectViewObjectTypeLabel(type)}
+                  </option>
+                ))}
+              </select>
+            </ProjectViewField>
+          ) : null}
+
+          <div className="space-y-4">
+            <TextFields form={form} set={set} type={objectType} />
+            <LifecycleFields form={form} set={set} type={objectType} />
+            <RelationFields
+              editingId={object?.id}
+              form={form}
+              objects={objects}
+              paths={paths}
+              set={set}
+              type={objectType}
+            />
           </div>
-        ) : null}
 
-        <DialogFooter>
-          <Button
-            disabled={mutation.isPending}
-            onClick={conflict ? discardDraft : () => onOpenChange(false)}
-            type="button"
-            variant="outline"
-          >
-            {conflict ? "Discard draft" : "Cancel"}
-          </Button>
-          <Button
-            disabled={mutation.isPending}
-            onClick={() => void submit()}
-            type="button"
-          >
-            {mutation.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : mode === "create" ? (
-              <Plus />
-            ) : (
-              <Save />
-            )}
-            {mutation.isPending
-              ? "Submitting…"
-              : mode === "create"
-                ? `Create ${projectViewObjectTypeLabel(objectType)}`
-                : "Save changes"}
-          </Button>
-        </DialogFooter>
+          {error ? (
+            <div
+              className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              role="alert"
+            >
+              {error}
+            </div>
+          ) : null}
+
+          <DialogFooter>
+            <Button
+              disabled={mutation.isPending}
+              onClick={conflict ? discardDraft : () => onOpenChange(false)}
+              type="button"
+              variant="outline"
+            >
+              {conflict ? "Discard draft" : "Cancel"}
+            </Button>
+            <Button
+              disabled={mutation.isPending || Boolean(conflict)}
+              type="submit"
+            >
+              {mutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : mode === "create" ? (
+                <Plus />
+              ) : (
+                <Save />
+              )}
+              {mutation.isPending
+                ? "Submitting…"
+                : mode === "create"
+                  ? `Create ${projectViewObjectTypeLabel(objectType)}`
+                  : "Save changes"}
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );

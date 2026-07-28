@@ -42,9 +42,11 @@ import {
 import {
   ProjectViewErrorState,
   ProjectViewForbiddenState,
+  ProjectViewIntegrityFailureState,
   ProjectViewLoadingState,
   ProjectViewUnsupportedState,
 } from "@/features/project-view/ui/ProjectViewStates";
+import { isProjectViewIntegrityError } from "@/shared/api/tauriProjectView";
 import type {
   ProjectView,
   ProjectViewLoadResult,
@@ -110,7 +112,9 @@ function ProjectProfile({
       data-testid="project-view-profile"
     >
       <button
+        aria-label={`Inspect Project Profile ${profile.data.name}`}
         className="w-full p-5 text-left transition-colors hover:bg-muted/20 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        data-object-id={profile.id}
         onClick={() => onSelectObject(profile.id)}
         type="button"
       >
@@ -427,6 +431,11 @@ function ReadyProjectView({
   const selectedObject = selectedObjectId
     ? objectsById.get(selectedObjectId)
     : undefined;
+  React.useEffect(() => {
+    if (selectedObjectId && !selectedObject) {
+      onSelectObject(undefined);
+    }
+  }, [onSelectObject, selectedObject, selectedObjectId]);
   const focus = React.useMemo(() => countProjectViewFocus(view), [view]);
   const selectObject = React.useCallback(
     (objectId: string) => onSelectObject(objectId),
@@ -439,11 +448,23 @@ function ReadyProjectView({
     ) => setEditor({ mode: "create", initialType: objectType, context }),
     [],
   );
+  const closeInspector = React.useCallback(() => {
+    const closingObjectId = selectedObject?.id;
+    onSelectObject(undefined);
+    if (!closingObjectId) return;
+    window.requestAnimationFrame(() => {
+      document
+        .querySelector<HTMLButtonElement>(
+          `button[data-object-id="${closingObjectId}"]`,
+        )
+        ?.focus();
+    });
+  }, [onSelectObject, selectedObject?.id]);
 
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
       <main className="min-w-0 flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-7xl space-y-6 p-5 pb-12">
+        <div className="mx-auto max-w-7xl space-y-6 p-3 pb-12 sm:p-5">
           {initializationDraft ? (
             <InitializationDraftRecovery
               conflict={initializationConflict}
@@ -557,7 +578,7 @@ function ReadyProjectView({
           currentPubkey={currentPubkey}
           object={selectedObject}
           objectsById={objectsById}
-          onClose={() => onSelectObject(undefined)}
+          onClose={closeInspector}
           onDelete={setDeleteTarget}
           onEdit={(object) => setEditor({ mode: "edit", object })}
           onSelectObject={selectObject}
@@ -647,25 +668,32 @@ export function ProjectViewScreen({
           : liveStatus === "retrying"
             ? `Showing verified project revision ${verifiedRevision} while the live update subscription reconnects.`
             : `Keeping verified project revision ${verifiedRevision} visible while a new complete snapshot is verified.`;
+  const fatalError = query.isError && !query.data ? query.error : undefined;
+  const fatalErrorMessage =
+    fatalError instanceof Error
+      ? fatalError.message
+      : "The Relay returned an unexpected Project View response.";
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <TopChromeInsetHeader flush>
         <header
-          className="flex h-12 items-center gap-3 px-5"
+          className="flex h-12 items-center gap-2 px-3 sm:gap-3 sm:px-5"
           data-tauri-drag-region
         >
           <MapIcon className="h-4 w-4 text-muted-foreground" />
           <div className="min-w-0 flex-1">
             <div className="text-sm font-semibold">View</div>
-            <div className="text-2xs text-muted-foreground">
+            <div className="hidden text-2xs text-muted-foreground sm:block">
               Community project context
             </div>
           </div>
           {!degraded &&
           (query.data?.status === "ready" ||
             query.data?.status === "uninitialized") ? (
-            <Badge variant="outline">Editable</Badge>
+            <Badge className="hidden sm:inline-flex" variant="outline">
+              Editable
+            </Badge>
           ) : null}
           {query.data?.status === "ready" ? (
             <Badge variant="success">
@@ -694,13 +722,16 @@ export function ProjectViewScreen({
       </TopChromeInsetHeader>
 
       {query.isPending ? <ProjectViewLoadingState /> : null}
-      {query.isError && !query.data ? (
+      {fatalError && isProjectViewIntegrityError(fatalError) ? (
+        <ProjectViewIntegrityFailureState
+          diagnostic={fatalErrorMessage}
+          onRetry={() => void query.refetch()}
+          retrying={query.isFetching}
+        />
+      ) : null}
+      {fatalError && !isProjectViewIntegrityError(fatalError) ? (
         <ProjectViewErrorState
-          message={
-            query.error instanceof Error
-              ? query.error.message
-              : "The Relay returned an unexpected Project View response."
-          }
+          message={fatalErrorMessage}
           onRetry={() => void query.refetch()}
           retrying={query.isFetching}
         />
