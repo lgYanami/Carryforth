@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::num::NonZeroI64;
 
+mod project_object;
 mod role_continuity;
 
+pub use project_object::ProjectObjectCommand;
 pub use role_continuity::{
     AssignmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, MemberGovernance,
     ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal, RoleCommand,

@@ -15,9 +15,13 @@ use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::ChangeSource;
 use buzz_project_view::v2::{
     AssignmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, MemberGovernance,
-    ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal, RoleCommand,
-    RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityState,
-    RoleDefinition, RoleHandoff, RoleLevel, RoleSlot,
+    ProjectObjectCommand, ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal,
+    RoleCommand, RoleContinuityChange, RoleContinuityEntity, RoleContinuityError,
+    RoleContinuityState, RoleDefinition, RoleHandoff, RoleLevel, RoleSlot,
+};
+use buzz_project_view::{
+    DomainError, MutationOutcome, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
+    ProjectViewObjectType, ProjectViewState,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -40,6 +44,9 @@ pub enum ProjectViewV2WriteError {
     /// Pure v2 state machine rejected the command.
     #[error(transparent)]
     Domain(#[from] RoleContinuityError),
+    /// Shared ordinary-object reducer rejected a schema-v2 command.
+    #[error(transparent)]
+    ObjectDomain(#[from] DomainError),
     /// Community is not an initialized, enabled v2 Project View.
     #[error("Project View v2 is unavailable for community {community_id}")]
     Unavailable {
@@ -125,6 +132,49 @@ pub struct PreparedV2RoleChange {
     pub receipt_result: Value,
 }
 
+/// One changed head produced by an ordinary-object command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedV2ProjectObjectHead {
+    /// An ordinary active object or tombstone.
+    Object(ProjectViewEntry),
+    /// An active Role carrying its v2 governance level.
+    Role(RoleDefinition),
+}
+
+impl PreparedV2ProjectObjectHead {
+    /// Stable canonical object ID whose projection pointer will be replaced.
+    #[must_use]
+    pub const fn object_id(&self) -> Uuid {
+        match self {
+            Self::Object(entry) => entry.id(),
+            Self::Role(role) => role.role_id,
+        }
+    }
+}
+
+/// Prepared state returned to the Relay for signing an ordinary-object change.
+#[derive(Debug, Clone)]
+pub struct PreparedV2ProjectObjectChange {
+    /// Community/Project identity.
+    pub community_id: CommunityId,
+    /// New project revision.
+    pub project_revision: u64,
+    /// Existing projection generation.
+    pub projection_generation: u64,
+    /// Expected stable Relay signer.
+    pub projection_pubkey: PublicKey,
+    /// Relay canonical change time.
+    pub canonical_time: DateTime<Utc>,
+    /// Changed object/entity heads.
+    pub heads: Vec<PreparedV2ProjectObjectHead>,
+    /// Counts after the staged change.
+    pub counts: V2CanonicalCounts,
+    /// Existing exact NIP-43 snapshot pointer.
+    pub membership_snapshot_event_id: EventId,
+    /// Stable receipt response.
+    pub receipt_result: Value,
+}
+
 impl PreparedV2RoleChange {
     /// Return whether the transaction must publish a replacement membership
     /// snapshot.
@@ -157,6 +207,17 @@ pub struct PreparedV2RoleCommit {
     pub meta_projection: Event,
     /// New NIP-43 snapshot when canonical membership changed.
     pub membership_projection: Option<Event>,
+}
+
+/// Relay-signed material completing a staged ordinary-object change.
+#[derive(Debug, Clone)]
+pub struct PreparedV2ProjectObjectCommit {
+    /// Original accepted member command.
+    pub command_event: Event,
+    /// One signed head per changed canonical object.
+    pub object_projections: Vec<crate::project_view::PreparedObjectProjection>,
+    /// Signed kind `40904` metadata head.
+    pub meta_projection: Event,
 }
 
 /// Result of committing a new v2 role change.
@@ -216,11 +277,21 @@ pub enum ProjectViewV2PrepareOutcome {
     Prepared(PreparedV2RoleChange),
 }
 
+/// Ordinary-object preparation may discover an accepted event after fencing.
+#[derive(Debug, Clone)]
+pub enum ProjectViewV2ProjectObjectPrepareOutcome {
+    /// Existing receipt; no revision was allocated.
+    Replayed(ProjectViewV2Receipt),
+    /// New change staged inside the still-open transaction.
+    Prepared(PreparedV2ProjectObjectChange),
+}
+
 /// Caller-owned v2 write transaction holding the Community Project lock.
 pub struct ProjectViewV2WriteTx {
     tx: Transaction<'static, Postgres>,
     community_id: CommunityId,
     basis: Option<V2PreparedBasis>,
+    object_basis: Option<V2PreparedProjectObjectBasis>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +302,19 @@ struct V2PreparedBasis {
     preparation: PreparedV2RoleChange,
     old_meta_projection_id: [u8; 32],
     old_projection_ids: BTreeMap<(RoleContinuityEntity, Uuid), [u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+struct V2PreparedProjectObjectBasis {
+    command: ProjectObjectCommand,
+    command_event_id: [u8; 32],
+    actor: PublicKey,
+    preparation: PreparedV2ProjectObjectChange,
+    next_state: ProjectViewState,
+    outcome: MutationOutcome,
+    role_levels: BTreeMap<Uuid, RoleLevel>,
+    old_meta_projection_id: [u8; 32],
+    old_projection_ids: BTreeMap<Uuid, [u8; 32]>,
 }
 
 impl std::fmt::Debug for ProjectViewV2WriteTx {
@@ -1154,6 +1238,7 @@ impl Db {
             tx,
             community_id,
             basis: None,
+            object_basis: None,
         })
     }
 }
@@ -1172,7 +1257,7 @@ impl ProjectViewV2WriteTx {
         command_event: &Event,
         command: &RoleCommand,
     ) -> ProjectViewV2WriteResult<ProjectViewV2PrepareOutcome> {
-        if self.basis.is_some() {
+        if self.basis.is_some() || self.object_basis.is_some() {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "this transaction already has a prepared v2 change".to_owned(),
             ));
@@ -1271,6 +1356,325 @@ impl ProjectViewV2WriteTx {
             old_projection_ids,
         });
         Ok(ProjectViewV2PrepareOutcome::Prepared(preparation))
+    }
+
+    /// Validate actor fencing and stage one ordinary Project View object
+    /// transition under the same v2 revision and Community lock.
+    pub async fn prepare_project_object_command(
+        &mut self,
+        command_event: &Event,
+        command: &ProjectObjectCommand,
+    ) -> ProjectViewV2WriteResult<ProjectViewV2ProjectObjectPrepareOutcome> {
+        if self.basis.is_some() || self.object_basis.is_some() {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "this transaction already has a prepared v2 change".to_owned(),
+            ));
+        }
+        if command_event.kind.as_u16() as u32 != KIND_PROJECT_VIEW_MUTATION
+            || ProjectObjectCommand::from_json(&command_event.content)? != *command
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "command event does not carry the supplied typed v2 object command".to_owned(),
+            ));
+        }
+
+        let loaded = load_v2_project_object_state(&mut self.tx, self.community_id).await?;
+        validate_project_object_actor_fence(
+            &mut self.tx,
+            self.community_id,
+            command_event.pubkey,
+            command.acting_assignment_id,
+        )
+        .await?;
+        if let Some(receipt) =
+            find_receipt(&mut self.tx, self.community_id, command_event.id.as_bytes()).await?
+        {
+            return Ok(ProjectViewV2ProjectObjectPrepareOutcome::Replayed(receipt));
+        }
+
+        let mutation = command.as_reducer_mutation();
+        let (next_state, outcome) =
+            loaded
+                .state
+                .reduce(&mutation, command_event.pubkey, loaded.canonical_time)?;
+        reject_assigned_role_deactivation(
+            &mut self.tx,
+            self.community_id,
+            &outcome.changed_entries,
+        )
+        .await?;
+
+        let mut role_levels = loaded.role_levels;
+        for entry in &outcome.changed_entries {
+            if entry.object_type() == ProjectViewObjectType::Role {
+                role_levels.entry(entry.id()).or_insert(RoleLevel::Member);
+            }
+        }
+        let heads = outcome
+            .changed_entries
+            .iter()
+            .map(|entry| match entry {
+                ProjectViewEntry::Active(object)
+                    if object.object_type == ProjectViewObjectType::Role =>
+                {
+                    let level = role_levels.get(&object.id).copied().ok_or_else(|| {
+                        ProjectViewV2WriteError::InvalidCommit(
+                            "active v2 Role has no governance level".to_owned(),
+                        )
+                    })?;
+                    role_definition_from_object(object, level)
+                        .map(PreparedV2ProjectObjectHead::Role)
+                }
+                _ => Ok(PreparedV2ProjectObjectHead::Object(entry.clone())),
+            })
+            .collect::<ProjectViewV2WriteResult<Vec<_>>>()?;
+
+        let changed_ids = outcome
+            .changed_entries
+            .iter()
+            .map(ProjectViewEntry::id)
+            .collect::<Vec<_>>();
+        let old_rows = sqlx::query(
+            "SELECT object_id, projection_event_id \
+             FROM project_view_objects \
+             WHERE community_id = $1 AND object_id = ANY($2) FOR UPDATE",
+        )
+        .bind(self.community_id.as_uuid())
+        .bind(&changed_ids)
+        .fetch_all(&mut *self.tx)
+        .await?;
+        let old_projection_ids = old_rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<Uuid, _>("object_id")?,
+                    bytes32(
+                        row.try_get("projection_event_id")?,
+                        "object.projection_event_id",
+                    )?,
+                ))
+            })
+            .collect::<ProjectViewV2WriteResult<BTreeMap<_, _>>>()?;
+
+        let receipt_result =
+            project_object_receipt(&outcome.changed_entries, outcome.project_revision);
+        insert_project_object_change(
+            &mut self.tx,
+            self.community_id,
+            command_event,
+            command,
+            outcome.project_revision,
+            loaded.canonical_time,
+            &receipt_result,
+        )
+        .await?;
+        let mut counts = load_counts(&mut self.tx, self.community_id).await?;
+        counts.active_objects =
+            u32::try_from(next_state.active_objects().count()).map_err(|_| {
+                ProjectViewV2WriteError::InvalidCommit(
+                    "active Project View object count exceeds u32".to_owned(),
+                )
+            })?;
+        let membership_snapshot_event_id =
+            loaded.membership_snapshot_event_id.ok_or_else(|| {
+                ProjectViewV2WriteError::InvalidCommit(
+                    "v2 state has no membership snapshot pointer".to_owned(),
+                )
+            })?;
+        let preparation = PreparedV2ProjectObjectChange {
+            community_id: self.community_id,
+            project_revision: outcome.project_revision,
+            projection_generation: loaded.projection_generation,
+            projection_pubkey: loaded.projection_pubkey,
+            canonical_time: loaded.canonical_time,
+            heads,
+            counts,
+            membership_snapshot_event_id,
+            receipt_result,
+        };
+        self.object_basis = Some(V2PreparedProjectObjectBasis {
+            command: command.clone(),
+            command_event_id: command_event.id.to_bytes(),
+            actor: command_event.pubkey,
+            preparation: preparation.clone(),
+            next_state,
+            outcome,
+            role_levels,
+            old_meta_projection_id: loaded.meta_projection_event_id,
+            old_projection_ids,
+        });
+        Ok(ProjectViewV2ProjectObjectPrepareOutcome::Prepared(
+            preparation,
+        ))
+    }
+
+    /// Commit a staged ordinary-object change and every signed v2 head.
+    pub async fn commit_project_object_command(
+        mut self,
+        commit: PreparedV2ProjectObjectCommit,
+    ) -> ProjectViewV2WriteResult<ProjectViewV2CommitOutcome> {
+        let basis = self.object_basis.take().ok_or_else(|| {
+            ProjectViewV2WriteError::InvalidCommit(
+                "commit requires prepare_project_object_command on the same transaction".to_owned(),
+            )
+        })?;
+        validate_project_object_commit_bundle(&basis, &commit)?;
+
+        let (_, command_inserted) = crate::event::insert_event_in_tx(
+            &mut self.tx,
+            self.community_id,
+            &commit.command_event,
+            None,
+        )
+        .await?;
+        if !command_inserted {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "command event exists without its v2 receipt".to_owned(),
+            ));
+        }
+
+        for old_event_id in basis.old_projection_ids.values() {
+            if !crate::event::retire_projection_head_in_tx(
+                &mut self.tx,
+                self.community_id,
+                old_event_id,
+                KIND_PROJECT_VIEW_OBJECT,
+            )
+            .await?
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "stored v2 object projection pointer is not live".to_owned(),
+                ));
+            }
+        }
+        if !crate::event::retire_projection_head_in_tx(
+            &mut self.tx,
+            self.community_id,
+            &basis.old_meta_projection_id,
+            KIND_PROJECT_VIEW_META,
+        )
+        .await?
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "stored v2 metadata pointer is not live".to_owned(),
+            ));
+        }
+
+        let projections = commit
+            .object_projections
+            .iter()
+            .map(|projection| (projection.object_id(), projection.event()))
+            .collect::<BTreeMap<_, _>>();
+        let mut events = vec![commit.command_event.clone()];
+        for entry in &basis.outcome.changed_entries {
+            let projection = projections.get(&entry.id()).ok_or_else(|| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "missing signed head for changed object {}",
+                    entry.id()
+                ))
+            })?;
+            let role_level = basis
+                .role_levels
+                .get(&entry.id())
+                .map(|level| level.as_str());
+            crate::project_view::write_project_view_entry(
+                &mut self.tx,
+                self.community_id,
+                basis.command_event_id.as_slice(),
+                projection.id.as_bytes(),
+                entry,
+                2,
+                role_level,
+            )
+            .await
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "persist schema-v2 Project object: {error}"
+                ))
+            })?;
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut self.tx, self.community_id, projection, None)
+                    .await?;
+            if !inserted {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "v2 object projection {} already exists",
+                    entry.id()
+                )));
+            }
+            events.push((*projection).clone());
+        }
+
+        let (_, meta_inserted) = crate::event::insert_event_in_tx(
+            &mut self.tx,
+            self.community_id,
+            &commit.meta_projection,
+            None,
+        )
+        .await?;
+        if !meta_inserted {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "v2 metadata projection already exists".to_owned(),
+            ));
+        }
+        let actor_bytes = basis.actor.to_bytes();
+        let result = sqlx::query(
+            "UPDATE project_view_state SET \
+                 project_revision = $2, updated_at = $3, last_event_id = $4, \
+                 last_actor_pubkey = $5, meta_projection_event_id = $6, \
+                 schema_version = 2, last_change_id = $4, \
+                 last_source_event_id = $4 \
+             WHERE community_id = $1 AND project_revision = $7 \
+               AND schema_version = 2",
+        )
+        .bind(self.community_id.as_uuid())
+        .bind(revision_i64(
+            basis.preparation.project_revision,
+            "project_revision",
+        )?)
+        .bind(basis.preparation.canonical_time)
+        .bind(basis.command_event_id.as_slice())
+        .bind(actor_bytes.as_slice())
+        .bind(commit.meta_projection.id.as_bytes().as_slice())
+        .bind(revision_i64(
+            basis.command.expected_project_revision,
+            "expected_project_revision",
+        )?)
+        .execute(&mut *self.tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(ProjectViewV2WriteError::ObjectDomain(
+                DomainError::RevisionConflict {
+                    expected: basis.command.expected_project_revision,
+                    actual: basis.preparation.project_revision.saturating_sub(1),
+                },
+            ));
+        }
+        let active_count: i32 = sqlx::query_scalar(
+            "SELECT active_object_count FROM project_view_state WHERE community_id = $1",
+        )
+        .bind(self.community_id.as_uuid())
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if u32::try_from(active_count).ok() != Some(basis.preparation.counts.active_objects) {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "active-object count differs from the prepared v2 state".to_owned(),
+            ));
+        }
+
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        events.push(commit.meta_projection);
+        let receipt = ProjectViewV2Receipt {
+            change_id: basis.command_event_id,
+            project_revision: basis.preparation.project_revision,
+            actor_pubkey: basis.actor,
+            operation: basis.command.operation().to_owned(),
+            result: basis.preparation.receipt_result,
+            accepted_at: basis.preparation.canonical_time,
+        };
+        Ok(ProjectViewV2CommitOutcome { receipt, events })
     }
 
     /// Commit a staged canonical change and every signed projection.
@@ -1707,6 +2111,209 @@ async fn load_v2_state(
     })
 }
 
+#[derive(Debug)]
+struct LoadedV2ProjectObjectState {
+    state: ProjectViewState,
+    canonical_time: DateTime<Utc>,
+    projection_generation: u64,
+    projection_pubkey: PublicKey,
+    meta_projection_event_id: [u8; 32],
+    membership_snapshot_event_id: Option<EventId>,
+    role_levels: BTreeMap<Uuid, RoleLevel>,
+}
+
+async fn load_v2_project_object_state(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+) -> ProjectViewV2WriteResult<LoadedV2ProjectObjectState> {
+    let continuity = load_v2_state(tx, community_id).await?;
+    let state_times = sqlx::query(
+        "SELECT initialized_at, updated_at \
+         FROM project_view_state \
+         WHERE community_id = $1 AND schema_version = 2",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await?;
+    let initialized_at: DateTime<Utc> = state_times.try_get("initialized_at")?;
+    let updated_at: DateTime<Utc> = state_times.try_get("updated_at")?;
+    let rows = sqlx::query(
+        "SELECT object_id, object_type, object_revision, project_revision, body, \
+                under_goal_id, under_plan_id, planned_in_stage_id, \
+                about_object_id, about_object_type, handles_object_id, \
+                handles_object_type, created_at, updated_at, created_by, \
+                updated_by, deleted_at \
+         FROM project_view_objects \
+         WHERE community_id = $1 ORDER BY object_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            crate::project_view::entry_from_row(row).map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "load schema-v2 Project object: {error}"
+                ))
+            })
+        })
+        .collect::<ProjectViewV2WriteResult<Vec<_>>>()?;
+    let state = ProjectViewState::from_snapshot(
+        community_id,
+        continuity.state.project_revision(),
+        Some(initialized_at),
+        Some(updated_at),
+        entries,
+    )?;
+    let role_rows = sqlx::query(
+        "SELECT object_id, role_level \
+         FROM project_view_objects \
+         WHERE community_id = $1 AND object_type = 'role'",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    let role_levels = role_rows
+        .into_iter()
+        .map(|row| {
+            let role_id: Uuid = row.try_get("object_id")?;
+            let level: String = row.try_get("role_level")?;
+            Ok((role_id, parse_role_level(&level)?))
+        })
+        .collect::<ProjectViewV2WriteResult<BTreeMap<_, _>>>()?;
+    Ok(LoadedV2ProjectObjectState {
+        state,
+        canonical_time: continuity.canonical_time,
+        projection_generation: continuity.projection_generation,
+        projection_pubkey: continuity.projection_pubkey,
+        meta_projection_event_id: continuity.meta_projection_event_id,
+        membership_snapshot_event_id: continuity.membership_snapshot_event_id,
+        role_levels,
+    })
+}
+
+async fn validate_project_object_actor_fence(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    actor: PublicKey,
+    acting_assignment_id: Option<Uuid>,
+) -> ProjectViewV2WriteResult<()> {
+    let actor_bytes = actor.to_bytes();
+    let managed: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM users \
+             WHERE community_id = $1 AND pubkey = $2 \
+               AND agent_owner_pubkey IS NOT NULL \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(actor_bytes.as_slice())
+    .fetch_one(&mut **tx)
+    .await?;
+    if managed && acting_assignment_id.is_none() {
+        return Err(ProjectViewV2WriteError::Domain(
+            RoleContinuityError::ActingAssignmentRequired,
+        ));
+    }
+    let Some(assignment_id) = acting_assignment_id else {
+        return Ok(());
+    };
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM project_role_assignments \
+             WHERE community_id = $1 AND assignment_id = $2 \
+               AND member_pubkey = $3 AND ended_at IS NULL \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(assignment_id)
+    .bind(actor.to_hex())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !valid {
+        return Err(ProjectViewV2WriteError::Domain(
+            RoleContinuityError::ActingAssignmentInvalid,
+        ));
+    }
+    Ok(())
+}
+
+async fn reject_assigned_role_deactivation(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    entries: &[ProjectViewEntry],
+) -> ProjectViewV2WriteResult<()> {
+    let role_ids = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ProjectViewEntry::Active(object)
+                if matches!(
+                    &object.data,
+                    ProjectViewObjectData::Role(role) if !role.active
+                ) =>
+            {
+                Some(object.id)
+            }
+            ProjectViewEntry::Tombstone(tombstone)
+                if tombstone.object_type == ProjectViewObjectType::Role =>
+            {
+                Some(tombstone.id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if role_ids.is_empty() {
+        return Ok(());
+    }
+    let assigned_role: Option<Uuid> = sqlx::query_scalar(
+        "SELECT role_id FROM project_role_assignments \
+         WHERE community_id = $1 AND role_id = ANY($2) AND ended_at IS NULL \
+         ORDER BY role_id LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(&role_ids)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(role_id) = assigned_role {
+        return Err(ProjectViewV2WriteError::ObjectDomain(
+            DomainError::InvalidField {
+                field: "active",
+                reason: format!(
+                    "Role {role_id} has an active Assignment; end the Assignment before deactivating or deleting the Role"
+                ),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn role_definition_from_object(
+    object: &ProjectViewObject,
+    level: RoleLevel,
+) -> ProjectViewV2WriteResult<RoleDefinition> {
+    let ProjectViewObjectData::Role(role) = &object.data else {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "Role head was prepared from a non-Role object".to_owned(),
+        ));
+    };
+    Ok(RoleDefinition {
+        role_id: object.id,
+        name: role.name.clone(),
+        purpose: role.purpose.clone(),
+        responsibilities: role.responsibilities.clone(),
+        boundaries: role.boundaries.clone(),
+        level,
+        active: role.active,
+        object_revision: object.object_revision,
+        project_revision: object.project_revision,
+        created_at: object.created_at,
+        updated_at: object.updated_at,
+        created_by: object.created_by,
+        updated_by: object.updated_by,
+    })
+}
+
 async fn load_member_governance(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -2000,6 +2607,62 @@ async fn insert_change(
     let actor = event.pubkey.to_bytes();
     let subject = serde_json::to_value(&command.request).map_err(|error| {
         ProjectViewV2WriteError::InvalidCommit(format!("serialize command subject: {error}"))
+    })?;
+    sqlx::query(
+        "INSERT INTO project_view_changes \
+            (community_id, change_id, source_type, source_event_id, actor_pubkey, \
+             acting_assignment_id, operation, subject, project_revision, result, accepted_at) \
+         VALUES ($1, $2, 'nostr_event', $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event.id.as_bytes().as_slice())
+    .bind(actor.as_slice())
+    .bind(command.acting_assignment_id)
+    .bind(command.operation())
+    .bind(subject)
+    .bind(revision_i64(project_revision, "project_revision")?)
+    .bind(result)
+    .bind(canonical_time)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn project_object_receipt(entries: &[ProjectViewEntry], project_revision: u64) -> Value {
+    let mut result = serde_json::Map::new();
+    result.insert("project_revision".to_owned(), Value::from(project_revision));
+    if let [entry] = entries {
+        result.insert(
+            "object_id".to_owned(),
+            Value::String(entry.id().to_string()),
+        );
+        result.insert(
+            "object_revision".to_owned(),
+            Value::from(entry.object_revision()),
+        );
+        result.insert(
+            "deleted".to_owned(),
+            Value::Bool(matches!(entry, ProjectViewEntry::Tombstone(_))),
+        );
+    }
+    Value::Object(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_project_object_change(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event: &Event,
+    command: &ProjectObjectCommand,
+    project_revision: u64,
+    canonical_time: DateTime<Utc>,
+    result: &Value,
+) -> ProjectViewV2WriteResult<()> {
+    let actor = event.pubkey.to_bytes();
+    let subject = serde_json::to_value(&command.request).map_err(|error| {
+        ProjectViewV2WriteError::InvalidCommit(format!(
+            "serialize v2 object command subject: {error}"
+        ))
     })?;
     sqlx::query(
         "INSERT INTO project_view_changes \
@@ -2594,13 +3257,23 @@ fn validate_commit_bundle(
     let actual_heads = meta
         .changed_heads
         .iter()
-        .map(|head| {
-            (
-                head.coordinate.clone(),
-                (head.event_id, head.entity_type, head.entity_revision),
-            )
+        .map(|head| match head {
+            buzz_sdk::project_view_v2::V2ChangedHead::Entity {
+                coordinate,
+                event_id,
+                entity_type,
+                entity_revision,
+            } => Ok((
+                coordinate.clone(),
+                (*event_id, *entity_type, *entity_revision),
+            )),
+            buzz_sdk::project_view_v2::V2ChangedHead::Object { .. } => {
+                Err(ProjectViewV2WriteError::InvalidCommit(
+                    "Role command metadata contains an ordinary-object changed head".to_owned(),
+                ))
+            }
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<ProjectViewV2WriteResult<BTreeMap<_, _>>>()?;
     if actual_heads.len() != meta.changed_heads.len() || actual_heads != expected_heads {
         return Err(ProjectViewV2WriteError::InvalidCommit(
             "metadata changed heads do not exactly bind the signed canonical entity heads"
@@ -2608,6 +3281,194 @@ fn validate_commit_bundle(
         ));
     }
     Ok(())
+}
+
+fn validate_project_object_commit_bundle(
+    basis: &V2PreparedProjectObjectBasis,
+    commit: &PreparedV2ProjectObjectCommit,
+) -> ProjectViewV2WriteResult<()> {
+    if commit.command_event.id.to_bytes() != basis.command_event_id
+        || commit.command_event.pubkey != basis.actor
+        || ProjectObjectCommand::from_json(&commit.command_event.content)? != basis.command
+    {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "committed object command differs from the prepared command".to_owned(),
+        ));
+    }
+    commit.command_event.verify().map_err(|error| {
+        ProjectViewV2WriteError::InvalidCommit(format!(
+            "committed object command signature is invalid: {error}"
+        ))
+    })?;
+    let command_tags = commit
+        .command_event
+        .tags
+        .iter()
+        .map(Tag::as_slice)
+        .collect::<Vec<_>>();
+    let expected_command_tags = [
+        vec!["-".to_owned()],
+        vec!["t".to_owned(), "buzz-project-view-mutation".to_owned()],
+    ];
+    if command_tags != expected_command_tags {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "committed object command tags are not the exact protected v2 shape".to_owned(),
+        ));
+    }
+    if basis.next_state.project_revision() != basis.preparation.project_revision
+        || basis.outcome.project_revision != basis.preparation.project_revision
+    {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "prepared object state and outcome revisions disagree".to_owned(),
+        ));
+    }
+
+    let projection_map = commit
+        .object_projections
+        .iter()
+        .map(|projection| (projection.object_id(), projection.event()))
+        .collect::<BTreeMap<_, _>>();
+    if projection_map.len() != commit.object_projections.len()
+        || projection_map.len() != basis.preparation.heads.len()
+    {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "projection set does not exactly cover changed Project objects".to_owned(),
+        ));
+    }
+    let expected_source = buzz_sdk::project_view_v2::V2ProjectionSource::NostrEvent {
+        change_id: commit.command_event.id,
+        event_id: commit.command_event.id,
+    };
+    let context = buzz_sdk::project_view_v2::V2ProjectionContext {
+        project_id: basis.preparation.community_id,
+        projection_generation: basis.preparation.projection_generation,
+        project_revision: basis.preparation.project_revision,
+        source: expected_source.clone(),
+        updated_at: basis.preparation.canonical_time,
+    };
+    let mut expected_heads = BTreeMap::new();
+    for head in &basis.preparation.heads {
+        let event = projection_map.get(&head.object_id()).ok_or_else(|| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "missing projection for prepared object {}",
+                head.object_id()
+            ))
+        })?;
+        let changed_head = match head {
+            PreparedV2ProjectObjectHead::Role(role) => {
+                let parsed = buzz_sdk::project_view_v2::parse_entity_projection(
+                    event,
+                    &basis.preparation.projection_pubkey,
+                    basis.preparation.community_id,
+                )
+                .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+                if parsed.project_revision != basis.preparation.project_revision
+                    || parsed.projection_generation != basis.preparation.projection_generation
+                    || parsed.source != expected_source
+                    || parsed.updated_at != basis.preparation.canonical_time
+                    || parsed.entity != RoleContinuityChange::Role(role.clone())
+                {
+                    return Err(ProjectViewV2WriteError::InvalidCommit(
+                        "signed Role head differs from the prepared object change".to_owned(),
+                    ));
+                }
+                buzz_sdk::project_view_v2::changed_head_for(
+                    &context,
+                    &RoleContinuityChange::Role(role.clone()),
+                    event,
+                )
+            }
+            PreparedV2ProjectObjectHead::Object(entry) => {
+                let parsed = buzz_sdk::project_view_v2::parse_project_object_projection(
+                    event,
+                    &basis.preparation.projection_pubkey,
+                    basis.preparation.community_id,
+                )
+                .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+                if parsed.project_revision != basis.preparation.project_revision
+                    || parsed.projection_generation != basis.preparation.projection_generation
+                    || parsed.source != expected_source
+                    || parsed.updated_at != basis.preparation.canonical_time
+                    || !projected_object_matches_entry(&parsed.object, entry)
+                {
+                    return Err(ProjectViewV2WriteError::InvalidCommit(
+                        "signed ordinary-object head differs from the prepared change".to_owned(),
+                    ));
+                }
+                buzz_sdk::project_view_v2::changed_head_for_project_object(&context, entry, event)
+            }
+        }
+        .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+        if expected_heads
+            .insert(changed_head.coordinate().to_owned(), changed_head)
+            .is_some()
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "prepared object change contains duplicate coordinates".to_owned(),
+            ));
+        }
+    }
+
+    let meta = buzz_sdk::project_view_v2::parse_meta_projection(
+        &commit.meta_projection,
+        &basis.preparation.projection_pubkey,
+    )
+    .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+    let expected_counts = buzz_sdk::project_view_v2::V2EntityCounts {
+        active_objects: basis.preparation.counts.active_objects,
+        open_proposals: basis.preparation.counts.open_proposals,
+        active_assignments: basis.preparation.counts.active_assignments,
+        active_commitments: basis.preparation.counts.active_commitments,
+        checkpoints: basis.preparation.counts.checkpoints,
+        handoffs: basis.preparation.counts.handoffs,
+    };
+    let actual_heads = meta
+        .changed_heads
+        .iter()
+        .map(|head| (head.coordinate().to_owned(), head.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if meta.project_id != basis.preparation.community_id
+        || meta.project_revision != basis.preparation.project_revision
+        || meta.projection_generation != basis.preparation.projection_generation
+        || meta.entity_counts != expected_counts
+        || meta.membership_snapshot_event_id != basis.preparation.membership_snapshot_event_id
+        || meta.reset
+        || meta.source != expected_source
+        || meta.updated_at != basis.preparation.canonical_time
+        || actual_heads.len() != meta.changed_heads.len()
+        || actual_heads != expected_heads
+    {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "signed v2 metadata differs from the prepared ordinary-object change".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn projected_object_matches_entry(
+    projected: &buzz_sdk::project_view_v2::V2ProjectedObject,
+    entry: &ProjectViewEntry,
+) -> bool {
+    match (projected, entry) {
+        (
+            buzz_sdk::project_view_v2::V2ProjectedObject::Active(projected),
+            ProjectViewEntry::Active(entry),
+        ) => projected.as_ref() == entry,
+        (
+            buzz_sdk::project_view_v2::V2ProjectedObject::Tombstone(projected),
+            ProjectViewEntry::Tombstone(entry),
+        ) => {
+            projected.object_id == entry.id
+                && projected.object_type == entry.object_type
+                && projected.object_revision == entry.object_revision
+                && projected.project_revision == entry.project_revision
+                && projected.created_at == entry.created_at
+                && projected.deleted_at == entry.deleted_at
+                && projected.created_by == entry.created_by
+                && projected.deleted_by == entry.deleted_by
+        }
+        _ => false,
+    }
 }
 
 fn verify_membership_projection(

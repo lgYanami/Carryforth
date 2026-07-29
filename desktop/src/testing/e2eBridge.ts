@@ -55,6 +55,7 @@ import type {
 import type {
   RawProjectViewLoadResult,
   RawProjectViewMutationResult,
+  RawProjectViewRoleMutationResult,
 } from "@/shared/api/tauriProjectView";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
@@ -297,6 +298,11 @@ type E2eConfig = {
     projectViewMutationResult?: RawProjectViewMutationResult;
     projectViewMutationResults?: RawProjectViewMutationResult[];
     projectViewAfterMutation?: RawProjectViewLoadResult;
+    projectViewRoleMutationDelayMs?: number;
+    projectViewRoleMutationError?: string;
+    projectViewRoleMutationResult?: RawProjectViewRoleMutationResult;
+    projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
+    projectViewAfterRoleMutation?: RawProjectViewLoadResult;
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1173,6 +1179,8 @@ declare global {
     __BUZZ_E2E_GET_EVENT_CALL_COUNT__?: number;
     /** Typed Project View mutation payloads submitted during the current test. */
     __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: unknown[];
+    /** Typed Project View Role intents submitted during the current test. */
+    __BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?: unknown[];
     /** Replace the next trusted Project View command result. */
     __BUZZ_E2E_SET_PROJECT_VIEW__?: (
       result: RawProjectViewLoadResult,
@@ -9153,6 +9161,7 @@ export function maybeInstallE2eTauriMocks() {
   // get_event defer/release seam — reset counter and queue on each install.
   window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
   window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
+  window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__ = [];
   window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
     if (!config.mock) {
       throw new Error("Mock Project View is unavailable in relay mode.");
@@ -11049,6 +11058,47 @@ export function maybeInstallE2eTauriMocks() {
           } else {
             activeConfig.mock.projectView =
               activeConfig.mock.projectViewAfterMutation;
+          }
+        }
+        return result;
+      }
+      case "mutate_project_view_role": {
+        const input = structuredClone(
+          (payload as { input?: unknown }).input ?? payload,
+        );
+        window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.push(input);
+        if ((activeConfig?.mock?.projectViewRoleMutationDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectViewRoleMutationDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectViewRoleMutationError) {
+          throw new Error(activeConfig.mock.projectViewRoleMutationError);
+        }
+        const sequence = activeConfig?.mock?.projectViewRoleMutationResults;
+        const result = (sequence && sequence.length > 0
+          ? sequence.shift()
+          : activeConfig?.mock?.projectViewRoleMutationResult) ?? {
+          status: "applied",
+          event_id: "d".repeat(64),
+          project_revision: 8,
+          operation:
+            (input as { operation?: string }).operation ?? "role_mutation",
+          changed_entities: [],
+        };
+        if (
+          result.status === "applied" &&
+          activeConfig?.mock?.projectViewAfterRoleMutation
+        ) {
+          if (activeConfig.mock.projectViewsByRelayUrl) {
+            activeConfig.mock.projectViewsByRelayUrl[mockAppliedRelayUrl] =
+              activeConfig.mock.projectViewAfterRoleMutation;
+          } else {
+            activeConfig.mock.projectView =
+              activeConfig.mock.projectViewAfterRoleMutation;
           }
         }
         return result;

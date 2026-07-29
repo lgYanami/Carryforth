@@ -28,6 +28,7 @@ function readyResult() {
   return {
     status: "ready",
     relay_pubkey: "b".repeat(64),
+    schema_version: 1,
     project_revision: 1,
     projection_generation: 1,
     active_object_count: 2,

@@ -18,6 +18,17 @@ import {
   ProjectViewSelect,
 } from "@/features/project-view/ui/ProjectViewFormFields";
 import { ProjectViewObjectConflict } from "@/features/project-view/ui/ProjectViewObjectConflict";
+import {
+  CREATE_TYPES,
+  ISSUE_STATUSES,
+  LOCATOR_TYPES,
+  PLAN_STATUSES,
+  PRIORITIES,
+  REQUIREMENT_STATUSES,
+  RESOURCE_TYPES,
+  STAGE_STATUSES,
+  WORK_STATUSES,
+} from "@/features/project-view/ui/projectViewObjectFormOptions";
 import type {
   ProjectView,
   ProjectViewIssueStatus,
@@ -46,64 +57,6 @@ import {
 import { Input } from "@/shared/ui/input";
 import { Switch } from "@/shared/ui/switch";
 import { Textarea } from "@/shared/ui/textarea";
-
-const CREATE_TYPES = [
-  "goal",
-  "plan",
-  "stage",
-  "requirement",
-  "issue",
-  "work",
-  "role",
-  "resource",
-] as const;
-
-const PLAN_STATUSES = [
-  "draft",
-  "active",
-  "paused",
-  "completed",
-  "cancelled",
-] as const;
-const STAGE_STATUSES = [
-  "planned",
-  "active",
-  "paused",
-  "completed",
-  "cancelled",
-] as const;
-const REQUIREMENT_STATUSES = [
-  "proposed",
-  "ready",
-  "in_progress",
-  "satisfied",
-  "withdrawn",
-] as const;
-const ISSUE_STATUSES = ["open", "in_progress", "resolved", "closed"] as const;
-const WORK_STATUSES = [
-  "pending",
-  "in_progress",
-  "paused",
-  "submitted",
-  "completed",
-  "cancelled",
-] as const;
-const PRIORITIES = ["low", "normal", "high", "urgent"] as const;
-const RESOURCE_TYPES = [
-  "repository",
-  "document",
-  "design",
-  "service",
-  "environment",
-  "artifact",
-  "url",
-] as const;
-const LOCATOR_TYPES = [
-  "url",
-  "nostr_address",
-  "nostr_event",
-  "buzz_deep_link",
-] as const;
 
 type CreatableObjectType = (typeof CREATE_TYPES)[number];
 
@@ -399,10 +352,12 @@ function writableFromForm(
 
 function TextFields({
   form,
+  roleHasActiveAssignment,
   set,
   type,
 }: {
   form: FormState;
+  roleHasActiveAssignment?: boolean;
   set: <K extends keyof FormState>(field: K, value: FormState[K]) => void;
   type: ProjectViewObjectType;
 }) {
@@ -493,12 +448,15 @@ function TextFields({
           <div>
             <div className="text-sm font-medium">Active role</div>
             <div className="text-xs text-muted-foreground">
-              This is semantic project state, not Buzz authorization.
+              {roleHasActiveAssignment
+                ? "End or replace the active Assignment before deactivating this Role."
+                : "This is semantic project state, not Buzz authorization."}
             </div>
           </div>
           <Switch
             aria-label="Active role"
             checked={form.active}
+            disabled={roleHasActiveAssignment}
             onCheckedChange={(value) => set("active", value)}
           />
         </div>
@@ -720,6 +678,7 @@ export function ProjectViewObjectDialog({
   onReviewLatest,
   open,
   projectRevision,
+  roleHasActiveAssignment,
   view,
 }: {
   context?: ProjectViewCreateContext;
@@ -731,6 +690,7 @@ export function ProjectViewObjectDialog({
   onReviewLatest: () => Promise<unknown>;
   open: boolean;
   projectRevision: number;
+  roleHasActiveAssignment?: boolean;
   view: ProjectView;
 }) {
   const mutation = useProjectViewMutation();
@@ -817,6 +777,12 @@ export function ProjectViewObjectDialog({
     setRebasedRevision(undefined);
     setConflict(undefined);
     try {
+      if (roleHasActiveAssignment && objectType === "role" && !form.active) {
+        setError(
+          "End or replace the active Assignment before deactivating this Role.",
+        );
+        return;
+      }
       const writable = writableFromForm(objectType, form, objects);
       if (
         mode === "edit" &&
@@ -934,7 +900,12 @@ export function ProjectViewObjectDialog({
           ) : null}
 
           <div className="space-y-4">
-            <TextFields form={form} set={set} type={objectType} />
+            <TextFields
+              form={form}
+              roleHasActiveAssignment={roleHasActiveAssignment}
+              set={set}
+              type={objectType}
+            />
             <LifecycleFields form={form} set={set} type={objectType} />
             <RelationFields
               editingId={object?.id}

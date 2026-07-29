@@ -6,9 +6,13 @@ import type {
   ProjectViewObjectType,
 } from "../../src/shared/api/tauriProjectView";
 import { installMockBridge } from "../helpers/bridge";
+import { openSettings } from "../helpers/settings";
 
 const ACTOR = "a".repeat(64);
 const HUMAN = "deadbeef".repeat(8);
+const FORMER_ASSIGNEE = "e".repeat(64);
+const ALICE =
+  "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f";
 const NOW = "2026-07-27T08:00:00Z";
 const COMMUNITY_A = {
   id: "project-view-a",
@@ -151,6 +155,7 @@ const resource = object("resource", IDS.resource, {
 const READY_VIEW = {
   status: "ready",
   relay_pubkey: "b".repeat(64),
+  schema_version: 1,
   project_revision: 7,
   projection_generation: 2,
   active_object_count: 10,
@@ -182,6 +187,96 @@ const READY_VIEW = {
     issue_references_by_target: {
       [IDS.profile]: [{ object_type: "issue", object_id: IDS.issue }],
     },
+  },
+} as RawProjectViewLoadResult;
+
+const ROLE_STATE_IDS = {
+  currentAssignment: "20000000-0000-4000-8000-000000000001",
+  formerAssignment: "20000000-0000-4000-8000-000000000002",
+  proposal: "20000000-0000-4000-8000-000000000003",
+  handoff: "20000000-0000-4000-8000-000000000004",
+} as const;
+
+const V2_READY_VIEW = {
+  ...structuredClone(READY_VIEW),
+  schema_version: 2,
+  role_continuity: {
+    roles: [
+      {
+        role_id: IDS.role,
+        name: "Context steward",
+        purpose: "Keep project intent coherent.",
+        responsibilities: ["Review project structure"],
+        boundaries: ["Does not grant unscoped authority"],
+        level: "admin",
+        active: true,
+        object_revision: 1,
+        project_revision: 7,
+        created_at: NOW,
+        updated_at: NOW,
+        created_by: ACTOR,
+        updated_by: ACTOR,
+      },
+    ],
+    proposals: [
+      {
+        proposal_id: ROLE_STATE_IDS.proposal,
+        role_id: IDS.role,
+        candidate_pubkey: FORMER_ASSIGNEE,
+        proposal_type: "request",
+        candidate_accepted_at: NOW,
+        expected_target_assignment_id: ROLE_STATE_IDS.currentAssignment,
+        expires_at: "2026-08-01T08:00:00Z",
+        status: "open",
+        reason: "Return to project context stewardship.",
+        created_by: FORMER_ASSIGNEE,
+        created_at: NOW,
+        entity_revision: 1,
+        project_revision: 7,
+      },
+    ],
+    assignments: [
+      {
+        assignment_id: ROLE_STATE_IDS.currentAssignment,
+        role_id: IDS.role,
+        member_pubkey: ACTOR,
+        started_at: NOW,
+        started_by: HUMAN,
+        entity_revision: 1,
+        project_revision: 7,
+      },
+      {
+        assignment_id: ROLE_STATE_IDS.formerAssignment,
+        role_id: IDS.role,
+        member_pubkey: FORMER_ASSIGNEE,
+        started_at: "2026-07-20T08:00:00Z",
+        started_by: HUMAN,
+        ended_at: "2026-07-26T08:00:00Z",
+        ended_by: HUMAN,
+        ended_reason: "replaced",
+        replaced_by_assignment_id: ROLE_STATE_IDS.currentAssignment,
+        entity_revision: 2,
+        project_revision: 6,
+      },
+    ],
+    handoffs: [
+      {
+        handoff_id: ROLE_STATE_IDS.handoff,
+        role_id: IDS.role,
+        from_assignment_id: ROLE_STATE_IDS.formerAssignment,
+        to_assignment_id: ROLE_STATE_IDS.currentAssignment,
+        affected_commitment_ids: [],
+        cause: "replaced",
+        created_at: "2026-07-26T08:00:00Z",
+        entity_revision: 1,
+        project_revision: 6,
+      },
+    ],
+    members: [
+      { pubkey: HUMAN, role: "owner" },
+      { pubkey: ACTOR, role: "admin" },
+      { pubkey: FORMER_ASSIGNEE, role: "member" },
+    ],
   },
 } as RawProjectViewLoadResult;
 
@@ -232,6 +327,7 @@ function minimalReadyView(name: string, revision = 7) {
   return {
     status: "ready",
     relay_pubkey: "c".repeat(64),
+    schema_version: 1,
     project_revision: revision,
     projection_generation: 1,
     active_object_count: 2,
@@ -247,6 +343,25 @@ function minimalReadyView(name: string, revision = 7) {
       issue_references_by_target: {},
     },
   } as RawProjectViewLoadResult;
+}
+
+function vacantV2View() {
+  const next = structuredClone(V2_READY_VIEW) as Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >;
+  if (!next.role_continuity) {
+    throw new Error("v2 fixture must include Role continuity");
+  }
+  next.relay_pubkey = "c".repeat(64);
+  next.role_continuity.proposals = [];
+  next.role_continuity.assignments = [];
+  next.role_continuity.handoffs = [];
+  next.role_continuity.members = [
+    { pubkey: HUMAN, role: "owner" },
+    { pubkey: ACTOR, role: "member" },
+  ];
+  return next;
 }
 
 async function seedCommunities(
@@ -309,6 +424,135 @@ test("View renders the verified canonical map and object inspector", async ({
   );
 
   await page.getByRole("button", { name: "Close inspector" }).click();
+  await expect(page).toHaveURL(/\/view$/);
+});
+
+test("v2 Role cards and Inspector show one verified continuity state", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    projectView: V2_READY_VIEW,
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  const roleCard = page.getByTestId(`project-role-card-${IDS.role}`);
+  await expect(roleCard).toContainText("Leader");
+  await expect(roleCard).toContainText("Assigned");
+  await expect(roleCard).toContainText("Context Agent");
+  await roleCard.click();
+
+  const inspector = page.getByTestId("project-view-inspector");
+  await expect(inspector).toContainText("Leader · admin");
+  await expect(inspector).toContainText("Current tenure");
+  await expect(inspector).toContainText(
+    "Return to project context stewardship",
+  );
+  await expect(inspector).toContainText("Tenure history");
+  await expect(inspector).toContainText("Handoffs");
+  await expect(
+    inspector.getByRole("button", { name: "Delete" }),
+  ).toBeDisabled();
+  await expect(page.getByTestId("project-role-lifecycle-guard")).toBeVisible();
+
+  await inspector.getByRole("button", { name: "Edit" }).click();
+  await expect(page.getByLabel("Active role")).toBeDisabled();
+});
+
+test("owner creates a revision-fenced Role offer from the Inspector", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    projectView: V2_READY_VIEW,
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await page.getByTestId("project-role-offer").click();
+  await page.getByTestId("project-role-candidate").fill(FORMER_ASSIGNEE);
+  await page.getByTestId("project-role-offer-submit").click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const intent = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.[0],
+  );
+  expect(intent).toMatchObject({
+    operation: "offer_role",
+    expected_project_revision: 7,
+    role_id: IDS.role,
+    candidate_pubkey: FORMER_ASSIGNEE,
+    expires_in_hours: 72,
+  });
+});
+
+test("a concurrent Role replacement refreshes state without replaying intent", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: V2_READY_VIEW,
+    projectViewRoleMutationResult: {
+      status: "conflict",
+      expected_project_revision: 7,
+      current_project_revision: 8,
+      message: "conflict:project_view_v2:revision_conflict",
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await page.getByTestId("project-role-offer").click();
+  await page.getByTestId("project-role-candidate").fill(FORMER_ASSIGNEE);
+  await page.getByTestId("project-role-offer-submit").click();
+
+  await expect(
+    page.getByText(/changed before this Role action was applied/),
+  ).toBeVisible();
+  await page.waitForTimeout(250);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+});
+
+test("v2 Community settings route Role changes through View", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: V2_READY_VIEW,
+    relayRequiresMembership: true,
+  });
+  await page.goto("/");
+  await openSettings(page, "community-members");
+
+  await expect(
+    page.getByTestId("community-members-manage-in-view"),
+  ).toBeVisible();
+  await expect(page.getByTestId("community-invite-dialog-trigger")).toHaveCount(
+    0,
+  );
+  await page.getByTestId(`relay-member-actions-${ALICE}`).click();
+  await expect(
+    page.getByRole("menuitem", { name: "Manage Role in View" }),
+  ).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Make member" })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("menuitem", { name: "Remove from community" }),
+  ).toHaveCount(0);
+
+  await page.getByRole("menuitem", { name: "Manage Role in View" }).click();
   await expect(page).toHaveURL(/\/view$/);
 });
 
@@ -771,6 +1015,34 @@ test("Community switching does not carry View data, selection, or drafts across 
   await expect(page.getByLabel("Project name")).toHaveValue("");
   await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
   await expect(page).not.toHaveURL(/object=/);
+});
+
+test("Community switching does not carry an Assignment into another View", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    {
+      managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+      projectViewsByRelayUrl: {
+        [COMMUNITY_A.relayUrl]: structuredClone(V2_READY_VIEW),
+        [COMMUNITY_B.relayUrl]: vacantV2View(),
+      },
+    },
+    { skipCommunitySeed: true },
+  );
+  await seedCommunities(page);
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await expect(page.getByTestId(`project-role-card-${IDS.role}`)).toContainText(
+    "Assigned",
+  );
+
+  await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+  await page.getByTestId("open-view").click();
+  const roleCard = page.getByTestId(`project-role-card-${IDS.role}`);
+  await expect(roleCard).toContainText("Vacant");
+  await expect(roleCard).not.toContainText("Context Agent");
 });
 
 test("a disconnected View keeps its verified snapshot and marks it stale", async ({

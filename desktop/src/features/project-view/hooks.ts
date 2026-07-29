@@ -10,6 +10,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   getProjectView,
   mutateProjectView,
+  mutateProjectViewRole,
 } from "@/shared/api/tauriProjectView";
 
 export const projectViewQueryKey = (communityId: string | undefined) =>
@@ -39,6 +40,20 @@ export function useProjectViewMutation() {
         queryKey: projectViewQueryKey(communityId),
       });
     },
+  });
+}
+
+export function useProjectViewRoleMutation() {
+  const { activeCommunity } = useCommunities();
+  const queryClient = useQueryClient();
+  const communityId = activeCommunity?.id;
+
+  return useMutation({
+    mutationFn: mutateProjectViewRole,
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: projectViewQueryKey(communityId),
+      }),
   });
 }
 

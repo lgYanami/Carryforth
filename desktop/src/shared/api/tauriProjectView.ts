@@ -1,4 +1,34 @@
 import { invokeTauri } from "@/shared/api/tauri";
+import { ProjectViewIntegrityError } from "@/shared/api/tauriProjectViewIntegrity";
+import {
+  normalizeRoleContinuity,
+  type ProjectViewRoleContinuity,
+  type RawProjectViewRoleContinuity,
+} from "@/shared/api/tauriProjectViewRole";
+
+export {
+  ProjectViewIntegrityError,
+  isProjectViewIntegrityError,
+} from "@/shared/api/tauriProjectViewIntegrity";
+export {
+  mutateProjectViewRole,
+  serializeProjectViewRoleMutationIntent,
+} from "@/shared/api/tauriProjectViewRole";
+export type {
+  ProjectCommunityMemberRole,
+  ProjectRoleAssignment,
+  ProjectRoleAssignmentEndReason,
+  ProjectRoleDefinition,
+  ProjectRoleHandoff,
+  ProjectRoleLevel,
+  ProjectRoleProposal,
+  ProjectRoleProposalStatus,
+  ProjectRoleProposalType,
+  ProjectViewRoleMutationIntent,
+  ProjectViewRoleMutationResult,
+  ProjectViewRoleContinuity,
+  RawProjectViewRoleMutationResult,
+} from "@/shared/api/tauriProjectViewRole";
 
 export type ProjectViewObjectType =
   | "project_profile"
@@ -208,11 +238,13 @@ export type RawProjectViewLoadResult =
   | {
       status: "ready";
       relay_pubkey: string;
+      schema_version: number;
       project_revision: number;
       projection_generation: number;
       active_object_count: number;
       updated_at: string;
       view: RawProjectView;
+      role_continuity?: RawProjectViewRoleContinuity;
     };
 
 export type ProjectProfileData = RawProjectProfileData;
@@ -321,36 +353,14 @@ export type ProjectViewLoadResult =
   | {
       status: "ready";
       relayPubkey: string;
+      schemaVersion: 1 | 2;
       projectRevision: number;
       projectionGeneration: number;
       activeObjectCount: number;
       updatedAt: string;
       view: ProjectView;
+      roleContinuity?: ProjectViewRoleContinuity;
     };
-
-const PROJECT_VIEW_INTEGRITY_PREFIX = "Project View integrity error:";
-
-/**
- * A defensive client-boundary failure raised when the native command returns
- * a self-contradictory Project View DTO. The native layer remains responsible
- * for signature and projection verification; this guard prevents an
- * accidentally mixed or malformed result from reaching React.
- */
-export class ProjectViewIntegrityError extends Error {
-  constructor(reason: string) {
-    super(`${PROJECT_VIEW_INTEGRITY_PREFIX} ${reason}`);
-    this.name = "ProjectViewIntegrityError";
-  }
-}
-
-/** Returns whether an unknown command/query failure represents integrity. */
-export function isProjectViewIntegrityError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return (
-    error instanceof ProjectViewIntegrityError ||
-    message.includes(PROJECT_VIEW_INTEGRITY_PREFIX)
-  );
-}
 
 export type ProjectViewWritableObject =
   | { objectType: "project_profile"; data: ProjectProfileData }
@@ -765,14 +775,36 @@ export function normalizeProjectViewLoadResult(
         raw.project_revision,
         raw.active_object_count,
       );
+      if (raw.schema_version !== 1 && raw.schema_version !== 2) {
+        throw new ProjectViewIntegrityError(
+          `unsupported native schema version ${raw.schema_version}`,
+        );
+      }
+      const roleContinuity = raw.role_continuity
+        ? normalizeRoleContinuity(
+            raw.role_continuity,
+            view,
+            raw.project_revision,
+          )
+        : undefined;
+      if (
+        (raw.schema_version === 2 && !roleContinuity) ||
+        (raw.schema_version === 1 && roleContinuity)
+      ) {
+        throw new ProjectViewIntegrityError(
+          "Role continuity payload does not match the Project View schema",
+        );
+      }
       return {
         status: raw.status,
         relayPubkey: raw.relay_pubkey,
+        schemaVersion: raw.schema_version,
         projectRevision: raw.project_revision,
         projectionGeneration: raw.projection_generation,
         activeObjectCount: raw.active_object_count,
         updatedAt: raw.updated_at,
         view,
+        roleContinuity,
       };
     }
   }

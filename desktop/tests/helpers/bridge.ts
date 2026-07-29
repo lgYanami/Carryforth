@@ -3,6 +3,7 @@ import type { ChannelTemplate } from "../../src/shared/api/types";
 import type {
   RawProjectViewLoadResult,
   RawProjectViewMutationResult,
+  RawProjectViewRoleMutationResult,
 } from "../../src/shared/api/tauriProjectView";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
@@ -147,6 +148,11 @@ type MockBridgeOptions = {
   projectViewMutationResult?: RawProjectViewMutationResult;
   projectViewMutationResults?: RawProjectViewMutationResult[];
   projectViewAfterMutation?: RawProjectViewLoadResult;
+  projectViewRoleMutationDelayMs?: number;
+  projectViewRoleMutationError?: string;
+  projectViewRoleMutationResult?: RawProjectViewRoleMutationResult;
+  projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
+  projectViewAfterRoleMutation?: RawProjectViewLoadResult;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
   /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */

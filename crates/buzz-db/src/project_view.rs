@@ -1401,6 +1401,12 @@ impl ProjectViewWriteTx {
                 command_event_id,
                 projection.id.as_bytes(),
                 entry,
+                i16::try_from(MUTATION_SCHEMA_VERSION).map_err(|_| {
+                    ProjectViewWriteError::InvalidCommit(
+                        "mutation schema version does not fit PostgreSQL SMALLINT".to_owned(),
+                    )
+                })?,
+                None,
             )
             .await?;
 
@@ -1783,19 +1789,21 @@ impl ProjectViewReprojectTx {
     }
 }
 
-async fn write_project_view_entry(
+pub(crate) async fn write_project_view_entry(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     source_event_id: &[u8],
     projection_event_id: &[u8],
     entry: &ProjectViewEntry,
+    schema_version: i16,
+    role_level: Option<&str>,
 ) -> ProjectViewWriteResult<()> {
     let (
         object_id,
         object_type,
         object_revision,
         project_revision,
-        body,
+        mut body,
         relations,
         created_at,
         updated_at,
@@ -1832,6 +1840,20 @@ async fn write_project_view_entry(
     };
     let object_revision = revision_to_i64(object_revision, "object_revision")?;
     let project_revision = revision_to_i64(project_revision, "project_revision")?;
+    if schema_version == 2 && object_type == ProjectViewObjectType::Role {
+        let level = role_level.ok_or_else(|| {
+            ProjectViewWriteError::InvalidCommit(
+                "schema-v2 Role write is missing its preserved level".to_owned(),
+            )
+        })?;
+        if let Some(Value::Object(body)) = body.as_mut() {
+            body.insert("level".to_owned(), Value::String(level.to_owned()));
+        }
+    } else if role_level.is_some() {
+        return Err(ProjectViewWriteError::InvalidCommit(
+            "only schema-v2 Roles may carry role_level".to_owned(),
+        ));
+    }
     let created_by = created_by.to_bytes();
     let updated_by = updated_by.to_bytes();
     let about_object_id = relations.about.map(|reference| reference.object_id);
@@ -1850,10 +1872,10 @@ async fn write_project_view_entry(
              under_plan_id, planned_in_stage_id, about_object_id, \
              about_object_type, handles_object_id, handles_object_type, \
              created_at, updated_at, created_by, updated_by, source_event_id, \
-             projection_event_id, deleted_at) \
+             projection_event_id, deleted_at, role_level) \
          VALUES \
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-             $14, $15, $16, $17, $18, $19, $20, $21) \
+             $14, $15, $16, $17, $18, $19, $20, $21, $22) \
          ON CONFLICT (community_id, object_id) DO UPDATE SET \
              object_type = EXCLUDED.object_type, \
              schema_version = EXCLUDED.schema_version, \
@@ -1873,7 +1895,8 @@ async fn write_project_view_entry(
              updated_by = EXCLUDED.updated_by, \
              source_event_id = EXCLUDED.source_event_id, \
              projection_event_id = EXCLUDED.projection_event_id, \
-             deleted_at = EXCLUDED.deleted_at \
+             deleted_at = EXCLUDED.deleted_at, \
+             role_level = EXCLUDED.role_level \
          WHERE project_view_objects.deleted_at IS NULL \
            AND project_view_objects.object_type = EXCLUDED.object_type \
            AND project_view_objects.object_revision + 1 = EXCLUDED.object_revision \
@@ -1882,11 +1905,7 @@ async fn write_project_view_entry(
     .bind(community_id.as_uuid())
     .bind(object_id)
     .bind(object_type.as_str())
-    .bind(i16::try_from(MUTATION_SCHEMA_VERSION).map_err(|_| {
-        ProjectViewWriteError::InvalidCommit(
-            "mutation schema version does not fit PostgreSQL SMALLINT".to_owned(),
-        )
-    })?)
+    .bind(schema_version)
     .bind(object_revision)
     .bind(project_revision)
     .bind(body)
@@ -1904,6 +1923,7 @@ async fn write_project_view_entry(
     .bind(source_event_id)
     .bind(projection_event_id)
     .bind(deleted_at)
+    .bind(role_level)
     .execute(&mut **tx)
     .await?;
 
@@ -2185,8 +2205,15 @@ fn typed_reference(
 
 fn object_data_from_body(
     object_type: ProjectViewObjectType,
-    body: Value,
+    mut body: Value,
 ) -> ProjectViewWriteResult<ProjectViewObjectData> {
+    // Role `level` is v2 governance state. The shared nine-object reducer must
+    // see the unchanged Role body so it cannot accidentally mutate authority.
+    if object_type == ProjectViewObjectType::Role {
+        if let Value::Object(body) = &mut body {
+            body.remove("level");
+        }
+    }
     serde_json::from_value(serde_json::json!({
         "object_type": object_type.as_str(),
         "data": body,
@@ -2403,23 +2430,29 @@ fn projection_map(projections: Vec<PreparedObjectProjection>) -> BTreeMap<Uuid, 
 mod tests {
     use super::*;
 
-    use buzz_project_view::v2::{RoleCommand, RoleCommandRequest, RoleContinuityError};
+    use buzz_project_view::v2::{
+        ProjectObjectCommand, RoleCommand, RoleCommandRequest, RoleContinuityChange,
+        RoleContinuityError,
+    };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
-        NewProjectViewObject, ProjectProfile,
+        NewProjectViewObject, Patch, ProjectProfile, RolePatch, UpdateMutation,
     };
     use buzz_sdk::project_view_v2::{
         build_entity_projection as build_v2_entity_projection,
-        build_meta_projection as build_v2_meta_projection, build_role_command,
-        changed_head_for as v2_changed_head_for, V2EntityCounts, V2ProjectionContext,
-        V2ProjectionSource,
+        build_meta_projection as build_v2_meta_projection, build_project_object_command,
+        build_project_object_projection, build_role_command,
+        changed_head_for as v2_changed_head_for, changed_head_for_project_object, V2EntityCounts,
+        V2ProjectionContext, V2ProjectionSource,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
     use crate::project_view_v2::{
-        PreparedV2EntityProjection, PreparedV2RoleCommit, ProjectViewV2CommitOutcome,
-        ProjectViewV2CutoverPlan, ProjectViewV2PrepareOutcome, ProjectViewV2WriteError,
+        PreparedV2EntityProjection, PreparedV2ProjectObjectCommit, PreparedV2ProjectObjectHead,
+        PreparedV2RoleCommit, ProjectViewV2CommitOutcome, ProjectViewV2CutoverPlan,
+        ProjectViewV2PrepareOutcome, ProjectViewV2ProjectObjectPrepareOutcome,
+        ProjectViewV2WriteError,
     };
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
@@ -2824,6 +2857,95 @@ mod tests {
             })
             .await
             .expect("commit v2 Role command")
+    }
+
+    async fn commit_v2_object_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        actor: &Keys,
+        relay: &Keys,
+        command: ProjectObjectCommand,
+    ) -> ProjectViewV2CommitOutcome {
+        let command_event = build_project_object_command(command.clone())
+            .expect("build v2 Project object command")
+            .sign_with_keys(actor)
+            .expect("sign v2 Project object command");
+        let mut write = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin v2 Project object command");
+        let prepared = match write
+            .prepare_project_object_command(&command_event, &command)
+            .await
+            .expect("prepare v2 Project object command")
+        {
+            ProjectViewV2ProjectObjectPrepareOutcome::Prepared(prepared) => prepared,
+            ProjectViewV2ProjectObjectPrepareOutcome::Replayed(_) => {
+                panic!("a fresh v2 Project object command must not replay")
+            }
+        };
+        let context = V2ProjectionContext {
+            project_id: community_id,
+            projection_generation: prepared.projection_generation,
+            project_revision: prepared.project_revision,
+            source: V2ProjectionSource::NostrEvent {
+                change_id: command_event.id,
+                event_id: command_event.id,
+            },
+            updated_at: prepared.canonical_time,
+        };
+        let mut object_projections = Vec::with_capacity(prepared.heads.len());
+        let mut changed_heads = Vec::with_capacity(prepared.heads.len());
+        for head in &prepared.heads {
+            let (object_id, event, changed_head) = match head {
+                PreparedV2ProjectObjectHead::Object(entry) => {
+                    let event = build_project_object_projection(&context, entry)
+                        .expect("build v2 ordinary-object projection")
+                        .sign_with_keys(relay)
+                        .expect("sign v2 ordinary-object projection");
+                    let changed_head = changed_head_for_project_object(&context, entry, &event)
+                        .expect("bind v2 ordinary-object head");
+                    (entry.id(), event, changed_head)
+                }
+                PreparedV2ProjectObjectHead::Role(role) => {
+                    let change = RoleContinuityChange::Role(role.clone());
+                    let event = build_v2_entity_projection(&context, &change)
+                        .expect("build v2 Role object projection")
+                        .sign_with_keys(relay)
+                        .expect("sign v2 Role object projection");
+                    let changed_head = v2_changed_head_for(&context, &change, &event)
+                        .expect("bind v2 Role object head");
+                    (role.role_id, event, changed_head)
+                }
+            };
+            object_projections.push(PreparedObjectProjection::new(object_id, event));
+            changed_heads.push(changed_head);
+        }
+        let meta_projection = build_v2_meta_projection(
+            &context,
+            V2EntityCounts {
+                active_objects: prepared.counts.active_objects,
+                open_proposals: prepared.counts.open_proposals,
+                active_assignments: prepared.counts.active_assignments,
+                active_commitments: prepared.counts.active_commitments,
+                checkpoints: prepared.counts.checkpoints,
+                handoffs: prepared.counts.handoffs,
+            },
+            prepared.membership_snapshot_event_id,
+            false,
+            &changed_heads,
+        )
+        .expect("build v2 Project object metadata")
+        .sign_with_keys(relay)
+        .expect("sign v2 Project object metadata");
+        write
+            .commit_project_object_command(PreparedV2ProjectObjectCommit {
+                command_event,
+                object_projections,
+                meta_projection,
+            })
+            .await
+            .expect("commit v2 Project object command")
     }
 
     async fn reject_v2_role_for_test(
@@ -4642,6 +4764,75 @@ mod tests {
             stale,
             ProjectViewV2WriteError::Domain(RoleContinuityError::ActingAssignmentInvalid)
         ));
+
+        let goal_id = Uuid::new_v4();
+        let created = commit_v2_object_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            ProjectObjectCommand::new(
+                7,
+                None,
+                MutationRequest::Create(CreateMutation {
+                    object: NewProjectViewObject::Goal {
+                        id: goal_id,
+                        title: "Continue editing after cutover".to_owned(),
+                        desired_outcome: "Humans and Agents share the v2 View".to_owned(),
+                        directions: vec!["Preserve the common revision stream".to_owned()],
+                    },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(created.receipt.project_revision, 8);
+        assert_eq!(
+            created.receipt.result["object_id"].as_str(),
+            Some(goal_id.to_string().as_str())
+        );
+        assert!(
+            created
+                .events
+                .iter()
+                .any(|event| event.kind.as_u16() as u32 == KIND_PROJECT_VIEW_OBJECT),
+            "ordinary v2 writes must emit a signed object head"
+        );
+
+        let deactivate = ProjectObjectCommand::new(
+            8,
+            None,
+            MutationRequest::Update(UpdateMutation::Role {
+                object_id: role_id,
+                patch: RolePatch {
+                    active: Patch::Set(false),
+                    ..RolePatch::default()
+                },
+            }),
+        );
+        let deactivate_event = build_project_object_command(deactivate.clone())
+            .expect("build rejected Role deactivation")
+            .sign_with_keys(&owner)
+            .expect("sign rejected Role deactivation");
+        let mut write = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin rejected Role deactivation");
+        let error = write
+            .prepare_project_object_command(&deactivate_event, &deactivate)
+            .await
+            .expect_err("an assigned Role cannot be deactivated through the generic editor");
+        assert!(matches!(
+            error,
+            ProjectViewV2WriteError::ObjectDomain(DomainError::InvalidField {
+                field: "active",
+                ..
+            })
+        ));
+        write
+            .rollback()
+            .await
+            .expect("roll back rejected Role deactivation");
+
         let final_state: (i64, i32, i32, i32) = sqlx::query_as(
             "SELECT project_revision, open_proposal_count, active_assignment_count, handoff_count \
              FROM project_view_state WHERE community_id = $1",
@@ -4650,7 +4841,7 @@ mod tests {
         .fetch_one(&scratch.pool)
         .await
         .expect("read final v2 materialized counts");
-        assert_eq!(final_state, (7, 0, 1, 1));
+        assert_eq!(final_state, (8, 0, 1, 1));
         assert!(db
             .project_view_v2_capability_ready(community_id, &relay.public_key())
             .await

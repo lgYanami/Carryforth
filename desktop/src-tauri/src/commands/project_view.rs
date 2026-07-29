@@ -1,16 +1,30 @@
 //! Verified, read-only Project View bridge for the desktop client.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
-use buzz_core_pkg::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
+use buzz_core_pkg::kind::{
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
+};
 use buzz_core_pkg::PublicKey;
+use buzz_project_view_pkg::v2::{
+    CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal,
+    RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel,
+};
 use buzz_project_view_pkg::{
-    ProjectView, ProjectViewEntry, ProjectViewObjectType, ProjectViewState,
+    ProjectRole, ProjectView, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
+    ProjectViewObjectType, ProjectViewRelations, ProjectViewState,
 };
 use buzz_sdk_pkg::project_view::{
     parse_meta_projection, parse_object_projection, MetaProjection, ObjectProjection,
     ProjectedObject,
+};
+use buzz_sdk_pkg::project_view_v2::{
+    parse_entity_projection as parse_v2_entity_projection,
+    parse_membership_projection as parse_v2_membership_projection,
+    parse_meta_projection as parse_v2_meta_projection,
+    parse_project_object_projection as parse_v2_project_object_projection, V2MembershipProjection,
+    V2MetaProjection, V2ProjectedObject,
 };
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -24,13 +38,21 @@ use crate::relay::{
     relay_error_message,
 };
 
-pub(crate) const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
+pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
+pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectViewSchema {
+    V1,
+    V2,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
+    pub(crate) schema: ProjectViewSchema,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +66,30 @@ struct Nip11Document {
 struct ProjectSnapshot {
     meta: MetaProjection,
     view: ProjectView,
+}
+
+struct V2ProjectSnapshot {
+    meta: V2MetaProjection,
+    view: ProjectView,
+    role_continuity: ProjectViewRoleContinuity,
+}
+
+/// Verified Role continuity state returned beside a schema-v2 Project View.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectViewRoleContinuity {
+    roles: Vec<RoleDefinition>,
+    proposals: Vec<RoleAssignmentProposal>,
+    assignments: Vec<RoleAssignment>,
+    handoffs: Vec<RoleHandoff>,
+    members: Vec<ProjectViewMembershipMember>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectViewMembershipMember {
+    pubkey: String,
+    role: CommunityMemberRole,
 }
 
 #[derive(Debug)]
@@ -72,6 +118,8 @@ pub enum ProjectViewLoadResult {
     Ready {
         /// Canonical Relay signing identity established by NIP-11.
         relay_pubkey: String,
+        /// Project View protocol schema selected by the Community.
+        schema_version: u16,
         /// Current optimistic-concurrency revision.
         project_revision: u64,
         /// Current projection generation.
@@ -82,6 +130,9 @@ pub enum ProjectViewLoadResult {
         updated_at: DateTime<Utc>,
         /// Deterministically assembled Project View hierarchy.
         view: Box<ProjectView>,
+        /// Verified Role continuity state for schema v2.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role_continuity: Option<Box<ProjectViewRoleContinuity>>,
     },
 }
 
@@ -96,15 +147,48 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
         return Ok(ProjectViewLoadResult::Unsupported);
     };
 
-    match fetch_consistent_snapshot(state, identity).await {
-        Ok(Some(ProjectSnapshot { meta, view })) => Ok(ProjectViewLoadResult::Ready {
-            relay_pubkey: identity.relay_pubkey.to_hex(),
-            project_revision: meta.project_revision,
-            projection_generation: meta.projection_generation,
-            active_object_count: meta.active_object_count,
-            updated_at: meta.updated_at,
-            view: Box::new(view),
-        }),
+    let loaded = match identity.schema {
+        ProjectViewSchema::V1 => fetch_consistent_snapshot(state, identity)
+            .await
+            .map(|snapshot| {
+                snapshot.map(
+                    |ProjectSnapshot { meta, view }| ProjectViewLoadResult::Ready {
+                        relay_pubkey: identity.relay_pubkey.to_hex(),
+                        schema_version: 1,
+                        project_revision: meta.project_revision,
+                        projection_generation: meta.projection_generation,
+                        active_object_count: meta.active_object_count,
+                        updated_at: meta.updated_at,
+                        view: Box::new(view),
+                        role_continuity: None,
+                    },
+                )
+            }),
+        ProjectViewSchema::V2 => {
+            fetch_consistent_v2_snapshot(state, identity)
+                .await
+                .map(|snapshot| {
+                    snapshot.map(
+                        |V2ProjectSnapshot {
+                             meta,
+                             view,
+                             role_continuity,
+                         }| ProjectViewLoadResult::Ready {
+                            relay_pubkey: identity.relay_pubkey.to_hex(),
+                            schema_version: 2,
+                            project_revision: meta.project_revision,
+                            projection_generation: meta.projection_generation,
+                            active_object_count: meta.entity_counts.active_objects,
+                            updated_at: meta.updated_at,
+                            view: Box::new(view),
+                            role_continuity: Some(Box::new(role_continuity)),
+                        },
+                    )
+                })
+        }
+    };
+    match loaded {
+        Ok(Some(result)) => Ok(result),
         Ok(None) => Ok(ProjectViewLoadResult::Uninitialized {
             relay_pubkey: identity.relay_pubkey.to_hex(),
         }),
@@ -135,13 +219,21 @@ pub(crate) async fn read_identity_at(
         return Err(relay_error_message(response).await);
     }
     let info: Nip11Document = parse_json_response(response).await?;
-    if !info
+    let has_v2 = info
         .supported_extensions
         .iter()
-        .any(|extension| extension == PROJECT_VIEW_EXTENSION)
-    {
+        .any(|extension| extension == PROJECT_VIEW_V2_EXTENSION);
+    let has_v1 = info
+        .supported_extensions
+        .iter()
+        .any(|extension| extension == PROJECT_VIEW_V1_EXTENSION);
+    let schema = if has_v2 {
+        ProjectViewSchema::V2
+    } else if has_v1 {
+        ProjectViewSchema::V1
+    } else {
         return Ok(None);
-    }
+    };
 
     let relay_self = info.relay_self.ok_or_else(|| {
         integrity_error("NIP-11 advertises Project View without a Relay `self` key")
@@ -153,7 +245,10 @@ pub(crate) async fn read_identity_at(
             "NIP-11 Relay `self` is not canonical lowercase hex",
         ));
     }
-    Ok(Some(ProjectViewIdentity { relay_pubkey }))
+    Ok(Some(ProjectViewIdentity {
+        relay_pubkey,
+        schema,
+    }))
 }
 
 async fn fetch_consistent_snapshot(
@@ -293,6 +388,325 @@ async fn fetch_snapshot_once(
     Ok(Some(ProjectSnapshot { meta, view }))
 }
 
+async fn fetch_consistent_v2_snapshot(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+) -> ProjectViewReadResult<Option<V2ProjectSnapshot>> {
+    for attempt in 0..SNAPSHOT_MAX_ATTEMPTS {
+        match fetch_v2_snapshot_once(state, identity).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(ProjectViewReadError::Conflict(_)) if attempt + 1 < SNAPSHOT_MAX_ATTEMPTS => {
+                let backoff_ms = 25_u64 << attempt;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(conflict_error(
+        "Project View v2 changed during every bounded snapshot attempt",
+    ))
+}
+
+async fn fetch_v2_snapshot_once(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+) -> ProjectViewReadResult<Option<V2ProjectSnapshot>> {
+    let Some(meta) = read_v2_meta(state, identity).await? else {
+        return Ok(None);
+    };
+    let ordinary_events = query_project_view(
+        state,
+        &[json!({
+            "kinds": [KIND_PROJECT_VIEW_OBJECT],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "#t": ["buzz-project-view-v2-object"],
+        })],
+    )
+    .await?;
+    let entity_events = query_project_view(
+        state,
+        &[json!({
+            "kinds": [KIND_PROJECT_VIEW_OBJECT],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+        })],
+    )
+    .await?;
+
+    let mut event_ids = HashSet::with_capacity(ordinary_events.len() + entity_events.len());
+    let mut object_ids = HashSet::new();
+    let mut entries = Vec::new();
+    for event in &ordinary_events {
+        if !event_ids.insert(event.id) {
+            return Err(integrity_read_error(
+                "v2 object query returned a duplicate event",
+            ));
+        }
+        let projection =
+            parse_v2_project_object_projection(event, &identity.relay_pubkey, meta.project_id)
+                .map_err(|error| integrity_read_error(error.to_string()))?;
+        validate_v2_projection_basis(
+            projection.projection_generation,
+            projection.project_revision,
+            &meta,
+        )?;
+        if let V2ProjectedObject::Active(object) = projection.object {
+            if !object_ids.insert(object.id) {
+                return Err(integrity_read_error(
+                    "v2 snapshot contains a duplicate active object ID",
+                ));
+            }
+            entries.push(ProjectViewEntry::Active(*object));
+        }
+    }
+
+    let mut roles = Vec::new();
+    let mut proposals = Vec::new();
+    let mut assignments = Vec::new();
+    let mut handoffs = Vec::new();
+    for event in &entity_events {
+        if !event_ids.insert(event.id) {
+            return Err(integrity_read_error(
+                "v2 entity query returned a duplicate event",
+            ));
+        }
+        let projection = parse_v2_entity_projection(event, &identity.relay_pubkey, meta.project_id)
+            .map_err(|error| integrity_read_error(error.to_string()))?;
+        validate_v2_projection_basis(
+            projection.projection_generation,
+            projection.project_revision,
+            &meta,
+        )?;
+        match projection.entity {
+            RoleContinuityChange::Role(role) => {
+                if !object_ids.insert(role.role_id) {
+                    return Err(integrity_read_error(
+                        "v2 Role head collides with another active object ID",
+                    ));
+                }
+                entries.push(ProjectViewEntry::Active(project_object_from_role(&role)));
+                roles.push(role);
+            }
+            RoleContinuityChange::Proposal(proposal) => proposals.push(proposal),
+            RoleContinuityChange::Assignment(assignment) => assignments.push(assignment),
+            RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff),
+        }
+    }
+    let membership = read_v2_membership(state, identity, &meta).await?;
+    validate_v2_counts_and_membership(
+        &meta,
+        &roles,
+        &proposals,
+        &assignments,
+        &handoffs,
+        &membership,
+    )?;
+
+    if entries.len() != meta.entity_counts.active_objects as usize {
+        return Err(integrity_read_error(format!(
+            "v2 snapshot contains {} active objects but metadata declares {}",
+            entries.len(),
+            meta.entity_counts.active_objects
+        )));
+    }
+    let initialized_at = entries.iter().find_map(|entry| match entry {
+        ProjectViewEntry::Active(object)
+            if object.object_type == ProjectViewObjectType::ProjectProfile =>
+        {
+            Some(object.created_at)
+        }
+        _ => None,
+    });
+    let project_state = ProjectViewState::from_snapshot(
+        meta.project_id,
+        meta.project_revision,
+        initialized_at,
+        Some(meta.updated_at),
+        entries,
+    )
+    .map_err(|error| integrity_read_error(format!("invalid v2 Project snapshot: {error}")))?;
+    let view = ProjectView::assemble(&project_state).map_err(|error| {
+        integrity_read_error(format!("cannot assemble v2 Project View: {error}"))
+    })?;
+
+    let final_meta = read_v2_meta(state, identity)
+        .await?
+        .ok_or_else(|| conflict_error("Project View v2 metadata disappeared"))?;
+    if final_meta.event_id != meta.event_id {
+        return Err(conflict_error(
+            "Project View v2 changed while assembling the snapshot",
+        ));
+    }
+    roles.sort_by_key(|role| role.role_id);
+    proposals.sort_by_key(|proposal| proposal.proposal_id);
+    assignments.sort_by_key(|assignment| assignment.assignment_id);
+    handoffs.sort_by_key(|handoff| handoff.handoff_id);
+    let members = membership
+        .members
+        .into_iter()
+        .map(|member| ProjectViewMembershipMember {
+            pubkey: member.pubkey.to_hex(),
+            role: member.role,
+        })
+        .collect();
+    Ok(Some(V2ProjectSnapshot {
+        meta,
+        view,
+        role_continuity: ProjectViewRoleContinuity {
+            roles,
+            proposals,
+            assignments,
+            handoffs,
+            members,
+        },
+    }))
+}
+
+fn project_object_from_role(role: &RoleDefinition) -> ProjectViewObject {
+    ProjectViewObject {
+        id: role.role_id,
+        object_type: ProjectViewObjectType::Role,
+        object_revision: role.object_revision,
+        project_revision: role.project_revision,
+        created_at: role.created_at,
+        updated_at: role.updated_at,
+        created_by: role.created_by,
+        updated_by: role.updated_by,
+        data: ProjectViewObjectData::Role(ProjectRole {
+            name: role.name.clone(),
+            purpose: role.purpose.clone(),
+            responsibilities: role.responsibilities.clone(),
+            boundaries: role.boundaries.clone(),
+            active: role.active,
+        }),
+        relations: ProjectViewRelations::default(),
+    }
+}
+
+fn validate_v2_projection_basis(
+    projection_generation: u64,
+    project_revision: u64,
+    meta: &V2MetaProjection,
+) -> ProjectViewReadResult<()> {
+    if projection_generation != meta.projection_generation {
+        return Err(conflict_error(
+            "v2 head generation differs from current metadata",
+        ));
+    }
+    if project_revision > meta.project_revision {
+        return Err(integrity_read_error(
+            "v2 head is newer than current metadata",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_v2_membership(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+    meta: &V2MetaProjection,
+) -> ProjectViewReadResult<V2MembershipProjection> {
+    let events = query_project_view(
+        state,
+        &[json!({
+            "ids": [meta.membership_snapshot_event_id.to_hex()],
+            "kinds": [KIND_NIP43_MEMBERSHIP_LIST],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "limit": 2,
+        })],
+    )
+    .await?;
+    let [event] = events.as_slice() else {
+        return Err(integrity_read_error(
+            "v2 metadata membership pointer did not resolve exactly once",
+        ));
+    };
+    if event.id != meta.membership_snapshot_event_id {
+        return Err(integrity_read_error(
+            "membership query returned an event other than the metadata pointer",
+        ));
+    }
+    parse_v2_membership_projection(event, &identity.relay_pubkey)
+        .map_err(|error| integrity_read_error(error.to_string()))
+}
+
+fn validate_v2_counts_and_membership(
+    meta: &V2MetaProjection,
+    roles: &[RoleDefinition],
+    proposals: &[RoleAssignmentProposal],
+    assignments: &[RoleAssignment],
+    handoffs: &[RoleHandoff],
+    membership: &V2MembershipProjection,
+) -> ProjectViewReadResult<()> {
+    let open_proposals = proposals
+        .iter()
+        .filter(|proposal| proposal.status == ProposalStatus::Open)
+        .count();
+    let active_assignments = assignments
+        .iter()
+        .filter(|assignment| assignment.is_active())
+        .count();
+    if usize::try_from(meta.entity_counts.open_proposals).ok() != Some(open_proposals)
+        || usize::try_from(meta.entity_counts.active_assignments).ok() != Some(active_assignments)
+        || usize::try_from(meta.entity_counts.handoffs).ok() != Some(handoffs.len())
+    {
+        return Err(integrity_read_error(
+            "v2 metadata counts disagree with verified Role heads",
+        ));
+    }
+    let roles_by_id = roles
+        .iter()
+        .map(|role| (role.role_id, role))
+        .collect::<BTreeMap<_, _>>();
+    let members = membership
+        .members
+        .iter()
+        .map(|member| (member.pubkey, member.role))
+        .collect::<BTreeMap<_, _>>();
+    let mut assigned_members = HashSet::new();
+    for assignment in assignments
+        .iter()
+        .filter(|assignment| assignment.is_active())
+    {
+        if !assigned_members.insert(assignment.member_pubkey) {
+            return Err(integrity_read_error(
+                "one Member has multiple active Assignment heads",
+            ));
+        }
+        let role = roles_by_id.get(&assignment.role_id).ok_or_else(|| {
+            integrity_read_error("an active Assignment references a missing Role")
+        })?;
+        let actual_role = members
+            .get(&assignment.member_pubkey)
+            .ok_or_else(|| integrity_read_error("an active assignee is absent from membership"))?;
+        let expected_role = match role.level {
+            RoleLevel::Admin => CommunityMemberRole::Admin,
+            RoleLevel::Member => CommunityMemberRole::Member,
+        };
+        if *actual_role != CommunityMemberRole::Owner && *actual_role != expected_role {
+            return Err(integrity_read_error(
+                "an active Assignment disagrees with Community membership",
+            ));
+        }
+    }
+    for (pubkey, role) in members {
+        if role == CommunityMemberRole::Admin
+            && !assignments.iter().any(|assignment| {
+                assignment.is_active()
+                    && assignment.member_pubkey == pubkey
+                    && roles_by_id
+                        .get(&assignment.role_id)
+                        .is_some_and(|role| role.level == RoleLevel::Admin)
+            })
+        {
+            return Err(integrity_read_error(
+                "a non-owner admin has no active Leader Assignment",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn read_meta(
     state: &AppState,
     identity: ProjectViewIdentity,
@@ -313,6 +727,30 @@ async fn read_meta(
             .map_err(|error| integrity_read_error(error.to_string())),
         _ => Err(integrity_read_error(
             "metadata query returned multiple current heads",
+        )),
+    }
+}
+
+async fn read_v2_meta(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+) -> ProjectViewReadResult<Option<V2MetaProjection>> {
+    let events = query_project_view(
+        state,
+        &[json!({
+            "kinds": [KIND_PROJECT_VIEW_META],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "limit": 2,
+        })],
+    )
+    .await?;
+    match events.as_slice() {
+        [] => Ok(None),
+        [event] => parse_v2_meta_projection(event, &identity.relay_pubkey)
+            .map(Some)
+            .map_err(|error| integrity_read_error(error.to_string())),
+        _ => Err(integrity_read_error(
+            "v2 metadata query returned multiple current heads",
         )),
     }
 }
@@ -367,297 +805,5 @@ fn integrity_error(message: impl Into<String>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    use axum::extract::State as AxumState;
-    use axum::http::StatusCode;
-    use axum::routing::{get, post};
-    use axum::{Json, Router};
-    use buzz_core_pkg::CommunityId;
-    use buzz_project_view_pkg::{
-        InitializeGoal, InitializeMutation, Mutation, MutationRequest, ProjectProfile,
-        ProjectionPlan,
-    };
-    use buzz_sdk_pkg::project_view::{
-        build_meta_projection, build_object_projection, changed_head_for,
-    };
-    use nostr::Keys;
-    use serde_json::Value;
-    use tokio::net::TcpListener;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::app_state::build_app_state;
-
-    #[derive(Clone)]
-    struct SnapshotServerState {
-        relay_pubkey: String,
-        meta: Event,
-        objects: Vec<Event>,
-        meta_queries: Arc<AtomicUsize>,
-        snapshot_queries: Arc<AtomicUsize>,
-    }
-
-    async fn snapshot_info(AxumState(state): AxumState<SnapshotServerState>) -> Json<Value> {
-        Json(json!({
-            "supported_extensions": [PROJECT_VIEW_EXTENSION],
-            "self": state.relay_pubkey,
-        }))
-    }
-
-    async fn snapshot_query(
-        AxumState(state): AxumState<SnapshotServerState>,
-        Json(filters): Json<Vec<Value>>,
-    ) -> Json<Value> {
-        let filter = filters.first().cloned().unwrap_or_else(|| json!({}));
-        if filter.get("buzz_project_view").is_some() {
-            state.snapshot_queries.fetch_add(1, Ordering::SeqCst);
-            Json(serde_json::to_value(state.objects).expect("serialize object projections"))
-        } else {
-            state.meta_queries.fetch_add(1, Ordering::SeqCst);
-            Json(serde_json::to_value([state.meta]).expect("serialize metadata projection"))
-        }
-    }
-
-    async fn spawn_snapshot_server(state: SnapshotServerState) -> String {
-        let app = Router::new()
-            .route("/info", get(snapshot_info))
-            .route("/query", post(snapshot_query))
-            .with_state(state);
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Project View test server");
-        let address = listener.local_addr().expect("read test server address");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve Project View fixture");
-        });
-        format!("http://{address}")
-    }
-
-    #[derive(Clone)]
-    struct IdentityServerState {
-        relay_pubkey: String,
-    }
-
-    async fn identity_info(AxumState(state): AxumState<IdentityServerState>) -> Json<Value> {
-        Json(json!({
-            "supported_extensions": [PROJECT_VIEW_EXTENSION],
-            "self": state.relay_pubkey,
-        }))
-    }
-
-    async fn unsupported_info() -> Json<Value> {
-        Json(json!({
-            "supported_extensions": [],
-        }))
-    }
-
-    async fn empty_query() -> Json<Value> {
-        Json(json!([]))
-    }
-
-    async fn forbidden_query() -> (StatusCode, Json<Value>) {
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "not authorized"})),
-        )
-    }
-
-    async fn spawn_identity_server(
-        relay_pubkey: String,
-        query_handler: axum::routing::MethodRouter<IdentityServerState>,
-    ) -> String {
-        let app = Router::new()
-            .route("/info", get(identity_info))
-            .route("/query", query_handler)
-            .with_state(IdentityServerState { relay_pubkey });
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Project View state test server");
-        let address = listener.local_addr().expect("read test server address");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve Project View state fixture");
-        });
-        format!("http://{address}")
-    }
-
-    async fn spawn_unsupported_server() -> String {
-        let app = Router::new().route("/info", get(unsupported_info));
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind unsupported Project View test server");
-        let address = listener.local_addr().expect("read test server address");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve unsupported Project View fixture");
-        });
-        format!("http://{address}")
-    }
-
-    fn projection_fixture() -> SnapshotServerState {
-        let project_id = CommunityId::from_uuid(Uuid::new_v4());
-        let mutation = Mutation::new(
-            0,
-            MutationRequest::Initialize(InitializeMutation {
-                profile: ProjectProfile {
-                    name: "Desktop integration".to_owned(),
-                    positioning: "Verified snapshots".to_owned(),
-                    purpose: "Exercise the native client boundary".to_owned(),
-                    problem: "Untrusted projection input".to_owned(),
-                    scope: "Project View".to_owned(),
-                },
-                goals: vec![InitializeGoal {
-                    id: Uuid::new_v4(),
-                    title: "Ship".to_owned(),
-                    desired_outcome: "One consistent desktop read model".to_owned(),
-                    directions: Vec::new(),
-                }],
-            }),
-        );
-        let (state, outcome) = ProjectViewState::new(project_id)
-            .reduce(
-                &mutation,
-                Keys::generate().public_key(),
-                DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("fixture timestamp"),
-            )
-            .expect("initialize fixture");
-        let plan = ProjectionPlan::for_mutation(&state, &outcome, [0x44; 32], 1)
-            .expect("build projection plan");
-        let relay = Keys::generate();
-        let mut paired = plan
-            .entries()
-            .iter()
-            .map(|entry| {
-                let event = build_object_projection(&plan, entry)
-                    .expect("build object projection")
-                    .sign_with_keys(&relay)
-                    .expect("sign object projection");
-                let head = changed_head_for(&plan, entry, &event).expect("build changed head");
-                (
-                    entry.object_type().as_str().to_owned(),
-                    entry.id(),
-                    event,
-                    head,
-                )
-            })
-            .collect::<Vec<_>>();
-        paired.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
-        });
-        let heads = paired
-            .iter()
-            .map(|(_, _, _, head)| head.clone())
-            .collect::<Vec<_>>();
-        let objects = paired.into_iter().map(|(_, _, event, _)| event).collect();
-        let meta = build_meta_projection(&plan, &heads)
-            .expect("build metadata projection")
-            .sign_with_keys(&relay)
-            .expect("sign metadata projection");
-        SnapshotServerState {
-            relay_pubkey: relay.public_key().to_hex(),
-            meta,
-            objects,
-            meta_queries: Arc::new(AtomicUsize::new(0)),
-            snapshot_queries: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    #[tokio::test]
-    async fn desktop_snapshot_verifies_and_assembles_read_model() {
-        let fixture = projection_fixture();
-        let counters = fixture.clone();
-        let url = spawn_snapshot_server(fixture).await;
-        let state = build_app_state();
-        *state
-            .relay_url_override
-            .lock()
-            .expect("lock Relay override") = Some(url);
-
-        let result = load_project_view(&state)
-            .await
-            .expect("load verified Project View");
-        let ProjectViewLoadResult::Ready {
-            project_revision,
-            active_object_count,
-            view,
-            ..
-        } = result
-        else {
-            panic!("expected initialized Project View");
-        };
-
-        assert_eq!(project_revision, 1);
-        assert_eq!(active_object_count, 2);
-        assert_eq!(view.goals.len(), 1);
-        assert_eq!(
-            counters.meta_queries.load(Ordering::SeqCst),
-            2,
-            "snapshot must bracket pagination with metadata reads"
-        );
-        assert_eq!(counters.snapshot_queries.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn desktop_snapshot_rejects_a_projection_from_an_unadvertised_signer() {
-        let mut fixture = projection_fixture();
-        fixture.relay_pubkey = Keys::generate().public_key().to_hex();
-        let url = spawn_snapshot_server(fixture).await;
-        let state = build_app_state();
-        *state
-            .relay_url_override
-            .lock()
-            .expect("lock Relay override") = Some(url);
-
-        let error = load_project_view(&state)
-            .await
-            .expect_err("wrongly signed Project View must fail closed");
-        assert!(error.starts_with("Project View integrity error:"));
-    }
-
-    #[tokio::test]
-    async fn desktop_reports_capability_initialization_and_permission_states() {
-        let unsupported_url = spawn_unsupported_server().await;
-        let unsupported_state = build_app_state();
-        *unsupported_state
-            .relay_url_override
-            .lock()
-            .expect("lock Relay override") = Some(unsupported_url);
-        assert!(matches!(
-            load_project_view(&unsupported_state).await,
-            Ok(ProjectViewLoadResult::Unsupported)
-        ));
-
-        let relay_pubkey = Keys::generate().public_key().to_hex();
-        let uninitialized_url =
-            spawn_identity_server(relay_pubkey.clone(), post(empty_query)).await;
-        let uninitialized_state = build_app_state();
-        *uninitialized_state
-            .relay_url_override
-            .lock()
-            .expect("lock Relay override") = Some(uninitialized_url);
-        assert!(matches!(
-            load_project_view(&uninitialized_state).await,
-            Ok(ProjectViewLoadResult::Uninitialized { .. })
-        ));
-
-        let forbidden_url = spawn_identity_server(relay_pubkey, post(forbidden_query)).await;
-        let forbidden_state = build_app_state();
-        *forbidden_state
-            .relay_url_override
-            .lock()
-            .expect("lock Relay override") = Some(forbidden_url);
-        assert!(matches!(
-            load_project_view(&forbidden_state).await,
-            Ok(ProjectViewLoadResult::Forbidden)
-        ));
-    }
-}
+#[path = "project_view_tests.rs"]
+mod tests;

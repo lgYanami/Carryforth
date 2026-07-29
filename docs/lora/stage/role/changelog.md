@@ -1,5 +1,77 @@
 # 角色连续性变更记录
 
+## 2026-07-28 — 阶段 3：Desktop Human 治理
+
+### v2 普通 Project View 对象写入
+
+- 补齐 schema-v2 `initialize/create/update/delete` command 信封，复用既有对象 reducer，
+  但显式携带 `schema_version = 2`、`expected_project_revision` 和可选
+  `acting_assignment_id`。v1 wire command 不会被当成 v2 接受。
+- Relay 按 v2 command 的 closed shape 区分普通对象写入与 Role Continuity command；
+  普通对象同样经过 Community Project lock、全局 project revision、幂等 receipt、
+  canonical row、旧 head retirement、`40903` object/Role head 和 `40904` meta 的单事务
+  提交。
+- v2 新建 Role 默认是普通 `member` level；通用 Role 更新保留既有 level，不能借对象
+  patch 升降级。Role 仍有 active Assignment 时，通用停用和删除在服务端准备阶段拒绝，
+  不依赖 Desktop 按钮守卫。
+- Desktop native mutation 根据 NIP-11 capability 生成 v1 或 v2 command，并对返回的
+  object/meta projection 做 schema-aware 签名与 source/revision 确认；revision conflict
+  返回 typed result，不自动重放 Human intent。
+
+### Desktop verified read 与 Role 治理
+
+- Tauri `get_project_view` 支持 verified v2 snapshot：固定 NIP-11 Relay identity，校验
+  meta、普通 object、Role/Proposal/Assignment/Handoff entity head、membership snapshot、
+  counts、generation、revision 与 source pointer，再把组装后的 typed DTO 交给 React。
+- `View` 的 Role 卡显示 `Leader/Role` level、当前承担者、vacant 与 inactive 状态；Role
+  Inspector 显示当前任期、open Proposal、历史任期和最小 Handoff，承担者名称与普通成员
+  profile 共用同一解析结果。
+- 增加 typed Tauri Role mutation，覆盖 request、offer、accept、reject、withdraw、
+  authorize 和治理性 end。owner 可以治理全部 Role，active Leader 只能治理普通 Role；
+  普通成员可请求 Role 或处理属于自己的 Proposal，assignee 不获得主动结束自己任期的入口。
+- 指派/替换候选人只来自 verified Community membership；写入带当前 project revision。
+  409 conflict 会使当前 Community 的 Project View query 失效并读取最新快照，旧表单动作
+  不会在新 revision 上自动执行。
+- 普通 Role 编辑器在有 active Assignment 时禁用 deactivate，Inspector 禁用通用 delete；
+  即使绕过 UI，Relay/DB 仍执行相同硬约束。
+
+### Community Members 设置与 Community 隔离
+
+- v1 Community 保留原 invite、promote、demote、remove 行为；v2 Community 的 Settings
+  fail closed，隐藏直接邀请与等级/删除 mutation，并统一引导到 `View` 的 Role 治理流程。
+- v2 成员行显示当前 Role，不能从 Settings 直接制造没有 Leader Assignment 的 admin，
+  也不能直接删除有任期的 Member；Relay 继续作为最终权限边界。
+- Role continuity 不增加 module-level Community cache，沿用包含 Community identity 的
+  Project View query key 和现有 key-based remount。切换 Community 后会重新读取对应
+  snapshot，不复用上一项目的 Assignment。
+- 将 Role continuity API、integrity error 与大型 Tauri 测试夹具拆为独立模块，所有
+  Desktop 源文件继续满足 1000 行硬上限。
+
+### 验证
+
+- Desktop 单元测试 `3507/3507`、Biome/file-size/px-text/pubkey guards、TypeScript
+  `--noEmit` 均通过。
+- Project View Playwright smoke `24/24` 通过；新增场景覆盖 v2 Role 卡与 Inspector、
+  owner 携 revision 发起 Offer、conflict 刷新且不重放、Settings 不直接改 admin，以及
+  Community 切换后 assigned→vacant 不泄漏。
+- Tauri Project View 定向测试 `12/12` 通过，覆盖 verified snapshot、capability 状态、
+  typed mutation、签名投影确认、revision conflict 不重试和 Role command 输入边界。
+- `buzz-project-view` v2 object command 测试、`buzz-sdk` v2 projection 测试与
+  `buzz-db` PostgreSQL 纵向测试通过；实库测试验证 cutover 后普通 Goal 写入进入同一
+  revision/projection 流，active Assignment Role 的通用停用不会提交。
+- `buzz-project-view`、`buzz-sdk`、`buzz-db`、`buzz-relay` 和 Desktop Tauri 的
+  `clippy --all-targets -D warnings` 均通过。
+
+### 范围边界
+
+- 本阶段交付 Human 对 Assignment 的完整首轮治理面，但尚未让 managed Agent Runtime
+  自动解析和携带自己的 Assignment；Agent 仍通过阶段 2 的 `buzz roles` CLI 显式操作。
+- Role Inspector 目前展示阶段 2 的最小 Handoff；Work Commitment、结构化 Checkpoint、
+  完整 Role Brief 和可信 runtime 自动故障恢复分别留在后续阶段。
+- 下一阶段是 managed Agent 绑定与最小 Role Brief：Runtime 在启动和每个 turn 前读取
+  verified active Assignment，动态注入 Role 上下文，并让所有角色身份写入自动携带
+  `acting_assignment_id`。
+
 ## 2026-07-28 — 阶段 2：Proposal、Assignment 与 CLI 纵向闭环
 
 ### Role Continuity 状态机

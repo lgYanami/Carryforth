@@ -8,8 +8,8 @@ use buzz_core::kind::{
 };
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::{
-    CommunityMemberRole, RoleAssignment, RoleAssignmentProposal, RoleCommand, RoleContinuityChange,
-    RoleContinuityEntity, RoleDefinition, RoleHandoff, SchemaVersion,
+    CommunityMemberRole, ProjectObjectCommand, RoleAssignment, RoleAssignmentProposal, RoleCommand,
+    RoleContinuityChange, RoleContinuityEntity, RoleDefinition, RoleHandoff, SchemaVersion,
 };
 use buzz_project_view::{
     validate_projected_object, ProjectViewEntry, ProjectViewObject, ProjectViewObjectType,
@@ -36,6 +36,24 @@ pub fn build_role_command(command: RoleCommand) -> Result<EventBuilder, SdkError
     let content = serde_json::to_string(&command)
         .map_err(|error| SdkError::InvalidInput(format!("serialize Role command: {error}")))?;
     RoleCommand::from_json(&content).map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    Ok(
+        EventBuilder::new(Kind::Custom(KIND_PROJECT_VIEW_MUTATION as u16), content)
+            .tags([tag(["-"])?, tag(["t", PROJECT_VIEW_MUTATION_TAG])?]),
+    )
+}
+
+/// Build a protected kind `44300` schema-v2 ordinary-object command.
+pub fn build_project_object_command(
+    command: ProjectObjectCommand,
+) -> Result<EventBuilder, SdkError> {
+    command
+        .validate_for_submission()
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let content = serde_json::to_string(&command).map_err(|error| {
+        SdkError::InvalidInput(format!("serialize v2 Project object command: {error}"))
+    })?;
+    ProjectObjectCommand::from_json(&content)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
     Ok(
         EventBuilder::new(Kind::Custom(KIND_PROJECT_VIEW_MUTATION as u16), content)
             .tags([tag(["-"])?, tag(["t", PROJECT_VIEW_MUTATION_TAG])?]),
@@ -133,18 +151,81 @@ pub struct V2EntityCounts {
     pub handoffs: u32,
 }
 
-/// One signed v2 entity head referenced by metadata.
+/// One signed v2 head referenced by incremental metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct V2ChangedHead {
-    /// Stable entity coordinate.
-    pub coordinate: String,
+#[serde(tag = "head_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum V2ChangedHead {
+    /// Role-continuity entity head.
+    Entity {
+        /// Stable entity coordinate.
+        coordinate: String,
+        /// Signed head event ID.
+        event_id: EventId,
+        /// Entity discriminator.
+        entity_type: RoleContinuityEntity,
+        /// Per-entity revision.
+        entity_revision: u64,
+    },
+    /// Ordinary Project View object or tombstone head.
+    Object {
+        /// Stable object coordinate.
+        coordinate: String,
+        /// Signed head event ID.
+        event_id: EventId,
+        /// Immutable object type.
+        object_type: ProjectViewObjectType,
+        /// Per-object revision.
+        object_revision: u64,
+    },
+}
+
+impl V2ChangedHead {
+    /// Stable replaceable-event coordinate.
+    #[must_use]
+    pub fn coordinate(&self) -> &str {
+        match self {
+            Self::Entity { coordinate, .. } | Self::Object { coordinate, .. } => coordinate,
+        }
+    }
+
     /// Signed head event ID.
-    pub event_id: EventId,
-    /// Entity discriminator.
-    pub entity_type: RoleContinuityEntity,
-    /// Per-entity revision.
-    pub entity_revision: u64,
+    #[must_use]
+    pub const fn event_id(&self) -> EventId {
+        match self {
+            Self::Entity { event_id, .. } | Self::Object { event_id, .. } => *event_id,
+        }
+    }
+
+    /// Entity discriminator when this binds a continuity entity.
+    #[must_use]
+    pub const fn entity_type(&self) -> Option<RoleContinuityEntity> {
+        match self {
+            Self::Entity { entity_type, .. } => Some(*entity_type),
+            Self::Object { .. } => None,
+        }
+    }
+
+    /// Object discriminator when this binds an ordinary object head.
+    #[must_use]
+    pub const fn object_type(&self) -> Option<ProjectViewObjectType> {
+        match self {
+            Self::Entity { .. } => None,
+            Self::Object { object_type, .. } => Some(*object_type),
+        }
+    }
+
+    /// Per-head revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        match self {
+            Self::Entity {
+                entity_revision, ..
+            } => *entity_revision,
+            Self::Object {
+                object_revision, ..
+            } => *object_revision,
+        }
+    }
 }
 
 /// Verified v2 continuity entity projection.
@@ -620,7 +701,7 @@ pub fn changed_head_for(
             "v2 changed head has the wrong event kind".to_owned(),
         ));
     }
-    Ok(V2ChangedHead {
+    Ok(V2ChangedHead::Entity {
         coordinate: entity_projection_coordinate(
             context.project_id,
             entity.entity_type(),
@@ -632,7 +713,30 @@ pub fn changed_head_for(
     })
 }
 
-/// Build unsigned v2 metadata after every changed entity has been signed.
+/// Bind a signed ordinary-object event into a v2 metadata changed-head entry.
+pub fn changed_head_for_project_object(
+    context: &V2ProjectionContext,
+    entry: &ProjectViewEntry,
+    event: &Event,
+) -> Result<V2ChangedHead, SdkError> {
+    if event.kind.as_u16() as u32 != KIND_PROJECT_VIEW_OBJECT {
+        return Err(SdkError::InvalidInput(
+            "v2 changed head has the wrong event kind".to_owned(),
+        ));
+    }
+    Ok(V2ChangedHead::Object {
+        coordinate: crate::project_view::object_projection_coordinate(
+            context.project_id,
+            entry.object_type(),
+            entry.id(),
+        ),
+        event_id: event.id,
+        object_type: entry.object_type(),
+        object_revision: entry.object_revision(),
+    })
+}
+
+/// Build unsigned v2 metadata after every changed head has been signed.
 pub fn build_meta_projection(
     context: &V2ProjectionContext,
     counts: V2EntityCounts,
@@ -654,7 +758,7 @@ pub fn build_meta_projection(
     let mut coordinates = HashSet::with_capacity(changed_heads.len());
     if changed_heads
         .iter()
-        .any(|head| !coordinates.insert(head.coordinate.as_str()))
+        .any(|head| !coordinates.insert(head.coordinate()))
     {
         return Err(SdkError::InvalidInput(
             "v2 metadata contains duplicate changed heads".to_owned(),
@@ -785,13 +889,28 @@ pub fn parse_meta_projection(
     let project_id = CommunityId::from_uuid(raw.project_id);
     let mut coordinates = HashSet::with_capacity(raw.changed_heads.len());
     for head in &raw.changed_heads {
-        require_revision(head.entity_revision, "changed_heads.entity_revision")?;
-        let expected = entity_projection_coordinate(
-            project_id,
-            head.entity_type,
-            parse_coordinate_id(&head.coordinate, project_id, head.entity_type)?,
-        );
-        if head.coordinate != expected || !coordinates.insert(head.coordinate.as_str()) {
+        require_revision(head.revision(), "changed_heads.revision")?;
+        let expected = match head {
+            V2ChangedHead::Entity {
+                coordinate,
+                entity_type,
+                ..
+            } => entity_projection_coordinate(
+                project_id,
+                *entity_type,
+                parse_coordinate_id(coordinate, project_id, *entity_type)?,
+            ),
+            V2ChangedHead::Object {
+                coordinate,
+                object_type,
+                ..
+            } => crate::project_view::object_projection_coordinate(
+                project_id,
+                *object_type,
+                parse_object_coordinate_id(coordinate, project_id, *object_type)?,
+            ),
+        };
+        if head.coordinate() != expected || !coordinates.insert(head.coordinate()) {
             return Err(invalid_projection(
                 "v2 metadata changed-head coordinate is invalid or duplicated",
             ));
@@ -1090,6 +1209,29 @@ fn parse_coordinate_id(
     if id.is_nil() || id.to_string() != parts[3] {
         return Err(invalid_projection(
             "v2 entity coordinate UUID is not canonical",
+        ));
+    }
+    Ok(id)
+}
+
+fn parse_object_coordinate_id(
+    coordinate: &str,
+    project_id: CommunityId,
+    object_type: ProjectViewObjectType,
+) -> Result<Uuid, SdkError> {
+    let parts = coordinate.split(':').collect::<Vec<_>>();
+    if parts.len() != 4
+        || parts[0] != "project-view"
+        || parts[1] != project_id.as_uuid().to_string()
+        || parts[2] != object_type.as_str()
+    {
+        return Err(invalid_projection("invalid v2 object coordinate"));
+    }
+    let id = Uuid::parse_str(parts[3])
+        .map_err(|error| invalid_projection(format!("invalid object coordinate UUID: {error}")))?;
+    if id.is_nil() || id.to_string() != parts[3] {
+        return Err(invalid_projection(
+            "v2 object coordinate UUID is not canonical",
         ));
     }
     Ok(id)

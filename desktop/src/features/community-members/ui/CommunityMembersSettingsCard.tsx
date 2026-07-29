@@ -3,6 +3,7 @@ import { nip19 } from "nostr-tools";
 import * as React from "react";
 import { toast } from "sonner";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
   useChangeRelayMemberRoleMutation,
   useMyRelayMembershipLookupQuery,
@@ -11,6 +12,7 @@ import {
 } from "@/features/community-members/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { useProjectViewQuery } from "@/features/project-view/hooks";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
 import type {
   RelayMember,
@@ -85,13 +87,21 @@ function HoverMemberIdentity({
 function RelayMemberRow({
   currentRole,
   currentPubkey,
+  directMembershipAllowed,
+  onManageInView,
   profile,
   member,
+  roleGoverned,
+  roleName,
 }: {
   currentRole: RelayMemberRole;
   currentPubkey?: string;
+  directMembershipAllowed: boolean;
+  onManageInView: () => void;
   profile?: UserProfileSummary;
   member: RelayMember;
+  roleGoverned: boolean;
+  roleName?: string;
 }) {
   const removeMutation = useRemoveRelayMemberMutation();
   const changeRoleMutation = useChangeRelayMemberRoleMutation();
@@ -100,12 +110,20 @@ function RelayMemberRow({
     : false;
   const isBusy = removeMutation.isPending || changeRoleMutation.isPending;
   const canRemove =
+    directMembershipAllowed &&
     !isSelf &&
     member.role !== "owner" &&
     (currentRole === "owner" || member.role === "member");
-  const canPromote = currentRole === "owner" && member.role === "member";
-  const canDemote = currentRole === "owner" && member.role === "admin";
-  const hasActions = canRemove || canPromote || canDemote;
+  const canPromote =
+    directMembershipAllowed &&
+    currentRole === "owner" &&
+    member.role === "member";
+  const canDemote =
+    directMembershipAllowed &&
+    currentRole === "owner" &&
+    member.role === "admin";
+  const canManageInView = roleGoverned && member.role !== "owner";
+  const hasActions = canRemove || canPromote || canDemote || canManageInView;
   const displayName = formatDisplayName(member, profile?.displayName);
 
   async function mutateWithToast(
@@ -153,6 +171,14 @@ function RelayMemberRow({
             ·
           </span>
           <span className="shrink-0">Added {formatDate(member.createdAt)}</span>
+          {roleName ? (
+            <>
+              <span aria-hidden="true" className="shrink-0">
+                ·
+              </span>
+              <span className="min-w-0 truncate">{roleName}</span>
+            </>
+          ) : null}
           {isSelf ? (
             <>
               <span aria-hidden="true" className="shrink-0">
@@ -178,6 +204,11 @@ function RelayMemberRow({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
+            {canManageInView ? (
+              <DropdownMenuItem onClick={onManageInView}>
+                Manage Role in View
+              </DropdownMenuItem>
+            ) : null}
             {canPromote ? (
               <DropdownMenuItem
                 onClick={() =>
@@ -238,7 +269,34 @@ export function CommunityMembersSettingsCard({
 }: {
   currentPubkey?: string;
 }) {
+  const { goView } = useAppNavigation();
   const myMembershipQuery = useMyRelayMembershipLookupQuery();
+  const projectViewQuery = useProjectViewQuery();
+  const roleContinuity =
+    projectViewQuery.data?.status === "ready" &&
+    projectViewQuery.data.schemaVersion === 2
+      ? projectViewQuery.data.roleContinuity
+      : undefined;
+  const roleGoverned = Boolean(roleContinuity);
+  const directMembershipAllowed =
+    projectViewQuery.data?.status === "unsupported" ||
+    projectViewQuery.data?.status === "uninitialized" ||
+    (projectViewQuery.data?.status === "ready" &&
+      projectViewQuery.data.schemaVersion === 1);
+  const roleNamesByMember = React.useMemo(() => {
+    const names = new Map<string, string>();
+    if (!roleContinuity) return names;
+    const namesByRole = new Map(
+      roleContinuity.roles.map((role) => [role.roleId, role.name]),
+    );
+    for (const assignment of roleContinuity.assignments) {
+      if (assignment.endedAt) continue;
+      const roleName = namesByRole.get(assignment.roleId);
+      if (roleName)
+        names.set(normalizePubkey(assignment.memberPubkey), roleName);
+    }
+    return names;
+  }, [roleContinuity]);
   const currentRole = myMembershipQuery.data?.membership?.role ?? null;
   const canManageRelay = currentRole === "owner" || currentRole === "admin";
   const membersQuery = useRelayMembersQuery(canManageRelay);
@@ -293,15 +351,35 @@ export function CommunityMembersSettingsCard({
     <section className="min-w-0" data-testid="settings-community-members">
       <SettingsSectionHeader
         action={
-          <Button
-            data-testid="community-invite-dialog-trigger"
-            onClick={() => setInviteDialogOpen(true)}
-          >
-            Invite to community
-          </Button>
+          roleGoverned ? (
+            <Button
+              data-testid="community-members-manage-in-view"
+              onClick={() => void goView()}
+              variant="outline"
+            >
+              Manage Roles in View
+            </Button>
+          ) : directMembershipAllowed ? (
+            <Button
+              data-testid="community-invite-dialog-trigger"
+              onClick={() => setInviteDialogOpen(true)}
+            >
+              Invite to community
+            </Button>
+          ) : (
+            <Button disabled variant="outline">
+              Checking View governance…
+            </Button>
+          )
         }
         title="Invites"
-        description="Manage members and community access."
+        description={
+          roleGoverned
+            ? "Role levels and active tenures are governed in View; direct admin changes and member removal are disabled here."
+            : directMembershipAllowed
+              ? "Manage members and community access."
+              : "Membership changes are disabled until View governance can be verified."
+        }
       />
 
       <div className="overflow-hidden rounded-2xl border border-border/70 bg-background/70 shadow-xs">
@@ -360,8 +438,14 @@ export function CommunityMembersSettingsCard({
                 <RelayMemberRow
                   currentPubkey={currentPubkey}
                   currentRole={currentRole}
+                  directMembershipAllowed={directMembershipAllowed}
                   member={member}
+                  onManageInView={() => void goView()}
                   profile={profiles?.[normalizePubkey(member.pubkey)]}
+                  roleGoverned={roleGoverned}
+                  roleName={roleNamesByMember.get(
+                    normalizePubkey(member.pubkey),
+                  )}
                 />
               )}
             />
@@ -369,10 +453,12 @@ export function CommunityMembersSettingsCard({
         </div>
       </div>
 
-      <CommunityInviteDialog
-        onOpenChange={setInviteDialogOpen}
-        open={inviteDialogOpen}
-      />
+      {directMembershipAllowed ? (
+        <CommunityInviteDialog
+          onOpenChange={setInviteDialogOpen}
+          open={inviteDialogOpen}
+        />
+      ) : null}
     </section>
   );
 }

@@ -18,9 +18,12 @@ import {
 } from "@/features/project-view/model";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
+import { ProjectRoleInspector } from "@/features/project-view/ui/ProjectRoleInspector";
 import type {
+  ProjectRoleDefinition,
   ProjectView,
   ProjectViewObject,
+  ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
 import { useIsAuxiliaryPanelOverlay } from "@/shared/hooks/use-mobile";
 import { Badge } from "@/shared/ui/badge";
@@ -42,6 +45,9 @@ type ProjectViewInspectorProps = {
   onDelete: (object: ProjectViewObject) => void;
   onEdit: (object: ProjectViewObject) => void;
   onSelectObject: (objectId: string) => void;
+  projectRevision: number;
+  roleContinuity?: ProjectViewRoleContinuity;
+  roleDefinition?: ProjectRoleDefinition;
   view: ProjectView;
 };
 
@@ -186,6 +192,9 @@ function ProjectViewInspectorContent({
   onDelete,
   onEdit,
   onSelectObject,
+  projectRevision,
+  roleContinuity,
+  roleDefinition,
   view,
 }: ProjectViewInspectorProps) {
   const status = projectViewObjectStatus(object);
@@ -209,6 +218,13 @@ function ProjectViewInspectorContent({
       : null,
   ].filter((relation): relation is { label: string; id: string } =>
     Boolean(relation),
+  );
+  const roleHasActiveAssignment = Boolean(
+    roleDefinition &&
+      roleContinuity?.assignments.some(
+        (assignment) =>
+          assignment.roleId === roleDefinition.roleId && !assignment.endedAt,
+      ),
   );
 
   return (
@@ -255,7 +271,13 @@ function ProjectViewInspectorContent({
             Edit
           </Button>
           <Button
+            disabled={roleHasActiveAssignment}
             onClick={() => onDelete(object)}
+            title={
+              roleHasActiveAssignment
+                ? "End the active Assignment before deleting this Role."
+                : undefined
+            }
             type="button"
             variant="outline"
           >
@@ -267,6 +289,26 @@ function ProjectViewInspectorContent({
         <div className="space-y-4">
           <ObjectDetails object={object} />
         </div>
+
+        {roleHasActiveAssignment ? (
+          <p
+            className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-muted-foreground"
+            data-testid="project-role-lifecycle-guard"
+          >
+            This Role has an active Assignment. End or replace the tenure before
+            deactivating or deleting the Role.
+          </p>
+        ) : null}
+
+        {object.objectType === "role" && roleContinuity && roleDefinition ? (
+          <ProjectRoleInspector
+            actorProfiles={actorProfiles}
+            continuity={roleContinuity}
+            currentPubkey={currentPubkey}
+            definition={roleDefinition}
+            projectRevision={projectRevision}
+          />
+        ) : null}
 
         {relations.length > 0 || issueRefs.length > 0 ? (
           <section className="space-y-2">

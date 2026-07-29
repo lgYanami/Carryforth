@@ -33,6 +33,7 @@ import { ProjectViewInspector } from "@/features/project-view/ui/ProjectViewInsp
 import { ProjectViewMap } from "@/features/project-view/ui/ProjectViewMap";
 import { ProjectViewObjectDialog } from "@/features/project-view/ui/ProjectViewObjectDialog";
 import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
+import { ProjectRoleCard } from "@/features/project-view/ui/ProjectRoleCard";
 import {
   createProjectViewInitializationDraft,
   isProjectViewInitializationDraftDirty,
@@ -53,6 +54,7 @@ import type {
   ProjectViewMutationResult,
   ProjectViewObject,
   ProjectViewObjectType,
+  ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
@@ -177,6 +179,7 @@ function SupportingObjects({
   currentPubkey,
   onCreateObject,
   onSelectObject,
+  roleContinuity,
   selectedObjectId,
   view,
 }: {
@@ -187,9 +190,30 @@ function SupportingObjects({
     context?: ProjectViewCreateContext,
   ) => void;
   onSelectObject: (objectId: string) => void;
+  roleContinuity?: ProjectViewRoleContinuity;
   selectedObjectId?: string;
   view: ProjectView;
 }) {
+  const roleDefinitions = React.useMemo(
+    () =>
+      new Map(
+        roleContinuity?.roles.map((definition) => [
+          definition.roleId,
+          definition,
+        ]) ?? [],
+      ),
+    [roleContinuity],
+  );
+  const currentAssignments = React.useMemo(
+    () =>
+      new Map(
+        roleContinuity?.assignments
+          .filter((assignment) => !assignment.endedAt)
+          .map((assignment) => [assignment.roleId, assignment]) ?? [],
+      ),
+    [roleContinuity],
+  );
+
   return (
     <section className="grid gap-5 xl:grid-cols-2">
       <div>
@@ -212,17 +236,31 @@ function SupportingObjects({
         </div>
         {view.roles.length > 0 ? (
           <div className="grid gap-2 sm:grid-cols-2">
-            {view.roles.map((role) => (
-              <ProjectViewObjectCard
-                actorProfiles={actorProfiles}
-                currentPubkey={currentPubkey}
-                key={role.id}
-                object={role}
-                onSelect={onSelectObject}
-                selected={selectedObjectId === role.id}
-                size="compact"
-              />
-            ))}
+            {view.roles.map((role) => {
+              const definition = roleDefinitions.get(role.id);
+              return definition ? (
+                <ProjectRoleCard
+                  actorProfiles={actorProfiles}
+                  currentAssignment={currentAssignments.get(role.id)}
+                  currentPubkey={currentPubkey}
+                  definition={definition}
+                  key={role.id}
+                  object={role}
+                  onSelect={onSelectObject}
+                  selected={selectedObjectId === role.id}
+                />
+              ) : (
+                <ProjectViewObjectCard
+                  actorProfiles={actorProfiles}
+                  currentPubkey={currentPubkey}
+                  key={role.id}
+                  object={role}
+                  onSelect={onSelectObject}
+                  selected={selectedObjectId === role.id}
+                  size="compact"
+                />
+              );
+            })}
           </div>
         ) : (
           <div className="rounded-xl border border-dashed border-border/70 p-4 text-xs text-muted-foreground">
@@ -352,6 +390,7 @@ function ReadyProjectView({
   projectRevision,
   projectionGeneration,
   relayPubkey,
+  roleContinuity,
   onRefresh,
   selectedObjectId,
   syncMessage,
@@ -390,8 +429,21 @@ function ReadyProjectView({
       pubkeys.add(object.createdBy);
       pubkeys.add(object.updatedBy);
     }
+    if (roleContinuity) {
+      for (const member of roleContinuity.members) pubkeys.add(member.pubkey);
+      for (const assignment of roleContinuity.assignments) {
+        pubkeys.add(assignment.memberPubkey);
+        pubkeys.add(assignment.startedBy);
+        if (assignment.endedBy) pubkeys.add(assignment.endedBy);
+      }
+      for (const proposal of roleContinuity.proposals) {
+        pubkeys.add(proposal.candidatePubkey);
+        pubkeys.add(proposal.createdBy);
+        if (proposal.authorizedBy) pubkeys.add(proposal.authorizedBy);
+      }
+    }
     return [...pubkeys];
-  }, [objectsById]);
+  }, [objectsById, roleContinuity]);
   const actorProfilesQuery = useUsersBatchQuery(actorPubkeys);
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
@@ -431,6 +483,12 @@ function ReadyProjectView({
   const selectedObject = selectedObjectId
     ? objectsById.get(selectedObjectId)
     : undefined;
+  const selectedRoleDefinition =
+    selectedObject?.objectType === "role"
+      ? roleContinuity?.roles.find(
+          (definition) => definition.roleId === selectedObject.id,
+        )
+      : undefined;
   React.useEffect(() => {
     if (selectedObjectId && !selectedObject) {
       onSelectObject(undefined);
@@ -559,6 +617,7 @@ function ReadyProjectView({
             currentPubkey={currentPubkey}
             onCreateObject={createObject}
             onSelectObject={selectObject}
+            roleContinuity={roleContinuity}
             selectedObjectId={selectedObjectId}
             view={view}
           />
@@ -582,6 +641,9 @@ function ReadyProjectView({
           onDelete={setDeleteTarget}
           onEdit={(object) => setEditor({ mode: "edit", object })}
           onSelectObject={selectObject}
+          projectRevision={projectRevision}
+          roleContinuity={roleContinuity}
+          roleDefinition={selectedRoleDefinition}
           view={view}
         />
       ) : null}
@@ -602,6 +664,16 @@ function ReadyProjectView({
           onReviewLatest={onRefresh}
           open
           projectRevision={projectRevision}
+          roleHasActiveAssignment={
+            editor.mode === "edit" &&
+            editor.object.objectType === "role" &&
+            Boolean(
+              roleContinuity?.assignments.some(
+                (assignment) =>
+                  assignment.roleId === editor.object.id && !assignment.endedAt,
+              ),
+            )
+          }
           view={view}
         />
       ) : null}
