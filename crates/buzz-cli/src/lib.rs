@@ -391,6 +391,9 @@ pub enum RuntimeEvidenceArg {
     /// Renew the lease for an available epoch.
     #[value(name = "lease_renewed")]
     LeaseRenewed,
+    /// Retire a deliberately stopped available runtime without ending its Assignment.
+    #[value(name = "graceful_stop")]
+    GracefulStop,
     /// Begin recovery after a trusted abnormal process exit.
     #[value(name = "abnormal_exit")]
     AbnormalExit,

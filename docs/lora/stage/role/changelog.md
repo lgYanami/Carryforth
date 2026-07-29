@@ -1,5 +1,56 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 8：ACP Supervisor Adapter
+
+### 受信 harness 与 Agent 进程隔离
+
+- `buzz-acp` 增加具体的 Runtime supervisor adapter。ACP harness 是模型进程之外的
+  受信边界：它在 Tokio 和任何 Agent 子进程启动前消费独立 supervisor 私钥及 pair-scoped
+  恢复状态路径；模型面对的 Agent 只能继承 Relay 签发的 `BUZZ_RUNTIME_ID` 与
+  `BUZZ_RUNTIME_EPOCH`，不能读取 supervisor 私钥或恢复文件能力。
+- supervisor identity 必须与 managed Agent 的 Member identity 不同。Desktop 只接受
+  operator 从自身环境显式提供的 supervisor 私钥，按 canonical
+  `Member pubkey + Relay URL` 派生独立状态文件；persona、自定义环境和父进程残留值均不能
+  覆盖 harness 持有的 managed marker 或 Runtime fence。
+- eager pool、lazy pool、slot refill、panic recovery 和普通 respawn 使用同一份
+  harness-issued fence。ACP 先连接 Relay、验证启动 Role Brief、读取 Assignment 的
+  supervision binding 并取得 epoch，之后才允许启动首个模型进程；受监督 Assignment
+  缺少可信配置或 Role context 无法验证时 fail closed。
+
+### 持久恢复、续租与停止语义
+
+- adapter 通过 authenticated Runtime status/evidence 接口启动新 logical Runtime、
+  定期续租，并在 harness 健康后完成 `recovery_succeeded`。状态文件以原子写和仅 owner
+  可读权限保存 Assignment、Runtime、epoch、Member、supervisor 与 Relay 绑定，替代
+  harness 启动时始终采用服务端 epoch，不信任本地旧 epoch。
+- 前一 harness 未留下正常停止证据时，替代者先报告 `abnormal_exit`；若前一
+  `recovery_attempt` 中断，则先报告 `recovery_failed`，遵守服务端 backoff 并在长等待
+  期间发送 supervisor heartbeat，随后由 Relay 分配新 epoch。终态
+  `unavailable`、缺失本地 ownership 但服务端已有 evidence、或身份/Relay 不一致时均不能
+  另建 Runtime 绕过恢复上限。
+- 新增 `graceful_stop` typed evidence 和 additive migration
+  `0031_project_runtime_graceful_stop.sql`。Desktop/ACP 的有意停止只关闭当前 Runtime
+  lease，不启动故障恢复、不增加失败证据，也不结束 Assignment；已结束 Runtime 拒绝迟到
+  的续租或其他证据。只有 SIGTERM、Ctrl-C 或 owner shutdown 属于正常停止；Relay
+  无法恢复、Agent pool 耗尽等内部退出会报告 `abnormal_exit`。证据失败或超时时保留本地
+  状态，交给下一受信 harness 对账。`recovering/unavailable` Runtime 不能用
+  `graceful_stop` 擦除既有失败或绕过恢复上限。
+- ACP 内部 worker 的补位和重启属于同一受监督 harness 的实现细节；只要 harness 本身
+  仍健康，就不改变 logical Runtime 或 epoch。
+
+### 启用边界与验证
+
+- Runtime supervision 仍需 Relay operator 先为具体 Assignment 注册 supervisor binding，
+  并向 Desktop/部署环境单独配置对应私钥；没有 binding 的现有 candidate/assigned Agent
+  保持原有未监督行为。已经运行的 harness 若在运行期间才获得 Assignment 或 binding，
+  本阶段需要下一次 managed harness generation 才启用 adapter。
+- `buzz-project-view` `25/25`、`buzz-cli` `262/262`、`buzz-acp` `606/606`、
+  `buzz-db` `97/97` 非 ignored 测试和 Runtime supervision PostgreSQL 纵向测试、
+  Desktop Tauri `1644/1644` 非 ignored 测试通过；Project View 六条 ignored migration
+  测试和 schema-drift gate 通过。workspace/Desktop all-targets check 与 clippy 通过。
+  覆盖正常停止、旧 epoch、恢复 ownership、恢复耗尽、服务端 epoch 优先、状态文件权限及
+  fence 环境覆盖。
+
 ## 2026-07-29 — 阶段 7：可信 Runtime 监督与自动故障恢复
 
 ### Assignment 与 Runtime 分离

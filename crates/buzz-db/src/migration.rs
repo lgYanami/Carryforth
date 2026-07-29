@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 31);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -970,6 +970,13 @@ mod tests {
             .contains("Runtime lease is not backed by its exact latest evidence"));
         assert!(runtime_supervision.contains("Runtime evidence does not match its trusted binding"));
         assert!(runtime_supervision.contains("DEFERRABLE INITIALLY DEFERRED"));
+
+        // The concrete supervisor adapter needs a non-failure terminal state
+        // for deliberate Desktop/ACP shutdowns.
+        assert_eq!(migrations[30].version, 31);
+        let graceful_stop = migrations[30].sql.as_str();
+        assert!(graceful_stop.contains("project_runtime_evidence_type_check"));
+        assert!(graceful_stop.contains("'graceful_stop'"));
     }
 
     #[test]
@@ -1005,6 +1012,7 @@ mod tests {
             "recovery_attempt_in_flight",
             "next_recovery_at",
             "project_runtime_evidence_append_only",
+            "'graceful_stop'",
             "project_runtime_supervision_validate_community",
             "Runtime lease is not backed by its exact latest evidence",
             "Runtime evidence does not match its trusted binding",
@@ -1298,8 +1306,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0030");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
+            .expect("upgrade scratch database through 0031");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1431,15 +1439,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(30));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(31));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version IN (25, 26, 27, 28, 29, 30) AND success",
+             WHERE version IN (25, 26, 27, 28, 29, 30, 31) AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 6);
+        assert_eq!(project_view_migration_count, 7);
 
         first.close().await;
         second.close().await;
@@ -1519,7 +1527,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
     }
 
     #[tokio::test]

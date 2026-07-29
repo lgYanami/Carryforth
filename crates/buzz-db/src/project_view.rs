@@ -6213,6 +6213,7 @@ mod tests {
         let runtime_one = Uuid::new_v4();
         let runtime_two = Uuid::new_v4();
         let runtime_three = Uuid::new_v4();
+        let gracefully_stopped_runtime = Uuid::new_v4();
         let start_one = runtime_evidence_request(
             assignment_id,
             runtime_one,
@@ -6269,6 +6270,45 @@ mod tests {
         )
         .await
         .expect("start second runtime");
+        db.record_runtime_evidence(
+            community_id,
+            supervisor.public_key(),
+            [0x80; 32],
+            &runtime_evidence_request(
+                assignment_id,
+                gracefully_stopped_runtime,
+                Uuid::new_v4(),
+                None,
+                RuntimeEvidence::Start,
+            ),
+        )
+        .await
+        .expect("start runtime that will stop deliberately");
+        db.record_runtime_evidence(
+            community_id,
+            supervisor.public_key(),
+            [0x81; 32],
+            &runtime_evidence_request(
+                assignment_id,
+                gracefully_stopped_runtime,
+                Uuid::new_v4(),
+                Some(1),
+                RuntimeEvidence::GracefulStop,
+            ),
+        )
+        .await
+        .expect("retire runtime without failure evidence");
+        let graceful_lease_ended: bool = sqlx::query_scalar(
+            "SELECT ended_at IS NOT NULL FROM project_runtime_leases \
+             WHERE community_id = $1 AND binding_id = $2 AND runtime_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .bind(gracefully_stopped_runtime)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read deliberately retired runtime");
+        assert!(graceful_lease_ended);
 
         let mut fence_tx = scratch.pool.begin().await.expect("begin fence check");
         crate::project_runtime::validate_runtime_command_fence_in_tx(
@@ -6515,7 +6555,7 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].assignment_id, assignment_id);
         assert_eq!(claims[0].binding_id, binding.binding_id);
-        assert_eq!(claims[0].evidence_ids.len(), 13);
+        assert_eq!(claims[0].evidence_ids.len(), 15);
         assert!(
             db.claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
                 .await

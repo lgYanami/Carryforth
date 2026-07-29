@@ -69,7 +69,7 @@ fi
 # trigger differences are tracked independently and must not weaken this gate.
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 -qtA \
-  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 30 AND success" \
+  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 31 AND success" \
   | grep -qx ok
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \

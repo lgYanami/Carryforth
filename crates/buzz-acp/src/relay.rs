@@ -409,6 +409,45 @@ impl RestClient {
             .map_err(|error| RelayError::Http(error.to_string()))
     }
 
+    /// GET one Relay API resource with this client's exact NIP-98 identity.
+    pub(crate) async fn get_authed(&self, path: &str) -> Result<Value, RelayError> {
+        let url = format!("{}{}", self.base_url, path);
+        let auth_tag_header = self.auth_tag_json.clone();
+        let response = self
+            .request_with_retry("GET", path, || {
+                let auth = self.nip98_header("GET", &url, None).unwrap_or_default();
+                let mut request = self
+                    .http
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .header(reqwest::header::ACCEPT, "application/json");
+                if let Some(ref tag) = auth_tag_header {
+                    request = request.header("x-auth-tag", tag);
+                }
+                request.send()
+            })
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))
+    }
+
+    /// POST one typed JSON document with this client's exact NIP-98 identity.
+    pub(crate) async fn post_authed_json(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, RelayError> {
+        let body_bytes = serde_json::to_vec(body)
+            .map_err(|error| RelayError::Http(format!("JSON serialize error: {error}")))?;
+        let response = self.bridge_post(path, &body_bytes).await?;
+        response
+            .json()
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))
+    }
+
     /// Query events via the HTTP bridge: `POST /query` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).

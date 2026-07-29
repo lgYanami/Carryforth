@@ -170,6 +170,14 @@ pub enum RuntimeEvidence {
     Start,
     /// Renew a healthy runtime's lease without changing its epoch.
     LeaseRenewed,
+    /// Retire a deliberately stopped, currently available runtime without
+    /// changing its Assignment.
+    ///
+    /// This is distinct from an abnormal exit: it closes the runtime lease and
+    /// removes the runtime from availability aggregation, but it never opens a
+    /// recovery episode or contributes terminal-failure evidence. It cannot
+    /// close or erase an active/failed recovery episode.
+    GracefulStop,
     /// Record a trusted abnormal process exit and open a recovery episode.
     AbnormalExit {
         /// Optional bounded diagnostic summary; never secret material.
@@ -200,6 +208,7 @@ impl RuntimeEvidence {
         match self {
             Self::Start => "start",
             Self::LeaseRenewed => "lease_renewed",
+            Self::GracefulStop => "graceful_stop",
             Self::AbnormalExit { .. } => "abnormal_exit",
             Self::RecoveryAttempt => "recovery_attempt",
             Self::RecoverySucceeded => "recovery_succeeded",
@@ -375,6 +384,9 @@ mod tests {
             .validate()
             .is_err());
         assert!(request(RuntimeEvidence::LeaseRenewed, Some(1))
+            .validate()
+            .is_ok());
+        assert!(request(RuntimeEvidence::GracefulStop, Some(1))
             .validate()
             .is_ok());
     }

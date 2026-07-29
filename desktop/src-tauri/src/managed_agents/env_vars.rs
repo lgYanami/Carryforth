@@ -56,13 +56,17 @@ pub(crate) fn is_derived_provider_model_key(key: &str) -> bool {
 /// overridable; those have dedicated UI fields but power users may want
 /// to bypass them.
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
-    // Identity / secrets.
+    // Identity / secrets / server-issued runtime fences.
     "BUZZ_PRIVATE_KEY",
     "NOSTR_PRIVATE_KEY",
     "BUZZ_AUTH_TAG",
     "BUZZ_API_TOKEN",
     "BUZZ_ACP_PRIVATE_KEY",
     "BUZZ_ACP_API_TOKEN",
+    "BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY",
+    "BUZZ_RUNTIME_SUPERVISION_STATE_PATH",
+    "BUZZ_RUNTIME_ID",
+    "BUZZ_RUNTIME_EPOCH",
     // Relay URL: overriding would let a malicious config redirect the
     // agent to an attacker-controlled relay.
     "BUZZ_RELAY_URL",

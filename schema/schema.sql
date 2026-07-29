@@ -3568,6 +3568,7 @@ CREATE TABLE project_runtime_evidence (
             evidence_type IN (
                 'start',
                 'lease_renewed',
+                'graceful_stop',
                 'abnormal_exit',
                 'recovery_attempt',
                 'recovery_succeeded',

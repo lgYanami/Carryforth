@@ -10,6 +10,7 @@ mod pool_lifecycle;
 mod queue;
 mod relay;
 mod role_brief;
+mod runtime_supervisor;
 mod setup_mode;
 mod usage;
 
@@ -1233,11 +1234,15 @@ impl Drop for RespawnGuard {
 
 pub fn run() -> Result<()> {
     config::propagate_legacy_env_vars();
-    tokio_main()
+    let runtime_supervisor = runtime_supervisor::RuntimeSupervisorConfig::take_from_env()
+        .map_err(|error| anyhow::anyhow!("runtime supervisor configuration error: {error}"))?;
+    tokio_main(runtime_supervisor)
 }
 
 #[tokio::main]
-async fn tokio_main() -> Result<()> {
+async fn tokio_main(
+    runtime_supervisor_config: Option<runtime_supervisor::RuntimeSupervisorConfig>,
+) -> Result<()> {
     // Install the ring crypto provider for rustls (required for wss:// connections).
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -1315,12 +1320,11 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    let mut pool = if config.lazy_pool {
-        AgentPool::from_slots((0..config.agents).map(|_| None).collect())
-    } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
-    };
-    let mut pool_ready = !config.lazy_pool;
+    // Runtime supervision must allocate the epoch before a model-facing Agent
+    // child is spawned. Keep every slot empty until the verified Assignment
+    // and optional operator-installed binding have been resolved below.
+    let mut pool = AgentPool::from_slots((0..config.agents).map(|_| None).collect());
+    let mut pool_ready = false;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
 
     // Capture a startup watermark BEFORE connecting to the relay. This timestamp
@@ -1372,6 +1376,48 @@ async fn tokio_main() -> Result<()> {
             projection_generation = ?startup_role_context.projection_generation,
             "managed Agent startup Role context resolved"
         ),
+    }
+    if startup_role_context.error_code.is_some() && runtime_supervisor_config.is_some() {
+        return Err(anyhow::anyhow!(
+            "Runtime supervision requires a verified startup Role context; \
+             persisted state was left untouched"
+        ));
+    }
+
+    let mut runtime_supervisor = runtime_supervisor::RuntimeSupervisor::prepare(
+        runtime_supervisor_config,
+        &relay.rest_client(),
+        config.keys.public_key(),
+        startup_role_context.assignment_id,
+        &config.relay_url,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("Runtime supervision failed closed: {error}"))?;
+    config.runtime_fence = runtime_supervisor
+        .as_ref()
+        .map(runtime_supervisor::RuntimeSupervisor::fence);
+
+    if !config.lazy_pool {
+        match initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None)
+            .await
+        {
+            Ok(initialized) => {
+                pool = initialized;
+                pool_ready = true;
+            }
+            Err(error) => {
+                if let Some(supervisor) = runtime_supervisor.as_mut() {
+                    let _ = supervisor.mark_start_failed(error.to_string()).await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    if let Some(supervisor) = runtime_supervisor.as_mut() {
+        supervisor
+            .mark_healthy()
+            .await
+            .map_err(|error| anyhow::anyhow!("Runtime health receipt failed: {error}"))?;
     }
 
     relay
@@ -1724,7 +1770,13 @@ async fn tokio_main() -> Result<()> {
         Wake(u32, Result<AgentPool, String>),
     }
 
-    loop {
+    #[derive(Clone, Copy)]
+    enum MainLoopExit {
+        Graceful,
+        Abnormal(&'static str),
+    }
+
+    let main_loop_exit = loop {
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -1779,7 +1831,7 @@ async fn tokio_main() -> Result<()> {
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = managed_agent_env(&config.persona_env_vars);
+                let env = managed_agent_env(&config.persona_env_vars, config.runtime_fence);
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -1847,7 +1899,7 @@ async fn tokio_main() -> Result<()> {
                     Some(result) => Some(PoolEvent::Result(Box::new(result))),
                     None => {
                         tracing::info!("result channel closed — exiting main loop");
-                        break;
+                        break MainLoopExit::Abnormal("agent result channel closed");
                     }
                 },
                 // Guard: join_next() returns None immediately when JoinSet is
@@ -2290,7 +2342,7 @@ async fn tokio_main() -> Result<()> {
                             if let Err(e) = relay.reconnect().await {
                                 tracing::error!("relay background task is gone: {e} — exiting");
                                 tokio::time::sleep(Duration::from_secs(1)).await;
-                                break;
+                                break MainLoopExit::Abnormal("Relay reconnect failed");
                             }
                         }
                     }
@@ -2364,7 +2416,7 @@ async fn tokio_main() -> Result<()> {
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("shutting down");
-                    break;
+                    break MainLoopExit::Graceful;
                 }
             }
         };
@@ -2389,7 +2441,9 @@ async fn tokio_main() -> Result<()> {
                     Some(&ctx.rest_client),
                 ) == LoopAction::Exit
                 {
-                    break;
+                    break MainLoopExit::Abnormal(
+                        "Agent pool exhausted while handling a prompt result",
+                    );
                 }
                 if drain_ready_join_results(
                     &mut pool,
@@ -2404,7 +2458,9 @@ async fn tokio_main() -> Result<()> {
                     observer.clone(),
                 ) == LoopAction::Exit
                 {
-                    break;
+                    break MainLoopExit::Abnormal(
+                        "Agent pool exhausted while draining completed work",
+                    );
                 }
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2427,7 +2483,7 @@ async fn tokio_main() -> Result<()> {
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
-                    break;
+                    break MainLoopExit::Abnormal("all Agent processes are unavailable");
                 }
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2595,6 +2651,36 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             None => {} // relay/heartbeat/shutdown branches handled inline above
+        }
+    };
+
+    // Record the harness-level exit before the longer Agent-pool drain. Desktop
+    // grants the harness only a short SIGTERM window before escalating to
+    // SIGKILL. Only an explicit signal/owner shutdown is graceful; Relay or
+    // Agent-pool failure must retain state and open recovery instead of silently
+    // minting a replacement logical Runtime. A timeout keeps local shutdown
+    // authoritative and leaves state for the next trusted generation.
+    if let Some(supervisor) = runtime_supervisor.as_mut() {
+        let evidence_result = tokio::time::timeout(Duration::from_millis(750), async {
+            match main_loop_exit {
+                MainLoopExit::Graceful => supervisor.graceful_stop().await,
+                MainLoopExit::Abnormal(summary) => supervisor.abnormal_stop(summary).await,
+            }
+        })
+        .await;
+        match evidence_result {
+            Ok(Ok(())) => match main_loop_exit {
+                MainLoopExit::Graceful => tracing::info!("managed Runtime retired gracefully"),
+                MainLoopExit::Abnormal(summary) => {
+                    tracing::warn!(summary, "managed Runtime recorded an abnormal harness exit")
+                }
+            },
+            Ok(Err(error)) => {
+                tracing::warn!("managed Runtime exit evidence failed: {error}")
+            }
+            Err(_) => {
+                tracing::warn!("managed Runtime exit evidence timed out; recovery state retained")
+            }
         }
     }
 
@@ -3505,7 +3591,7 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = managed_agent_env(&config.persona_env_vars);
+    let env = managed_agent_env(&config.persona_env_vars, config.runtime_fence);
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3683,7 +3769,7 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = managed_agent_env(&config.persona_env_vars);
+    let env = managed_agent_env(&config.persona_env_vars, config.runtime_fence);
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3750,7 +3836,7 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: managed_agent_env(&config.persona_env_vars),
+            extra_env: managed_agent_env(&config.persona_env_vars, config.runtime_fence),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
@@ -3758,13 +3844,28 @@ impl PoolStartup {
     }
 }
 
-fn managed_agent_env(persona_env: &[(String, String)]) -> Vec<(String, String)> {
+fn managed_agent_env(
+    persona_env: &[(String, String)],
+    runtime_fence: Option<buzz_project_view::v2::RuntimeFence>,
+) -> Vec<(String, String)> {
     let mut env = persona_env
         .iter()
-        .filter(|(name, _)| name != "BUZZ_MANAGED_AGENT")
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "BUZZ_MANAGED_AGENT" | "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH"
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     env.push(("BUZZ_MANAGED_AGENT".to_owned(), "1".to_owned()));
+    if let Some(fence) = runtime_fence {
+        env.push(("BUZZ_RUNTIME_ID".to_owned(), fence.runtime_id.to_string()));
+        env.push((
+            "BUZZ_RUNTIME_EPOCH".to_owned(),
+            fence.runtime_epoch.to_string(),
+        ));
+    }
     env
 }
 
@@ -5012,6 +5113,7 @@ mod build_mcp_servers_tests {
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            runtime_fence: None,
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
@@ -5054,10 +5156,13 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn managed_runtime_marker_overrides_persona_value() {
-        let env = managed_agent_env(&[
-            ("PERSONA".to_owned(), "developer".to_owned()),
-            ("BUZZ_MANAGED_AGENT".to_owned(), "0".to_owned()),
-        ]);
+        let env = managed_agent_env(
+            &[
+                ("PERSONA".to_owned(), "developer".to_owned()),
+                ("BUZZ_MANAGED_AGENT".to_owned(), "0".to_owned()),
+            ],
+            None,
+        );
         let marker_values = env
             .iter()
             .filter(|(name, _)| name == "BUZZ_MANAGED_AGENT")
@@ -5067,6 +5172,34 @@ mod build_mcp_servers_tests {
         assert!(env
             .iter()
             .any(|(name, value)| name == "PERSONA" && value == "developer"));
+    }
+
+    #[test]
+    fn runtime_fence_overrides_persona_values_as_one_pair() {
+        let runtime_id = Uuid::new_v4();
+        let expected_runtime_id = runtime_id.to_string();
+        let env = managed_agent_env(
+            &[
+                ("BUZZ_RUNTIME_ID".to_owned(), Uuid::new_v4().to_string()),
+                ("BUZZ_RUNTIME_EPOCH".to_owned(), "999".to_owned()),
+            ],
+            Some(buzz_project_view::v2::RuntimeFence {
+                runtime_id,
+                runtime_epoch: 7,
+            }),
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "BUZZ_RUNTIME_ID")
+                .map(|(_, value)| value.as_str()),
+            Some(expected_runtime_id.as_str())
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "BUZZ_RUNTIME_EPOCH")
+                .map(|(_, value)| value.as_str()),
+            Some("7")
+        );
     }
 
     #[test]
@@ -5207,6 +5340,7 @@ mod error_outcome_emission_tests {
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            runtime_fence: None,
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,

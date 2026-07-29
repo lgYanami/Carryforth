@@ -1719,6 +1719,44 @@ pub fn spawn_agent_child(
     command.env("RUST_LOG", child_rust_log_filter());
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
+    // Runtime supervision is opt-in through an operator-provisioned identity
+    // on the Desktop process. The secret is passed only to the trusted ACP
+    // harness, which consumes and removes it before spawning the model-facing
+    // Agent. Pair-scoped state lets a replacement harness reconcile an
+    // interrupted predecessor without reusing or guessing its epoch.
+    command
+        .env_remove("BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY")
+        .env_remove("BUZZ_RUNTIME_SUPERVISION_STATE_PATH")
+        .env_remove("BUZZ_RUNTIME_ID")
+        .env_remove("BUZZ_RUNTIME_EPOCH");
+    match std::env::var("BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY") {
+        Ok(supervisor_key) => {
+            let supervisor_key = zeroize::Zeroizing::new(supervisor_key);
+            let supervisor_keys = nostr::Keys::parse(supervisor_key.trim())
+                .map_err(|error| format!("invalid Runtime supervisor private key: {error}"))?;
+            let member_pubkey = nostr::PublicKey::parse(&record.pubkey)
+                .map_err(|error| format!("invalid managed Agent public key: {error}"))?;
+            if supervisor_keys.public_key() == member_pubkey {
+                return Err(
+                    "Runtime supervisor identity must differ from the managed Agent identity"
+                        .to_owned(),
+                );
+            }
+            let state_path = super::managed_agents_base_dir(app)?
+                .join("runtime-supervision")
+                .join(format!("{}.json", runtime_key.runtime_id()));
+            command
+                .env(
+                    "BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY",
+                    supervisor_key.as_str(),
+                )
+                .env("BUZZ_RUNTIME_SUPERVISION_STATE_PATH", state_path);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("Runtime supervisor private key contains invalid UTF-8".to_owned());
+        }
+    }
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
@@ -1979,10 +2017,9 @@ pub fn spawn_agent_child(
     // PERSONA < per-agent.
     //
     // These writes go LAST so user-provided values win over every Buzz-set env
-    // above — EXCEPT reserved keys (BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY,
-    // BUZZ_AUTH_TAG, BUZZ_API_TOKEN, BUZZ_ACP_PRIVATE_KEY, BUZZ_ACP_API_TOKEN),
-    // which `merged_user_env` strips. Those carry Buzz's identity and must
-    // never be GUI-overridable.
+    // above — EXCEPT reserved identity, authorization, Runtime-supervision and
+    // code-execution keys, which `merged_user_env` strips. Those define Buzz's
+    // trusted process boundary and must never be GUI-overridable.
     // global < live persona < agent (last-wins on collision at each layer).
     let persona_over_global = super::env_vars::merged_user_env(
         &global.env_vars,

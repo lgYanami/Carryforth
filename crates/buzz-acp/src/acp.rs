@@ -422,6 +422,15 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+        // The harness may be a trusted Runtime supervisor, but the
+        // model-facing Agent process never is. Strip both the supervisor key
+        // and its durable state capability even if an embedding forgot to
+        // consume them before starting Tokio. Only BUZZ_RUNTIME_ID/EPOCH may
+        // cross this boundary through the explicit extra_env allowlist below.
+        cmd.env_remove(crate::runtime_supervisor::SUPERVISOR_PRIVATE_KEY_ENV)
+            .env_remove(crate::runtime_supervisor::SUPERVISION_STATE_PATH_ENV)
+            .env_remove("BUZZ_RUNTIME_ID")
+            .env_remove("BUZZ_RUNTIME_EPOCH");
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
@@ -452,9 +461,13 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if key == "BUZZ_MANAGED_AGENT" {
-                // This is a harness-owned security-mode marker. A parent-shell
-                // value must not downgrade a managed child to an unfenced CLI.
+            if matches!(
+                key.as_str(),
+                "BUZZ_MANAGED_AGENT" | "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH"
+            ) {
+                // These are harness-owned security and fencing values. A
+                // parent-shell value must neither downgrade managed mode nor
+                // replace the server-issued runtime coordinate.
                 cmd.env(key, value);
                 continue;
             }

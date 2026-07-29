@@ -397,7 +397,7 @@ impl Db {
             "SELECT runtime_epoch, availability, lease_expires_at, \
                     recovery_started_at, recovery_deadline, recovery_attempts, \
                     recovery_attempt_in_flight, next_recovery_at, \
-                    created_at \
+                    ended_at, created_at \
              FROM project_runtime_leases \
              WHERE community_id = $1 AND binding_id = $2 AND runtime_id = $3 \
              FOR UPDATE",
@@ -436,7 +436,7 @@ impl Db {
                  recovery_deadline, recovery_attempts, recovery_attempt_in_flight, \
                  next_recovery_at, last_evidence_id, \
                  last_evidence_at, ended_at, created_at, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL,$15,$14) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$14) \
              ON CONFLICT (community_id, binding_id, runtime_id) DO UPDATE SET \
                  runtime_epoch = EXCLUDED.runtime_epoch, \
                  availability = EXCLUDED.availability, \
@@ -448,7 +448,7 @@ impl Db {
                  next_recovery_at = EXCLUDED.next_recovery_at, \
                  last_evidence_id = EXCLUDED.last_evidence_id, \
                  last_evidence_at = EXCLUDED.last_evidence_at, \
-                 ended_at = NULL, updated_at = EXCLUDED.updated_at",
+                 ended_at = EXCLUDED.ended_at, updated_at = EXCLUDED.updated_at",
         )
         .bind(community_id.as_uuid())
         .bind(binding_id)
@@ -468,6 +468,7 @@ impl Db {
         .bind(transition.next_recovery_at)
         .bind(evidence_id.as_slice())
         .bind(now)
+        .bind(transition.ended_at)
         .bind(created_at)
         .execute(&mut *tx)
         .await?;
@@ -978,6 +979,7 @@ struct RuntimeTransition {
     recovery_attempts: u32,
     recovery_attempt_in_flight: bool,
     next_recovery_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
 }
 
 fn apply_evidence_transition(
@@ -998,6 +1000,11 @@ fn apply_runtime_transition(
 ) -> RuntimeSupervisionResult<RuntimeTransition> {
     let lease_deadline = now + Duration::seconds(i64::from(policy.lease_seconds));
     let recovery_deadline = now + Duration::seconds(i64::from(policy.recovery_window_seconds));
+    if current.is_some_and(|runtime| runtime.ended_at.is_some()) {
+        return Err(RuntimeSupervisionError::Invalid(
+            "logical runtime has already been retired".to_owned(),
+        ));
+    }
     match (&request.evidence, current) {
         (RuntimeEvidence::Start, None) => Ok(RuntimeTransition {
             runtime_epoch: 1,
@@ -1008,6 +1015,7 @@ fn apply_runtime_transition(
             recovery_attempts: 0,
             recovery_attempt_in_flight: false,
             next_recovery_at: None,
+            ended_at: None,
         }),
         (RuntimeEvidence::Start, Some(_)) => Err(RuntimeSupervisionError::Invalid(
             "start cannot replace an existing logical runtime; use the fenced recovery flow"
@@ -1023,6 +1031,24 @@ fn apply_runtime_transition(
             }
             Ok(RuntimeTransition {
                 lease_expires_at: Some(lease_deadline),
+                ..current
+            })
+        }
+        (RuntimeEvidence::GracefulStop, Some(current)) => {
+            require_epoch(request, current.runtime_epoch)?;
+            if current.availability != RuntimeAvailability::Available
+                || current.recovery_attempt_in_flight
+            {
+                return Err(RuntimeSupervisionError::Invalid(
+                    "graceful_stop requires an available runtime without recovery in flight"
+                        .to_owned(),
+                ));
+            }
+            Ok(RuntimeTransition {
+                lease_expires_at: None,
+                recovery_attempt_in_flight: false,
+                next_recovery_at: None,
+                ended_at: Some(now),
                 ..current
             })
         }
@@ -1042,6 +1068,7 @@ fn apply_runtime_transition(
                 recovery_attempts: 0,
                 recovery_attempt_in_flight: false,
                 next_recovery_at: Some(now),
+                ended_at: None,
             })
         }
         (RuntimeEvidence::RecoveryAttempt, Some(current)) => {
@@ -1090,6 +1117,7 @@ fn apply_runtime_transition(
                 recovery_attempts: 0,
                 recovery_attempt_in_flight: false,
                 next_recovery_at: None,
+                ended_at: None,
             })
         }
         (RuntimeEvidence::RecoveryFailed { .. }, Some(current)) => {
@@ -1161,6 +1189,7 @@ fn current_runtime(row: &sqlx::postgres::PgRow) -> RuntimeSupervisionResult<Runt
         recovery_attempts: db_u32(row.try_get("recovery_attempts")?, "recovery_attempts")?,
         recovery_attempt_in_flight: row.try_get("recovery_attempt_in_flight")?,
         next_recovery_at: row.try_get("next_recovery_at")?,
+        ended_at: row.try_get("ended_at")?,
     })
 }
 
@@ -1331,6 +1360,64 @@ mod tests {
         assert!(started
             .lease_expires_at
             .is_some_and(|deadline| deadline > now));
+    }
+
+    #[test]
+    fn graceful_stop_retires_only_the_runtime_without_failure_evidence() {
+        let policy = RuntimeRecoveryPolicy::default();
+        let now = Utc::now();
+        let started =
+            apply_runtime_transition(None, &request(RuntimeEvidence::Start, None), policy, now)
+                .expect("start");
+        let stopped = apply_runtime_transition(
+            Some(started),
+            &request(RuntimeEvidence::GracefulStop, Some(1)),
+            policy,
+            now + Duration::seconds(1),
+        )
+        .expect("graceful stop");
+        assert_eq!(stopped.availability, RuntimeAvailability::Available);
+        assert!(stopped.lease_expires_at.is_none());
+        assert_eq!(stopped.ended_at, Some(now + Duration::seconds(1)));
+        assert!(stopped.recovery_started_at.is_none());
+        assert_eq!(stopped.recovery_attempts, 0);
+
+        let late_renewal = apply_runtime_transition(
+            Some(stopped),
+            &request(RuntimeEvidence::LeaseRenewed, Some(1)),
+            policy,
+            now + Duration::seconds(2),
+        );
+        assert!(matches!(
+            late_renewal,
+            Err(RuntimeSupervisionError::Invalid(message))
+                if message.contains("already been retired")
+        ));
+
+        let recovering = apply_runtime_transition(
+            Some(started),
+            &request(
+                RuntimeEvidence::AbnormalExit {
+                    summary: None,
+                    exit_code: None,
+                },
+                Some(1),
+            ),
+            policy,
+            now + Duration::seconds(1),
+        )
+        .expect("abnormal exit");
+        let bypass_recovery = apply_runtime_transition(
+            Some(recovering),
+            &request(RuntimeEvidence::GracefulStop, Some(1)),
+            policy,
+            now + Duration::seconds(2),
+        );
+        assert!(matches!(
+            bypass_recovery,
+            Err(RuntimeSupervisionError::Invalid(message))
+                if message.contains("requires an available runtime")
+        ));
     }
 
     #[test]

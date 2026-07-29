@@ -63,6 +63,9 @@ fn build_evidence(
         RuntimeEvidenceArg::LeaseRenewed => {
             reject_diagnostics(summary, exit_code, RuntimeEvidence::LeaseRenewed)
         }
+        RuntimeEvidenceArg::GracefulStop => {
+            reject_diagnostics(summary, exit_code, RuntimeEvidence::GracefulStop)
+        }
         RuntimeEvidenceArg::AbnormalExit => {
             Ok(RuntimeEvidence::AbnormalExit { summary, exit_code })
         }
@@ -119,5 +122,15 @@ mod tests {
             ),
             Ok(RuntimeEvidence::RecoveryFailed { .. })
         ));
+        assert!(matches!(
+            build_evidence(RuntimeEvidenceArg::GracefulStop, None, None),
+            Ok(RuntimeEvidence::GracefulStop)
+        ));
+        assert!(build_evidence(
+            RuntimeEvidenceArg::GracefulStop,
+            Some("not a failure".to_owned()),
+            None
+        )
+        .is_err());
     }
 }
