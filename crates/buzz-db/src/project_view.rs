@@ -3148,10 +3148,11 @@ mod tests {
     use super::*;
 
     use buzz_project_view::v2::{
-        HandoffCause, ProjectObjectCommand, RoleCheckpointContent, RoleCommand, RoleCommandRequest,
-        RoleContinuityChange, RoleContinuityError, RoleContinuityReference, RoleHandoffContent,
-        RuntimeAvailability, RuntimeEvidence, RuntimeEvidenceRequest, RuntimeFence,
-        RuntimeRecoveryPolicy, RUNTIME_SUPERVISION_SCHEMA_VERSION,
+        CommunityMemberRole, HandoffCause, ProjectObjectCommand, RoleCheckpointContent,
+        RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityError,
+        RoleContinuityReference, RoleHandoffContent, RoleLevel, RuntimeAvailability,
+        RuntimeEvidence, RuntimeEvidenceRequest, RuntimeFence, RuntimeRecoveryPolicy,
+        RUNTIME_SUPERVISION_SCHEMA_VERSION,
     };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
@@ -3162,17 +3163,19 @@ mod tests {
         build_entity_projection as build_v2_entity_projection,
         build_meta_projection as build_v2_meta_projection, build_project_object_command,
         build_project_object_projection_with_responsibility, build_role_command,
-        changed_head_for as v2_changed_head_for, changed_head_for_project_object, V2EntityCounts,
-        V2ProjectionContext, V2ProjectionSource,
+        changed_head_for as v2_changed_head_for, changed_head_for_project_object,
+        parse_entity_projection, parse_membership_projection, parse_meta_projection,
+        parse_project_object_projection, V2EntityCounts, V2ProjectionContext, V2ProjectionSource,
     };
+    use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
     use crate::project_view_v2::{
         PreparedV2EntityProjection, PreparedV2ProjectObjectCommit, PreparedV2ProjectObjectHead,
-        PreparedV2RoleCommit, ProjectViewV2CommitOutcome, ProjectViewV2CutoverPlan,
-        ProjectViewV2PrepareOutcome, ProjectViewV2ProjectObjectPrepareOutcome,
-        ProjectViewV2WriteError,
+        PreparedV2RoleCommit, ProjectViewV2AdminAssignment, ProjectViewV2CommitOutcome,
+        ProjectViewV2CutoverPlan, ProjectViewV2PrepareOutcome,
+        ProjectViewV2ProjectObjectPrepareOutcome, ProjectViewV2WriteError,
     };
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
@@ -3741,6 +3744,52 @@ mod tests {
             .await
             .expect("roll back rejected v2 Role command");
         error
+    }
+
+    fn verified_v2_snapshot_from_events(
+        events: &[Event],
+        relay: &Keys,
+        community_id: CommunityId,
+    ) -> VerifiedRoleBriefSnapshot {
+        let meta = parse_meta_projection(
+            events
+                .iter()
+                .find(|event| event.kind.as_u16() as u32 == KIND_PROJECT_VIEW_META)
+                .expect("v2 metadata event"),
+            &relay.public_key(),
+        )
+        .expect("parse v2 metadata");
+        let membership = parse_membership_projection(
+            events
+                .iter()
+                .find(|event| {
+                    event.kind.as_u16() as u32 == buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST
+                })
+                .expect("v2 membership event"),
+            &relay.public_key(),
+        )
+        .expect("parse v2 membership");
+        let mut objects = Vec::new();
+        let mut entities = Vec::new();
+        for event in events
+            .iter()
+            .filter(|event| event.kind.as_u16() as u32 == KIND_PROJECT_VIEW_OBJECT)
+        {
+            match parse_project_object_projection(event, &relay.public_key(), community_id) {
+                Ok(object) => objects.push(object),
+                Err(object_error) => entities.push(
+                    parse_entity_projection(event, &relay.public_key(), community_id)
+                        .unwrap_or_else(|entity_error| {
+                            panic!(
+                                "v2 head is neither an object ({object_error}) nor an entity \
+                                 ({entity_error})"
+                            )
+                        }),
+                ),
+            }
+        }
+        VerifiedRoleBriefSnapshot::new_with_partial_history(meta, membership, objects, entities)
+            .expect("events must form one client-readable verified v2 snapshot")
     }
 
     fn runtime_evidence_request(
@@ -5300,6 +5349,7 @@ mod tests {
             }),
             "cutover must emit the exact membership snapshot referenced by v2 metadata"
         );
+        verified_v2_snapshot_from_events(&cutover.events, &relay, community_id);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM project_view_objects \
@@ -6082,6 +6132,142 @@ mod tests {
             .await,
             Err(ProjectViewReadError::InvalidCursor(_))
         ));
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn v2_cutover_reset_preserves_head_revisions_in_verified_snapshot() {
+        let scratch = ScratchDatabase::create("buzz_pv_v2_cutover_snapshot").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let leader = Keys::generate();
+        let relay = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap cutover snapshot owner");
+        db.add_relay_member(
+            community_id,
+            &leader.public_key().to_hex(),
+            "admin",
+            Some(&owner.public_key().to_hex()),
+        )
+        .await
+        .expect("add existing admin for explicit Leader mapping");
+        initialize(&db, community_id, &owner, &relay).await;
+        let deleted_goal_id: Uuid = sqlx::query_scalar(
+            "SELECT object_id FROM project_view_objects \
+             WHERE community_id = $1 AND object_type = 'goal' AND deleted_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read initial goal");
+        let replacement_goal_id = Uuid::new_v4();
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            create_goal_mutation_with_id(1, replacement_goal_id, "Replacement goal"),
+        )
+        .await;
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            Mutation::new(
+                2,
+                MutationRequest::Delete(DeleteMutation {
+                    object_type: ProjectViewObjectType::Goal,
+                    object_id: deleted_goal_id,
+                }),
+            ),
+        )
+        .await;
+        let role_id = Uuid::new_v4();
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            create_role_mutation(3, role_id, "Cutover Role"),
+        )
+        .await;
+        db.set_project_view_enabled(community_id, false)
+            .await
+            .expect("pause v1 before snapshot cutover");
+
+        let audit = buzz_audit::AuditService::new(scratch.pool.clone());
+        let cutover_audit = audit
+            .log(buzz_audit::NewAuditEntry {
+                community_id,
+                action: buzz_audit::AuditAction::ProjectViewCutover,
+                actor_pubkey: Some(owner.public_key().to_bytes().to_vec()),
+                object_id: Some(community_id.to_string()),
+                detail: serde_json::json!({"test": "verified reset snapshot"}),
+            })
+            .await
+            .expect("append cutover audit fact");
+        let cutover = db
+            .cutover_project_view_v2(
+                community_id,
+                &ProjectViewV2CutoverPlan {
+                    admin_assignments: vec![ProjectViewV2AdminAssignment {
+                        member_pubkey: leader.public_key(),
+                        role_id,
+                    }],
+                    downgraded_admins: Vec::new(),
+                    audit_seq: cutover_audit.seq,
+                    idempotency_key_hash: [0x53; 32],
+                },
+                &relay,
+            )
+            .await
+            .expect("cut Project View over to v2");
+        assert_eq!(cutover.project_revision, 5);
+        assert_eq!(cutover.projection_generation, 2);
+
+        let snapshot = verified_v2_snapshot_from_events(&cutover.events, &relay, community_id);
+        assert_eq!(snapshot.meta().project_revision, 5);
+        assert!(matches!(
+            snapshot.entry(deleted_goal_id),
+            Some(ProjectViewEntry::Tombstone(tombstone))
+                if tombstone.project_revision == 3
+        ));
+        assert!(matches!(
+            snapshot.entry(replacement_goal_id),
+            Some(ProjectViewEntry::Active(object))
+                if object.project_revision == 2
+        ));
+        assert_eq!(
+            snapshot
+                .roles()
+                .find(|role| role.role_id == role_id)
+                .expect("cutover Role")
+                .project_revision,
+            4
+        );
+        assert_eq!(
+            snapshot
+                .roles()
+                .find(|role| role.role_id == role_id)
+                .expect("cutover Leader Role")
+                .level,
+            RoleLevel::Admin
+        );
+        assert!(snapshot.assignments().any(|assignment| {
+            assignment.role_id == role_id
+                && assignment.member_pubkey == leader.public_key()
+                && assignment.is_active()
+        }));
+        assert!(snapshot.membership().members.iter().any(|member| {
+            member.pubkey == leader.public_key() && member.role == CommunityMemberRole::Admin
+        }));
 
         scratch.cleanup().await;
     }

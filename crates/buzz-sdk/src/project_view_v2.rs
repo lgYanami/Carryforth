@@ -119,18 +119,22 @@ impl V2ProjectionSource {
     }
 }
 
-/// Shared immutable inputs for all heads emitted by one accepted v2 change.
+/// Projection-envelope inputs for one v2 head.
+///
+/// Incremental changes normally use one context for every changed head. During
+/// a generation reset, unchanged heads retain their own last-change revision
+/// and time while sharing the new projection generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2ProjectionContext {
     /// Community/Project identity.
     pub project_id: CommunityId,
     /// Current projection signer generation.
     pub projection_generation: u64,
-    /// New project revision.
+    /// Project revision represented by this head.
     pub project_revision: u64,
     /// Typed accepted change source.
     pub source: V2ProjectionSource,
-    /// Relay canonical time.
+    /// Relay canonical time represented by this head.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -334,7 +338,7 @@ pub struct V2ProjectObjectProjection {
     pub project_id: CommunityId,
     /// Projection signer generation.
     pub projection_generation: u64,
-    /// Project revision at which the reset head was emitted.
+    /// Project revision at which this object last changed.
     pub project_revision: u64,
     /// Typed accepted change source.
     pub source: V2ProjectionSource,
@@ -342,7 +346,7 @@ pub struct V2ProjectObjectProjection {
     pub object: V2ProjectedObject,
     /// Stable Role responsible for an active Work.
     pub responsible_role_id: Option<Uuid>,
-    /// Relay canonical emission time.
+    /// Relay canonical time at which this object last changed.
     pub updated_at: DateTime<Utc>,
 }
 

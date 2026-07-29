@@ -1,12 +1,12 @@
 //! `buzz roles` — verified Project View v2 Role continuity reads and writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use buzz_core::PublicKey;
 use buzz_project_view::v2::{
-    HandoffCause, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpoint,
-    RoleCheckpointContent, RoleCommand, RoleCommandRequest, RoleContinuityChange,
-    RoleContinuityEntity, RoleDefinition, RoleHandoff, RoleHandoffContent,
+    HandoffCause, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpointContent,
+    RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity, RoleDefinition,
+    RoleHandoffContent,
 };
 use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
 use buzz_sdk::role_brief::render_role_brief_markdown;
@@ -18,7 +18,8 @@ use uuid::Uuid;
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
     is_managed_runtime, read_current_v2_snapshot, read_role_history_page,
-    read_verified_v2_snapshot, require_v2_identity, runtime_fence_from_env, RoleHistoryRequest,
+    read_verified_v2_snapshot, require_v2_identity, runtime_fence_from_env, ProjectViewIdentity,
+    RoleHistoryRequest,
 };
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
@@ -31,10 +32,7 @@ use crate::{
 struct RoleSnapshot {
     meta: V2MetaProjection,
     roles: Vec<RoleDefinition>,
-    proposals: Vec<RoleAssignmentProposal>,
     assignments: Vec<RoleAssignment>,
-    checkpoints: Vec<RoleCheckpoint>,
-    handoffs: Vec<RoleHandoff>,
 }
 
 #[derive(Serialize)]
@@ -179,50 +177,105 @@ async fn get_role(
     role_id: Uuid,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
-    let snapshot = read_snapshot(client).await?;
+    let identity = require_v2_identity(client).await?;
+    let snapshot = read_verified_v2_snapshot(client, identity).await?;
     let role = snapshot
-        .roles
-        .iter()
+        .roles()
         .find(|role| role.role_id == role_id)
         .ok_or_else(|| CliError::NotFound(format!("Role {role_id} was not found")))?;
     let current_assignment = snapshot
-        .assignments
-        .iter()
+        .assignments()
         .find(|assignment| assignment.role_id == role_id && assignment.is_active());
-    let history = snapshot
-        .assignments
-        .iter()
-        .filter(|assignment| assignment.role_id == role_id)
-        .collect::<Vec<_>>();
-    let proposals = snapshot
-        .proposals
-        .iter()
-        .filter(|proposal| proposal.role_id == role_id)
-        .map(proposal_output)
-        .collect::<Vec<_>>();
-    let handoffs = snapshot
-        .handoffs
-        .iter()
-        .filter(|handoff| handoff.role_id == role_id)
-        .collect::<Vec<_>>();
-    let checkpoints = snapshot
-        .checkpoints
-        .iter()
-        .filter(|checkpoint| checkpoint.role_id == role_id)
-        .collect::<Vec<_>>();
+    let history = read_complete_role_history(client, identity, snapshot.meta(), role_id).await?;
+    let mut assignments = Vec::new();
+    let mut proposals = Vec::new();
+    let mut checkpoints = Vec::new();
+    let mut handoffs = Vec::new();
+    for change in history {
+        match change {
+            RoleContinuityChange::Proposal(proposal) => {
+                proposals.push(proposal_output(&proposal));
+            }
+            RoleContinuityChange::Assignment(assignment) => assignments.push(assignment),
+            RoleContinuityChange::Checkpoint(checkpoint) => checkpoints.push(checkpoint),
+            RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff),
+            RoleContinuityChange::Role(_) | RoleContinuityChange::Commitment(_) => {
+                return Err(integrity_error(
+                    "Role history returned an entity outside the requested history set",
+                ));
+            }
+        }
+    }
+    if current_assignment
+        .is_some_and(|current| !assignments.iter().any(|historical| historical == current))
+    {
+        return Err(integrity_error(
+            "current Assignment is missing from Role history",
+        ));
+    }
     print_json(
         &json!({
-            "project_revision": snapshot.meta.project_revision,
+            "project_revision": snapshot.meta().project_revision,
             "role": role,
             "vacant": current_assignment.is_none(),
             "current_assignment": current_assignment,
-            "assignment_history": history,
+            "assignment_history": assignments,
             "proposals": proposals,
             "checkpoints": checkpoints,
             "handoffs": handoffs,
         }),
         format,
     )
+}
+
+async fn read_complete_role_history(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    meta: &V2MetaProjection,
+    role_id: Uuid,
+) -> Result<Vec<RoleContinuityChange>, CliError> {
+    const PAGE_SIZE: u16 = 500;
+
+    let entity_types = [
+        RoleContinuityEntity::RoleAssignmentProposal,
+        RoleContinuityEntity::RoleAssignment,
+        RoleContinuityEntity::RoleCheckpoint,
+        RoleContinuityEntity::RoleHandoff,
+    ];
+    let mut history = Vec::new();
+    let mut event_ids = HashSet::new();
+    let mut before = None;
+    loop {
+        let page = read_role_history_page(
+            client,
+            identity,
+            meta,
+            RoleHistoryRequest {
+                entity_types: &entity_types,
+                role_id: Some(role_id),
+                assignment_id: None,
+                member_pubkey: None,
+                limit: PAGE_SIZE,
+                before: before.as_deref(),
+            },
+        )
+        .await?;
+        for projection in page.projections {
+            if !event_ids.insert(projection.event_id) {
+                return Err(integrity_error(
+                    "Role history pages contain a duplicate event",
+                ));
+            }
+            history.push(projection.entity);
+        }
+        let Some(next_before) = page.next_before else {
+            return Ok(history);
+        };
+        if before.as_deref() == Some(next_before.as_str()) {
+            return Err(integrity_error("Role history cursor did not advance"));
+        }
+        before = Some(next_before);
+    }
 }
 
 async fn current_assignment(
@@ -814,10 +867,7 @@ async fn read_snapshot(client: &BuzzClient) -> Result<RoleSnapshot, CliError> {
     Ok(RoleSnapshot {
         meta: snapshot.meta().clone(),
         roles: snapshot.roles().cloned().collect(),
-        proposals: snapshot.proposals().cloned().collect(),
         assignments: snapshot.assignments().cloned().collect(),
-        checkpoints: snapshot.checkpoints().cloned().collect(),
-        handoffs: snapshot.handoffs().cloned().collect(),
     })
 }
 

@@ -1,5 +1,52 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 集成验收缺陷修复：可验证 cutover 快照与完整 Role 历史
+
+### v2 generation reset 保留每个 head 的最后变更坐标
+
+- 修复正式集成验收发现的 P1：v1→v2 cutover 曾以新的 cutover revision/time 包裹全部
+  旧普通对象和 Role，但 body 仍保留对象自身最后变化时的 revision/time，导致共享
+  `VerifiedRoleBriefSnapshot` 正确地 fail closed。现在 reset meta 仍表示新的 Project
+  revision 和 projection generation；未变化的普通对象、tombstone 与 Role head 则保留
+  各自最后变化时的 `project_revision` 和 `updated_at/deleted_at`，同时进入新的
+  generation。cutover 新建的 Proposal、Assignment 以及 meta 继续使用 cutover 的新
+  revision/time。
+- cutover 提交前的投影回读校验改为与每个 head 的规范状态比较，不再错误地要求所有
+  head 等于 meta revision。共享 assembler 的严格校验没有放宽：head generation 必须
+  等于 meta generation，head revision 只能小于等于 meta revision，body revision/time
+  仍必须与该 head 精确一致。
+- 在写入或退休任何 event 前，cutover 生产事务会把新 membership、全部普通对象/Role
+  continuity heads 和 reset meta 交给共享 `VerifiedRoleBriefSnapshot` 完整组装；Role
+  level、Assignment、membership、计数或引用任一不一致都会使整个 cutover 回滚。
+- SDK 对 `V2ProjectionContext` 的注释同步明确“一份 context 对应一个 head”；增量变更
+  通常共享同一 revision/time，而 generation reset 中未变化的 head 保留最后变更坐标。
+
+### `roles get` 从有界当前页恢复完整任期历史
+
+- 修复阶段 6 引入的读取回归：默认 Role Brief 快照为了保持有界，只包含 active
+  Assignment 和有限 Checkpoint/Handoff；`buzz roles get` 曾误把这份当前页作为完整
+  `assignment_history`，因此 A→B 替换后只显示继任者的一段任期。
+- `roles get` 现在先组装共享 verified 当前快照，再以同一
+  `projection_generation + project_revision` 对目标 Role 分页读取 Proposal、
+  Assignment、Checkpoint 与 Handoff 完整历史。分页保持服务端每页 500 条的上限，并对
+  跨页重复 event、停滞 cursor 以及当前 Assignment 在历史中缺失执行 fail-closed 校验。
+  这不会把已结束任期重新注入每轮 ACP Role Brief，也不会扩大 Desktop 默认当前页。
+
+### 回归与验证
+
+- PostgreSQL cutover 回归直接把 Relay 签名的 membership、object/entity heads 和 meta
+  交给与 CLI/ACP 相同的 `VerifiedRoleBriefSnapshot`；覆盖不同历史 revision 的 active
+  object、Role 和 tombstone，并断言 reset meta revision 高于这些未变化 head。夹具还
+  把一个既有 Community admin 显式映射到 Leader Role，验证 admin membership、Role
+  level 与初始 Assignment 在事务内一致。
+- 原有 v2 Assignment 纵向数据库测试也新增完整 cutover snapshot 组装断言，防止未来只
+  校验外层 schema/envelope 而遗漏跨 head 一致性。
+- `just project-view-test` 全部通过：领域/协议专项 93 项、PostgreSQL 19 项、迁移与
+  schema drift 6 项、真实 Relay/CLI E2E 1 项。真实 E2E 已重新完成 v1→v2 cutover、
+  Agent A 接受、自卸任拒绝、A→B 原子替换，并读取到两段 Assignment 历史与一条
+  Handoff。`buzz-sdk`、`buzz-db`、`buzz-cli` 的 all-targets clippy（warnings denied）、
+  Rust fmt 和 diff whitespace gate 通过。
+
 ## 2026-07-29 — 阶段 10：Role Brief 按 revision 增量刷新
 
 ### 每轮确认身份，按需重建完整上下文

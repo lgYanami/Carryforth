@@ -957,7 +957,7 @@ impl Db {
         let membership_event =
             build_cutover_membership_event(&membership, canonical_time, relay_keys)?;
         let counts = load_counts(&mut tx, community_id).await?;
-        let context = buzz_sdk::project_view_v2::V2ProjectionContext {
+        let cutover_context = buzz_sdk::project_view_v2::V2ProjectionContext {
             project_id: community_id,
             projection_generation: next_generation,
             project_revision: next_revision,
@@ -972,19 +972,31 @@ impl Db {
             updated_at: canonical_time,
         };
         let mut projections = Vec::with_capacity(changes.len());
+        let mut verified_entity_projections = Vec::with_capacity(changes.len());
         for change in &changes {
-            let event = buzz_sdk::project_view_v2::build_entity_projection(&context, change)
-                .map_err(|error| {
-                    ProjectViewV2WriteError::InvalidCommit(format!(
-                        "build cutover entity projection: {error}"
-                    ))
-                })?
-                .sign_with_keys(relay_keys)
-                .map_err(|error| {
-                    ProjectViewV2WriteError::InvalidCommit(format!(
-                        "sign cutover entity projection: {error}"
-                    ))
-                })?;
+            let projection_context = match change {
+                RoleContinuityChange::Role(role) => {
+                    buzz_sdk::project_view_v2::V2ProjectionContext {
+                        project_revision: role.project_revision,
+                        updated_at: role.updated_at,
+                        ..cutover_context.clone()
+                    }
+                }
+                _ => cutover_context.clone(),
+            };
+            let event =
+                buzz_sdk::project_view_v2::build_entity_projection(&projection_context, change)
+                    .map_err(|error| {
+                        ProjectViewV2WriteError::InvalidCommit(format!(
+                            "build cutover entity projection: {error}"
+                        ))
+                    })?
+                    .sign_with_keys(relay_keys)
+                    .map_err(|error| {
+                        ProjectViewV2WriteError::InvalidCommit(format!(
+                            "sign cutover entity projection: {error}"
+                        ))
+                    })?;
             let parsed = buzz_sdk::project_view_v2::parse_entity_projection(
                 &event,
                 &relay_keys.public_key(),
@@ -996,15 +1008,16 @@ impl Db {
                 ))
             })?;
             if parsed.entity != *change
-                || parsed.project_revision != next_revision
+                || parsed.project_revision != projection_context.project_revision
                 || parsed.projection_generation != next_generation
-                || parsed.source != context.source
-                || parsed.updated_at != canonical_time
+                || parsed.source != projection_context.source
+                || parsed.updated_at != projection_context.updated_at
             {
                 return Err(ProjectViewV2WriteError::InvalidCommit(
                     "cutover entity projection differs from canonical state".to_owned(),
                 ));
             }
+            verified_entity_projections.push(parsed);
             projections.push(PreparedV2EntityProjection {
                 entity_type: change.entity_type(),
                 entity_id: change.entity_id(),
@@ -1012,19 +1025,32 @@ impl Db {
             });
         }
         let mut project_object_projections = Vec::with_capacity(project_entries.len());
+        let mut verified_object_projections = Vec::with_capacity(project_entries.len());
         for entry in &project_entries {
-            let event = buzz_sdk::project_view_v2::build_project_object_projection(&context, entry)
-                .map_err(|error| {
-                    ProjectViewV2WriteError::InvalidCommit(format!(
-                        "build cutover Project object projection: {error}"
-                    ))
-                })?
-                .sign_with_keys(relay_keys)
-                .map_err(|error| {
-                    ProjectViewV2WriteError::InvalidCommit(format!(
-                        "sign cutover Project object projection: {error}"
-                    ))
-                })?;
+            let updated_at = match entry {
+                ProjectViewEntry::Active(object) => object.updated_at,
+                ProjectViewEntry::Tombstone(tombstone) => tombstone.deleted_at,
+            };
+            let projection_context = buzz_sdk::project_view_v2::V2ProjectionContext {
+                project_revision: entry.project_revision(),
+                updated_at,
+                ..cutover_context.clone()
+            };
+            let event = buzz_sdk::project_view_v2::build_project_object_projection(
+                &projection_context,
+                entry,
+            )
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "build cutover Project object projection: {error}"
+                ))
+            })?
+            .sign_with_keys(relay_keys)
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "sign cutover Project object projection: {error}"
+                ))
+            })?;
             let parsed = buzz_sdk::project_view_v2::parse_project_object_projection(
                 &event,
                 &relay_keys.public_key(),
@@ -1035,20 +1061,21 @@ impl Db {
                     "verify cutover Project object projection: {error}"
                 ))
             })?;
-            if parsed.object.id() != entry.id()
-                || parsed.project_revision != next_revision
+            if !projected_object_matches_entry(&parsed.object, entry)
+                || parsed.project_revision != projection_context.project_revision
                 || parsed.projection_generation != next_generation
-                || parsed.source != context.source
-                || parsed.updated_at != canonical_time
+                || parsed.source != projection_context.source
+                || parsed.updated_at != projection_context.updated_at
             {
                 return Err(ProjectViewV2WriteError::InvalidCommit(
                     "cutover Project object projection differs from canonical state".to_owned(),
                 ));
             }
+            verified_object_projections.push(parsed);
             project_object_projections.push((entry.id(), event));
         }
         let meta_event = buzz_sdk::project_view_v2::build_meta_projection(
-            &context,
+            &cutover_context,
             buzz_sdk::project_view_v2::V2EntityCounts {
                 active_objects: counts.active_objects,
                 open_proposals: counts.open_proposals,
@@ -1094,7 +1121,7 @@ impl Db {
             || verified_meta.membership_snapshot_event_id != membership_event.id
             || !verified_meta.reset
             || !verified_meta.changed_heads.is_empty()
-            || verified_meta.source != context.source
+            || verified_meta.source != cutover_context.source
             || verified_meta.updated_at != canonical_time
         {
             return Err(ProjectViewV2WriteError::InvalidCommit(
@@ -1107,6 +1134,26 @@ impl Db {
             &membership,
             canonical_time,
         )?;
+        let verified_membership = buzz_sdk::project_view_v2::parse_membership_projection(
+            &membership_event,
+            &relay_keys.public_key(),
+        )
+        .map_err(|error| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "verify cutover membership projection: {error}"
+            ))
+        })?;
+        buzz_sdk::role_brief::VerifiedRoleBriefSnapshot::new(
+            verified_meta,
+            verified_membership,
+            verified_object_projections,
+            verified_entity_projections,
+        )
+        .map_err(|error| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "assemble cutover verified snapshot: {error}"
+            ))
+        })?;
 
         for event_id in old_object_projection_ids {
             if !crate::event::retire_projection_head_in_tx(
