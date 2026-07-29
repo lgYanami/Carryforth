@@ -11,6 +11,7 @@ use std::num::NonZeroI64;
 
 mod project_object;
 mod role_continuity;
+mod runtime_supervision;
 
 pub use project_object::ProjectObjectCommand;
 pub use role_continuity::{
@@ -20,6 +21,11 @@ pub use role_continuity::{
     RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityOutcome,
     RoleContinuityReference, RoleContinuityState, RoleDefinition, RoleHandoff, RoleHandoffContent,
     RoleSlot, WorkCommitment, WorkResponsibility, MAX_PROPOSAL_LIFETIME_DAYS,
+};
+pub use runtime_supervision::{
+    AssignmentRuntimeStatus, RuntimeAvailability, RuntimeEvidence, RuntimeEvidenceReceipt,
+    RuntimeEvidenceRequest, RuntimeFence, RuntimeLeaseStatus, RuntimeRecoveryPolicy,
+    RUNTIME_SUPERVISION_SCHEMA_VERSION,
 };
 
 const CHANGE_ID_DOMAIN: &[u8] = b"buzz-project-view-v2:change-id\0";

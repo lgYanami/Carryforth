@@ -434,6 +434,15 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    if state.config.runtime_unrecoverable_enabled {
+        tokio::spawn(buzz_relay::runtime_supervision::run(Arc::clone(&state)));
+    } else {
+        info!(
+            "Automatic runtime unrecoverable transitions disabled by \
+             BUZZ_RUNTIME_UNRECOVERABLE"
+        );
+    }
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When

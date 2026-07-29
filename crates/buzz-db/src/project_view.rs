@@ -3150,6 +3150,8 @@ mod tests {
     use buzz_project_view::v2::{
         HandoffCause, ProjectObjectCommand, RoleCheckpointContent, RoleCommand, RoleCommandRequest,
         RoleContinuityChange, RoleContinuityError, RoleContinuityReference, RoleHandoffContent,
+        RuntimeAvailability, RuntimeEvidence, RuntimeEvidenceRequest, RuntimeFence,
+        RuntimeRecoveryPolicy, RUNTIME_SUPERVISION_SCHEMA_VERSION,
     };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
@@ -3739,6 +3741,23 @@ mod tests {
             .await
             .expect("roll back rejected v2 Role command");
         error
+    }
+
+    fn runtime_evidence_request(
+        assignment_id: Uuid,
+        runtime_id: Uuid,
+        idempotency_key: Uuid,
+        runtime_epoch: Option<u64>,
+        evidence: RuntimeEvidence,
+    ) -> RuntimeEvidenceRequest {
+        RuntimeEvidenceRequest {
+            schema_version: RUNTIME_SUPERVISION_SCHEMA_VERSION,
+            assignment_id,
+            runtime_id,
+            idempotency_key,
+            runtime_epoch,
+            evidence,
+        }
     }
 
     async fn cutover_role_continuity_fixture(
@@ -6063,6 +6082,594 @@ mod tests {
             .await,
             Err(ProjectViewReadError::InvalidCursor(_))
         ));
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn trusted_runtime_supervision_fails_closed_and_commits_one_system_change() {
+        let scratch = ScratchDatabase::create("buzz_pv_runtime_supervision").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let supervisor = Keys::generate();
+        let relay = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap runtime fixture owner");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, NULL), ($1, $3, $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .bind(agent.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("register owner-backed managed Agent");
+
+        initialize(&db, community_id, &owner, &relay).await;
+        let role_id = Uuid::new_v4();
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            create_role_mutation(1, role_id, "Runtime-owned Builder"),
+        )
+        .await;
+        db.set_project_view_enabled(community_id, false)
+            .await
+            .expect("pause v1 before runtime fixture cutover");
+
+        let audit = buzz_audit::AuditService::new(scratch.pool.clone());
+        let cutover_audit = audit
+            .log(buzz_audit::NewAuditEntry {
+                community_id,
+                action: buzz_audit::AuditAction::ProjectViewCutover,
+                actor_pubkey: Some(owner.public_key().to_bytes().to_vec()),
+                object_id: Some(community_id.to_string()),
+                detail: serde_json::json!({"test": "runtime supervision cutover"}),
+            })
+            .await
+            .expect("append valid cutover audit fact");
+        let cutover = db
+            .cutover_project_view_v2(
+                community_id,
+                &ProjectViewV2CutoverPlan {
+                    admin_assignments: Vec::new(),
+                    downgraded_admins: Vec::new(),
+                    audit_seq: cutover_audit.seq,
+                    idempotency_key_hash: [0x70; 32],
+                },
+                &relay,
+            )
+            .await
+            .expect("cut runtime fixture over to v2");
+        assert_eq!(cutover.project_revision, 3);
+        assert!(db
+            .set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()))
+            .await
+            .expect("enable verified runtime fixture"));
+
+        let proposal_id = Uuid::new_v4();
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            RoleCommand::new(
+                3,
+                None,
+                RoleCommandRequest::OfferRole {
+                    proposal_id,
+                    role_id,
+                    candidate_pubkey: agent.public_key(),
+                    expires_at: Utc::now() + chrono::Duration::days(1),
+                    reason: Some("supervised tenure".to_owned()),
+                },
+            ),
+        )
+        .await;
+        let accepted = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &agent,
+            &relay,
+            RoleCommand::new(4, None, RoleCommandRequest::AcceptProposal { proposal_id }),
+        )
+        .await;
+        let assignment_id = Uuid::parse_str(
+            accepted.receipt.result["assignment_id"]
+                .as_str()
+                .expect("accepted Assignment ID"),
+        )
+        .expect("valid Assignment UUID");
+
+        let policy = RuntimeRecoveryPolicy {
+            lease_seconds: 10,
+            recovery_window_seconds: 30,
+            max_recovery_attempts: 1,
+            recovery_backoff_seconds: 1,
+            monitor_timeout_seconds: 30,
+            monitor_grace_seconds: 30,
+            automatic_unrecoverable: true,
+        };
+        let binding = db
+            .register_runtime_supervisor(
+                community_id,
+                assignment_id,
+                supervisor.public_key(),
+                owner.public_key(),
+                policy,
+            )
+            .await
+            .expect("register trusted runtime supervisor");
+        assert_eq!(binding.assignment_id, assignment_id);
+
+        let runtime_one = Uuid::new_v4();
+        let runtime_two = Uuid::new_v4();
+        let runtime_three = Uuid::new_v4();
+        let start_one = runtime_evidence_request(
+            assignment_id,
+            runtime_one,
+            Uuid::new_v4(),
+            None,
+            RuntimeEvidence::Start,
+        );
+        let first_receipt = db
+            .record_runtime_evidence(
+                community_id,
+                supervisor.public_key(),
+                [0x71; 32],
+                &start_one,
+            )
+            .await
+            .expect("start first runtime");
+        assert_eq!(first_receipt.runtime_epoch, 1);
+        assert_eq!(first_receipt.availability, RuntimeAvailability::Available);
+        let replayed = db
+            .record_runtime_evidence(
+                community_id,
+                supervisor.public_key(),
+                [0x72; 32],
+                &start_one,
+            )
+            .await
+            .expect("replay exact start request");
+        assert!(replayed.replayed);
+        let mut idempotency_conflict = start_one.clone();
+        idempotency_conflict.runtime_epoch = Some(1);
+        idempotency_conflict.evidence = RuntimeEvidence::LeaseRenewed;
+        assert!(matches!(
+            db.record_runtime_evidence(
+                community_id,
+                supervisor.public_key(),
+                [0x73; 32],
+                &idempotency_conflict,
+            )
+            .await,
+            Err(crate::project_runtime::RuntimeSupervisionError::Invalid(_))
+        ));
+
+        db.record_runtime_evidence(
+            community_id,
+            supervisor.public_key(),
+            [0x74; 32],
+            &runtime_evidence_request(
+                assignment_id,
+                runtime_two,
+                Uuid::new_v4(),
+                None,
+                RuntimeEvidence::Start,
+            ),
+        )
+        .await
+        .expect("start second runtime");
+
+        let mut fence_tx = scratch.pool.begin().await.expect("begin fence check");
+        crate::project_runtime::validate_runtime_command_fence_in_tx(
+            &mut fence_tx,
+            community_id,
+            Some(assignment_id),
+            Some(RuntimeFence {
+                runtime_id: runtime_one,
+                runtime_epoch: 1,
+            }),
+        )
+        .await
+        .expect("current leased runtime fence");
+        assert!(matches!(
+            crate::project_runtime::validate_runtime_command_fence_in_tx(
+                &mut fence_tx,
+                community_id,
+                Some(assignment_id),
+                Some(RuntimeFence {
+                    runtime_id: runtime_one,
+                    runtime_epoch: 2,
+                }),
+            )
+            .await,
+            Err(crate::project_runtime::RuntimeSupervisionError::CommandFence)
+        ));
+        fence_tx.rollback().await.expect("release fence check");
+
+        for (marker, evidence, epoch) in [
+            (
+                0x75,
+                RuntimeEvidence::AbnormalExit {
+                    summary: Some("first runtime exited".to_owned()),
+                    exit_code: Some(1),
+                },
+                1,
+            ),
+            (0x76, RuntimeEvidence::RecoveryAttempt, 1),
+            (
+                0x77,
+                RuntimeEvidence::RecoveryFailed {
+                    summary: Some("first replacement failed".to_owned()),
+                },
+                2,
+            ),
+        ] {
+            db.record_runtime_evidence(
+                community_id,
+                supervisor.public_key(),
+                [marker; 32],
+                &runtime_evidence_request(
+                    assignment_id,
+                    runtime_one,
+                    Uuid::new_v4(),
+                    Some(epoch),
+                    evidence,
+                ),
+            )
+            .await
+            .expect("exhaust first runtime");
+        }
+        let with_healthy_peer = db
+            .assignment_runtime_status(community_id, assignment_id)
+            .await
+            .expect("read multi-runtime status");
+        assert_eq!(
+            with_healthy_peer.availability,
+            Some(RuntimeAvailability::Available)
+        );
+
+        sqlx::query(
+            "UPDATE project_runtime_leases SET \
+                 lease_expires_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND binding_id = $2 AND runtime_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .bind(runtime_two)
+        .execute(&scratch.pool)
+        .await
+        .expect("expire second runtime lease without inventing failure evidence");
+        assert!(
+            db.claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
+                .await
+                .expect("claim with expired healthy lease")
+                .is_empty(),
+            "lease expiry and silence must never become terminal evidence"
+        );
+
+        for (marker, evidence, epoch) in [
+            (
+                0x78,
+                RuntimeEvidence::AbnormalExit {
+                    summary: Some("second runtime exited".to_owned()),
+                    exit_code: Some(2),
+                },
+                1,
+            ),
+            (0x79, RuntimeEvidence::RecoveryAttempt, 1),
+            (
+                0x7A,
+                RuntimeEvidence::RecoveryFailed {
+                    summary: Some("second replacement failed".to_owned()),
+                },
+                2,
+            ),
+        ] {
+            db.record_runtime_evidence(
+                community_id,
+                supervisor.public_key(),
+                [marker; 32],
+                &runtime_evidence_request(
+                    assignment_id,
+                    runtime_two,
+                    Uuid::new_v4(),
+                    Some(epoch),
+                    evidence,
+                ),
+            )
+            .await
+            .expect("exhaust second runtime");
+        }
+
+        for (marker, evidence, epoch) in [
+            (0x7B, RuntimeEvidence::Start, None),
+            (
+                0x7C,
+                RuntimeEvidence::AbnormalExit {
+                    summary: Some("third runtime exited".to_owned()),
+                    exit_code: Some(3),
+                },
+                Some(1),
+            ),
+            (0x7D, RuntimeEvidence::RecoveryAttempt, Some(1)),
+        ] {
+            db.record_runtime_evidence(
+                community_id,
+                supervisor.public_key(),
+                [marker; 32],
+                &runtime_evidence_request(
+                    assignment_id,
+                    runtime_three,
+                    Uuid::new_v4(),
+                    epoch,
+                    evidence,
+                ),
+            )
+            .await
+            .expect("open in-flight final recovery attempt");
+        }
+        db.record_runtime_evidence(
+            community_id,
+            supervisor.public_key(),
+            [0x7E; 32],
+            &runtime_evidence_request(
+                assignment_id,
+                runtime_three,
+                Uuid::new_v4(),
+                Some(2),
+                RuntimeEvidence::SupervisorHeartbeat,
+            ),
+        )
+        .await
+        .expect("heartbeat must preserve an in-flight attempt");
+        assert_eq!(
+            db.assignment_runtime_status(community_id, assignment_id)
+                .await
+                .expect("read in-flight aggregate status")
+                .availability,
+            Some(RuntimeAvailability::Recovering)
+        );
+        assert!(
+            db.claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
+                .await
+                .expect("claim with final attempt in flight")
+                .is_empty(),
+            "a recovery attempt still in flight must fence terminal scheduling"
+        );
+        db.record_runtime_evidence(
+            community_id,
+            supervisor.public_key(),
+            [0x7F; 32],
+            &runtime_evidence_request(
+                assignment_id,
+                runtime_three,
+                Uuid::new_v4(),
+                Some(2),
+                RuntimeEvidence::RecoveryFailed {
+                    summary: Some("third replacement finally failed".to_owned()),
+                },
+            ),
+        )
+        .await
+        .expect("record explicit final attempt failure");
+
+        let unavailable = db
+            .assignment_runtime_status(community_id, assignment_id)
+            .await
+            .expect("read exhausted status");
+        assert_eq!(
+            unavailable.availability,
+            Some(RuntimeAvailability::Unavailable)
+        );
+        assert!(
+            db.claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
+                .await
+                .expect("claim during monitor grace")
+                .is_empty(),
+            "fresh evidence must still honor the monitor recovery grace"
+        );
+
+        sqlx::query(
+            "UPDATE project_runtime_supervisor_bindings SET \
+                 last_monitor_at = NULL, monitor_grace_until = NULL \
+             WHERE community_id = $1 AND binding_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .execute(&scratch.pool)
+        .await
+        .expect("simulate unavailable supervisor monitor");
+        assert!(
+            db.claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
+                .await
+                .expect("claim without monitor health")
+                .is_empty(),
+            "an unavailable supervisor monitor must fail closed"
+        );
+
+        sqlx::query(
+            "UPDATE project_runtime_supervisor_bindings SET \
+                 last_monitor_at = registered_at, monitor_grace_until = registered_at \
+             WHERE community_id = $1 AND binding_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .execute(&scratch.pool)
+        .await
+        .expect("restore supervisor health after an explicit grace boundary");
+        let claims = db
+            .claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
+            .await
+            .expect("claim exhausted Assignment");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].assignment_id, assignment_id);
+        assert_eq!(claims[0].binding_id, binding.binding_id);
+        assert_eq!(claims[0].evidence_ids.len(), 13);
+        assert!(
+            db.claim_unrecoverable_runtime_assignments(10, std::time::Duration::from_secs(60))
+                .await
+                .expect("second Relay pod claim")
+                .is_empty(),
+            "an active scheduler claim must fence other Relay pods"
+        );
+
+        let system = db
+            .end_unrecoverable_assignment(&claims[0], &relay)
+            .await
+            .expect("commit atomic unrecoverable system change");
+        assert_eq!(system.project_revision, 6);
+        assert!(!system.replayed);
+        assert_eq!(system.result["assignment_id"], assignment_id.to_string());
+        assert!(system.events.iter().any(|event| {
+            event.kind.as_u16() as u32 == buzz_core::kind::KIND_PROJECT_VIEW_META
+        }));
+        let replay = db
+            .end_unrecoverable_assignment(&claims[0], &relay)
+            .await
+            .expect("replay system idempotency receipt");
+        assert!(replay.replayed);
+        assert_eq!(replay.project_revision, system.project_revision);
+        assert!(replay.events.is_empty());
+
+        let (ended_reason, ended_by): (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT ended_reason, ended_by FROM project_role_assignments \
+             WHERE community_id = $1 AND assignment_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(assignment_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read terminal Assignment");
+        assert_eq!(ended_reason.as_deref(), Some("unrecoverable"));
+        assert_eq!(
+            ended_by.as_deref(),
+            Some(relay.public_key().as_bytes().as_slice())
+        );
+        let handoff_cause: String = sqlx::query_scalar(
+            "SELECT body->>'cause' FROM project_role_handoffs \
+             WHERE community_id = $1 AND from_assignment_id = $2 AND system_generated",
+        )
+        .bind(community_id.as_uuid())
+        .bind(assignment_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read system Handoff");
+        assert_eq!(handoff_cause, "unrecoverable");
+        let live_leases: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM project_runtime_leases \
+             WHERE community_id = $1 AND binding_id = $2 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("count terminal leases");
+        assert_eq!(live_leases, 0);
+        let latest_audit_seq: i64 =
+            sqlx::query_scalar("SELECT max(seq) FROM audit_log WHERE community_id = $1")
+                .bind(community_id.as_uuid())
+                .fetch_one(&scratch.pool)
+                .await
+                .expect("read runtime audit head");
+        assert_eq!(latest_audit_seq, 3);
+        assert!(audit
+            .verify_chain(community_id, 1, latest_audit_seq)
+            .await
+            .expect("verify runtime audit chain"));
+
+        let late = reject_v2_role_for_test(
+            &db,
+            community_id,
+            &agent,
+            RoleCommand::new(
+                6,
+                Some(assignment_id),
+                RoleCommandRequest::ReportUnableToContinue {
+                    assignment_id,
+                    reason: Some("late command from recovered old runtime".to_owned()),
+                },
+            )
+            .with_runtime_fence(RuntimeFence {
+                runtime_id: runtime_one,
+                runtime_epoch: 1,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            late,
+            ProjectViewV2WriteError::Domain(RoleContinuityError::ActingAssignmentInvalid)
+        ));
+
+        let mut evidence_link_tamper = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin latest evidence link tamper");
+        sqlx::query(
+            "UPDATE project_runtime_leases SET last_evidence_id = $4 \
+             WHERE community_id = $1 AND binding_id = $2 AND runtime_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .bind(runtime_one)
+        .bind([0x75_u8; 32].as_slice())
+        .execute(&mut *evidence_link_tamper)
+        .await
+        .expect("stage mismatched latest evidence link");
+        assert!(
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *evidence_link_tamper)
+                .await
+                .is_err(),
+            "a Runtime lease must point to evidence for its exact current state"
+        );
+        evidence_link_tamper
+            .rollback()
+            .await
+            .expect("roll back latest evidence link tamper");
+
+        assert!(
+            sqlx::query(
+                "UPDATE project_runtime_evidence SET availability_after = 'available' \
+                 WHERE community_id = $1 AND evidence_id = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind([0x77_u8; 32].as_slice())
+            .execute(&scratch.pool)
+            .await
+            .is_err(),
+            "trusted supervisor evidence must remain append-only"
+        );
+        let mut tamper = scratch.pool.begin().await.expect("begin binding tamper");
+        sqlx::query(
+            "UPDATE project_runtime_supervisor_bindings SET \
+                 system_change_id = NULL, system_audit_seq = NULL \
+             WHERE community_id = $1 AND binding_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(binding.binding_id)
+        .execute(&mut *tamper)
+        .await
+        .expect("stage incomplete terminal graph");
+        assert!(
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *tamper)
+                .await
+                .is_err(),
+            "deferred constraints must reject a partial runtime trust graph"
+        );
+        tamper.rollback().await.expect("roll back binding tamper");
 
         scratch.cleanup().await;
     }

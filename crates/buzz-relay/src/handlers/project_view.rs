@@ -957,7 +957,7 @@ async fn dispatch_committed_events(
     .await;
 }
 
-async fn dispatch_v2_committed_events(
+pub(crate) async fn dispatch_v2_committed_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     events: &[Event],
@@ -1045,6 +1045,36 @@ fn map_v2_write_error(error: ProjectViewV2WriteError) -> IngestError {
         }
         ProjectViewV2WriteError::Sqlx(error) => {
             IngestError::Internal(format!("error: Project View v2 SQL failure: {error}"))
+        }
+        ProjectViewV2WriteError::Audit(error) => {
+            IngestError::Internal(format!("error: Project View v2 audit failure: {error}"))
+        }
+        ProjectViewV2WriteError::RuntimeSupervision(error) => {
+            use buzz_db::project_runtime::RuntimeSupervisionError;
+
+            match error {
+                RuntimeSupervisionError::CommandFence
+                | RuntimeSupervisionError::StaleEpoch
+                | RuntimeSupervisionError::AssignmentEnded
+                | RuntimeSupervisionError::BindingConflict => {
+                    IngestError::Conflict("conflict:project_view:runtime_fence".to_owned())
+                }
+                RuntimeSupervisionError::Invalid(reason) => IngestError::Rejected(format!(
+                    "invalid:project_view:runtime_supervision:{reason}"
+                )),
+                RuntimeSupervisionError::NotRegistered => IngestError::Rejected(
+                    "invalid:project_view:runtime_supervision:not_registered".to_owned(),
+                ),
+                RuntimeSupervisionError::Database(error) => IngestError::Internal(format!(
+                    "error: Project View runtime database failure: {error}"
+                )),
+                RuntimeSupervisionError::Sqlx(error) => IngestError::Internal(format!(
+                    "error: Project View runtime SQL failure: {error}"
+                )),
+                RuntimeSupervisionError::Audit(error) => IngestError::Internal(format!(
+                    "error: Project View runtime audit failure: {error}"
+                )),
+            }
         }
         ProjectViewV2WriteError::InvalidCommit(reason) => {
             IngestError::Internal(format!("error: invalid Project View v2 commit: {reason}"))

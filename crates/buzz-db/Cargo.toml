@@ -11,6 +11,7 @@ description = "Postgres event store and data access layer for Buzz"
 buzz-core = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-sdk = { workspace = true }
+buzz-audit = { workspace = true }
 sqlx        = { workspace = true }
 tokio       = { workspace = true }
 serde       = { workspace = true }

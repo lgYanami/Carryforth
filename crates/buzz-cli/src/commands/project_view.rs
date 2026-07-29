@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 use crate::client::{create_response_with_id, normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_identity, read_verified_v2_snapshot, ProjectViewIdentity,
-    ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
+    is_managed_runtime, read_identity, read_verified_v2_snapshot, runtime_fence_from_env,
+    ProjectViewIdentity, ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
 };
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
@@ -284,14 +284,13 @@ async fn cmd_create(
             .sign_event_exact(build_create(expected_project_revision, object).map_err(sdk_err)?)?,
         ProjectViewSchema::V2 => {
             let acting_assignment = v2_acting_assignment(client, identity).await?;
-            client.sign_event_exact(
-                build_project_object_command(ProjectObjectCommand::new(
-                    expected_project_revision,
-                    acting_assignment,
-                    MutationRequest::Create(CreateMutation { object }),
-                ))
-                .map_err(sdk_err)?,
-            )?
+            let mut command = ProjectObjectCommand::new(
+                expected_project_revision,
+                acting_assignment,
+                MutationRequest::Create(CreateMutation { object }),
+            );
+            command.runtime_fence = runtime_fence_from_env()?;
+            client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
@@ -326,14 +325,13 @@ async fn cmd_update(
             .sign_event_exact(build_update(expected_project_revision, update).map_err(sdk_err)?)?,
         ProjectViewSchema::V2 => {
             let acting_assignment = v2_acting_assignment(client, identity).await?;
-            client.sign_event_exact(
-                build_project_object_command(ProjectObjectCommand::new(
-                    expected_project_revision,
-                    acting_assignment,
-                    MutationRequest::Update(update),
-                ))
-                .map_err(sdk_err)?,
-            )?
+            let mut command = ProjectObjectCommand::new(
+                expected_project_revision,
+                acting_assignment,
+                MutationRequest::Update(update),
+            );
+            command.runtime_fence = runtime_fence_from_env()?;
+            client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
@@ -356,17 +354,16 @@ async fn cmd_delete(
         )?,
         ProjectViewSchema::V2 => {
             let acting_assignment = v2_acting_assignment(client, identity).await?;
-            client.sign_event_exact(
-                build_project_object_command(ProjectObjectCommand::new(
-                    expected_project_revision,
-                    acting_assignment,
-                    MutationRequest::Delete(DeleteMutation {
-                        object_type,
-                        object_id,
-                    }),
-                ))
-                .map_err(sdk_err)?,
-            )?
+            let mut command = ProjectObjectCommand::new(
+                expected_project_revision,
+                acting_assignment,
+                MutationRequest::Delete(DeleteMutation {
+                    object_type,
+                    object_id,
+                }),
+            );
+            command.runtime_fence = runtime_fence_from_env()?;
+            client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;

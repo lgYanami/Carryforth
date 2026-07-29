@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
     is_managed_runtime, read_current_v2_snapshot, read_role_history_page,
-    read_verified_v2_snapshot, require_v2_identity, RoleHistoryRequest,
+    read_verified_v2_snapshot, require_v2_identity, runtime_fence_from_env, RoleHistoryRequest,
 };
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
@@ -801,6 +801,7 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
             _ => {}
         }
         command.acting_assignment_id = current_assignment;
+        command.runtime_fence = runtime_fence_from_env()?;
     }
     let event = client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?;
     let response = client.submit_event(event).await?;

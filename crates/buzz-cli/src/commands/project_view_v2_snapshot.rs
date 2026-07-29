@@ -7,7 +7,7 @@ use buzz_core::kind::{
     KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::PublicKey;
-use buzz_project_view::v2::RoleContinuityEntity;
+use buzz_project_view::v2::{RoleContinuityEntity, RuntimeFence};
 use buzz_sdk::project_view_v2::{
     parse_entity_projection, parse_membership_projection, parse_meta_projection,
     parse_project_object_projection, V2EntityProjection, V2MembershipProjection, V2MetaProjection,
@@ -461,6 +461,31 @@ pub(crate) async fn read_current_v2_snapshot(
 
 pub(crate) fn is_managed_runtime() -> bool {
     std::env::var("BUZZ_MANAGED_AGENT").as_deref() == Ok("1")
+}
+
+pub(crate) fn runtime_fence_from_env() -> Result<Option<RuntimeFence>, CliError> {
+    let runtime_id = std::env::var("BUZZ_RUNTIME_ID").ok();
+    let runtime_epoch = std::env::var("BUZZ_RUNTIME_EPOCH").ok();
+    match (runtime_id, runtime_epoch) {
+        (None, None) => Ok(None),
+        (Some(runtime_id), Some(runtime_epoch)) => {
+            let runtime_fence = RuntimeFence {
+                runtime_id: runtime_id
+                    .parse()
+                    .map_err(|error| CliError::Auth(format!("invalid BUZZ_RUNTIME_ID: {error}")))?,
+                runtime_epoch: runtime_epoch.parse().map_err(|error| {
+                    CliError::Auth(format!("invalid BUZZ_RUNTIME_EPOCH: {error}"))
+                })?,
+            };
+            runtime_fence.validate().map_err(|error| {
+                CliError::Auth(format!("invalid managed runtime fence: {error}"))
+            })?;
+            Ok(Some(runtime_fence))
+        }
+        _ => Err(CliError::Auth(
+            "BUZZ_RUNTIME_ID and BUZZ_RUNTIME_EPOCH must be supplied together".to_owned(),
+        )),
+    }
 }
 
 async fn read_meta(

@@ -30,6 +30,12 @@ pub enum AuditAction {
     MediaUploaded,
     /// One Community was explicitly cut over to Project View schema v2.
     ProjectViewCutover,
+    /// A trusted runtime supervisor was bound to an exact Assignment.
+    RuntimeSupervisorRegistered,
+    /// An Assignment-scoped runtime supervisor binding was revoked.
+    RuntimeSupervisorRevoked,
+    /// Exhausted trusted recovery ended one Assignment as unrecoverable.
+    RuntimeAssignmentUnrecoverable,
 }
 
 impl AuditAction {
@@ -48,6 +54,9 @@ impl AuditAction {
             Self::RateLimitExceeded => "rate_limit_exceeded",
             Self::MediaUploaded => "media_uploaded",
             Self::ProjectViewCutover => "project_view_cutover",
+            Self::RuntimeSupervisorRegistered => "runtime_supervisor_registered",
+            Self::RuntimeSupervisorRevoked => "runtime_supervisor_revoked",
+            Self::RuntimeAssignmentUnrecoverable => "runtime_assignment_unrecoverable",
         }
     }
 
@@ -64,6 +73,9 @@ impl AuditAction {
         Self::RateLimitExceeded,
         Self::MediaUploaded,
         Self::ProjectViewCutover,
+        Self::RuntimeSupervisorRegistered,
+        Self::RuntimeSupervisorRevoked,
+        Self::RuntimeAssignmentUnrecoverable,
     ];
 }
 

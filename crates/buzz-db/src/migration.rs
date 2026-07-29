@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -952,6 +952,24 @@ mod tests {
             role_history.contains("source_change.operation IS DISTINCT FROM 'append_checkpoint'")
         );
         assert!(role_history.contains("source_change.operation IS DISTINCT FROM 'append_handoff'"));
+
+        // Stage 7 keeps high-frequency runtime state outside Project revisions,
+        // while deferring the terminal trust-chain validation until the atomic
+        // system change is complete.
+        assert_eq!(migrations[29].version, 30);
+        let runtime_supervision = migrations[29].sql.as_str();
+        assert!(runtime_supervision.contains("CREATE TABLE project_runtime_supervisor_bindings"));
+        assert!(runtime_supervision.contains("CREATE TABLE project_runtime_leases"));
+        assert!(runtime_supervision.contains("CREATE TABLE project_runtime_evidence"));
+        assert!(runtime_supervision.contains("recovery_backoff_seconds"));
+        assert!(runtime_supervision.contains("recovery_attempt_in_flight"));
+        assert!(runtime_supervision.contains("next_recovery_at"));
+        assert!(runtime_supervision.contains("project_runtime_evidence_append_only"));
+        assert!(runtime_supervision.contains("project_runtime_supervision_validate_community"));
+        assert!(runtime_supervision
+            .contains("Runtime lease is not backed by its exact latest evidence"));
+        assert!(runtime_supervision.contains("Runtime evidence does not match its trusted binding"));
+        assert!(runtime_supervision.contains("DEFERRABLE INITIALLY DEFERRED"));
     }
 
     #[test]
@@ -980,6 +998,16 @@ mod tests {
             "project_role_handoffs_content_check",
             "project_role_history_append_only",
             "project_role_history_validate_stage6_community",
+            "CREATE TABLE project_runtime_supervisor_bindings",
+            "CREATE TABLE project_runtime_leases",
+            "CREATE TABLE project_runtime_evidence",
+            "recovery_backoff_seconds",
+            "recovery_attempt_in_flight",
+            "next_recovery_at",
+            "project_runtime_evidence_append_only",
+            "project_runtime_supervision_validate_community",
+            "Runtime lease is not backed by its exact latest evidence",
+            "Runtime evidence does not match its trusted binding",
         ] {
             assert!(
                 schema.contains(fragment),
@@ -1270,8 +1298,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0029");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(29));
+            .expect("upgrade scratch database through 0030");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1403,15 +1431,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(29));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(30));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version IN (25, 26, 27, 28, 29) AND success",
+             WHERE version IN (25, 26, 27, 28, 29, 30) AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 5);
+        assert_eq!(project_view_migration_count, 6);
 
         first.close().await;
         second.close().await;
@@ -1491,7 +1519,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(29));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
     }
 
     #[tokio::test]

@@ -69,7 +69,7 @@ fi
 # trigger differences are tracked independently and must not weaken this gate.
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 -qtA \
-  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 27 AND success" \
+  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 30 AND success" \
   | grep -qx ok
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
@@ -94,8 +94,8 @@ project_view_drift="$(
   jq '[
     .groups[].steps[]?
     | select(
-        ((.path // "") | test("project_view|project_role|project_work_commitments"; "i"))
-        or ((.sql // "") | test("project_view|project_role|project_work_commitments"; "i"))
+        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime"; "i"))
+        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime"; "i"))
       )
   ]' "${plan_file}"
 )"

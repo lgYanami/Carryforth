@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{
     KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
     KIND_PROJECT_VIEW_OBJECT,
@@ -43,12 +44,18 @@ pub enum ProjectViewV2WriteError {
     /// SQL execution failed.
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    /// Tamper-evident audit append failed.
+    #[error(transparent)]
+    Audit(#[from] buzz_audit::AuditError),
     /// Pure v2 state machine rejected the command.
     #[error(transparent)]
     Domain(#[from] RoleContinuityError),
     /// Shared ordinary-object reducer rejected a schema-v2 command.
     #[error(transparent)]
     ObjectDomain(#[from] DomainError),
+    /// Trusted runtime fencing rejected a supervised managed command.
+    #[error(transparent)]
+    RuntimeSupervision(#[from] crate::project_runtime::RuntimeSupervisionError),
     /// Community is not an initialized, enabled v2 Project View.
     #[error("Project View v2 is unavailable for community {community_id}")]
     Unavailable {
@@ -291,6 +298,19 @@ pub struct ProjectViewV2CutoverOutcome {
     /// Relay-signed events to fan out after commit.
     pub events: Vec<Event>,
     /// Whether an existing idempotency receipt was returned.
+    pub replayed: bool,
+}
+
+/// Result of one trusted internal Project View system change.
+#[derive(Debug, Clone)]
+pub struct ProjectViewV2SystemOutcome {
+    /// New or replayed project revision.
+    pub project_revision: u64,
+    /// Stable successful receipt.
+    pub result: Value,
+    /// Newly stored Relay-signed projections in dispatch order.
+    pub events: Vec<Event>,
+    /// Whether the idempotent system change was already committed.
     pub replayed: bool,
 }
 
@@ -1241,6 +1261,488 @@ impl Db {
         })
     }
 
+    /// End one exhaustively recovered managed-Agent Assignment as a trusted
+    /// system action.
+    ///
+    /// Runtime claim revalidation, audit append, canonical Role continuity,
+    /// Community membership, signed projections, and supervisor fencing commit
+    /// in one transaction. Presence and lease expiry are never accepted as the
+    /// terminal evidence.
+    pub async fn end_unrecoverable_assignment(
+        &self,
+        claim: &crate::project_runtime::RuntimeUnrecoverableClaim,
+        relay_keys: &Keys,
+    ) -> ProjectViewV2WriteResult<ProjectViewV2SystemOutcome> {
+        const OPERATION: &str = "end_unrecoverable_assignment";
+
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, claim.community_id, false).await?;
+
+        if let Some(row) = sqlx::query(
+            "SELECT operation, subject, project_revision, result \
+             FROM project_view_changes \
+             WHERE community_id = $1 AND idempotency_key_hash = $2",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(claim.idempotency_key_hash.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let operation: String = row.try_get("operation")?;
+            let subject: Value = row.try_get("subject")?;
+            if operation != OPERATION
+                || subject.get("binding_id").and_then(Value::as_str)
+                    != Some(claim.binding_id.to_string().as_str())
+                || subject.get("assignment_id").and_then(Value::as_str)
+                    != Some(claim.assignment_id.to_string().as_str())
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "runtime system idempotency key belongs to another change".to_owned(),
+                ));
+            }
+            let project_revision =
+                db_revision(row.try_get("project_revision")?, "project_revision")?;
+            let result: Value = row.try_get("result")?;
+            tx.rollback().await?;
+            return Ok(ProjectViewV2SystemOutcome {
+                project_revision,
+                result,
+                events: Vec::new(),
+                replayed: true,
+            });
+        }
+
+        let evidence_ids =
+            crate::project_runtime::validate_unrecoverable_claim_in_tx(&mut tx, claim).await?;
+        let loaded = load_v2_state(&mut tx, claim.community_id).await?;
+        let relay_pubkey = relay_keys.public_key();
+        if loaded.projection_pubkey != relay_pubkey {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "runtime system action is fenced during projection signer rotation".to_owned(),
+            ));
+        }
+        let current_revision = loaded.state.project_revision();
+        let handoff_id = Uuid::new_v4();
+        let (next_state, outcome) = loaded.state.reduce_unrecoverable_assignment(
+            claim.assignment_id,
+            relay_pubkey,
+            loaded.canonical_time,
+            handoff_id,
+        )?;
+        if !outcome.work_changes.is_empty() {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "unrecoverable Assignment unexpectedly rewrote Project Work".to_owned(),
+            ));
+        }
+        let old_projection_ids =
+            load_old_projection_ids(&mut tx, claim.community_id, &outcome.changes).await?;
+        let membership_before = load_membership(&mut tx, claim.community_id).await?;
+        let previous_membership_id = loaded.membership_snapshot_event_id.ok_or_else(|| {
+            ProjectViewV2WriteError::InvalidCommit(
+                "v2 Project View has no membership snapshot".to_owned(),
+            )
+        })?;
+
+        let evidence_hex = evidence_ids.iter().map(hex::encode).collect::<Vec<_>>();
+        let audit_entry = buzz_audit::append_in_transaction(
+            &mut tx,
+            NewAuditEntry {
+                community_id: claim.community_id,
+                action: AuditAction::RuntimeAssignmentUnrecoverable,
+                actor_pubkey: None,
+                object_id: Some(claim.assignment_id.to_string()),
+                detail: json!({
+                    "binding_id": claim.binding_id,
+                    "assignment_id": claim.assignment_id,
+                    "handoff_id": handoff_id,
+                    "evidence_ids": evidence_hex,
+                    "idempotency_key_hash": hex::encode(claim.idempotency_key_hash),
+                }),
+            },
+        )
+        .await?;
+        let source =
+            ChangeSource::system(audit_entry.seq, claim.idempotency_key_hash).map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "invalid runtime system source: {error}"
+                ))
+            })?;
+        let change_id = source.change_id();
+        let change_event_id = EventId::from_slice(&change_id).map_err(|error| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "invalid runtime system change ID: {error}"
+            ))
+        })?;
+        let result = json!({
+            "operation": OPERATION,
+            "project_revision": outcome.project_revision,
+            "assignment_id": claim.assignment_id,
+            "handoff_id": handoff_id,
+            "changed_entities": outcome.changes.iter().map(|change| json!({
+                "entity_type": change.entity_type().as_str(),
+                "entity_id": change.entity_id(),
+                "entity_revision": change.entity_revision(),
+            })).collect::<Vec<_>>(),
+            "evidence_ids": evidence_hex,
+        });
+        let subject = json!({
+            "binding_id": claim.binding_id,
+            "assignment_id": claim.assignment_id,
+            "evidence_ids": evidence_hex,
+        });
+        sqlx::query(
+            "INSERT INTO project_view_changes \
+                (community_id, change_id, source_type, source_audit_seq, \
+                 idempotency_key_hash, actor_pubkey, acting_assignment_id, \
+                 operation, subject, project_revision, result, accepted_at) \
+             VALUES ($1,$2,'system',$3,$4,NULL,NULL,$5,$6,$7,$8,$9)",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(change_id.as_slice())
+        .bind(audit_entry.seq)
+        .bind(claim.idempotency_key_hash.as_slice())
+        .bind(OPERATION)
+        .bind(&subject)
+        .bind(revision_i64(outcome.project_revision, "project_revision")?)
+        .bind(&result)
+        .bind(loaded.canonical_time)
+        .execute(&mut *tx)
+        .await?;
+
+        persist_changes(
+            &mut tx,
+            claim.community_id,
+            &change_id,
+            loaded.canonical_time,
+            &outcome.changes,
+        )
+        .await?;
+        apply_membership_roles(
+            &mut tx,
+            claim.community_id,
+            relay_pubkey,
+            &outcome.membership_roles,
+            loaded.canonical_time,
+        )
+        .await?;
+        let membership_after = load_membership(&mut tx, claim.community_id).await?;
+        let counts = load_counts(&mut tx, claim.community_id).await?;
+        if counts.active_assignments
+            != u32::try_from(
+                next_state
+                    .assignments()
+                    .filter(|assignment| assignment.is_active())
+                    .count(),
+            )
+            .map_err(|_| {
+                ProjectViewV2WriteError::InvalidCommit(
+                    "active Assignment count exceeds u32".to_owned(),
+                )
+            })?
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "runtime reducer and stored active Assignment count disagree".to_owned(),
+            ));
+        }
+
+        let membership_event = if membership_before != membership_after {
+            Some(build_cutover_membership_event(
+                &membership_after,
+                loaded.canonical_time,
+                relay_keys,
+            )?)
+        } else {
+            None
+        };
+        let membership_event_id = membership_event
+            .as_ref()
+            .map_or(previous_membership_id, |event| event.id);
+        let audit_seq = u64::try_from(audit_entry.seq).map_err(|_| {
+            ProjectViewV2WriteError::InvalidCommit(
+                "runtime system audit sequence must be positive".to_owned(),
+            )
+        })?;
+        let projection_source = buzz_sdk::project_view_v2::V2ProjectionSource::System {
+            change_id: change_event_id,
+            audit_seq,
+        };
+        let context = buzz_sdk::project_view_v2::V2ProjectionContext {
+            project_id: claim.community_id,
+            projection_generation: loaded.projection_generation,
+            project_revision: outcome.project_revision,
+            source: projection_source.clone(),
+            updated_at: loaded.canonical_time,
+        };
+        let mut entity_projections = Vec::with_capacity(outcome.changes.len());
+        let mut expected_heads = BTreeMap::new();
+        for change in &outcome.changes {
+            let event = buzz_sdk::project_view_v2::build_entity_projection(&context, change)
+                .map_err(|error| {
+                    ProjectViewV2WriteError::InvalidCommit(format!(
+                        "build runtime system entity projection: {error}"
+                    ))
+                })?
+                .sign_with_keys(relay_keys)
+                .map_err(|error| {
+                    ProjectViewV2WriteError::InvalidCommit(format!(
+                        "sign runtime system entity projection: {error}"
+                    ))
+                })?;
+            let parsed = buzz_sdk::project_view_v2::parse_entity_projection(
+                &event,
+                &relay_pubkey,
+                claim.community_id,
+            )
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "verify runtime system entity projection: {error}"
+                ))
+            })?;
+            if parsed.entity != *change
+                || parsed.project_revision != outcome.project_revision
+                || parsed.projection_generation != loaded.projection_generation
+                || parsed.source != projection_source
+                || parsed.updated_at != loaded.canonical_time
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "runtime system entity projection differs from canonical state".to_owned(),
+                ));
+            }
+            let changed_head = buzz_sdk::project_view_v2::changed_head_for(
+                &context, change, &event,
+            )
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "bind runtime system changed head: {error}"
+                ))
+            })?;
+            if expected_heads
+                .insert(changed_head.coordinate().to_owned(), changed_head)
+                .is_some()
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "runtime system change generated duplicate head coordinates".to_owned(),
+                ));
+            }
+            entity_projections.push(PreparedV2EntityProjection {
+                entity_type: change.entity_type(),
+                entity_id: change.entity_id(),
+                event,
+            });
+        }
+        let changed_heads = expected_heads.values().cloned().collect::<Vec<_>>();
+        let entity_counts = buzz_sdk::project_view_v2::V2EntityCounts {
+            active_objects: counts.active_objects,
+            open_proposals: counts.open_proposals,
+            active_assignments: counts.active_assignments,
+            active_commitments: counts.active_commitments,
+            checkpoints: counts.checkpoints,
+            handoffs: counts.handoffs,
+        };
+        let meta_event = buzz_sdk::project_view_v2::build_meta_projection(
+            &context,
+            entity_counts,
+            membership_event_id,
+            false,
+            &changed_heads,
+        )
+        .map_err(|error| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "build runtime system metadata projection: {error}"
+            ))
+        })?
+        .sign_with_keys(relay_keys)
+        .map_err(|error| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "sign runtime system metadata projection: {error}"
+            ))
+        })?;
+        let meta = buzz_sdk::project_view_v2::parse_meta_projection(&meta_event, &relay_pubkey)
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "verify runtime system metadata projection: {error}"
+                ))
+            })?;
+        let actual_heads = meta
+            .changed_heads
+            .iter()
+            .map(|head| (head.coordinate().to_owned(), head.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if meta.project_id != claim.community_id
+            || meta.project_revision != outcome.project_revision
+            || meta.projection_generation != loaded.projection_generation
+            || meta.entity_counts != entity_counts
+            || meta.membership_snapshot_event_id != membership_event_id
+            || meta.reset
+            || meta.source != projection_source
+            || meta.updated_at != loaded.canonical_time
+            || actual_heads != expected_heads
+            || actual_heads.len() != meta.changed_heads.len()
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "runtime system metadata projection differs from canonical state".to_owned(),
+            ));
+        }
+        if let Some(event) = &membership_event {
+            verify_membership_projection(
+                event,
+                relay_pubkey,
+                &membership_after,
+                loaded.canonical_time,
+            )?;
+        }
+
+        for old_event_id in old_projection_ids.values() {
+            if !crate::event::retire_projection_head_in_tx(
+                &mut tx,
+                claim.community_id,
+                old_event_id,
+                KIND_PROJECT_VIEW_OBJECT,
+            )
+            .await?
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "stored runtime-affected entity projection is not live".to_owned(),
+                ));
+            }
+        }
+        if !crate::event::retire_projection_head_in_tx(
+            &mut tx,
+            claim.community_id,
+            &loaded.meta_projection_event_id,
+            KIND_PROJECT_VIEW_META,
+        )
+        .await?
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "stored v2 metadata projection is not live".to_owned(),
+            ));
+        }
+
+        let mut events = Vec::with_capacity(entity_projections.len() + 2);
+        if let Some(event) = &membership_event {
+            retire_membership_heads(&mut tx, claim.community_id, relay_pubkey).await?;
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut tx, claim.community_id, event, None).await?;
+            if !inserted {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "runtime membership projection already exists".to_owned(),
+                ));
+            }
+            events.push(event.clone());
+        }
+        for projection in &entity_projections {
+            let (_, inserted) = crate::event::insert_event_in_tx(
+                &mut tx,
+                claim.community_id,
+                &projection.event,
+                None,
+            )
+            .await?;
+            if !inserted {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "runtime entity projection {} already exists",
+                    projection.entity_id
+                )));
+            }
+            update_projection_pointer(
+                &mut tx,
+                claim.community_id,
+                projection.entity_type,
+                projection.entity_id,
+                projection.event.id.as_bytes(),
+            )
+            .await?;
+            events.push(projection.event.clone());
+        }
+        let (_, meta_inserted) =
+            crate::event::insert_event_in_tx(&mut tx, claim.community_id, &meta_event, None)
+                .await?;
+        if !meta_inserted {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "runtime metadata projection already exists".to_owned(),
+            ));
+        }
+
+        let relay_bytes = relay_pubkey.to_bytes();
+        let state_update = sqlx::query(
+            "UPDATE project_view_state SET \
+                 project_revision = $2, updated_at = $3, last_event_id = $4, \
+                 last_actor_pubkey = $5, meta_projection_event_id = $6, \
+                 schema_version = 2, last_change_id = $4, \
+                 last_source_event_id = NULL, open_proposal_count = $7, \
+                 active_assignment_count = $8, active_commitment_count = $9, \
+                 checkpoint_count = $10, handoff_count = $11, \
+                 membership_snapshot_event_id = $12 \
+             WHERE community_id = $1 AND project_revision = $13 \
+               AND schema_version = 2",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(revision_i64(outcome.project_revision, "project_revision")?)
+        .bind(loaded.canonical_time)
+        .bind(change_id.as_slice())
+        .bind(relay_bytes.as_slice())
+        .bind(meta_event.id.as_bytes().as_slice())
+        .bind(count_i32(counts.open_proposals, "open_proposals")?)
+        .bind(count_i32(counts.active_assignments, "active_assignments")?)
+        .bind(count_i32(counts.active_commitments, "active_commitments")?)
+        .bind(count_i32(counts.checkpoints, "checkpoints")?)
+        .bind(count_i32(counts.handoffs, "handoffs")?)
+        .bind(membership_event_id.as_bytes().as_slice())
+        .bind(revision_i64(current_revision, "current_revision")?)
+        .execute(&mut *tx)
+        .await?;
+        if state_update.rows_affected() != 1 {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "Project View state changed during runtime system action".to_owned(),
+            ));
+        }
+        let binding_update = sqlx::query(
+            "UPDATE project_runtime_supervisor_bindings SET \
+                 system_change_id = $4, system_audit_seq = $5, \
+                 automatic_unrecoverable = FALSE, scheduler_claim_token = NULL, \
+                 scheduler_claimed_until = NULL, updated_at = $6 \
+             WHERE community_id = $1 AND binding_id = $2 \
+               AND scheduler_claim_token = $3 AND system_change_id IS NULL",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(claim.binding_id)
+        .bind(claim.claim_token)
+        .bind(change_id.as_slice())
+        .bind(audit_entry.seq)
+        .bind(loaded.canonical_time)
+        .execute(&mut *tx)
+        .await?;
+        if binding_update.rows_affected() != 1 {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "runtime scheduler claim changed during system action".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE project_runtime_leases SET \
+                 lease_expires_at = NULL, recovery_attempt_in_flight = FALSE, \
+                 next_recovery_at = NULL, ended_at = $3, updated_at = $3 \
+             WHERE community_id = $1 AND binding_id = $2 AND ended_at IS NULL",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(claim.binding_id)
+        .bind(loaded.canonical_time)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        events.push(meta_event);
+        Ok(ProjectViewV2SystemOutcome {
+            project_revision: outcome.project_revision,
+            result,
+            events,
+            replayed: false,
+        })
+    }
+
     /// Begin a v2 write under the same Community advisory lock used by all
     /// membership writers.
     pub async fn begin_project_view_v2_write(
@@ -1304,6 +1806,13 @@ impl ProjectViewV2WriteTx {
         loaded
             .state
             .validate_actor_for_replay(command, command_event.pubkey)?;
+        crate::project_runtime::validate_runtime_command_fence_in_tx(
+            &mut self.tx,
+            self.community_id,
+            command.acting_assignment_id,
+            command.runtime_fence,
+        )
+        .await?;
         if let Some(receipt) =
             find_receipt(&mut self.tx, self.community_id, command_event.id.as_bytes()).await?
         {
@@ -1350,6 +1859,14 @@ impl ProjectViewV2WriteTx {
             command_event.id.as_bytes(),
             loaded.canonical_time,
             &outcome.changes,
+        )
+        .await?;
+        crate::project_runtime::fence_ended_runtime_bindings_in_tx(
+            &mut self.tx,
+            self.community_id,
+            &outcome.changes,
+            command_event.pubkey,
+            loaded.canonical_time,
         )
         .await?;
 
@@ -1416,6 +1933,7 @@ impl ProjectViewV2WriteTx {
             self.community_id,
             command_event.pubkey,
             command.acting_assignment_id,
+            command.runtime_fence,
         )
         .await?;
         if let Some(receipt) =
@@ -2469,6 +2987,7 @@ async fn validate_project_object_actor_fence(
     community_id: CommunityId,
     actor: PublicKey,
     acting_assignment_id: Option<Uuid>,
+    runtime_fence: Option<buzz_project_view::v2::RuntimeFence>,
 ) -> ProjectViewV2WriteResult<()> {
     let actor_bytes = actor.to_bytes();
     let managed: bool = sqlx::query_scalar(
@@ -2507,6 +3026,13 @@ async fn validate_project_object_actor_fence(
             RoleContinuityError::ActingAssignmentInvalid,
         ));
     }
+    crate::project_runtime::validate_runtime_command_fence_in_tx(
+        tx,
+        community_id,
+        Some(assignment_id),
+        runtime_fence,
+    )
+    .await?;
     Ok(())
 }
 

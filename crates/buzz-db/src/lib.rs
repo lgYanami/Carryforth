@@ -36,6 +36,8 @@ pub mod moderation;
 pub mod partition;
 /// Buzz product-feedback sidecar persistence.
 pub mod product_feedback;
+/// Trusted managed-runtime leases, epochs, and supervisor evidence.
+pub mod project_runtime;
 /// Project View canonical state and atomic mutation persistence.
 pub mod project_view;
 /// Project View v2 Role Proposal/Assignment transaction coordinator.

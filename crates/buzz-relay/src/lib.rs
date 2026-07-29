@@ -35,6 +35,8 @@ pub mod protocol;
 pub mod push_runtime;
 /// Axum router construction.
 pub mod router;
+/// Trusted managed-runtime recovery scheduler.
+pub mod runtime_supervision;
 /// Shared application state.
 pub mod state;
 pub mod storage_sweep;

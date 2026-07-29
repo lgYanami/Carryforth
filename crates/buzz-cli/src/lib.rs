@@ -236,6 +236,9 @@ enum Cmd {
     /// Read and govern Project View v2 Roles and Assignments
     #[command(subcommand)]
     Roles(RolesCmd),
+    /// Submit trusted managed-runtime evidence and read availability
+    #[command(subcommand)]
+    Runtime(RuntimeCmd),
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
@@ -343,6 +346,66 @@ pub enum ProjectViewCmd {
         #[arg(long)]
         expected_project_revision: u64,
     },
+}
+
+/// Trusted runtime supervisor operations.
+#[derive(Subcommand)]
+pub enum RuntimeCmd {
+    /// Submit one immutable, Assignment-scoped supervisor observation
+    Evidence {
+        /// Closed evidence transition.
+        #[arg(value_enum)]
+        evidence: RuntimeEvidenceArg,
+        /// Exact managed-Agent Assignment UUID.
+        #[arg(long)]
+        assignment: Uuid,
+        /// Stable logical runtime UUID.
+        #[arg(long)]
+        runtime: Uuid,
+        /// Current server-allocated epoch; omit only for `start`.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Stable retry key; generated when omitted.
+        #[arg(long)]
+        idempotency_key: Option<Uuid>,
+        /// Bounded diagnostic summary for abnormal/failed recovery.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Operating-system exit status for `abnormal_exit`.
+        #[arg(long)]
+        exit_code: Option<i32>,
+    },
+    /// Read one Assignment's current runtime availability
+    Status {
+        /// Assignment UUID.
+        #[arg(long)]
+        assignment: Uuid,
+    },
+}
+
+/// Closed trusted runtime evidence type.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RuntimeEvidenceArg {
+    /// Open a newly fenced runtime epoch.
+    Start,
+    /// Renew the lease for an available epoch.
+    #[value(name = "lease_renewed")]
+    LeaseRenewed,
+    /// Begin recovery after a trusted abnormal process exit.
+    #[value(name = "abnormal_exit")]
+    AbnormalExit,
+    /// Allocate the next fenced epoch for one bounded recovery attempt.
+    #[value(name = "recovery_attempt")]
+    RecoveryAttempt,
+    /// Mark the currently fenced replacement attempt as healthy.
+    #[value(name = "recovery_succeeded")]
+    RecoverySucceeded,
+    /// Record a failed recovery result.
+    #[value(name = "recovery_failed")]
+    RecoveryFailed,
+    /// Prove supervisor health without consuming a retry.
+    #[value(name = "supervisor_heartbeat")]
+    SupervisorHeartbeat,
 }
 
 /// Project View v2 Role continuity commands.
@@ -2306,6 +2369,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
         Cmd::Roles(sub) => commands::roles::dispatch(sub, &client, &cli.format).await,
+        Cmd::Runtime(sub) => commands::runtime::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
@@ -2344,6 +2408,7 @@ mod tests {
             "reactions",
             "repos",
             "roles",
+            "runtime",
             "social",
             "upload",
             "users",

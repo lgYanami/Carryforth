@@ -91,6 +91,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/operator/communities/transfer",
             post(api::operator::transfer_community),
         )
+        .route(
+            "/operator/project-runtime/bindings",
+            post(api::operator::register_runtime_supervisor),
+        )
+        .route(
+            "/operator/project-runtime/bindings/revoke",
+            post(api::operator::revoke_runtime_supervisor),
+        )
+        .route(
+            "/api/project-runtime/evidence",
+            post(api::project_runtime::record_evidence),
+        )
+        .route(
+            "/api/project-runtime/status",
+            get(api::project_runtime::assignment_status),
+        )
         // Relay invites: mint (owner/admin) + claim (membership-gate exempt)
         .route("/api/invites", post(api::invites::mint_invite))
         .route("/api/join-policy", get(api::invites::join_policy))

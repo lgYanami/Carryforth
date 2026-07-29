@@ -28,6 +28,25 @@ fn log_timestamp() -> DateTime<Utc> {
 /// taken with `pg_advisory_lock(hashtextextended(...))` — see [`AuditService::log`].
 const AUDIT_LOCK_NAMESPACE: &str = "buzz_audit:";
 
+/// Append one audit fact inside a caller-owned transaction.
+///
+/// The transaction-scoped advisory lock uses the exact key namespace as
+/// [`AuditService::log`], so ordinary asynchronous audit writes and a Project
+/// system change cannot race the same Community hash-chain head. The caller
+/// decides whether the returned entry commits or rolls back with its domain
+/// transaction.
+pub async fn append_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entry: NewAuditEntry,
+) -> Result<AuditEntry, AuditError> {
+    let lock_key = format!("{AUDIT_LOCK_NAMESPACE}{}", entry.community_id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&lock_key)
+        .execute(&mut **tx)
+        .await?;
+    append_locked(tx, entry).await
+}
+
 /// Append-only, per-community hash-chain audit log backed by Postgres.
 ///
 /// Each community has an independent chain keyed `(community_id, seq)`. Writes
@@ -85,67 +104,7 @@ impl AuditService {
         entry: NewAuditEntry,
     ) -> Result<AuditEntry, AuditError> {
         let mut tx = conn.begin().await?;
-
-        // The stored row keys on the raw UUID; the typed `CommunityId` on the
-        // input is the provenance fence, dereferenced here at the DB boundary.
-        let community_id = *entry.community_id.as_uuid();
-
-        // Head of THIS community's chain — scoped by community_id.
-        let head = sqlx::query(
-            "SELECT seq, hash FROM audit_log
-             WHERE community_id = $1
-             ORDER BY seq DESC LIMIT 1",
-        )
-        .bind(community_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let (prev_seq, prev_hash): (i64, Option<Vec<u8>>) = match head {
-            Some(row) => (
-                row.get::<i64, _>("seq"),
-                Some(row.get::<Vec<u8>, _>("hash")),
-            ),
-            None => (0, None), // community's first entry
-        };
-        let seq = prev_seq + 1;
-
-        let created_at: DateTime<Utc> = log_timestamp();
-
-        let mut audit_entry = AuditEntry {
-            community_id,
-            seq,
-            hash: Vec::new(),
-            prev_hash,
-            action: entry.action,
-            actor_pubkey: entry.actor_pubkey,
-            object_id: entry.object_id,
-            detail: entry.detail,
-            created_at,
-        };
-
-        audit_entry.hash = compute_hash(&audit_entry)?.to_vec();
-
-        debug!(seq, "writing audit entry");
-
-        sqlx::query(
-            r#"
-            INSERT INTO audit_log
-                (community_id, seq, hash, prev_hash, action, actor_pubkey, object_id, detail, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            "#,
-        )
-        .bind(audit_entry.community_id)
-        .bind(audit_entry.seq)
-        .bind(&audit_entry.hash)
-        .bind(audit_entry.prev_hash.as_deref())
-        .bind(audit_entry.action.as_str())
-        .bind(audit_entry.actor_pubkey.as_deref())
-        .bind(audit_entry.object_id.as_deref())
-        .bind(&audit_entry.detail)
-        .bind(audit_entry.created_at)
-        .execute(&mut *tx)
-        .await?;
-
+        let audit_entry = append_locked(&mut tx, entry).await?;
         tx.commit().await?;
 
         Ok(audit_entry)
@@ -233,6 +192,63 @@ impl AuditService {
 
         rows.iter().map(row_to_audit_entry).collect()
     }
+}
+
+async fn append_locked(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entry: NewAuditEntry,
+) -> Result<AuditEntry, AuditError> {
+    // The stored row keys on the raw UUID; the typed `CommunityId` on the
+    // input is the provenance fence, dereferenced here at the DB boundary.
+    let community_id = *entry.community_id.as_uuid();
+    let head = sqlx::query(
+        "SELECT seq, hash FROM audit_log
+         WHERE community_id = $1
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(community_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (prev_seq, prev_hash): (i64, Option<Vec<u8>>) = match head {
+        Some(row) => (
+            row.get::<i64, _>("seq"),
+            Some(row.get::<Vec<u8>, _>("hash")),
+        ),
+        None => (0, None),
+    };
+    let seq = prev_seq + 1;
+    let mut audit_entry = AuditEntry {
+        community_id,
+        seq,
+        hash: Vec::new(),
+        prev_hash,
+        action: entry.action,
+        actor_pubkey: entry.actor_pubkey,
+        object_id: entry.object_id,
+        detail: entry.detail,
+        created_at: log_timestamp(),
+    };
+    audit_entry.hash = compute_hash(&audit_entry)?.to_vec();
+    debug!(seq, "writing audit entry");
+    sqlx::query(
+        r#"
+        INSERT INTO audit_log
+            (community_id, seq, hash, prev_hash, action, actor_pubkey, object_id, detail, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(audit_entry.community_id)
+    .bind(audit_entry.seq)
+    .bind(&audit_entry.hash)
+    .bind(audit_entry.prev_hash.as_deref())
+    .bind(audit_entry.action.as_str())
+    .bind(audit_entry.actor_pubkey.as_deref())
+    .bind(audit_entry.object_id.as_deref())
+    .bind(&audit_entry.detail)
+    .bind(audit_entry.created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(audit_entry)
 }
 
 fn row_to_audit_entry(row: &sqlx::postgres::PgRow) -> Result<AuditEntry, AuditError> {

@@ -29,6 +29,9 @@ pub struct ProjectObjectCommand {
     /// a signer is a managed actor and therefore requires the fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting_assignment_id: Option<Uuid>,
+    /// Current runtime epoch when the acting Assignment is supervised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_fence: Option<super::RuntimeFence>,
     /// Closed ordinary-object operation.
     pub request: MutationRequest,
 }
@@ -45,8 +48,16 @@ impl ProjectObjectCommand {
             schema_version: SchemaVersion::V2.as_u16(),
             expected_project_revision,
             acting_assignment_id,
+            runtime_fence: None,
             request,
         }
+    }
+
+    /// Attach the server-issued fence of a supervised managed runtime.
+    #[must_use]
+    pub const fn with_runtime_fence(mut self, runtime_fence: super::RuntimeFence) -> Self {
+        self.runtime_fence = Some(runtime_fence);
+        self
     }
 
     /// Parse a closed command while enforcing Project View's content limits.
@@ -92,6 +103,20 @@ impl ProjectObjectCommand {
                 field: "acting_assignment_id",
                 reason: "must not be nil".to_owned(),
             });
+        }
+        if let Some(runtime_fence) = self.runtime_fence {
+            runtime_fence
+                .validate()
+                .map_err(|reason| DomainError::InvalidField {
+                    field: "runtime_fence",
+                    reason,
+                })?;
+            if self.acting_assignment_id.is_none() {
+                return Err(DomainError::InvalidField {
+                    field: "runtime_fence",
+                    reason: "requires acting_assignment_id".to_owned(),
+                });
+            }
         }
         self.as_reducer_mutation().validate_for_submission()
     }

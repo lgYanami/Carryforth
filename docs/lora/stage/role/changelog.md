@@ -1,5 +1,68 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 7：可信 Runtime 监督与自动故障恢复
+
+### Assignment 与 Runtime 分离
+
+- 增加 closed、版本化的 Runtime supervision 协议，显式区分
+  `available/recovering/unavailable` 与 Assignment 的 `active/ended`。Runtime 启停、
+  lease 过期、presence 离线或普通 WebSocket 断开都不会直接结束 Assignment。
+- 每个受监督 Runtime 使用 assignment-scoped binding、独立 `runtime_id` 和单调
+  `runtime_epoch`。managed Agent 的角色写命令自动附带当前 Runtime fence；旧 epoch、
+  已撤销 binding 或已经结束的 Assignment 均不能继续写入。`recovery_attempt` 以旧
+  epoch 请求，Relay 在替代进程启动前先分配并返回新 epoch；监督器把新 epoch 注入
+  替代进程，随后成功或失败结果也必须引用它。
+- supervisor policy 对 lease、恢复窗口、最大尝试次数、指数退避基数、monitor timeout
+  和恢复宽限设置有界值。服务端强制每个 attempt 必须先收到成功或失败结果，失败后下一次
+  attempt 必须等待递增退避；最后一次 attempt 仍在运行时，即使窗口已过也不能提前结束
+  Assignment。自动结束默认关闭，只有明确启用且 Relay audit 和稳定签名密钥同时可用时
+  才能启动。
+
+### 可信证据与 fail-closed 恢复
+
+- additive migration `0030_project_runtime_supervision.sql` 增加 supervisor binding、
+  Runtime lease 和 append-only evidence。`start`、续租、异常退出、恢复尝试、成功、
+  失败和 supervisor heartbeat 都使用 closed typed payload，并以 auth event
+  idempotency key 加请求哈希防止同 key 重放不同证据。
+- supervisor 只能提交运行证据，不能修改 Assignment。注册/撤销 binding 使用 operator
+  入口并写入 hash-chain audit；证据入口使用 tenant-bound、payload-bound、带 replay
+  防护的 NIP-98，且签名者必须精确匹配已注册 supervisor。
+- 异常后先进入 `recovering`，恢复成功继续同一 Assignment；只有明确异常、已执行并失败
+  的至少一轮有限恢复尝试、达到策略阈值、同 Assignment 下所有受信 Runtime 均不可用、monitor
+  当前健康且额外宽限已结束时，才成为终止候选。lease 静默过期只影响可用性读取，不会
+  被提升为“不可恢复”证据。
+- 进程重启仍由持有 supervisor identity 的 Desktop/ACP 外层或部署侧监督器执行；Relay
+  提供可信证据协议、状态机、fencing 和最终策略执行。监督器密钥不注入被监督的
+  Agent Runtime，Agent 因而不能伪造失败来主动卸任。
+
+### 原子 Project system action
+
+- 多 Pod scheduler 通过数据库 claim、`SKIP LOCKED`、claim token 和期限实现幂等竞争；
+  终止前在同一事务中重新验证全部证据与健康 Runtime，部署开关可随时停止自动终止。
+- `end_unrecoverable_assignment` 使用内部 `ProjectSystemChange`，而不是伪装成 Community
+  Member 命令。一个 Project lock 事务同时提交 system audit、Assignment
+  `ended(unrecoverable)`、Commitment `assignment_ended`、system Handoff、成员等级同步、
+  canonical rows、Relay 签名的 entity/meta heads 和 project revision；任一步失败全部
+  回滚。
+- system Handoff 引用最新 Checkpoint、被中断 Commitment 和相关 Work，确保 Runtime
+  无法恢复时 Role 变为空缺，但责任、当前局势和历史归因仍留在 Project。该动作推进一次
+  project revision；高频 lease/heartbeat/evidence 不进入 Project View 投影。
+
+### 操作入口、可观测性与验证
+
+- CLI 增加 `buzz runtime evidence ...` 与 `buzz runtime status --assignment ...`，供可信
+  supervisor 提交证据、供 Project Member/运维读取 Runtime availability。监督器为
+  managed Runtime 注入 `BUZZ_RUNTIME_ID`/`BUZZ_RUNTIME_EPOCH` 后，普通 Role 和 Project
+  View v2 写入会在签名前携带该 fence；Relay 仍做最终事务内验证。
+- 增加低基数 `buzz_role_runtime_recovery_total{result}`，并保留 evidence、scheduler
+  claim/error 和 Assignment ended 指标；日志携带 Community、Assignment 和 binding，
+  不把 Runtime 或 Assignment ID 放进指标 label。
+- 领域与数据库测试覆盖状态转换、同键同请求幂等、同键异请求拒绝、旧 epoch 拒绝、
+  多 Runtime 中任一健康即阻止终止、单纯 lease 过期不终止、最后一次恢复尝试、monitor
+  故障与恢复宽限、多 Pod claim 互斥、append-only 证据、deferred trust-chain 约束及完整
+  system action 原子提交。迁移门禁同步覆盖 `0030` 与 checked-in schema 的 runtime
+  对象漂移。
+
 ## 2026-07-29 — 阶段 6：Checkpoint、Handoff 与完整 Role Brief
 
 ### Project-owned 追加式连续性

@@ -640,6 +640,9 @@ pub struct RoleCommand {
     /// Active tenure from which a role-bearing action is performed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting_assignment_id: Option<Uuid>,
+    /// Current runtime epoch when the acting Assignment is supervised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_fence: Option<super::RuntimeFence>,
     /// Closed operation payload.
     pub request: RoleCommandRequest,
 }
@@ -656,8 +659,16 @@ impl RoleCommand {
             schema_version: SchemaVersion::V2.as_u16(),
             expected_project_revision,
             acting_assignment_id,
+            runtime_fence: None,
             request,
         }
+    }
+
+    /// Attach the server-issued fence of a supervised managed runtime.
+    #[must_use]
+    pub const fn with_runtime_fence(mut self, runtime_fence: super::RuntimeFence) -> Self {
+        self.runtime_fence = Some(runtime_fence);
+        self
     }
 
     /// Parse a closed command from JSON and apply submission-shape checks.
@@ -687,6 +698,16 @@ impl RoleCommand {
             return Err(RoleContinuityError::InvalidCommand(
                 "acting_assignment_id cannot be nil".to_owned(),
             ));
+        }
+        if let Some(runtime_fence) = self.runtime_fence {
+            runtime_fence
+                .validate()
+                .map_err(RoleContinuityError::InvalidCommand)?;
+            if self.acting_assignment_id.is_none() {
+                return Err(RoleContinuityError::InvalidCommand(
+                    "runtime_fence requires acting_assignment_id".to_owned(),
+                ));
+            }
         }
         match &self.request {
             RoleCommandRequest::RequestRole {
@@ -1541,6 +1562,120 @@ impl RoleContinuityState {
                 work_changes,
                 membership_roles,
                 ended_commitments: affected_commitments,
+            },
+        ))
+    }
+
+    /// Apply the sole trusted runtime-driven Assignment transition.
+    ///
+    /// This is intentionally not represented by [`RoleCommandRequest`]: a
+    /// Community Member cannot submit it. The caller must first prove the
+    /// assignment-scoped supervisor policy and exhausted runtime evidence,
+    /// then persist the outcome as a `system` Project change.
+    pub fn reduce_unrecoverable_assignment(
+        &self,
+        assignment_id: Uuid,
+        system_actor: PublicKey,
+        canonical_time: DateTime<Utc>,
+        handoff_id: Uuid,
+    ) -> Result<(Self, RoleContinuityOutcome), RoleContinuityError> {
+        require_id(assignment_id, "assignment_id")?;
+        require_id(handoff_id, "handoff_id")?;
+        if self.handoffs.contains_key(&handoff_id) {
+            return Err(RoleContinuityError::IdCollision);
+        }
+        let assignment = self.active_assignment(assignment_id)?.clone();
+        let member = self
+            .members
+            .get(&assignment.member_pubkey)
+            .filter(|member| member.eligible && member.is_managed_agent())
+            .ok_or(RoleContinuityError::CandidateIneligible)?;
+        if member.is_owner() {
+            return Err(RoleContinuityError::NotAuthorized);
+        }
+        let next_revision = self
+            .project_revision
+            .checked_add(1)
+            .filter(|revision| *revision <= MAX_SAFE_REVISION)
+            .ok_or(RoleContinuityError::RevisionOverflow)?;
+
+        let mut next = self.clone();
+        let before = self.entity_map();
+        let checkpoint_id = next.latest_checkpoint_for_assignment(assignment_id);
+        let commitment_ids = next.end_assignment(
+            assignment_id,
+            system_actor,
+            AssignmentEndReason::Unrecoverable,
+            None,
+            canonical_time,
+            next_revision,
+        )?;
+        let mut references = Vec::with_capacity(commitment_ids.len() * 2);
+        let mut unresolved_items = Vec::with_capacity(commitment_ids.len());
+        for commitment_id in &commitment_ids {
+            references.push(RoleContinuityReference::Commitment {
+                commitment_id: *commitment_id,
+                label: Some("interrupted Commitment".to_owned()),
+            });
+            if let Some(commitment) = next.commitments.get(commitment_id) {
+                references.push(RoleContinuityReference::Object {
+                    object_id: commitment.work_id,
+                    label: Some("Work waiting for continuation".to_owned()),
+                });
+                unresolved_items.push(format!(
+                    "Work {} requires explicit successor acceptance",
+                    commitment.work_id
+                ));
+            }
+        }
+        next.handoffs.insert(
+            handoff_id,
+            RoleHandoff {
+                handoff_id,
+                role_id: assignment.role_id,
+                from_assignment_id: assignment_id,
+                to_assignment_id: None,
+                checkpoint_id,
+                affected_commitment_ids: commitment_ids.clone(),
+                content: RoleHandoffContent {
+                    summary: Some(if unresolved_items.is_empty() {
+                        "Trusted runtime recovery was exhausted; continue from retained Project state."
+                            .to_owned()
+                    } else {
+                        "Trusted runtime recovery was exhausted; unfinished Work is waiting for continuation."
+                            .to_owned()
+                    }),
+                    unresolved_items,
+                    references,
+                },
+                cause: HandoffCause::Unrecoverable,
+                system_generated: true,
+                created_by: None,
+                created_at: canonical_time,
+                entity_revision: 1,
+                project_revision: next_revision,
+            },
+        );
+        let mut membership_roles = BTreeMap::new();
+        next.record_desired_member_role(assignment.member_pubkey, &mut membership_roles)?;
+        next.project_revision = next_revision;
+        next.validate()?;
+        let changes = changed_entities(before, &next.entity_map());
+        if changes.is_empty() {
+            return Err(RoleContinuityError::InvalidState(
+                "unrecoverable system action produced no canonical change".to_owned(),
+            ));
+        }
+        let mut ended_commitments = BTreeMap::new();
+        ended_commitments.insert(assignment_id, commitment_ids);
+        Ok((
+            next,
+            RoleContinuityOutcome {
+                project_revision: next_revision,
+                changes,
+                work_changes: Vec::new(),
+                membership_roles,
+                ended_commitments,
             },
         ))
     }
@@ -3211,6 +3346,19 @@ mod tests {
         }
     }
 
+    fn managed_member(
+        pubkey: PublicKey,
+        owner: PublicKey,
+        role: CommunityMemberRole,
+    ) -> MemberGovernance {
+        MemberGovernance {
+            pubkey,
+            community_role: Some(role),
+            eligible: true,
+            managed_agent_owner: Some(owner),
+        }
+    }
+
     fn state(
         roles: Vec<RoleSlot>,
         members: Vec<MemberGovernance>,
@@ -4152,5 +4300,147 @@ mod tests {
                     ..
                 } if *referenced == commitment_id
             )));
+    }
+
+    #[test]
+    fn unrecoverable_system_action_preserves_project_continuity_atomically() {
+        let owner = pubkey();
+        let agent = pubkey();
+        let relay = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let commitment_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let handoff_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let current = complete_state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Admin,
+                active: true,
+            }],
+            vec![work(work_id, Some(role_id), owner)],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                managed_member(agent, owner, CommunityMemberRole::Admin),
+            ],
+            vec![assignment(assignment_id, role_id, agent)],
+            vec![WorkCommitment {
+                commitment_id,
+                work_id,
+                assignment_id,
+                member_pubkey: agent,
+                started_at: now - Duration::seconds(1),
+                started_by: agent,
+                ended_at: None,
+                ended_by: None,
+                ended_reason: None,
+                entity_revision: 1,
+                project_revision: 7,
+            }],
+        );
+        let (checkpointed, _) = current
+            .reduce(
+                &RoleCommand::new(
+                    7,
+                    Some(assignment_id),
+                    RoleCommandRequest::AppendCheckpoint {
+                        checkpoint_id,
+                        based_on_project_revision: 7,
+                        content: checkpoint_content("last durable situation", Vec::new()),
+                        supersedes_checkpoint_id: None,
+                    },
+                ),
+                agent,
+                now,
+                &ids(0),
+            )
+            .expect("append checkpoint");
+
+        let (ended, outcome) = checkpointed
+            .reduce_unrecoverable_assignment(
+                assignment_id,
+                relay,
+                now + Duration::seconds(1),
+                handoff_id,
+            )
+            .expect("trusted runtime system action");
+
+        let assignment = ended
+            .assignments
+            .get(&assignment_id)
+            .expect("ended Assignment");
+        assert_eq!(
+            assignment.ended_reason,
+            Some(AssignmentEndReason::Unrecoverable)
+        );
+        assert_eq!(assignment.ended_by, Some(relay));
+        let commitment = ended
+            .commitments
+            .get(&commitment_id)
+            .expect("interrupted Commitment");
+        assert_eq!(
+            commitment.ended_reason,
+            Some(CommitmentEndReason::AssignmentEnded)
+        );
+        assert_eq!(commitment.ended_by, Some(relay));
+        let handoff = ended.handoffs.get(&handoff_id).expect("system Handoff");
+        assert!(handoff.system_generated);
+        assert_eq!(handoff.created_by, None);
+        assert_eq!(handoff.cause, HandoffCause::Unrecoverable);
+        assert_eq!(handoff.checkpoint_id, Some(checkpoint_id));
+        assert_eq!(handoff.affected_commitment_ids, vec![commitment_id]);
+        assert!(handoff.content.references.iter().any(|reference| matches!(
+            reference,
+            RoleContinuityReference::Object { object_id, .. } if *object_id == work_id
+        )));
+        assert_eq!(
+            ended
+                .members
+                .get(&agent)
+                .and_then(|member| member.community_role),
+            Some(CommunityMemberRole::Member)
+        );
+        assert_eq!(
+            outcome.membership_roles.get(&agent),
+            Some(&CommunityMemberRole::Member)
+        );
+        assert_eq!(
+            outcome.ended_commitments.get(&assignment_id),
+            Some(&vec![commitment_id])
+        );
+        assert!(outcome.work_changes.is_empty());
+        assert_eq!(ended.works.get(&work_id), checkpointed.works.get(&work_id));
+        assert_eq!(outcome.project_revision, 9);
+    }
+
+    #[test]
+    fn unrecoverable_system_action_rejects_an_unmanaged_member() {
+        let owner = pubkey();
+        let member_pubkey = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let current = state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(member_pubkey, Some(CommunityMemberRole::Member)),
+            ],
+            vec![assignment(assignment_id, role_id, member_pubkey)],
+        );
+        assert_eq!(
+            current.reduce_unrecoverable_assignment(
+                assignment_id,
+                pubkey(),
+                DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp"),
+                Uuid::new_v4(),
+            ),
+            Err(RoleContinuityError::CandidateIneligible)
+        );
     }
 }
