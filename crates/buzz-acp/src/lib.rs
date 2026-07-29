@@ -1362,7 +1362,9 @@ async fn tokio_main(
 
     let role_brief_resolver =
         role_brief::RoleBriefResolver::new(relay.rest_client(), config.keys.public_key());
-    let startup_role_context = role_brief_resolver.resolve_bounded().await;
+    let startup_role_context = role_brief_resolver
+        .resolve_bounded(role_brief::RoleContextRefresh::Full)
+        .await;
     match startup_role_context.error_code {
         Some(code) => tracing::warn!(
             status = startup_role_context.status,

@@ -846,6 +846,49 @@ impl VerifiedRoleBriefSnapshot {
     }
 }
 
+/// Render the compact per-turn binding derived from a previously verified
+/// canonical Role Brief.
+///
+/// This representation deliberately carries only identity and revision
+/// coordinates. It is prompt context, not an authorization cache: managed
+/// writers must still resolve the current Assignment before every write.
+#[must_use]
+pub fn render_role_binding_markdown(brief: &RoleBrief) -> String {
+    let mut output = String::from("[Role Binding]\n");
+    let _ = writeln!(output, "State: {}", brief.state.status());
+    let _ = writeln!(output, "Project ID: {}", brief.project_id);
+    match &brief.state {
+        RoleBriefMemberState::Candidate { .. } => {
+            output.push_str(
+                "Role ID: none\nRole: none\nLevel: none\nAssignment: none\n\
+                 Boundary: no active Assignment is verified for this meta head. Do not act as a \
+                 Project Role or perform role-bearing Project View writes.\n",
+            );
+        }
+        RoleBriefMemberState::Assigned { role, assignment } => {
+            let _ = writeln!(output, "Role ID: {}", role.role.role_id);
+            let _ = writeln!(output, "Role: {}", one_line(&role.role.name));
+            let _ = writeln!(output, "Level: {}", role.role.level.as_str());
+            let _ = writeln!(
+                output,
+                "Assignment: {}",
+                assignment.assignment.assignment_id
+            );
+            output.push_str(
+                "Boundary: this binding is context for the exact meta head below, not cached \
+                 authorization. Re-resolve the current Assignment before every role-bearing \
+                 Project View write; the Relay performs the final fence check.\n",
+            );
+        }
+    }
+    let _ = writeln!(
+        output,
+        "Source revisions: project={} generation={} meta={}",
+        brief.project_revision, brief.projection_generation, brief.source_revisions.meta_event_id
+    );
+    output
+}
+
 /// Render the canonical human/Agent Markdown representation of a Role Brief.
 #[must_use]
 pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
@@ -1724,6 +1767,16 @@ mod tests {
         assert!(markdown.contains("Recent Role Handoffs:"));
         assert!(markdown.contains("unresolved: publish the desktop timeline"));
         assert!(markdown.contains("Source revisions: project=7 generation=1"));
+
+        let binding = render_role_binding_markdown(&brief);
+        assert!(binding.starts_with("[Role Binding]\nState: assigned"));
+        assert!(binding.contains(&format!("Role ID: {}", fixture.role_id)));
+        assert!(binding.contains(&format!("Assignment: {}", fixture.assignment_id)));
+        assert!(binding.contains("Level: member"));
+        assert!(binding.contains("not cached authorization"));
+        assert!(binding.contains("Source revisions: project=7 generation=1"));
+        assert!(!binding.contains("Responsible Work:"));
+        assert!(!binding.contains("Latest Role Checkpoint:"));
     }
 
     #[test]
@@ -1784,6 +1837,12 @@ mod tests {
         let markdown = render_role_brief_markdown(&brief);
         assert!(markdown.contains("State: candidate"));
         assert!(markdown.contains("no active Assignment is verified"));
+
+        let binding = render_role_binding_markdown(&brief);
+        assert!(binding.starts_with("[Role Binding]\nState: candidate"));
+        assert!(binding.contains("Role ID: none"));
+        assert!(binding.contains("Assignment: none"));
+        assert!(binding.contains("no active Assignment is verified for this meta head"));
     }
 
     #[test]

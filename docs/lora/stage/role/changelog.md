@@ -1,5 +1,51 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 10：Role Brief 按 revision 增量刷新
+
+### 每轮确认身份，按需重建完整上下文
+
+- ACP 仍在每个完整 channel turn 和 heartbeat 开始前读取 NIP-11 Relay identity，并查询、
+  验签唯一的 Project View v2 meta head。首次启动、ACP session 新建或重建、本地无匹配
+  cache，以及 meta event、project revision、projection generation、Project、Member 或
+  Relay identity 任一变化时，继续读取 object/entity heads、meta 指向的 membership
+  snapshot，并使用前后 meta bracket 组装完整 verified Role Brief。
+- 同一 session 的后续 turn 若当前 Relay、Project、Member、meta event、revision 和
+  generation 与上次完整 verified Brief 精确一致，不再查询全部 heads 和 membership，
+  而是注入紧凑的 `[Role Binding]`。它包含 candidate/assigned 状态、Role ID/name/level、
+  Assignment ID 和完整 meta revision 坐标；assigned binding 明确声明自己不是缓存授权，
+  每次 role-bearing 写入仍须重新解析 Assignment。
+- compact renderer 直接从共享 canonical `RoleBrief` 派生，没有引入第二套 Role 解释或
+  持久化 `role.md`。完整 Brief、JSON/Desktop read model 和 compact binding 仍以同一个
+  `VerifiedRoleBriefSnapshot` assembler 为事实解释边界。
+
+### Session、Runtime 与 fail-closed 边界
+
+- channel 与 heartbeat 的 session 是否已经存在，会在 Role context 解析前决定
+  `full/compact` refresh；rotate、模型切换、取消失败、Agent 退出等既有 session
+  invalidation 路径会使下一 turn 自动恢复为完整 Brief。启动检查也显式采用 full refresh。
+- compact 与 full 两条路径都在把 context 交给 Agent 前调用 Runtime supervisor
+  coordinator 对账当前 Assignment。缓存只减少投影读取和 prompt 重复，不跳过 Runtime
+  状态收敛，也不改变 CLI 每次签名前的完整 Assignment 校验或 Relay 的事务内最终 fencing。
+- meta/Relay 读取失败、完整 snapshot 不能稳定、共享 Brief 组装失败或 Runtime 对账失败
+  时，仍暂停本地 Runtime fence 并注入 `State: unavailable`；失败 turn 不会回退到上一份
+  Role Binding。Relay identity 变化会立即清空旧 cache realm，其他 key 不匹配也会在完整
+  rebuild 前清空。native steer 仍是当前 turn 内的增量消息，不新增独立 Role 授权语义。
+- `role_context_resolved` observer frame 增加 `mode=full|compact|unavailable` 与精确
+  `metaEventId`，便于确认上下文刷新行为而不把缓存提升为授权状态。
+
+### 验证与范围
+
+- 新增真实 HTTP mock 纵向测试，验证首次 full 读取、未变化 meta 的轻量 compact 路径、
+  session 重建强制 full、meta 读取失败不复用 cache、失败后重新确认同一 head，以及
+  revision 变化后的下一 turn 重读 object/entity/membership 并注入新 Brief。
+- cache-key 单元测试覆盖 Relay、Project/Community、Member、meta event、revision 和
+  generation 的任一变化均不能命中；session 生命周期测试覆盖 channel 与 heartbeat 的
+  创建、复用和 invalidation；共享 renderer 测试覆盖 assigned/candidate binding 及
+  Assignment 写入边界。
+- `buzz-sdk` `250/250`、`buzz-acp` `613/613` 测试通过；workspace all-targets check、
+  clippy（warnings denied）与 Rust formatting gate 通过。本阶段不改变 Project View
+  协议、数据库规范状态、Relay 权限或 Desktop 页面。
+
 ## 2026-07-29 — 阶段 9：运行中 Runtime 动态收敛
 
 ### 每轮 Role context 与 Runtime 原子对账

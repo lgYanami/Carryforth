@@ -235,6 +235,21 @@ pub enum PromptSource {
     Heartbeat,
 }
 
+fn role_context_refresh_for(
+    state: &SessionState,
+    source: &PromptSource,
+) -> crate::role_brief::RoleContextRefresh {
+    let session_exists = match source {
+        PromptSource::Channel(channel_id) => state.sessions.contains_key(channel_id),
+        PromptSource::Heartbeat => state.heartbeat_session.is_some(),
+    };
+    if session_exists {
+        crate::role_brief::RoleContextRefresh::Incremental
+    } else {
+        crate::role_brief::RoleContextRefresh::Full
+    }
+}
+
 /// Apply state effects for Race 1, where a control signal arrives just after the
 /// prompt completed naturally. The prompt result has already been consumed by
 /// `select!`, so the harness must synthesize a successful result while still
@@ -502,7 +517,8 @@ pub struct PromptContext {
     pub cwd: String,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
-    /// Stateless verified Project View v2 resolver refreshed before every turn.
+    /// Project View v2 resolver that verifies meta every turn and retains only
+    /// an exact-head compact prompt cache; the cache never authorizes writes.
     pub role_brief_resolver: crate::role_brief::RoleBriefResolver,
     /// Shared channel metadata for startup-known and dynamically joined channels.
     pub channel_info: ChannelInfoResolver,
@@ -1120,7 +1136,8 @@ pub(crate) fn prepend_canvas_for_legacy(
     }
 }
 
-/// Prepend the freshly verified dynamic Role Brief to one prompt body.
+/// Prepend the freshly verified dynamic Role Brief or compact Role Binding to
+/// one prompt body.
 ///
 /// Unlike base/persona/canvas context this is never folded into
 /// `session/new`: a long-lived session must observe Assignment replacement on
@@ -1361,18 +1378,26 @@ pub async fn run_prompt_task(
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
 
-    // Role identity is dynamic authorization context, not session configuration.
-    // Resolve it before session creation on every channel prompt and heartbeat.
-    // The resolver never reuses an older Brief: failure produces an explicit
-    // fail-closed `[Role Brief]` section instead.
-    let role_context = ctx.role_brief_resolver.resolve_bounded().await;
+    // Role identity is dynamic authorization context, not session
+    // configuration. Every complete channel prompt and heartbeat verifies the
+    // current Relay/meta head before session creation. Existing sessions may
+    // receive a compact binding only for an exact cache-key match; a missing or
+    // rebuilt session always receives a newly assembled full Brief. Any current
+    // read failure remains fail closed and never injects the cached binding.
+    let role_context_refresh = role_context_refresh_for(&agent.state, &source);
+    let role_context = ctx
+        .role_brief_resolver
+        .resolve_bounded(role_context_refresh)
+        .await;
     agent.acp.observe(
         "role_context_resolved",
         serde_json::json!({
             "status": role_context.status,
+            "mode": role_context.mode,
             "assignmentId": role_context.assignment_id,
             "projectRevision": role_context.project_revision,
             "projectionGeneration": role_context.projection_generation,
+            "metaEventId": role_context.meta_event_id,
             "errorCode": role_context.error_code,
         }),
     );
@@ -1386,9 +1411,10 @@ pub async fn run_prompt_task(
         tracing::info!(
             target: "pool::role_brief",
             status = role_context.status,
+            mode = role_context.mode,
             assignment_id = ?role_context.assignment_id,
             project_revision = ?role_context.project_revision,
-            "current Role Brief verified"
+            "current Role context verified"
         );
     }
 
@@ -4315,6 +4341,46 @@ mod tests {
         s.heartbeat_session = Some("sess-hb".into());
         s.heartbeat_turn_count = 7;
         (s, ch_a, ch_b)
+    }
+
+    #[test]
+    fn role_context_full_refresh_tracks_channel_and_heartbeat_session_lifecycle() {
+        use crate::role_brief::RoleContextRefresh;
+
+        let channel_id = Uuid::new_v4();
+        let mut state = SessionState::default();
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Channel(channel_id)),
+            RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Heartbeat),
+            RoleContextRefresh::Full
+        );
+
+        state
+            .sessions
+            .insert(channel_id, "channel-session".to_owned());
+        state.heartbeat_session = Some("heartbeat-session".to_owned());
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Channel(channel_id)),
+            RoleContextRefresh::Incremental
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Heartbeat),
+            RoleContextRefresh::Incremental
+        );
+
+        state.invalidate(&PromptSource::Channel(channel_id));
+        state.invalidate(&PromptSource::Heartbeat);
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Channel(channel_id)),
+            RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Heartbeat),
+            RoleContextRefresh::Full
+        );
     }
 
     #[test]
