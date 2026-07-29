@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use buzz_core::kind::{
     KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND,
@@ -72,8 +73,13 @@ pub(crate) async fn handle_command(
     event: &Event,
     auth: &IngestAuth,
 ) -> Result<IngestResult, IngestError> {
-    let (session_id, command) = parse_control_command(event)?;
+    // Resolve only the room boundary before authorization. Full command
+    // parsing can disclose protocol details (for example which action tags are
+    // required), so non-participants must be rejected before that validation.
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
     authorize_participant_command(tenant, state, session_id, auth).await?;
+    let (parsed_session_id, command) = parse_control_command(event)?;
+    debug_assert_eq!(parsed_session_id, session_id);
     execute(tenant, state, session_id, event, command).await
 }
 
@@ -160,6 +166,8 @@ async fn execute(
     event: &Event,
     command: BatonCommand,
 ) -> Result<IngestResult, IngestError> {
+    let action = command_metric_action(&command);
+    let started_at = Instant::now();
     let result = buzz_db::meeting_baton::execute_baton_command(
         &state.db,
         BatonCommandTxParams {
@@ -170,8 +178,30 @@ async fn execute(
             command,
         },
     )
-    .await
-    .map_err(map_baton_db_error)?;
+    .await;
+    let result = match result {
+        Ok(result) => {
+            record_command_metrics(
+                action,
+                classify_command_outcome(&result.command_outcome),
+                result.recovery_transitions.len(),
+                started_at.elapsed().as_secs_f64(),
+            );
+            result
+        }
+        Err(error) => {
+            record_command_metrics(
+                action,
+                CommandMetricOutcome {
+                    outcome: "error",
+                    duplicate: false,
+                },
+                0,
+                started_at.elapsed().as_secs_f64(),
+            );
+            return Err(map_baton_db_error(error));
+        }
+    };
 
     let recovery_count = result.recovery_transitions.len();
     match result.command_outcome {
@@ -237,6 +267,86 @@ async fn execute(
             recovery_count,
         )),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandMetricOutcome {
+    outcome: &'static str,
+    duplicate: bool,
+}
+
+fn command_metric_action(command: &BatonCommand) -> &'static str {
+    match command {
+        BatonCommand::IntentSubmit { .. } => "intent_submit",
+        BatonCommand::IntentRefresh { .. } => "intent_refresh",
+        BatonCommand::IntentWithdraw { .. } => "intent_withdraw",
+        BatonCommand::ModeratorSelect { .. } => "moderator_select",
+        BatonCommand::ModeratorReject { .. } => "moderator_reject",
+        BatonCommand::ModeratorDismissHandoff { .. } => "moderator_dismiss_handoff",
+        BatonCommand::ModeratorRecall { .. } => "moderator_recall",
+        BatonCommand::HumanRequest => "human_request",
+        BatonCommand::HumanWithdraw { .. } => "human_withdraw",
+        BatonCommand::OfferAck { .. } => "offer_ack",
+        BatonCommand::OfferDecline { .. } => "offer_decline",
+        BatonCommand::GrantProgress { .. } => "grant_progress",
+        BatonCommand::GrantYield { .. } => "grant_yield",
+        BatonCommand::Speech { .. } => "speech",
+    }
+}
+
+fn classify_command_outcome(outcome: &BatonCommandOutcome) -> CommandMetricOutcome {
+    match outcome {
+        BatonCommandOutcome::Accepted { .. } => CommandMetricOutcome {
+            outcome: "accepted",
+            duplicate: false,
+        },
+        BatonCommandOutcome::Duplicate { accepted: true, .. } => CommandMetricOutcome {
+            outcome: "accepted",
+            duplicate: true,
+        },
+        BatonCommandOutcome::Duplicate {
+            accepted: false,
+            outcome_class,
+            ..
+        } => CommandMetricOutcome {
+            outcome: match outcome_class.as_str() {
+                "rejected_terminal" => "rejected_terminal",
+                "rejected_after_recovery" => "rejected_after_recovery",
+                _ => "unknown",
+            },
+            duplicate: true,
+        },
+        BatonCommandOutcome::RejectedTerminal { .. } => CommandMetricOutcome {
+            outcome: "rejected_terminal",
+            duplicate: false,
+        },
+        BatonCommandOutcome::RejectedAfterRecovery { .. } => CommandMetricOutcome {
+            outcome: "rejected_after_recovery",
+            duplicate: false,
+        },
+    }
+}
+
+fn record_command_metrics(
+    action: &'static str,
+    classified: CommandMetricOutcome,
+    recovery_count: usize,
+    latency_seconds: f64,
+) {
+    let duplicate = if classified.duplicate {
+        "true"
+    } else {
+        "false"
+    };
+    let labels = [
+        ("action", action),
+        ("outcome", classified.outcome),
+        ("duplicate", duplicate),
+    ];
+    metrics::counter!("meeting_v1_command_total", &labels).increment(1);
+    metrics::histogram!("meeting_v1_command_latency_seconds", &labels).record(latency_seconds);
+    metrics::histogram!("meeting_v1_command_recovery_transitions", &labels)
+        .record(recovery_count as f64);
 }
 
 fn map_baton_db_error(error: DbError) -> IngestError {
@@ -1076,13 +1186,31 @@ mod tests {
                 reason: Some("Context unavailable."),
             }),
         ];
+        let expected_actions = [
+            "intent_submit",
+            "intent_refresh",
+            "intent_withdraw",
+            "moderator_select",
+            "moderator_select",
+            "moderator_reject",
+            "moderator_dismiss_handoff",
+            "moderator_recall",
+            "human_request",
+            "human_withdraw",
+            "offer_ack",
+            "offer_decline",
+            "grant_progress",
+            "grant_yield",
+        ];
         let keys = Keys::generate();
-        for builder in commands {
+        for (builder, expected_action) in commands.into_iter().zip(expected_actions) {
             let event = builder
                 .expect("valid SDK builder")
                 .sign_with_keys(&keys)
                 .expect("sign SDK event");
-            parse_control_command(&event).expect("Relay must accept SDK command");
+            let (_, command) =
+                parse_control_command(&event).expect("Relay must accept SDK command");
+            assert_eq!(command_metric_action(&command), expected_action);
         }
 
         let speech = buzz_sdk::build_meeting_v1_speech(buzz_sdk::MeetingV1SpeechParams {
@@ -1100,7 +1228,101 @@ mod tests {
         .expect("valid SDK speech")
         .sign_with_keys(&keys)
         .expect("sign SDK speech");
-        parse_speech(&speech).expect("Relay must accept SDK speech");
+        let (_, command) = parse_speech(&speech).expect("Relay must accept SDK speech");
+        assert_eq!(command_metric_action(&command), "speech");
+    }
+
+    #[test]
+    fn command_metric_outcomes_are_closed_and_keep_duplicate_separate() {
+        let cases = [
+            (
+                BatonCommandOutcome::Accepted {
+                    canonical_object_id: None,
+                    state_revision: 1,
+                },
+                CommandMetricOutcome {
+                    outcome: "accepted",
+                    duplicate: false,
+                },
+            ),
+            (
+                BatonCommandOutcome::Duplicate {
+                    accepted: true,
+                    outcome_class: "accepted".to_string(),
+                    canonical_object_id: None,
+                    state_revision: Some(1),
+                    outcome_code: "accepted".to_string(),
+                },
+                CommandMetricOutcome {
+                    outcome: "accepted",
+                    duplicate: true,
+                },
+            ),
+            (
+                BatonCommandOutcome::Duplicate {
+                    accepted: false,
+                    outcome_class: "rejected_terminal".to_string(),
+                    canonical_object_id: None,
+                    state_revision: None,
+                    outcome_code: "conflict".to_string(),
+                },
+                CommandMetricOutcome {
+                    outcome: "rejected_terminal",
+                    duplicate: true,
+                },
+            ),
+            (
+                BatonCommandOutcome::Duplicate {
+                    accepted: false,
+                    outcome_class: "rejected_after_recovery".to_string(),
+                    canonical_object_id: None,
+                    state_revision: Some(2),
+                    outcome_code: "offer_expired".to_string(),
+                },
+                CommandMetricOutcome {
+                    outcome: "rejected_after_recovery",
+                    duplicate: true,
+                },
+            ),
+            (
+                BatonCommandOutcome::RejectedTerminal {
+                    code: "conflict".to_string(),
+                    canonical_object_id: None,
+                },
+                CommandMetricOutcome {
+                    outcome: "rejected_terminal",
+                    duplicate: false,
+                },
+            ),
+            (
+                BatonCommandOutcome::RejectedAfterRecovery {
+                    code: "expired".to_string(),
+                    canonical_object_id: None,
+                },
+                CommandMetricOutcome {
+                    outcome: "rejected_after_recovery",
+                    duplicate: false,
+                },
+            ),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(classify_command_outcome(&outcome), expected);
+        }
+
+        let private_text = BatonCommandOutcome::Duplicate {
+            accepted: false,
+            outcome_class: "session-or-error-shaped-private-text".to_string(),
+            canonical_object_id: None,
+            state_revision: None,
+            outcome_code: "reason body".to_string(),
+        };
+        assert_eq!(
+            classify_command_outcome(&private_text),
+            CommandMetricOutcome {
+                outcome: "unknown",
+                duplicate: true,
+            }
+        );
     }
 
     #[test]

@@ -549,7 +549,11 @@ impl AcpClient {
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
         let result = self.send_request("initialize", params).await?;
-        tracing::debug!(target: "acp::init", "initialize response: {result}");
+        tracing::debug!(
+            target: "acp::init",
+            response_fields = result.as_object().map_or(0, serde_json::Map::len),
+            "initialize response received"
+        );
         Ok(result)
     }
 
@@ -586,7 +590,11 @@ impl AcpClient {
             .as_str()
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
-        tracing::info!(target: "acp::session", "session created: {session_id}");
+        tracing::info!(
+            target: "acp::session",
+            session_id_bytes = session_id.len(),
+            "session created"
+        );
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -709,7 +717,14 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(
+            target: "acp::wire",
+            direction = "outbound",
+            frame_kind = "request",
+            prompt_blocks = prompt_blocks.len(),
+            prompt_bytes = prompt_blocks.iter().map(|block| block.len()).sum::<usize>(),
+            "ACP frame"
+        );
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
@@ -931,7 +946,8 @@ impl AcpClient {
                 self.write_ndjson(&response).await?;
                 tracing::debug!(
                     target: "acp::cancel",
-                    "responded cancelled to pending permission id={perm_id}"
+                    request_id_bytes = json_rpc_id_len(&perm_id),
+                    "responded cancelled to pending permission request"
                 );
             }
             self.pending_permission_id = None;
@@ -940,7 +956,11 @@ impl AcpClient {
 
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
-        tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
+        tracing::info!(
+            target: "acp::cancel",
+            session_id_bytes = session_id.len(),
+            "sent session/cancel"
+        );
         // Use a fixed 30s idle timeout during cleanup — the cancel notification
         // needs time to propagate and the agent may go silent while winding down.
         // The separate hard_deadline bounds agents that keep producing output
@@ -1008,7 +1028,13 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(
+            target: "acp::wire",
+            direction = "outbound",
+            frame_kind = "request",
+            method = privacy_safe_method(method),
+            "ACP frame"
+        );
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1073,7 +1099,13 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(
+            target: "acp::wire",
+            direction = "outbound",
+            frame_kind = "notification",
+            method = privacy_safe_method(method),
+            "ACP frame"
+        );
         self.write_ndjson(&msg).await?;
         Ok(())
     }
@@ -1115,7 +1147,12 @@ impl AcpClient {
             }
 
             // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
+            tracing::debug!(
+                target: "acp::wire",
+                direction = "inbound",
+                frame_bytes = trimmed.len(),
+                "ACP frame"
+            );
 
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
@@ -1174,7 +1211,12 @@ impl AcpClient {
                             // agent process is dead and continuing would hang.
                             self.write_ndjson(&err_resp).await?;
                         }
-                        tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                        tracing::debug!(
+                            target: "acp::wire",
+                            method_bytes = other.len(),
+                            is_request = msg.get("id").is_some(),
+                            "ignoring unknown ACP method"
+                        );
                     }
                 }
             }
@@ -1332,8 +1374,15 @@ impl AcpClient {
                             });
                             tracing::debug!(
                                 target: "acp::wire",
-                                "→ {}",
-                                serde_json::to_string(&msg).unwrap_or_default()
+                                direction = "outbound",
+                                frame_kind = "request",
+                                method = "_goose/unstable/session/steer",
+                                prompt_blocks = prompt_block_refs.len(),
+                                prompt_bytes = prompt_block_refs
+                                    .iter()
+                                    .map(|block| block.len())
+                                    .sum::<usize>(),
+                                "ACP frame"
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
@@ -1409,7 +1458,12 @@ impl AcpClient {
                         continue;
                     }
 
-                    tracing::debug!(target: "acp::wire", "← {trimmed}");
+                    tracing::debug!(
+                        target: "acp::wire",
+                        direction = "inbound",
+                        frame_bytes = trimmed.len(),
+                        "ACP frame"
+                    );
 
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
@@ -1521,7 +1575,12 @@ impl AcpClient {
                                     // agent process is dead and continuing would hang.
                                     self.write_ndjson(&err_resp).await?;
                                 }
-                                tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                                tracing::debug!(
+                                    target: "acp::wire",
+                                    method_bytes = other.len(),
+                                    is_request = msg.get("id").is_some(),
+                                    "ignoring unknown ACP method"
+                                );
                             }
                         }
                     }
@@ -1551,7 +1610,15 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::info!(target: "acp::stream", "{text}");
+                    // Agent output can contain private Meeting speech, intent
+                    // summaries, tool results, or project context. Keep raw
+                    // content in the bounded in-memory turn buffer, never in
+                    // the process log.
+                    tracing::debug!(
+                        target: "acp::stream",
+                        chunk_bytes = text.len(),
+                        "agent message chunk received"
+                    );
                     let remaining =
                         MAX_AGENT_MESSAGE_SIZE.saturating_sub(self.current_agent_message.len());
                     if remaining > 0 {
@@ -1571,24 +1638,35 @@ impl AcpClient {
                 false
             }
             "tool_call" => {
-                let title = update
+                let title_bytes = update
                     .get("title")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let kind = update
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                    .map_or(0, str::len);
+                let kind = privacy_safe_tool_kind(update.get("kind").and_then(|v| v.as_str()));
+                let status =
+                    privacy_safe_tool_status(update.get("status").and_then(|v| v.as_str()));
+                tracing::info!(
+                    target: "acp::tool",
+                    title_bytes,
+                    kind,
+                    status,
+                    "tool call received"
+                );
                 true
             }
             "tool_call_update" => {
-                let tool_id = update
+                let tool_id_bytes = update
                     .get("toolCallId")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                    .map_or(0, str::len);
+                let status =
+                    privacy_safe_tool_status(update.get("status").and_then(|v| v.as_str()));
+                tracing::info!(
+                    target: "acp::tool",
+                    tool_id_bytes,
+                    status,
+                    "tool call update received"
+                );
                 false
             }
             "plan" => {
@@ -1597,22 +1675,23 @@ impl AcpClient {
             }
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::debug!(target: "acp::thought", "{text}");
+                    tracing::debug!(
+                        target: "acp::thought",
+                        chunk_bytes = text.len(),
+                        "agent thought chunk received"
+                    );
                 }
                 false
             }
             "available_commands_update" => {
                 // Advertised slash commands (ACP slash-commands extension).
-                // Logged for observability; UI surfacing is a follow-up.
-                let names: Vec<&str> = update["availableCommands"]
-                    .as_array()
-                    .map(|cmds| cmds.iter().filter_map(|c| c["name"].as_str()).collect())
-                    .unwrap_or_default();
+                // Keep only counts in process logs; names may contain private
+                // adapter- or project-specific commands.
+                let command_count = update["availableCommands"].as_array().map_or(0, Vec::len);
                 tracing::info!(
                     target: "acp::update",
-                    "available_commands_update: {} commands [{}]",
-                    names.len(),
-                    names.join(", ")
+                    command_count,
+                    "available commands update received"
                 );
                 false
             }
@@ -1635,7 +1714,8 @@ impl AcpClient {
                         Some(serde_json::Value::String(run_id)) => {
                             tracing::debug!(
                                 target: "acp::update",
-                                "session_info_update: activeRunId={run_id}"
+                                active_run_id_bytes = run_id.len(),
+                                "session info update set active run id"
                             );
                             self.active_run_id = Some(run_id.clone());
                         }
@@ -1654,7 +1734,11 @@ impl AcpClient {
             }
             "keepalive" => false,
             other => {
-                tracing::debug!(target: "acp::update", "session/update: {other}");
+                tracing::debug!(
+                    target: "acp::update",
+                    update_type_bytes = other.len(),
+                    "unknown session update received"
+                );
                 false
             }
         }
@@ -1683,7 +1767,7 @@ impl AcpClient {
                 if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
                     tracing::debug!(
                         target: "acp::usage",
-                        session_id = %notif.session_id,
+                        session_id_bytes = notif.session_id.len(),
                         input = payload.accumulated_input_tokens,
                         output = payload.accumulated_output_tokens,
                         "goose usage update"
@@ -1727,8 +1811,9 @@ impl AcpClient {
 
         tracing::debug!(
             target: "acp::permission",
-            "session/request_permission id={id}, {} options",
-            options.len()
+            request_id_bytes = json_rpc_id_len(&id),
+            option_count = options.len(),
+            "permission request received"
         );
 
         // Find allow_once by kind — NEVER hardcode optionId.
@@ -1742,14 +1827,15 @@ impl AcpClient {
                 .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
             tracing::info!(
                 target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
+                option_id_bytes = option_id.len(),
+                "auto-approving permission with allow_once"
             );
             permission_response_selected(&id, option_id)
         } else {
             // No allow_once — fall back to reject_once.
             tracing::warn!(
                 target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
+                "no allow_once option found in permission request; falling back to reject_once"
             );
             let reject = options
                 .iter()
@@ -1793,6 +1879,64 @@ impl AcpClient {
         })?;
         StopReason::from_str(raw)
             .ok_or_else(|| AcpError::Protocol(format!("unknown stopReason: {raw:?}")))
+    }
+}
+
+/// Return a closed, privacy-safe label for an outbound ACP method.
+///
+/// Callers must not log an unrecognized method verbatim because adapter-defined
+/// method names can contain project-specific command names.
+fn privacy_safe_method(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "authenticate" => "authenticate",
+        "session/new" => "session/new",
+        "_goose/unstable/session/system-prompt/set" => "_goose/unstable/session/system-prompt/set",
+        "session/set_config_option" => "session/set_config_option",
+        "session/set_model" => "session/set_model",
+        "session/prompt" => "session/prompt",
+        "session/cancel" => "session/cancel",
+        "_goose/unstable/session/steer" => "_goose/unstable/session/steer",
+        _ => "unknown",
+    }
+}
+
+/// Return a closed ACP tool-kind label, collapsing extension values.
+fn privacy_safe_tool_kind(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("read") => "read",
+        Some("edit") => "edit",
+        Some("delete") => "delete",
+        Some("move") => "move",
+        Some("search") => "search",
+        Some("execute") => "execute",
+        Some("think") => "think",
+        Some("fetch") => "fetch",
+        Some("switch_mode") => "switch_mode",
+        Some("other") => "other",
+        Some(_) => "unknown",
+        None => "missing",
+    }
+}
+
+/// Return a closed ACP tool-status label, collapsing extension values.
+fn privacy_safe_tool_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("pending") => "pending",
+        Some("in_progress") => "in_progress",
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        Some(_) => "unknown",
+        None => "missing",
+    }
+}
+
+/// Return the encoded scalar length of a JSON-RPC id without exposing its value.
+fn json_rpc_id_len(id: &serde_json::Value) -> usize {
+    match id {
+        serde_json::Value::String(value) => value.len(),
+        serde_json::Value::Number(value) => value.to_string().len(),
+        _ => 0,
     }
 }
 
@@ -2039,6 +2183,26 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_safe_log_labels_fail_closed_for_extension_values() {
+        assert_eq!(privacy_safe_method("session/prompt"), "session/prompt");
+        assert_eq!(privacy_safe_method("private/project-command"), "unknown");
+
+        assert_eq!(privacy_safe_tool_kind(Some("execute")), "execute");
+        assert_eq!(
+            privacy_safe_tool_kind(Some("private-project-tool")),
+            "unknown"
+        );
+        assert_eq!(privacy_safe_tool_kind(None), "missing");
+
+        assert_eq!(privacy_safe_tool_status(Some("in_progress")), "in_progress");
+        assert_eq!(
+            privacy_safe_tool_status(Some("private-project-status")),
+            "unknown"
+        );
+        assert_eq!(privacy_safe_tool_status(None), "missing");
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {

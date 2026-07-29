@@ -3,10 +3,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use buzz_core::kind::{
+    KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_GRANT_SIGNAL,
+    KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE,
+    KIND_MEETING_SPEECH_INTENT, KIND_MEETING_STATE, KIND_STREAM_MESSAGE,
+};
 use buzz_core::tenant::TenantContext;
 use buzz_db::meeting_baton::BatonConfig;
 use buzz_db::meeting_floor::{FloorConfig, WinnerSelector};
 use chrono::Utc;
+use nostr::Event;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -182,7 +188,29 @@ pub async fn run(state: Arc<AppState>) {
 }
 
 async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buzz_db::DbError> {
-    let sessions = buzz_db::meeting_baton::claim_due_baton_sessions(&state.db, limit).await?;
+    let sessions = match buzz_db::meeting_baton::claim_due_baton_sessions(&state.db, limit).await {
+        Ok(sessions) => {
+            metrics::counter!("meeting_v1_recovery_scan_total", "outcome" => "success")
+                .increment(1);
+            metrics::histogram!("meeting_v1_recovery_scan_sessions").record(sessions.len() as f64);
+            metrics::gauge!("meeting_v1_recovery_scan_last_sessions").set(sessions.len() as f64);
+            metrics::gauge!("meeting_v1_recovery_scan_saturated").set(
+                if sessions.len() as i64 >= limit {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            sessions
+        }
+        Err(error) => {
+            metrics::counter!("meeting_v1_recovery_scan_total", "outcome" => "error").increment(1);
+            metrics::gauge!("meeting_v1_recovery_scan_last_sessions").set(0.0);
+            metrics::gauge!("meeting_v1_recovery_scan_saturated").set(0.0);
+            record_worker_error("recovery_scan");
+            return Err(error);
+        }
+    };
     for session in sessions {
         match buzz_db::meeting_baton::recover_meeting_v1(
             &state.db,
@@ -193,6 +221,23 @@ async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buz
         .await
         {
             Ok(transitions) => {
+                let outcome = recovery_result_outcome(transitions.len());
+                let recovery_lag_seconds = elapsed_since(session.next_action_at);
+                metrics::counter!("meeting_v1_recovery_result_total", "outcome" => outcome)
+                    .increment(1);
+                for transition in &transitions {
+                    let deadline_type = classify_recovery_deadline(&transition.primary_type);
+                    metrics::counter!(
+                        "meeting_v1_recovery_transition_total",
+                        "transition" => classify_recovery_transition(&transition.primary_type)
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "meeting_v1_recovery_lag_seconds",
+                        "deadline_type" => deadline_type
+                    )
+                    .record(recovery_lag_seconds);
+                }
                 if !transitions.is_empty() {
                     info!(
                         meeting = %session.session_id,
@@ -209,6 +254,9 @@ async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buz
                     community = %session.community_id,
                     "Meeting V1 session recovery failed: {error}"
                 );
+                metrics::counter!("meeting_v1_recovery_result_total", "outcome" => "error")
+                    .increment(1);
+                record_worker_error("recovery_session");
             }
         }
     }
@@ -231,13 +279,14 @@ async fn process_revocation_jobs(
             error!(
                 community = %job.community_id,
                 revocation_job = %job.job_id,
-                attempts = job.attempts,
+                claim_attempt = job.claim_token.attempt(),
                 "Meeting security-revocation job failed: {job_error}"
             );
             if !buzz_db::meeting_baton::release_revocation_job(
                 &state.db,
                 job.community_id,
                 job.job_id,
+                job.claim_token,
                 &job_error.to_string(),
             )
             .await?
@@ -295,8 +344,13 @@ async fn process_revocation_job(
     }
 
     if revocation_batch_is_complete(sessions.len(), session_limit) {
-        if !buzz_db::meeting_baton::complete_revocation_job(&state.db, job.community_id, job.job_id)
-            .await?
+        if !buzz_db::meeting_baton::complete_revocation_job(
+            &state.db,
+            job.community_id,
+            job.job_id,
+            job.claim_token,
+        )
+        .await?
         {
             warn!(
                 community = %job.community_id,
@@ -309,6 +363,7 @@ async fn process_revocation_job(
             &state.db,
             job.community_id,
             job.job_id,
+            job.claim_token,
             cursor,
             Utc::now(),
         )
@@ -340,9 +395,20 @@ async fn dispatch_outbox_batch(
     lease: Duration,
     limit: i64,
 ) -> Result<(), buzz_db::DbError> {
-    let events =
-        buzz_db::meeting_floor::claim_outbox_batch(&state.db, worker_id, lease, limit).await?;
+    let events = match buzz_db::meeting_floor::claim_outbox_batch(
+        &state.db, worker_id, lease, limit,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            record_worker_error("outbox_claim");
+            return Err(error);
+        }
+    };
     for item in events {
+        let observe_v1 = is_meeting_v1_outbox_event(&item.stored_event.event);
+        let delivery_latency_seconds = elapsed_since(item.stored_event.received_at);
         let tenant = TenantContext::resolved(item.community_id, item.host);
         let kind = item.stored_event.event.kind.as_u16() as u32;
         let actor = item.stored_event.event.pubkey.to_hex();
@@ -350,41 +416,159 @@ async fn dispatch_outbox_batch(
             .await
         {
             Ok(_) => {
-                if !buzz_db::meeting_floor::mark_outbox_delivered(
+                let delivered = buzz_db::meeting_floor::mark_outbox_delivered(
                     &state.db,
                     item.community_id,
                     item.sequence,
                     worker_id,
                 )
-                .await?
-                {
-                    warn!(
-                        meeting = %item.session_id,
-                        sequence = item.sequence,
-                        "Meeting outbox claim was lost before delivery acknowledgement"
-                    );
+                .await;
+                match delivered {
+                    Ok(true) => {
+                        if observe_v1 {
+                            record_v1_outbox_delivery("delivered", delivery_latency_seconds);
+                        }
+                    }
+                    Ok(false) => {
+                        if observe_v1 {
+                            record_v1_outbox_delivery("claim_lost", delivery_latency_seconds);
+                            record_worker_error("outbox_claim_lost");
+                        }
+                        warn!(
+                            meeting = %item.session_id,
+                            sequence = item.sequence,
+                            "Meeting outbox claim was lost before delivery acknowledgement"
+                        );
+                    }
+                    Err(error) => {
+                        if observe_v1 {
+                            record_v1_outbox_delivery("worker_error", delivery_latency_seconds);
+                            record_worker_error("outbox_ack");
+                        }
+                        return Err(error);
+                    }
                 }
             }
             Err(error) => {
-                if !buzz_db::meeting_floor::release_outbox(
+                if observe_v1 {
+                    record_worker_error("outbox_dispatch");
+                }
+                let released = buzz_db::meeting_floor::release_outbox(
                     &state.db,
                     item.community_id,
                     item.sequence,
                     worker_id,
                     &error,
                 )
-                .await?
-                {
-                    warn!(
-                        meeting = %item.session_id,
-                        sequence = item.sequence,
-                        "Meeting outbox claim was lost before failed delivery could be released"
-                    );
+                .await;
+                match released {
+                    Ok(true) => {
+                        if observe_v1 {
+                            record_v1_outbox_delivery("dispatch_failed", delivery_latency_seconds);
+                        }
+                    }
+                    Ok(false) => {
+                        if observe_v1 {
+                            record_v1_outbox_delivery("claim_lost", delivery_latency_seconds);
+                            record_worker_error("outbox_claim_lost");
+                        }
+                        warn!(
+                            meeting = %item.session_id,
+                            sequence = item.sequence,
+                            "Meeting outbox claim was lost before failed delivery could be released"
+                        );
+                    }
+                    Err(release_error) => {
+                        if observe_v1 {
+                            record_v1_outbox_delivery("worker_error", delivery_latency_seconds);
+                            record_worker_error("outbox_release");
+                        }
+                        return Err(release_error);
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+fn recovery_result_outcome(transition_count: usize) -> &'static str {
+    if transition_count == 0 {
+        "noop"
+    } else {
+        "recovered"
+    }
+}
+
+fn classify_recovery_transition(primary_type: &str) -> &'static str {
+    match primary_type {
+        "participant_revoked" => "participant_revoked",
+        "offer_timed_out" => "offer_timed_out",
+        "grant_soft_expired" => "grant_soft_expired",
+        "grant_hard_expired" => "grant_hard_expired",
+        "moderator_fallback" => "moderator_fallback",
+        _ => "unknown",
+    }
+}
+
+fn classify_recovery_deadline(primary_type: &str) -> &'static str {
+    match primary_type {
+        "offer_timed_out" => "offer_ack",
+        "grant_soft_expired" => "grant_soft",
+        "grant_hard_expired" => "grant_hard",
+        "moderator_fallback" => "moderator_decision",
+        "participant_revoked" => "security_revocation",
+        _ => "unknown",
+    }
+}
+
+fn elapsed_since(timestamp: chrono::DateTime<Utc>) -> f64 {
+    Utc::now()
+        .signed_duration_since(timestamp)
+        .num_milliseconds()
+        .max(0) as f64
+        / 1_000.0
+}
+
+fn is_meeting_v1_outbox_event(event: &Event) -> bool {
+    let kind = event.kind.as_u16() as u32;
+    if !matches!(
+        kind,
+        KIND_STREAM_MESSAGE
+            | KIND_MEETING_CREATE
+            | KIND_MEETING_END
+            | KIND_MEETING_STATE
+            | KIND_MEETING_SPEECH_INTENT
+            | KIND_MEETING_MODERATOR_COMMAND
+            | KIND_MEETING_HUMAN_FLOOR_REQUEST
+            | KIND_MEETING_OFFER_RESPONSE
+            | KIND_MEETING_GRANT_SIGNAL
+    ) {
+        return false;
+    }
+
+    let mut versions = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == "v");
+    versions
+        .next()
+        .and_then(|tag| tag.content())
+        .is_some_and(|version| version == "2")
+        && versions.next().is_none()
+}
+
+fn record_v1_outbox_delivery(outcome: &'static str, latency_seconds: f64) {
+    metrics::counter!("meeting_v1_outbox_delivery_total", "outcome" => outcome).increment(1);
+    metrics::histogram!(
+        "meeting_v1_outbox_delivery_latency_seconds",
+        "outcome" => outcome
+    )
+    .record(latency_seconds);
+}
+
+fn record_worker_error(worker: &'static str) {
+    metrics::counter!("meeting_v1_worker_errors_total", "worker" => worker).increment(1);
 }
 
 fn env_duration_ms(name: &str, default: Duration) -> Duration {
@@ -421,6 +605,14 @@ fn valid_baton_config(config: &BatonConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn signed_event(kind: u32, tags: Vec<Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(u16::try_from(kind).expect("test kind")), "")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign test event")
+    }
 
     #[test]
     fn invalid_duration_uses_default() {
@@ -441,5 +633,64 @@ mod tests {
         assert!(revocation_batch_is_complete(0, 32));
         assert!(revocation_batch_is_complete(31, 32));
         assert!(!revocation_batch_is_complete(32, 32));
+    }
+
+    #[test]
+    fn recovery_metric_classification_is_closed() {
+        assert_eq!(recovery_result_outcome(0), "noop");
+        assert_eq!(recovery_result_outcome(1), "recovered");
+        assert_eq!(
+            classify_recovery_transition("offer_timed_out"),
+            "offer_timed_out"
+        );
+        assert_eq!(
+            classify_recovery_transition("grant_hard_expired"),
+            "grant_hard_expired"
+        );
+        assert_eq!(
+            classify_recovery_transition("session-or-error-shaped-private-text"),
+            "unknown"
+        );
+        assert_eq!(classify_recovery_deadline("offer_timed_out"), "offer_ack");
+        assert_eq!(
+            classify_recovery_deadline("grant_soft_expired"),
+            "grant_soft"
+        );
+        assert_eq!(
+            classify_recovery_deadline("grant_hard_expired"),
+            "grant_hard"
+        );
+        assert_eq!(
+            classify_recovery_deadline("moderator_fallback"),
+            "moderator_decision"
+        );
+        assert_eq!(
+            classify_recovery_deadline("session-or-error-shaped-private-text"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn outbox_protocol_detection_requires_one_v2_tag_on_a_v1_kind() {
+        let v2 = || Tag::parse(["v", "2"]).expect("v2");
+        let v1 = || Tag::parse(["v", "1"]).expect("v1");
+
+        let state = signed_event(KIND_MEETING_STATE, vec![v2()]);
+        assert!(is_meeting_v1_outbox_event(&state));
+
+        let speech = signed_event(KIND_STREAM_MESSAGE, vec![v2()]);
+        assert!(is_meeting_v1_outbox_event(&speech));
+
+        let missing_version = signed_event(KIND_MEETING_STATE, Vec::new());
+        assert!(!is_meeting_v1_outbox_event(&missing_version));
+
+        let old_protocol = signed_event(KIND_MEETING_STATE, vec![v1()]);
+        assert!(!is_meeting_v1_outbox_event(&old_protocol));
+
+        let duplicate_version = signed_event(KIND_MEETING_STATE, vec![v2(), v2()]);
+        assert!(!is_meeting_v1_outbox_event(&duplicate_version));
+
+        let unrelated = signed_event(42_199, vec![v2()]);
+        assert!(!is_meeting_v1_outbox_event(&unrelated));
     }
 }

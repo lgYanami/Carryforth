@@ -45,6 +45,7 @@ const PREVIOUS_LEDGER_VERSION: u32 = 2;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const SYNC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_LEDGER_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const PROTOCOL_SUBMIT_TIMEOUT: Duration = Duration::from_secs(2);
 const INTENT_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_GRANT_SAFETY_MARGIN: Duration = Duration::from_secs(30);
@@ -784,10 +785,12 @@ pub(super) struct MeetingV1Coordinator {
     auto_accept_offers: bool,
     ledger_path: PathBuf,
     ledger: AgentLedger,
+    terminal_ledger_cleanup_retry_at: Option<Instant>,
     meetings: HashMap<Uuid, MeetingRuntime>,
     pending: VecDeque<MeetingTurnRequest>,
     in_flight: HashMap<String, MeetingTurnRequest>,
     in_flight_epochs: HashMap<String, u64>,
+    external_reclaimable_turns: BTreeSet<Uuid>,
     preemptions: BTreeSet<Uuid>,
     next_session_epoch: u64,
     next_sync_request_id: u64,
@@ -847,10 +850,12 @@ impl MeetingV1Coordinator {
             auto_accept_offers,
             ledger_path,
             ledger,
+            terminal_ledger_cleanup_retry_at: None,
             meetings: HashMap::new(),
             pending: VecDeque::new(),
             in_flight: HashMap::new(),
             in_flight_epochs: HashMap::new(),
+            external_reclaimable_turns: BTreeSet::new(),
             preemptions: BTreeSet::new(),
             next_session_epoch: 0,
             next_sync_request_id: 0,
@@ -875,6 +880,10 @@ impl MeetingV1Coordinator {
 
     pub(super) fn set_available_agent_slots(&mut self, available: usize) {
         self.available_agent_slots = available.min(self.agent_capacity);
+    }
+
+    pub(super) fn set_external_reclaimable_turns(&mut self, sessions: BTreeSet<Uuid>) {
+        self.external_reclaimable_turns = sessions;
     }
 
     pub(super) fn unassigned_reserved_slots(&self) -> usize {
@@ -978,8 +987,14 @@ impl MeetingV1Coordinator {
     }
 
     pub(super) async fn register(&mut self, session_id: Uuid) {
+        if self.register_local(session_id) {
+            self.request_full_sync(session_id);
+        }
+    }
+
+    fn register_local(&mut self, session_id: Uuid) -> bool {
         if self.meetings.contains_key(&session_id) {
-            return;
+            return false;
         }
         self.next_session_epoch = self.next_session_epoch.saturating_add(1).max(1);
         self.meetings
@@ -991,7 +1006,7 @@ impl MeetingV1Coordinator {
             None,
             json!({ "session_id": session_id }),
         );
-        self.request_full_sync(session_id);
+        true
     }
 
     pub(super) fn remove(&mut self, session_id: Uuid) {
@@ -1031,6 +1046,40 @@ impl MeetingV1Coordinator {
         );
     }
 
+    /// Tear down a Session only after a validated Relay snapshot proves that
+    /// its authoritative Baton phase or room metadata is terminal.
+    ///
+    /// Unlike membership removal, an ended Meeting can never resume prepared
+    /// protocol work. Drop its entire durable ledger entry so prompts, private
+    /// reasons, and signed prepared events do not accumulate indefinitely.
+    /// Running model turns remain indexed only until the protocol-neutral
+    /// coordinator delivers their cancellation result; the removed runtime
+    /// epoch makes every such late result inert.
+    fn teardown_terminal_session(&mut self, session_id: Uuid) {
+        self.pending
+            .retain(|request| request.session_id != session_id);
+        if self
+            .in_flight
+            .values()
+            .any(|request| request.session_id == session_id)
+        {
+            self.preemptions.insert(session_id);
+        } else {
+            self.preemptions.remove(&session_id);
+        }
+        self.deferred_turn_results.remove(&session_id);
+        self.protocol_in_flight
+            .retain(|key, _| key.session_id() != session_id);
+        self.progress_in_flight
+            .retain(|(meeting_id, _), _| *meeting_id != session_id);
+        self.progress_waiting_for_state
+            .retain(|(meeting_id, _), _| *meeting_id != session_id);
+        self.external_reclaimable_turns.remove(&session_id);
+        self.meetings.remove(&session_id);
+        self.ledger.meetings.remove(&session_id.to_string());
+        self.persist_terminal_ledger_cleanup();
+    }
+
     pub(super) fn mark_all_for_resync(&mut self) {
         let session_ids: Vec<_> = self.meetings.keys().copied().collect();
         for session_id in session_ids {
@@ -1068,6 +1117,7 @@ impl MeetingV1Coordinator {
     }
 
     pub(super) async fn tick(&mut self) {
+        self.retry_terminal_ledger_cleanup_if_due();
         self.drain_protocol_results().await;
         self.drain_progress_results();
         let now = Instant::now();
@@ -1169,6 +1219,13 @@ impl MeetingV1Coordinator {
 
     pub(super) fn take_preemptions(&mut self) -> Vec<Uuid> {
         std::mem::take(&mut self.preemptions).into_iter().collect()
+    }
+
+    pub(super) fn mark_cross_protocol_preempted(&mut self, session_id: Uuid) {
+        self.preempt_intent_turn(session_id);
+        // MeetingCoordinator returns this cancellation in the current drain;
+        // do not leave a duplicate request for the next main-loop iteration.
+        self.preemptions.remove(&session_id);
     }
 
     fn ensure_meeting_ledger(&mut self, session_id: Uuid) {
@@ -1401,12 +1458,13 @@ impl MeetingV1Coordinator {
                         "submission": protocol_submission_label(&completed.result),
                     }),
                 );
-                if let Err(error) = &completed.result {
+                if completed.result.is_err() {
                     tracing::warn!(
                         meeting = %session_id,
                         offer = %offer_id,
                         action = action.as_str(),
-                        "Meeting V1 Offer response was not confirmed: {error}"
+                        outcome = protocol_submission_label(&completed.result),
+                        "Meeting V1 Offer response was not confirmed"
                     );
                 }
                 if completed
@@ -1457,11 +1515,12 @@ impl MeetingV1Coordinator {
                             .map(|queued_at_ms| now_ms().saturating_sub(queued_at_ms)),
                     }),
                 );
-                if let Err(error) = &completed.result {
+                if completed.result.is_err() {
                     tracing::warn!(
                         meeting = %session_id,
                         trigger = %trigger_id,
-                        "Meeting V1 Intent submission was not confirmed: {error}"
+                        outcome = protocol_submission_label(&completed.result),
+                        "Meeting V1 Intent submission was not confirmed"
                     );
                 }
                 self.request_fast_backfill(session_id);
@@ -1567,12 +1626,13 @@ impl MeetingV1Coordinator {
                     turn_id,
                     telemetry,
                 );
-                if let Err(error) = &completed.result {
+                if completed.result.is_err() {
                     tracing::warn!(
                         meeting = %session_id,
                         grant = %grant_id,
                         action = action.as_str(),
-                        "Meeting V1 Grant terminal action was not confirmed: {error}"
+                        outcome = protocol_submission_label(&completed.result),
+                        "Meeting V1 Grant terminal action was not confirmed"
                     );
                 }
                 let should_yield = event_matches
@@ -1633,12 +1693,13 @@ impl MeetingV1Coordinator {
                             .map(|queued| now_ms().saturating_sub(queued)),
                     }),
                 );
-                if let Err(error) = &completed.result {
+                if completed.result.is_err() {
                     tracing::warn!(
                         meeting = %session_id,
                         action = %action_kind,
                         object = %object_id,
-                        "Meeting V1 moderator action was not confirmed: {error}"
+                        outcome = protocol_submission_label(&completed.result),
+                        "Meeting V1 moderator action was not confirmed"
                     );
                 }
                 // Even an uncertain transport result may already have committed
@@ -2055,6 +2116,10 @@ impl MeetingV1Coordinator {
     }
 
     fn apply_view_to_ledger(&mut self, view: &MeetingView) {
+        if view.ended {
+            self.teardown_terminal_session(view.session_id);
+            return;
+        }
         self.ensure_meeting_ledger(view.session_id);
         let key = view.session_id.to_string();
         let agent_pubkey = self.agent_pubkey.clone();
@@ -2303,24 +2368,6 @@ impl MeetingV1Coordinator {
             }
         }
 
-        if view.ended {
-            for trigger in ledger.triggers.values_mut() {
-                if !matches!(trigger.state.as_str(), "passed" | "submitted" | "stale") {
-                    trigger.state = "stale".to_string();
-                }
-            }
-            for reservation in ledger.reservations.values_mut() {
-                reservation.state = "released".to_string();
-            }
-            for grant in ledger.grants.values_mut() {
-                if grant.state != "spoken" {
-                    grant.state = "terminal".to_string();
-                }
-            }
-            ledger.moderator_agenda = None;
-            ledger.moderator_control = None;
-            ledger.prepared_moderator_action = None;
-        }
         self.persist_ledger_best_effort();
     }
 
@@ -3468,6 +3515,11 @@ impl MeetingV1Coordinator {
                 )
             })
             .collect();
+        reclaimable_turns.extend(
+            self.external_reclaimable_turns
+                .iter()
+                .map(|session_id| (0, *session_id)),
+        );
         reclaimable_turns.sort_unstable();
         reclaimable_turns.dedup_by_key(|(_, session_id)| *session_id);
         let reclaimable_slots = reclaimable_turns.len();
@@ -3576,6 +3628,10 @@ impl MeetingV1Coordinator {
                 .saturating_sub(self.available_agent_slots);
             for (_, reclaimed_session) in reclaimable_turns.into_iter().take(required_reclaims) {
                 self.preempt_intent_turn(reclaimed_session);
+                // External V0 Intent turns have no V1 ledger/runtime entry,
+                // but the protocol-neutral coordinator still needs the same
+                // cancellation request to release their physical Agent slot.
+                self.preemptions.insert(reclaimed_session);
             }
             self.preempt_intent_turn(session_id);
         }
@@ -4971,6 +5027,31 @@ impl MeetingV1Coordinator {
                 path = %self.ledger_path.display(),
                 "Meeting V1 ledger persistence failed: {error}"
             );
+        }
+    }
+
+    fn persist_terminal_ledger_cleanup(&mut self) {
+        match persist_ledger(&self.ledger_path, &self.ledger) {
+            Ok(()) => {
+                self.terminal_ledger_cleanup_retry_at = None;
+            }
+            Err(error) => {
+                self.terminal_ledger_cleanup_retry_at =
+                    Some(Instant::now() + TERMINAL_LEDGER_CLEANUP_RETRY_INTERVAL);
+                tracing::warn!(
+                    path = %self.ledger_path.display(),
+                    "terminal Meeting V1 ledger cleanup persistence failed; retry scheduled: {error}"
+                );
+            }
+        }
+    }
+
+    fn retry_terminal_ledger_cleanup_if_due(&mut self) {
+        if self
+            .terminal_ledger_cleanup_retry_at
+            .is_some_and(|retry_at| Instant::now() >= retry_at)
+        {
+            self.persist_terminal_ledger_cleanup();
         }
     }
 
@@ -6994,6 +7075,22 @@ mod tests {
         }
     }
 
+    fn ended_meeting_view(
+        session_id: Uuid,
+        agent_pubkey: &str,
+        other_pubkey: &str,
+        state_revision: u64,
+    ) -> MeetingView {
+        let mut view = meeting_view(session_id, agent_pubkey, other_pubkey);
+        view.ended = true;
+        view.baton.phase = "ended".to_string();
+        view.baton.state_revision = state_revision;
+        view.baton.state_event_id = pubkey((state_revision as u8).saturating_add(20));
+        view.baton.raw_state["phase"] = json!("ended");
+        view.baton.raw_state["state_revision"] = json!(state_revision);
+        view
+    }
+
     fn test_coordinator(
         keys: Keys,
         ledger_path: PathBuf,
@@ -7022,10 +7119,12 @@ mod tests {
                 agent_pubkey,
                 meetings: BTreeMap::new(),
             },
+            terminal_ledger_cleanup_retry_at: None,
             meetings: HashMap::new(),
             pending: VecDeque::new(),
             in_flight: HashMap::new(),
             in_flight_epochs: HashMap::new(),
+            external_reclaimable_turns: BTreeSet::new(),
             preemptions: BTreeSet::new(),
             next_session_epoch: 0,
             next_sync_request_id: 0,
@@ -7332,6 +7431,623 @@ mod tests {
         assert!(coordinator.protocol_in_flight.is_empty());
     }
 
+    #[tokio::test]
+    async fn sixteen_sessions_start_and_settle_independent_ack_submissions_concurrently() {
+        const SESSION_COUNT: usize = 16;
+
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let offers: Vec<_> = (0..SESSION_COUNT)
+            .map(|index| {
+                let session_id = Uuid::new_v4();
+                let offer_id = pubkey(120 + index as u8);
+                let view = agent_offer_view(session_id, &agent_pubkey, &other_pubkey, &offer_id);
+                (session_id, offer_id, view)
+            })
+            .collect();
+        let (rest, mut request_started, release_responses, server) =
+            gated_rest_responding_to(keys.clone(), SESSION_COUNT).await;
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        coordinator.rest = rest;
+        coordinator.agent_capacity = SESSION_COUNT;
+        coordinator.available_agent_slots = SESSION_COUNT;
+        for (session_id, _, _) in &offers {
+            coordinator.ensure_meeting_ledger(*session_id);
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for (session_id, _, view) in &offers {
+                assert!(coordinator.handle_offer(*session_id, view).await);
+            }
+        })
+        .await
+        .expect("all Offer handlers must return without awaiting gated HTTP responses");
+
+        assert_eq!(
+            coordinator.protocol_in_flight.len(),
+            SESSION_COUNT,
+            "every Session must own an independent background ACK"
+        );
+        for (session_id, offer_id, _) in &offers {
+            assert_eq!(
+                reservation_state(&coordinator, *session_id, offer_id),
+                Some("ack_prepared")
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..SESSION_COUNT {
+                request_started
+                    .recv()
+                    .await
+                    .expect("every ACK must reach the gated HTTP server");
+            }
+        })
+        .await
+        .expect("all ACK requests must start before any response is released");
+
+        coordinator.drain_protocol_results().await;
+        for (session_id, offer_id, _) in &offers {
+            assert_eq!(
+                reservation_state(&coordinator, *session_id, offer_id),
+                Some("ack_prepared"),
+                "a gated response must leave its reservation prepared"
+            );
+        }
+
+        release_responses
+            .send(true)
+            .expect("release all gated HTTP responses");
+        server.await.expect("join gated HTTP server");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                coordinator.drain_protocol_results().await;
+                if offers.iter().all(|(session_id, offer_id, _)| {
+                    reservation_state(&coordinator, *session_id, offer_id) == Some("ack_sent")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every independent ACK completion must settle");
+        assert!(coordinator.protocol_in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn eight_agent_slots_complete_five_granted_rounds_without_duplicate_or_cross_session_speech(
+    ) {
+        const SESSION_COUNT: usize = 8;
+        const ROUND_COUNT: usize = 5;
+
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let mut coordinator = test_coordinator(
+            keys.clone(),
+            dir.path().join("meeting-v1-ledger.json"),
+            None,
+        );
+        coordinator.agent_capacity = SESSION_COUNT;
+        coordinator.available_agent_slots = SESSION_COUNT;
+
+        let mut sessions = Vec::with_capacity(SESSION_COUNT);
+        for index in 0..SESSION_COUNT {
+            let session_id = Uuid::new_v4();
+            let view = meeting_view(session_id, &agent_pubkey, &other_pubkey);
+            coordinator.apply_view_to_ledger(&view);
+            let activation_id = format!("activation:{session_id}");
+            coordinator
+                .ledger_for_mut(session_id)
+                .and_then(|ledger| ledger.triggers.get_mut(&activation_id))
+                .expect("initial activation trigger")
+                .state = "passed".to_string();
+            coordinator.meetings.insert(
+                session_id,
+                runtime_with_view(index as u64 + 1, view.clone()),
+            );
+            sessions.push((session_id, view));
+        }
+
+        let mut all_speech_event_ids = BTreeSet::new();
+        for round_index in 0..ROUND_COUNT {
+            let (rest, mut request_started, release_responses, server) =
+                gated_rest_responding_to(keys.clone(), SESSION_COUNT).await;
+            coordinator.rest = rest;
+            let mut expected = BTreeMap::new();
+
+            for (session_index, (session_id, view)) in sessions.iter_mut().enumerate() {
+                let grant_id = pubkey(20 + (round_index * SESSION_COUNT + session_index) as u8);
+                let offer_id = pubkey(80 + (round_index * SESSION_COUNT + session_index) as u8);
+                let mut grant = test_grant(&agent_pubkey, &grant_id, &offer_id);
+                grant.basis_speech_revision = view.baton.speech_revision;
+                view.baton.phase = "granted".to_string();
+                view.baton.state_revision = view.baton.state_revision.saturating_add(1);
+                view.baton.state_event_id =
+                    pubkey(140 + (round_index * SESSION_COUNT + session_index) as u8);
+                view.baton.grant = Some(grant);
+                view.baton.raw_state["phase"] = json!("granted");
+                view.baton.raw_state["state_revision"] = json!(view.baton.state_revision);
+                view.baton.raw_state["speech_revision"] = json!(view.baton.speech_revision);
+
+                coordinator.apply_view_to_ledger(view);
+                let runtime = coordinator
+                    .meetings
+                    .get_mut(session_id)
+                    .expect("active Meeting runtime");
+                runtime.view = Some(view.clone());
+                runtime.last_sync = Some(Instant::now());
+
+                coordinator.reconcile(*session_id).await;
+                coordinator.reconcile(*session_id).await;
+                let content = format!(
+                    "Session {session_index} round {} has one canonical answer.",
+                    round_index + 1
+                );
+                expected.insert(*session_id, (grant_id, offer_id, content));
+            }
+
+            assert_eq!(
+                coordinator.pending.len(),
+                SESSION_COUNT,
+                "each active Grant must queue exactly one Agent turn"
+            );
+            assert_eq!(
+                coordinator
+                    .pending
+                    .iter()
+                    .map(|request| request.session_id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                SESSION_COUNT,
+                "repeated reconciliation must not duplicate a Session turn"
+            );
+
+            for dispatch_index in 0..SESSION_COUNT {
+                let request = coordinator.pop_pending().expect("queued Granted turn");
+                assert_eq!(request.kind, MeetingTurnKind::V1Granted);
+                let (grant_id, _, content) = expected
+                    .get(&request.session_id)
+                    .expect("request belongs to this stress round");
+                assert_eq!(request.grant_event_id.as_deref(), Some(grant_id.as_str()));
+                let turn_id = format!("stress-round-{round_index}-turn-{dispatch_index}");
+                coordinator.mark_dispatched(turn_id.clone(), request.clone());
+
+                // The production wrapper removes ownership before applying the
+                // already-synchronized semantic result. Keep that invariant in
+                // this focused controller test without starting another Relay
+                // history query.
+                coordinator.in_flight.remove(&turn_id);
+                coordinator.in_flight_epochs.remove(&turn_id);
+                coordinator
+                    .meetings
+                    .get_mut(&request.session_id)
+                    .expect("dispatched Meeting runtime")
+                    .in_flight_turn = None;
+                let output = json!({
+                    "action": "SAY",
+                    "content": content,
+                    "mention_pubkeys": [],
+                    "handoff": null,
+                    "reason": null,
+                })
+                .to_string();
+                coordinator
+                    .handle_granted_result(&turn_id, &request, &output, true)
+                    .await;
+            }
+
+            assert!(coordinator.pending.is_empty());
+            assert_eq!(
+                coordinator.protocol_in_flight.len(),
+                SESSION_COUNT,
+                "all Speech submissions must be independently in flight"
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                for _ in 0..SESSION_COUNT {
+                    request_started
+                        .recv()
+                        .await
+                        .expect("every Speech must reach the gated HTTP server");
+                }
+            })
+            .await
+            .expect("all Speech requests must start before any response is released");
+
+            let mut prepared = BTreeMap::new();
+            for (session_id, (grant_id, _, expected_content)) in &expected {
+                let record = coordinator
+                    .ledger_for(*session_id)
+                    .and_then(|ledger| ledger.grants.get(grant_id))
+                    .expect("durable Grant record");
+                assert_eq!(record.state, "speech_prepared");
+                let event: Event = serde_json::from_value(
+                    record
+                        .speech_event
+                        .clone()
+                        .expect("durable prepared Speech"),
+                )
+                .expect("deserialize prepared Speech");
+                assert_eq!(event.kind.as_u16() as u32, KIND_STREAM_MESSAGE);
+                let session_tag = session_id.to_string();
+                assert_eq!(tag_value(&event, "h"), Some(session_tag.as_str()));
+                assert_eq!(tag_value(&event, "meeting-grant"), Some(grant_id.as_str()));
+                assert_eq!(
+                    tag_value(&event, "speech-revision")
+                        .and_then(|value| value.parse::<u64>().ok()),
+                    Some(round_index as u64 + 1)
+                );
+                assert_eq!(&event.content, expected_content);
+                assert!(
+                    all_speech_event_ids.insert(event.id.to_hex()),
+                    "every Session/round must own a distinct signed Speech"
+                );
+                prepared.insert(*session_id, event);
+            }
+
+            release_responses
+                .send(true)
+                .expect("release all Speech responses");
+            server.await.expect("join gated Speech server");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    coordinator.drain_protocol_results().await;
+                    if expected.iter().all(|(session_id, (grant_id, _, _))| {
+                        coordinator
+                            .ledger_for(*session_id)
+                            .and_then(|ledger| ledger.grants.get(grant_id))
+                            .is_some_and(|record| record.state == "speech_sent")
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("every Speech completion must settle independently");
+            assert!(coordinator.protocol_in_flight.is_empty());
+
+            // A successful POST is not yet authoritative. Until Relay State
+            // advances, every Session must wait instead of publishing a second
+            // Speech for the same Grant.
+            for (session_id, _) in &sessions {
+                coordinator
+                    .meetings
+                    .get_mut(session_id)
+                    .expect("active Meeting runtime")
+                    .last_sync = Some(Instant::now());
+                coordinator.reconcile(*session_id).await;
+            }
+            assert!(coordinator.pending.is_empty());
+            assert!(coordinator.protocol_in_flight.is_empty());
+
+            for (session_id, view) in &mut sessions {
+                let (grant_id, offer_id, expected_content) = expected
+                    .get(session_id)
+                    .expect("canonical Speech belongs to this Session");
+                let event = prepared
+                    .remove(session_id)
+                    .expect("prepared Speech for canonical projection");
+                view.speeches.push(Speech {
+                    event_id: event.id.to_hex(),
+                    author_pubkey: agent_pubkey.clone(),
+                    author_display_name: "Agent".to_string(),
+                    content: expected_content.clone(),
+                    created_at: event.created_at.as_secs(),
+                    speech_revision: round_index as u64 + 1,
+                    grant_id: grant_id.clone(),
+                    mentions: Vec::new(),
+                    handoff: None,
+                });
+                view.speech_cursor = Some(event.id.to_hex());
+                view.baton.phase = "moderator_control".to_string();
+                view.baton.state_revision = view.baton.state_revision.saturating_add(1);
+                view.baton.speech_revision = round_index as u64 + 1;
+                view.baton.state_event_id =
+                    pubkey(200 + (round_index * SESSION_COUNT + expected.len()) as u8);
+                view.baton.grant = None;
+                view.baton.raw_state["phase"] = json!("moderator_control");
+                view.baton.raw_state["state_revision"] = json!(view.baton.state_revision);
+                view.baton.raw_state["speech_revision"] = json!(view.baton.speech_revision);
+
+                coordinator.apply_view_to_ledger(view);
+                let runtime = coordinator
+                    .meetings
+                    .get_mut(session_id)
+                    .expect("active Meeting runtime");
+                runtime.view = Some(view.clone());
+                runtime.last_sync = Some(Instant::now());
+                coordinator.reconcile(*session_id).await;
+
+                let ledger = coordinator
+                    .ledger_for(*session_id)
+                    .expect("Session-scoped Meeting ledger");
+                assert_eq!(ledger.grants[grant_id].state, "spoken");
+                assert_eq!(ledger.reservations[offer_id].state, "released");
+                assert!(
+                    !ledger
+                        .triggers
+                        .contains_key(&format!("speech:{}", event.id.to_hex())),
+                    "an Agent's own Speech must not trigger another Intent turn"
+                );
+            }
+            assert!(coordinator.pending.is_empty());
+        }
+
+        assert_eq!(all_speech_event_ids.len(), SESSION_COUNT * ROUND_COUNT);
+        for (session_id, _) in sessions {
+            let ledger = coordinator
+                .ledger_for(session_id)
+                .expect("final Session ledger");
+            assert_eq!(ledger.grants.len(), ROUND_COUNT);
+            assert!(ledger
+                .grants
+                .values()
+                .all(|record| record.state == "spoken"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ten_agent_identities_observe_twenty_shared_rounds_without_duplicate_intent_turns() {
+        const AGENT_COUNT: usize = 10;
+        const ROUND_COUNT: usize = 20;
+
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let session_id = Uuid::new_v4();
+        let agent_keys: Vec<_> = (0..AGENT_COUNT).map(|_| Keys::generate()).collect();
+        let agent_pubkeys: Vec<_> = agent_keys
+            .iter()
+            .map(|keys| keys.public_key().to_hex())
+            .collect();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let mut roster = BTreeMap::new();
+        for (index, pubkey) in agent_pubkeys.iter().enumerate() {
+            roster.insert(
+                pubkey.clone(),
+                Participant {
+                    pubkey: pubkey.clone(),
+                    role: "member".to_string(),
+                    participant_type: "agent".to_string(),
+                    display_name: format!("Agent {index}"),
+                },
+            );
+        }
+        roster.insert(
+            moderator_pubkey.clone(),
+            Participant {
+                pubkey: moderator_pubkey.clone(),
+                role: "moderator".to_string(),
+                participant_type: "human".to_string(),
+                display_name: "Human moderator".to_string(),
+            },
+        );
+        let mut baton = baton_view();
+        baton.moderator_pubkey = moderator_pubkey.clone();
+        baton.raw_state["moderator_pubkey"] = json!(moderator_pubkey);
+        let mut shared_view = MeetingView {
+            session_id,
+            title: "Ten-Agent stress meeting".to_string(),
+            description: Some("Twenty canonical speech rounds".to_string()),
+            ended: false,
+            relay_pubkey: pubkey(10),
+            roster,
+            speeches: Vec::new(),
+            intents: BTreeMap::new(),
+            speech_cursor: None,
+            baton,
+        };
+
+        let mut coordinators = Vec::with_capacity(AGENT_COUNT);
+        for (index, keys) in agent_keys.into_iter().enumerate() {
+            let mut coordinator = test_coordinator(
+                keys,
+                dir.path().join(format!("meeting-v1-ledger-{index}.json")),
+                None,
+            );
+            coordinator.apply_view_to_ledger(&shared_view);
+            let activation_id = format!("activation:{session_id}");
+            coordinator
+                .ledger_for_mut(session_id)
+                .and_then(|ledger| ledger.triggers.get_mut(&activation_id))
+                .expect("initial activation trigger")
+                .state = "passed".to_string();
+            coordinator
+                .meetings
+                .insert(session_id, runtime_with_view(1, shared_view.clone()));
+            coordinators.push(coordinator);
+        }
+
+        for round_index in 0..ROUND_COUNT {
+            let speaker_index = round_index % AGENT_COUNT;
+            let event_id = pubkey(40 + round_index as u8);
+            let grant_id = pubkey(80 + round_index as u8);
+            let content = format!(
+                "Round {} contribution from Agent {speaker_index}.",
+                round_index + 1
+            );
+            shared_view.speeches.push(Speech {
+                event_id: event_id.clone(),
+                author_pubkey: agent_pubkeys[speaker_index].clone(),
+                author_display_name: format!("Agent {speaker_index}"),
+                content: content.clone(),
+                created_at: round_index as u64 + 1,
+                speech_revision: round_index as u64 + 1,
+                grant_id,
+                mentions: Vec::new(),
+                handoff: None,
+            });
+            shared_view.speech_cursor = Some(event_id.clone());
+            shared_view.baton.phase = "moderator_control".to_string();
+            shared_view.baton.state_revision = shared_view.baton.state_revision.saturating_add(1);
+            shared_view.baton.speech_revision = round_index as u64 + 1;
+            shared_view.baton.state_event_id = pubkey(120 + round_index as u8);
+            shared_view.baton.raw_state["phase"] = json!("moderator_control");
+            shared_view.baton.raw_state["state_revision"] = json!(shared_view.baton.state_revision);
+            shared_view.baton.raw_state["speech_revision"] =
+                json!(shared_view.baton.speech_revision);
+
+            for (agent_index, coordinator) in coordinators.iter_mut().enumerate() {
+                coordinator.apply_view_to_ledger(&shared_view);
+                let runtime = coordinator
+                    .meetings
+                    .get_mut(&session_id)
+                    .expect("active shared Meeting runtime");
+                runtime.view = Some(shared_view.clone());
+                runtime.last_sync = Some(Instant::now());
+
+                coordinator.reconcile(session_id).await;
+                coordinator.reconcile(session_id).await;
+                let trigger_id = format!("speech:{event_id}");
+                if agent_index == speaker_index {
+                    assert!(
+                        coordinator.pending.is_empty(),
+                        "the speaker must not react to its own Speech"
+                    );
+                    assert!(
+                        !coordinator
+                            .ledger_for(session_id)
+                            .expect("speaker Meeting ledger")
+                            .triggers
+                            .contains_key(&trigger_id),
+                        "the speaker must not create an Intent trigger for itself"
+                    );
+                    continue;
+                }
+
+                assert_eq!(
+                    coordinator.pending.len(),
+                    1,
+                    "each observing Agent must own one semantic turn per Speech"
+                );
+                let request = coordinator.pop_pending().expect("observer Intent turn");
+                assert_eq!(request.kind, MeetingTurnKind::V1Intent);
+                assert_eq!(request.session_id, session_id);
+                assert_eq!(request.basis_id, trigger_id);
+                assert!(
+                    request.prompt.contains(&content),
+                    "every observer must receive the latest shared Speech"
+                );
+
+                let turn_id = format!("agent-{agent_index}-round-{round_index}");
+                coordinator.mark_dispatched(turn_id.clone(), request.clone());
+                coordinator.in_flight.remove(&turn_id);
+                coordinator.in_flight_epochs.remove(&turn_id);
+                coordinator
+                    .meetings
+                    .get_mut(&session_id)
+                    .expect("observer Meeting runtime")
+                    .in_flight_turn = None;
+                coordinator
+                    .handle_intent_result(
+                        &turn_id,
+                        &request,
+                        r#"{"action":"PASS","summary":null,"addressed_to":null}"#,
+                        true,
+                    )
+                    .await;
+                coordinator.reconcile(session_id).await;
+                coordinator.reconcile(session_id).await;
+                assert!(
+                    coordinator.pending.is_empty(),
+                    "a completed semantic trigger must not queue twice"
+                );
+                assert_eq!(
+                    coordinator
+                        .ledger_for(session_id)
+                        .and_then(|ledger| ledger.triggers.get(&trigger_id))
+                        .map(|trigger| trigger.state.as_str()),
+                    Some("passed")
+                );
+                assert!(coordinator.protocol_in_flight.is_empty());
+            }
+        }
+
+        for (agent_index, coordinator) in coordinators.iter().enumerate() {
+            let ledger = coordinator
+                .ledger_for(session_id)
+                .expect("final identity-scoped Meeting ledger");
+            let authored_speeches = (0..ROUND_COUNT)
+                .filter(|round_index| round_index % AGENT_COUNT == agent_index)
+                .count();
+            assert_eq!(ledger.seen_speech_ids.len(), ROUND_COUNT);
+            assert_eq!(
+                ledger.triggers.len(),
+                1 + ROUND_COUNT - authored_speeches,
+                "the ledger must contain one activation plus one trigger per foreign Speech"
+            );
+            assert!(ledger.triggers.values().all(|trigger| {
+                trigger.state == "passed" || trigger.trigger_id.starts_with("activation:")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_participant_turn_prepares_and_submits_intent_asynchronously() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let trigger_id = "activation:intent-submission".to_string();
+        let (rest, mut request_started, release, server) =
+            gated_rest_responding_to(keys.clone(), 1).await;
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        coordinator.rest = rest;
+        let view = meeting_view(session_id, &agent_pubkey, &other_pubkey);
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view));
+        coordinator.ensure_meeting_ledger(session_id);
+        let mut trigger = TriggerRecord::new(trigger_id.clone(), None, 0);
+        trigger.state = "running".to_string();
+        coordinator
+            .ledger_for_mut(session_id)
+            .expect("participant Meeting ledger")
+            .triggers
+            .insert(trigger_id.clone(), trigger);
+        let mut request = granted_turn_request(session_id, &pubkey(30));
+        request.kind = MeetingTurnKind::V1Intent;
+        request.basis_id = trigger_id.clone();
+        request.round_number = 0;
+        request.grant_event_id = None;
+
+        coordinator
+            .handle_intent_result(
+                "participant-intent-turn",
+                &request,
+                r#"{"action":"SUBMIT","summary":"Surface the dependency risk.","addressed_to":null}"#,
+                true,
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), request_started.recv())
+            .await
+            .expect("Intent submission must start without blocking the coordinator")
+            .expect("Intent submission observer remains open");
+        let trigger = coordinator
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.triggers.get(&trigger_id))
+            .expect("durable prepared Intent");
+        assert_eq!(trigger.state, "prepared");
+        assert!(trigger.prepared_event.is_some());
+        assert!(trigger.prepared_event_id.is_some());
+        assert!(coordinator
+            .protocol_in_flight
+            .contains_key(&ProtocolSubmissionKey::Intent {
+                session_id,
+                trigger_id,
+            }));
+
+        release.send(true).expect("release Intent response");
+        server.await.expect("join Intent responder");
+    }
+
     #[test]
     fn remove_preserves_prepared_ack_decline_speech_and_yield_events() {
         let dir = tempfile::tempdir().expect("temp ledger directory");
@@ -7475,6 +8191,377 @@ mod tests {
                 .and_then(serialized_event_id),
             Some(yield_event.id.to_hex())
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_end_tears_down_runtime_ledger_and_all_session_work() {
+        const PRIVATE_CONTENT: &str = "PRIVATE_TERMINAL_MEETING_CONTENT";
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let ledger_path = dir.path().join("meeting-v1-ledger.json");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let grant_id = pubkey(70);
+        let offer_id = pubkey(71);
+        let trigger_id = "speech:terminal".to_string();
+        let turn_id = "terminal-granted-turn".to_string();
+        let mut coordinator = test_coordinator(keys, ledger_path.clone(), None);
+
+        let mut active_view = meeting_view(session_id, &agent_pubkey, &other_pubkey);
+        active_view.speeches.push(Speech {
+            event_id: pubkey(72),
+            author_pubkey: other_pubkey.clone(),
+            author_display_name: "Human".to_string(),
+            content: PRIVATE_CONTENT.to_string(),
+            created_at: 1,
+            speech_revision: 1,
+            grant_id: pubkey(73),
+            mentions: Vec::new(),
+            handoff: None,
+        });
+        let mut runtime = runtime_with_view(7, active_view);
+        runtime.last_sync = Some(Instant::now() - SYNC_INTERVAL);
+        runtime.queued = true;
+        runtime.in_flight_turn = Some(turn_id.clone());
+        runtime.control_retry_at = Some(Instant::now());
+        coordinator.meetings.insert(session_id, runtime);
+        coordinator.ensure_meeting_ledger(session_id);
+
+        let mut trigger = TriggerRecord::new(trigger_id.clone(), Some(pubkey(72)), 1);
+        trigger.state = "prepared".to_string();
+        trigger.prepared_event = Some(json!({
+            "content": PRIVATE_CONTENT,
+            "summary": PRIVATE_CONTENT,
+        }));
+        trigger.prepared_event_id = Some(pubkey(74));
+        let grant = test_grant(&agent_pubkey, &grant_id, &offer_id);
+        let mut grant_record = test_grant_record(&grant);
+        grant_record.state = "speech_prepared".to_string();
+        grant_record.speech_event = Some(json!({ "content": PRIVATE_CONTENT }));
+        grant_record.speech_event_id = Some(pubkey(75));
+        grant_record.yield_event = Some(json!({ "reason": PRIVATE_CONTENT }));
+        let ledger = coordinator
+            .ledger_for_mut(session_id)
+            .expect("active Meeting ledger");
+        ledger.meeting_synced = true;
+        ledger.seen_speech_ids.insert(pubkey(72));
+        ledger.triggers.insert(trigger_id.clone(), trigger);
+        ledger.reservations.insert(
+            offer_id.clone(),
+            ReservationRecord {
+                offer_id: offer_id.clone(),
+                state: "ack_prepared".to_string(),
+                ack_event: Some(json!({ "reason": PRIVATE_CONTENT })),
+                decline_event: None,
+                created_at_ms: now_ms(),
+                capacity_expires_at_ms: now_ms() + 300_000,
+            },
+        );
+        ledger.grants.insert(grant_id.clone(), grant_record);
+        coordinator.persist_ledger_best_effort();
+        assert!(
+            std::fs::read_to_string(&ledger_path)
+                .expect("read active ledger")
+                .contains(PRIVATE_CONTENT),
+            "the fixture must prove terminal compaction removes persisted private content"
+        );
+
+        let mut queued_request = granted_turn_request(session_id, &grant_id);
+        queued_request.kind = MeetingTurnKind::V1Intent;
+        queued_request.prompt = PRIVATE_CONTENT.to_string();
+        queued_request.basis_id = trigger_id.clone();
+        queued_request.grant_event_id = None;
+        coordinator.pending.push_back(queued_request.clone());
+        coordinator.deferred_turn_results.insert(
+            session_id,
+            DeferredTurnResult {
+                request_id: 40,
+                session_epoch: 7,
+                turn_id: "deferred-terminal-turn".to_string(),
+                request: queued_request,
+                raw_output: PRIVATE_CONTENT.to_string(),
+                succeeded: true,
+            },
+        );
+        coordinator.protocol_in_flight.insert(
+            ProtocolSubmissionKey::Intent {
+                session_id,
+                trigger_id,
+            },
+            ProtocolInFlight {
+                session_epoch: 7,
+                submission_id: 41,
+                event_id: pubkey(76),
+            },
+        );
+        coordinator.progress_in_flight.insert(
+            (session_id, grant_id.clone()),
+            ProgressInFlight {
+                session_epoch: 7,
+                submission_id: 42,
+                event_id: pubkey(77),
+            },
+        );
+        coordinator
+            .progress_waiting_for_state
+            .insert((session_id, grant_id.clone()), 43);
+        coordinator
+            .in_flight
+            .insert(turn_id.clone(), granted_turn_request(session_id, &grant_id));
+        coordinator.in_flight_epochs.insert(turn_id.clone(), 7);
+
+        let ended_view = ended_meeting_view(session_id, &agent_pubkey, &other_pubkey, 2);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, ended_view),
+            SyncApplyResult::Applied
+        );
+
+        assert!(!coordinator.meetings.contains_key(&session_id));
+        assert!(coordinator.ledger_for(session_id).is_none());
+        assert!(!coordinator
+            .pending
+            .iter()
+            .any(|request| request.session_id == session_id));
+        assert!(!coordinator.deferred_turn_results.contains_key(&session_id));
+        assert!(!coordinator
+            .protocol_in_flight
+            .keys()
+            .any(|key| key.session_id() == session_id));
+        assert!(!coordinator
+            .progress_in_flight
+            .keys()
+            .any(|(meeting_id, _)| *meeting_id == session_id));
+        assert!(!coordinator
+            .progress_waiting_for_state
+            .keys()
+            .any(|(meeting_id, _)| *meeting_id == session_id));
+        assert_eq!(
+            coordinator.take_preemptions(),
+            vec![session_id],
+            "terminal State must cancel even an in-flight Granted turn"
+        );
+        assert!(
+            coordinator.in_flight.contains_key(&turn_id),
+            "turn ownership remains until the cancellation completion is delivered"
+        );
+
+        let persisted = std::fs::read_to_string(&ledger_path).expect("read compacted ledger");
+        assert!(!persisted.contains(PRIVATE_CONTENT));
+        assert!(!load_ledger(&ledger_path)
+            .expect("load compacted ledger")
+            .meetings
+            .contains_key(&session_id.to_string()));
+
+        let sync_requests_before_tick = coordinator.next_sync_request_id;
+        coordinator.tick().await;
+        assert_eq!(
+            coordinator.next_sync_request_id, sync_requests_before_tick,
+            "a terminal runtime must not be scheduled for periodic sync"
+        );
+
+        coordinator
+            .handle_turn_result(&turn_id, PRIVATE_CONTENT.to_string(), true)
+            .await;
+        assert!(!coordinator.in_flight.contains_key(&turn_id));
+        assert!(!coordinator.in_flight_epochs.contains_key(&turn_id));
+        assert!(!coordinator.meetings.contains_key(&session_id));
+        assert!(coordinator.ledger_for(session_id).is_none());
+        assert!(coordinator.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_ledger_cleanup_retries_after_failure_without_active_meetings() {
+        const PRIVATE_CONTENT: &str = "PRIVATE_TERMINAL_RETRY_CONTENT";
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let ledger_path = dir.path().join("meeting-v1-ledger.json");
+        let preserved_ledger_path = dir.path().join("meeting-v1-ledger.private");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(keys, ledger_path.clone(), None);
+
+        assert!(coordinator.register_local(session_id));
+        let mut trigger = TriggerRecord::new("terminal-retry".to_string(), Some(pubkey(78)), 1);
+        trigger.state = "prepared".to_string();
+        trigger.prepared_event = Some(json!({ "content": PRIVATE_CONTENT }));
+        coordinator
+            .ledger_for_mut(session_id)
+            .expect("active Meeting ledger")
+            .triggers
+            .insert(trigger.trigger_id.clone(), trigger);
+        persist_ledger(&ledger_path, &coordinator.ledger).expect("persist private active ledger");
+        assert!(std::fs::read_to_string(&ledger_path)
+            .expect("read private active ledger")
+            .contains(PRIVATE_CONTENT));
+
+        // Preserve the old durable file and make its configured destination a
+        // directory so the terminal cleanup's atomic rename fails.
+        std::fs::rename(&ledger_path, &preserved_ledger_path)
+            .expect("preserve private ledger before injected failure");
+        std::fs::create_dir(&ledger_path).expect("block atomic ledger replacement");
+
+        let ended = ended_meeting_view(session_id, &agent_pubkey, &other_pubkey, 2);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, ended),
+            SyncApplyResult::Applied
+        );
+        assert!(coordinator.meetings.is_empty());
+        assert!(coordinator.ledger.meetings.is_empty());
+        assert!(
+            coordinator.terminal_ledger_cleanup_retry_at.is_some(),
+            "a failed terminal cleanup must remain independently retryable"
+        );
+        assert!(
+            std::fs::read_to_string(&preserved_ledger_path)
+                .expect("read preserved private ledger")
+                .contains(PRIVATE_CONTENT),
+            "the injected failure must leave the old durable private content intact"
+        );
+
+        std::fs::remove_dir(&ledger_path).expect("remove atomic-replace blocker");
+        std::fs::rename(&preserved_ledger_path, &ledger_path)
+            .expect("restore old private ledger before retry");
+        coordinator.terminal_ledger_cleanup_retry_at = Some(Instant::now());
+
+        coordinator.tick().await;
+
+        assert!(
+            coordinator.terminal_ledger_cleanup_retry_at.is_none(),
+            "a successful periodic retry must clear the cleanup marker"
+        );
+        assert!(coordinator.meetings.is_empty());
+        let persisted =
+            std::fs::read_to_string(&ledger_path).expect("read retried terminal ledger");
+        assert!(!persisted.contains(PRIVATE_CONTENT));
+        assert!(load_ledger(&ledger_path)
+            .expect("load retried terminal ledger")
+            .meetings
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_teardown_cancels_low_priority_and_granted_turns() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        let kinds = [
+            MeetingTurnKind::V1Intent,
+            MeetingTurnKind::V1ModeratorAgenda,
+            MeetingTurnKind::V1ModeratorControl,
+            MeetingTurnKind::V1Granted,
+        ];
+        let mut sessions = BTreeSet::new();
+        let mut turns = Vec::new();
+
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let session_id = Uuid::new_v4();
+            let epoch = index as u64 + 1;
+            let turn_id = format!("terminal-turn-{index}");
+            let grant_id = pubkey(80 + index as u8);
+            sessions.insert(session_id);
+            turns.push(turn_id.clone());
+            coordinator
+                .meetings
+                .insert(session_id, MeetingRuntime::new(epoch));
+            coordinator.ensure_meeting_ledger(session_id);
+            let mut request = granted_turn_request(session_id, &grant_id);
+            request.kind = kind;
+            if kind != MeetingTurnKind::V1Granted {
+                request.grant_event_id = None;
+            }
+            coordinator.in_flight.insert(turn_id.clone(), request);
+            coordinator.in_flight_epochs.insert(turn_id, epoch);
+
+            coordinator.teardown_terminal_session(session_id);
+            assert!(!coordinator.meetings.contains_key(&session_id));
+            assert!(coordinator.ledger_for(session_id).is_none());
+        }
+
+        assert_eq!(
+            coordinator
+                .take_preemptions()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            sessions,
+            "every V1 model turn kind must receive a terminal cancellation signal"
+        );
+        for turn_id in turns {
+            coordinator
+                .handle_turn_result(&turn_id, "late terminal result".to_string(), true)
+                .await;
+        }
+        assert!(coordinator.in_flight.is_empty());
+        assert!(coordinator.in_flight_epochs.is_empty());
+        assert!(coordinator.pending.is_empty());
+        assert!(coordinator.ledger.meetings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarted_and_repeated_ended_registration_is_inert_and_tears_down_again() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let ledger_path = dir.path().join("meeting-v1-ledger.json");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+
+        let mut original = test_coordinator(keys.clone(), ledger_path.clone(), None);
+        assert!(original.register_local(session_id));
+        let first_ended = ended_meeting_view(session_id, &agent_pubkey, &other_pubkey, 2);
+        assert_eq!(
+            original.apply_synced_view(session_id, first_ended),
+            SyncApplyResult::Applied
+        );
+        assert!(!original.meetings.contains_key(&session_id));
+        assert!(original.ledger_for(session_id).is_none());
+        drop(original);
+
+        let durable = load_ledger(&ledger_path).expect("load terminally compacted ledger");
+        assert!(!durable.meetings.contains_key(&session_id.to_string()));
+        let mut restarted = test_coordinator(keys, ledger_path, None);
+        restarted.ledger = durable;
+
+        for state_revision in [2, 3] {
+            assert!(
+                restarted.register_local(session_id),
+                "terminal teardown must allow an idempotent detector re-registration"
+            );
+            assert!(restarted.meetings.contains_key(&session_id));
+            assert!(restarted.ledger_for(session_id).is_some());
+            let protocol_submissions_before = restarted.next_protocol_submission_id;
+            let progress_submissions_before = restarted.next_progress_submission_id;
+            let ended =
+                ended_meeting_view(session_id, &agent_pubkey, &other_pubkey, state_revision);
+            assert_eq!(
+                restarted.apply_synced_view(session_id, ended),
+                SyncApplyResult::Applied
+            );
+            assert!(!restarted.meetings.contains_key(&session_id));
+            assert!(restarted.ledger_for(session_id).is_none());
+            assert!(restarted.pending.is_empty());
+            assert!(restarted.in_flight.is_empty());
+            assert!(restarted.protocol_in_flight.is_empty());
+            assert!(restarted.progress_in_flight.is_empty());
+            assert!(restarted.preemptions.is_empty());
+            assert_eq!(
+                restarted.next_protocol_submission_id, protocol_submissions_before,
+                "an ended registration must not emit a protocol action"
+            );
+            assert_eq!(
+                restarted.next_progress_submission_id, progress_submissions_before,
+                "an ended registration must not emit Progress"
+            );
+
+            let sync_requests_before_tick = restarted.next_sync_request_id;
+            restarted.tick().await;
+            assert_eq!(
+                restarted.next_sync_request_id, sync_requests_before_tick,
+                "repeated terminal teardown must remain absent from periodic sync"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8126,6 +9213,131 @@ mod tests {
             handoff: None,
         });
         assert!(speech_projection_complete(&view));
+    }
+
+    #[tokio::test]
+    async fn directed_speech_before_state_acks_offer_without_duplicate_voluntary_intent() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let speech_id = pubkey(24);
+        let offer_id = pubkey(25);
+        let (rest, mut request_started, release, server) =
+            gated_rest_responding_to(keys.clone(), 1).await;
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        coordinator.rest = rest;
+
+        let mut initial = meeting_view(session_id, &agent_pubkey, &other_pubkey);
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, initial.clone()));
+        coordinator.ensure_meeting_ledger(session_id);
+        let ledger = coordinator
+            .ledger_for_mut(session_id)
+            .expect("test Meeting ledger");
+        ledger.meeting_synced = true;
+        ledger.triggers.clear();
+
+        let directed_speech = Speech {
+            event_id: speech_id.clone(),
+            author_pubkey: other_pubkey.clone(),
+            author_display_name: "Human".to_string(),
+            content: "Please review this result.".to_string(),
+            created_at: 1,
+            speech_revision: 1,
+            grant_id: pubkey(26),
+            mentions: vec![agent_pubkey.clone()],
+            handoff: Some(SpeechHandoff {
+                target_pubkey: agent_pubkey.clone(),
+                handoff_type: "review".to_string(),
+                reason: "Confirm the evidence.".to_string(),
+            }),
+        };
+
+        // The canonical speech can fan out before the Relay-signed State that
+        // atomically creates its directed-Handoff Offer.
+        initial.speeches.push(directed_speech);
+        initial.speech_cursor = Some(speech_id.clone());
+        coordinator.apply_view_to_ledger(&initial);
+        let ledger = coordinator
+            .ledger_for(session_id)
+            .expect("ledger before authoritative State");
+        assert!(!ledger.seen_speech_ids.contains(&speech_id));
+        assert!(!ledger.triggers.contains_key(&format!("speech:{speech_id}")));
+
+        let mut authoritative = initial;
+        authoritative.baton.phase = "offered".to_string();
+        authoritative.baton.state_revision = 2;
+        authoritative.baton.speech_revision = 1;
+        authoritative.baton.offer = Some(OfferView {
+            offer_id: offer_id.clone(),
+            target_pubkey: agent_pubkey.clone(),
+            target_participant_type: "agent".to_string(),
+            allocation_source: "directed_handoff".to_string(),
+            turn_role: "participant".to_string(),
+            source_intent_id: None,
+            source_request_id: None,
+            source_handoff_id: Some(speech_id.clone()),
+            source_speech_event_id: Some(speech_id.clone()),
+            handoff_context: Some(HandoffContextView {
+                from_pubkey: other_pubkey.clone(),
+                reason_type: "review".to_string(),
+                reason_text: "Confirm the evidence.".to_string(),
+            }),
+            created_at_ms: now_ms(),
+            ack_deadline_ms: now_ms() + 30_000,
+        });
+        authoritative.baton.unresolved_handoffs = vec![OpenHandoffView {
+            handoff_id: speech_id.clone(),
+            source_speech_event_id: speech_id.clone(),
+            from_pubkey: other_pubkey,
+            to_pubkey: agent_pubkey,
+            reason_type: "review".to_string(),
+            reason_text: "Confirm the evidence.".to_string(),
+            question_state: "open".to_string(),
+            attempt_count: 1,
+            last_offer_id: Some(offer_id.clone()),
+            last_grant_id: None,
+            last_attempt_outcome: Some("offered".to_string()),
+            blocked_by: None,
+        }];
+        coordinator
+            .meetings
+            .get_mut(&session_id)
+            .expect("registered Meeting runtime")
+            .view = Some(authoritative.clone());
+        coordinator.apply_view_to_ledger(&authoritative);
+        coordinator.reconcile(session_id).await;
+
+        tokio::time::timeout(Duration::from_secs(1), request_started.recv())
+            .await
+            .expect("deterministic ACK submission must start")
+            .expect("ACK submission observer remains open");
+        let ledger = coordinator
+            .ledger_for(session_id)
+            .expect("ledger after authoritative State");
+        assert!(ledger.seen_speech_ids.contains(&speech_id));
+        assert!(!ledger.triggers.contains_key(&format!("speech:{speech_id}")));
+        assert!(!ledger
+            .triggers
+            .contains_key(&format!("handoff:{speech_id}")));
+        assert_eq!(
+            reservation_state(&coordinator, session_id, &offer_id),
+            Some("ack_prepared")
+        );
+        assert!(
+            coordinator
+                .pending
+                .iter()
+                .all(|request| request.kind != MeetingTurnKind::V1Intent),
+            "the directed speech must produce an ACK, never a duplicate voluntary Intent"
+        );
+
+        release.send(true).expect("release ACK response");
+        server.await.expect("join ACK responder");
     }
 
     #[test]
@@ -8937,6 +10149,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_moderator_prepares_agenda_while_another_participant_has_the_grant() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let moderator_pubkey = keys.public_key().to_hex();
+        let speaker_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let mut view = meeting_view(session_id, &moderator_pubkey, &speaker_pubkey);
+        view.baton.moderator_pubkey = moderator_pubkey.clone();
+        view.baton.raw_state["moderator_pubkey"] = json!(moderator_pubkey);
+        view.baton.phase = "granted".to_string();
+        view.baton.intent_revision = 1;
+        view.baton.pending_intents = vec![PendingIntentView {
+            intent_id: pubkey(105),
+            current_event_id: pubkey(106),
+            author_pubkey: speaker_pubkey.clone(),
+            basis_speech_revision: 0,
+            summary: "Review this contribution next.".to_string(),
+            addressed_to: None,
+            created_at_ms: now_ms(),
+            deferred: false,
+            selection_attempt_count: 0,
+            last_offer_id: None,
+            last_attempt_outcome: None,
+        }];
+        view.baton.grant = Some(GrantView {
+            grant_id: pubkey(107),
+            holder_pubkey: speaker_pubkey,
+            allocation_source: "moderator_select".to_string(),
+            turn_role: "participant".to_string(),
+            source_offer_id: pubkey(108),
+            source_intent_id: Some(pubkey(109)),
+            source_request_id: None,
+            source_handoff_id: None,
+            source_speech_event_id: None,
+            handoff_context: None,
+            basis_speech_revision: 0,
+            soft_lease_expires_at_ms: now_ms() + 60_000,
+            hard_deadline_ms: now_ms() + 300_000,
+            progress_seq: 0,
+        });
+
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view.clone()));
+        coordinator.apply_view_to_ledger(&view);
+        coordinator.reconcile(session_id).await;
+
+        assert_eq!(coordinator.pending.len(), 1);
+        assert_eq!(
+            coordinator.pending.front().map(|request| request.kind),
+            Some(MeetingTurnKind::V1ModeratorAgenda)
+        );
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_agenda.as_ref())
+                .map(|agenda| agenda.state.as_str()),
+            Some("preparing")
+        );
+        assert!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_agenda.as_ref())
+                .is_some_and(|agenda| agenda.active_grant_id.is_some()),
+            "the prepared agenda must remember the Grant it was planned alongside"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_moderator_idle_still_queues_a_control_decision() {
         let dir = tempfile::tempdir().expect("temp ledger directory");
         let keys = Keys::generate();
@@ -9232,6 +10515,48 @@ mod tests {
         assert!(reservation.ack_event.is_some());
         assert!(reservation.decline_event.is_none());
         assert!(coordinator.preemptions.contains(&session_id));
+    }
+
+    #[tokio::test]
+    async fn offer_ack_reclaims_a_slot_from_external_v0_intent() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let agent_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let v0_session_id = Uuid::new_v4();
+        let offer_id = pubkey(110);
+        let mut view = meeting_view(session_id, &agent_pubkey, &other_pubkey);
+        view.baton.phase = "offered".to_string();
+        view.baton.offer = Some(OfferView {
+            offer_id: offer_id.clone(),
+            target_pubkey: agent_pubkey,
+            target_participant_type: "agent".to_string(),
+            allocation_source: "moderator_select".to_string(),
+            turn_role: "participant".to_string(),
+            source_intent_id: Some(pubkey(111)),
+            source_request_id: None,
+            source_handoff_id: None,
+            source_speech_event_id: None,
+            handoff_context: None,
+            created_at_ms: now_ms(),
+            ack_deadline_ms: now_ms() + 60_000,
+        });
+
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        coordinator.available_agent_slots = 0;
+        coordinator.set_external_reclaimable_turns(BTreeSet::from([v0_session_id]));
+        coordinator.apply_view_to_ledger(&view);
+
+        assert!(coordinator.handle_offer(session_id, &view).await);
+        let reservation = coordinator
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.reservations.get(&offer_id))
+            .expect("prepared Offer response");
+        assert_eq!(reservation.state, "ack_prepared");
+        assert!(reservation.ack_event.is_some());
+        assert_eq!(coordinator.take_preemptions(), vec![v0_session_id]);
     }
 
     #[tokio::test]

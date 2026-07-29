@@ -536,7 +536,7 @@ async fn meeting_floor_is_unique_grant_bound_recoverable_and_shared() {
         .sign_with_keys(winner)
         .expect("sign kind 40002");
     let (status, body) = post_event(winner, &v2).await;
-    assert_rejected(status, &body, "not part of the Meeting V0 canonical log");
+    assert_rejected(status, &body, "not part of the canonical Meeting log");
 
     let mention = non_winner.public_key().to_hex();
     let speech = buzz_sdk::build_meeting_speech(

@@ -1,6 +1,6 @@
 # Meeting V1 后端实现设计
 
-> 状态：后端实现设计 V1；阶段一、阶段二、阶段三、阶段四已交付，阶段五待实施
+> 状态：后端实现设计 V1；阶段一至阶段五已交付，Meeting V1 后端交付完成
 >
 > 前置概念设计：[Meeting V1：主持式发言权接力协议](./meeting-v1.md)
 >
@@ -2470,6 +2470,10 @@ meeting_granted_speech_prompt.md
     和 ACK Handoff Offer；
 11. 会议结束后历史完整且只读。
 
+容量与多轮稳定性验收还应覆盖 2 Human + 4 Agent 的协议上限：六个身份各至少完成两次
+发言，第五个 Agent 的加入被明确拒绝；并验证每位参会者最终读取到同一组 Speech 和
+无缺口 State 历史。
+
 ## 18. 可观测性
 
 新增建议 metrics：
@@ -2686,7 +2690,7 @@ speech 不变量和基础幂等测试通过。
 阶段三和阶段四可以在共享同步器、ledger schema 和 Stage 2 协议冻结后部分并行开发；最终
 验收仍以二者集成为准。
 
-### 阶段五：后端综合验收与发布准备
+### 阶段五：后端综合验收与发布准备（已交付）
 
 目标：
 
@@ -2694,7 +2698,7 @@ speech 不变量和基础幂等测试通过。
 
 开发内容：
 
-- 2 Human + 2 Agent 综合场景；
+- 2 Human + 2 Agent 基础综合场景，以及 2 Human + 4 Agent 容量上限多轮场景；
 - 并发边界、故障注入、Relay/ACP 重启和 outbox 重投；
 - 长会议与多 Session 负载；
 - metrics、日志和告警；
@@ -2711,7 +2715,31 @@ speech 不变量和基础幂等测试通过。
 - 已知 deadline 下没有双 Offer、双 Grant、双 speech 或 due-row starvation；
 - 形成后端协议版本说明和前端可依赖的稳定事件契约。
 
-完成此阶段后，Meeting V1 后端才视为交付完成。
+实际收口：
+
+- V0/V1 共用协议中立的运行 Turn 登记、Agent 容量核算和跨协议抢占；
+- 权威 End 会停止 Session 后续调度、取消运行 Turn、清理私密 ledger，并在持久化失败时
+  保留待重试状态；
+- DB 覆盖 ACK/Human、ACK/timeout、SAY/hard deadline、Progress/soft deadline、
+  SAY/End、Human/Human、Moderator/Moderator 和 recovery/recovery 并发矩阵，并按
+  最早 deadline 公平领取 due Session；Agent 目标 Handoff 的 Decline/重新选择和连续
+  五次直接接力上限也由真实 Postgres contract 覆盖；revocation worker 的
+  advance/complete/release 使用 claim-attempt token fencing，过期 worker 不能修改
+  新租约；
+- Relay 提供闭合低基数的 command、recovery、outbox 和 worker error metrics；
+- 2 Human + 2 Agent、2 Human + 4 Agent 共 12 次发言、V0/V1 回归、关闭 Create
+  开关后的 Relay 重启、membership 撤权都进入 `just test-meeting-backend`；容量场景
+  同时验证第五个 Agent 被拒绝、Human 优先、直接 Handoff、主持人恢复和六个身份的
+  完整历史可见性；
+- ACP 验收覆盖 16 个 Session 并发 ACK、1205 个同秒 State 的复合游标分页，以及
+  Grant 期间异步 Intent/Human Request 不阻塞当前发言；额外压力回归覆盖 8 个
+  Session 连续 5 轮共 40 次唯一 Speech，以及 10 个 Agent 身份观察 20 轮共享消息时
+  不重复产生 Intent；
+- 发布、观测、告警与回滚说明见
+  [`meeting-v1-backend-operations.md`](meeting-v1-backend-operations.md)。
+
+完成此阶段后，Meeting V1 后端视为交付完成；Desktop、Web 和 Mobile 仍按约定留待后续
+单独设计与实现。
 
 ## 21. 后端完成后的前端讨论输入
 

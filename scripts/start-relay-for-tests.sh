@@ -7,11 +7,12 @@
 # and polls readiness.
 #
 # Usage:
-#   ./scripts/start-relay-for-tests.sh [--profile <cargo-profile>] [--no-build]
+#   ./scripts/start-relay-for-tests.sh [--profile <cargo-profile>] [--no-build] [--no-schema]
 #
 # Options:
 #   --profile <profile>   Cargo build profile (default: ci)
 #   --no-build            Use existing target/<profile>/ binaries (CI artifact reuse)
+#   --no-schema           Reuse an already-prepared database (Relay restart tests)
 #
 # Exports:
 #   RELAY_URL=ws://localhost:3000
@@ -25,6 +26,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CARGO_PROFILE="${CARGO_PROFILE:-ci}"
 SKIP_BUILD=false
+SKIP_SCHEMA=false
+RELAY_PID_FILE="${BUZZ_TEST_RELAY_PID_FILE:-/tmp/buzz-relay.pid}"
+RELAY_LOG_FILE="${BUZZ_TEST_RELAY_LOG_FILE:-/tmp/buzz-relay.log}"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -36,6 +40,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-build)
       SKIP_BUILD=true
+      shift
+      ;;
+    --no-schema)
+      SKIP_SCHEMA=true
       shift
       ;;
     *)
@@ -86,27 +94,36 @@ wait_healthy "Postgres" "buzz-postgres"
 wait_healthy "Redis" "buzz-redis"
 wait_healthy "MinIO" "buzz-minio"
 
-# ── Apply database schema ────────────────────────────────────────────────────
-
-log "Applying database schema..."
+# This helper owns the local docker-compose Postgres instance. Keep schema,
+# partition attachment, seeding, and Relay startup on one connection tuple;
+# callers may isolate a run by changing only the database name.
 export PGHOST=localhost
 export PGPORT=5432
 export PGUSER=buzz
 export PGPASSWORD=buzz_dev
-export PGDATABASE=buzz
+export PGDATABASE="${BUZZ_TEST_PGDATABASE:-buzz}"
+export DATABASE_URL="postgres://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}"
 
-# Use the already-running docker postgres for desired-state planning instead of
-# downloading an embedded Postgres from Maven Central (transient-fetch flake source).
-export PGSCHEMA_PLAN_HOST=localhost
-export PGSCHEMA_PLAN_PORT=5432
-export PGSCHEMA_PLAN_DB=buzz
-export PGSCHEMA_PLAN_USER=buzz
-export PGSCHEMA_PLAN_PASSWORD=buzz_dev
+# ── Apply database schema ────────────────────────────────────────────────────
 
-./bin/pgschema apply --file schema/schema.sql --auto-approve
-docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
-  psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql
-ok "Schema applied"
+if [[ "${SKIP_SCHEMA}" == "true" ]]; then
+  log "Skipping database schema (--no-schema); reusing ${PGDATABASE}"
+else
+  log "Applying database schema..."
+
+  # Use the already-running docker postgres for desired-state planning instead of
+  # downloading an embedded Postgres from Maven Central (transient-fetch flake source).
+  export PGSCHEMA_PLAN_HOST="${PGHOST}"
+  export PGSCHEMA_PLAN_PORT="${PGPORT}"
+  export PGSCHEMA_PLAN_DB="${PGDATABASE}"
+  export PGSCHEMA_PLAN_USER="${PGUSER}"
+  export PGSCHEMA_PLAN_PASSWORD="${PGPASSWORD}"
+
+  ./bin/pgschema apply --file schema/schema.sql --auto-approve
+  docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
+    psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql
+  ok "Schema applied"
+fi
 
 # ── Seed the deployment community ────────────────────────────────────────────
 # Multi-tenant: the relay resolves every connection's tenant from the durable
@@ -152,23 +169,23 @@ fi
 
 log "Starting relay..."
 nohup env \
-  DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz \
-  REDIS_URL=redis://localhost:6379 \
+  DATABASE_URL="${DATABASE_URL}" \
+  REDIS_URL="${REDIS_URL:-redis://localhost:6379}" \
   RELAY_URL=ws://localhost:3000 \
   BUZZ_BIND_ADDR=0.0.0.0:3000 \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \
   BUZZ_GIT_PROBE_WRITERS=8 \
-  "./target/${CARGO_PROFILE}/buzz-relay" > /tmp/buzz-relay.log 2>&1 &
-echo $! > /tmp/buzz-relay.pid
+  "./target/${CARGO_PROFILE}/buzz-relay" > "${RELAY_LOG_FILE}" 2>&1 &
+echo $! > "${RELAY_PID_FILE}"
 
 # ── Poll readiness ───────────────────────────────────────────────────────────
 
 log "Waiting for relay readiness..."
 for attempt in $(seq 1 60); do
-  if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
+  if ! kill -0 "$(<"${RELAY_PID_FILE}")" 2>/dev/null; then
     err "Relay process died"
-    cat /tmp/buzz-relay.log
+    cat "${RELAY_LOG_FILE}"
     exit 1
   fi
   status_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/_readiness || true)
@@ -181,5 +198,5 @@ for attempt in $(seq 1 60); do
 done
 
 err "Relay did not become ready within 60s"
-cat /tmp/buzz-relay.log
+cat "${RELAY_LOG_FILE}"
 exit 1

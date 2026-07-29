@@ -317,6 +317,13 @@ struct FinishedV0TurnCompletion {
     status: V0TurnCompletionStatus,
 }
 
+#[derive(Debug, Clone)]
+struct RunningMeetingTurn {
+    request: MeetingTurnRequest,
+    cancellation_requested: bool,
+    v0_grant_capacity_credit: bool,
+}
+
 /// Per-process protocol-neutral coordinator for every visible Meeting room.
 ///
 /// Registration probes the Relay-signed State once, then delegates the room to
@@ -327,7 +334,8 @@ pub(crate) struct MeetingCoordinator {
     v0: Option<V0MeetingCoordinator>,
     v0_keys: Keys,
     v0_observer: Option<ObserverHandle>,
-    v0_turns: HashMap<String, Uuid>,
+    running_turns: HashMap<String, RunningMeetingTurn>,
+    available_agent_slots: usize,
     v0_completion_queue: VecDeque<PendingV0TurnCompletion>,
     v0_completion_task: Option<tokio::task::JoinHandle<FinishedV0TurnCompletion>>,
     v0_deferred_requeues: VecDeque<MeetingTurnRequest>,
@@ -363,7 +371,8 @@ impl MeetingCoordinator {
             )),
             v0_keys: keys.clone(),
             v0_observer: observer.clone(),
-            v0_turns: HashMap::new(),
+            running_turns: HashMap::new(),
+            available_agent_slots: agent_capacity,
             v0_completion_queue: VecDeque::new(),
             v0_completion_task: None,
             v0_deferred_requeues: VecDeque::new(),
@@ -421,9 +430,24 @@ impl MeetingCoordinator {
 
     pub(crate) fn mark_dispatched(&mut self, turn_id: String, request: MeetingTurnRequest) {
         if request.kind.is_v1() {
+            self.running_turns.insert(
+                turn_id.clone(),
+                RunningMeetingTurn {
+                    request: request.clone(),
+                    cancellation_requested: false,
+                    v0_grant_capacity_credit: false,
+                },
+            );
             self.v1.mark_dispatched(turn_id, request);
         } else if let Some(v0) = self.v0.as_mut() {
-            self.v0_turns.insert(turn_id.clone(), request.session_id);
+            self.running_turns.insert(
+                turn_id.clone(),
+                RunningMeetingTurn {
+                    request: request.clone(),
+                    cancellation_requested: false,
+                    v0_grant_capacity_credit: false,
+                },
+            );
             v0.mark_dispatched(turn_id, request);
         } else {
             tracing::error!(
@@ -433,10 +457,11 @@ impl MeetingCoordinator {
             );
             self.v0_deferred_requeues.push_front(request);
         }
+        self.refresh_v1_external_reclaimable_turns();
     }
 
     pub(crate) fn owns_turn(&self, turn_id: &str) -> bool {
-        self.v1.owns_turn(turn_id) || self.v0_turns.contains_key(turn_id)
+        self.running_turns.contains_key(turn_id)
     }
 
     pub(crate) async fn register(&mut self, session_id: Uuid) {
@@ -498,6 +523,7 @@ impl MeetingCoordinator {
             }
             return;
         }
+        self.refresh_v1_external_reclaimable_turns();
         match self.protocols.get(&event.channel_id) {
             Some(RegisteredMeetingProtocol::UniformV0) => {
                 if let Some(v0) = self.v0.as_mut() {
@@ -524,6 +550,7 @@ impl MeetingCoordinator {
 
     pub(crate) async fn tick(&mut self) {
         // V1 lease maintenance always runs before best-effort legacy recovery.
+        self.refresh_v1_external_reclaimable_turns();
         self.v1.tick().await;
         self.drain_v0_completion().await;
         self.drain_detection_results().await;
@@ -544,18 +571,23 @@ impl MeetingCoordinator {
         raw_output: String,
         succeeded: bool,
     ) {
-        if self.v1.owns_turn(turn_id) {
+        let Some(running) = self.running_turns.remove(turn_id) else {
+            return;
+        };
+        self.refresh_v1_external_reclaimable_turns();
+        if running.request.kind.is_v1() {
+            debug_assert!(
+                self.v1.owns_turn(turn_id),
+                "protocol-neutral V1 ownership diverged from the V1 controller"
+            );
             self.v1
                 .handle_turn_result(turn_id, raw_output, succeeded)
                 .await;
             return;
         }
-        let Some(session_id) = self.v0_turns.remove(turn_id) else {
-            return;
-        };
         self.v0_completion_queue.push_back(PendingV0TurnCompletion {
             turn_id: turn_id.to_string(),
-            session_id,
+            session_id: running.request.session_id,
             raw_output,
             succeeded,
         });
@@ -566,18 +598,124 @@ impl MeetingCoordinator {
         self.handle_turn_result(turn_id, String::new(), false).await;
     }
 
-    /// Drain sessions whose lower-priority V1 Intent turn should be cancelled
-    /// after an Offer/Grant arrived. The main loop owns the Agent pool and
-    /// performs the actual control-signal send.
+    /// Drain protocol-neutral running turns that should be cancelled.
+    ///
+    /// V1 supplies preemptions required by a deterministic Offer ACK. A queued
+    /// V0 Grant additionally preempts running V1 planning work. Granted turns
+    /// are never selected by this cross-protocol priority path.
     pub(crate) fn take_preemptions(&mut self) -> Vec<Uuid> {
-        self.v1.take_preemptions()
+        let mut ready = BTreeSet::new();
+        for session_id in self.v1.take_preemptions() {
+            if self.mark_running_turn_for_cancellation(session_id, None, false) {
+                ready.insert(session_id);
+            }
+        }
+
+        let pending_v0_grants = self.v0.as_ref().map_or(0, |v0| {
+            v0.pending
+                .iter()
+                .filter(|request| request.kind == MeetingTurnKind::V0Granted)
+                .count()
+        });
+        let ordinary_idle = self
+            .available_agent_slots
+            .saturating_sub(self.v1.unassigned_reserved_slots());
+        let cancellation_credit = self
+            .running_turns
+            .values()
+            .filter(|running| {
+                running.cancellation_requested
+                    && running.v0_grant_capacity_credit
+                    && matches!(
+                        running.request.kind,
+                        MeetingTurnKind::V1Intent
+                            | MeetingTurnKind::V1ModeratorAgenda
+                            | MeetingTurnKind::V1ModeratorControl
+                    )
+            })
+            .count();
+        let required =
+            pending_v0_grants.saturating_sub(ordinary_idle.saturating_add(cancellation_credit));
+        let mut candidates: Vec<_> = self
+            .running_turns
+            .values()
+            .filter(|running| {
+                !running.cancellation_requested
+                    && matches!(
+                        running.request.kind,
+                        MeetingTurnKind::V1Intent
+                            | MeetingTurnKind::V1ModeratorAgenda
+                            | MeetingTurnKind::V1ModeratorControl
+                    )
+            })
+            .map(|running| {
+                (
+                    match running.request.kind {
+                        MeetingTurnKind::V1Intent => 0,
+                        MeetingTurnKind::V1ModeratorAgenda
+                        | MeetingTurnKind::V1ModeratorControl => 1,
+                        _ => 2,
+                    },
+                    running.request.session_id,
+                )
+            })
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup_by_key(|(_, session_id)| *session_id);
+        for (_, session_id) in candidates.into_iter().take(required) {
+            self.v1.mark_cross_protocol_preempted(session_id);
+            if self.mark_running_turn_for_cancellation(
+                session_id,
+                Some(&[
+                    MeetingTurnKind::V1Intent,
+                    MeetingTurnKind::V1ModeratorAgenda,
+                    MeetingTurnKind::V1ModeratorControl,
+                ]),
+                true,
+            ) {
+                ready.insert(session_id);
+            }
+        }
+        ready.into_iter().collect()
     }
 
     /// Update the physical Agent slots currently available for a deterministic
     /// V1 Offer decision. Durable Meeting reservations are accounted for by the
     /// V1 controller separately.
     pub(crate) fn set_available_agent_slots(&mut self, available: usize) {
+        self.available_agent_slots = available;
+        self.refresh_v1_external_reclaimable_turns();
         self.v1.set_available_agent_slots(available);
+    }
+
+    fn refresh_v1_external_reclaimable_turns(&mut self) {
+        let sessions = self
+            .running_turns
+            .values()
+            .filter(|running| running.request.kind == MeetingTurnKind::V0Intent)
+            .map(|running| running.request.session_id)
+            .collect();
+        self.v1.set_external_reclaimable_turns(sessions);
+    }
+
+    fn mark_running_turn_for_cancellation(
+        &mut self,
+        session_id: Uuid,
+        allowed_kinds: Option<&[MeetingTurnKind]>,
+        v0_grant_capacity_credit: bool,
+    ) -> bool {
+        let Some(running) = self.running_turns.values_mut().find(|running| {
+            running.request.session_id == session_id
+                && allowed_kinds.is_none_or(|allowed| allowed.contains(&running.request.kind))
+        }) else {
+            return false;
+        };
+        if running.cancellation_requested {
+            return false;
+        }
+        running.cancellation_requested = true;
+        running.v0_grant_capacity_credit = v0_grant_capacity_credit;
+        true
     }
 
     /// Physical Agent slots that ordinary queue dispatch must leave available
@@ -3033,8 +3171,176 @@ fn short_pubkey(pubkey: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::Tag;
+    use nostr::{Tag, Timestamp};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_test_http_json(
+        socket: &mut tokio::net::TcpStream,
+    ) -> (String, serde_json::Value) {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 8 * 1024];
+            let bytes_read = socket
+                .read(&mut chunk)
+                .await
+                .expect("read test HTTP request");
+            assert!(bytes_read > 0, "test HTTP request closed before its body");
+            request.extend_from_slice(&chunk[..bytes_read]);
+            assert!(
+                request.len() <= 1024 * 1024,
+                "test HTTP request exceeded one MiB"
+            );
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers =
+                std::str::from_utf8(&request[..header_end]).expect("test HTTP headers are UTF-8");
+            let request_line = headers
+                .lines()
+                .next()
+                .expect("test HTTP request line")
+                .to_string();
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("test HTTP Content-Length");
+            let body_start = header_end + 4;
+            if request.len() < body_start + content_length {
+                continue;
+            }
+            let body = serde_json::from_slice(&request[body_start..body_start + content_length])
+                .expect("parse test HTTP JSON body");
+            return (request_line, body);
+        }
+    }
+
+    async fn write_test_http_json(
+        socket: &mut tokio::net::TcpStream,
+        status: &str,
+        body: &serde_json::Value,
+    ) {
+        let body = serde_json::to_vec(body).expect("serialize test HTTP response");
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write test HTTP response headers");
+        socket
+            .write_all(&body)
+            .await
+            .expect("write test HTTP response body");
+    }
+
+    fn history_cursor_start(
+        filter: &serde_json::Value,
+        rows: &[serde_json::Value],
+    ) -> Option<usize> {
+        let until = filter.get("until").filter(|value| !value.is_null());
+        let before_id = filter.get("before_id").filter(|value| !value.is_null());
+        match (until, before_id) {
+            (None, None) => Some(0),
+            (Some(until), Some(before_id)) => {
+                let until = until.as_u64()?;
+                let before_id = before_id.as_str()?;
+                Some(
+                    rows.iter()
+                        .position(|event| {
+                            let created_at = event.get("created_at").and_then(Value::as_u64);
+                            let event_id = event.get("id").and_then(Value::as_str);
+                            created_at.is_some_and(|created_at| {
+                                created_at < until
+                                    || (created_at == until
+                                        && event_id.is_some_and(|event_id| event_id > before_id))
+                            })
+                        })
+                        .unwrap_or(rows.len()),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    async fn paginated_history_rest(
+        events: &[Event],
+    ) -> (RestClient, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind paginated history HTTP bridge");
+        let address = listener
+            .local_addr()
+            .expect("read paginated history HTTP address");
+        let rows: Vec<_> = events
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("serialize signed history event"))
+            .collect();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut expected_start = 0;
+            loop {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept paginated history HTTP request");
+                let (request_line, body) = read_test_http_json(&mut socket).await;
+                let filter = body
+                    .as_array()
+                    .filter(|filters| filters.len() == 1)
+                    .and_then(|filters| filters.first())
+                    .cloned();
+                let Some(filter) = filter else {
+                    write_test_http_json(
+                        &mut socket,
+                        "400 Bad Request",
+                        &json!({ "error": "expected exactly one filter" }),
+                    )
+                    .await;
+                    break;
+                };
+                requests.push(filter.clone());
+                let start = history_cursor_start(&filter, &rows);
+                if !request_line.starts_with("POST /query ")
+                    || start != Some(expected_start)
+                    || filter.get("limit").and_then(Value::as_u64) != Some(HISTORY_PAGE_SIZE as u64)
+                {
+                    write_test_http_json(
+                        &mut socket,
+                        "400 Bad Request",
+                        &json!({ "error": "invalid or non-advancing history cursor" }),
+                    )
+                    .await;
+                    break;
+                }
+
+                let end = (expected_start + HISTORY_PAGE_SIZE).min(rows.len());
+                let page = serde_json::Value::Array(rows[expected_start..end].to_vec());
+                write_test_http_json(&mut socket, "200 OK", &page).await;
+                let page_len = end - expected_start;
+                expected_start = end;
+                if page_len < HISTORY_PAGE_SIZE {
+                    break;
+                }
+            }
+            requests
+        });
+        (
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: format!("http://{address}"),
+                keys: Keys::generate(),
+                auth_tag_json: None,
+            },
+            server,
+        )
+    }
 
     async fn gated_rest_responder(
         keys: Keys,
@@ -3115,6 +3421,26 @@ mod tests {
         }
     }
 
+    fn test_turn_request(session_id: Uuid, kind: MeetingTurnKind) -> MeetingTurnRequest {
+        MeetingTurnRequest {
+            session_id,
+            prompt: "test cross-protocol turn".to_string(),
+            hard_deadline_unix_ms: now_ms() + 60_000,
+            kind,
+            format_retry: false,
+            basis_id: format!("{kind:?}:{session_id}"),
+            round_number: 1,
+            speech_cursor: None,
+            floor_revision: 1,
+            grant_event_id: matches!(
+                kind,
+                MeetingTurnKind::V0Granted | MeetingTurnKind::V1Granted
+            )
+            .then(|| "a".repeat(64)),
+            queued_at_unix_ms: now_ms(),
+        }
+    }
+
     fn signed_meeting_metadata(keys: &Keys, session_id: Uuid) -> Event {
         let session = session_id.to_string();
         let event = EventBuilder::new(
@@ -3167,12 +3493,214 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fetch_meeting_history_paginates_dense_long_state_chain_without_gaps_or_duplicates() {
+        const EVENT_COUNT: usize = HISTORY_PAGE_SIZE * 2 + 205;
+        const DENSE_CREATED_AT: u64 = 1_750_000_000;
+
+        let signing_keys = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let session = session_id.to_string();
+        let h_tag = Tag::parse(["h", session.as_str()]).expect("history h tag");
+        let mut expected = Vec::with_capacity(EVENT_COUNT);
+        for index in 0..EVENT_COUNT {
+            let state_revision = index + 1;
+            let state_revision_tag = state_revision.to_string();
+            expected.push(
+                EventBuilder::new(
+                    Kind::Custom(KIND_MEETING_ROUND_STATE as u16),
+                    json!({
+                        "phase": if state_revision == EVENT_COUNT {
+                            "moderator_idle"
+                        } else {
+                            "granted"
+                        },
+                        "state_revision": state_revision,
+                    })
+                    .to_string(),
+                )
+                .tags([
+                    h_tag.clone(),
+                    Tag::parse(["v", "2"]).expect("history version tag"),
+                    Tag::parse(["policy", "moderated-baton-v1"]).expect("history policy tag"),
+                    Tag::parse(["state-revision", state_revision_tag.as_str()])
+                        .expect("history State revision tag"),
+                ])
+                .custom_created_at(Timestamp::from(DENSE_CREATED_AT))
+                .sign_with_keys(&signing_keys)
+                .expect("sign dense Meeting State"),
+            );
+        }
+        expected.sort_by(|left, right| {
+            right
+                .created_at
+                .as_secs()
+                .cmp(&left.created_at.as_secs())
+                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+        });
+        let expected_ids: Vec<_> = expected.iter().map(|event| event.id.to_hex()).collect();
+
+        let (rest, server) = paginated_history_rest(&expected).await;
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_MEETING_ROUND_STATE as u16))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [session.as_str()]);
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(20),
+            fetch_meeting_history(&rest, filter),
+        )
+        .await
+        .expect("long meeting history pagination timed out")
+        .expect("fetch long meeting history");
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("paginated history server timed out")
+            .expect("join paginated history server");
+
+        let fetched_ids: Vec<_> = fetched.iter().map(|event| event.id.to_hex()).collect();
+        assert_eq!(fetched_ids, expected_ids, "history must have no gaps");
+        assert_eq!(fetched.len(), EVENT_COUNT);
+        assert_eq!(
+            fetched_ids.iter().cloned().collect::<BTreeSet<_>>().len(),
+            EVENT_COUNT,
+            "history must return every event exactly once"
+        );
+        let revisions: BTreeSet<u64> = fetched
+            .iter()
+            .map(|event| {
+                serde_json::from_str::<Value>(&event.content)
+                    .expect("parse dense Meeting State content")["state_revision"]
+                    .as_u64()
+                    .expect("dense Meeting State revision")
+            })
+            .collect();
+        assert_eq!(revisions.len(), EVENT_COUNT);
+        assert_eq!(revisions.first(), Some(&1));
+        assert_eq!(
+            revisions.last(),
+            Some(&(EVENT_COUNT as u64)),
+            "the paginated history must converge on the final State revision"
+        );
+
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(
+                request.get("limit").and_then(Value::as_u64),
+                Some(HISTORY_PAGE_SIZE as u64)
+            );
+        }
+        assert!(requests[0].get("until").is_none());
+        assert!(requests[0].get("before_id").is_none());
+        for (page_index, boundary_index) in [(1, 499), (2, 999)] {
+            assert_eq!(
+                requests[page_index].get("until").and_then(Value::as_u64),
+                Some(DENSE_CREATED_AT)
+            );
+            assert_eq!(
+                requests[page_index]
+                    .get("before_id")
+                    .and_then(Value::as_str),
+                Some(expected_ids[boundary_index].as_str())
+            );
+        }
+        assert_eq!(
+            requests[1].get("until"),
+            requests[2].get("until"),
+            "equal-timestamp pages must retain the timestamp cursor"
+        );
+        assert_ne!(
+            requests[1].get("before_id"),
+            requests[2].get("before_id"),
+            "before_id must advance within a dense timestamp"
+        );
+    }
+
     #[test]
     fn moderator_turn_kinds_route_to_the_v1_controller() {
         assert!(MeetingTurnKind::V1ModeratorAgenda.is_v1());
         assert!(MeetingTurnKind::V1ModeratorControl.is_v1());
         assert!(!MeetingTurnKind::V0Intent.is_v1());
         assert!(!MeetingTurnKind::V0Granted.is_v1());
+    }
+
+    #[test]
+    fn queued_v0_grants_preempt_v1_lower_priority_turns_but_never_granted() {
+        let keys = Keys::generate();
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            keys: keys.clone(),
+            auth_tag_json: None,
+        };
+        let mut coordinator = MeetingCoordinator::new(rest, keys, None, 4);
+        coordinator.available_agent_slots = 0;
+
+        let v1_intent_session = Uuid::new_v4();
+        let v1_moderator_session = Uuid::new_v4();
+        let v1_granted_session = Uuid::new_v4();
+        let v0_granted_session = Uuid::new_v4();
+        for (turn_id, request) in [
+            (
+                "v1-intent-running",
+                test_turn_request(v1_intent_session, MeetingTurnKind::V1Intent),
+            ),
+            (
+                "v1-moderator-running",
+                test_turn_request(v1_moderator_session, MeetingTurnKind::V1ModeratorControl),
+            ),
+            (
+                "v1-granted-running",
+                test_turn_request(v1_granted_session, MeetingTurnKind::V1Granted),
+            ),
+            (
+                "v0-granted-running",
+                test_turn_request(v0_granted_session, MeetingTurnKind::V0Granted),
+            ),
+        ] {
+            coordinator.running_turns.insert(
+                turn_id.to_string(),
+                RunningMeetingTurn {
+                    request,
+                    cancellation_requested: false,
+                    v0_grant_capacity_credit: false,
+                },
+            );
+        }
+        let v0 = coordinator.v0.as_mut().expect("V0 controller");
+        v0.pending.push_back(test_turn_request(
+            Uuid::new_v4(),
+            MeetingTurnKind::V0Granted,
+        ));
+        v0.pending.push_back(test_turn_request(
+            Uuid::new_v4(),
+            MeetingTurnKind::V0Granted,
+        ));
+
+        let preemptions: BTreeSet<_> = coordinator.take_preemptions().into_iter().collect();
+        assert_eq!(
+            preemptions,
+            BTreeSet::from([v1_intent_session, v1_moderator_session])
+        );
+        assert!(coordinator
+            .running_turns
+            .values()
+            .find(|running| running.request.session_id == v1_intent_session)
+            .is_some_and(|running| running.cancellation_requested));
+        assert!(coordinator
+            .running_turns
+            .values()
+            .find(|running| running.request.session_id == v1_moderator_session)
+            .is_some_and(|running| running.cancellation_requested));
+        for granted_session in [v1_granted_session, v0_granted_session] {
+            assert!(coordinator
+                .running_turns
+                .values()
+                .find(|running| running.request.session_id == granted_session)
+                .is_some_and(|running| !running.cancellation_requested));
+        }
+        assert!(
+            coordinator.take_preemptions().is_empty(),
+            "already-requested cancellations provide capacity credit without duplicate signals"
+        );
     }
 
     #[test]

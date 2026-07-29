@@ -331,6 +331,8 @@ pub struct BatonDueSession {
     pub community_id: CommunityId,
     /// Meeting Session UUID.
     pub session_id: Uuid,
+    /// Database deadline that made this Session eligible for recovery.
+    pub next_action_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -2922,7 +2924,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
                AND s.session_id = due.session_id \
              RETURNING s.community_id, s.session_id, s.next_action_at \
          ) \
-         SELECT community_id, session_id \
+         SELECT community_id, session_id, next_action_at \
          FROM claimed \
          ORDER BY next_action_at, community_id, session_id",
     )
@@ -2935,6 +2937,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
             Ok(BatonDueSession {
                 community_id: CommunityId::from_uuid(row.try_get("community_id")?),
                 session_id: row.try_get("session_id")?,
+                next_action_at: row.try_get("next_action_at")?,
             })
         })
         .collect()
@@ -6046,7 +6049,7 @@ mod tests {
         }
     }
 
-    async fn latest_transition(meeting: &TestMeeting) -> Value {
+    async fn latest_state_content(meeting: &TestMeeting) -> Value {
         let content: String = sqlx::query_scalar(
             "SELECT e.content \
              FROM meeting_baton_state s \
@@ -6060,8 +6063,10 @@ mod tests {
         .await
         .expect("load latest authoritative State content");
         serde_json::from_str::<Value>(&content).expect("parse latest authoritative State")
-            ["transition"]
-            .clone()
+    }
+
+    async fn latest_transition(meeting: &TestMeeting) -> Value {
+        latest_state_content(meeting).await["transition"].clone()
     }
 
     async fn assert_command_not_persisted(meeting: &TestMeeting, event: &Event) {
@@ -6082,6 +6087,86 @@ mod tests {
             !receipt_exists,
             "unauthorized command must not receive a private receipt"
         );
+    }
+
+    async fn assert_serial_state_and_outbox(meeting: &TestMeeting) -> BatonSnapshot {
+        let snapshot = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load authoritative State after concurrent commands");
+        let current_state_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM meeting_baton_state \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("count current State rows");
+        assert_eq!(
+            current_state_count, 1,
+            "one Session must retain exactly one authoritative State row"
+        );
+
+        let (history_count, min_revision, max_revision, distinct_state_events): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT count(*), min(state_revision), max(state_revision), \
+                    count(DISTINCT state_event_id) \
+             FROM meeting_baton_state_history \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load State revision chain");
+        assert_eq!(min_revision, Some(1));
+        assert_eq!(max_revision, Some(snapshot.state_revision));
+        assert_eq!(
+            history_count, snapshot.state_revision,
+            "State revisions must be gap-free from revision one"
+        );
+        assert_eq!(
+            distinct_state_events, history_count,
+            "each State revision must have one unique signed State event"
+        );
+
+        let state_outbox_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+             FROM meeting_baton_state_history history \
+             JOIN meeting_event_outbox outbox \
+               ON outbox.community_id = history.community_id \
+              AND outbox.session_id = history.session_id \
+              AND outbox.event_id = history.state_event_id \
+             WHERE history.community_id = $1 AND history.session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("count State outbox rows");
+        assert_eq!(
+            state_outbox_count, history_count,
+            "every canonical State must have exactly one outbox row"
+        );
+        let (outbox_count, distinct_outbox_events): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(DISTINCT event_id) \
+             FROM meeting_event_outbox \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("check Meeting outbox uniqueness");
+        assert_eq!(
+            outbox_count, distinct_outbox_events,
+            "concurrent transitions must not duplicate an outbox event"
+        );
+        snapshot
     }
 
     async fn end_test_meeting(meeting: &TestMeeting) -> Value {
@@ -6227,6 +6312,73 @@ mod tests {
         .await
         .expect("ACK test Agent Offer");
         (offer_id, accepted_id(&acked))
+    }
+
+    async fn ack_test_offer(
+        meeting: &TestMeeting,
+        target: &Keys,
+        offer_id: Vec<u8>,
+    ) -> BatonCommitResult {
+        let ack = signed_event(
+            target,
+            buzz_core::kind::KIND_MEETING_OFFER_RESPONSE,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &ack,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::OfferAck { offer_id },
+            },
+        )
+        .await
+        .expect("ACK test Offer")
+    }
+
+    async fn submit_handoff_speech(
+        meeting: &TestMeeting,
+        speaker: &Keys,
+        grant_id: Vec<u8>,
+        speech_revision: i64,
+        target: &Keys,
+        content: &str,
+    ) -> (Event, BatonCommitResult) {
+        let target_pubkey = target.public_key().to_bytes().to_vec();
+        let speech = signed_event(
+            speaker,
+            9,
+            meeting.session_id,
+            content,
+            std::slice::from_ref(&target_pubkey),
+        );
+        let result = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &speech,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::Speech {
+                    grant_id,
+                    speech_revision,
+                    handoff: Some(BatonHandoffInput {
+                        to_pubkey: target_pubkey,
+                        reason_type: "question".to_string(),
+                        reason_text: format!(
+                            "Directed test question at revision {speech_revision}"
+                        ),
+                    }),
+                },
+            },
+        )
+        .await
+        .expect("submit test Directed Handoff speech");
+        (speech, result)
     }
 
     async fn create_recalled_human_offer(
@@ -7393,6 +7545,438 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn directed_handoff_decline_reselect_and_max_depth_chain_are_canonical() {
+        let meeting = create_test_meeting().await;
+        let (_, setup_grant_id) =
+            create_agent_grant(&meeting, "Start the Directed Handoff chain").await;
+        let (_, setup_handoff) = submit_handoff_speech(
+            &meeting,
+            &meeting.agent,
+            setup_grant_id,
+            1,
+            &meeting.human,
+            "Pass the setup turn to the Human",
+        )
+        .await;
+        let setup_offer_id = setup_handoff
+            .snapshot
+            .active_offer_id
+            .expect("setup Handoff creates a Human Offer");
+        let setup_ack = ack_test_offer(&meeting, &meeting.human, setup_offer_id).await;
+        let (initial_speech, initial_handoff) = submit_handoff_speech(
+            &meeting,
+            &meeting.human,
+            accepted_id(&setup_ack),
+            2,
+            &meeting.agent,
+            "Initial question for the Agent",
+        )
+        .await;
+        let initial_handoff_id = initial_speech.id.as_bytes().to_vec();
+        let first_offer_id = initial_handoff
+            .snapshot
+            .active_offer_id
+            .clone()
+            .expect("initial Handoff creates an Offer");
+        assert_eq!(initial_handoff.snapshot.phase, BatonPhase::Offered);
+        let agent_pubkey = hex::encode(meeting.agent.public_key().to_bytes());
+        let initial_state = latest_state_content(&meeting).await;
+        assert_eq!(initial_state["offer"]["target_pubkey"], agent_pubkey);
+        assert_eq!(initial_state["offer"]["target_participant_type"], "agent");
+        let (
+            initial_question_state,
+            initial_attempt_outcome,
+            initial_attempt_count,
+            initial_last_offer_id,
+        ): (String, Option<String>, i32, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT question_state, last_attempt_outcome, attempt_count, last_offer_id \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&initial_handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load initial Directed Handoff attempt");
+        assert_eq!(initial_question_state, "open");
+        assert_eq!(initial_attempt_outcome.as_deref(), Some("offered"));
+        assert_eq!(initial_attempt_count, 1);
+        assert_eq!(
+            initial_last_offer_id.as_deref(),
+            Some(first_offer_id.as_slice())
+        );
+
+        let decline = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_OFFER_RESPONSE,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let declined = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &decline,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::OfferDecline {
+                    offer_id: first_offer_id.clone(),
+                    reason: Some("not ready yet".to_string()),
+                },
+            },
+        )
+        .await
+        .expect("Directed Handoff target declines its Offer");
+        assert!(matches!(
+            declined.snapshot.phase,
+            BatonPhase::ModeratorIdle | BatonPhase::ModeratorControl
+        ));
+        assert!(declined.snapshot.active_offer_id.is_none());
+        assert!(declined.snapshot.active_grant_id.is_none());
+        assert_eq!(declined.snapshot.handoff_depth, 0);
+        let (declined_state, declined_outcome, declined_attempt_count): (
+            String,
+            Option<String>,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT question_state, last_attempt_outcome, attempt_count \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&initial_handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load declined Directed Handoff attempt");
+        assert_eq!(declined_state, "open");
+        assert_eq!(declined_outcome.as_deref(), Some("declined"));
+        assert_eq!(declined_attempt_count, 1);
+        let declined_canonical_state = latest_state_content(&meeting).await;
+        let declined_unresolved = declined_canonical_state["unresolved_handoffs"]
+            .as_array()
+            .expect("declined State unresolved Handoffs");
+        assert_eq!(declined_unresolved.len(), 1);
+        assert_eq!(
+            declined_unresolved[0]["handoff_id"],
+            hex::encode(&initial_handoff_id)
+        );
+        assert_eq!(declined_unresolved[0]["attempt_count"], 1);
+        assert_eq!(declined_unresolved[0]["last_attempt_outcome"], "declined");
+        let decline_transition = &declined_canonical_state["transition"];
+        assert_eq!(decline_transition["primary_type"], "offer_declined");
+        let decline_effects = decline_transition["effects"]
+            .as_array()
+            .expect("decline canonical effects");
+        assert!(decline_effects.iter().any(|effect| {
+            effect["type"] == "offer_declined"
+                && effect["object_id"] == hex::encode(&first_offer_id)
+        }));
+        assert!(decline_effects.iter().any(|effect| {
+            effect["type"] == "handoff_attempt_failed"
+                && effect["object_id"] == hex::encode(&initial_handoff_id)
+        }));
+
+        let reselect_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "retry the open question",
+            &[],
+        );
+        let reselected = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &reselect_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorSelect {
+                    source: BatonSelectionSource::Handoff {
+                        handoff_id: initial_handoff_id.clone(),
+                        expected_attempt_count: 1,
+                    },
+                    expected_control_epoch: declined.snapshot.control_epoch,
+                    expected_decision_epoch: declined.snapshot.decision_epoch,
+                    expected_intent_revision: declined.snapshot.intent_revision,
+                    expected_speech_revision: declined.snapshot.speech_revision,
+                    selection_reason: Some("retry the still-open question".to_string()),
+                    deferrals: Vec::new(),
+                },
+            },
+        )
+        .await
+        .expect("moderator re-selects the declined open Handoff");
+        let second_offer_id = accepted_id(&reselected);
+        assert_ne!(second_offer_id, first_offer_id);
+        assert_eq!(reselected.snapshot.phase, BatonPhase::Offered);
+        assert_eq!(
+            reselected.snapshot.active_offer_id.as_deref(),
+            Some(second_offer_id.as_slice())
+        );
+        let (reselected_attempt_count, reselected_outcome, reselected_last_offer): (
+            i32,
+            Option<String>,
+            Option<Vec<u8>>,
+        ) = sqlx::query_as(
+            "SELECT attempt_count, last_attempt_outcome, last_offer_id \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&initial_handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load re-selected Directed Handoff");
+        assert_eq!(reselected_attempt_count, 2);
+        assert_eq!(reselected_outcome.as_deref(), Some("offered"));
+        assert_eq!(
+            reselected_last_offer.as_deref(),
+            Some(second_offer_id.as_slice())
+        );
+        let reselected_state = latest_state_content(&meeting).await;
+        assert_eq!(
+            reselected_state["offer"]["offer_id"],
+            hex::encode(&second_offer_id)
+        );
+        assert_eq!(
+            reselected_state["offer"]["source_handoff_id"],
+            hex::encode(&initial_handoff_id)
+        );
+        assert_eq!(reselected_state["offer"]["target_pubkey"], agent_pubkey);
+        assert_eq!(
+            reselected_state["offer"]["target_participant_type"],
+            "agent"
+        );
+        let reselect_effects = reselected_state["transition"]["effects"]
+            .as_array()
+            .expect("re-select canonical effects");
+        assert!(reselect_effects.iter().any(|effect| {
+            effect["type"] == "handoff_attempted"
+                && effect["object_id"] == hex::encode(&initial_handoff_id)
+        }));
+        assert!(reselect_effects.iter().any(|effect| {
+            effect["type"] == "offer_created"
+                && effect["object_id"] == hex::encode(&second_offer_id)
+        }));
+
+        let reselected_ack =
+            ack_test_offer(&meeting, &meeting.agent, second_offer_id.clone()).await;
+        let mut grant_id = accepted_id(&reselected_ack);
+        assert_eq!(reselected_ack.snapshot.handoff_depth, 0);
+        assert_eq!(
+            reselected_ack.snapshot.active_grant_id.as_deref(),
+            Some(grant_id.as_slice())
+        );
+        let mut source_handoff_id = initial_handoff_id;
+
+        for hop in 1_i64..=5 {
+            let (speaker, target) = if hop % 2 == 1 {
+                (&meeting.agent, &meeting.human)
+            } else {
+                (&meeting.human, &meeting.agent)
+            };
+            let (speech, handed_off) = submit_handoff_speech(
+                &meeting,
+                speaker,
+                grant_id,
+                hop + 2,
+                target,
+                &format!("Direct Handoff hop {hop}"),
+            )
+            .await;
+            let handoff_id = speech.id.as_bytes().to_vec();
+            let offer_id = handed_off
+                .snapshot
+                .active_offer_id
+                .clone()
+                .expect("each of the first five direct Handoffs creates an Offer");
+            assert_eq!(handed_off.snapshot.phase, BatonPhase::Offered);
+            assert!(handed_off.snapshot.active_grant_id.is_none());
+            let speech_transition = latest_transition(&meeting).await;
+            assert_eq!(speech_transition["primary_type"], "speech_accepted");
+            let speech_effects = speech_transition["effects"]
+                .as_array()
+                .expect("direct Handoff speech effects");
+            assert!(speech_effects.iter().any(|effect| {
+                effect["type"] == "handoff_answered"
+                    && effect["object_id"] == hex::encode(&source_handoff_id)
+            }));
+            assert!(speech_effects.iter().any(|effect| {
+                effect["type"] == "handoff_created"
+                    && effect["object_id"] == hex::encode(&handoff_id)
+            }));
+            assert!(speech_effects.iter().any(|effect| {
+                effect["type"] == "offer_created" && effect["object_id"] == hex::encode(&offer_id)
+            }));
+
+            let acked = ack_test_offer(&meeting, target, offer_id).await;
+            let next_grant_id = accepted_id(&acked);
+            assert_eq!(
+                acked.snapshot.handoff_depth,
+                i32::try_from(hop).expect("test hop fits i32")
+            );
+            assert_eq!(
+                acked.snapshot.active_grant_id.as_deref(),
+                Some(next_grant_id.as_slice())
+            );
+            grant_id = next_grant_id;
+            source_handoff_id = handoff_id;
+        }
+
+        let depth_five = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load depth-five Grant");
+        assert_eq!(
+            depth_five.handoff_depth,
+            depth_five.config.max_handoff_depth
+        );
+        assert_eq!(depth_five.handoff_depth, 5);
+        assert_eq!(depth_five.speech_revision, 7);
+        let (blocked_speech, returned) = submit_handoff_speech(
+            &meeting,
+            &meeting.human,
+            grant_id,
+            8,
+            &meeting.agent,
+            "Depth-five target speaks and proposes a sixth Handoff",
+        )
+        .await;
+        let blocked_handoff_id = blocked_speech.id.as_bytes().to_vec();
+        assert!(matches!(
+            returned.snapshot.phase,
+            BatonPhase::ModeratorIdle | BatonPhase::ModeratorControl
+        ));
+        assert!(returned.snapshot.active_offer_id.is_none());
+        assert!(returned.snapshot.active_grant_id.is_none());
+        assert_eq!(returned.snapshot.handoff_depth, 0);
+        assert_eq!(returned.snapshot.speech_revision, 8);
+        assert_eq!(
+            returned.snapshot.control_epoch,
+            depth_five.control_epoch + 1
+        );
+
+        let blocked_handoff = sqlx::query(
+            "SELECT question_state, initial_disposition, blocked_by, requested_depth, \
+                    attempt_count, last_offer_id, last_grant_id, last_attempt_outcome \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&blocked_handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load max-depth-blocked Handoff");
+        assert_eq!(
+            blocked_handoff
+                .try_get::<String, _>("question_state")
+                .expect("blocked Handoff question_state"),
+            "open"
+        );
+        assert_eq!(
+            blocked_handoff
+                .try_get::<String, _>("initial_disposition")
+                .expect("blocked Handoff initial_disposition"),
+            "blocked"
+        );
+        assert_eq!(
+            blocked_handoff
+                .try_get::<Option<String>, _>("blocked_by")
+                .expect("blocked Handoff blocked_by")
+                .as_deref(),
+            Some("max_depth")
+        );
+        assert_eq!(
+            blocked_handoff
+                .try_get::<i32, _>("requested_depth")
+                .expect("blocked Handoff requested_depth"),
+            6
+        );
+        assert_eq!(
+            blocked_handoff
+                .try_get::<i32, _>("attempt_count")
+                .expect("blocked Handoff attempt_count"),
+            0
+        );
+        assert!(blocked_handoff
+            .try_get::<Option<Vec<u8>>, _>("last_offer_id")
+            .expect("blocked Handoff last_offer_id")
+            .is_none());
+        assert!(blocked_handoff
+            .try_get::<Option<Vec<u8>>, _>("last_grant_id")
+            .expect("blocked Handoff last_grant_id")
+            .is_none());
+        assert!(blocked_handoff
+            .try_get::<Option<String>, _>("last_attempt_outcome")
+            .expect("blocked Handoff last_attempt_outcome")
+            .is_none());
+
+        let (pending_offers, active_grants): (i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM meeting_baton_offers \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'pending'), \
+                 (SELECT count(*) FROM meeting_baton_grants \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'active')",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("confirm max-depth return has no active Offer or Grant");
+        assert_eq!((pending_offers, active_grants), (0, 0));
+
+        let final_state = latest_state_content(&meeting).await;
+        assert!(final_state["offer"].is_null());
+        assert!(final_state["grant"].is_null());
+        assert_eq!(final_state["handoff_depth"], 0);
+        let unresolved = final_state["unresolved_handoffs"]
+            .as_array()
+            .expect("final State unresolved Handoffs");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            unresolved[0]["handoff_id"],
+            hex::encode(&blocked_handoff_id)
+        );
+        assert_eq!(unresolved[0]["question_state"], "open");
+        assert_eq!(unresolved[0]["blocked_by"], "max_depth");
+        assert_eq!(unresolved[0]["attempt_count"], 0);
+        assert!(unresolved[0]["last_offer_id"].is_null());
+        assert!(unresolved[0]["last_grant_id"].is_null());
+        let final_transition = &final_state["transition"];
+        assert_eq!(final_transition["primary_type"], "speech_accepted");
+        assert_eq!(
+            final_transition["primary_object_id"],
+            hex::encode(&blocked_handoff_id)
+        );
+        let final_effects = final_transition["effects"]
+            .as_array()
+            .expect("max-depth speech effects");
+        assert!(final_effects.iter().any(|effect| {
+            effect["type"] == "handoff_answered"
+                && effect["object_id"] == hex::encode(&source_handoff_id)
+        }));
+        assert!(final_effects.iter().any(|effect| {
+            effect["type"] == "handoff_created"
+                && effect["object_id"] == hex::encode(&blocked_handoff_id)
+        }));
+        assert!(final_effects
+            .iter()
+            .any(|effect| effect["type"] == "forced_return_completed"));
+        assert!(final_effects
+            .iter()
+            .all(|effect| effect["type"] != "offer_created"));
+
+        let canonical = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(canonical.state_event_id, returned.snapshot.state_event_id);
+        assert_eq!(canonical.state_revision, returned.snapshot.state_revision);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn latched_recall_clears_only_when_human_priority_is_exhausted() {
         for terminal_mode in ["withdraw", "timeout"] {
             let meeting = create_test_meeting().await;
@@ -8091,6 +8675,725 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn concurrent_ack_and_human_request_have_one_serial_canonical_floor() {
+        let meeting = create_test_meeting().await;
+        let (_, submitted) = submit_intent(&meeting, &meeting.agent, "ACK or Human priority").await;
+        let (_, selected) = moderator_select_intent(&meeting, accepted_id(&submitted)).await;
+        let before_revision = selected.snapshot.state_revision;
+        let offer_id = accepted_id(&selected);
+        let ack = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_OFFER_RESPONSE,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let request = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+
+        let (ack_result, request_result) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &ack,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::OfferAck { offer_id },
+                },
+            ),
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &request,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::HumanRequest,
+                },
+            )
+        );
+        let ack_result = ack_result.expect("concurrent ACK result");
+        let request_result = request_result.expect("concurrent Human Request result");
+        assert!(matches!(
+            &request_result.command_outcome,
+            BatonCommandOutcome::Accepted {
+                canonical_object_id: Some(id),
+                ..
+            } if id == request.id.as_bytes().as_slice()
+        ));
+        let ack_won = matches!(
+            &ack_result.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        );
+        if !ack_won {
+            assert!(matches!(
+                &ack_result.command_outcome,
+                BatonCommandOutcome::RejectedTerminal { code, .. }
+                    if code == "offer_not_active"
+            ));
+        }
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        let request_state: String = sqlx::query_scalar(
+            "SELECT state FROM meeting_human_floor_requests \
+             WHERE community_id = $1 AND session_id = $2 AND request_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(request.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load concurrent Human Request state");
+        let (pending_offers, active_grants): (i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM meeting_baton_offers \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'pending'), \
+                 (SELECT count(*) FROM meeting_baton_grants \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'active')",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("count active floor objects after ACK/Human race");
+        if ack_won {
+            assert_eq!(snapshot.phase, BatonPhase::Granted);
+            assert_eq!(snapshot.state_revision, before_revision + 2);
+            assert_eq!(request_state, "queued");
+            assert_eq!((pending_offers, active_grants), (0, 1));
+        } else {
+            assert_eq!(snapshot.phase, BatonPhase::Offered);
+            assert_eq!(snapshot.state_revision, before_revision + 1);
+            assert_eq!(request_state, "offered");
+            assert_eq!((pending_offers, active_grants), (1, 0));
+        }
+        let persisted_commands: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND id IN ($2, $3)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(ack.id.as_bytes().as_slice())
+        .bind(request.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("count canonical ACK/Human commands");
+        assert_eq!(persisted_commands, if ack_won { 2 } else { 1 });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_ack_and_offer_timeout_commit_exactly_one_recovery() {
+        let meeting = create_test_meeting().await;
+        let (_, submitted) =
+            submit_intent(&meeting, &meeting.agent, "ACK at timeout boundary").await;
+        let (_, selected) = moderator_select_intent(&meeting, accepted_id(&submitted)).await;
+        let before_revision = selected.snapshot.state_revision;
+        let offer_id = accepted_id(&selected);
+        sqlx::query(
+            "UPDATE meeting_baton_offers \
+             SET ack_deadline = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&offer_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force Offer deadline before concurrent recovery");
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET next_action_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force due State hint before concurrent Offer recovery");
+        let ack = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_OFFER_RESPONSE,
+            meeting.session_id,
+            "",
+            &[],
+        );
+
+        let (ack_result, recovered) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &ack,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::OfferAck {
+                        offer_id: offer_id.clone(),
+                    },
+                },
+            ),
+            recover_meeting_v1(
+                &meeting.db,
+                meeting.community_id,
+                meeting.session_id,
+                &meeting.relay,
+            )
+        );
+        let ack_result = ack_result.expect("concurrent late ACK result");
+        let recovered = recovered.expect("concurrent Offer recovery result");
+        assert!(matches!(
+            &ack_result.command_outcome,
+            BatonCommandOutcome::RejectedAfterRecovery { code, .. }
+                | BatonCommandOutcome::RejectedTerminal { code, .. }
+                if code == "offer_not_active"
+        ));
+        let recovery_types: Vec<_> = ack_result
+            .recovery_transitions
+            .iter()
+            .chain(recovered.iter())
+            .map(|transition| transition.primary_type.as_str())
+            .collect();
+        assert_eq!(recovery_types, vec!["offer_timed_out"]);
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(snapshot.state_revision, before_revision + 1);
+        assert!(snapshot.active_offer_id.is_none());
+        let offer_state: String = sqlx::query_scalar(
+            "SELECT state FROM meeting_baton_offers \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(offer_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load timed-out Offer");
+        assert_eq!(offer_state, "timed_out");
+        let ack_persisted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE community_id = $1 AND id = $2)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(ack.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("check late ACK canonical log");
+        assert!(!ack_persisted);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_speech_and_hard_deadline_commit_exactly_one_recovery() {
+        let meeting = create_test_meeting().await;
+        let (_, grant_id) = create_agent_grant(&meeting, "SAY at hard deadline").await;
+        let before = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load Grant before hard-deadline race");
+        sqlx::query(
+            "UPDATE meeting_baton_grants \
+             SET soft_lease_expires_at = clock_timestamp() - interval '2 seconds', \
+                 hard_deadline = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2 AND grant_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&grant_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force hard Grant deadline before concurrent recovery");
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET next_action_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force due State hint before hard Grant recovery");
+        let speech = signed_event(
+            &meeting.agent,
+            9,
+            meeting.session_id,
+            "Too late at the hard boundary",
+            &[],
+        );
+
+        let (speech_result, recovered) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &speech,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::Speech {
+                        grant_id: grant_id.clone(),
+                        speech_revision: before.speech_revision + 1,
+                        handoff: None,
+                    },
+                },
+            ),
+            recover_meeting_v1(
+                &meeting.db,
+                meeting.community_id,
+                meeting.session_id,
+                &meeting.relay,
+            )
+        );
+        let speech_result = speech_result.expect("concurrent hard-deadline SAY result");
+        let recovered = recovered.expect("concurrent hard Grant recovery result");
+        assert!(matches!(
+            &speech_result.command_outcome,
+            BatonCommandOutcome::RejectedAfterRecovery { code, .. }
+                | BatonCommandOutcome::RejectedTerminal { code, .. }
+                if code == "grant_not_active"
+        ));
+        let recovery_types: Vec<_> = speech_result
+            .recovery_transitions
+            .iter()
+            .chain(recovered.iter())
+            .map(|transition| transition.primary_type.as_str())
+            .collect();
+        assert_eq!(recovery_types, vec!["grant_hard_expired"]);
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(snapshot.state_revision, before.state_revision + 1);
+        assert_eq!(snapshot.speech_revision, before.speech_revision);
+        assert!(snapshot.active_grant_id.is_none());
+        let grant_state: String = sqlx::query_scalar(
+            "SELECT state FROM meeting_baton_grants \
+             WHERE community_id = $1 AND session_id = $2 AND grant_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(grant_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load hard-expired Grant");
+        assert_eq!(grant_state, "hard_expired");
+        let speech_persisted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE community_id = $1 AND id = $2)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(speech.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("check hard-deadline SAY canonical log");
+        assert!(!speech_persisted);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_progress_and_soft_expiry_commit_exactly_one_recovery() {
+        let meeting = create_test_meeting().await;
+        let (_, grant_id) = create_agent_grant(&meeting, "Progress at soft expiry").await;
+        let before = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load Grant before soft-expiry race");
+        sqlx::query(
+            "UPDATE meeting_baton_grants \
+             SET soft_lease_expires_at = clock_timestamp() - interval '1 second', \
+                 hard_deadline = clock_timestamp() + interval '1 minute' \
+             WHERE community_id = $1 AND session_id = $2 AND grant_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&grant_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force soft Grant expiry before concurrent recovery");
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET next_action_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force due State hint before soft Grant recovery");
+        let progress = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_GRANT_SIGNAL,
+            meeting.session_id,
+            "",
+            &[],
+        );
+
+        let (progress_result, recovered) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &progress,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::GrantProgress {
+                        grant_id: grant_id.clone(),
+                        progress_seq: 1,
+                        stage: BatonProgressStage::ToolUse,
+                    },
+                },
+            ),
+            recover_meeting_v1(
+                &meeting.db,
+                meeting.community_id,
+                meeting.session_id,
+                &meeting.relay,
+            )
+        );
+        let progress_result = progress_result.expect("concurrent soft-expiry Progress result");
+        let recovered = recovered.expect("concurrent soft Grant recovery result");
+        assert!(matches!(
+            &progress_result.command_outcome,
+            BatonCommandOutcome::RejectedAfterRecovery { code, .. }
+                | BatonCommandOutcome::RejectedTerminal { code, .. }
+                if code == "grant_not_active"
+        ));
+        let recovery_types: Vec<_> = progress_result
+            .recovery_transitions
+            .iter()
+            .chain(recovered.iter())
+            .map(|transition| transition.primary_type.as_str())
+            .collect();
+        assert_eq!(recovery_types, vec!["grant_soft_expired"]);
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(snapshot.state_revision, before.state_revision + 1);
+        assert_eq!(snapshot.speech_revision, before.speech_revision);
+        assert!(snapshot.active_grant_id.is_none());
+        let (grant_state, progress_rows): (String, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT state FROM meeting_baton_grants \
+                  WHERE community_id = $1 AND session_id = $2 AND grant_id = $3), \
+                 (SELECT count(*) FROM meeting_grant_progress \
+                  WHERE community_id = $1 AND session_id = $2 AND grant_id = $3)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(grant_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load soft-expired Grant and Progress rows");
+        assert_eq!(grant_state, "soft_expired");
+        assert_eq!(progress_rows, 0);
+        let progress_persisted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE community_id = $1 AND id = $2)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(progress.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("check soft-expiry Progress canonical log");
+        assert!(!progress_persisted);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_speech_and_end_produce_one_valid_terminal_order() {
+        let meeting = create_test_meeting().await;
+        let (_, grant_id) = create_agent_grant(&meeting, "SAY while End races").await;
+        let before = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load Grant before SAY/End race");
+        let speech = signed_event(
+            &meeting.agent,
+            9,
+            meeting.session_id,
+            "Possibly the final contribution",
+            &[],
+        );
+
+        let (speech_result, end_transition) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &speech,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::Speech {
+                        grant_id: grant_id.clone(),
+                        speech_revision: before.speech_revision + 1,
+                        handoff: None,
+                    },
+                },
+            ),
+            end_test_meeting(&meeting)
+        );
+        let speech_result = speech_result.expect("concurrent SAY/End result");
+        assert_eq!(end_transition["primary_type"], "meeting_ended");
+        let speech_won = matches!(
+            &speech_result.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        );
+        if !speech_won {
+            assert!(matches!(
+                &speech_result.command_outcome,
+                BatonCommandOutcome::RejectedTerminal { code, .. }
+                    if code == "meeting_ended"
+            ));
+        }
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(snapshot.phase, BatonPhase::Ended);
+        assert_eq!(
+            snapshot.state_revision,
+            before.state_revision + if speech_won { 2 } else { 1 }
+        );
+        assert_eq!(
+            snapshot.speech_revision,
+            before.speech_revision + i64::from(speech_won)
+        );
+        let (speech_count, grant_state): (i64, String) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM events \
+                  WHERE community_id = $1 AND id = $3), \
+                 (SELECT state FROM meeting_baton_grants \
+                  WHERE community_id = $1 AND session_id = $2 AND grant_id = $4)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(speech.id.as_bytes().as_slice())
+        .bind(grant_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load canonical SAY/End outcome");
+        assert_eq!(speech_count, i64::from(speech_won));
+        assert_eq!(grant_state, if speech_won { "spoken" } else { "ended" });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_human_requests_create_one_offer_and_one_queue_entry() {
+        let meeting = create_test_meeting().await;
+        let before = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load State before concurrent Human Requests");
+        let first_request = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let second_request = signed_event(
+            &meeting.human_two,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+
+        let (first, second) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &first_request,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::HumanRequest,
+                },
+            ),
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &second_request,
+                    relay_keys: &meeting.relay,
+                    command: BatonCommand::HumanRequest,
+                },
+            )
+        );
+        let results = [
+            first.expect("first concurrent Human Request"),
+            second.expect("second concurrent Human Request"),
+        ];
+        assert!(results.iter().all(|result| matches!(
+            &result.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        )));
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(snapshot.phase, BatonPhase::Offered);
+        assert_eq!(snapshot.state_revision, before.state_revision + 2);
+        let (offered_requests, queued_requests, pending_offers, offered_source_matches): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM meeting_human_floor_requests \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'offered'), \
+                 (SELECT count(*) FROM meeting_human_floor_requests \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'queued'), \
+                 (SELECT count(*) FROM meeting_baton_offers \
+                  WHERE community_id = $1 AND session_id = $2 AND state = 'pending'), \
+                 (SELECT count(*) \
+                  FROM meeting_baton_state state \
+                  JOIN meeting_baton_offers offer \
+                    ON offer.community_id = state.community_id \
+                   AND offer.session_id = state.session_id \
+                   AND offer.offer_id = state.active_offer_id \
+                  JOIN meeting_human_floor_requests request \
+                    ON request.community_id = offer.community_id \
+                   AND request.session_id = offer.session_id \
+                   AND request.request_id = offer.source_request_id \
+                  WHERE state.community_id = $1 AND state.session_id = $2 \
+                    AND request.state = 'offered')",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load concurrent Human Request queue shape");
+        assert_eq!(
+            (
+                offered_requests,
+                queued_requests,
+                pending_offers,
+                offered_source_matches,
+            ),
+            (1, 1, 1, 1)
+        );
+        let canonical_request_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND id IN ($2, $3)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(first_request.id.as_bytes().as_slice())
+        .bind(second_request.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("count canonical concurrent Human Requests");
+        assert_eq!(canonical_request_events, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_moderator_selects_create_exactly_one_offer() {
+        let meeting = create_test_meeting().await;
+        let (_, first_intent) =
+            submit_intent(&meeting, &meeting.human, "First selectable Intent").await;
+        let first_intent_id = accepted_id(&first_intent);
+        let (_, second_intent) =
+            submit_intent(&meeting, &meeting.human_two, "Second selectable Intent").await;
+        let second_intent_id = accepted_id(&second_intent);
+        let before = second_intent.snapshot;
+        let first_select = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let second_select = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let select_command = |intent_id| BatonCommand::ModeratorSelect {
+            source: BatonSelectionSource::Intent { intent_id },
+            expected_control_epoch: before.control_epoch,
+            expected_decision_epoch: before.decision_epoch,
+            expected_intent_revision: before.intent_revision,
+            expected_speech_revision: before.speech_revision,
+            selection_reason: Some("concurrent selection".to_string()),
+            deferrals: Vec::new(),
+        };
+
+        let (first, second) = tokio::join!(
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &first_select,
+                    relay_keys: &meeting.relay,
+                    command: select_command(first_intent_id.clone()),
+                },
+            ),
+            execute_baton_command(
+                &meeting.db,
+                BatonCommandTxParams {
+                    community_id: meeting.community_id,
+                    session_id: meeting.session_id,
+                    event: &second_select,
+                    relay_keys: &meeting.relay,
+                    command: select_command(second_intent_id.clone()),
+                },
+            )
+        );
+        let results = [
+            first.expect("first concurrent moderator Select"),
+            second.expect("second concurrent moderator Select"),
+        ];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    &result.command_outcome,
+                    BatonCommandOutcome::Accepted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    &result.command_outcome,
+                    BatonCommandOutcome::RejectedTerminal { code, .. }
+                        if code == "moderator_does_not_hold_control"
+                ))
+                .count(),
+            1
+        );
+
+        let snapshot = assert_serial_state_and_outbox(&meeting).await;
+        assert_eq!(snapshot.phase, BatonPhase::Offered);
+        assert_eq!(snapshot.state_revision, before.state_revision + 1);
+        let active_offer_id = snapshot.active_offer_id.expect("one active Offer");
+        let source_intent_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT source_intent_id FROM meeting_baton_offers \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3 \
+               AND state = 'pending'",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(active_offer_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load winning moderator Select source");
+        assert!(
+            source_intent_id == first_intent_id || source_intent_id == second_intent_id,
+            "the active Offer must reference exactly one competing Intent"
+        );
+        let canonical_select_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND id IN ($2, $3)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(first_select.id.as_bytes().as_slice())
+        .bind(second_select.id.as_bytes().as_slice())
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("count canonical concurrent moderator Select commands");
+        assert_eq!(canonical_select_events, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn frozen_timing_fallback_and_progress_deadlines_are_deterministic() {
         let fallback = create_test_meeting().await;
         submit_intent(&fallback, &fallback.agent, "Let fallback select me").await;
@@ -8473,17 +9776,37 @@ mod tests {
         .execute(&first.db.pool)
         .await
         .expect("isolate due-claim test from earlier Sessions");
+        let first_deadline: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT next_action_at FROM meeting_baton_state \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(first.community_id.as_uuid())
+        .bind(first.session_id)
+        .fetch_one(&first.db.pool)
+        .await
+        .expect("load first claimed recovery deadline");
+        let second_deadline: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT next_action_at FROM meeting_baton_state \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(second.community_id.as_uuid())
+        .bind(second.session_id)
+        .fetch_one(&second.db.pool)
+        .await
+        .expect("load second claimed recovery deadline");
 
         let first_claim = claim_due_baton_sessions(&first.db, 1)
             .await
             .expect("claim first due State");
         assert_eq!(first_claim.len(), 1);
         assert_eq!(first_claim[0].session_id, first.session_id);
+        assert_eq!(first_claim[0].next_action_at, first_deadline);
         let second_claim = claim_due_baton_sessions(&first.db, 1)
             .await
             .expect("claim around retry-fenced first State");
         assert_eq!(second_claim.len(), 1);
         assert_eq!(second_claim[0].session_id, second.session_id);
+        assert_eq!(second_claim[0].next_action_at, second_deadline);
         assert!(claim_due_baton_sessions(&first.db, 1)
             .await
             .expect("both due States remain retry fenced")

@@ -3782,6 +3782,8 @@ mod tests {
                 fail "expected prompt directly after session/new" 45
             [[ "$PROMPT" == *'granted_speech'* ]] ||
                 fail "expected Meeting Granted Speech prompt" 46
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"meeting-session","update":{"sessionUpdate":"tool_call","toolCallId":"meeting-context-read","title":"Read project context","kind":"read","status":"in_progress"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"meeting-session","update":{"sessionUpdate":"tool_call_update","toolCallId":"meeting-context-read","status":"completed"}}}'
             printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"meeting-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"{\"action\":\"SAY\",\"content\":\"The Meeting"}}}}'
             printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"meeting-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" state is coherent.\",\"mention_pubkeys\":[],\"handoff\":null,\"reason\":null}"}}}}'
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'

@@ -291,6 +291,13 @@ test-unit:
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
+        # ACP owns the Meeting runtime and its privacy-safe wire/log boundary.
+        # Run the full lib suite so cross-cutting ACP regressions are not
+        # accidentally excluded by a Meeting-only name filter.
+        cargo nextest run -p buzz-acp --lib
+        # Relay Meeting parsing, rollout-gate, recovery/outbox metric-label,
+        # and privacy-ordering tests are infrastructure-free.
+        cargo nextest run -p buzz-relay --lib -E 'test(meeting)'
     else
         ./scripts/run-tests.sh unit
     fi
@@ -298,6 +305,11 @@ test-unit:
 # Run integration tests only (starts services if needed)
 test-integration:
     ./scripts/run-tests.sh integration
+
+# Run the complete Meeting V0/V1 backend gate with a locally managed Relay.
+# Port 3000 must be free; Postgres/Redis/MinIO are started automatically.
+test-meeting-backend:
+    ./scripts/run-meeting-backend-tests.sh
 
 # Buzz shared compute e2e: current desktop discovery/admission logic and
 # Playwright UI coverage.

@@ -259,6 +259,21 @@ pub enum EndMeetingV1Outcome {
     ParticipantRevoked(Box<BatonSnapshot>),
 }
 
+/// Opaque lease token for one claim of a durable security-revocation job.
+///
+/// Reclaiming an expired job produces a different token. Workers must present
+/// the token returned by [`claim_revocation_jobs`] when advancing, completing,
+/// or releasing that claim so a stale worker cannot mutate a newer lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeetingRevocationClaimToken(i32);
+
+impl MeetingRevocationClaimToken {
+    /// Monotonic claim-attempt number, exposed for bounded observability only.
+    pub fn attempt(self) -> i32 {
+        self.0
+    }
+}
+
 /// One claimed durable security-revocation job.
 #[derive(Debug, Clone)]
 pub struct MeetingRevocationJob {
@@ -277,8 +292,8 @@ pub struct MeetingRevocationJob {
     pub security_order: i64,
     /// Optional cursor used by a bounded worker.
     pub cursor_session_id: Option<Uuid>,
-    /// Number of times the job has been claimed.
-    pub attempts: i32,
+    /// Token fencing every mutation performed under this claim.
+    pub claim_token: MeetingRevocationClaimToken,
 }
 
 /// Create a Meeting V1 room, strict frozen identity projection, immutable
@@ -759,27 +774,32 @@ pub async fn claim_revocation_jobs(
                 created_at: row.try_get("created_at")?,
                 security_order: row.try_get("security_order")?,
                 cursor_session_id: row.try_get("cursor_session_id")?,
-                attempts: row.try_get("attempts")?,
+                claim_token: MeetingRevocationClaimToken(row.try_get("attempts")?),
             })
         })
         .collect()
 }
 
 /// Advance a security-revocation job cursor after one bounded worker batch.
+///
+/// Returns `false` when the claim token no longer owns the running lease.
 pub async fn advance_revocation_job(
     db: &Db,
     community_id: CommunityId,
     job_id: Uuid,
+    claim_token: MeetingRevocationClaimToken,
     cursor_session_id: Uuid,
     retry_at: DateTime<Utc>,
 ) -> Result<bool> {
     let result = sqlx::query(
         "UPDATE meeting_revocation_jobs \
-         SET cursor_session_id = $3, state = 'pending', next_attempt_at = $4 \
-         WHERE community_id = $1 AND job_id = $2 AND state = 'running'",
+         SET cursor_session_id = $4, state = 'pending', next_attempt_at = $5 \
+         WHERE community_id = $1 AND job_id = $2 AND state = 'running' \
+           AND attempts = $3",
     )
     .bind(community_id.as_uuid())
     .bind(job_id)
+    .bind(claim_token.attempt())
     .bind(cursor_session_id)
     .bind(retry_at)
     .execute(&db.pool)
@@ -788,38 +808,48 @@ pub async fn advance_revocation_job(
 }
 
 /// Mark a security-revocation job complete.
+///
+/// Returns `false` when the claim token no longer owns the running lease.
 pub async fn complete_revocation_job(
     db: &Db,
     community_id: CommunityId,
     job_id: Uuid,
+    claim_token: MeetingRevocationClaimToken,
 ) -> Result<bool> {
     let result = sqlx::query(
         "UPDATE meeting_revocation_jobs \
          SET state = 'completed', completed_at = clock_timestamp() \
-         WHERE community_id = $1 AND job_id = $2 AND state = 'running'",
+         WHERE community_id = $1 AND job_id = $2 AND state = 'running' \
+           AND attempts = $3",
     )
     .bind(community_id.as_uuid())
     .bind(job_id)
+    .bind(claim_token.attempt())
     .execute(&db.pool)
     .await?;
     Ok(result.rows_affected() == 1)
 }
 
 /// Release a claimed security-revocation job for retry.
+///
+/// Returns `false` when the claim token no longer owns the running lease.
 pub async fn release_revocation_job(
     db: &Db,
     community_id: CommunityId,
     job_id: Uuid,
+    claim_token: MeetingRevocationClaimToken,
     error: &str,
 ) -> Result<bool> {
     let result = sqlx::query(
         "UPDATE meeting_revocation_jobs \
          SET state = 'pending', next_attempt_at = clock_timestamp() + interval '1 second', \
-             last_error = $3 \
-         WHERE community_id = $1 AND job_id = $2 AND state = 'running'",
+             last_error = $4 \
+         WHERE community_id = $1 AND job_id = $2 AND state = 'running' \
+           AND attempts = $3",
     )
     .bind(community_id.as_uuid())
     .bind(job_id)
+    .bind(claim_token.attempt())
     .bind(error)
     .execute(&db.pool)
     .await?;
@@ -3072,6 +3102,192 @@ mod tests {
         assert_eq!(
             (event_count, channel_count, session_count, state_count),
             (0, 0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn revocation_claim_token_fences_every_stale_worker_mutation() {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool.clone());
+        let community_id = make_community(&pool).await;
+        let advance_job_id = Uuid::new_v4();
+        let complete_job_id = Uuid::new_v4();
+        let release_job_id = Uuid::new_v4();
+        let job_ids = [advance_job_id, complete_job_id, release_job_id];
+
+        let mut tx = pool.begin().await.expect("begin revocation job seeds");
+        for (index, job_id) in job_ids.iter().copied().enumerate() {
+            let revoked_pubkey = vec![0x70 + index as u8; 32];
+            let revocation_event_id = vec![0x80 + index as u8; 32];
+            assert!(enqueue_revocation_job_tx(
+                &mut tx,
+                community_id,
+                job_id,
+                &revoked_pubkey,
+                &revocation_event_id,
+            )
+            .await
+            .expect("enqueue revocation job"));
+        }
+        tx.commit().await.expect("commit revocation job seeds");
+
+        // Give these uniquely-scoped jobs deterministic priority over unrelated
+        // rows that may exist in a shared integration-test database.
+        sqlx::query(
+            "UPDATE meeting_revocation_jobs \
+             SET next_attempt_at = '-infinity' \
+             WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("make initial claims due");
+
+        let first_claims = claim_revocation_jobs(&db, 3, 60_000)
+            .await
+            .expect("claim first leases");
+        assert_eq!(first_claims.len(), 3);
+        assert!(first_claims
+            .iter()
+            .all(|job| job.claim_token.attempt() == 1));
+
+        // Simulate all three workers exceeding their lease, then let another
+        // worker reclaim each row. Every returned token must now fence attempt 1.
+        sqlx::query(
+            "UPDATE meeting_revocation_jobs \
+             SET next_attempt_at = '-infinity' \
+             WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("expire first claims");
+        let second_claims = claim_revocation_jobs(&db, 3, 60_000)
+            .await
+            .expect("claim replacement leases");
+        assert_eq!(second_claims.len(), 3);
+        assert!(second_claims
+            .iter()
+            .all(|job| job.claim_token.attempt() == 2));
+
+        let claimed = |claims: &[MeetingRevocationJob], job_id: Uuid| {
+            claims
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .cloned()
+                .expect("find claimed revocation job")
+        };
+        let stale_advance = claimed(&first_claims, advance_job_id);
+        let current_advance = claimed(&second_claims, advance_job_id);
+        let stale_complete = claimed(&first_claims, complete_job_id);
+        let current_complete = claimed(&second_claims, complete_job_id);
+        let stale_release = claimed(&first_claims, release_job_id);
+        let current_release = claimed(&second_claims, release_job_id);
+        let cursor = Uuid::new_v4();
+
+        assert!(!advance_revocation_job(
+            &db,
+            community_id,
+            advance_job_id,
+            stale_advance.claim_token,
+            Uuid::new_v4(),
+            Utc::now(),
+        )
+        .await
+        .expect("reject stale cursor advancement"));
+        assert!(!complete_revocation_job(
+            &db,
+            community_id,
+            complete_job_id,
+            stale_complete.claim_token,
+        )
+        .await
+        .expect("reject stale completion"));
+        assert!(!release_revocation_job(
+            &db,
+            community_id,
+            release_job_id,
+            stale_release.claim_token,
+            "stale release",
+        )
+        .await
+        .expect("reject stale release"));
+
+        // The current claim remains authoritative after all three stale calls.
+        assert!(advance_revocation_job(
+            &db,
+            community_id,
+            advance_job_id,
+            current_advance.claim_token,
+            cursor,
+            Utc::now(),
+        )
+        .await
+        .expect("advance with current claim"));
+        assert!(complete_revocation_job(
+            &db,
+            community_id,
+            complete_job_id,
+            current_complete.claim_token,
+        )
+        .await
+        .expect("complete with current claim"));
+        assert!(release_revocation_job(
+            &db,
+            community_id,
+            release_job_id,
+            current_release.claim_token,
+            "current release",
+        )
+        .await
+        .expect("release with current claim"));
+
+        let advance_shape: (String, Option<Uuid>, i32, Option<String>) = sqlx::query_as(
+            "SELECT state, cursor_session_id, attempts, last_error \
+             FROM meeting_revocation_jobs \
+             WHERE community_id = $1 AND job_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(advance_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load advanced job");
+        assert_eq!(
+            advance_shape,
+            ("pending".to_string(), Some(cursor), 2, None)
+        );
+
+        let complete_shape: (String, i32, bool) = sqlx::query_as(
+            "SELECT state, attempts, completed_at IS NOT NULL \
+             FROM meeting_revocation_jobs \
+             WHERE community_id = $1 AND job_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(complete_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load completed job");
+        assert_eq!(complete_shape, ("completed".to_string(), 2, true));
+
+        let release_shape: (String, Option<Uuid>, i32, Option<String>) = sqlx::query_as(
+            "SELECT state, cursor_session_id, attempts, last_error \
+             FROM meeting_revocation_jobs \
+             WHERE community_id = $1 AND job_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(release_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load released job");
+        assert_eq!(
+            release_shape,
+            (
+                "pending".to_string(),
+                None,
+                2,
+                Some("current release".to_string()),
+            )
         );
     }
 }
