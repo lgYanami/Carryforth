@@ -674,6 +674,7 @@ pub fn run() {
             get_git_identity,
             get_project_repo_snapshot,
             get_project_view,
+            get_project_view_role_history,
             mutate_project_view,
             mutate_project_view_role,
             get_project_repo_diff,

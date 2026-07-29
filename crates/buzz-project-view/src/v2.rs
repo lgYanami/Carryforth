@@ -15,9 +15,10 @@ mod role_continuity;
 pub use project_object::ProjectObjectCommand;
 pub use role_continuity::{
     AssignmentEndReason, CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds,
-    MemberGovernance, ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal,
-    RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity,
-    RoleContinuityError, RoleContinuityOutcome, RoleContinuityState, RoleDefinition, RoleHandoff,
+    HandoffCause, MemberGovernance, ProposalStatus, ProposalType, RoleAssignment,
+    RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent, RoleCommand, RoleCommandRequest,
+    RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityOutcome,
+    RoleContinuityReference, RoleContinuityState, RoleDefinition, RoleHandoff, RoleHandoffContent,
     RoleSlot, WorkCommitment, WorkResponsibility, MAX_PROPOSAL_LIFETIME_DAYS,
 };
 

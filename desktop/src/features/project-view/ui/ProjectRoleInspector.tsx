@@ -12,8 +12,17 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import { useProjectViewRoleMutation } from "@/features/project-view/hooks";
+import {
+  useProjectViewRoleHistory,
+  useProjectViewRoleMutation,
+} from "@/features/project-view/hooks";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
+import {
+  EMPTY_ROLE_CONTINUITY_DRAFT,
+  ProjectRoleCheckpointDialog,
+  ProjectRoleHandoffDialog,
+} from "@/features/project-view/ui/ProjectRoleContinuityDialogs";
+import { formatProjectRoleDateTime } from "@/features/project-view/ui/projectRoleFormatting";
 import type {
   ProjectRoleAssignment,
   ProjectRoleDefinition,
@@ -34,16 +43,6 @@ import {
 } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
-
-const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
-
-function formatDateTime(value: string) {
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? value : dateTimeFormatter.format(date);
-}
 
 function activeAssignmentForRole(
   assignments: ProjectRoleAssignment[],
@@ -66,25 +65,55 @@ function memberLabel(pubkey: string, profiles?: UserProfileLookup) {
   return profile?.displayName ?? profile?.name ?? truncatePubkey(pubkey);
 }
 
+function uniqueBy<T>(items: T[], key: (item: T) => string) {
+  return [...new Map(items.map((item) => [key(item), item])).values()];
+}
+
 export function ProjectRoleInspector({
   actorProfiles,
   continuity,
   currentPubkey,
   definition,
+  projectionGeneration,
   projectRevision,
 }: {
   actorProfiles?: UserProfileLookup;
   continuity: ProjectViewRoleContinuity;
   currentPubkey?: string;
   definition: ProjectRoleDefinition;
+  projectionGeneration: number;
   projectRevision: number;
 }) {
   const mutation = useProjectViewRoleMutation();
+  const roleHistory = useProjectViewRoleHistory({
+    roleId: definition.roleId,
+    projectRevision,
+    projectionGeneration,
+  });
   const [offerOpen, setOfferOpen] = React.useState(false);
   const [endOpen, setEndOpen] = React.useState(false);
+  const [checkpointOpen, setCheckpointOpen] = React.useState(false);
+  const [handoffOpen, setHandoffOpen] = React.useState(false);
   const [candidatePubkey, setCandidatePubkey] = React.useState("");
   const [reason, setReason] = React.useState("");
+  const [continuityDraft, setContinuityDraft] = React.useState(
+    EMPTY_ROLE_CONTINUITY_DRAFT,
+  );
   const [renderedAt] = React.useState(Date.now);
+  const historyItems =
+    roleHistory.data?.pages.flatMap((page) => page.items) ?? [];
+  const historicalProposals = historyItems.flatMap((item) =>
+    item.entityType === "proposal" ? [item.entity] : [],
+  );
+  const historicalAssignments = historyItems.flatMap((item) =>
+    item.entityType === "assignment" ? [item.entity] : [],
+  );
+  const historicalCheckpoints = historyItems.flatMap((item) =>
+    item.entityType === "checkpoint" ? [item.entity] : [],
+  );
+  const historicalHandoffs = historyItems.flatMap((item) =>
+    item.entityType === "handoff" ? [item.entity] : [],
+  );
   const normalizedCurrentPubkey = currentPubkey?.toLowerCase();
   const currentAssignment = activeAssignmentForRole(
     continuity.assignments,
@@ -118,20 +147,74 @@ export function ProjectRoleInspector({
     : isLeader
       ? viewerAssignment?.assignmentId
       : undefined;
-  const proposals = continuity.proposals
-    .filter((proposal) => proposal.roleId === definition.roleId)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-  const history = continuity.assignments
-    .filter(
-      (assignment) =>
-        assignment.roleId === definition.roleId && Boolean(assignment.endedAt),
-    )
-    .sort((left, right) =>
-      (right.endedAt ?? "").localeCompare(left.endedAt ?? ""),
-    );
-  const handoffs = continuity.handoffs
-    .filter((handoff) => handoff.roleId === definition.roleId)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const proposals = uniqueBy(
+    [
+      ...continuity.proposals.filter(
+        (proposal) => proposal.roleId === definition.roleId,
+      ),
+      ...historicalProposals,
+    ],
+    (proposal) => proposal.proposalId,
+  ).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const history = uniqueBy(
+    [
+      ...continuity.assignments.filter(
+        (assignment) =>
+          assignment.roleId === definition.roleId &&
+          Boolean(assignment.endedAt),
+      ),
+      ...historicalAssignments.filter((assignment) =>
+        Boolean(assignment.endedAt),
+      ),
+    ],
+    (assignment) => assignment.assignmentId,
+  ).sort((left, right) =>
+    (right.endedAt ?? "").localeCompare(left.endedAt ?? ""),
+  );
+  const handoffs = uniqueBy(
+    [
+      ...continuity.handoffs.filter(
+        (handoff) => handoff.roleId === definition.roleId,
+      ),
+      ...historicalHandoffs,
+    ],
+    (handoff) => handoff.handoffId,
+  ).sort(
+    (left, right) =>
+      right.projectRevision - left.projectRevision ||
+      right.handoffId.localeCompare(left.handoffId),
+  );
+  const checkpoints = uniqueBy(
+    [
+      ...continuity.checkpoints.filter(
+        (checkpoint) => checkpoint.roleId === definition.roleId,
+      ),
+      ...historicalCheckpoints,
+    ],
+    (checkpoint) => checkpoint.checkpointId,
+  ).sort(
+    (left, right) =>
+      right.projectRevision - left.projectRevision ||
+      right.checkpointId.localeCompare(left.checkpointId),
+  );
+  const timeline = [
+    ...checkpoints.map((checkpoint) => ({
+      id: checkpoint.checkpointId,
+      createdAt: checkpoint.createdAt,
+      item: checkpoint,
+      type: "checkpoint" as const,
+    })),
+    ...handoffs.map((handoff) => ({
+      id: handoff.handoffId,
+      createdAt: handoff.createdAt,
+      item: handoff,
+      type: "handoff" as const,
+    })),
+  ].sort(
+    (left, right) =>
+      right.item.projectRevision - left.item.projectRevision ||
+      right.id.localeCompare(left.id),
+  );
   const viewerIsCurrentAssignee =
     currentAssignment?.memberPubkey.toLowerCase() === normalizedCurrentPubkey;
   const hasOpenViewerProposal = proposals.some(
@@ -197,6 +280,61 @@ export function ProjectRoleInspector({
     }
   }
 
+  function lines(value: string) {
+    return value
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  }
+
+  function clearContinuityDraft() {
+    setContinuityDraft(EMPTY_ROLE_CONTINUITY_DRAFT);
+  }
+
+  async function submitCheckpoint() {
+    if (!currentAssignment || !continuityDraft.summary.trim()) return;
+    const applied = await submit({
+      operation: "append_checkpoint",
+      expectedProjectRevision: projectRevision,
+      basedOnProjectRevision: projectRevision,
+      actingAssignmentId: currentAssignment.assignmentId,
+      content: {
+        summary: continuityDraft.summary.trim(),
+        currentFocus: lines(continuityDraft.currentFocus),
+        progress: lines(continuityDraft.progress),
+        blockers: lines(continuityDraft.blockers),
+        risks: lines(continuityDraft.risks),
+        openQuestions: lines(continuityDraft.openQuestions),
+        nextSteps: lines(continuityDraft.nextSteps),
+        references: [],
+      },
+    });
+    if (applied) {
+      setCheckpointOpen(false);
+      clearContinuityDraft();
+    }
+  }
+
+  async function submitHandoff() {
+    if (!currentAssignment || !continuityDraft.summary.trim()) return;
+    const applied = await submit({
+      operation: "append_handoff",
+      expectedProjectRevision: projectRevision,
+      actingAssignmentId: currentAssignment.assignmentId,
+      checkpointId: checkpoints[0]?.checkpointId,
+      cause: "planned",
+      content: {
+        summary: continuityDraft.summary.trim(),
+        unresolvedItems: lines(continuityDraft.openQuestions),
+        references: [],
+      },
+    });
+    if (applied) {
+      setHandoffOpen(false);
+      clearContinuityDraft();
+    }
+  }
+
   return (
     <section
       className="space-y-4 border-t border-border/70 pt-4"
@@ -229,7 +367,7 @@ export function ProjectRoleInspector({
               pubkey={currentAssignment.memberPubkey}
             />
             <div className="text-xs text-muted-foreground">
-              Since {formatDateTime(currentAssignment.startedAt)}
+              Since {formatProjectRoleDateTime(currentAssignment.startedAt)}
             </div>
             {currentAssignment.replacementRequestedAt ? (
               <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-xs">
@@ -329,6 +467,41 @@ export function ProjectRoleInspector({
               {currentBrief.relatedObjects.length === 1 ? "object" : "objects"}
             </p>
           ) : null}
+          {currentBrief.latestCheckpoint ? (
+            <div
+              className="mt-3 rounded-lg border border-border/70 px-2.5 py-2"
+              data-testid="project-role-latest-checkpoint"
+            >
+              <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Latest Checkpoint
+              </div>
+              <p className="mt-1 text-xs font-medium">
+                {currentBrief.latestCheckpoint.content.summary}
+              </p>
+              {currentBrief.latestCheckpoint.content.blockers.length > 0 ? (
+                <p className="mt-1 text-xs text-destructive">
+                  Blocked ·{" "}
+                  {currentBrief.latestCheckpoint.content.blockers.join(" · ")}
+                </p>
+              ) : null}
+              {currentBrief.latestCheckpoint.content.risks.length > 0 ? (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Risks ·{" "}
+                  {currentBrief.latestCheckpoint.content.risks.join(" · ")}
+                </p>
+              ) : null}
+              {currentBrief.latestCheckpoint.content.nextSteps.length > 0 ? (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Next ·{" "}
+                  {currentBrief.latestCheckpoint.content.nextSteps.join(" · ")}
+                </p>
+              ) : null}
+            </div>
+          ) : (
+            <p className="mt-3 text-xs text-muted-foreground">
+              No Role Checkpoint has been recorded yet.
+            </p>
+          )}
           <p className="mt-2 text-2xs text-muted-foreground">
             Projection generation {currentBrief.projectionGeneration} · built
             from the same verified projection model used by assigned Agents.
@@ -397,6 +570,38 @@ export function ProjectRoleInspector({
           ) : null}
         </div>
       ) : null}
+      {viewerIsCurrentAssignee ? (
+        <div className="flex flex-wrap gap-2">
+          <Button
+            data-testid="project-role-checkpoint"
+            disabled={mutation.isPending}
+            onClick={() => {
+              clearContinuityDraft();
+              setCheckpointOpen(true);
+            }}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <Clock3 />
+            Add Checkpoint
+          </Button>
+          <Button
+            data-testid="project-role-handoff"
+            disabled={mutation.isPending}
+            onClick={() => {
+              clearContinuityDraft();
+              setHandoffOpen(true);
+            }}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <ArrowRightLeft />
+            Add Handoff note
+          </Button>
+        </div>
+      ) : null}
 
       <div>
         <div className="flex items-center gap-2">
@@ -447,7 +652,7 @@ export function ProjectRoleInspector({
                     />
                   </div>
                   <div className="mt-1 text-2xs text-muted-foreground">
-                    Expires {formatDateTime(proposal.expiresAt)}
+                    Expires {formatProjectRoleDateTime(proposal.expiresAt)}
                   </div>
                   {proposal.reason ? (
                     <p className="mt-1 text-xs text-muted-foreground">
@@ -570,9 +775,9 @@ export function ProjectRoleInspector({
                   pubkey={assignment.memberPubkey}
                 />
                 <div className="mt-1 text-2xs text-muted-foreground">
-                  {formatDateTime(assignment.startedAt)} –{" "}
+                  {formatProjectRoleDateTime(assignment.startedAt)} –{" "}
                   {assignment.endedAt
-                    ? formatDateTime(assignment.endedAt)
+                    ? formatProjectRoleDateTime(assignment.endedAt)
                     : "current"}{" "}
                   · {assignment.endedReason ?? "ended"}
                 </div>
@@ -582,23 +787,87 @@ export function ProjectRoleInspector({
         )}
       </div>
 
-      {handoffs.length > 0 ? (
-        <div>
+      <div data-testid="project-role-timeline">
+        <div className="flex items-center gap-2">
+          <History className="h-3.5 w-3.5 text-muted-foreground" />
           <h4 className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Handoffs
+            Continuity timeline
           </h4>
-          <div className="mt-2 space-y-2">
-            {handoffs.map((handoff) => (
-              <div
-                className="rounded-lg border border-border/70 p-2.5 text-xs"
-                key={handoff.handoffId}
-              >
-                {handoff.cause} · {formatDateTime(handoff.createdAt)}
-              </div>
-            ))}
-          </div>
         </div>
-      ) : null}
+        {timeline.length === 0 ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            No Checkpoints or Handoffs yet.
+          </p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {timeline.map((entry) =>
+              entry.type === "checkpoint" ? (
+                <div
+                  className="rounded-lg border border-border/70 p-2.5 text-xs"
+                  key={`checkpoint-${entry.id}`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Badge variant="outline">Checkpoint</Badge>
+                    <span className="text-2xs text-muted-foreground">
+                      {formatProjectRoleDateTime(entry.createdAt)}
+                    </span>
+                  </div>
+                  <p className="mt-1.5 font-medium">
+                    {entry.item.content.summary}
+                  </p>
+                  {entry.item.content.openQuestions.length > 0 ? (
+                    <p className="mt-1 text-muted-foreground">
+                      Open · {entry.item.content.openQuestions.join(" · ")}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (
+                <div
+                  className="rounded-lg border border-border/70 p-2.5 text-xs"
+                  key={`handoff-${entry.id}`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Badge variant="secondary">
+                      Handoff · {entry.item.cause}
+                    </Badge>
+                    <span className="text-2xs text-muted-foreground">
+                      {formatProjectRoleDateTime(entry.createdAt)}
+                    </span>
+                  </div>
+                  {entry.item.content.summary ? (
+                    <p className="mt-1.5 font-medium">
+                      {entry.item.content.summary}
+                    </p>
+                  ) : null}
+                  {entry.item.content.unresolvedItems.length > 0 ? (
+                    <p className="mt-1 text-muted-foreground">
+                      Unresolved ·{" "}
+                      {entry.item.content.unresolvedItems.join(" · ")}
+                    </p>
+                  ) : null}
+                </div>
+              ),
+            )}
+            {roleHistory.hasNextPage ? (
+              <Button
+                data-testid="project-role-timeline-more"
+                disabled={roleHistory.isFetchingNextPage}
+                onClick={() => void roleHistory.fetchNextPage()}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                {roleHistory.isFetchingNextPage ? "Loading…" : "Load more"}
+              </Button>
+            ) : null}
+            {roleHistory.isError ? (
+              <p className="text-xs text-destructive">
+                Role history could not be loaded.
+              </p>
+            ) : null}
+          </div>
+        )}
+      </div>
 
       <Dialog onOpenChange={setOfferOpen} open={offerOpen}>
         <DialogContent>
@@ -700,6 +969,26 @@ export function ProjectRoleInspector({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ProjectRoleCheckpointDialog
+        draft={continuityDraft}
+        onDraftChange={setContinuityDraft}
+        onOpenChange={setCheckpointOpen}
+        onSubmit={() => void submitCheckpoint()}
+        open={checkpointOpen}
+        pending={mutation.isPending}
+        roleId={definition.roleId}
+      />
+      <ProjectRoleHandoffDialog
+        draft={continuityDraft}
+        hasCheckpoint={Boolean(checkpoints[0])}
+        onDraftChange={setContinuityDraft}
+        onOpenChange={setHandoffOpen}
+        onSubmit={() => void submitHandoff()}
+        open={handoffOpen}
+        pending={mutation.isPending}
+        roleId={definition.roleId}
+      />
     </section>
   );
 }

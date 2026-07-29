@@ -2,7 +2,9 @@
 
 use buzz_core_pkg::kind::KIND_PROJECT_VIEW_META;
 use buzz_core_pkg::PublicKey;
-use buzz_project_view_pkg::v2::{RoleCommand, RoleCommandRequest};
+use buzz_project_view_pkg::v2::{
+    HandoffCause, RoleCheckpointContent, RoleCommand, RoleCommandRequest, RoleHandoffContent,
+};
 use buzz_sdk_pkg::project_view_v2::{
     build_role_command, parse_meta_projection, V2ProjectionSource,
 };
@@ -148,6 +150,34 @@ pub enum ProjectViewRoleMutationInput {
         /// Current Assignment tenure.
         acting_assignment_id: Option<Uuid>,
     },
+    /// The current assignee appends one structured continuity Checkpoint.
+    AppendCheckpoint {
+        /// Verified Project revision on which the Human acts.
+        expected_project_revision: u64,
+        /// Project revision whose facts were reviewed.
+        based_on_project_revision: u64,
+        /// Structured Checkpoint body.
+        content: RoleCheckpointContent,
+        /// Earlier Checkpoint corrected by this entry.
+        supersedes_checkpoint_id: Option<Uuid>,
+        /// Current Assignment tenure.
+        acting_assignment_id: Option<Uuid>,
+    },
+    /// The current assignee appends a context-only Handoff note.
+    AppendHandoff {
+        /// Verified Project revision on which the Human acts.
+        expected_project_revision: u64,
+        /// Known successor Assignment in the same Role.
+        to_assignment_id: Option<Uuid>,
+        /// Checkpoint explicitly carried by this note.
+        checkpoint_id: Option<Uuid>,
+        /// Structured transition body.
+        content: RoleHandoffContent,
+        /// Member-authored cause (`planned` or `other`).
+        cause: HandoffCause,
+        /// Current Assignment tenure.
+        acting_assignment_id: Option<Uuid>,
+    },
 }
 
 /// Result of one non-replayed desktop Role intent.
@@ -180,6 +210,12 @@ pub enum ProjectViewRoleMutationResult {
         /// Commitment created or targeted by the command.
         #[serde(skip_serializing_if = "Option::is_none")]
         commitment_id: Option<Uuid>,
+        /// Checkpoint created by the command.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_id: Option<Uuid>,
+        /// Handoff created by the command.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        handoff_id: Option<Uuid>,
         /// Canonical changed entity coordinates from the receipt.
         changed_entities: Vec<RoleChangedEntity>,
     },
@@ -215,6 +251,8 @@ struct RoleReceipt {
     work_id: Option<Uuid>,
     responsible_role_id: Option<Uuid>,
     commitment_id: Option<Uuid>,
+    checkpoint_id: Option<Uuid>,
+    handoff_id: Option<Uuid>,
 }
 
 struct RoleMutationContext {
@@ -285,6 +323,8 @@ async fn execute_role_mutation(
         work_id: receipt.work_id,
         responsible_role_id: receipt.responsible_role_id,
         commitment_id: receipt.commitment_id,
+        checkpoint_id: receipt.checkpoint_id,
+        handoff_id: receipt.handoff_id,
         changed_entities: receipt.changed_entities,
     })
 }
@@ -432,6 +472,40 @@ fn prepare_role_command(input: ProjectViewRoleMutationInput) -> Result<(RoleComm
                 commitment_id: Uuid::new_v4(),
                 work_id,
                 expected_commitment_id,
+            },
+        ),
+        ProjectViewRoleMutationInput::AppendCheckpoint {
+            expected_project_revision,
+            based_on_project_revision,
+            content,
+            supersedes_checkpoint_id,
+            acting_assignment_id,
+        } => (
+            expected_project_revision,
+            acting_assignment_id,
+            RoleCommandRequest::AppendCheckpoint {
+                checkpoint_id: Uuid::new_v4(),
+                based_on_project_revision,
+                content,
+                supersedes_checkpoint_id,
+            },
+        ),
+        ProjectViewRoleMutationInput::AppendHandoff {
+            expected_project_revision,
+            to_assignment_id,
+            checkpoint_id,
+            content,
+            cause,
+            acting_assignment_id,
+        } => (
+            expected_project_revision,
+            acting_assignment_id,
+            RoleCommandRequest::AppendHandoff {
+                handoff_id: Uuid::new_v4(),
+                to_assignment_id,
+                checkpoint_id,
+                content,
+                cause,
             },
         ),
     };
@@ -615,5 +689,92 @@ mod tests {
                 && actual_work_id == work_id
                 && expected_commitment_id == observed_commitment_id
         ));
+    }
+
+    #[test]
+    fn continuity_writes_generate_append_only_ids_and_keep_the_assignment_fence() {
+        let assignment_id = Uuid::new_v4();
+        let superseded_id = Uuid::new_v4();
+        let checkpoint_content = RoleCheckpointContent {
+            summary: "The release path is verified".to_owned(),
+            current_focus: vec!["finish migration tests".to_owned()],
+            progress: vec![],
+            blockers: vec!["waiting for review".to_owned()],
+            risks: vec![],
+            open_questions: vec![],
+            next_steps: vec!["publish the handoff".to_owned()],
+            references: vec![],
+        };
+        let (checkpoint, revision) =
+            prepare_role_command(ProjectViewRoleMutationInput::AppendCheckpoint {
+                expected_project_revision: 21,
+                based_on_project_revision: 21,
+                content: checkpoint_content.clone(),
+                supersedes_checkpoint_id: Some(superseded_id),
+                acting_assignment_id: Some(assignment_id),
+            })
+            .expect("prepare Checkpoint");
+        let RoleCommandRequest::AppendCheckpoint {
+            checkpoint_id,
+            based_on_project_revision,
+            content,
+            supersedes_checkpoint_id,
+        } = checkpoint.request
+        else {
+            panic!("expected append Checkpoint");
+        };
+        assert_eq!(revision, 21);
+        assert_eq!(checkpoint.acting_assignment_id, Some(assignment_id));
+        assert!(!checkpoint_id.is_nil());
+        assert_eq!(based_on_project_revision, 21);
+        assert_eq!(content, checkpoint_content);
+        assert_eq!(supersedes_checkpoint_id, Some(superseded_id));
+
+        let successor_id = Uuid::new_v4();
+        let handoff_content = RoleHandoffContent {
+            summary: Some("Continue the release".to_owned()),
+            unresolved_items: vec!["confirm rollout".to_owned()],
+            references: vec![],
+        };
+        let (handoff, _) = prepare_role_command(ProjectViewRoleMutationInput::AppendHandoff {
+            expected_project_revision: 22,
+            to_assignment_id: Some(successor_id),
+            checkpoint_id: Some(checkpoint_id),
+            content: handoff_content.clone(),
+            cause: HandoffCause::Planned,
+            acting_assignment_id: Some(assignment_id),
+        })
+        .expect("prepare Handoff");
+        assert_eq!(handoff.acting_assignment_id, Some(assignment_id));
+        assert!(matches!(
+            handoff.request,
+            RoleCommandRequest::AppendHandoff {
+                handoff_id,
+                to_assignment_id: Some(actual_successor),
+                checkpoint_id: Some(actual_checkpoint),
+                content,
+                cause: HandoffCause::Planned,
+            } if !handoff_id.is_nil()
+                && actual_successor == successor_id
+                && actual_checkpoint == checkpoint_id
+                && content == handoff_content
+        ));
+    }
+
+    #[test]
+    fn human_handoff_cannot_claim_a_system_cause() {
+        let result = prepare_role_command(ProjectViewRoleMutationInput::AppendHandoff {
+            expected_project_revision: 3,
+            to_assignment_id: None,
+            checkpoint_id: None,
+            content: RoleHandoffContent {
+                summary: Some("invalid system claim".to_owned()),
+                unresolved_items: vec![],
+                references: vec![],
+            },
+            cause: HandoffCause::Revoked,
+            acting_assignment_id: Some(Uuid::new_v4()),
+        });
+        assert!(result.is_err());
     }
 }

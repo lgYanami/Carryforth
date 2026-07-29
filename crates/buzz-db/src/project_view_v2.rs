@@ -15,9 +15,10 @@ use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::ChangeSource;
 use buzz_project_view::v2::{
     AssignmentEndReason, CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds,
-    MemberGovernance, ProjectObjectCommand, ProposalStatus, ProposalType, RoleAssignment,
-    RoleAssignmentProposal, RoleCommand, RoleContinuityChange, RoleContinuityEntity,
-    RoleContinuityError, RoleContinuityState, RoleDefinition, RoleHandoff, RoleLevel, RoleSlot,
+    HandoffCause, MemberGovernance, ProjectObjectCommand, ProposalStatus, ProposalType,
+    RoleAssignment, RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent, RoleCommand,
+    RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityReference,
+    RoleContinuityState, RoleDefinition, RoleHandoff, RoleHandoffContent, RoleLevel, RoleSlot,
     WorkCommitment, WorkResponsibility,
 };
 use buzz_project_view::{
@@ -2296,7 +2297,16 @@ async fn load_v2_state(
     let proposals = load_proposals(tx, community_id).await?;
     let assignments = load_assignments(tx, community_id).await?;
     let commitments = load_commitments(tx, community_id).await?;
-    let handoffs = load_handoffs(tx, community_id).await?;
+    let references = load_continuity_references(tx, community_id).await?;
+    let checkpoints = load_checkpoints(tx, community_id, &references).await?;
+    let handoffs = load_handoffs(tx, community_id, &references).await?;
+    let referenceable_object_ids = sqlx::query_scalar(
+        "SELECT object_id FROM project_view_objects \
+         WHERE community_id = $1 ORDER BY object_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
     let state = RoleContinuityState::from_complete_snapshot(
         project_revision,
         roles,
@@ -2305,7 +2315,9 @@ async fn load_v2_state(
         proposals,
         assignments,
         commitments,
+        checkpoints,
         handoffs,
+        referenceable_object_ids,
     )?;
     Ok(LoadedV2State {
         state,
@@ -2831,13 +2843,156 @@ async fn load_commitments(
         .collect()
 }
 
+type ContinuityReferences = BTreeMap<(RoleContinuityEntity, Uuid), Vec<RoleContinuityReference>>;
+
+async fn load_continuity_references(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+) -> ProjectViewV2WriteResult<ContinuityReferences> {
+    let rows = sqlx::query(
+        "SELECT owner_type, owner_id, reference_type, object_id, assignment_id, \
+                commitment_id, nostr_event_id, label \
+         FROM project_role_continuity_references \
+         WHERE community_id = $1 ORDER BY owner_type, owner_id, position",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut references = ContinuityReferences::new();
+    for row in rows {
+        let owner_type: String = row.try_get("owner_type")?;
+        let entity_type = match owner_type.as_str() {
+            "checkpoint" => RoleContinuityEntity::RoleCheckpoint,
+            "handoff" => RoleContinuityEntity::RoleHandoff,
+            _ => {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "invalid Role continuity reference owner type {owner_type}"
+                )));
+            }
+        };
+        let reference_type: String = row.try_get("reference_type")?;
+        let label: Option<String> = row.try_get("label")?;
+        let reference = match reference_type.as_str() {
+            "object" => RoleContinuityReference::Object {
+                object_id: row
+                    .try_get::<Option<Uuid>, _>("object_id")?
+                    .ok_or_else(|| {
+                        ProjectViewV2WriteError::InvalidCommit(
+                            "object reference has no object_id".to_owned(),
+                        )
+                    })?,
+                label,
+            },
+            "assignment" => RoleContinuityReference::Assignment {
+                assignment_id: row
+                    .try_get::<Option<Uuid>, _>("assignment_id")?
+                    .ok_or_else(|| {
+                        ProjectViewV2WriteError::InvalidCommit(
+                            "Assignment reference has no assignment_id".to_owned(),
+                        )
+                    })?,
+                label,
+            },
+            "commitment" => RoleContinuityReference::Commitment {
+                commitment_id: row
+                    .try_get::<Option<Uuid>, _>("commitment_id")?
+                    .ok_or_else(|| {
+                        ProjectViewV2WriteError::InvalidCommit(
+                            "Commitment reference has no commitment_id".to_owned(),
+                        )
+                    })?,
+                label,
+            },
+            "nostr_event" => RoleContinuityReference::NostrEvent {
+                event_id: event_id(
+                    row.try_get::<Option<Vec<u8>>, _>("nostr_event_id")?
+                        .ok_or_else(|| {
+                            ProjectViewV2WriteError::InvalidCommit(
+                                "Nostr reference has no event_id".to_owned(),
+                            )
+                        })?,
+                    "continuity_reference.nostr_event_id",
+                )?,
+                label,
+            },
+            _ => {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "invalid Role continuity reference type {reference_type}"
+                )));
+            }
+        };
+        references
+            .entry((entity_type, row.try_get("owner_id")?))
+            .or_default()
+            .push(reference);
+    }
+    Ok(references)
+}
+
+async fn load_checkpoints(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    references: &ContinuityReferences,
+) -> ProjectViewV2WriteResult<Vec<RoleCheckpoint>> {
+    let rows = sqlx::query(
+        "SELECT checkpoint_id, role_id, assignment_id, based_on_project_revision, \
+                body, supersedes_checkpoint_id, created_by, created_at, \
+                entity_revision, project_revision \
+         FROM project_role_checkpoints WHERE community_id = $1 ORDER BY checkpoint_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let checkpoint_id: Uuid = row.try_get("checkpoint_id")?;
+            let mut content: RoleCheckpointContent = serde_json::from_value(row.try_get("body")?)
+                .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "stored Checkpoint content is invalid: {error}"
+                ))
+            })?;
+            content.references = references
+                .get(&(RoleContinuityEntity::RoleCheckpoint, checkpoint_id))
+                .cloned()
+                .unwrap_or_default();
+            Ok(RoleCheckpoint {
+                checkpoint_id,
+                role_id: row.try_get("role_id")?,
+                assignment_id: row.try_get("assignment_id")?,
+                based_on_project_revision: db_revision(
+                    row.try_get("based_on_project_revision")?,
+                    "checkpoint.based_on_project_revision",
+                )?,
+                content,
+                supersedes_checkpoint_id: row.try_get("supersedes_checkpoint_id")?,
+                created_by: public_key(
+                    &row.try_get::<Vec<u8>, _>("created_by")?,
+                    "checkpoint.created_by",
+                )?,
+                created_at: row.try_get("created_at")?,
+                entity_revision: db_revision(
+                    row.try_get("entity_revision")?,
+                    "checkpoint.entity_revision",
+                )?,
+                project_revision: db_revision(
+                    row.try_get("project_revision")?,
+                    "checkpoint.project_revision",
+                )?,
+            })
+        })
+        .collect()
+}
+
 async fn load_handoffs(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
+    references: &ContinuityReferences,
 ) -> ProjectViewV2WriteResult<Vec<RoleHandoff>> {
     let rows = sqlx::query(
         "SELECT handoff_id, role_id, from_assignment_id, to_assignment_id, \
-                body, created_at, entity_revision, project_revision \
+                checkpoint_id, body, system_generated, created_by, created_at, \
+                entity_revision, project_revision \
          FROM project_role_handoffs WHERE community_id = $1 ORDER BY handoff_id",
     )
     .bind(community_id.as_uuid())
@@ -2845,6 +3000,7 @@ async fn load_handoffs(
     .await?;
     rows.into_iter()
         .map(|row| {
+            let handoff_id: Uuid = row.try_get("handoff_id")?;
             let body: Value = row.try_get("body")?;
             let cause = body
                 .get("cause")
@@ -2854,7 +3010,7 @@ async fn load_handoffs(
                         "stored Handoff body has no cause".to_owned(),
                     )
                 })
-                .and_then(parse_end_reason)?;
+                .and_then(parse_handoff_cause)?;
             let affected_commitment_ids = body
                 .get("affected_commitment_ids")
                 .cloned()
@@ -2866,8 +3022,23 @@ async fn load_handoffs(
                     ))
                 })?
                 .unwrap_or_default();
+            let mut content = body
+                .get("content")
+                .cloned()
+                .map(serde_json::from_value::<RoleHandoffContent>)
+                .transpose()
+                .map_err(|error| {
+                    ProjectViewV2WriteError::InvalidCommit(format!(
+                        "stored Handoff content is invalid: {error}"
+                    ))
+                })?
+                .unwrap_or_default();
+            content.references = references
+                .get(&(RoleContinuityEntity::RoleHandoff, handoff_id))
+                .cloned()
+                .unwrap_or_default();
             Ok(RoleHandoff {
-                handoff_id: row.try_get("handoff_id")?,
+                handoff_id,
                 role_id: row.try_get("role_id")?,
                 from_assignment_id: row
                     .try_get::<Option<Uuid>, _>("from_assignment_id")?
@@ -2877,8 +3048,15 @@ async fn load_handoffs(
                         )
                     })?,
                 to_assignment_id: row.try_get("to_assignment_id")?,
+                checkpoint_id: row.try_get("checkpoint_id")?,
                 affected_commitment_ids,
+                content,
                 cause,
+                system_generated: row.try_get("system_generated")?,
+                created_by: row
+                    .try_get::<Option<Vec<u8>>, _>("created_by")?
+                    .map(|bytes| public_key(&bytes, "handoff.created_by"))
+                    .transpose()?,
                 created_at: row.try_get("created_at")?,
                 entity_revision: db_revision(row.try_get("entity_revision")?, "entity_revision")?,
                 project_revision: db_revision(
@@ -3075,6 +3253,15 @@ async fn load_old_projection_ids(
             RoleContinuityEntity::WorkCommitment => sqlx::query_scalar(
                 "SELECT projection_event_id FROM project_work_commitments \
                  WHERE community_id = $1 AND commitment_id = $2 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .bind(change.entity_id())
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten(),
+            RoleContinuityEntity::RoleCheckpoint => sqlx::query_scalar(
+                "SELECT projection_event_id FROM project_role_checkpoints \
+                 WHERE community_id = $1 AND checkpoint_id = $2 FOR UPDATE",
             )
             .bind(community_id.as_uuid())
             .bind(change.entity_id())
@@ -3304,6 +3491,12 @@ async fn persist_changes(
     }) {
         persist_assignment(tx, community_id, change_id, canonical_time, assignment).await?;
     }
+    for checkpoint in changes.iter().filter_map(|change| match change {
+        RoleContinuityChange::Checkpoint(checkpoint) => Some(checkpoint),
+        _ => None,
+    }) {
+        persist_checkpoint(tx, community_id, change_id, checkpoint).await?;
+    }
     for handoff in changes.iter().filter_map(|change| match change {
         RoleContinuityChange::Handoff(handoff) => Some(handoff),
         _ => None,
@@ -3311,6 +3504,69 @@ async fn persist_changes(
         persist_handoff(tx, community_id, change_id, handoff).await?;
     }
     Ok(())
+}
+
+async fn persist_checkpoint(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    change_id: &[u8],
+    checkpoint: &RoleCheckpoint,
+) -> ProjectViewV2WriteResult<()> {
+    let mut stored_content = checkpoint.content.clone();
+    stored_content.references.clear();
+    let body = serde_json::to_value(stored_content).map_err(|error| {
+        ProjectViewV2WriteError::InvalidCommit(format!(
+            "cannot serialize Checkpoint content: {error}"
+        ))
+    })?;
+    let created_by = checkpoint.created_by.to_bytes();
+    let result = sqlx::query(
+        "INSERT INTO project_role_checkpoints \
+            (community_id, checkpoint_id, role_id, assignment_id, \
+             based_on_project_revision, body, supersedes_checkpoint_id, \
+             created_by, created_at, source_change_id, last_change_id, \
+             entity_revision, project_revision) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(community_id.as_uuid())
+    .bind(checkpoint.checkpoint_id)
+    .bind(checkpoint.role_id)
+    .bind(checkpoint.assignment_id)
+    .bind(revision_i64(
+        checkpoint.based_on_project_revision,
+        "checkpoint.based_on_project_revision",
+    )?)
+    .bind(body)
+    .bind(checkpoint.supersedes_checkpoint_id)
+    .bind(created_by.as_slice())
+    .bind(checkpoint.created_at)
+    .bind(change_id)
+    .bind(revision_i64(
+        checkpoint.entity_revision,
+        "checkpoint.entity_revision",
+    )?)
+    .bind(revision_i64(
+        checkpoint.project_revision,
+        "checkpoint.project_revision",
+    )?)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+            "Checkpoint {} already exists",
+            checkpoint.checkpoint_id
+        )));
+    }
+    persist_continuity_references(
+        tx,
+        community_id,
+        change_id,
+        RoleContinuityEntity::RoleCheckpoint,
+        checkpoint.checkpoint_id,
+        &checkpoint.content.references,
+    )
+    .await
 }
 
 async fn persist_commitment(
@@ -3527,16 +3783,20 @@ async fn persist_handoff(
     change_id: &[u8],
     handoff: &RoleHandoff,
 ) -> ProjectViewV2WriteResult<()> {
+    let mut stored_content = handoff.content.clone();
+    stored_content.references.clear();
     let body = json!({
         "cause": handoff.cause.as_str(),
         "affected_commitment_ids": handoff.affected_commitment_ids,
+        "content": stored_content,
     });
+    let created_by = handoff.created_by.map(PublicKey::to_bytes);
     let result = sqlx::query(
         "INSERT INTO project_role_handoffs \
             (community_id, handoff_id, role_id, from_assignment_id, to_assignment_id, \
-             body, system_generated, created_by, created_at, source_change_id, \
-             last_change_id, entity_revision, project_revision) \
-         VALUES ($1,$2,$3,$4,$5,$6,TRUE,NULL,$7,$8,$8,$9,$10) \
+             checkpoint_id, body, system_generated, created_by, created_at, \
+             source_change_id, last_change_id, entity_revision, project_revision) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13) \
          ON CONFLICT DO NOTHING",
     )
     .bind(community_id.as_uuid())
@@ -3544,7 +3804,10 @@ async fn persist_handoff(
     .bind(handoff.role_id)
     .bind(handoff.from_assignment_id)
     .bind(handoff.to_assignment_id)
+    .bind(handoff.checkpoint_id)
     .bind(body)
+    .bind(handoff.system_generated)
+    .bind(created_by.as_ref().map(<[u8; 32]>::as_slice))
     .bind(handoff.created_at)
     .bind(change_id)
     .bind(revision_i64(
@@ -3562,6 +3825,107 @@ async fn persist_handoff(
             "Handoff {} already exists",
             handoff.handoff_id
         )));
+    }
+    persist_continuity_references(
+        tx,
+        community_id,
+        change_id,
+        RoleContinuityEntity::RoleHandoff,
+        handoff.handoff_id,
+        &handoff.content.references,
+    )
+    .await
+}
+
+async fn persist_continuity_references(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    change_id: &[u8],
+    owner_type: RoleContinuityEntity,
+    owner_id: Uuid,
+    references: &[RoleContinuityReference],
+) -> ProjectViewV2WriteResult<()> {
+    let owner_type = match owner_type {
+        RoleContinuityEntity::RoleCheckpoint => "checkpoint",
+        RoleContinuityEntity::RoleHandoff => "handoff",
+        _ => {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "only Checkpoints and Handoffs own continuity references".to_owned(),
+            ));
+        }
+    };
+    for (position, reference) in references.iter().enumerate() {
+        let (reference_type, object_id, assignment_id, commitment_id, nostr_event_id, label) =
+            match reference {
+                RoleContinuityReference::Object { object_id, label } => (
+                    "object",
+                    Some(*object_id),
+                    None,
+                    None,
+                    None,
+                    label.as_deref(),
+                ),
+                RoleContinuityReference::Assignment {
+                    assignment_id,
+                    label,
+                } => (
+                    "assignment",
+                    None,
+                    Some(*assignment_id),
+                    None,
+                    None,
+                    label.as_deref(),
+                ),
+                RoleContinuityReference::Commitment {
+                    commitment_id,
+                    label,
+                } => (
+                    "commitment",
+                    None,
+                    None,
+                    Some(*commitment_id),
+                    None,
+                    label.as_deref(),
+                ),
+                RoleContinuityReference::NostrEvent { event_id, label } => (
+                    "nostr_event",
+                    None,
+                    None,
+                    None,
+                    Some(event_id.to_bytes()),
+                    label.as_deref(),
+                ),
+            };
+        let result = sqlx::query(
+            "INSERT INTO project_role_continuity_references \
+                (community_id, owner_type, owner_id, position, reference_type, \
+                 object_id, assignment_id, commitment_id, nostr_event_id, label, \
+                 source_change_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner_type)
+        .bind(owner_id)
+        .bind(i32::try_from(position).map_err(|_| {
+            ProjectViewV2WriteError::InvalidCommit(
+                "continuity reference position exceeds PostgreSQL INT".to_owned(),
+            )
+        })?)
+        .bind(reference_type)
+        .bind(object_id)
+        .bind(assignment_id)
+        .bind(commitment_id)
+        .bind(nostr_event_id.as_ref().map(<[u8; 32]>::as_slice))
+        .bind(label)
+        .bind(change_id)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                "continuity reference {owner_type}/{owner_id}/{position} already exists"
+            )));
+        }
     }
     Ok(())
 }
@@ -4230,6 +4594,17 @@ async fn update_projection_pointer(
             .execute(&mut **tx)
             .await?
         }
+        RoleContinuityEntity::RoleCheckpoint => {
+            sqlx::query(
+                "UPDATE project_role_checkpoints SET projection_event_id = $3 \
+             WHERE community_id = $1 AND checkpoint_id = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(entity_id)
+            .bind(event_id)
+            .execute(&mut **tx)
+            .await?
+        }
         RoleContinuityEntity::RoleHandoff => {
             sqlx::query(
                 "UPDATE project_role_handoffs SET projection_event_id = $3 \
@@ -4357,6 +4732,18 @@ fn role_receipt(
                 Value::String(commitment_id.to_string()),
             );
         }
+        buzz_project_view::v2::RoleCommandRequest::AppendCheckpoint { checkpoint_id, .. } => {
+            result.insert(
+                "checkpoint_id".to_owned(),
+                Value::String(checkpoint_id.to_string()),
+            );
+        }
+        buzz_project_view::v2::RoleCommandRequest::AppendHandoff { handoff_id, .. } => {
+            result.insert(
+                "handoff_id".to_owned(),
+                Value::String(handoff_id.to_string()),
+            );
+        }
     }
     Value::Object(result)
 }
@@ -4426,6 +4813,21 @@ fn parse_commitment_end_reason(value: &str) -> ProjectViewV2WriteResult<Commitme
         "work_closed" => Ok(CommitmentEndReason::WorkClosed),
         _ => Err(ProjectViewV2WriteError::InvalidCommit(format!(
             "invalid Commitment end reason {value}"
+        ))),
+    }
+}
+
+fn parse_handoff_cause(value: &str) -> ProjectViewV2WriteResult<HandoffCause> {
+    match value {
+        "planned" => Ok(HandoffCause::Planned),
+        "revoked" => Ok(HandoffCause::Revoked),
+        "replaced" => Ok(HandoffCause::Replaced),
+        "membership_ended" => Ok(HandoffCause::MembershipEnded),
+        "unrecoverable" => Ok(HandoffCause::Unrecoverable),
+        "role_deactivated" => Ok(HandoffCause::RoleDeactivated),
+        "other" => Ok(HandoffCause::Other),
+        _ => Err(ProjectViewV2WriteError::InvalidCommit(format!(
+            "invalid Handoff cause {value}"
         ))),
     }
 }

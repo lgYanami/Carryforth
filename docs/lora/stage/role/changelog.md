@@ -1,5 +1,87 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 6：Checkpoint、Handoff 与完整 Role Brief
+
+### Project-owned 追加式连续性
+
+- 增加 closed、结构化的 `RoleCheckpointContent`，覆盖摘要、当前关注、进展、阻塞、风险、
+  未决问题、下一步和 typed references。Checkpoint 固定归属于 Role、active Assignment
+  与 Member；创建后不可更新或删除，修正只能追加带 `supersedes_checkpoint_id` 的新记录。
+- typed reference 支持 Project View object、Assignment、Commitment 和本 Community 的
+  Nostr event。领域层拒绝缺失的规范对象，数据库 deferred constraint 再拒绝跨
+  Community、错误 owner/source 或不存在的 event。
+- 完整 Handoff 增加 cause、可选 Checkpoint、受影响 Commitment、未决事项与引用。
+  Member 可以在 active Assignment 期间追加 planned/other 上下文，但该动作不结束任期；
+  正式替换仍由 Relay 在同一事务中生成 system Handoff。
+- replacement system Handoff 自动携带旧任期的最新 Checkpoint、被终止的 Commitment、
+  对应 Work 引用和待接续事项。即使前任没有撰写 Handoff，也保留 Project View、Work
+  responsibility 和 waiting-for-continuation 作为恢复路径，不改写 Work/Issue 或前任归因。
+
+### 规范存储与可信投影
+
+- additive migration `0029_project_role_history.sql` 补齐 Checkpoint revision basis、
+  supersedes、Handoff Checkpoint 关系、append-only entity revision 和按 Role/revision 的
+  历史索引；结构化引用继续进入 `project_role_continuity_references`，不塞回 Role 行。
+- append-only trigger 禁止语义更新和删除，只允许可信 reprojection 重绑
+  `projection_event_id`。deferred validation 绑定 source change 的 project revision、
+  operation、actor、Assignment/Role/Commitment 归因与同 Project reference。
+- Checkpoint/Handoff、引用、canonical rows、`40903` signed entity heads、旧 projection
+  retirement、`40904` meta count/revision 和 write receipt 在同一 Project lock 事务中提交；
+  任一步失败均不会留下部分连续性状态。
+
+### 有界可信读取与历史分页
+
+- 现有 `POST /query` 的 `buzz_project_view` extension 增加
+  `v2_current_entities` 与 `role_history` scope，不增加 Role 专用 HTTP endpoint。两者继续
+  返回普通、可独立验签的 `40903` projection event。
+- 默认 snapshot 精确读取当前 Role、open Proposal、active Assignment、active
+  Commitment 及其必要依赖，并为每个未删除 Role 只附带最新 Checkpoint 和最近 3 条
+  Handoff。默认 View 与每轮 Role Brief 的读取量不再随已结束任期和连续性历史线性增长。
+- 历史页固定 `projection_generation + project_revision`，按
+  `project_revision DESC + entity type + UUID DESC` 做 keyset pagination，并支持
+  Role、Assignment、Member 和实体类型过滤。revision 改变返回 conflict；伪造、跨 Role
+  或跨类型 cursor fail closed，客户端不能拼接不同 snapshot 的页面。
+- 共享 `VerifiedRoleBriefSnapshot` 区分完整历史与有界历史覆盖：当前 object、Proposal、
+  Assignment 和 Commitment count 仍与 signed meta 精确一致；Checkpoint/Handoff
+  slice 只能小于等于 meta 总数，已携带的历史依赖仍逐项验证，不把部分历史伪装成完整
+  snapshot。
+
+### 完整 Role Brief、Agent 与 Human 入口
+
+- 共享 `VerifiedRoleBriefSnapshot` 验证有界、可接续的 append-only heads；Role Brief 按
+  `project_revision + UUID` 选择最新 Checkpoint，携带最近 Handoff、完整结构化字段及每段
+  signed source reference。没有 Handoff 时仍从 Profile/Goal、responsible Work、
+  Commitment 与最新 Checkpoint 组装可接续上下文。
+- ACP 继续在每个完整 turn 前重建同一个 verified Brief。assigned Brief 现在明确要求
+  Agent 在进展、阻塞、风险、未决问题或下一步发生重要变化后追加结构化 Checkpoint；
+  读取使用默认有界实体页；写入仍由 managed CLI 在签名前刷新 Assignment fence，Relay
+  做最终 fencing。
+- CLI 增加 `buzz roles checkpoint append|list` 与
+  `buzz roles handoff append|list`；Proposal、ended Assignment、Checkpoint 和 Handoff
+  列表均提供真实服务端 newest-first limit/cursor 页面。JSON 文件或 stdin 先进入 typed
+  schema；ended Assignment、错误 supersedes、错误 reference 或伪造 system cause 均不能
+  形成写入。
+- Desktop Role Inspector 展示最新 Brief 和有界 Checkpoint/Handoff 合并时间线；“Load
+  more” 通过 infinite query 调用原生 revision-pinned 历史页并按实体 ID 去重。当前 Human
+  assignee 可以填写结构化 Checkpoint 或 context-only Handoff。React 只提交
+  revision-fenced intent，Tauri 使用 SDK builder 签名，冲突后刷新但不重放旧意图。
+
+### 验证与范围
+
+- 领域测试覆盖连续 Checkpoint、追加式纠正、ended Assignment 拒绝、缺失 reference、
+  member Handoff 不卸任，以及 replacement 自动携带 Checkpoint/Work/Commitment。
+- PostgreSQL 纵向测试覆盖从 `0024` 升级、checked-in schema 冷建库、规范行/引用/投影/meta
+  原子提交、错误 Nostr reference 拒绝、history UPDATE/DELETE 拒绝、current/history
+  翻页无重复，以及跨 Role cursor 拒绝。
+- `buzz-project-view` `18/18`、`buzz-sdk` `250/250`（含 Role Brief 定向 `6/6`）、
+  `buzz-cli` `261/261`、`buzz-acp` `600/600`、Desktop Tauri `1644/1644` 非 ignored
+  测试、Desktop `3507/3507` 以及 Project View Playwright `28/28` 通过；`buzz-db`
+  `87/87` 非 ignored 测试、新增 Relay bridge parser 测试和 PostgreSQL 纵向测试通过。
+  workspace/Desktop all-targets check 与 clippy、TypeScript、Biome 和各 Desktop guard
+  均通过。
+- 阶段 6 至此形成 Role Continuity v0 的人工指派、替换和接续闭环。可信 runtime lease、
+  epoch、supervisor evidence 与自动 `unrecoverable` 仍属于阶段 7。
+
 ## 2026-07-29 — 阶段 5：Work Responsibility 与 Commitment
 
 ### Project-owned Work 责任

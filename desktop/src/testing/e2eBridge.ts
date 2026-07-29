@@ -57,6 +57,7 @@ import type {
   RawProjectViewMutationResult,
   RawProjectViewRoleMutationResult,
 } from "@/shared/api/tauriProjectView";
+import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRoleHistory";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -303,6 +304,7 @@ type E2eConfig = {
     projectViewRoleMutationResult?: RawProjectViewRoleMutationResult;
     projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
     projectViewAfterRoleMutation?: RawProjectViewLoadResult;
+    projectViewRoleHistoryPages?: RawProjectRoleHistoryPage[];
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1181,6 +1183,8 @@ declare global {
     __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: unknown[];
     /** Typed Project View Role intents submitted during the current test. */
     __BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?: unknown[];
+    /** Revision-pinned Role history page requests made during the current test. */
+    __BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__?: unknown[];
     /** Replace the next trusted Project View command result. */
     __BUZZ_E2E_SET_PROJECT_VIEW__?: (
       result: RawProjectViewLoadResult,
@@ -9162,6 +9166,7 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
   window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__ = [];
+  window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__ = [];
   window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
     if (!config.mock) {
       throw new Error("Mock Project View is unavailable in relay mode.");
@@ -11022,6 +11027,25 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig?.mock?.projectViewsByRelayUrl?.[mockAppliedRelayUrl] ??
           activeConfig?.mock?.projectView ?? { status: "unsupported" }
         );
+      case "get_project_view_role_history": {
+        const input = structuredClone(
+          (payload as { input?: unknown }).input ?? payload,
+        );
+        window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__?.push(input);
+        const pages = activeConfig?.mock?.projectViewRoleHistoryPages;
+        if (pages && pages.length > 0) {
+          return structuredClone(pages.shift());
+        }
+        const request = input as {
+          project_revision?: number;
+          projection_generation?: number;
+        };
+        return {
+          project_revision: request.project_revision ?? 1,
+          projection_generation: request.projection_generation ?? 1,
+          items: [],
+        };
+      }
       case "mutate_project_view": {
         window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.push(
           structuredClone((payload as { input?: unknown }).input ?? payload),

@@ -375,6 +375,12 @@ pub enum RolesCmd {
         /// Limit to one effective status.
         #[arg(long, value_enum)]
         status: Option<RoleProposalStatusArg>,
+        /// Maximum history entries to scan and return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
     },
     /// Request a Role as the current signer
     Request {
@@ -429,6 +435,16 @@ pub enum RolesCmd {
     Work {
         #[command(subcommand)]
         command: RoleWorkCmd,
+    },
+    /// Append or page through structured Role Checkpoints
+    Checkpoint {
+        #[command(subcommand)]
+        command: RoleCheckpointCmd,
+    },
+    /// Append or page through Role Handoff history
+    Handoff {
+        #[command(subcommand)]
+        command: RoleHandoffCmd,
     },
 }
 
@@ -527,6 +543,12 @@ pub enum RoleAssignmentCmd {
         /// Include ended tenure history.
         #[arg(long)]
         include_ended: bool,
+        /// Maximum history entries to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
     },
     /// Read one Assignment by UUID
     Get {
@@ -642,6 +664,94 @@ pub enum RoleWorkCmd {
         /// Current Assignment fence; managed runtimes resolve it automatically.
         #[arg(long)]
         acting_assignment: Option<Uuid>,
+    },
+}
+
+/// Commands targeting append-only Role Checkpoints.
+#[derive(Subcommand)]
+pub enum RoleCheckpointCmd {
+    /// Append a structured Checkpoint through the current Assignment
+    Append {
+        /// JSON file containing `RoleCheckpointContent`, or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Reviewed Project revision; defaults to the expected revision.
+        #[arg(long)]
+        based_on_project_revision: Option<u64>,
+        /// Earlier Checkpoint from this Assignment being corrected.
+        #[arg(long)]
+        supersedes: Option<Uuid>,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Page through Checkpoint history, newest first
+    List {
+        /// Limit to one Role.
+        #[arg(long)]
+        role: Option<Uuid>,
+        /// Limit to one Assignment.
+        #[arg(long)]
+        assignment: Option<Uuid>,
+        /// Maximum history entries to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
+    },
+}
+
+/// Member-authored Handoff causes.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RoleHandoffCauseArg {
+    /// A planned transition or context transfer.
+    Planned,
+    /// Other explicitly described transition context.
+    Other,
+}
+
+/// Commands targeting append-only Role Handoffs.
+#[derive(Subcommand)]
+pub enum RoleHandoffCmd {
+    /// Append a Handoff note without ending the Assignment
+    Append {
+        /// JSON file containing `RoleHandoffContent`, or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Known successor Assignment in the same Role.
+        #[arg(long)]
+        to_assignment: Option<Uuid>,
+        /// Checkpoint explicitly carried into this Handoff.
+        #[arg(long)]
+        checkpoint: Option<Uuid>,
+        /// Member-authored transition cause.
+        #[arg(long, value_enum, default_value = "planned")]
+        cause: RoleHandoffCauseArg,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Page through Handoff history, newest first
+    List {
+        /// Limit to one Role.
+        #[arg(long)]
+        role: Option<Uuid>,
+        /// Limit to one source Assignment.
+        #[arg(long)]
+        assignment: Option<Uuid>,
+        /// Maximum history entries to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
     },
 }
 
@@ -2311,8 +2421,10 @@ mod tests {
             vec![
                 "assignment",
                 "brief",
+                "checkpoint",
                 "current",
                 "get",
+                "handoff",
                 "list",
                 "offer",
                 "proposal",
@@ -2339,6 +2451,19 @@ mod tests {
             work_names,
             vec!["accept", "assign", "recommit", "release", "unassign"]
         );
+        for history_command in ["checkpoint", "handoff"] {
+            let history = roles
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == history_command)
+                .unwrap_or_else(|| panic!("roles {history_command} command"));
+            let mut history_names = history
+                .get_subcommands()
+                .map(|subcommand| subcommand.get_name().to_owned())
+                .filter(|name| name != "help")
+                .collect::<Vec<_>>();
+            history_names.sort();
+            assert_eq!(history_names, vec!["append", "list"]);
+        }
         assert_eq!(
             names(&cmd, "channels"),
             vec![
@@ -2458,7 +2583,7 @@ mod tests {
             ("project-view", 6),
             ("reactions", 3),
             ("repos", 4),
-            ("roles", 10),
+            ("roles", 12),
             ("social", 7),
             ("upload", 1),
             ("users", 4),

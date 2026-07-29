@@ -8,7 +8,7 @@ use buzz_core::kind::{
 };
 use buzz_sdk::project_view_v2::{
     parse_entity_projection, parse_membership_projection, parse_meta_projection,
-    parse_project_object_projection, V2MembershipProjection, V2MetaProjection,
+    parse_project_object_projection, V2EntityProjection, V2MembershipProjection, V2MetaProjection,
 };
 use buzz_sdk::role_brief::{
     render_role_brief_markdown, unavailable_role_brief_markdown, RoleBriefMemberState,
@@ -17,12 +17,14 @@ use buzz_sdk::role_brief::{
 use chrono::Utc;
 use nostr::{Alphabet, Event, Filter, Kind, PublicKey, SingleLetterTag};
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::relay::RestClient;
 
 const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 const ROLE_BRIEF_TIMEOUT: Duration = Duration::from_secs(12);
 const SNAPSHOT_ATTEMPTS: usize = 3;
+const V2_ENTITY_PAGE_SIZE: usize = 500;
 
 /// Dynamic prompt section plus machine-readable resolution metadata.
 #[derive(Debug, Clone)]
@@ -114,24 +116,18 @@ impl RoleBriefResolver {
                 .kind(Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
                 .author(relay_pubkey)
                 .custom_tags(t_tag, ["buzz-project-view-v2-object"]);
-            let entity_filter = Filter::new()
-                .kind(Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
-                .author(relay_pubkey)
-                .custom_tags(t_tag, ["buzz-project-view-v2-entity"]);
             let ordinary_events = parse_events(
                 self.rest_client
                     .query(&[ordinary_filter])
                     .await
                     .map_err(|error| error.to_string())?,
             )?;
-            let entity_events = parse_events(
-                self.rest_client
-                    .query(&[entity_filter])
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )?;
+            let entity_projections = self
+                .read_current_entity_projections(relay_pubkey, &before)
+                .await?;
 
-            let mut event_ids = HashSet::with_capacity(ordinary_events.len() + entity_events.len());
+            let mut event_ids =
+                HashSet::with_capacity(ordinary_events.len() + entity_projections.len());
             let mut object_projections = Vec::with_capacity(ordinary_events.len());
             for event in ordinary_events {
                 if !event_ids.insert(event.id) {
@@ -142,15 +138,10 @@ impl RoleBriefResolver {
                         .map_err(|error| error.to_string())?,
                 );
             }
-            let mut entity_projections = Vec::with_capacity(entity_events.len());
-            for event in entity_events {
-                if !event_ids.insert(event.id) {
+            for projection in &entity_projections {
+                if !event_ids.insert(projection.event_id) {
                     return Err("entity query returned a duplicate event".to_owned());
                 }
-                entity_projections.push(
-                    parse_entity_projection(&event, &relay_pubkey, before.project_id)
-                        .map_err(|error| error.to_string())?,
-                );
             }
             let membership = self.read_membership(relay_pubkey, &before).await?;
             let after = self.read_meta(relay_pubkey).await?;
@@ -161,7 +152,7 @@ impl RoleBriefResolver {
                 }
                 return Err("Project View changed during every bounded snapshot attempt".to_owned());
             }
-            return VerifiedRoleBriefSnapshot::new(
+            return VerifiedRoleBriefSnapshot::new_with_partial_history(
                 before,
                 membership,
                 object_projections,
@@ -170,6 +161,59 @@ impl RoleBriefResolver {
             .map_err(|error| error.to_string());
         }
         Err("Project View snapshot could not be stabilized".to_owned())
+    }
+
+    async fn read_current_entity_projections(
+        &self,
+        relay_pubkey: PublicKey,
+        meta: &V2MetaProjection,
+    ) -> Result<Vec<V2EntityProjection>, String> {
+        let mut projections = Vec::new();
+        let mut event_ids = HashSet::new();
+        let mut after: Option<Value> = None;
+        loop {
+            let mut extension = json!({
+                "scope": "v2_current_entities",
+                "revision": meta.project_revision,
+                "projection_generation": meta.projection_generation,
+            });
+            if let Some(cursor) = &after {
+                extension["after"] = cursor.clone();
+            }
+            let filter = json!({
+                "kinds": [KIND_PROJECT_VIEW_OBJECT],
+                "authors": [relay_pubkey.to_hex()],
+                "#t": ["buzz-project-view-v2-entity"],
+                "limit": V2_ENTITY_PAGE_SIZE,
+                "buzz_project_view": extension,
+            });
+            let events = parse_events(
+                self.rest_client
+                    .query_raw(&[filter])
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )?;
+            if events.len() > V2_ENTITY_PAGE_SIZE {
+                return Err("current-entity page exceeded its requested limit".to_owned());
+            }
+            let page_len = events.len();
+            for event in events {
+                if !event_ids.insert(event.id) {
+                    return Err("current-entity pages returned a duplicate signed event".to_owned());
+                }
+                let projection = parse_entity_projection(&event, &relay_pubkey, meta.project_id)
+                    .map_err(|error| error.to_string())?;
+                after = Some(json!({
+                    "entity_type": projection.entity.entity_type().as_str(),
+                    "entity_id": projection.entity.entity_id(),
+                }));
+                projections.push(projection);
+            }
+            if page_len < V2_ENTITY_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(projections)
     }
 
     async fn read_relay_identity(&self) -> Result<PublicKey, String> {

@@ -251,11 +251,26 @@ fn extract_channel_from_filter(filter: &nostr::Filter) -> Option<uuid::Uuid> {
 const BRIDGE_FEED_MAX_LIMIT: i64 = 100;
 const BRIDGE_THREAD_MAX_LIMIT: u32 = 500;
 
-struct ProjectViewPageRequest {
-    revision: u64,
-    projection_generation: u64,
-    after: Option<buzz_db::project_view::ProjectViewSnapshotCursor>,
-    limit: u16,
+enum ProjectViewPageRequest {
+    ActiveObjects {
+        revision: u64,
+        projection_generation: u64,
+        after: Option<buzz_db::project_view::ProjectViewSnapshotCursor>,
+        limit: u16,
+    },
+    V2CurrentEntities {
+        revision: u64,
+        projection_generation: u64,
+        after: Option<buzz_db::project_view::ProjectViewV2EntityCursor>,
+        limit: u16,
+    },
+    RoleHistory {
+        revision: u64,
+        projection_generation: u64,
+        filter: buzz_db::project_view::ProjectViewRoleHistoryFilter,
+        after: Option<buzz_db::project_view::ProjectViewRoleHistoryCursor>,
+        limit: u16,
+    },
 }
 
 fn parse_project_view_page_request(
@@ -289,19 +304,6 @@ fn parse_project_view_page_request(
             "buzz_project_view pagination contains an unsupported outer field",
         ));
     }
-    if raw.get("kinds")
-        != Some(&serde_json::json!([
-            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT
-        ]))
-        || raw.get("#t") != Some(&serde_json::json!(["buzz-project-view-active"]))
-        || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
-    {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "buzz_project_view pagination requires exact kinds, authors, and #t filters",
-        ));
-    }
-
     let limit = raw
         .get("limit")
         .and_then(Value::as_u64)
@@ -322,29 +324,133 @@ fn parse_project_view_page_request(
                 "buzz_project_view must be an object",
             )
         })?;
-    const ALLOWED_EXTENSION: &[&str] = &["revision", "projection_generation", "after"];
-    if extension
-        .keys()
-        .any(|key| !ALLOWED_EXTENSION.contains(&key.as_str()))
+    let revision = project_view_safe_revision(extension, "revision")?;
+    let projection_generation = project_view_safe_revision(extension, "projection_generation")?;
+    let scope = extension
+        .get("scope")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "buzz_project_view scope must be a string",
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or("active_objects");
+
+    let request = match scope {
+        "active_objects" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-active")?;
+            const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            ProjectViewPageRequest::ActiveObjects {
+                revision,
+                projection_generation,
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        "v2_current_entities" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v2-entity")?;
+            const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            ProjectViewPageRequest::V2CurrentEntities {
+                revision,
+                projection_generation,
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_entity_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        "role_history" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v2-entity")?;
+            const ALLOWED: &[&str] = &[
+                "scope",
+                "revision",
+                "projection_generation",
+                "entity_types",
+                "role_id",
+                "assignment_id",
+                "member_pubkey",
+                "after",
+            ];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            let entity_types = parse_project_view_history_entity_types(extension)?;
+            let role_id = extension
+                .get("role_id")
+                .map(|value| parse_project_view_uuid(value, "role_id"))
+                .transpose()?;
+            let assignment_id = extension
+                .get("assignment_id")
+                .map(|value| parse_project_view_uuid(value, "assignment_id"))
+                .transpose()?;
+            let member_pubkey = extension
+                .get("member_pubkey")
+                .map(parse_project_view_member_pubkey)
+                .transpose()?;
+            ProjectViewPageRequest::RoleHistory {
+                revision,
+                projection_generation,
+                filter: buzz_db::project_view::ProjectViewRoleHistoryFilter {
+                    entity_types,
+                    role_id,
+                    assignment_id,
+                    member_pubkey,
+                },
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_history_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view scope is unsupported",
+            ));
+        }
+    };
+    Ok(Some(request))
+}
+
+fn require_project_view_outer_filter(
+    raw: &serde_json::Map<String, Value>,
+    relay_pubkey: &nostr::PublicKey,
+    expected_tag: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if raw.get("kinds")
+        != Some(&serde_json::json!([
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT
+        ]))
+        || raw.get("#t") != Some(&serde_json::json!([expected_tag]))
+        || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
     {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination requires exact kinds, authors, and #t filters",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_project_view_extension_fields(
+    extension: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if extension.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "buzz_project_view contains an unsupported field",
         ));
     }
-    let revision = project_view_safe_revision(extension, "revision")?;
-    let projection_generation = project_view_safe_revision(extension, "projection_generation")?;
-    let after = extension
-        .get("after")
-        .map(parse_project_view_cursor)
-        .transpose()?;
-
-    Ok(Some(ProjectViewPageRequest {
-        revision,
-        projection_generation,
-        after,
-        limit,
-    }))
+    Ok(())
 }
 
 fn project_view_safe_revision(
@@ -417,6 +523,207 @@ fn parse_project_view_cursor(
         object_type,
         object_id,
     })
+}
+
+fn parse_project_view_entity_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewV2EntityCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after must be an object",
+        )
+    })?;
+    if object.len() != 2 || !object.contains_key("entity_type") || !object.contains_key("entity_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "current-entity after requires exactly entity_type and entity_id",
+        ));
+    }
+    let entity_type = parse_project_view_entity_type(
+        object.get("entity_type").and_then(Value::as_str),
+        &[
+            buzz_project_view::v2::RoleContinuityEntity::Role,
+            buzz_project_view::v2::RoleContinuityEntity::RoleAssignmentProposal,
+            buzz_project_view::v2::RoleContinuityEntity::RoleAssignment,
+            buzz_project_view::v2::RoleContinuityEntity::WorkCommitment,
+            buzz_project_view::v2::RoleContinuityEntity::RoleCheckpoint,
+            buzz_project_view::v2::RoleContinuityEntity::RoleHandoff,
+        ],
+        "after.entity_type",
+    )?;
+    let entity_id = object
+        .get("entity_id")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "current-entity after is missing entity_id",
+            )
+        })
+        .and_then(|value| parse_project_view_uuid(value, "after.entity_id"))?;
+    Ok(buzz_db::project_view::ProjectViewV2EntityCursor {
+        entity_type,
+        entity_id,
+    })
+}
+
+fn parse_project_view_history_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewRoleHistoryCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view history after must be an object",
+        )
+    })?;
+    if object.len() != 3
+        || !object.contains_key("project_revision")
+        || !object.contains_key("entity_type")
+        || !object.contains_key("entity_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "history after requires exactly project_revision, entity_type, and entity_id",
+        ));
+    }
+    let project_revision = project_view_safe_revision(object, "project_revision")?;
+    let entity_type = parse_project_view_entity_type(
+        object.get("entity_type").and_then(Value::as_str),
+        &history_entity_types(),
+        "after.entity_type",
+    )?;
+    let entity_id = object
+        .get("entity_id")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "history after is missing entity_id",
+            )
+        })
+        .and_then(|value| parse_project_view_uuid(value, "after.entity_id"))?;
+    Ok(buzz_db::project_view::ProjectViewRoleHistoryCursor {
+        project_revision,
+        entity_type,
+        entity_id,
+    })
+}
+
+fn parse_project_view_history_entity_types(
+    extension: &serde_json::Map<String, Value>,
+) -> Result<Vec<buzz_project_view::v2::RoleContinuityEntity>, (StatusCode, Json<Value>)> {
+    let values = extension
+        .get("entity_types")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.len() <= 4)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view entity_types must contain 1..=4 history types",
+            )
+        })?;
+    let allowed = history_entity_types();
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let entity_type =
+            parse_project_view_entity_type(value.as_str(), &allowed, "entity_types entry")?;
+        if result.contains(&entity_type) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view entity_types must not contain duplicates",
+            ));
+        }
+        result.push(entity_type);
+    }
+    Ok(result)
+}
+
+const fn history_entity_types() -> [buzz_project_view::v2::RoleContinuityEntity; 4] {
+    [
+        buzz_project_view::v2::RoleContinuityEntity::RoleAssignmentProposal,
+        buzz_project_view::v2::RoleContinuityEntity::RoleAssignment,
+        buzz_project_view::v2::RoleContinuityEntity::RoleCheckpoint,
+        buzz_project_view::v2::RoleContinuityEntity::RoleHandoff,
+    ]
+}
+
+fn parse_project_view_entity_type(
+    value: Option<&str>,
+    allowed: &[buzz_project_view::v2::RoleContinuityEntity],
+    field: &str,
+) -> Result<buzz_project_view::v2::RoleContinuityEntity, (StatusCode, Json<Value>)> {
+    let entity_type = match value {
+        Some("role") => buzz_project_view::v2::RoleContinuityEntity::Role,
+        Some("role_assignment_proposal") => {
+            buzz_project_view::v2::RoleContinuityEntity::RoleAssignmentProposal
+        }
+        Some("role_assignment") => buzz_project_view::v2::RoleContinuityEntity::RoleAssignment,
+        Some("work_commitment") => buzz_project_view::v2::RoleContinuityEntity::WorkCommitment,
+        Some("role_checkpoint") => buzz_project_view::v2::RoleContinuityEntity::RoleCheckpoint,
+        Some("role_handoff") => buzz_project_view::v2::RoleContinuityEntity::RoleHandoff,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("buzz_project_view {field} is invalid"),
+            ));
+        }
+    };
+    if !allowed.contains(&entity_type) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} is not allowed for this scope"),
+        ));
+    }
+    Ok(entity_type)
+}
+
+fn parse_project_view_uuid(
+    value: &Value,
+    field: &str,
+) -> Result<uuid::Uuid, (StatusCode, Json<Value>)> {
+    let raw = value.as_str().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} must be a canonical UUID"),
+        )
+    })?;
+    let parsed = raw.parse::<uuid::Uuid>().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} must be a canonical UUID"),
+        )
+    })?;
+    if parsed.to_string() != raw {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} must be a canonical lowercase UUID"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_project_view_member_pubkey(
+    value: &Value,
+) -> Result<nostr::PublicKey, (StatusCode, Json<Value>)> {
+    let raw = value.as_str().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view member_pubkey must be canonical lowercase hex",
+        )
+    })?;
+    let parsed = nostr::PublicKey::from_hex(raw).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view member_pubkey must be canonical lowercase hex",
+        )
+    })?;
+    if parsed.to_hex() != raw {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view member_pubkey must be canonical lowercase hex",
+        ));
+    }
+    Ok(parsed)
 }
 
 /// The `before_id` extension field, with "present but malformed" kept distinct
@@ -1236,17 +1543,66 @@ async fn query_events_authed(
             ));
         }
         let snapshot_started = std::time::Instant::now();
-        let page_result = state
-            .db
-            .project_view_snapshot_page(
-                tenant.community(),
-                &state.relay_keypair.public_key(),
-                page.revision,
-                page.projection_generation,
-                page.after,
-                page.limit,
-            )
-            .await;
+        let page_result = match page {
+            ProjectViewPageRequest::ActiveObjects {
+                revision,
+                projection_generation,
+                after,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_view_snapshot_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        revision,
+                        projection_generation,
+                        after,
+                        limit,
+                    )
+                    .await
+            }
+            ProjectViewPageRequest::V2CurrentEntities {
+                revision,
+                projection_generation,
+                after,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_view_v2_current_entities_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        revision,
+                        projection_generation,
+                        after,
+                        limit,
+                    )
+                    .await
+            }
+            ProjectViewPageRequest::RoleHistory {
+                revision,
+                projection_generation,
+                filter,
+                after,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_view_role_history_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        &buzz_db::project_view::ProjectViewRoleHistoryPageRequest {
+                            project_revision: revision,
+                            projection_generation,
+                            filter,
+                            after,
+                            limit,
+                        },
+                    )
+                    .await
+            }
+        };
         metrics::histogram!("buzz_project_view_snapshot_duration_seconds")
             .record(snapshot_started.elapsed().as_secs_f64());
         let page = page_result.map_err(|error| match error {
@@ -1260,6 +1616,9 @@ async fn query_events_authed(
                     StatusCode::CONFLICT,
                     "conflict:project_view:snapshot_changed",
                 )
+            }
+            buzz_db::project_view::ProjectViewReadError::InvalidCursor(_) => {
+                api_error(StatusCode::BAD_REQUEST, "invalid:project_view:cursor")
             }
             buzz_db::project_view::ProjectViewReadError::Database(_)
             | buzz_db::project_view::ProjectViewReadError::Sqlx(_)
@@ -2609,6 +2968,83 @@ mod tests {
             .expect("sign auth event")
             .id
             .to_bytes()
+    }
+
+    #[test]
+    fn project_view_extension_parses_v2_current_and_role_history_scopes() {
+        let relay = Keys::generate().public_key();
+        let role_id = uuid::Uuid::new_v4();
+        let current = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+            "limit": 100,
+            "buzz_project_view": {
+                "scope": "v2_current_entities",
+                "revision": 7,
+                "projection_generation": 2,
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(&[current], &relay),
+            Ok(Some(ProjectViewPageRequest::V2CurrentEntities {
+                revision: 7,
+                projection_generation: 2,
+                limit: 100,
+                ..
+            }))
+        ));
+
+        let history = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+            "limit": 20,
+            "buzz_project_view": {
+                "scope": "role_history",
+                "revision": 7,
+                "projection_generation": 2,
+                "entity_types": ["role_checkpoint", "role_handoff"],
+                "role_id": role_id,
+                "after": {
+                    "project_revision": 5,
+                    "entity_type": "role_checkpoint",
+                    "entity_id": uuid::Uuid::new_v4(),
+                },
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(&[history], &relay),
+            Ok(Some(ProjectViewPageRequest::RoleHistory {
+                revision: 7,
+                projection_generation: 2,
+                limit: 20,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn project_view_history_scope_rejects_noncanonical_or_cross_scope_cursor_types() {
+        let relay = Keys::generate().public_key();
+        let filter = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+            "limit": 20,
+            "buzz_project_view": {
+                "scope": "role_history",
+                "revision": 7,
+                "projection_generation": 2,
+                "entity_types": ["role_checkpoint"],
+                "after": {
+                    "project_revision": 5,
+                    "entity_type": "work_commitment",
+                    "entity_id": uuid::Uuid::new_v4(),
+                },
+            },
+        });
+        assert!(parse_project_view_page_request(&[filter], &relay).is_err());
     }
 
     #[test]

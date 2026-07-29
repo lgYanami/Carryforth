@@ -11,8 +11,9 @@ use std::fmt::Write as _;
 
 use buzz_core::{EventId, PublicKey};
 use buzz_project_view::v2::{
-    CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal,
-    RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel, WorkCommitment,
+    CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpoint,
+    RoleContinuityChange, RoleContinuityReference, RoleDefinition, RoleHandoff, RoleLevel,
+    WorkCommitment,
 };
 use buzz_project_view::{
     Goal, ObjectRef, ProjectIssue, ProjectRole, ProjectView, ProjectViewEntry, ProjectViewObject,
@@ -94,6 +95,26 @@ pub struct RoleBriefProposal {
 pub struct RoleBriefCommitment {
     /// Complete Commitment tenure.
     pub commitment: WorkCommitment,
+    /// Exact signed source revision.
+    pub source: RoleBriefSourceReference,
+}
+
+/// One append-only Checkpoint and the projection that proves its attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleBriefCheckpoint {
+    /// Complete structured Checkpoint.
+    pub checkpoint: RoleCheckpoint,
+    /// Exact signed source revision.
+    pub source: RoleBriefSourceReference,
+}
+
+/// One append-only Handoff and the projection that proves its attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleBriefHandoff {
+    /// Complete structured Handoff.
+    pub handoff: RoleHandoff,
     /// Exact signed source revision.
     pub source: RoleBriefSourceReference,
 }
@@ -209,6 +230,11 @@ pub struct RoleBrief {
     pub responsible_work: Vec<RoleBriefResponsibleWork>,
     /// Role-related Issues and their handling Work in deterministic order.
     pub related_objects: Vec<RoleBriefObject>,
+    /// Latest structured situation entry for the current or proposed Role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint: Option<RoleBriefCheckpoint>,
+    /// Most recent Handoffs for the current or proposed Role.
+    pub recent_handoffs: Vec<RoleBriefHandoff>,
     /// Signed snapshot boundaries.
     pub source_revisions: RoleBriefSourceRevisions,
 }
@@ -236,6 +262,7 @@ pub struct VerifiedRoleBriefSnapshot {
     proposals: BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
     assignments: BTreeMap<Uuid, EntityHead<RoleAssignment>>,
     commitments: BTreeMap<Uuid, EntityHead<WorkCommitment>>,
+    checkpoints: BTreeMap<Uuid, EntityHead<RoleCheckpoint>>,
     handoffs: BTreeMap<Uuid, EntityHead<RoleHandoff>>,
     view: ProjectView,
 }
@@ -260,6 +287,43 @@ impl VerifiedRoleBriefSnapshot {
         membership: V2MembershipProjection,
         object_projections: Vec<V2ProjectObjectProjection>,
         entity_projections: Vec<V2EntityProjection>,
+    ) -> Result<Self, SdkError> {
+        Self::build(
+            meta,
+            membership,
+            object_projections,
+            entity_projections,
+            true,
+        )
+    }
+
+    /// Validate current heads plus a bounded, Relay-signed history slice.
+    ///
+    /// Current-object, open-Proposal, active-Assignment, and
+    /// active-Commitment counts remain exact. Checkpoint/Handoff counts are
+    /// upper bounds because a revision-pinned history page intentionally does
+    /// not claim to be the complete append-only history.
+    pub fn new_with_partial_history(
+        meta: V2MetaProjection,
+        membership: V2MembershipProjection,
+        object_projections: Vec<V2ProjectObjectProjection>,
+        entity_projections: Vec<V2EntityProjection>,
+    ) -> Result<Self, SdkError> {
+        Self::build(
+            meta,
+            membership,
+            object_projections,
+            entity_projections,
+            false,
+        )
+    }
+
+    fn build(
+        meta: V2MetaProjection,
+        membership: V2MembershipProjection,
+        object_projections: Vec<V2ProjectObjectProjection>,
+        entity_projections: Vec<V2EntityProjection>,
+        complete_history: bool,
     ) -> Result<Self, SdkError> {
         validate_membership_pointer(&meta, &membership)?;
 
@@ -346,6 +410,7 @@ impl VerifiedRoleBriefSnapshot {
         let mut proposals = BTreeMap::new();
         let mut assignments = BTreeMap::new();
         let mut commitments = BTreeMap::new();
+        let mut checkpoints = BTreeMap::new();
         let mut handoffs = BTreeMap::new();
         for projection in entity_projections {
             validate_projection_basis(
@@ -439,6 +504,20 @@ impl VerifiedRoleBriefSnapshot {
                         },
                     );
                 }
+                RoleContinuityChange::Checkpoint(checkpoint) => {
+                    if checkpoint.project_revision != projection.project_revision {
+                        return Err(invalid(
+                            "Checkpoint body disagrees with its projection revision",
+                        ));
+                    }
+                    checkpoints.insert(
+                        checkpoint.checkpoint_id,
+                        EntityHead {
+                            entity: checkpoint,
+                            source,
+                        },
+                    );
+                }
                 RoleContinuityChange::Handoff(handoff) => {
                     if handoff.project_revision != projection.project_revision {
                         return Err(invalid(
@@ -458,11 +537,15 @@ impl VerifiedRoleBriefSnapshot {
 
         validate_counts(
             &meta,
-            objects.len() + roles.len(),
-            &proposals,
-            &assignments,
-            &commitments,
-            handoffs.len(),
+            VerifiedCountInputs {
+                active_objects: objects.len() + roles.len(),
+                proposals: &proposals,
+                assignments: &assignments,
+                commitments: &commitments,
+                checkpoints: checkpoints.len(),
+                handoffs: handoffs.len(),
+                complete_history,
+            },
         )?;
         let entries_by_id = entries
             .iter()
@@ -477,10 +560,12 @@ impl VerifiedRoleBriefSnapshot {
                 proposals: &proposals,
                 assignments: &assignments,
                 commitments: &commitments,
+                checkpoints: &checkpoints,
                 handoffs: &handoffs,
                 objects: &objects,
             },
             &membership,
+            complete_history,
         )?;
 
         Ok(Self {
@@ -492,6 +577,7 @@ impl VerifiedRoleBriefSnapshot {
             proposals,
             assignments,
             commitments,
+            checkpoints,
             handoffs,
             view,
         })
@@ -541,6 +627,11 @@ impl VerifiedRoleBriefSnapshot {
         self.commitments.values().map(|head| &head.entity)
     }
 
+    /// Iterate over append-only Checkpoints by stable Checkpoint ID.
+    pub fn checkpoints(&self) -> impl Iterator<Item = &RoleCheckpoint> {
+        self.checkpoints.values().map(|head| &head.entity)
+    }
+
     /// Iterate over Handoff heads by stable Handoff ID.
     pub fn handoffs(&self) -> impl Iterator<Item = &RoleHandoff> {
         self.handoffs.values().map(|head| &head.entity)
@@ -568,7 +659,7 @@ impl VerifiedRoleBriefSnapshot {
             .assignments
             .values()
             .find(|head| head.entity.member_pubkey == member_pubkey && head.entity.is_active());
-        let (state, responsible_work, related_objects) =
+        let (state, responsible_work, related_objects, context_role_id) =
             if let Some(assignment) = active_assignment {
                 let role = self.roles.get(&assignment.entity.role_id).ok_or_else(|| {
                     invalid("active Assignment references a missing verified Role")
@@ -586,6 +677,7 @@ impl VerifiedRoleBriefSnapshot {
                     },
                     self.responsible_work(role.entity.role_id),
                     self.related_objects(role.entity.role_id),
+                    Some(role.entity.role_id),
                 )
             } else {
                 let mut open_proposals = self
@@ -606,10 +698,14 @@ impl VerifiedRoleBriefSnapshot {
                         .cmp(&right.proposal.created_at)
                         .then(left.proposal.proposal_id.cmp(&right.proposal.proposal_id))
                 });
+                let context_role_id = open_proposals
+                    .first()
+                    .map(|proposal| proposal.proposal.role_id);
                 (
                     RoleBriefMemberState::Candidate { open_proposals },
                     Vec::new(),
                     Vec::new(),
+                    context_role_id,
                 )
             };
         let community_role = self
@@ -618,6 +714,20 @@ impl VerifiedRoleBriefSnapshot {
             .iter()
             .find(|member| member.pubkey == member_pubkey)
             .map(|member| member.role);
+        let latest_checkpoint = context_role_id
+            .and_then(|role_id| self.latest_checkpoint(role_id))
+            .map(|head| RoleBriefCheckpoint {
+                checkpoint: head.entity.clone(),
+                source: head.source.clone(),
+            });
+        let recent_handoffs = context_role_id
+            .map_or_else(Vec::new, |role_id| self.recent_handoffs(role_id, 3))
+            .into_iter()
+            .map(|head| RoleBriefHandoff {
+                handoff: head.entity.clone(),
+                source: head.source.clone(),
+            })
+            .collect();
 
         Ok(RoleBrief {
             generated_at,
@@ -633,6 +743,8 @@ impl VerifiedRoleBriefSnapshot {
             state,
             responsible_work,
             related_objects,
+            latest_checkpoint,
+            recent_handoffs,
             source_revisions: RoleBriefSourceRevisions {
                 meta_event_id: self.meta.event_id,
                 meta_change_id: self.meta.source.change_id(),
@@ -702,6 +814,35 @@ impl VerifiedRoleBriefSnapshot {
             .collect::<Vec<_>>();
         related.sort_by(|left, right| object_order(&left.object, &right.object));
         related.into_iter().map(role_brief_object).collect()
+    }
+
+    fn latest_checkpoint(&self, role_id: Uuid) -> Option<&EntityHead<RoleCheckpoint>> {
+        self.checkpoints
+            .values()
+            .filter(|head| head.entity.role_id == role_id)
+            .max_by(|left, right| {
+                left.entity
+                    .project_revision
+                    .cmp(&right.entity.project_revision)
+                    .then(left.entity.checkpoint_id.cmp(&right.entity.checkpoint_id))
+            })
+    }
+
+    fn recent_handoffs(&self, role_id: Uuid, limit: usize) -> Vec<&EntityHead<RoleHandoff>> {
+        let mut handoffs = self
+            .handoffs
+            .values()
+            .filter(|head| head.entity.role_id == role_id)
+            .collect::<Vec<_>>();
+        handoffs.sort_by(|left, right| {
+            right
+                .entity
+                .project_revision
+                .cmp(&left.entity.project_revision)
+                .then(right.entity.handoff_id.cmp(&left.entity.handoff_id))
+        });
+        handoffs.truncate(limit);
+        handoffs
     }
 }
 
@@ -790,6 +931,10 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
                 "Boundary: this Assignment ID is the current role-bearing write fence. \
                  Re-resolve it before each write; never reuse it after replacement or end.\n",
             );
+            output.push_str(
+                "Continuity: append a structured Role Checkpoint after a material change to \
+                 progress, blockers, risks, open questions, or next steps.\n",
+            );
         }
     }
 
@@ -837,6 +982,70 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
             );
         }
     }
+    if let Some(latest) = &brief.latest_checkpoint {
+        let checkpoint = &latest.checkpoint;
+        let _ = writeln!(
+            output,
+            "Latest Role Checkpoint: {} (Assignment {}, based on project revision {})",
+            checkpoint.checkpoint_id,
+            checkpoint.assignment_id,
+            checkpoint.based_on_project_revision
+        );
+        let _ = writeln!(
+            output,
+            "Situation: {}",
+            one_line(&checkpoint.content.summary)
+        );
+        render_named_items(
+            &mut output,
+            "Current focus",
+            &checkpoint.content.current_focus,
+        );
+        render_named_items(&mut output, "Progress", &checkpoint.content.progress);
+        render_named_items(&mut output, "Blockers", &checkpoint.content.blockers);
+        render_named_items(&mut output, "Risks", &checkpoint.content.risks);
+        render_named_items(
+            &mut output,
+            "Open questions",
+            &checkpoint.content.open_questions,
+        );
+        render_named_items(&mut output, "Next steps", &checkpoint.content.next_steps);
+        render_references(
+            &mut output,
+            "Checkpoint references",
+            &checkpoint.content.references,
+        );
+    } else if matches!(&brief.state, RoleBriefMemberState::Assigned { .. }) {
+        output.push_str("Latest Role Checkpoint: none\n");
+    }
+    if !brief.recent_handoffs.is_empty() {
+        output.push_str("Recent Role Handoffs:\n");
+        for item in &brief.recent_handoffs {
+            let handoff = &item.handoff;
+            let summary = handoff
+                .content
+                .summary
+                .as_deref()
+                .map_or_else(|| "no summary".to_owned(), one_line);
+            let _ = writeln!(
+                output,
+                "- {} [{}] from Assignment {}{} — {}",
+                handoff.handoff_id,
+                handoff.cause.as_str(),
+                handoff.from_assignment_id,
+                handoff
+                    .to_assignment_id
+                    .map_or_else(String::new, |id| format!(" to Assignment {id}")),
+                summary
+            );
+            for unresolved in &handoff.content.unresolved_items {
+                let _ = writeln!(output, "  - unresolved: {}", one_line(unresolved));
+            }
+            for reference in &handoff.content.references {
+                let _ = writeln!(output, "  - reference: {}", reference_line(reference));
+            }
+        }
+    }
     let _ = writeln!(
         output,
         "Source revisions: project={} generation={} meta={} membership={}",
@@ -853,6 +1062,56 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
             .to_rfc3339_opts(SecondsFormat::Secs, true)
     );
     output
+}
+
+fn render_named_items(output: &mut String, heading: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    let _ = writeln!(output, "{heading}:");
+    for item in items {
+        let _ = writeln!(output, "- {}", one_line(item));
+    }
+}
+
+fn render_references(output: &mut String, heading: &str, references: &[RoleContinuityReference]) {
+    if references.is_empty() {
+        return;
+    }
+    let _ = writeln!(output, "{heading}:");
+    for reference in references {
+        let _ = writeln!(output, "- {}", reference_line(reference));
+    }
+}
+
+fn reference_line(reference: &RoleContinuityReference) -> String {
+    match reference {
+        RoleContinuityReference::Object { object_id, label } => {
+            labeled_reference("object", object_id, label.as_deref())
+        }
+        RoleContinuityReference::Assignment {
+            assignment_id,
+            label,
+        } => labeled_reference("assignment", assignment_id, label.as_deref()),
+        RoleContinuityReference::Commitment {
+            commitment_id,
+            label,
+        } => labeled_reference("commitment", commitment_id, label.as_deref()),
+        RoleContinuityReference::NostrEvent { event_id, label } => {
+            labeled_reference("event", event_id, label.as_deref())
+        }
+    }
+}
+
+fn labeled_reference(
+    reference_type: &str,
+    id: impl std::fmt::Display,
+    label: Option<&str>,
+) -> String {
+    label.map_or_else(
+        || format!("{reference_type} {id}"),
+        |label| format!("{reference_type} {id} ({})", one_line(label)),
+    )
 }
 
 /// Render a fail-closed dynamic prompt section when no current Brief can be
@@ -894,36 +1153,51 @@ fn validate_projection_basis(
     Ok(())
 }
 
+struct VerifiedCountInputs<'a> {
+    active_objects: usize,
+    proposals: &'a BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
+    assignments: &'a BTreeMap<Uuid, EntityHead<RoleAssignment>>,
+    commitments: &'a BTreeMap<Uuid, EntityHead<WorkCommitment>>,
+    checkpoints: usize,
+    handoffs: usize,
+    complete_history: bool,
+}
+
 fn validate_counts(
     meta: &V2MetaProjection,
-    active_objects: usize,
-    proposals: &BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
-    assignments: &BTreeMap<Uuid, EntityHead<RoleAssignment>>,
-    commitments: &BTreeMap<Uuid, EntityHead<WorkCommitment>>,
-    handoffs: usize,
+    input: VerifiedCountInputs<'_>,
 ) -> Result<(), SdkError> {
-    let open_proposals = proposals
+    let open_proposals = input
+        .proposals
         .values()
         .filter(|head| head.entity.status == ProposalStatus::Open)
         .count();
-    let active_assignments = assignments
+    let active_assignments = input
+        .assignments
         .values()
         .filter(|head| head.entity.is_active())
         .count();
-    let active_commitments = commitments
+    let active_commitments = input
+        .commitments
         .values()
         .filter(|head| head.entity.is_active())
         .count();
     let counts = meta.entity_counts;
-    if usize::try_from(counts.active_objects).ok() != Some(active_objects)
+    let history_counts_match = if input.complete_history {
+        usize::try_from(counts.checkpoints).ok() == Some(input.checkpoints)
+            && usize::try_from(counts.handoffs).ok() == Some(input.handoffs)
+    } else {
+        usize::try_from(counts.checkpoints).is_ok_and(|count| input.checkpoints <= count)
+            && usize::try_from(counts.handoffs).is_ok_and(|count| input.handoffs <= count)
+    };
+    if usize::try_from(counts.active_objects).ok() != Some(input.active_objects)
         || usize::try_from(counts.open_proposals).ok() != Some(open_proposals)
         || usize::try_from(counts.active_assignments).ok() != Some(active_assignments)
         || usize::try_from(counts.active_commitments).ok() != Some(active_commitments)
-        || usize::try_from(counts.handoffs).ok() != Some(handoffs)
-        || counts.checkpoints != 0
+        || !history_counts_match
     {
         return Err(invalid(
-            "v2 metadata counts disagree with the complete verified heads",
+            "v2 metadata counts disagree with the verified current heads or history coverage",
         ));
     }
     Ok(())
@@ -959,6 +1233,7 @@ struct ContinuityHeads<'a> {
     proposals: &'a BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
     assignments: &'a BTreeMap<Uuid, EntityHead<RoleAssignment>>,
     commitments: &'a BTreeMap<Uuid, EntityHead<WorkCommitment>>,
+    checkpoints: &'a BTreeMap<Uuid, EntityHead<RoleCheckpoint>>,
     handoffs: &'a BTreeMap<Uuid, EntityHead<RoleHandoff>>,
     objects: &'a BTreeMap<Uuid, ObjectHead>,
 }
@@ -966,6 +1241,7 @@ struct ContinuityHeads<'a> {
 fn validate_continuity(
     heads: ContinuityHeads<'_>,
     membership: &V2MembershipProjection,
+    complete_history: bool,
 ) -> Result<(), SdkError> {
     let ContinuityHeads {
         entries,
@@ -973,6 +1249,7 @@ fn validate_continuity(
         proposals,
         assignments,
         commitments,
+        checkpoints,
         handoffs,
         objects,
     } = heads;
@@ -999,22 +1276,146 @@ fn validate_continuity(
         {
             return Err(invalid("Assignment references a missing Role"));
         }
-        if !proposals.contains_key(&assignment.entity.proposal_id) {
+        if !proposals.contains_key(&assignment.entity.proposal_id)
+            && (complete_history || assignment.entity.is_active())
+        {
             return Err(invalid("Assignment references a missing Proposal"));
         }
+    }
+    for checkpoint in checkpoints.values() {
+        if entries
+            .get(&checkpoint.entity.role_id)
+            .is_none_or(|entry| entry.object_type() != ProjectViewObjectType::Role)
+        {
+            return Err(invalid("Checkpoint references a missing Role"));
+        }
+        match assignments.get(&checkpoint.entity.assignment_id) {
+            Some(assignment)
+                if assignment.entity.role_id == checkpoint.entity.role_id
+                    && assignment.entity.member_pubkey == checkpoint.entity.created_by => {}
+            Some(_) => {
+                return Err(invalid(
+                    "Checkpoint attribution disagrees with its Role or Assignment",
+                ));
+            }
+            None if complete_history => {
+                return Err(invalid("Checkpoint references a missing Assignment"));
+            }
+            None => {}
+        }
+        if checkpoint.entity.entity_revision != 1
+            || checkpoint.entity.based_on_project_revision == 0
+            || checkpoint.entity.based_on_project_revision >= checkpoint.entity.project_revision
+        {
+            return Err(invalid("Checkpoint revision basis is invalid"));
+        }
+        if let Some(superseded_id) = checkpoint.entity.supersedes_checkpoint_id {
+            match checkpoints.get(&superseded_id) {
+                Some(superseded)
+                    if superseded.entity.role_id == checkpoint.entity.role_id
+                        && superseded.entity.assignment_id == checkpoint.entity.assignment_id
+                        && superseded.entity.project_revision
+                            < checkpoint.entity.project_revision
+                        && superseded.entity.checkpoint_id != checkpoint.entity.checkpoint_id => {}
+                Some(_) => {
+                    return Err(invalid(
+                        "Checkpoint supersedes an unrelated or newer Checkpoint",
+                    ));
+                }
+                None if complete_history => {
+                    return Err(invalid("Checkpoint supersedes a missing Checkpoint"));
+                }
+                None => {}
+            }
+        }
+        validate_continuity_references(
+            &checkpoint.entity.content.references,
+            entries,
+            assignments,
+            commitments,
+            complete_history,
+        )?;
     }
     for handoff in handoffs.values() {
         if entries
             .get(&handoff.entity.role_id)
             .is_none_or(|entry| entry.object_type() != ProjectViewObjectType::Role)
-            || !assignments.contains_key(&handoff.entity.from_assignment_id)
-            || handoff
-                .entity
-                .to_assignment_id
-                .is_some_and(|id| !assignments.contains_key(&id))
         {
-            return Err(invalid("Handoff references a missing Role or Assignment"));
+            return Err(invalid("Handoff references a missing Role"));
         }
+        let from_assignment = assignments.get(&handoff.entity.from_assignment_id);
+        match from_assignment {
+            Some(assignment) if assignment.entity.role_id == handoff.entity.role_id => {}
+            Some(_) => {
+                return Err(invalid(
+                    "Handoff disagrees with its Role or source Assignment",
+                ));
+            }
+            None if complete_history => {
+                return Err(invalid("Handoff references a missing source Assignment"));
+            }
+            None => {}
+        }
+        if let Some(to_assignment_id) = handoff.entity.to_assignment_id {
+            match assignments.get(&to_assignment_id) {
+                Some(to_assignment) if to_assignment.entity.role_id == handoff.entity.role_id => {}
+                Some(_) => return Err(invalid("Handoff target belongs to another Role")),
+                None if complete_history => {
+                    return Err(invalid("Handoff references a missing target Assignment"));
+                }
+                None => {}
+            }
+        }
+        if let Some(checkpoint_id) = handoff.entity.checkpoint_id {
+            match checkpoints.get(&checkpoint_id) {
+                Some(checkpoint)
+                    if checkpoint.entity.role_id == handoff.entity.role_id
+                        && checkpoint.entity.assignment_id == handoff.entity.from_assignment_id => {
+                }
+                Some(_) => {
+                    return Err(invalid(
+                        "Handoff Checkpoint belongs to another Role or Assignment",
+                    ));
+                }
+                None if complete_history => {
+                    return Err(invalid("Handoff references a missing Checkpoint"));
+                }
+                None => {}
+            }
+        }
+        for commitment_id in &handoff.entity.affected_commitment_ids {
+            match commitments.get(commitment_id) {
+                Some(commitment)
+                    if commitment.entity.assignment_id == handoff.entity.from_assignment_id => {}
+                Some(_) => {
+                    return Err(invalid(
+                        "Handoff affected Commitment belongs to another Assignment",
+                    ));
+                }
+                None if complete_history => {
+                    return Err(invalid("Handoff references a missing affected Commitment"));
+                }
+                None => {}
+            }
+        }
+        match (handoff.entity.system_generated, handoff.entity.created_by) {
+            (true, None) => {}
+            (false, Some(author))
+                if matches!(
+                    handoff.entity.cause,
+                    buzz_project_view::v2::HandoffCause::Planned
+                        | buzz_project_view::v2::HandoffCause::Other
+                ) && from_assignment
+                    .is_none_or(|assignment| assignment.entity.member_pubkey == author) => {}
+            _ => return Err(invalid("Handoff author or cause is invalid")),
+        }
+        validate_continuity_references(
+            &handoff.entity.content.references,
+            entries,
+            assignments,
+            commitments,
+            complete_history,
+        )?;
     }
 
     for work in objects
@@ -1122,6 +1523,36 @@ fn validate_continuity(
     Ok(())
 }
 
+fn validate_continuity_references(
+    references: &[RoleContinuityReference],
+    entries: &BTreeMap<Uuid, ProjectViewEntry>,
+    assignments: &BTreeMap<Uuid, EntityHead<RoleAssignment>>,
+    commitments: &BTreeMap<Uuid, EntityHead<WorkCommitment>>,
+    complete_history: bool,
+) -> Result<(), SdkError> {
+    for reference in references {
+        let exists = match reference {
+            RoleContinuityReference::Object { object_id, .. } => entries.contains_key(object_id),
+            RoleContinuityReference::Assignment { assignment_id, .. } => {
+                !complete_history || assignments.contains_key(assignment_id)
+            }
+            RoleContinuityReference::Commitment { commitment_id, .. } => {
+                !complete_history || commitments.contains_key(commitment_id)
+            }
+            // Raw event existence and Community scope are enforced while the
+            // Relay commits the reference. The v2 projection snapshot does not
+            // intentionally contain every historical Nostr event.
+            RoleContinuityReference::NostrEvent { .. } => true,
+        };
+        if !exists {
+            return Err(invalid(
+                "Checkpoint or Handoff references missing canonical Project state",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn source_reference(
     event_id: EventId,
     project_revision: u64,
@@ -1220,7 +1651,10 @@ fn invalid(message: impl Into<String>) -> SdkError {
 #[cfg(test)]
 mod tests {
     use buzz_core::CommunityId;
-    use buzz_project_view::v2::{ProposalType, RoleContinuityChange};
+    use buzz_project_view::v2::{
+        HandoffCause, ProposalType, RoleCheckpointContent, RoleContinuityChange,
+        RoleContinuityReference, RoleHandoffContent,
+    };
     use buzz_project_view::{
         Goal, IssueStatus, Priority, ProjectIssue, ProjectProfile, ProjectViewObjectData,
         ProjectViewRelations, ProjectWork, WorkStatus,
@@ -1276,7 +1710,61 @@ mod tests {
         assert!(markdown.contains("Responsible Work:"));
         assert!(markdown.contains("committed via"));
         assert!(markdown.contains("Related Project View slice:"));
-        assert!(markdown.contains("Source revisions: project=4 generation=1"));
+        assert_eq!(fixture.snapshot.checkpoints().count(), 2);
+        assert_eq!(
+            brief.latest_checkpoint.as_ref().map(|latest| latest
+                .checkpoint
+                .content
+                .summary
+                .as_str()),
+            Some("Timeline is ready for clients")
+        );
+        assert_eq!(brief.recent_handoffs.len(), 1);
+        assert!(markdown.contains("Latest Role Checkpoint:"));
+        assert!(markdown.contains("Recent Role Handoffs:"));
+        assert!(markdown.contains("unresolved: publish the desktop timeline"));
+        assert!(markdown.contains("Source revisions: project=7 generation=1"));
+    }
+
+    #[test]
+    fn bounded_history_slice_preserves_exact_current_counts_and_latest_brief() {
+        let fixture = fixture();
+        let objects = object_projections(&fixture.snapshot);
+        let entities = entity_projections(&fixture.snapshot)
+            .into_iter()
+            .filter(|projection| {
+                !matches!(
+                    &projection.entity,
+                    RoleContinuityChange::Checkpoint(checkpoint)
+                        if checkpoint.content.summary == "Role Brief projection is wired"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(VerifiedRoleBriefSnapshot::new(
+            fixture.snapshot.meta.clone(),
+            fixture.snapshot.membership.clone(),
+            objects.clone(),
+            entities.clone(),
+        )
+        .is_err());
+
+        let snapshot = VerifiedRoleBriefSnapshot::new_with_partial_history(
+            fixture.snapshot.meta.clone(),
+            fixture.snapshot.membership.clone(),
+            objects,
+            entities,
+        )
+        .expect("bounded history slice");
+        let brief = snapshot
+            .brief_for(fixture.agent, instant())
+            .expect("Brief from bounded history");
+        assert_eq!(snapshot.checkpoints().count(), 1);
+        assert_eq!(
+            brief
+                .latest_checkpoint
+                .map(|item| item.checkpoint.content.summary),
+            Some("Timeline is ready for clients".to_owned())
+        );
     }
 
     #[test]
@@ -1330,6 +1818,33 @@ mod tests {
     }
 
     #[test]
+    fn project_state_and_checkpoint_remain_a_recovery_path_without_handoff() {
+        let fixture = fixture();
+        let mut meta = fixture.snapshot.meta.clone();
+        meta.entity_counts.handoffs = 0;
+        let objects = object_projections(&fixture.snapshot);
+        let entities = entity_projections(&fixture.snapshot)
+            .into_iter()
+            .filter(|projection| !matches!(&projection.entity, RoleContinuityChange::Handoff(_)))
+            .collect();
+        let snapshot = VerifiedRoleBriefSnapshot::new(
+            meta,
+            fixture.snapshot.membership.clone(),
+            objects,
+            entities,
+        )
+        .expect("snapshot without Handoff");
+        let brief = snapshot
+            .brief_for(fixture.agent, instant())
+            .expect("recoverable Brief");
+
+        assert!(brief.recent_handoffs.is_empty());
+        assert!(brief.latest_checkpoint.is_some());
+        assert_eq!(brief.responsible_work.len(), 1);
+        assert_eq!(brief.project.goals.len(), 1);
+    }
+
+    #[test]
     fn inconsistent_metadata_fails_before_a_brief_can_be_obtained() {
         let Fixture {
             snapshot,
@@ -1356,6 +1871,9 @@ mod tests {
         let proposal_id = Uuid::new_v4();
         let assignment_id = Uuid::new_v4();
         let commitment_id = Uuid::new_v4();
+        let first_checkpoint_id = Uuid::new_v4();
+        let latest_checkpoint_id = Uuid::new_v4();
+        let handoff_id = Uuid::new_v4();
         let issue_id = Uuid::new_v4();
         let work_id = Uuid::new_v4();
         let now = instant();
@@ -1501,6 +2019,73 @@ mod tests {
             entity_revision: 1,
             project_revision: 4,
         };
+        let first_checkpoint = RoleCheckpoint {
+            checkpoint_id: first_checkpoint_id,
+            role_id,
+            assignment_id,
+            based_on_project_revision: 4,
+            content: RoleCheckpointContent {
+                summary: "Role Brief projection is wired".to_owned(),
+                current_focus: vec!["trusted continuity history".to_owned()],
+                progress: vec!["Checkpoint domain is complete".to_owned()],
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                open_questions: Vec::new(),
+                next_steps: vec!["verify the timeline".to_owned()],
+                references: vec![RoleContinuityReference::Object {
+                    object_id: work_id,
+                    label: Some("active Work".to_owned()),
+                }],
+            },
+            supersedes_checkpoint_id: None,
+            created_by: agent,
+            created_at: now,
+            entity_revision: 1,
+            project_revision: 5,
+        };
+        let latest_checkpoint = RoleCheckpoint {
+            checkpoint_id: latest_checkpoint_id,
+            role_id,
+            assignment_id,
+            based_on_project_revision: 5,
+            content: RoleCheckpointContent {
+                summary: "Timeline is ready for clients".to_owned(),
+                current_focus: vec!["desktop history".to_owned()],
+                progress: vec!["trusted projection validates".to_owned()],
+                blockers: Vec::new(),
+                risks: vec!["stale snapshot".to_owned()],
+                open_questions: Vec::new(),
+                next_steps: vec!["publish the UI".to_owned()],
+                references: Vec::new(),
+            },
+            supersedes_checkpoint_id: Some(first_checkpoint_id),
+            created_by: agent,
+            created_at: now + Duration::seconds(1),
+            entity_revision: 1,
+            project_revision: 6,
+        };
+        let handoff = RoleHandoff {
+            handoff_id,
+            role_id,
+            from_assignment_id: assignment_id,
+            to_assignment_id: None,
+            checkpoint_id: Some(latest_checkpoint_id),
+            affected_commitment_ids: Vec::new(),
+            content: RoleHandoffContent {
+                summary: Some("Prepare a future successor".to_owned()),
+                unresolved_items: vec!["publish the desktop timeline".to_owned()],
+                references: vec![RoleContinuityReference::Object {
+                    object_id: work_id,
+                    label: None,
+                }],
+            },
+            cause: HandoffCause::Planned,
+            system_generated: false,
+            created_by: Some(agent),
+            created_at: now + Duration::seconds(2),
+            entity_revision: 1,
+            project_revision: 7,
+        };
         let entities = vec![
             projected_entity(
                 5,
@@ -1538,9 +2123,36 @@ mod tests {
                 source.clone(),
                 now,
             ),
+            projected_entity(
+                11,
+                project_id,
+                5,
+                1,
+                RoleContinuityChange::Checkpoint(first_checkpoint),
+                source.clone(),
+                now,
+            ),
+            projected_entity(
+                12,
+                project_id,
+                6,
+                1,
+                RoleContinuityChange::Checkpoint(latest_checkpoint),
+                source.clone(),
+                now + Duration::seconds(1),
+            ),
+            projected_entity(
+                13,
+                project_id,
+                7,
+                1,
+                RoleContinuityChange::Handoff(handoff),
+                source.clone(),
+                now + Duration::seconds(2),
+            ),
         ];
 
-        let membership_event_id = event_id(9);
+        let membership_event_id = event_id(14);
         let mut members = vec![
             V2MembershipMember {
                 pubkey: owner,
@@ -1558,23 +2170,23 @@ mod tests {
             created_at: Timestamp::from(now.timestamp() as u64),
         };
         let meta = V2MetaProjection {
-            event_id: event_id(10),
+            event_id: event_id(15),
             project_id,
             projection_generation: 1,
-            project_revision: 4,
+            project_revision: 7,
             entity_counts: V2EntityCounts {
                 active_objects: 5,
                 open_proposals: 0,
                 active_assignments: 1,
                 active_commitments: 1,
-                checkpoints: 0,
-                handoffs: 0,
+                checkpoints: 2,
+                handoffs: 1,
             },
             membership_snapshot_event_id: membership_event_id,
             reset: true,
             changed_heads: Vec::new(),
             source,
-            updated_at: now,
+            updated_at: now + Duration::seconds(2),
         };
         let snapshot = VerifiedRoleBriefSnapshot::new(meta, membership, ordinary, entities)
             .expect("valid fixture");
@@ -1728,6 +2340,28 @@ mod tests {
                 RoleContinuityChange::Commitment(commitment.entity.clone()),
                 source(u8::try_from(index + 130).unwrap()),
                 instant(),
+            ));
+        }
+        for (index, checkpoint) in snapshot.checkpoints.values().enumerate() {
+            entities.push(projected_entity(
+                u8::try_from(index + 140).unwrap(),
+                snapshot.meta.project_id,
+                checkpoint.entity.project_revision,
+                checkpoint.entity.entity_revision,
+                RoleContinuityChange::Checkpoint(checkpoint.entity.clone()),
+                source(u8::try_from(index + 150).unwrap()),
+                checkpoint.entity.created_at,
+            ));
+        }
+        for (index, handoff) in snapshot.handoffs.values().enumerate() {
+            entities.push(projected_entity(
+                u8::try_from(index + 160).unwrap(),
+                snapshot.meta.project_id,
+                handoff.entity.project_revision,
+                handoff.entity.entity_revision,
+                RoleContinuityChange::Handoff(handoff.entity.clone()),
+                source(u8::try_from(index + 170).unwrap()),
+                handoff.entity.created_at,
             ));
         }
         entities

@@ -641,6 +641,7 @@ function ReadyProjectView({
           onDelete={setDeleteTarget}
           onEdit={(object) => setEditor({ mode: "edit", object })}
           onSelectObject={selectObject}
+          projectionGeneration={projectionGeneration}
           projectRevision={projectRevision}
           roleContinuity={roleContinuity}
           roleDefinition={selectedRoleDefinition}

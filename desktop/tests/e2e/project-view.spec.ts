@@ -5,6 +5,7 @@ import type {
   RawProjectViewObject,
   ProjectViewObjectType,
 } from "../../src/shared/api/tauriProjectView";
+import type { RawProjectRoleHistoryPage } from "../../src/shared/api/tauriProjectViewRoleHistory";
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
 
@@ -196,6 +197,7 @@ const ROLE_STATE_IDS = {
   proposal: "20000000-0000-4000-8000-000000000003",
   handoff: "20000000-0000-4000-8000-000000000004",
   commitment: "20000000-0000-4000-8000-000000000005",
+  checkpoint: "20000000-0000-4000-8000-000000000006",
 } as const;
 
 const ROLE_BRIEF_SOURCE = {
@@ -281,6 +283,34 @@ const V2_READY_VIEW = {
       },
     ],
     workResponsibilities: [{ workId: IDS.work, roleId: IDS.role }],
+    checkpoints: [
+      {
+        checkpoint_id: ROLE_STATE_IDS.checkpoint,
+        role_id: IDS.role,
+        assignment_id: ROLE_STATE_IDS.currentAssignment,
+        based_on_project_revision: 6,
+        content: {
+          summary: "The View is usable; finish the continuity timeline.",
+          current_focus: ["Role continuity timeline"],
+          progress: ["Trusted Role Brief is visible"],
+          blockers: [],
+          risks: ["A stale projection could hide new context"],
+          open_questions: ["How much history should load initially?"],
+          next_steps: ["Ship paginated Checkpoint history"],
+          references: [
+            {
+              reference_type: "object",
+              object_id: IDS.work,
+              label: "Add the View entry",
+            },
+          ],
+        },
+        created_by: ACTOR,
+        created_at: NOW,
+        entity_revision: 1,
+        project_revision: 7,
+      },
+    ],
     handoffs: [
       {
         handoff_id: ROLE_STATE_IDS.handoff,
@@ -288,7 +318,13 @@ const V2_READY_VIEW = {
         from_assignment_id: ROLE_STATE_IDS.formerAssignment,
         to_assignment_id: ROLE_STATE_IDS.currentAssignment,
         affected_commitment_ids: [],
+        content: {
+          summary: "Continue from the verified Project View.",
+          unresolved_items: ["Keep Role context current"],
+          references: [],
+        },
         cause: "replaced",
+        system_generated: true,
         created_at: "2026-07-26T08:00:00Z",
         entity_revision: 1,
         project_revision: 6,
@@ -379,6 +415,57 @@ const V2_READY_VIEW = {
           },
         ],
         related_objects: [],
+        latest_checkpoint: {
+          checkpoint: {
+            checkpoint_id: ROLE_STATE_IDS.checkpoint,
+            role_id: IDS.role,
+            assignment_id: ROLE_STATE_IDS.currentAssignment,
+            based_on_project_revision: 6,
+            content: {
+              summary: "The View is usable; finish the continuity timeline.",
+              current_focus: ["Role continuity timeline"],
+              progress: ["Trusted Role Brief is visible"],
+              blockers: [],
+              risks: ["A stale projection could hide new context"],
+              open_questions: ["How much history should load initially?"],
+              next_steps: ["Ship paginated Checkpoint history"],
+              references: [
+                {
+                  reference_type: "object",
+                  object_id: IDS.work,
+                  label: "Add the View entry",
+                },
+              ],
+            },
+            created_by: ACTOR,
+            created_at: NOW,
+            entity_revision: 1,
+            project_revision: 7,
+          },
+          source: ROLE_BRIEF_SOURCE,
+        },
+        recent_handoffs: [
+          {
+            handoff: {
+              handoff_id: ROLE_STATE_IDS.handoff,
+              role_id: IDS.role,
+              from_assignment_id: ROLE_STATE_IDS.formerAssignment,
+              to_assignment_id: ROLE_STATE_IDS.currentAssignment,
+              affected_commitment_ids: [],
+              content: {
+                summary: "Continue from the verified Project View.",
+                unresolved_items: ["Keep Role context current"],
+                references: [],
+              },
+              cause: "replaced",
+              system_generated: true,
+              created_at: "2026-07-26T08:00:00Z",
+              entity_revision: 1,
+              project_revision: 6,
+            },
+            source: ROLE_BRIEF_SOURCE,
+          },
+        ],
         source_revisions: {
           meta_event_id: "f".repeat(64),
           meta_change_id: "a".repeat(64),
@@ -468,12 +555,62 @@ function vacantV2View() {
   next.role_continuity.assignments = [];
   next.role_continuity.commitments = [];
   next.role_continuity.workResponsibilities = [];
+  next.role_continuity.checkpoints = [];
   next.role_continuity.handoffs = [];
   next.role_continuity.briefs = [];
   next.role_continuity.members = [
     { pubkey: HUMAN, role: "owner" },
     { pubkey: ACTOR, role: "member" },
   ];
+  return next;
+}
+
+function humanAssignedV2View() {
+  const next = structuredClone(V2_READY_VIEW) as Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >;
+  const continuity = next.role_continuity;
+  if (!continuity) {
+    throw new Error("v2 fixture must include Role continuity");
+  }
+  const assignment = continuity.assignments.find(
+    (candidate) => candidate.assignment_id === ROLE_STATE_IDS.currentAssignment,
+  );
+  const commitment = continuity.commitments.find(
+    (candidate) => candidate.commitment_id === ROLE_STATE_IDS.commitment,
+  );
+  const checkpoint = continuity.checkpoints.find(
+    (candidate) => candidate.checkpoint_id === ROLE_STATE_IDS.checkpoint,
+  );
+  const brief = continuity.briefs[0];
+  if (
+    !assignment ||
+    !commitment ||
+    !checkpoint ||
+    !brief ||
+    brief.state.status !== "assigned"
+  ) {
+    throw new Error("assigned v2 fixture is incomplete");
+  }
+  assignment.member_pubkey = HUMAN;
+  commitment.member_pubkey = HUMAN;
+  commitment.started_by = HUMAN;
+  checkpoint.created_by = HUMAN;
+  brief.member_pubkey = HUMAN;
+  brief.community_role = "owner";
+  brief.state.assignment.assignment.member_pubkey = HUMAN;
+  const briefCommitment =
+    brief.responsible_work[0]?.state.status === "committed"
+      ? brief.responsible_work[0].state.commitment.commitment
+      : undefined;
+  if (briefCommitment) {
+    briefCommitment.member_pubkey = HUMAN;
+    briefCommitment.started_by = HUMAN;
+  }
+  if (brief.latest_checkpoint) {
+    brief.latest_checkpoint.checkpoint.created_by = HUMAN;
+  }
   return next;
 }
 
@@ -575,7 +712,13 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
     "Return to project context stewardship",
   );
   await expect(inspector).toContainText("Tenure history");
-  await expect(inspector).toContainText("Handoffs");
+  await expect(inspector).toContainText("Continuity timeline");
+  await expect(
+    page.getByTestId("project-role-latest-checkpoint"),
+  ).toContainText("The View is usable; finish the continuity timeline.");
+  await expect(page.getByTestId("project-role-timeline")).toContainText(
+    "Continue from the verified Project View.",
+  );
   await expect(
     inspector.getByRole("button", { name: "Delete" }),
   ).toBeDisabled();
@@ -583,6 +726,109 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
 
   await inspector.getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Active role")).toBeDisabled();
+});
+
+test("Role Inspector loads the next history page through the native boundary", async ({
+  page,
+}) => {
+  const cursorId = "00000000-0000-4000-8000-000000000091";
+  const pages: RawProjectRoleHistoryPage[] = [
+    {
+      project_revision: 7,
+      projection_generation: 2,
+      items: [
+        {
+          entity_type: "checkpoint",
+          entity: {
+            checkpoint_id: cursorId,
+            role_id: IDS.role,
+            assignment_id: ROLE_STATE_IDS.formerAssignment,
+            based_on_project_revision: 4,
+            content: {
+              summary: "First bounded history page.",
+              current_focus: [],
+              progress: [],
+              blockers: [],
+              risks: [],
+              open_questions: [],
+              next_steps: [],
+              references: [],
+            },
+            created_by: FORMER_ASSIGNEE,
+            created_at: "2026-07-25T08:00:00Z",
+            entity_revision: 1,
+            project_revision: 5,
+          },
+        },
+      ],
+      next_before: {
+        project_revision: 5,
+        entity_type: "role_checkpoint",
+        entity_id: cursorId,
+      },
+    },
+    {
+      project_revision: 7,
+      projection_generation: 2,
+      items: [
+        {
+          entity_type: "handoff",
+          entity: {
+            handoff_id: "00000000-0000-4000-8000-000000000092",
+            role_id: IDS.role,
+            from_assignment_id: ROLE_STATE_IDS.formerAssignment,
+            affected_commitment_ids: [],
+            content: {
+              summary: "Loaded from the server-side continuation page.",
+              unresolved_items: [],
+              references: [],
+            },
+            cause: "planned",
+            system_generated: false,
+            created_by: FORMER_ASSIGNEE,
+            created_at: "2026-07-24T08:00:00Z",
+            entity_revision: 1,
+            project_revision: 4,
+          },
+        },
+      ],
+    },
+  ];
+  await installMockBridge(page, {
+    projectView: V2_READY_VIEW,
+    projectViewRoleHistoryPages: pages,
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+
+  await expect(page.getByText("First bounded history page.")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  await page.getByTestId("project-role-timeline-more").click();
+  await expect(
+    page.getByText("Loaded from the server-side continuation page."),
+  ).toBeVisible();
+  const requests = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__,
+  );
+  expect(requests).toHaveLength(2);
+  expect(requests?.[1]).toMatchObject({
+    project_revision: 7,
+    projection_generation: 2,
+    role_id: IDS.role,
+    before: {
+      project_revision: 5,
+      entity_type: "role_checkpoint",
+      entity_id: cursorId,
+    },
+  });
 });
 
 test("Work Inspector shows the verified responsibility and Commitment", async ({
@@ -665,6 +911,85 @@ test("owner creates a revision-fenced Role offer from the Inspector", async ({
     role_id: IDS.role,
     candidate_pubkey: FORMER_ASSIGNEE,
     expires_in_hours: 72,
+  });
+});
+
+test("the current assignee appends Checkpoint and Handoff context", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: humanAssignedV2View(),
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await page.getByTestId("project-role-checkpoint").click();
+  await page
+    .getByLabel("Situation summary")
+    .fill("The naming decision is ready for implementation.");
+  await page
+    .getByLabel("Current focus")
+    .fill("Rename the navigation entry\nPreserve old routes");
+  await page
+    .getByLabel("Blockers")
+    .fill("Awaiting final copy review\nDesktop snapshot is stale");
+  await page.getByTestId("project-role-checkpoint-submit").click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const intent = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.[0],
+  );
+  expect(intent).toMatchObject({
+    operation: "append_checkpoint",
+    expected_project_revision: 7,
+    based_on_project_revision: 7,
+    acting_assignment_id: ROLE_STATE_IDS.currentAssignment,
+    content: {
+      summary: "The naming decision is ready for implementation.",
+      current_focus: ["Rename the navigation entry", "Preserve old routes"],
+      blockers: ["Awaiting final copy review", "Desktop snapshot is stale"],
+      references: [],
+    },
+  });
+
+  await page.getByTestId("project-role-handoff").click();
+  await page
+    .getByLabel("Transition summary")
+    .fill("Keep the route migration reversible.");
+  await page
+    .getByLabel("Unresolved items")
+    .fill("Confirm final navigation copy\nCapture a fresh screenshot");
+  await page.getByTestId("project-role-handoff-submit").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(2);
+  const handoffIntent = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.[1],
+  );
+  expect(handoffIntent).toMatchObject({
+    operation: "append_handoff",
+    expected_project_revision: 7,
+    acting_assignment_id: ROLE_STATE_IDS.currentAssignment,
+    checkpoint_id: ROLE_STATE_IDS.checkpoint,
+    cause: "planned",
+    content: {
+      summary: "Keep the route migration reversible.",
+      unresolved_items: [
+        "Confirm final navigation copy",
+        "Capture a fresh screenshot",
+      ],
+      references: [],
+    },
   });
 });
 

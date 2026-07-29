@@ -8,9 +8,9 @@ use buzz_core::kind::{
 };
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::{
-    CommunityMemberRole, ProjectObjectCommand, RoleAssignment, RoleAssignmentProposal, RoleCommand,
-    RoleContinuityChange, RoleContinuityEntity, RoleDefinition, RoleHandoff, SchemaVersion,
-    WorkCommitment,
+    CommunityMemberRole, ProjectObjectCommand, RoleAssignment, RoleAssignmentProposal,
+    RoleCheckpoint, RoleCommand, RoleContinuityChange, RoleContinuityEntity, RoleDefinition,
+    RoleHandoff, SchemaVersion, WorkCommitment,
 };
 use buzz_project_view::{
     validate_projected_object, ProjectViewEntry, ProjectViewObject, ProjectViewObjectType,
@@ -1089,6 +1089,7 @@ fn entity_parts(
         RoleContinuityChange::Proposal(value) => serde_json::to_value(value),
         RoleContinuityChange::Assignment(value) => serde_json::to_value(value),
         RoleContinuityChange::Commitment(value) => serde_json::to_value(value),
+        RoleContinuityChange::Checkpoint(value) => serde_json::to_value(value),
         RoleContinuityChange::Handoff(value) => serde_json::to_value(value),
     }
     .map_err(|error| SdkError::InvalidInput(format!("serialize v2 entity: {error}")))?;
@@ -1112,6 +1113,9 @@ fn parse_entity(
         }
         RoleContinuityEntity::WorkCommitment => {
             serde_json::from_value::<WorkCommitment>(value).map(RoleContinuityChange::Commitment)
+        }
+        RoleContinuityEntity::RoleCheckpoint => {
+            serde_json::from_value::<RoleCheckpoint>(value).map(RoleContinuityChange::Checkpoint)
         }
         RoleContinuityEntity::RoleHandoff => {
             serde_json::from_value::<RoleHandoff>(value).map(RoleContinuityChange::Handoff)

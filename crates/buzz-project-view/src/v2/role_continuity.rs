@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use buzz_core::PublicKey;
+use buzz_core::{EventId, PublicKey};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,6 +16,11 @@ use super::{RoleLevel, SchemaVersion};
 use crate::{WorkStatus, MAX_SAFE_REVISION};
 
 const MAX_REASON_BYTES: usize = 4_096;
+const MAX_CONTINUITY_SUMMARY_BYTES: usize = 8_192;
+const MAX_CONTINUITY_ITEM_BYTES: usize = 2_048;
+const MAX_CONTINUITY_LABEL_BYTES: usize = 256;
+const MAX_CONTINUITY_ITEMS: usize = 64;
+const MAX_CONTINUITY_REFERENCES: usize = 128;
 
 /// Longest Proposal lifetime accepted by the v0 role-continuity protocol.
 pub const MAX_PROPOSAL_LIFETIME_DAYS: i64 = 30;
@@ -420,8 +425,176 @@ impl WorkCommitment {
     }
 }
 
-/// Minimal system-generated record created whenever an Assignment is
-/// replaced.
+/// One typed reference retained by a Checkpoint or Handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reference_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleContinuityReference {
+    /// Reference one Project View object in this Project.
+    Object {
+        /// Stable object identifier.
+        object_id: Uuid,
+        /// Optional human-facing label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Reference one Assignment in this Project.
+    Assignment {
+        /// Stable Assignment identifier.
+        assignment_id: Uuid,
+        /// Optional human-facing label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Reference one Work Commitment in this Project.
+    Commitment {
+        /// Stable Commitment identifier.
+        commitment_id: Uuid,
+        /// Optional human-facing label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Reference one Nostr event stored in this Project's Community.
+    NostrEvent {
+        /// Stable event identifier.
+        event_id: EventId,
+        /// Optional human-facing label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+}
+
+impl RoleContinuityReference {
+    fn label(&self) -> Option<&str> {
+        match self {
+            Self::Object { label, .. }
+            | Self::Assignment { label, .. }
+            | Self::Commitment { label, .. }
+            | Self::NostrEvent { label, .. } => label.as_deref(),
+        }
+    }
+}
+
+/// Closed structured body of an append-only Role Checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleCheckpointContent {
+    /// One concise statement of the Role's current situation.
+    pub summary: String,
+    /// Current areas of attention.
+    #[serde(default)]
+    pub current_focus: Vec<String>,
+    /// Durable progress and evidence summaries.
+    #[serde(default)]
+    pub progress: Vec<String>,
+    /// Current blockers.
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    /// Current risks.
+    #[serde(default)]
+    pub risks: Vec<String>,
+    /// Questions the Project still needs to resolve.
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+    /// Known next actions.
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+    /// Typed references into canonical Project state or evidence.
+    #[serde(default)]
+    pub references: Vec<RoleContinuityReference>,
+}
+
+/// Append-only structured snapshot authored by one active Assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleCheckpoint {
+    /// Stable Checkpoint identifier.
+    pub checkpoint_id: Uuid,
+    /// Role whose situation was captured.
+    pub role_id: Uuid,
+    /// Assignment that authored the Checkpoint.
+    pub assignment_id: Uuid,
+    /// Project revision whose facts the author reviewed.
+    pub based_on_project_revision: u64,
+    /// Closed structured situation body.
+    pub content: RoleCheckpointContent,
+    /// Earlier Checkpoint corrected by this append-only entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_checkpoint_id: Option<Uuid>,
+    /// Verified author; equal to the Assignment Member.
+    pub created_by: PublicKey,
+    /// Relay canonical creation time.
+    pub created_at: DateTime<Utc>,
+    /// Per-entity revision; Checkpoints are append-only and therefore one.
+    pub entity_revision: u64,
+    /// Project revision allocated to this Checkpoint.
+    pub project_revision: u64,
+}
+
+/// Why one Role Handoff record exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffCause {
+    /// Assignee is preparing a planned transition.
+    Planned,
+    /// Governance revoked the old Assignment.
+    Revoked,
+    /// Another Assignment replaced the old tenure.
+    Replaced,
+    /// Community membership ended.
+    MembershipEnded,
+    /// Trusted recovery declared the runtime unrecoverable.
+    Unrecoverable,
+    /// The Role was deactivated.
+    RoleDeactivated,
+    /// Other explicitly described member-authored context.
+    Other,
+}
+
+impl HandoffCause {
+    /// Return the stable database and wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Revoked => "revoked",
+            Self::Replaced => "replaced",
+            Self::MembershipEnded => "membership_ended",
+            Self::Unrecoverable => "unrecoverable",
+            Self::RoleDeactivated => "role_deactivated",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl From<AssignmentEndReason> for HandoffCause {
+    fn from(value: AssignmentEndReason) -> Self {
+        match value {
+            AssignmentEndReason::Revoked => Self::Revoked,
+            AssignmentEndReason::Replaced => Self::Replaced,
+            AssignmentEndReason::Unrecoverable => Self::Unrecoverable,
+            AssignmentEndReason::MembershipEnded => Self::MembershipEnded,
+            AssignmentEndReason::RoleDeactivated => Self::RoleDeactivated,
+        }
+    }
+}
+
+/// Closed structured body of an append-only Role Handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoleHandoffContent {
+    /// Optional concise transition summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Items a successor still needs to resolve.
+    #[serde(default)]
+    pub unresolved_items: Vec<String>,
+    /// Typed references into canonical Project state or evidence.
+    #[serde(default)]
+    pub references: Vec<RoleContinuityReference>,
+}
+
+/// Append-only transition record. Replacement always creates a minimal system
+/// Handoff; an active assignee may also append a richer note beforehand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleHandoff {
@@ -434,10 +607,20 @@ pub struct RoleHandoff {
     /// New Assignment when the handoff is directly into the same Role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_assignment_id: Option<Uuid>,
+    /// Latest Checkpoint explicitly carried into the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<Uuid>,
     /// Work Commitments ended with the old tenure.
     pub affected_commitment_ids: Vec<Uuid>,
-    /// Stable cause.
-    pub cause: AssignmentEndReason,
+    /// Closed structured transition body.
+    pub content: RoleHandoffContent,
+    /// Stable transition cause.
+    pub cause: HandoffCause,
+    /// Whether Relay generated the minimum cutover record.
+    pub system_generated: bool,
+    /// Verified member author, absent only for a system-generated Handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<PublicKey>,
     /// Canonical creation time.
     pub created_at: DateTime<Utc>,
     /// Per-entity revision; Handoffs are append-only and therefore always one.
@@ -590,6 +773,52 @@ impl RoleCommand {
                     ));
                 }
             }
+            RoleCommandRequest::AppendCheckpoint {
+                checkpoint_id,
+                based_on_project_revision,
+                content,
+                supersedes_checkpoint_id,
+            } => {
+                require_id(*checkpoint_id, "checkpoint_id")?;
+                if *based_on_project_revision == 0
+                    || *based_on_project_revision > self.expected_project_revision
+                {
+                    return Err(RoleContinuityError::InvalidCommand(
+                        "based_on_project_revision must be within the signed Project baseline"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(supersedes_checkpoint_id) = supersedes_checkpoint_id {
+                    require_id(*supersedes_checkpoint_id, "supersedes_checkpoint_id")?;
+                    if supersedes_checkpoint_id == checkpoint_id {
+                        return Err(RoleContinuityError::InvalidCommand(
+                            "a Checkpoint cannot supersede itself".to_owned(),
+                        ));
+                    }
+                }
+                validate_checkpoint_content(content)?;
+            }
+            RoleCommandRequest::AppendHandoff {
+                handoff_id,
+                to_assignment_id,
+                checkpoint_id,
+                content,
+                cause,
+            } => {
+                require_id(*handoff_id, "handoff_id")?;
+                if let Some(to_assignment_id) = to_assignment_id {
+                    require_id(*to_assignment_id, "to_assignment_id")?;
+                }
+                if let Some(checkpoint_id) = checkpoint_id {
+                    require_id(*checkpoint_id, "checkpoint_id")?;
+                }
+                if !matches!(cause, HandoffCause::Planned | HandoffCause::Other) {
+                    return Err(RoleContinuityError::InvalidCommand(
+                        "member-authored Handoff cause must be planned or other".to_owned(),
+                    ));
+                }
+                validate_handoff_content(content)?;
+            }
         }
         Ok(())
     }
@@ -601,7 +830,7 @@ impl RoleCommand {
     }
 }
 
-/// Closed Role continuity operation set through stage 5.
+/// Closed Role continuity operation set through stage 6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoleCommandRequest {
@@ -717,6 +946,33 @@ pub enum RoleCommandRequest {
         /// Active Commitment observed by the caller.
         expected_commitment_id: Uuid,
     },
+    /// Append one structured Checkpoint through the signer's active Assignment.
+    AppendCheckpoint {
+        /// Client-generated Checkpoint UUID.
+        checkpoint_id: Uuid,
+        /// Project revision whose state was reviewed.
+        based_on_project_revision: u64,
+        /// Closed structured situation body.
+        content: RoleCheckpointContent,
+        /// Earlier Checkpoint from the same Assignment being corrected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes_checkpoint_id: Option<Uuid>,
+    },
+    /// Append a member-authored Handoff note without ending the Assignment.
+    AppendHandoff {
+        /// Client-generated Handoff UUID.
+        handoff_id: Uuid,
+        /// Known successor Assignment, when already materialized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_assignment_id: Option<Uuid>,
+        /// Checkpoint explicitly carried into the note.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_id: Option<Uuid>,
+        /// Closed structured transition body.
+        content: RoleHandoffContent,
+        /// Member-authored cause (`planned` or `other`).
+        cause: HandoffCause,
+    },
 }
 
 impl RoleCommandRequest {
@@ -738,6 +994,8 @@ impl RoleCommandRequest {
             Self::AcceptWork { .. } => "accept_work",
             Self::EndCommitment { .. } => "end_commitment",
             Self::ReplaceCommitment { .. } => "replace_commitment",
+            Self::AppendCheckpoint { .. } => "append_checkpoint",
+            Self::AppendHandoff { .. } => "append_handoff",
         }
     }
 }
@@ -755,12 +1013,14 @@ pub struct GeneratedRoleContinuityIds {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleContinuityState {
     project_revision: u64,
+    referenceable_objects: BTreeSet<Uuid>,
     roles: BTreeMap<Uuid, RoleSlot>,
     works: BTreeMap<Uuid, WorkResponsibility>,
     members: BTreeMap<PublicKey, MemberGovernance>,
     proposals: BTreeMap<Uuid, RoleAssignmentProposal>,
     assignments: BTreeMap<Uuid, RoleAssignment>,
     commitments: BTreeMap<Uuid, WorkCommitment>,
+    checkpoints: BTreeMap<Uuid, RoleCheckpoint>,
     handoffs: BTreeMap<Uuid, RoleHandoff>,
 }
 
@@ -782,11 +1042,13 @@ impl RoleContinuityState {
             proposals,
             assignments,
             Vec::new(),
+            Vec::new(),
             handoffs,
+            Vec::new(),
         )
     }
 
-    /// Reconstruct the complete stage-5 state loaded under the Community
+    /// Reconstruct the complete stage-6 state loaded under the Community
     /// Project lock.
     #[allow(clippy::too_many_arguments)]
     pub fn from_complete_snapshot(
@@ -797,12 +1059,22 @@ impl RoleContinuityState {
         proposals: Vec<RoleAssignmentProposal>,
         assignments: Vec<RoleAssignment>,
         commitments: Vec<WorkCommitment>,
+        checkpoints: Vec<RoleCheckpoint>,
         handoffs: Vec<RoleHandoff>,
+        referenceable_object_ids: Vec<Uuid>,
     ) -> Result<Self, RoleContinuityError> {
+        let roles = collect_unique(roles, |role| role.role_id, "Role")?;
+        let works = collect_unique(works, |work| work.work_id, "Work")?;
+        let mut referenceable_objects = referenceable_object_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        referenceable_objects.extend(roles.keys().copied());
+        referenceable_objects.extend(works.keys().copied());
         let state = Self {
             project_revision,
-            roles: collect_unique(roles, |role| role.role_id, "Role")?,
-            works: collect_unique(works, |work| work.work_id, "Work")?,
+            referenceable_objects,
+            roles,
+            works,
             members: collect_unique(members, |member| member.pubkey, "Member")?,
             proposals: collect_unique(proposals, |proposal| proposal.proposal_id, "Proposal")?,
             assignments: collect_unique(
@@ -814,6 +1086,11 @@ impl RoleContinuityState {
                 commitments,
                 |commitment| commitment.commitment_id,
                 "Commitment",
+            )?,
+            checkpoints: collect_unique(
+                checkpoints,
+                |checkpoint| checkpoint.checkpoint_id,
+                "Checkpoint",
             )?,
             handoffs: collect_unique(handoffs, |handoff| handoff.handoff_id, "Handoff")?,
         };
@@ -845,6 +1122,16 @@ impl RoleContinuityState {
     /// All Work Commitment heads in stable Commitment ID order.
     pub fn commitments(&self) -> impl Iterator<Item = &WorkCommitment> {
         self.commitments.values()
+    }
+
+    /// All append-only Checkpoints in stable ID order.
+    pub fn checkpoints(&self) -> impl Iterator<Item = &RoleCheckpoint> {
+        self.checkpoints.values()
+    }
+
+    /// All append-only Handoffs in stable ID order.
+    pub fn handoffs(&self) -> impl Iterator<Item = &RoleHandoff> {
+        self.handoffs.values()
     }
 
     /// Re-run the current membership and active-Assignment security fence
@@ -1191,6 +1478,50 @@ impl RoleContinuityState {
                     next_revision,
                 )?;
             }
+            RoleCommandRequest::AppendCheckpoint {
+                checkpoint_id,
+                based_on_project_revision,
+                content,
+                supersedes_checkpoint_id,
+            } => {
+                let assignment_id = command
+                    .acting_assignment_id
+                    .ok_or(RoleContinuityError::ActingAssignmentRequired)?;
+                next.require_assignee_action(command, actor, assignment_id)?;
+                next.append_checkpoint(
+                    *checkpoint_id,
+                    assignment_id,
+                    *based_on_project_revision,
+                    content.clone(),
+                    *supersedes_checkpoint_id,
+                    actor,
+                    canonical_time,
+                    next_revision,
+                )?;
+            }
+            RoleCommandRequest::AppendHandoff {
+                handoff_id,
+                to_assignment_id,
+                checkpoint_id,
+                content,
+                cause,
+            } => {
+                let assignment_id = command
+                    .acting_assignment_id
+                    .ok_or(RoleContinuityError::ActingAssignmentRequired)?;
+                next.require_assignee_action(command, actor, assignment_id)?;
+                next.append_handoff(
+                    *handoff_id,
+                    assignment_id,
+                    *to_assignment_id,
+                    *checkpoint_id,
+                    content.clone(),
+                    *cause,
+                    actor,
+                    canonical_time,
+                    next_revision,
+                )?;
+            }
         }
 
         next.project_revision = next_revision;
@@ -1311,6 +1642,103 @@ impl RoleContinuityState {
                 ));
             }
         }
+        for checkpoint in self.checkpoints.values() {
+            if checkpoint.entity_revision != 1
+                || checkpoint.project_revision > self.project_revision
+                || checkpoint.based_on_project_revision == 0
+                || checkpoint.based_on_project_revision >= checkpoint.project_revision
+            {
+                return Err(RoleContinuityError::InvalidState(
+                    "Checkpoint revisions are invalid".to_owned(),
+                ));
+            }
+            let assignment = self
+                .assignments
+                .get(&checkpoint.assignment_id)
+                .ok_or(RoleContinuityError::AssignmentNotFound)?;
+            if assignment.role_id != checkpoint.role_id
+                || assignment.member_pubkey != checkpoint.created_by
+            {
+                return Err(RoleContinuityError::InvalidState(
+                    "Checkpoint attribution disagrees with its Assignment".to_owned(),
+                ));
+            }
+            validate_checkpoint_content(&checkpoint.content)?;
+            self.validate_references(&checkpoint.content.references)?;
+            if let Some(superseded_id) = checkpoint.supersedes_checkpoint_id {
+                let superseded = self
+                    .checkpoints
+                    .get(&superseded_id)
+                    .ok_or(RoleContinuityError::CheckpointNotFound)?;
+                if superseded.checkpoint_id == checkpoint.checkpoint_id
+                    || superseded.role_id != checkpoint.role_id
+                    || superseded.assignment_id != checkpoint.assignment_id
+                    || superseded.created_at > checkpoint.created_at
+                {
+                    return Err(RoleContinuityError::CheckpointSupersedesInvalid);
+                }
+            }
+        }
+        for handoff in self.handoffs.values() {
+            if handoff.entity_revision != 1 || handoff.project_revision > self.project_revision {
+                return Err(RoleContinuityError::InvalidState(
+                    "Handoff revisions are invalid".to_owned(),
+                ));
+            }
+            let from_assignment = self
+                .assignments
+                .get(&handoff.from_assignment_id)
+                .ok_or(RoleContinuityError::AssignmentNotFound)?;
+            if from_assignment.role_id != handoff.role_id {
+                return Err(RoleContinuityError::HandoffTargetInvalid);
+            }
+            if let Some(to_assignment_id) = handoff.to_assignment_id {
+                let to_assignment = self
+                    .assignments
+                    .get(&to_assignment_id)
+                    .ok_or(RoleContinuityError::AssignmentNotFound)?;
+                if to_assignment.role_id != handoff.role_id {
+                    return Err(RoleContinuityError::HandoffTargetInvalid);
+                }
+            }
+            if let Some(checkpoint_id) = handoff.checkpoint_id {
+                let checkpoint = self
+                    .checkpoints
+                    .get(&checkpoint_id)
+                    .ok_or(RoleContinuityError::CheckpointNotFound)?;
+                if checkpoint.role_id != handoff.role_id
+                    || checkpoint.assignment_id != handoff.from_assignment_id
+                {
+                    return Err(RoleContinuityError::HandoffCheckpointInvalid);
+                }
+            }
+            for commitment_id in &handoff.affected_commitment_ids {
+                let commitment = self
+                    .commitments
+                    .get(commitment_id)
+                    .ok_or(RoleContinuityError::CommitmentNotFound)?;
+                if commitment.assignment_id != handoff.from_assignment_id {
+                    return Err(RoleContinuityError::InvalidState(
+                        "Handoff Commitment belongs to another Assignment".to_owned(),
+                    ));
+                }
+            }
+            validate_handoff_content(&handoff.content)?;
+            self.validate_references(&handoff.content.references)?;
+            match (handoff.system_generated, handoff.created_by) {
+                (true, None) => {}
+                (false, Some(created_by)) if created_by == from_assignment.member_pubkey => {
+                    if !matches!(handoff.cause, HandoffCause::Planned | HandoffCause::Other) {
+                        return Err(RoleContinuityError::HandoffCauseInvalid);
+                    }
+                }
+                _ => {
+                    return Err(RoleContinuityError::InvalidState(
+                        "Handoff author shape is invalid".to_owned(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1342,6 +1770,8 @@ impl RoleContinuityState {
                 | RoleCommandRequest::AcceptWork { .. }
                 | RoleCommandRequest::EndCommitment { .. }
                 | RoleCommandRequest::ReplaceCommitment { .. }
+                | RoleCommandRequest::AppendCheckpoint { .. }
+                | RoleCommandRequest::AppendHandoff { .. }
         );
         if role_action_requires_fence && command.acting_assignment_id.is_none() {
             return Err(RoleContinuityError::ActingAssignmentRequired);
@@ -1484,6 +1914,7 @@ impl RoleContinuityState {
 
         for (assignment_id, handoff_id) in ended_ids.iter().zip(handoff_ids) {
             let old = self.active_assignment(*assignment_id)?.clone();
+            let checkpoint_id = self.latest_checkpoint_for_assignment(old.assignment_id);
             let commitment_ids = self.end_assignment(
                 *assignment_id,
                 authorizer,
@@ -1495,6 +1926,24 @@ impl RoleContinuityState {
             let to_assignment_id =
                 (old.role_id == proposal.role_id).then_some(generated_ids.assignment_id);
             affected_commitments.insert(*assignment_id, commitment_ids.clone());
+            let mut references = Vec::with_capacity(commitment_ids.len() * 2);
+            let mut unresolved_items = Vec::with_capacity(commitment_ids.len());
+            for commitment_id in &commitment_ids {
+                references.push(RoleContinuityReference::Commitment {
+                    commitment_id: *commitment_id,
+                    label: Some("interrupted Commitment".to_owned()),
+                });
+                if let Some(commitment) = self.commitments.get(commitment_id) {
+                    references.push(RoleContinuityReference::Object {
+                        object_id: commitment.work_id,
+                        label: Some("Work waiting for continuation".to_owned()),
+                    });
+                    unresolved_items.push(format!(
+                        "Work {} requires explicit successor acceptance",
+                        commitment.work_id
+                    ));
+                }
+            }
             self.handoffs.insert(
                 handoff_id,
                 RoleHandoff {
@@ -1502,8 +1951,22 @@ impl RoleContinuityState {
                     role_id: old.role_id,
                     from_assignment_id: old.assignment_id,
                     to_assignment_id,
+                    checkpoint_id,
                     affected_commitment_ids: commitment_ids,
-                    cause: AssignmentEndReason::Replaced,
+                    content: RoleHandoffContent {
+                        summary: Some(if unresolved_items.is_empty() {
+                            "Assignment replaced; continue from the retained Project state."
+                                .to_owned()
+                        } else {
+                            "Assignment replaced; unfinished Work is waiting for continuation."
+                                .to_owned()
+                        }),
+                        unresolved_items,
+                        references,
+                    },
+                    cause: HandoffCause::Replaced,
+                    system_generated: true,
+                    created_by: None,
                     created_at: canonical_time,
                     entity_revision: 1,
                     project_revision: next_revision,
@@ -1858,6 +2321,156 @@ impl RoleContinuityState {
         touch_commitment(commitment, next_revision)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn append_checkpoint(
+        &mut self,
+        checkpoint_id: Uuid,
+        assignment_id: Uuid,
+        based_on_project_revision: u64,
+        content: RoleCheckpointContent,
+        supersedes_checkpoint_id: Option<Uuid>,
+        actor: PublicKey,
+        canonical_time: DateTime<Utc>,
+        next_revision: u64,
+    ) -> Result<(), RoleContinuityError> {
+        if self.checkpoints.contains_key(&checkpoint_id) {
+            return Err(RoleContinuityError::IdCollision);
+        }
+        validate_checkpoint_content(&content)?;
+        let assignment = self.active_assignment(assignment_id)?;
+        if assignment.member_pubkey != actor {
+            return Err(RoleContinuityError::AssigneeRequired);
+        }
+        if based_on_project_revision == 0 || based_on_project_revision > self.project_revision {
+            return Err(RoleContinuityError::CheckpointBaselineInvalid);
+        }
+        if let Some(superseded_id) = supersedes_checkpoint_id {
+            let superseded = self
+                .checkpoints
+                .get(&superseded_id)
+                .ok_or(RoleContinuityError::CheckpointNotFound)?;
+            if superseded.role_id != assignment.role_id
+                || superseded.assignment_id != assignment_id
+                || superseded.created_by != actor
+            {
+                return Err(RoleContinuityError::CheckpointSupersedesInvalid);
+            }
+        }
+        self.validate_references(&content.references)?;
+        self.checkpoints.insert(
+            checkpoint_id,
+            RoleCheckpoint {
+                checkpoint_id,
+                role_id: assignment.role_id,
+                assignment_id,
+                based_on_project_revision,
+                content,
+                supersedes_checkpoint_id,
+                created_by: actor,
+                created_at: canonical_time,
+                entity_revision: 1,
+                project_revision: next_revision,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_handoff(
+        &mut self,
+        handoff_id: Uuid,
+        from_assignment_id: Uuid,
+        to_assignment_id: Option<Uuid>,
+        checkpoint_id: Option<Uuid>,
+        content: RoleHandoffContent,
+        cause: HandoffCause,
+        actor: PublicKey,
+        canonical_time: DateTime<Utc>,
+        next_revision: u64,
+    ) -> Result<(), RoleContinuityError> {
+        if self.handoffs.contains_key(&handoff_id) {
+            return Err(RoleContinuityError::IdCollision);
+        }
+        if !matches!(cause, HandoffCause::Planned | HandoffCause::Other) {
+            return Err(RoleContinuityError::HandoffCauseInvalid);
+        }
+        validate_handoff_content(&content)?;
+        let from_assignment = self.active_assignment(from_assignment_id)?;
+        if from_assignment.member_pubkey != actor {
+            return Err(RoleContinuityError::AssigneeRequired);
+        }
+        if let Some(to_assignment_id) = to_assignment_id {
+            let to_assignment = self
+                .assignments
+                .get(&to_assignment_id)
+                .ok_or(RoleContinuityError::AssignmentNotFound)?;
+            if to_assignment.role_id != from_assignment.role_id {
+                return Err(RoleContinuityError::HandoffTargetInvalid);
+            }
+        }
+        if let Some(checkpoint_id) = checkpoint_id {
+            let checkpoint = self
+                .checkpoints
+                .get(&checkpoint_id)
+                .ok_or(RoleContinuityError::CheckpointNotFound)?;
+            if checkpoint.role_id != from_assignment.role_id
+                || checkpoint.assignment_id != from_assignment_id
+            {
+                return Err(RoleContinuityError::HandoffCheckpointInvalid);
+            }
+        }
+        self.validate_references(&content.references)?;
+        self.handoffs.insert(
+            handoff_id,
+            RoleHandoff {
+                handoff_id,
+                role_id: from_assignment.role_id,
+                from_assignment_id,
+                to_assignment_id,
+                checkpoint_id,
+                affected_commitment_ids: Vec::new(),
+                content,
+                cause,
+                system_generated: false,
+                created_by: Some(actor),
+                created_at: canonical_time,
+                entity_revision: 1,
+                project_revision: next_revision,
+            },
+        );
+        Ok(())
+    }
+
+    fn validate_references(
+        &self,
+        references: &[RoleContinuityReference],
+    ) -> Result<(), RoleContinuityError> {
+        for reference in references {
+            match reference {
+                RoleContinuityReference::Object { object_id, .. }
+                    if !self.referenceable_objects.contains(object_id) =>
+                {
+                    return Err(RoleContinuityError::ReferenceNotFound);
+                }
+                RoleContinuityReference::Assignment { assignment_id, .. }
+                    if !self.assignments.contains_key(assignment_id) =>
+                {
+                    return Err(RoleContinuityError::ReferenceNotFound);
+                }
+                RoleContinuityReference::Commitment { commitment_id, .. }
+                    if !self.commitments.contains_key(commitment_id) =>
+                {
+                    return Err(RoleContinuityError::ReferenceNotFound);
+                }
+                RoleContinuityReference::NostrEvent { .. }
+                | RoleContinuityReference::Object { .. }
+                | RoleContinuityReference::Assignment { .. }
+                | RoleContinuityReference::Commitment { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     fn require_assignee_action(
         &self,
         command: &RoleCommand,
@@ -1943,6 +2556,18 @@ impl RoleContinuityState {
             .map(|commitment| commitment.commitment_id)
     }
 
+    fn latest_checkpoint_for_assignment(&self, assignment_id: Uuid) -> Option<Uuid> {
+        self.checkpoints
+            .values()
+            .filter(|checkpoint| checkpoint.assignment_id == assignment_id)
+            .max_by(|left, right| {
+                left.project_revision
+                    .cmp(&right.project_revision)
+                    .then(left.checkpoint_id.cmp(&right.checkpoint_id))
+            })
+            .map(|checkpoint| checkpoint.checkpoint_id)
+    }
+
     fn desired_member_role(
         &self,
         member_pubkey: PublicKey,
@@ -2008,6 +2633,15 @@ impl RoleContinuityState {
                 RoleContinuityChange::Commitment(commitment.clone()),
             );
         }
+        for checkpoint in self.checkpoints.values() {
+            entities.insert(
+                (
+                    RoleContinuityEntity::RoleCheckpoint,
+                    checkpoint.checkpoint_id,
+                ),
+                RoleContinuityChange::Checkpoint(checkpoint.clone()),
+            );
+        }
         for handoff in self.handoffs.values() {
             entities.insert(
                 (RoleContinuityEntity::RoleHandoff, handoff.handoff_id),
@@ -2030,6 +2664,8 @@ pub enum RoleContinuityEntity {
     RoleAssignment,
     /// Work Commitment tenure.
     WorkCommitment,
+    /// Append-only Role Checkpoint.
+    RoleCheckpoint,
     /// Append-only Role Handoff.
     RoleHandoff,
 }
@@ -2043,6 +2679,7 @@ impl RoleContinuityEntity {
             Self::RoleAssignmentProposal => "role_assignment_proposal",
             Self::RoleAssignment => "role_assignment",
             Self::WorkCommitment => "work_commitment",
+            Self::RoleCheckpoint => "role_checkpoint",
             Self::RoleHandoff => "role_handoff",
         }
     }
@@ -2060,6 +2697,8 @@ pub enum RoleContinuityChange {
     Assignment(RoleAssignment),
     /// Work Commitment head.
     Commitment(WorkCommitment),
+    /// Checkpoint head.
+    Checkpoint(RoleCheckpoint),
     /// Handoff head.
     Handoff(RoleHandoff),
 }
@@ -2073,6 +2712,7 @@ impl RoleContinuityChange {
             Self::Proposal(_) => RoleContinuityEntity::RoleAssignmentProposal,
             Self::Assignment(_) => RoleContinuityEntity::RoleAssignment,
             Self::Commitment(_) => RoleContinuityEntity::WorkCommitment,
+            Self::Checkpoint(_) => RoleContinuityEntity::RoleCheckpoint,
             Self::Handoff(_) => RoleContinuityEntity::RoleHandoff,
         }
     }
@@ -2085,6 +2725,7 @@ impl RoleContinuityChange {
             Self::Proposal(proposal) => proposal.proposal_id,
             Self::Assignment(assignment) => assignment.assignment_id,
             Self::Commitment(commitment) => commitment.commitment_id,
+            Self::Checkpoint(checkpoint) => checkpoint.checkpoint_id,
             Self::Handoff(handoff) => handoff.handoff_id,
         }
     }
@@ -2097,6 +2738,7 @@ impl RoleContinuityChange {
             Self::Proposal(proposal) => proposal.entity_revision,
             Self::Assignment(assignment) => assignment.entity_revision,
             Self::Commitment(commitment) => commitment.entity_revision,
+            Self::Checkpoint(checkpoint) => checkpoint.entity_revision,
             Self::Handoff(handoff) => handoff.entity_revision,
         }
     }
@@ -2220,6 +2862,27 @@ pub enum RoleContinuityError {
     /// Replacement did not fence the exact active Commitment.
     #[error("expected Work Commitment no longer matches")]
     CommitmentFenceConflict,
+    /// Checkpoint does not exist.
+    #[error("Role Checkpoint was not found")]
+    CheckpointNotFound,
+    /// Checkpoint baseline is outside the accepted Project history.
+    #[error("Checkpoint baseline revision is invalid")]
+    CheckpointBaselineInvalid,
+    /// A supersedes link crosses Role or Assignment attribution.
+    #[error("Checkpoint supersedes target is invalid")]
+    CheckpointSupersedesInvalid,
+    /// Handoff successor is absent or belongs to another Role.
+    #[error("Handoff Assignment target is invalid")]
+    HandoffTargetInvalid,
+    /// Handoff Checkpoint belongs to another Role or Assignment.
+    #[error("Handoff Checkpoint target is invalid")]
+    HandoffCheckpointInvalid,
+    /// Member-authored Handoff used a system-only cause.
+    #[error("member-authored Handoff cause is invalid")]
+    HandoffCauseInvalid,
+    /// Typed continuity reference is missing from this Project.
+    #[error("Role continuity reference was not found in this Project")]
+    ReferenceNotFound,
     /// Governor authority is insufficient.
     #[error("actor is not authorized for this Role change")]
     NotAuthorized,
@@ -2289,6 +2952,13 @@ impl RoleContinuityError {
             Self::CommitmentEnded => "commitment_ended",
             Self::CommitmentAssigneeRequired => "commitment_assignee_required",
             Self::CommitmentFenceConflict => "commitment_fence",
+            Self::CheckpointNotFound => "checkpoint_not_found",
+            Self::CheckpointBaselineInvalid => "checkpoint_baseline",
+            Self::CheckpointSupersedesInvalid => "checkpoint_supersedes",
+            Self::HandoffTargetInvalid => "handoff_target",
+            Self::HandoffCheckpointInvalid => "handoff_checkpoint",
+            Self::HandoffCauseInvalid => "handoff_cause",
+            Self::ReferenceNotFound => "reference_not_found",
             Self::NotAuthorized => "authorization",
             Self::OwnerRequired => "owner_required",
             Self::SelfEndForbidden => "self_end",
@@ -2393,6 +3063,92 @@ fn validate_optional_reason(reason: &Option<String>) -> Result<(), RoleContinuit
                 "reason must contain 1..={MAX_REASON_BYTES} bytes"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_content(content: &RoleCheckpointContent) -> Result<(), RoleContinuityError> {
+    validate_required_text(
+        &content.summary,
+        "checkpoint.summary",
+        MAX_CONTINUITY_SUMMARY_BYTES,
+    )?;
+    for (field, items) in [
+        ("checkpoint.current_focus", &content.current_focus),
+        ("checkpoint.progress", &content.progress),
+        ("checkpoint.blockers", &content.blockers),
+        ("checkpoint.risks", &content.risks),
+        ("checkpoint.open_questions", &content.open_questions),
+        ("checkpoint.next_steps", &content.next_steps),
+    ] {
+        validate_continuity_items(field, items)?;
+    }
+    validate_reference_shape(&content.references)
+}
+
+fn validate_handoff_content(content: &RoleHandoffContent) -> Result<(), RoleContinuityError> {
+    if let Some(summary) = &content.summary {
+        validate_required_text(summary, "handoff.summary", MAX_CONTINUITY_SUMMARY_BYTES)?;
+    }
+    validate_continuity_items("handoff.unresolved_items", &content.unresolved_items)?;
+    validate_reference_shape(&content.references)
+}
+
+fn validate_continuity_items(field: &str, items: &[String]) -> Result<(), RoleContinuityError> {
+    if items.len() > MAX_CONTINUITY_ITEMS {
+        return Err(RoleContinuityError::InvalidCommand(format!(
+            "{field} cannot contain more than {MAX_CONTINUITY_ITEMS} items"
+        )));
+    }
+    for item in items {
+        validate_required_text(item, field, MAX_CONTINUITY_ITEM_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_reference_shape(
+    references: &[RoleContinuityReference],
+) -> Result<(), RoleContinuityError> {
+    if references.len() > MAX_CONTINUITY_REFERENCES {
+        return Err(RoleContinuityError::InvalidCommand(format!(
+            "references cannot contain more than {MAX_CONTINUITY_REFERENCES} items"
+        )));
+    }
+    for reference in references {
+        match reference {
+            RoleContinuityReference::Object { object_id, .. } => {
+                require_id(*object_id, "reference.object_id")?;
+            }
+            RoleContinuityReference::Assignment { assignment_id, .. } => {
+                require_id(*assignment_id, "reference.assignment_id")?;
+            }
+            RoleContinuityReference::Commitment { commitment_id, .. } => {
+                require_id(*commitment_id, "reference.commitment_id")?;
+            }
+            RoleContinuityReference::NostrEvent { event_id, .. } => {
+                if event_id.to_bytes() == [0; 32] {
+                    return Err(RoleContinuityError::InvalidCommand(
+                        "reference.event_id cannot be all zeroes".to_owned(),
+                    ));
+                }
+            }
+        }
+        if let Some(label) = reference.label() {
+            validate_required_text(label, "reference.label", MAX_CONTINUITY_LABEL_BYTES)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_text(
+    value: &str,
+    field: &str,
+    max_bytes: usize,
+) -> Result<(), RoleContinuityError> {
+    if value.trim().is_empty() || value.len() > max_bytes {
+        return Err(RoleContinuityError::InvalidCommand(format!(
+            "{field} must contain 1..={max_bytes} bytes"
+        )));
     }
     Ok(())
 }
@@ -2523,6 +3279,8 @@ mod tests {
             Vec::new(),
             assignments,
             commitments,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
         )
         .expect("valid complete test state")
@@ -3074,5 +3832,325 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn checkpoint_content(
+        summary: &str,
+        references: Vec<RoleContinuityReference>,
+    ) -> RoleCheckpointContent {
+        RoleCheckpointContent {
+            summary: summary.to_owned(),
+            current_focus: vec!["finish stage 6".to_owned()],
+            progress: vec!["domain model is complete".to_owned()],
+            blockers: Vec::new(),
+            risks: vec!["projection drift".to_owned()],
+            open_questions: Vec::new(),
+            next_steps: vec!["publish the trusted head".to_owned()],
+            references,
+        }
+    }
+
+    #[test]
+    fn checkpoints_are_append_only_and_require_the_active_assignment() {
+        let owner = pubkey();
+        let agent = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let current = complete_state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            vec![work(work_id, Some(role_id), owner)],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(agent, Some(CommunityMemberRole::Member)),
+            ],
+            vec![assignment(assignment_id, role_id, agent)],
+            Vec::new(),
+        );
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let first_id = Uuid::new_v4();
+        let (first, _) = current
+            .reduce(
+                &RoleCommand::new(
+                    7,
+                    Some(assignment_id),
+                    RoleCommandRequest::AppendCheckpoint {
+                        checkpoint_id: first_id,
+                        based_on_project_revision: 7,
+                        content: checkpoint_content(
+                            "first situation",
+                            vec![RoleContinuityReference::Object {
+                                object_id: work_id,
+                                label: Some("owned Work".to_owned()),
+                            }],
+                        ),
+                        supersedes_checkpoint_id: None,
+                    },
+                ),
+                agent,
+                now,
+                &ids(0),
+            )
+            .expect("append first Checkpoint");
+        let second_id = Uuid::new_v4();
+        let (second, _) = first
+            .reduce(
+                &RoleCommand::new(
+                    8,
+                    Some(assignment_id),
+                    RoleCommandRequest::AppendCheckpoint {
+                        checkpoint_id: second_id,
+                        based_on_project_revision: 8,
+                        content: checkpoint_content("corrected situation", Vec::new()),
+                        supersedes_checkpoint_id: Some(first_id),
+                    },
+                ),
+                agent,
+                now + Duration::seconds(1),
+                &ids(0),
+            )
+            .expect("append correction");
+
+        assert_eq!(second.checkpoints().count(), 2);
+        assert_eq!(
+            second
+                .checkpoints
+                .get(&second_id)
+                .and_then(|checkpoint| checkpoint.supersedes_checkpoint_id),
+            Some(first_id)
+        );
+
+        let (ended, _) = second
+            .reduce(
+                &RoleCommand::new(
+                    9,
+                    None,
+                    RoleCommandRequest::EndAssignment {
+                        assignment_id,
+                        reason: None,
+                    },
+                ),
+                owner,
+                now + Duration::seconds(2),
+                &ids(1),
+            )
+            .expect("governance ends Assignment");
+        assert_eq!(
+            ended.reduce(
+                &RoleCommand::new(
+                    10,
+                    Some(assignment_id),
+                    RoleCommandRequest::AppendCheckpoint {
+                        checkpoint_id: Uuid::new_v4(),
+                        based_on_project_revision: 10,
+                        content: checkpoint_content("too late", Vec::new()),
+                        supersedes_checkpoint_id: None,
+                    },
+                ),
+                agent,
+                now + Duration::seconds(3),
+                &ids(0),
+            ),
+            Err(RoleContinuityError::ActingAssignmentInvalid)
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_a_reference_outside_loaded_project_state() {
+        let owner = pubkey();
+        let agent = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let current = complete_state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            Vec::new(),
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(agent, Some(CommunityMemberRole::Member)),
+            ],
+            vec![assignment(assignment_id, role_id, agent)],
+            Vec::new(),
+        );
+        let command = RoleCommand::new(
+            7,
+            Some(assignment_id),
+            RoleCommandRequest::AppendCheckpoint {
+                checkpoint_id: Uuid::new_v4(),
+                based_on_project_revision: 7,
+                content: checkpoint_content(
+                    "invalid reference",
+                    vec![RoleContinuityReference::Object {
+                        object_id: Uuid::new_v4(),
+                        label: None,
+                    }],
+                ),
+                supersedes_checkpoint_id: None,
+            },
+        );
+        assert_eq!(
+            current.reduce(
+                &command,
+                agent,
+                DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp"),
+                &ids(0),
+            ),
+            Err(RoleContinuityError::ReferenceNotFound)
+        );
+    }
+
+    #[test]
+    fn member_handoff_is_context_only_and_replacement_carries_latest_checkpoint() {
+        let owner = pubkey();
+        let incumbent = pubkey();
+        let successor = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let commitment_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let current = complete_state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            vec![work(work_id, Some(role_id), owner)],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(incumbent, Some(CommunityMemberRole::Member)),
+                member(successor, Some(CommunityMemberRole::Member)),
+            ],
+            vec![assignment(assignment_id, role_id, incumbent)],
+            vec![WorkCommitment {
+                commitment_id,
+                work_id,
+                assignment_id,
+                member_pubkey: incumbent,
+                started_at: now - Duration::seconds(1),
+                started_by: incumbent,
+                ended_at: None,
+                ended_by: None,
+                ended_reason: None,
+                entity_revision: 1,
+                project_revision: 7,
+            }],
+        );
+        let member_handoff_id = Uuid::new_v4();
+        let (noted, _) = current
+            .reduce(
+                &RoleCommand::new(
+                    7,
+                    Some(assignment_id),
+                    RoleCommandRequest::AppendHandoff {
+                        handoff_id: member_handoff_id,
+                        to_assignment_id: None,
+                        checkpoint_id: None,
+                        content: RoleHandoffContent {
+                            summary: Some("planned transition context".to_owned()),
+                            unresolved_items: vec!["finish the projection".to_owned()],
+                            references: vec![RoleContinuityReference::Object {
+                                object_id: work_id,
+                                label: None,
+                            }],
+                        },
+                        cause: HandoffCause::Planned,
+                    },
+                ),
+                incumbent,
+                now,
+                &ids(0),
+            )
+            .expect("append member Handoff");
+        assert_eq!(noted.works, current.works);
+        assert_eq!(noted.assignments, current.assignments);
+        assert_eq!(noted.commitments, current.commitments);
+        assert!(
+            !noted
+                .handoffs
+                .get(&member_handoff_id)
+                .expect("member Handoff")
+                .system_generated
+        );
+
+        let checkpoint_id = Uuid::new_v4();
+        let (checkpointed, _) = noted
+            .reduce(
+                &RoleCommand::new(
+                    8,
+                    Some(assignment_id),
+                    RoleCommandRequest::AppendCheckpoint {
+                        checkpoint_id,
+                        based_on_project_revision: 8,
+                        content: checkpoint_content("ready for successor", Vec::new()),
+                        supersedes_checkpoint_id: None,
+                    },
+                ),
+                incumbent,
+                now + Duration::seconds(1),
+                &ids(0),
+            )
+            .expect("append latest Checkpoint");
+        let proposal_id = Uuid::new_v4();
+        let (offered, _) = checkpointed
+            .reduce(
+                &RoleCommand::new(
+                    9,
+                    None,
+                    RoleCommandRequest::OfferRole {
+                        proposal_id,
+                        role_id,
+                        candidate_pubkey: successor,
+                        expires_at: now + Duration::days(1),
+                        reason: None,
+                    },
+                ),
+                owner,
+                now + Duration::seconds(2),
+                &ids(0),
+            )
+            .expect("offer replacement");
+        let generated = ids(1);
+        let (replaced, _) = offered
+            .reduce(
+                &RoleCommand::new(10, None, RoleCommandRequest::AcceptProposal { proposal_id }),
+                successor,
+                now + Duration::seconds(3),
+                &generated,
+            )
+            .expect("accept replacement");
+        let system_handoff = replaced
+            .handoffs
+            .values()
+            .find(|handoff| handoff.system_generated)
+            .expect("system Handoff");
+        assert_eq!(system_handoff.checkpoint_id, Some(checkpoint_id));
+        assert_eq!(system_handoff.affected_commitment_ids, vec![commitment_id]);
+        assert!(system_handoff
+            .content
+            .references
+            .iter()
+            .any(|reference| matches!(
+                reference,
+                RoleContinuityReference::Object { object_id, .. } if *object_id == work_id
+            )));
+        assert!(system_handoff
+            .content
+            .references
+            .iter()
+            .any(|reference| matches!(
+                reference,
+                RoleContinuityReference::Commitment {
+                    commitment_id: referenced,
+                    ..
+                } if *referenced == commitment_id
+            )));
     }
 }

@@ -8,7 +8,7 @@ use buzz_core_pkg::kind::{
 };
 use buzz_core_pkg::PublicKey;
 use buzz_project_view_pkg::v2::{
-    CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal,
+    CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpoint,
     RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel, WorkCommitment,
 };
 use buzz_project_view_pkg::{
@@ -84,6 +84,7 @@ pub struct ProjectViewRoleContinuity {
     assignments: Vec<RoleAssignment>,
     commitments: Vec<WorkCommitment>,
     work_responsibilities: Vec<ProjectViewWorkResponsibility>,
+    checkpoints: Vec<RoleCheckpoint>,
     handoffs: Vec<RoleHandoff>,
     members: Vec<ProjectViewMembershipMember>,
     briefs: Vec<RoleBrief>,
@@ -151,6 +152,18 @@ pub enum ProjectViewLoadResult {
 #[tauri::command]
 pub async fn get_project_view(state: State<'_, AppState>) -> Result<ProjectViewLoadResult, String> {
     load_project_view(&state).await
+}
+
+mod role_history;
+pub use role_history::*;
+
+fn read_error_message(error: ProjectViewReadError) -> String {
+    match error {
+        ProjectViewReadError::Forbidden => {
+            "restricted: Project View requires current Community membership".to_owned()
+        }
+        ProjectViewReadError::Conflict(message) | ProjectViewReadError::Other(message) => message,
+    }
 }
 
 async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, String> {
@@ -434,15 +447,7 @@ async fn fetch_v2_snapshot_once(
         })],
     )
     .await?;
-    let entity_events = query_project_view(
-        state,
-        &[json!({
-            "kinds": [KIND_PROJECT_VIEW_OBJECT],
-            "authors": [identity.relay_pubkey.to_hex()],
-            "#t": ["buzz-project-view-v2-entity"],
-        })],
-    )
-    .await?;
+    let entity_events = query_v2_current_entities(state, identity, &meta).await?;
 
     let mut event_ids = HashSet::with_capacity(ordinary_events.len() + entity_events.len());
     let mut object_ids = HashSet::new();
@@ -486,6 +491,7 @@ async fn fetch_v2_snapshot_once(
     let mut proposals = Vec::new();
     let mut assignments = Vec::new();
     let mut commitments = Vec::new();
+    let mut checkpoints = Vec::new();
     let mut handoffs = Vec::new();
     let mut entity_projections = Vec::with_capacity(entity_events.len());
     for event in &entity_events {
@@ -514,6 +520,7 @@ async fn fetch_v2_snapshot_once(
             RoleContinuityChange::Proposal(proposal) => proposals.push(proposal.clone()),
             RoleContinuityChange::Assignment(assignment) => assignments.push(assignment.clone()),
             RoleContinuityChange::Commitment(commitment) => commitments.push(commitment.clone()),
+            RoleContinuityChange::Checkpoint(checkpoint) => checkpoints.push(checkpoint.clone()),
             RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff.clone()),
         }
         entity_projections.push(projection);
@@ -521,11 +528,14 @@ async fn fetch_v2_snapshot_once(
     let membership = read_v2_membership(state, identity, &meta).await?;
     validate_v2_counts_and_membership(
         &meta,
-        &roles,
-        &proposals,
-        &assignments,
-        &commitments,
-        &handoffs,
+        V2ContinuitySlices {
+            roles: &roles,
+            proposals: &proposals,
+            assignments: &assignments,
+            commitments: &commitments,
+            checkpoints: &checkpoints,
+            handoffs: &handoffs,
+        },
         &membership,
     )?;
 
@@ -564,7 +574,7 @@ async fn fetch_v2_snapshot_once(
             "Project View v2 changed while assembling the snapshot",
         ));
     }
-    let verified = VerifiedRoleBriefSnapshot::new(
+    let verified = VerifiedRoleBriefSnapshot::new_with_partial_history(
         meta.clone(),
         membership.clone(),
         object_projections,
@@ -591,6 +601,7 @@ async fn fetch_v2_snapshot_once(
     assignments.sort_by_key(|assignment| assignment.assignment_id);
     commitments.sort_by_key(|commitment| commitment.commitment_id);
     work_responsibilities.sort_by_key(|responsibility| responsibility.work_id);
+    checkpoints.sort_by_key(|checkpoint| checkpoint.checkpoint_id);
     handoffs.sort_by_key(|handoff| handoff.handoff_id);
     let members = membership
         .members
@@ -609,11 +620,68 @@ async fn fetch_v2_snapshot_once(
             assignments,
             commitments,
             work_responsibilities,
+            checkpoints,
             handoffs,
             members,
             briefs,
         },
     }))
+}
+
+async fn query_v2_current_entities(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+    meta: &V2MetaProjection,
+) -> ProjectViewReadResult<Vec<Event>> {
+    let mut events = Vec::new();
+    let mut event_ids = HashSet::new();
+    let mut after: Option<serde_json::Value> = None;
+    loop {
+        let mut extension = json!({
+            "scope": "v2_current_entities",
+            "revision": meta.project_revision,
+            "projection_generation": meta.projection_generation,
+        });
+        if let Some(cursor) = &after {
+            extension["after"] = cursor.clone();
+        }
+        let page = query_project_view(
+            state,
+            &[json!({
+                "kinds": [KIND_PROJECT_VIEW_OBJECT],
+                "authors": [identity.relay_pubkey.to_hex()],
+                "#t": ["buzz-project-view-v2-entity"],
+                "limit": SNAPSHOT_PAGE_SIZE,
+                "buzz_project_view": extension,
+            })],
+        )
+        .await?;
+        if page.len() > SNAPSHOT_PAGE_SIZE {
+            return Err(integrity_read_error(
+                "v2 current-entity page exceeded its requested limit",
+            ));
+        }
+        let page_len = page.len();
+        for event in page {
+            if !event_ids.insert(event.id) {
+                return Err(integrity_read_error(
+                    "v2 current-entity pages contain a duplicate event",
+                ));
+            }
+            let projection =
+                parse_v2_entity_projection(&event, &identity.relay_pubkey, meta.project_id)
+                    .map_err(|error| integrity_read_error(error.to_string()))?;
+            after = Some(json!({
+                "entity_type": projection.entity.entity_type().as_str(),
+                "entity_id": projection.entity.entity_id(),
+            }));
+            events.push(event);
+        }
+        if page_len < SNAPSHOT_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 fn project_object_from_role(role: &RoleDefinition) -> ProjectViewObject {
@@ -684,37 +752,51 @@ async fn read_v2_membership(
         .map_err(|error| integrity_read_error(error.to_string()))
 }
 
+struct V2ContinuitySlices<'a> {
+    roles: &'a [RoleDefinition],
+    proposals: &'a [RoleAssignmentProposal],
+    assignments: &'a [RoleAssignment],
+    commitments: &'a [WorkCommitment],
+    checkpoints: &'a [RoleCheckpoint],
+    handoffs: &'a [RoleHandoff],
+}
+
 fn validate_v2_counts_and_membership(
     meta: &V2MetaProjection,
-    roles: &[RoleDefinition],
-    proposals: &[RoleAssignmentProposal],
-    assignments: &[RoleAssignment],
-    commitments: &[WorkCommitment],
-    handoffs: &[RoleHandoff],
+    continuity: V2ContinuitySlices<'_>,
     membership: &V2MembershipProjection,
 ) -> ProjectViewReadResult<()> {
-    let open_proposals = proposals
+    let open_proposals = continuity
+        .proposals
         .iter()
         .filter(|proposal| proposal.status == ProposalStatus::Open)
         .count();
-    let active_assignments = assignments
+    let active_assignments = continuity
+        .assignments
         .iter()
         .filter(|assignment| assignment.is_active())
         .count();
-    let active_commitments = commitments
+    let active_commitments = continuity
+        .commitments
         .iter()
         .filter(|commitment| commitment.is_active())
         .count();
     if usize::try_from(meta.entity_counts.open_proposals).ok() != Some(open_proposals)
         || usize::try_from(meta.entity_counts.active_assignments).ok() != Some(active_assignments)
         || usize::try_from(meta.entity_counts.active_commitments).ok() != Some(active_commitments)
-        || usize::try_from(meta.entity_counts.handoffs).ok() != Some(handoffs.len())
+        || usize::try_from(meta.entity_counts.checkpoints)
+            .ok()
+            .is_none_or(|count| continuity.checkpoints.len() > count)
+        || usize::try_from(meta.entity_counts.handoffs)
+            .ok()
+            .is_none_or(|count| continuity.handoffs.len() > count)
     {
         return Err(integrity_read_error(
             "v2 metadata counts disagree with verified Role heads",
         ));
     }
-    let roles_by_id = roles
+    let roles_by_id = continuity
+        .roles
         .iter()
         .map(|role| (role.role_id, role))
         .collect::<BTreeMap<_, _>>();
@@ -724,7 +806,8 @@ fn validate_v2_counts_and_membership(
         .map(|member| (member.pubkey, member.role))
         .collect::<BTreeMap<_, _>>();
     let mut assigned_members = HashSet::new();
-    for assignment in assignments
+    for assignment in continuity
+        .assignments
         .iter()
         .filter(|assignment| assignment.is_active())
     {
@@ -751,7 +834,7 @@ fn validate_v2_counts_and_membership(
     }
     for (pubkey, role) in members {
         if role == CommunityMemberRole::Admin
-            && !assignments.iter().any(|assignment| {
+            && !continuity.assignments.iter().any(|assignment| {
                 assignment.is_active()
                     && assignment.member_pubkey == pubkey
                     && roles_by_id

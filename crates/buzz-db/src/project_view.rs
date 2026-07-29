@@ -11,9 +11,9 @@ use buzz_core::kind::{
 };
 use buzz_core::{CommunityId, PublicKey, StoredEvent};
 use buzz_project_view::{
-    DomainError, Mutation, MutationOutcome, MutationRequest, ProjectViewEntry, ProjectViewObject,
-    ProjectViewObjectData, ProjectViewObjectType, ProjectViewRelations, ProjectViewState,
-    ProjectViewTombstone, MUTATION_SCHEMA_VERSION,
+    v2::RoleContinuityEntity, DomainError, Mutation, MutationOutcome, MutationRequest,
+    ProjectViewEntry, ProjectViewObject, ProjectViewObjectData, ProjectViewObjectType,
+    ProjectViewRelations, ProjectViewState, ProjectViewTombstone, MUTATION_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -69,6 +69,9 @@ pub enum ProjectViewReadError {
     /// The requested revision/generation no longer names the current snapshot.
     #[error("Project View snapshot changed while it was being read")]
     Conflict,
+    /// A keyset cursor does not belong to the requested pinned result set.
+    #[error("invalid Project View cursor: {0}")]
+    InvalidCursor(String),
     /// Canonical state points at a missing or invalid projection event.
     #[error("Project View projection state is inconsistent: {0}")]
     Inconsistent(String),
@@ -84,6 +87,54 @@ pub struct ProjectViewSnapshotCursor {
     pub object_type: ProjectViewObjectType,
     /// Last object identifier returned by the preceding page.
     pub object_id: Uuid,
+}
+
+/// Keyset cursor for a revision-pinned page of current Role-continuity heads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectViewV2EntityCursor {
+    /// Last entity type returned by the preceding page.
+    pub entity_type: RoleContinuityEntity,
+    /// Last entity identifier returned by the preceding page.
+    pub entity_id: Uuid,
+}
+
+/// Keyset cursor for a revision-pinned Role history page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectViewRoleHistoryCursor {
+    /// Canonical project revision of the last history head.
+    pub project_revision: u64,
+    /// Entity type of the last history head.
+    pub entity_type: RoleContinuityEntity,
+    /// Entity identifier of the last history head.
+    pub entity_id: Uuid,
+}
+
+/// Closed filters accepted by the Role history projection reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectViewRoleHistoryFilter {
+    /// Historical entity types to include.
+    pub entity_types: Vec<RoleContinuityEntity>,
+    /// Optional Role boundary.
+    pub role_id: Option<Uuid>,
+    /// Optional source/owning Assignment boundary.
+    pub assignment_id: Option<Uuid>,
+    /// Optional canonical Member boundary.
+    pub member_pubkey: Option<PublicKey>,
+}
+
+/// Complete request for one revision-pinned Role history page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectViewRoleHistoryPageRequest {
+    /// Exact Project revision that every returned page must share.
+    pub project_revision: u64,
+    /// Exact projection generation that every returned page must share.
+    pub projection_generation: u64,
+    /// Closed Role-history filter.
+    pub filter: ProjectViewRoleHistoryFilter,
+    /// Last item returned by the preceding page.
+    pub after: Option<ProjectViewRoleHistoryCursor>,
+    /// Maximum number of signed projection events to return.
+    pub limit: u16,
 }
 
 /// One revision-pinned page of current active object projections.
@@ -664,6 +715,281 @@ impl Db {
             }
             events.push(event.clone());
         }
+        tx.commit().await?;
+        Ok(ProjectViewSnapshotPage { events })
+    }
+
+    /// Read one bounded page containing current Role-continuity heads and the
+    /// small history slice required to assemble Role Briefs.
+    ///
+    /// Historical Proposals, ended Assignments, ended Commitments, and the
+    /// complete Checkpoint/Handoff history are deliberately excluded. The consumed Proposal
+    /// referenced by an active Assignment remains in the page so a client can
+    /// validate the active Assignment's provenance. At most the latest
+    /// Checkpoint and three latest Handoffs per Role are included, so this
+    /// default read stays independent of total Role-history length.
+    pub async fn project_view_v2_current_entities_page(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+        project_revision: u64,
+        projection_generation: u64,
+        after: Option<ProjectViewV2EntityCursor>,
+        limit: u16,
+    ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
+        if !(1..=500).contains(&limit) {
+            return Err(ProjectViewReadError::Inconsistent(
+                "snapshot limit must be in 1..=500".to_owned(),
+            ));
+        }
+        if after.is_some_and(|cursor| v2_current_entity_order(cursor.entity_type).is_none()) {
+            return Err(ProjectViewReadError::InvalidCursor(
+                "current-entity cursor has an unsupported entity type".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        pin_project_view_snapshot_in_tx(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+            project_revision,
+            projection_generation,
+        )
+        .await?;
+
+        if let Some(cursor) = after {
+            validate_v2_current_entity_cursor(&mut tx, community_id, cursor).await?;
+        }
+        let after_order = after.and_then(|cursor| v2_current_entity_order(cursor.entity_type));
+        let after_id = after.map(|cursor| cursor.entity_id);
+        let rows = sqlx::query(
+            "WITH current_entities AS ( \
+                 SELECT 0::smallint AS sort_order, 'role'::text AS entity_type, \
+                        object_id AS entity_id, project_revision, projection_event_id \
+                 FROM project_view_objects \
+                 WHERE community_id = $1 AND object_type = 'role' AND deleted_at IS NULL \
+                 UNION ALL \
+                 SELECT 1::smallint, 'role_assignment_proposal'::text, \
+                        proposal_id, project_revision, projection_event_id \
+                 FROM project_role_assignment_proposals p \
+                 WHERE p.community_id = $1 \
+                   AND ( \
+                       p.status = 'open' \
+                       OR EXISTS ( \
+                           SELECT 1 FROM project_role_assignments a \
+                           WHERE a.community_id = p.community_id \
+                             AND a.proposal_id = p.proposal_id \
+                             AND a.ended_at IS NULL \
+                       ) \
+                   ) \
+                 UNION ALL \
+                 SELECT 2::smallint, 'role_assignment'::text, \
+                        assignment_id, project_revision, projection_event_id \
+                 FROM project_role_assignments \
+                 WHERE community_id = $1 AND ended_at IS NULL \
+                 UNION ALL \
+                 SELECT 3::smallint, 'work_commitment'::text, \
+                        commitment_id, project_revision, projection_event_id \
+                 FROM project_work_commitments \
+                 WHERE community_id = $1 AND ended_at IS NULL \
+                 UNION ALL \
+                 SELECT 4::smallint, 'role_checkpoint'::text, \
+                        checkpoint_id, project_revision, projection_event_id \
+                 FROM ( \
+                     SELECT c.checkpoint_id, c.project_revision, c.projection_event_id, \
+                            row_number() OVER ( \
+                                PARTITION BY c.role_id \
+                                ORDER BY c.project_revision DESC, c.checkpoint_id DESC \
+                            ) AS history_rank \
+                     FROM project_role_checkpoints c \
+                     JOIN project_view_objects r \
+                       ON r.community_id = c.community_id \
+                      AND r.object_id = c.role_id \
+                      AND r.object_type = 'role' \
+                      AND r.deleted_at IS NULL \
+                     WHERE c.community_id = $1 \
+                 ) checkpoints \
+                 WHERE history_rank = 1 \
+                 UNION ALL \
+                 SELECT 5::smallint, 'role_handoff'::text, \
+                        handoff_id, project_revision, projection_event_id \
+                 FROM ( \
+                     SELECT h.handoff_id, h.project_revision, h.projection_event_id, \
+                            row_number() OVER ( \
+                                PARTITION BY h.role_id \
+                                ORDER BY h.project_revision DESC, h.handoff_id DESC \
+                            ) AS history_rank \
+                     FROM project_role_handoffs h \
+                     JOIN project_view_objects r \
+                       ON r.community_id = h.community_id \
+                      AND r.object_id = h.role_id \
+                      AND r.object_type = 'role' \
+                      AND r.deleted_at IS NULL \
+                     WHERE h.community_id = $1 \
+                 ) handoffs \
+                 WHERE history_rank <= 3 \
+             ) \
+             SELECT sort_order, entity_type, entity_id, project_revision, projection_event_id \
+             FROM current_entities \
+             WHERE $2::smallint IS NULL \
+                OR sort_order > $2 \
+                OR (sort_order = $2 AND entity_id > $3) \
+             ORDER BY sort_order ASC, entity_id ASC \
+             LIMIT $4",
+        )
+        .bind(community_id.as_uuid())
+        .bind(after_order)
+        .bind(after_id)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let pointers = projection_pointers_from_rows(rows, project_revision, "current entity")?;
+        let events = load_projection_events(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+            KIND_PROJECT_VIEW_OBJECT,
+            pointers,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ProjectViewSnapshotPage { events })
+    }
+
+    /// Read one newest-first Role history page pinned to one exact v2 snapshot.
+    pub async fn project_view_role_history_page(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+        request: &ProjectViewRoleHistoryPageRequest,
+    ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
+        let project_revision = request.project_revision;
+        let projection_generation = request.projection_generation;
+        let filter = &request.filter;
+        let after = request.after;
+        let limit = request.limit;
+        if !(1..=500).contains(&limit) {
+            return Err(ProjectViewReadError::Inconsistent(
+                "history limit must be in 1..=500".to_owned(),
+            ));
+        }
+        let entity_types = filter.entity_types.iter().copied().collect::<BTreeSet<_>>();
+        if entity_types.is_empty()
+            || entity_types
+                .iter()
+                .any(|entity_type| role_history_entity_order(*entity_type).is_none())
+        {
+            return Err(ProjectViewReadError::Inconsistent(
+                "history entity types must contain only Proposal, Assignment, Checkpoint, or Handoff"
+                    .to_owned(),
+            ));
+        }
+        if after.is_some_and(|cursor| {
+            !entity_types.contains(&cursor.entity_type)
+                || role_history_entity_order(cursor.entity_type).is_none()
+        }) {
+            return Err(ProjectViewReadError::InvalidCursor(
+                "history cursor entity type is outside the requested history set".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        pin_project_view_snapshot_in_tx(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+            project_revision,
+            projection_generation,
+        )
+        .await?;
+        if let Some(cursor) = after {
+            validate_role_history_cursor(&mut tx, community_id, filter, cursor).await?;
+        }
+
+        let requested_types = entity_types
+            .iter()
+            .map(|entity_type| entity_type.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let member_pubkey = filter.member_pubkey.map(|pubkey| pubkey.to_hex());
+        let after_revision = after
+            .map(|cursor| {
+                i64::try_from(cursor.project_revision).map_err(|_| {
+                    ProjectViewReadError::Inconsistent(
+                        "history cursor revision does not fit PostgreSQL BIGINT".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+        let after_order = after.and_then(|cursor| role_history_entity_order(cursor.entity_type));
+        let after_id = after.map(|cursor| cursor.entity_id);
+        let rows = sqlx::query(
+            "WITH role_history AS ( \
+                 SELECT 0::smallint AS sort_order, \
+                        'role_assignment_proposal'::text AS entity_type, \
+                        proposal_id AS entity_id, role_id, NULL::uuid AS assignment_id, \
+                        candidate_pubkey AS member_pubkey, project_revision, projection_event_id \
+                 FROM project_role_assignment_proposals \
+                 WHERE community_id = $1 \
+                 UNION ALL \
+                 SELECT 1::smallint, 'role_assignment'::text, \
+                        assignment_id, role_id, assignment_id, member_pubkey, \
+                        project_revision, projection_event_id \
+                 FROM project_role_assignments \
+                 WHERE community_id = $1 \
+                 UNION ALL \
+                 SELECT 2::smallint, 'role_checkpoint'::text, \
+                        c.checkpoint_id, c.role_id, c.assignment_id, \
+                        encode(c.created_by, 'hex'), c.project_revision, c.projection_event_id \
+                 FROM project_role_checkpoints c \
+                 WHERE c.community_id = $1 \
+                 UNION ALL \
+                 SELECT 3::smallint, 'role_handoff'::text, \
+                        h.handoff_id, h.role_id, h.from_assignment_id, a.member_pubkey, \
+                        h.project_revision, h.projection_event_id \
+                 FROM project_role_handoffs h \
+                 JOIN project_role_assignments a \
+                   ON a.community_id = h.community_id \
+                  AND a.assignment_id = h.from_assignment_id \
+                 WHERE h.community_id = $1 \
+             ) \
+             SELECT sort_order, entity_type, entity_id, project_revision, projection_event_id \
+             FROM role_history \
+             WHERE entity_type = ANY($2::text[]) \
+               AND ($3::uuid IS NULL OR role_id = $3) \
+               AND ($4::uuid IS NULL OR assignment_id = $4) \
+               AND ($5::text IS NULL OR member_pubkey = $5) \
+               AND ( \
+                   $6::bigint IS NULL \
+                   OR project_revision < $6 \
+                   OR (project_revision = $6 AND sort_order > $7) \
+                   OR (project_revision = $6 AND sort_order = $7 AND entity_id < $8) \
+               ) \
+             ORDER BY project_revision DESC, sort_order ASC, entity_id DESC \
+             LIMIT $9",
+        )
+        .bind(community_id.as_uuid())
+        .bind(requested_types)
+        .bind(filter.role_id)
+        .bind(filter.assignment_id)
+        .bind(member_pubkey)
+        .bind(after_revision)
+        .bind(after_order)
+        .bind(after_id)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let pointers = projection_pointers_from_rows(rows, project_revision, "Role history")?;
+        let events = load_projection_events(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+            KIND_PROJECT_VIEW_OBJECT,
+            pointers,
+        )
+        .await?;
         tx.commit().await?;
         Ok(ProjectViewSnapshotPage { events })
     }
@@ -2291,6 +2617,371 @@ fn db_revision_to_u64(value: i64, field: &str) -> crate::Result<u64> {
         .map_err(|_| DbError::InvalidData(format!("{field} must be non-negative, got {value}")))
 }
 
+const fn v2_current_entity_order(entity_type: RoleContinuityEntity) -> Option<i16> {
+    match entity_type {
+        RoleContinuityEntity::Role => Some(0),
+        RoleContinuityEntity::RoleAssignmentProposal => Some(1),
+        RoleContinuityEntity::RoleAssignment => Some(2),
+        RoleContinuityEntity::WorkCommitment => Some(3),
+        RoleContinuityEntity::RoleCheckpoint => Some(4),
+        RoleContinuityEntity::RoleHandoff => Some(5),
+    }
+}
+
+const fn role_history_entity_order(entity_type: RoleContinuityEntity) -> Option<i16> {
+    match entity_type {
+        RoleContinuityEntity::RoleAssignmentProposal => Some(0),
+        RoleContinuityEntity::RoleAssignment => Some(1),
+        RoleContinuityEntity::RoleCheckpoint => Some(2),
+        RoleContinuityEntity::RoleHandoff => Some(3),
+        RoleContinuityEntity::Role | RoleContinuityEntity::WorkCommitment => None,
+    }
+}
+
+async fn pin_project_view_snapshot_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    relay_pubkey: &PublicKey,
+    project_revision: u64,
+    projection_generation: u64,
+) -> ProjectViewReadResult<()> {
+    acquire_project_view_lock(tx, community_id, true)
+        .await
+        .map_err(project_view_write_to_read)?;
+    let state_row = sqlx::query(
+        "SELECT project_revision, projection_generation, projection_pubkey \
+         FROM project_view_state WHERE community_id = $1 FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(state_row) = state_row else {
+        return Err(ProjectViewReadError::Conflict);
+    };
+    let current_revision =
+        db_revision_to_u64(state_row.try_get("project_revision")?, "project_revision")?;
+    let current_generation = db_revision_to_u64(
+        state_row.try_get("projection_generation")?,
+        "projection_generation",
+    )?;
+    let current_pubkey: Vec<u8> = state_row.try_get("projection_pubkey")?;
+    if current_revision != project_revision
+        || current_generation != projection_generation
+        || current_pubkey.as_slice() != relay_pubkey.as_bytes()
+    {
+        return Err(ProjectViewReadError::Conflict);
+    }
+    Ok(())
+}
+
+async fn validate_v2_current_entity_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    cursor: ProjectViewV2EntityCursor,
+) -> ProjectViewReadResult<()> {
+    let exists = match cursor.entity_type {
+        RoleContinuityEntity::Role => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM project_view_objects \
+                     WHERE community_id = $1 AND object_id = $2 \
+                       AND object_type = 'role' AND deleted_at IS NULL \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::RoleAssignmentProposal => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM project_role_assignment_proposals p \
+                     WHERE p.community_id = $1 AND p.proposal_id = $2 \
+                       AND ( \
+                           p.status = 'open' \
+                           OR EXISTS ( \
+                               SELECT 1 FROM project_role_assignments a \
+                               WHERE a.community_id = p.community_id \
+                                 AND a.proposal_id = p.proposal_id \
+                                 AND a.ended_at IS NULL \
+                           ) \
+                       ) \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::RoleAssignment => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM project_role_assignments \
+                     WHERE community_id = $1 AND assignment_id = $2 \
+                       AND ended_at IS NULL \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::WorkCommitment => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM project_work_commitments \
+                     WHERE community_id = $1 AND commitment_id = $2 \
+                       AND ended_at IS NULL \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::RoleCheckpoint => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM ( \
+                         SELECT c.checkpoint_id, \
+                                row_number() OVER ( \
+                                    PARTITION BY c.role_id \
+                                    ORDER BY c.project_revision DESC, c.checkpoint_id DESC \
+                                ) AS history_rank \
+                         FROM project_role_checkpoints c \
+                         JOIN project_view_objects r \
+                           ON r.community_id = c.community_id \
+                          AND r.object_id = c.role_id \
+                          AND r.object_type = 'role' \
+                          AND r.deleted_at IS NULL \
+                         WHERE c.community_id = $1 \
+                     ) checkpoints \
+                     WHERE checkpoint_id = $2 AND history_rank = 1 \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::RoleHandoff => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM ( \
+                         SELECT h.handoff_id, \
+                                row_number() OVER ( \
+                                    PARTITION BY h.role_id \
+                                    ORDER BY h.project_revision DESC, h.handoff_id DESC \
+                                ) AS history_rank \
+                         FROM project_role_handoffs h \
+                         JOIN project_view_objects r \
+                           ON r.community_id = h.community_id \
+                          AND r.object_id = h.role_id \
+                          AND r.object_type = 'role' \
+                          AND r.deleted_at IS NULL \
+                         WHERE h.community_id = $1 \
+                     ) handoffs \
+                     WHERE handoff_id = $2 AND history_rank <= 3 \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+    };
+    if !exists {
+        return Err(ProjectViewReadError::InvalidCursor(
+            "current-entity cursor is not part of the pinned current set".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_role_history_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    filter: &ProjectViewRoleHistoryFilter,
+    cursor: ProjectViewRoleHistoryCursor,
+) -> ProjectViewReadResult<()> {
+    let cursor_revision = i64::try_from(cursor.project_revision).map_err(|_| {
+        ProjectViewReadError::Inconsistent(
+            "history cursor revision does not fit PostgreSQL BIGINT".to_owned(),
+        )
+    })?;
+    let member_pubkey = filter.member_pubkey.map(|pubkey| pubkey.to_hex());
+    let exists = match cursor.entity_type {
+        RoleContinuityEntity::RoleAssignmentProposal => {
+            if filter.assignment_id.is_some() {
+                false
+            } else {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM project_role_assignment_proposals \
+                         WHERE community_id = $1 AND proposal_id = $2 \
+                           AND project_revision = $3 \
+                           AND ($4::uuid IS NULL OR role_id = $4) \
+                           AND ($5::text IS NULL OR candidate_pubkey = $5) \
+                     )",
+                )
+                .bind(community_id.as_uuid())
+                .bind(cursor.entity_id)
+                .bind(cursor_revision)
+                .bind(filter.role_id)
+                .bind(member_pubkey)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+        }
+        RoleContinuityEntity::RoleAssignment => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM project_role_assignments \
+                     WHERE community_id = $1 AND assignment_id = $2 \
+                       AND project_revision = $3 \
+                       AND ($4::uuid IS NULL OR role_id = $4) \
+                       AND ($5::uuid IS NULL OR assignment_id = $5) \
+                       AND ($6::text IS NULL OR member_pubkey = $6) \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .bind(cursor_revision)
+            .bind(filter.role_id)
+            .bind(filter.assignment_id)
+            .bind(member_pubkey)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::RoleCheckpoint => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM project_role_checkpoints \
+                     WHERE community_id = $1 AND checkpoint_id = $2 \
+                       AND project_revision = $3 \
+                       AND ($4::uuid IS NULL OR role_id = $4) \
+                       AND ($5::uuid IS NULL OR assignment_id = $5) \
+                       AND ($6::text IS NULL OR encode(created_by, 'hex') = $6) \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .bind(cursor_revision)
+            .bind(filter.role_id)
+            .bind(filter.assignment_id)
+            .bind(member_pubkey)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::RoleHandoff => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 \
+                     FROM project_role_handoffs h \
+                     JOIN project_role_assignments a \
+                       ON a.community_id = h.community_id \
+                      AND a.assignment_id = h.from_assignment_id \
+                     WHERE h.community_id = $1 AND h.handoff_id = $2 \
+                       AND h.project_revision = $3 \
+                       AND ($4::uuid IS NULL OR h.role_id = $4) \
+                       AND ($5::uuid IS NULL OR h.from_assignment_id = $5) \
+                       AND ($6::text IS NULL OR a.member_pubkey = $6) \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(cursor.entity_id)
+            .bind(cursor_revision)
+            .bind(filter.role_id)
+            .bind(filter.assignment_id)
+            .bind(member_pubkey)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        RoleContinuityEntity::Role | RoleContinuityEntity::WorkCommitment => false,
+    };
+    if !exists {
+        return Err(ProjectViewReadError::InvalidCursor(
+            "history cursor does not belong to the requested pinned history".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn projection_pointers_from_rows(
+    rows: Vec<sqlx::postgres::PgRow>,
+    pinned_revision: u64,
+    label: &str,
+) -> ProjectViewReadResult<Vec<(Uuid, String, Vec<u8>)>> {
+    let mut pointers = Vec::with_capacity(rows.len());
+    let mut event_ids = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let entity_id: Uuid = row.try_get("entity_id")?;
+        let entity_type: String = row.try_get("entity_type")?;
+        let entity_revision =
+            db_revision_to_u64(row.try_get("project_revision")?, "project_revision")?;
+        if entity_revision > pinned_revision {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "{label} {entity_type} {entity_id} is newer than the pinned project revision"
+            )));
+        }
+        let event_id: Option<Vec<u8>> = row.try_get("projection_event_id")?;
+        let Some(event_id) = event_id.filter(|event_id| event_id.len() == 32) else {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "{label} {entity_type} {entity_id} has an invalid projection pointer"
+            )));
+        };
+        if !event_ids.insert(event_id.clone()) {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "{label} contains a duplicate projection pointer"
+            )));
+        }
+        pointers.push((entity_id, entity_type, event_id));
+    }
+    Ok(pointers)
+}
+
+async fn load_projection_events(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    relay_pubkey: &PublicKey,
+    expected_kind: u32,
+    pointers: Vec<(Uuid, String, Vec<u8>)>,
+) -> ProjectViewReadResult<Vec<StoredEvent>> {
+    let id_refs = pointers
+        .iter()
+        .map(|(_, _, event_id)| event_id.as_slice())
+        .collect::<Vec<_>>();
+    let stored = crate::event::get_events_by_ids_in_tx(tx, community_id, &id_refs).await?;
+    let by_id = stored
+        .into_iter()
+        .map(|event| (event.event.id.to_bytes(), event))
+        .collect::<HashMap<_, _>>();
+    let mut events = Vec::with_capacity(pointers.len());
+    for (entity_id, entity_type, event_id) in pointers {
+        let event_id: [u8; 32] = event_id.try_into().map_err(|_| {
+            ProjectViewReadError::Inconsistent(format!(
+                "{entity_type} {entity_id} has an invalid projection pointer"
+            ))
+        })?;
+        let event = by_id.get(&event_id).ok_or_else(|| {
+            ProjectViewReadError::Inconsistent(format!(
+                "{entity_type} {entity_id} points at a missing projection"
+            ))
+        })?;
+        if event.event.kind.as_u16() as u32 != expected_kind
+            || event.event.pubkey != *relay_pubkey
+            || event.channel_id.is_some()
+        {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "{entity_type} {entity_id} points at an invalid projection"
+            )));
+        }
+        events.push(event.clone());
+    }
+    Ok(events)
+}
+
 fn revision_to_i64(value: u64, field: &str) -> ProjectViewWriteResult<i64> {
     i64::try_from(value).map_err(|_| {
         ProjectViewWriteError::InvalidCommit(format!("{field} does not fit in PostgreSQL BIGINT"))
@@ -2457,8 +3148,8 @@ mod tests {
     use super::*;
 
     use buzz_project_view::v2::{
-        ProjectObjectCommand, RoleCommand, RoleCommandRequest, RoleContinuityChange,
-        RoleContinuityError,
+        HandoffCause, ProjectObjectCommand, RoleCheckpointContent, RoleCommand, RoleCommandRequest,
+        RoleContinuityChange, RoleContinuityError, RoleContinuityReference, RoleHandoffContent,
     };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
@@ -4831,6 +5522,74 @@ mod tests {
         )
         .expect("valid first Commitment UUID");
 
+        let checkpoint_id = Uuid::new_v4();
+        let checkpoint = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &first_agent,
+            &relay,
+            RoleCommand::new(
+                9,
+                Some(first_assignment),
+                RoleCommandRequest::AppendCheckpoint {
+                    checkpoint_id,
+                    based_on_project_revision: 9,
+                    content: RoleCheckpointContent {
+                        summary: "The Work is active and ready for succession".to_owned(),
+                        current_focus: vec!["preserve the current Work context".to_owned()],
+                        progress: vec!["Role responsibility is verified".to_owned()],
+                        blockers: Vec::new(),
+                        risks: vec!["replacement may lose local context".to_owned()],
+                        open_questions: vec!["who confirms the next rollout?".to_owned()],
+                        next_steps: vec!["brief the successor".to_owned()],
+                        references: vec![
+                            RoleContinuityReference::Object {
+                                object_id: work_id,
+                                label: Some("continuing Work".to_owned()),
+                            },
+                            RoleContinuityReference::Commitment {
+                                commitment_id: first_commitment_id,
+                                label: Some("current Commitment".to_owned()),
+                            },
+                        ],
+                    },
+                    supersedes_checkpoint_id: None,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            checkpoint.receipt.result["checkpoint_id"].as_str(),
+            Some(checkpoint_id.to_string().as_str())
+        );
+
+        let member_handoff_id = Uuid::new_v4();
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &first_agent,
+            &relay,
+            RoleCommand::new(
+                10,
+                Some(first_assignment),
+                RoleCommandRequest::AppendHandoff {
+                    handoff_id: member_handoff_id,
+                    to_assignment_id: None,
+                    checkpoint_id: Some(checkpoint_id),
+                    content: RoleHandoffContent {
+                        summary: Some("Keep the Work under the Builder Role".to_owned()),
+                        unresolved_items: vec!["confirm the next rollout".to_owned()],
+                        references: vec![RoleContinuityReference::Object {
+                            object_id: work_id,
+                            label: Some("Work to continue".to_owned()),
+                        }],
+                    },
+                    cause: HandoffCause::Planned,
+                },
+            ),
+        )
+        .await;
+
         let second_proposal = Uuid::new_v4();
         commit_v2_role_for_test(
             &db,
@@ -4838,7 +5597,7 @@ mod tests {
             &owner,
             &relay,
             RoleCommand::new(
-                9,
+                11,
                 None,
                 RoleCommandRequest::OfferRole {
                     proposal_id: second_proposal,
@@ -4856,7 +5615,7 @@ mod tests {
             &second_agent,
             &relay,
             RoleCommand::new(
-                10,
+                12,
                 None,
                 RoleCommandRequest::AcceptProposal {
                     proposal_id: second_proposal,
@@ -4906,7 +5665,75 @@ mod tests {
         .fetch_one(&scratch.pool)
         .await
         .expect("count replacement Handoffs");
-        assert_eq!(handoff_count, 1);
+        assert_eq!(handoff_count, 2);
+        let (system_checkpoint_id, system_body): (Option<Uuid>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT checkpoint_id, body FROM project_role_handoffs \
+                 WHERE community_id = $1 AND system_generated",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_one(&scratch.pool)
+            .await
+            .expect("read system replacement Handoff");
+        assert_eq!(system_checkpoint_id, Some(checkpoint_id));
+        assert_eq!(system_body["cause"], "replaced");
+        assert_eq!(
+            system_body["affected_commitment_ids"],
+            serde_json::json!([first_commitment_id])
+        );
+        let stored_reference_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM project_role_continuity_references \
+             WHERE community_id = $1 AND owner_id IN ($2, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(checkpoint_id)
+        .bind(member_handoff_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("count normalized continuity references");
+        assert_eq!(stored_reference_count, 3);
+        assert!(
+            sqlx::query(
+                "INSERT INTO project_role_continuity_references \
+                    (community_id, owner_type, owner_id, position, reference_type, \
+                     nostr_event_id, source_change_id) \
+                 SELECT community_id, 'checkpoint', checkpoint_id, 99, 'nostr_event', \
+                        $3, source_change_id \
+                 FROM project_role_checkpoints \
+                 WHERE community_id = $1 AND checkpoint_id = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(checkpoint_id)
+            .bind(vec![0xFE_u8; 32])
+            .execute(&scratch.pool)
+            .await
+            .is_err(),
+            "a Checkpoint must not reference an event absent from its Community"
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE project_role_checkpoints SET body = '{}'::jsonb \
+                 WHERE community_id = $1 AND checkpoint_id = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(checkpoint_id)
+            .execute(&scratch.pool)
+            .await
+            .is_err(),
+            "Checkpoint history must reject semantic updates"
+        );
+        assert!(
+            sqlx::query(
+                "DELETE FROM project_role_handoffs \
+                 WHERE community_id = $1 AND handoff_id = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(member_handoff_id)
+            .execute(&scratch.pool)
+            .await
+            .is_err(),
+            "Handoff history must reject deletion"
+        );
         let first_commitment_terminal: (String, String) = sqlx::query_as(
             "SELECT member_pubkey, ended_reason \
              FROM project_work_commitments \
@@ -4945,7 +5772,7 @@ mod tests {
             &second_agent,
             &relay,
             RoleCommand::new(
-                11,
+                13,
                 Some(second_assignment),
                 RoleCommandRequest::AcceptWork {
                     commitment_id: Uuid::new_v4(),
@@ -4981,7 +5808,7 @@ mod tests {
             community_id,
             &first_agent,
             RoleCommand::new(
-                12,
+                14,
                 Some(first_assignment),
                 RoleCommandRequest::ReportUnableToContinue {
                     assignment_id: first_assignment,
@@ -5002,7 +5829,7 @@ mod tests {
             &owner,
             &relay,
             ProjectObjectCommand::new(
-                12,
+                14,
                 None,
                 MutationRequest::Create(CreateMutation {
                     object: NewProjectViewObject::Goal {
@@ -5015,7 +5842,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(created.receipt.project_revision, 13);
+        assert_eq!(created.receipt.project_revision, 15);
         assert_eq!(
             created.receipt.result["object_id"].as_str(),
             Some(goal_id.to_string().as_str())
@@ -5034,7 +5861,7 @@ mod tests {
             &owner,
             &relay,
             RoleCommand::new(
-                13,
+                15,
                 None,
                 RoleCommandRequest::EndAssignment {
                     assignment_id: second_assignment,
@@ -5077,7 +5904,7 @@ mod tests {
         );
 
         let deactivate = ProjectObjectCommand::new(
-            14,
+            16,
             None,
             MutationRequest::Update(UpdateMutation::Role {
                 object_id: role_id,
@@ -5111,20 +5938,131 @@ mod tests {
             .await
             .expect("roll back rejected Role deactivation");
 
-        let final_state: (i64, i32, i32, i32, i32) = sqlx::query_as(
+        let final_state: (i64, i32, i32, i32, i32, i32) = sqlx::query_as(
             "SELECT project_revision, open_proposal_count, active_assignment_count, \
-                    active_commitment_count, handoff_count \
+                    active_commitment_count, checkpoint_count, handoff_count \
              FROM project_view_state WHERE community_id = $1",
         )
         .bind(community_id.as_uuid())
         .fetch_one(&scratch.pool)
         .await
         .expect("read final v2 materialized counts");
-        assert_eq!(final_state, (14, 0, 0, 0, 1));
+        assert_eq!(final_state, (16, 0, 0, 0, 1, 2));
         assert!(db
             .project_view_v2_capability_ready(community_id, &relay.public_key())
             .await
             .expect("verify final v2 capability"));
+
+        let current_page = db
+            .project_view_v2_current_entities_page(
+                community_id,
+                &relay.public_key(),
+                16,
+                2,
+                None,
+                2,
+            )
+            .await
+            .expect("read bounded current Role heads");
+        assert_eq!(current_page.events.len(), 2);
+        let current_last = buzz_sdk::project_view_v2::parse_entity_projection(
+            &current_page.events[1].event,
+            &relay.public_key(),
+            community_id,
+        )
+        .expect("parse current-page cursor");
+        let current_next = db
+            .project_view_v2_current_entities_page(
+                community_id,
+                &relay.public_key(),
+                16,
+                2,
+                Some(ProjectViewV2EntityCursor {
+                    entity_type: current_last.entity.entity_type(),
+                    entity_id: current_last.entity.entity_id(),
+                }),
+                2,
+            )
+            .await
+            .expect("continue bounded current Role heads");
+        assert_eq!(current_next.events.len(), 2);
+
+        let history_filter = ProjectViewRoleHistoryFilter {
+            entity_types: vec![
+                RoleContinuityEntity::RoleAssignmentProposal,
+                RoleContinuityEntity::RoleAssignment,
+                RoleContinuityEntity::RoleCheckpoint,
+                RoleContinuityEntity::RoleHandoff,
+            ],
+            role_id: Some(role_id),
+            assignment_id: None,
+            member_pubkey: None,
+        };
+        let history_page = db
+            .project_view_role_history_page(
+                community_id,
+                &relay.public_key(),
+                &ProjectViewRoleHistoryPageRequest {
+                    project_revision: 16,
+                    projection_generation: 2,
+                    filter: history_filter.clone(),
+                    after: None,
+                    limit: 2,
+                },
+            )
+            .await
+            .expect("read first revision-pinned Role history page");
+        assert_eq!(history_page.events.len(), 2);
+        let history_last = buzz_sdk::project_view_v2::parse_entity_projection(
+            &history_page.events[1].event,
+            &relay.public_key(),
+            community_id,
+        )
+        .expect("parse Role history cursor");
+        let history_cursor = ProjectViewRoleHistoryCursor {
+            project_revision: history_last.project_revision,
+            entity_type: history_last.entity.entity_type(),
+            entity_id: history_last.entity.entity_id(),
+        };
+        let history_next = db
+            .project_view_role_history_page(
+                community_id,
+                &relay.public_key(),
+                &ProjectViewRoleHistoryPageRequest {
+                    project_revision: 16,
+                    projection_generation: 2,
+                    filter: history_filter.clone(),
+                    after: Some(history_cursor),
+                    limit: 2,
+                },
+            )
+            .await
+            .expect("continue revision-pinned Role history");
+        assert_eq!(history_next.events.len(), 2);
+        assert!(history_page.events.iter().all(|first| history_next
+            .events
+            .iter()
+            .all(|next| first.event.id != next.event.id)));
+
+        let wrong_role_filter = ProjectViewRoleHistoryFilter {
+            role_id: Some(Uuid::new_v4()),
+            ..history_filter
+        };
+        assert!(matches!(
+            db.project_view_role_history_page(
+                community_id,
+                &relay.public_key(),
+                &ProjectViewRoleHistoryPageRequest {
+                    project_revision: 16,
+                    projection_generation: 2,
+                    filter: wrong_role_filter,
+                    after: Some(history_cursor),
+                    limit: 2,
+                },
+            )
+            .await,
+            Err(ProjectViewReadError::InvalidCursor(_))
+        ));
 
         scratch.cleanup().await;
     }

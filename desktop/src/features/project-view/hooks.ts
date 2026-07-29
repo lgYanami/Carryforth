@@ -1,5 +1,10 @@
 import * as React from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
@@ -12,6 +17,10 @@ import {
   mutateProjectView,
   mutateProjectViewRole,
 } from "@/shared/api/tauriProjectView";
+import {
+  getProjectViewRoleHistory,
+  type ProjectRoleHistoryCursor,
+} from "@/shared/api/tauriProjectViewRoleHistory";
 
 export const projectViewQueryKey = (communityId: string | undefined) =>
   ["project-view", communityId ?? "no-community"] as const;
@@ -54,6 +63,32 @@ export function useProjectViewRoleMutation() {
       queryClient.invalidateQueries({
         queryKey: projectViewQueryKey(communityId),
       }),
+  });
+}
+
+export function useProjectViewRoleHistory(input: {
+  roleId: string;
+  projectRevision: number;
+  projectionGeneration: number;
+}) {
+  const { activeCommunity } = useCommunities();
+  return useInfiniteQuery({
+    queryKey: [
+      "project-view-role-history",
+      activeCommunity?.id ?? "no-community",
+      input.projectRevision,
+      input.projectionGeneration,
+      input.roleId,
+    ],
+    queryFn: ({ pageParam }) =>
+      getProjectViewRoleHistory({
+        ...input,
+        before: pageParam,
+      }),
+    initialPageParam: undefined as ProjectRoleHistoryCursor | undefined,
+    getNextPageParam: (page) => page.nextBefore,
+    enabled: Boolean(activeCommunity && input.roleId),
+    staleTime: 15_000,
   });
 }
 

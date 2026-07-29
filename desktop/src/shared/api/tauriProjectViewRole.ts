@@ -1,6 +1,32 @@
-import { invokeTauri } from "@/shared/api/tauri";
 import type { ProjectView } from "@/shared/api/tauriProjectView";
 import { ProjectViewIntegrityError } from "@/shared/api/tauriProjectViewIntegrity";
+import {
+  normalizeCheckpoint,
+  normalizeHandoff,
+  type ProjectRoleCheckpoint,
+  type ProjectRoleHandoff,
+  type ProjectRoleContinuityReference,
+  type RawProjectRoleCheckpoint,
+  type RawProjectRoleHandoff,
+} from "@/shared/api/tauriProjectViewRoleHistory";
+
+export type {
+  ProjectRoleCheckpoint,
+  ProjectRoleCheckpointContent,
+  ProjectRoleContinuityReference,
+  ProjectRoleHandoff,
+  ProjectRoleHandoffCause,
+  ProjectRoleHandoffContent,
+} from "@/shared/api/tauriProjectViewRoleHistory";
+export {
+  mutateProjectViewRole,
+  serializeProjectViewRoleMutationIntent,
+} from "@/shared/api/tauriProjectViewRoleMutation";
+export type {
+  ProjectViewRoleMutationIntent,
+  ProjectViewRoleMutationResult,
+  RawProjectViewRoleMutationResult,
+} from "@/shared/api/tauriProjectViewRoleMutation";
 
 export type ProjectRoleLevel = "admin" | "member";
 export type ProjectRoleProposalType = "request" | "offer";
@@ -39,7 +65,7 @@ type RawProjectRoleDefinition = {
   updated_by: string;
 };
 
-type RawProjectRoleProposal = {
+export type RawProjectRoleProposal = {
   proposal_id: string;
   role_id: string;
   candidate_pubkey: string;
@@ -59,7 +85,7 @@ type RawProjectRoleProposal = {
   project_revision: number;
 };
 
-type RawProjectRoleAssignment = {
+export type RawProjectRoleAssignment = {
   assignment_id: string;
   role_id: string;
   member_pubkey: string;
@@ -88,18 +114,6 @@ type RawProjectWorkCommitment = {
   ended_at?: string;
   ended_by?: string;
   ended_reason?: ProjectWorkCommitmentEndReason;
-  entity_revision: number;
-  project_revision: number;
-};
-
-type RawProjectRoleHandoff = {
-  handoff_id: string;
-  role_id: string;
-  from_assignment_id: string;
-  to_assignment_id?: string;
-  affected_commitment_ids: string[];
-  cause: ProjectRoleAssignmentEndReason;
-  created_at: string;
   entity_revision: number;
   project_revision: number;
 };
@@ -168,6 +182,14 @@ type RawProjectRoleBrief = {
       | { status: "waiting_for_continuation" };
   }>;
   related_objects: RawRoleBriefObject[];
+  latest_checkpoint?: {
+    checkpoint: RawProjectRoleCheckpoint;
+    source: RawRoleBriefSource;
+  };
+  recent_handoffs: Array<{
+    handoff: RawProjectRoleHandoff;
+    source: RawRoleBriefSource;
+  }>;
   source_revisions: {
     meta_event_id: string;
     meta_change_id: string;
@@ -182,6 +204,7 @@ export type RawProjectViewRoleContinuity = {
   assignments: RawProjectRoleAssignment[];
   commitments: RawProjectWorkCommitment[];
   workResponsibilities: Array<{ workId: string; roleId: string }>;
+  checkpoints: RawProjectRoleCheckpoint[];
   handoffs: RawProjectRoleHandoff[];
   members: Array<{ pubkey: string; role: ProjectCommunityMemberRole }>;
   briefs: RawProjectRoleBrief[];
@@ -256,18 +279,6 @@ export type ProjectWorkCommitment = {
   projectRevision: number;
 };
 
-export type ProjectRoleHandoff = {
-  handoffId: string;
-  roleId: string;
-  fromAssignmentId: string;
-  toAssignmentId?: string;
-  affectedCommitmentIds: string[];
-  cause: ProjectRoleAssignmentEndReason;
-  createdAt: string;
-  entityRevision: number;
-  projectRevision: number;
-};
-
 export type ProjectRoleBrief = {
   generatedAt: string;
   projectId: string;
@@ -315,6 +326,8 @@ export type ProjectRoleBrief = {
     objectType: string;
     title: string;
   }>;
+  latestCheckpoint?: ProjectRoleCheckpoint;
+  recentHandoffs: ProjectRoleHandoff[];
   sourceRevisions: {
     metaEventId: string;
     metaChangeId: string;
@@ -329,10 +342,82 @@ export type ProjectViewRoleContinuity = {
   assignments: ProjectRoleAssignment[];
   commitments: ProjectWorkCommitment[];
   workResponsibilities: Array<{ workId: string; roleId: string }>;
+  checkpoints: ProjectRoleCheckpoint[];
   handoffs: ProjectRoleHandoff[];
   members: Array<{ pubkey: string; role: ProjectCommunityMemberRole }>;
   briefs: ProjectRoleBrief[];
 };
+
+export function normalizeRoleProposal(
+  proposal: RawProjectRoleProposal,
+): ProjectRoleProposal {
+  return {
+    proposalId: proposal.proposal_id,
+    roleId: proposal.role_id,
+    candidatePubkey: proposal.candidate_pubkey,
+    proposalType: proposal.proposal_type,
+    candidateAcceptedAt: proposal.candidate_accepted_at,
+    authorizedBy: proposal.authorized_by,
+    authorizedAt: proposal.authorized_at,
+    expectedTargetAssignmentId: proposal.expected_target_assignment_id,
+    expectedCandidateAssignmentId: proposal.expected_candidate_assignment_id,
+    expiresAt: proposal.expires_at,
+    status: proposal.status,
+    reason: proposal.reason,
+    createdBy: proposal.created_by,
+    createdAt: proposal.created_at,
+    resolvedAt: proposal.resolved_at,
+    entityRevision: proposal.entity_revision,
+    projectRevision: proposal.project_revision,
+  };
+}
+
+export function normalizeRoleAssignment(
+  assignment: RawProjectRoleAssignment,
+): ProjectRoleAssignment {
+  return {
+    assignmentId: assignment.assignment_id,
+    roleId: assignment.role_id,
+    memberPubkey: assignment.member_pubkey,
+    proposalId: assignment.proposal_id,
+    startedAt: assignment.started_at,
+    startedBy: assignment.started_by,
+    replacementRequestedAt: assignment.replacement_requested_at,
+    replacementRequestReason: assignment.replacement_request_reason,
+    unableReportedAt: assignment.unable_reported_at,
+    unableReportReason: assignment.unable_report_reason,
+    endedAt: assignment.ended_at,
+    endedBy: assignment.ended_by,
+    endedReason: assignment.ended_reason,
+    replacedByAssignmentId: assignment.replaced_by_assignment_id,
+    entityRevision: assignment.entity_revision,
+    projectRevision: assignment.project_revision,
+  };
+}
+
+function validateContinuityReferences(
+  references: ProjectRoleContinuityReference[],
+  objectIds: Set<string>,
+  assignments: Map<string, ProjectRoleAssignment>,
+  commitments: Map<string, ProjectWorkCommitment>,
+  partialHistory = false,
+) {
+  for (const reference of references) {
+    const valid =
+      reference.referenceType === "object"
+        ? objectIds.has(reference.objectId)
+        : reference.referenceType === "assignment"
+          ? partialHistory || assignments.has(reference.assignmentId)
+          : reference.referenceType === "commitment"
+            ? partialHistory || commitments.has(reference.commitmentId)
+            : /^[0-9a-f]{64}$/.test(reference.eventId);
+    if (!valid) {
+      throw new ProjectViewIntegrityError(
+        "Role continuity history references missing Project state",
+      );
+    }
+  }
+}
 
 function briefObjectTitle(object: RawRoleBriefObject["object"]) {
   const data = object.data.data;
@@ -453,6 +538,12 @@ function normalizeRoleBrief(
       objectType: related.object.object_type,
       title: briefObjectTitle(related.object),
     })),
+    latestCheckpoint: raw.latest_checkpoint
+      ? normalizeCheckpoint(raw.latest_checkpoint.checkpoint)
+      : undefined,
+    recentHandoffs: raw.recent_handoffs.map((handoff) =>
+      normalizeHandoff(handoff.handoff),
+    ),
     sourceRevisions: {
       metaEventId: raw.source_revisions.meta_event_id,
       metaChangeId: raw.source_revisions.meta_change_id,
@@ -482,45 +573,8 @@ export function normalizeRoleContinuity(
     createdBy: role.created_by,
     updatedBy: role.updated_by,
   }));
-  const proposals = raw.proposals.map<ProjectRoleProposal>((proposal) => ({
-    proposalId: proposal.proposal_id,
-    roleId: proposal.role_id,
-    candidatePubkey: proposal.candidate_pubkey,
-    proposalType: proposal.proposal_type,
-    candidateAcceptedAt: proposal.candidate_accepted_at,
-    authorizedBy: proposal.authorized_by,
-    authorizedAt: proposal.authorized_at,
-    expectedTargetAssignmentId: proposal.expected_target_assignment_id,
-    expectedCandidateAssignmentId: proposal.expected_candidate_assignment_id,
-    expiresAt: proposal.expires_at,
-    status: proposal.status,
-    reason: proposal.reason,
-    createdBy: proposal.created_by,
-    createdAt: proposal.created_at,
-    resolvedAt: proposal.resolved_at,
-    entityRevision: proposal.entity_revision,
-    projectRevision: proposal.project_revision,
-  }));
-  const assignments = raw.assignments.map<ProjectRoleAssignment>(
-    (assignment) => ({
-      assignmentId: assignment.assignment_id,
-      roleId: assignment.role_id,
-      memberPubkey: assignment.member_pubkey,
-      proposalId: assignment.proposal_id,
-      startedAt: assignment.started_at,
-      startedBy: assignment.started_by,
-      replacementRequestedAt: assignment.replacement_requested_at,
-      replacementRequestReason: assignment.replacement_request_reason,
-      unableReportedAt: assignment.unable_reported_at,
-      unableReportReason: assignment.unable_report_reason,
-      endedAt: assignment.ended_at,
-      endedBy: assignment.ended_by,
-      endedReason: assignment.ended_reason,
-      replacedByAssignmentId: assignment.replaced_by_assignment_id,
-      entityRevision: assignment.entity_revision,
-      projectRevision: assignment.project_revision,
-    }),
-  );
+  const proposals = raw.proposals.map(normalizeRoleProposal);
+  const assignments = raw.assignments.map(normalizeRoleAssignment);
   const commitments = raw.commitments.map<ProjectWorkCommitment>(
     (commitment) => ({
       commitmentId: commitment.commitment_id,
@@ -537,17 +591,8 @@ export function normalizeRoleContinuity(
     }),
   );
   const workResponsibilities = raw.workResponsibilities;
-  const handoffs = raw.handoffs.map<ProjectRoleHandoff>((handoff) => ({
-    handoffId: handoff.handoff_id,
-    roleId: handoff.role_id,
-    fromAssignmentId: handoff.from_assignment_id,
-    toAssignmentId: handoff.to_assignment_id,
-    affectedCommitmentIds: handoff.affected_commitment_ids,
-    cause: handoff.cause,
-    createdAt: handoff.created_at,
-    entityRevision: handoff.entity_revision,
-    projectRevision: handoff.project_revision,
-  }));
+  const checkpoints = raw.checkpoints.map(normalizeCheckpoint);
+  const handoffs = raw.handoffs.map(normalizeHandoff);
   const briefs = raw.briefs.map((brief) =>
     normalizeRoleBrief(brief, projectRevision),
   );
@@ -594,6 +639,53 @@ export function normalizeRoleContinuity(
   const assignmentsById = new Map(
     assignments.map((assignment) => [assignment.assignmentId, assignment]),
   );
+  const commitmentsById = new Map(
+    commitments.map((commitment) => [commitment.commitmentId, commitment]),
+  );
+  const objectIds = new Set([
+    view.profile.id,
+    ...view.goals.flatMap((goal) => [
+      goal.goal.id,
+      ...goal.plans.flatMap((plan) => [
+        plan.plan.id,
+        ...plan.stages.flatMap((stage) => [
+          stage.stage.id,
+          ...stage.requirements.flatMap((requirement) => [
+            requirement.requirement.id,
+            ...requirement.works.map((work) => work.id),
+          ]),
+          ...stage.issues.flatMap((issue) => [
+            issue.issue.id,
+            ...issue.works.map((work) => work.id),
+          ]),
+        ]),
+      ]),
+    ]),
+    ...view.unboundPlans.flatMap((plan) => [
+      plan.plan.id,
+      ...plan.stages.flatMap((stage) => [
+        stage.stage.id,
+        ...stage.requirements.flatMap((requirement) => [
+          requirement.requirement.id,
+          ...requirement.works.map((work) => work.id),
+        ]),
+        ...stage.issues.flatMap((issue) => [
+          issue.issue.id,
+          ...issue.works.map((work) => work.id),
+        ]),
+      ]),
+    ]),
+    ...view.unplannedRequirements.flatMap((requirement) => [
+      requirement.requirement.id,
+      ...requirement.works.map((work) => work.id),
+    ]),
+    ...view.unplannedIssues.flatMap((issue) => [
+      issue.issue.id,
+      ...issue.works.map((work) => work.id),
+    ]),
+    ...view.roles.map((role) => role.id),
+    ...view.resources.map((resource) => resource.id),
+  ]);
   const responsibleRolesByWork = new Map(
     workResponsibilities.map((responsibility) => [
       responsibility.workId,
@@ -624,6 +716,84 @@ export function normalizeRoleContinuity(
     }
     if (!commitment.endedAt) activeCommittedWork.add(commitment.workId);
   }
+  const checkpointIds = new Set<string>();
+  for (const checkpoint of checkpoints) {
+    const assignment = assignmentsById.get(checkpoint.assignmentId);
+    if (
+      checkpointIds.has(checkpoint.checkpointId) ||
+      (assignment &&
+        (assignment.roleId !== checkpoint.roleId ||
+          assignment.memberPubkey.toLowerCase() !==
+            checkpoint.createdBy.toLowerCase())) ||
+      checkpoint.basedOnProjectRevision >= checkpoint.projectRevision ||
+      checkpoint.projectRevision > projectRevision
+    ) {
+      throw new ProjectViewIntegrityError(
+        `Checkpoint ${checkpoint.checkpointId} has invalid attribution`,
+      );
+    }
+    checkpointIds.add(checkpoint.checkpointId);
+    validateContinuityReferences(
+      checkpoint.content.references,
+      objectIds,
+      assignmentsById,
+      commitmentsById,
+      true,
+    );
+  }
+  for (const checkpoint of checkpoints) {
+    const superseded = checkpoint.supersedesCheckpointId
+      ? checkpoints.find(
+          (candidate) =>
+            candidate.checkpointId === checkpoint.supersedesCheckpointId,
+        )
+      : undefined;
+    if (
+      superseded &&
+      (superseded.roleId !== checkpoint.roleId ||
+        superseded.assignmentId !== checkpoint.assignmentId ||
+        superseded.projectRevision >= checkpoint.projectRevision)
+    ) {
+      throw new ProjectViewIntegrityError(
+        `Checkpoint ${checkpoint.checkpointId} supersedes invalid history`,
+      );
+    }
+  }
+  for (const handoff of handoffs) {
+    const source = assignmentsById.get(handoff.fromAssignmentId);
+    const target = handoff.toAssignmentId
+      ? assignmentsById.get(handoff.toAssignmentId)
+      : undefined;
+    const checkpoint = handoff.checkpointId
+      ? checkpoints.find(
+          (candidate) => candidate.checkpointId === handoff.checkpointId,
+        )
+      : undefined;
+    if (
+      (source && source.roleId !== handoff.roleId) ||
+      (target && target.roleId !== handoff.roleId) ||
+      (checkpoint &&
+        (checkpoint.roleId !== handoff.roleId ||
+          checkpoint.assignmentId !== handoff.fromAssignmentId)) ||
+      handoff.affectedCommitmentIds.some((id) => {
+        const commitment = commitmentsById.get(id);
+        return (
+          commitment && commitment.assignmentId !== handoff.fromAssignmentId
+        );
+      })
+    ) {
+      throw new ProjectViewIntegrityError(
+        `Handoff ${handoff.handoffId} has invalid attribution`,
+      );
+    }
+    validateContinuityReferences(
+      handoff.content.references,
+      objectIds,
+      assignmentsById,
+      commitmentsById,
+      true,
+    );
+  }
   for (const brief of briefs) {
     if (brief.state.status === "assigned") {
       const assignedState = brief.state;
@@ -643,6 +813,26 @@ export function normalizeRoleContinuity(
         );
       }
     }
+    if (
+      brief.latestCheckpoint &&
+      !checkpointIds.has(brief.latestCheckpoint.checkpointId)
+    ) {
+      throw new ProjectViewIntegrityError(
+        "Role Brief latest Checkpoint is absent from verified history",
+      );
+    }
+    if (
+      brief.recentHandoffs.some(
+        (briefHandoff) =>
+          !handoffs.some(
+            (handoff) => handoff.handoffId === briefHandoff.handoffId,
+          ),
+      )
+    ) {
+      throw new ProjectViewIntegrityError(
+        "Role Brief Handoff is absent from verified history",
+      );
+    }
   }
   return {
     roles,
@@ -650,213 +840,9 @@ export function normalizeRoleContinuity(
     assignments,
     commitments,
     workResponsibilities,
+    checkpoints,
     handoffs,
     members: raw.members,
     briefs,
-  };
-}
-
-type ProjectViewRoleMutationBase = {
-  expectedProjectRevision: number;
-  actingAssignmentId?: string;
-};
-
-export type ProjectViewRoleMutationIntent =
-  | (ProjectViewRoleMutationBase & {
-      operation: "request_role";
-      roleId: string;
-      expiresInHours?: number;
-      reason?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "offer_role";
-      roleId: string;
-      candidatePubkey: string;
-      expiresInHours?: number;
-      reason?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "accept_proposal";
-      proposalId: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "reject_proposal";
-      proposalId: string;
-      reason?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "withdraw_proposal";
-      proposalId: string;
-      reason?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "authorize_proposal";
-      proposalId: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "end_assignment";
-      assignmentId: string;
-      reason?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "set_work_responsibility";
-      workId: string;
-      responsibleRoleId?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "accept_work";
-      workId: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "end_commitment";
-      commitmentId: string;
-      reason?: string;
-    })
-  | (ProjectViewRoleMutationBase & {
-      operation: "replace_commitment";
-      workId: string;
-      expectedCommitmentId: string;
-    });
-
-export type RawProjectViewRoleMutationResult =
-  | {
-      status: "applied";
-      event_id: string;
-      project_revision: number;
-      operation: string;
-      proposal_id?: string;
-      assignment_id?: string;
-      target_assignment_id?: string;
-      work_id?: string;
-      responsible_role_id?: string;
-      commitment_id?: string;
-      changed_entities: Array<{
-        entityType: string;
-        entityId: string;
-        entityRevision: number;
-      }>;
-    }
-  | {
-      status: "conflict";
-      expected_project_revision: number;
-      current_project_revision?: number;
-      message: string;
-    };
-
-export type ProjectViewRoleMutationResult =
-  | {
-      status: "applied";
-      eventId: string;
-      projectRevision: number;
-      operation: string;
-      proposalId?: string;
-      assignmentId?: string;
-      targetAssignmentId?: string;
-      workId?: string;
-      responsibleRoleId?: string;
-      commitmentId?: string;
-      changedEntities: Array<{
-        entityType: string;
-        entityId: string;
-        entityRevision: number;
-      }>;
-    }
-  | {
-      status: "conflict";
-      expectedProjectRevision: number;
-      currentProjectRevision?: number;
-      message: string;
-    };
-
-export function serializeProjectViewRoleMutationIntent(
-  intent: ProjectViewRoleMutationIntent,
-): Record<string, unknown> {
-  const common = {
-    operation: intent.operation,
-    expected_project_revision: intent.expectedProjectRevision,
-    acting_assignment_id: intent.actingAssignmentId,
-  };
-  switch (intent.operation) {
-    case "request_role":
-      return {
-        ...common,
-        role_id: intent.roleId,
-        expires_in_hours: intent.expiresInHours ?? 72,
-        reason: intent.reason,
-      };
-    case "offer_role":
-      return {
-        ...common,
-        role_id: intent.roleId,
-        candidate_pubkey: intent.candidatePubkey,
-        expires_in_hours: intent.expiresInHours ?? 72,
-        reason: intent.reason,
-      };
-    case "accept_proposal":
-    case "authorize_proposal":
-      return { ...common, proposal_id: intent.proposalId };
-    case "reject_proposal":
-    case "withdraw_proposal":
-      return {
-        ...common,
-        proposal_id: intent.proposalId,
-        reason: intent.reason,
-      };
-    case "end_assignment":
-      return {
-        ...common,
-        assignment_id: intent.assignmentId,
-        reason: intent.reason,
-      };
-    case "set_work_responsibility":
-      return {
-        ...common,
-        work_id: intent.workId,
-        responsible_role_id: intent.responsibleRoleId,
-      };
-    case "accept_work":
-      return { ...common, work_id: intent.workId };
-    case "end_commitment":
-      return {
-        ...common,
-        commitment_id: intent.commitmentId,
-        reason: intent.reason,
-      };
-    case "replace_commitment":
-      return {
-        ...common,
-        work_id: intent.workId,
-        expected_commitment_id: intent.expectedCommitmentId,
-      };
-  }
-}
-
-export async function mutateProjectViewRole(
-  intent: ProjectViewRoleMutationIntent,
-): Promise<ProjectViewRoleMutationResult> {
-  const raw = await invokeTauri<RawProjectViewRoleMutationResult>(
-    "mutate_project_view_role",
-    { input: serializeProjectViewRoleMutationIntent(intent) },
-  );
-  if (raw.status === "conflict") {
-    return {
-      status: raw.status,
-      expectedProjectRevision: raw.expected_project_revision,
-      currentProjectRevision: raw.current_project_revision,
-      message: raw.message,
-    };
-  }
-  return {
-    status: raw.status,
-    eventId: raw.event_id,
-    projectRevision: raw.project_revision,
-    operation: raw.operation,
-    proposalId: raw.proposal_id,
-    assignmentId: raw.assignment_id,
-    targetAssignmentId: raw.target_assignment_id,
-    workId: raw.work_id,
-    responsibleRoleId: raw.responsible_role_id,
-    commitmentId: raw.commitment_id,
-    changedEntities: raw.changed_entities,
   };
 }

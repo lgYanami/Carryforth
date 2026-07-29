@@ -46,6 +46,7 @@ type ProjectViewInspectorProps = {
   onDelete: (object: ProjectViewObject) => void;
   onEdit: (object: ProjectViewObject) => void;
   onSelectObject: (objectId: string) => void;
+  projectionGeneration: number;
   projectRevision: number;
   roleContinuity?: ProjectViewRoleContinuity;
   roleDefinition?: ProjectRoleDefinition;
@@ -193,6 +194,7 @@ function ProjectViewInspectorContent({
   onDelete,
   onEdit,
   onSelectObject,
+  projectionGeneration,
   projectRevision,
   roleContinuity,
   roleDefinition,
@@ -318,6 +320,7 @@ function ProjectViewInspectorContent({
             continuity={roleContinuity}
             currentPubkey={currentPubkey}
             definition={roleDefinition}
+            projectionGeneration={projectionGeneration}
             projectRevision={projectRevision}
           />
         ) : null}

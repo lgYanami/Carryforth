@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 
 use buzz_core::PublicKey;
 use buzz_project_view::v2::{
-    ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCommand, RoleCommandRequest,
-    RoleDefinition, RoleHandoff,
+    HandoffCause, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpoint,
+    RoleCheckpointContent, RoleCommand, RoleCommandRequest, RoleContinuityChange,
+    RoleContinuityEntity, RoleDefinition, RoleHandoff, RoleHandoffContent,
 };
 use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
 use buzz_sdk::role_brief::render_role_brief_markdown;
@@ -16,12 +17,14 @@ use uuid::Uuid;
 
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_current_v2_snapshot, read_verified_v2_snapshot, require_v2_identity,
+    is_managed_runtime, read_current_v2_snapshot, read_role_history_page,
+    read_verified_v2_snapshot, require_v2_identity, RoleHistoryRequest,
 };
 use crate::error::CliError;
-use crate::validate::sdk_err;
+use crate::validate::{read_file_or_stdin, sdk_err};
 use crate::{
-    OutputFormat, RoleAssignmentCmd, RoleProposalCmd, RoleProposalStatusArg, RoleWorkCmd, RolesCmd,
+    OutputFormat, RoleAssignmentCmd, RoleCheckpointCmd, RoleHandoffCauseArg, RoleHandoffCmd,
+    RoleProposalCmd, RoleProposalStatusArg, RoleWorkCmd, RolesCmd,
 };
 
 #[derive(Debug)]
@@ -30,6 +33,7 @@ struct RoleSnapshot {
     roles: Vec<RoleDefinition>,
     proposals: Vec<RoleAssignmentProposal>,
     assignments: Vec<RoleAssignment>,
+    checkpoints: Vec<RoleCheckpoint>,
     handoffs: Vec<RoleHandoff>,
 }
 
@@ -54,7 +58,11 @@ pub async fn dispatch(
         }
         RolesCmd::Get { role } => get_role(client, role, format).await,
         RolesCmd::Current { member } => current_assignment(client, member.as_deref(), format).await,
-        RolesCmd::Proposals { status } => list_proposals(client, status, format).await,
+        RolesCmd::Proposals {
+            status,
+            limit,
+            before,
+        } => list_proposals(client, status, limit, before.as_deref(), format).await,
         RolesCmd::Request {
             role,
             expected_project_revision,
@@ -104,6 +112,8 @@ pub async fn dispatch(
         RolesCmd::Proposal { command } => submit_proposal(client, command).await,
         RolesCmd::Assignment { command } => dispatch_assignment(client, command, format).await,
         RolesCmd::Work { command } => dispatch_work(client, command).await,
+        RolesCmd::Checkpoint { command } => dispatch_checkpoint(client, command, format).await,
+        RolesCmd::Handoff { command } => dispatch_handoff(client, command, format).await,
     }
 }
 
@@ -195,6 +205,11 @@ async fn get_role(
         .iter()
         .filter(|handoff| handoff.role_id == role_id)
         .collect::<Vec<_>>();
+    let checkpoints = snapshot
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.role_id == role_id)
+        .collect::<Vec<_>>();
     print_json(
         &json!({
             "project_revision": snapshot.meta.project_revision,
@@ -203,6 +218,7 @@ async fn get_role(
             "current_assignment": current_assignment,
             "assignment_history": history,
             "proposals": proposals,
+            "checkpoints": checkpoints,
             "handoffs": handoffs,
         }),
         format,
@@ -244,22 +260,48 @@ async fn current_assignment(
 async fn list_proposals(
     client: &BuzzClient,
     status: Option<RoleProposalStatusArg>,
+    limit: u16,
+    before: Option<&str>,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
-    let snapshot = read_snapshot(client).await?;
+    let identity = require_v2_identity(client).await?;
+    let snapshot = read_verified_v2_snapshot(client, identity).await?;
+    let page = read_role_history_page(
+        client,
+        identity,
+        snapshot.meta(),
+        RoleHistoryRequest {
+            entity_types: &[RoleContinuityEntity::RoleAssignmentProposal],
+            role_id: None,
+            assignment_id: None,
+            member_pubkey: None,
+            limit,
+            before,
+        },
+    )
+    .await?;
     let expected_status = status.map(proposal_status);
-    let proposals = snapshot
-        .proposals
-        .iter()
+    let proposals = page
+        .projections
+        .into_iter()
+        .filter_map(|projection| match projection.entity {
+            RoleContinuityChange::Proposal(proposal) => Some(proposal),
+            _ => None,
+        })
         .filter(|proposal| {
             expected_status.is_none_or(|status| proposal.effective_status(Utc::now()) == status)
         })
-        .map(proposal_output)
+        .map(|proposal| proposal_output(&proposal))
         .collect::<Vec<_>>();
     print_json(
         &json!({
-            "project_revision": snapshot.meta.project_revision,
+            "project_revision": snapshot.meta().project_revision,
             "proposals": proposals,
+            "page": {
+                "limit": limit,
+                "has_more": page.next_before.is_some(),
+                "next_before": page.next_before,
+            },
         }),
         format,
     )
@@ -340,20 +382,71 @@ async fn dispatch_assignment(
             role,
             member,
             include_ended,
+            limit,
+            before,
         } => {
             let member = member.as_deref().map(parse_pubkey).transpose()?;
-            let snapshot = read_snapshot(client).await?;
-            let assignments = snapshot
-                .assignments
-                .iter()
-                .filter(|assignment| role.is_none_or(|role| assignment.role_id == role))
-                .filter(|assignment| member.is_none_or(|member| assignment.member_pubkey == member))
-                .filter(|assignment| include_ended || assignment.is_active())
+            let identity = require_v2_identity(client).await?;
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            if !include_ended {
+                if before.is_some() {
+                    return Err(CliError::Usage(
+                        "--before requires --include-ended for Assignment history".to_owned(),
+                    ));
+                }
+                let mut assignments = snapshot
+                    .assignments()
+                    .filter(|assignment| assignment.is_active())
+                    .filter(|assignment| role.is_none_or(|role| assignment.role_id == role))
+                    .filter(|assignment| {
+                        member.is_none_or(|member| assignment.member_pubkey == member)
+                    })
+                    .collect::<Vec<_>>();
+                assignments.sort_by_key(|assignment| assignment.assignment_id);
+                return print_json(
+                    &json!({
+                        "project_revision": snapshot.meta().project_revision,
+                        "assignments": assignments,
+                        "page": {
+                            "limit": limit,
+                            "has_more": false,
+                            "next_before": Value::Null,
+                        },
+                    }),
+                    format,
+                );
+            }
+            let page = read_role_history_page(
+                client,
+                identity,
+                snapshot.meta(),
+                RoleHistoryRequest {
+                    entity_types: &[RoleContinuityEntity::RoleAssignment],
+                    role_id: role,
+                    assignment_id: None,
+                    member_pubkey: member,
+                    limit,
+                    before: before.as_deref(),
+                },
+            )
+            .await?;
+            let assignments = page
+                .projections
+                .into_iter()
+                .filter_map(|projection| match projection.entity {
+                    RoleContinuityChange::Assignment(assignment) => Some(assignment),
+                    _ => None,
+                })
                 .collect::<Vec<_>>();
             print_json(
                 &json!({
-                    "project_revision": snapshot.meta.project_revision,
+                    "project_revision": snapshot.meta().project_revision,
                     "assignments": assignments,
+                    "page": {
+                        "limit": limit,
+                        "has_more": page.next_before.is_some(),
+                        "next_before": page.next_before,
+                    },
                 }),
                 format,
             )
@@ -508,6 +601,170 @@ async fn dispatch_work(client: &BuzzClient, command: RoleWorkCmd) -> Result<(), 
     submit(client, RoleCommand::new(expected, acting, request)).await
 }
 
+async fn dispatch_checkpoint(
+    client: &BuzzClient,
+    command: RoleCheckpointCmd,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    match command {
+        RoleCheckpointCmd::Append {
+            input,
+            expected_project_revision,
+            based_on_project_revision,
+            supersedes,
+            acting_assignment,
+        } => {
+            let content: RoleCheckpointContent = serde_json::from_str(&read_file_or_stdin(&input)?)
+                .map_err(|error| {
+                    CliError::Usage(format!(
+                        "invalid Role Checkpoint JSON in {input:?}: {error}"
+                    ))
+                })?;
+            submit(
+                client,
+                RoleCommand::new(
+                    expected_project_revision,
+                    acting_assignment,
+                    RoleCommandRequest::AppendCheckpoint {
+                        checkpoint_id: Uuid::new_v4(),
+                        based_on_project_revision: based_on_project_revision
+                            .unwrap_or(expected_project_revision),
+                        content,
+                        supersedes_checkpoint_id: supersedes,
+                    },
+                ),
+            )
+            .await
+        }
+        RoleCheckpointCmd::List {
+            role,
+            assignment,
+            limit,
+            before,
+        } => {
+            let identity = require_v2_identity(client).await?;
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let page = read_role_history_page(
+                client,
+                identity,
+                snapshot.meta(),
+                RoleHistoryRequest {
+                    entity_types: &[RoleContinuityEntity::RoleCheckpoint],
+                    role_id: role,
+                    assignment_id: assignment,
+                    member_pubkey: None,
+                    limit,
+                    before: before.as_deref(),
+                },
+            )
+            .await?;
+            let checkpoints = page
+                .projections
+                .into_iter()
+                .filter_map(|projection| match projection.entity {
+                    RoleContinuityChange::Checkpoint(checkpoint) => Some(checkpoint),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            print_json(
+                &json!({
+                    "project_revision": snapshot.meta().project_revision,
+                    "checkpoints": checkpoints,
+                    "page": {
+                        "limit": limit,
+                        "has_more": page.next_before.is_some(),
+                        "next_before": page.next_before,
+                    },
+                }),
+                format,
+            )
+        }
+    }
+}
+
+async fn dispatch_handoff(
+    client: &BuzzClient,
+    command: RoleHandoffCmd,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    match command {
+        RoleHandoffCmd::Append {
+            input,
+            expected_project_revision,
+            to_assignment,
+            checkpoint,
+            cause,
+            acting_assignment,
+        } => {
+            let content: RoleHandoffContent = serde_json::from_str(&read_file_or_stdin(&input)?)
+                .map_err(|error| {
+                    CliError::Usage(format!("invalid Role Handoff JSON in {input:?}: {error}"))
+                })?;
+            submit(
+                client,
+                RoleCommand::new(
+                    expected_project_revision,
+                    acting_assignment,
+                    RoleCommandRequest::AppendHandoff {
+                        handoff_id: Uuid::new_v4(),
+                        to_assignment_id: to_assignment,
+                        checkpoint_id: checkpoint,
+                        content,
+                        cause: match cause {
+                            RoleHandoffCauseArg::Planned => HandoffCause::Planned,
+                            RoleHandoffCauseArg::Other => HandoffCause::Other,
+                        },
+                    },
+                ),
+            )
+            .await
+        }
+        RoleHandoffCmd::List {
+            role,
+            assignment,
+            limit,
+            before,
+        } => {
+            let identity = require_v2_identity(client).await?;
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let page = read_role_history_page(
+                client,
+                identity,
+                snapshot.meta(),
+                RoleHistoryRequest {
+                    entity_types: &[RoleContinuityEntity::RoleHandoff],
+                    role_id: role,
+                    assignment_id: assignment,
+                    member_pubkey: None,
+                    limit,
+                    before: before.as_deref(),
+                },
+            )
+            .await?;
+            let handoffs = page
+                .projections
+                .into_iter()
+                .filter_map(|projection| match projection.entity {
+                    RoleContinuityChange::Handoff(handoff) => Some(handoff),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            print_json(
+                &json!({
+                    "project_revision": snapshot.meta().project_revision,
+                    "handoffs": handoffs,
+                    "page": {
+                        "limit": limit,
+                        "has_more": page.next_before.is_some(),
+                        "next_before": page.next_before,
+                    },
+                }),
+                format,
+            )
+        }
+    }
+}
+
 async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), CliError> {
     let identity = require_v2_identity(client).await?;
     if is_managed_runtime() {
@@ -558,6 +815,7 @@ async fn read_snapshot(client: &BuzzClient) -> Result<RoleSnapshot, CliError> {
         roles: snapshot.roles().cloned().collect(),
         proposals: snapshot.proposals().cloned().collect(),
         assignments: snapshot.assignments().cloned().collect(),
+        checkpoints: snapshot.checkpoints().cloned().collect(),
         handoffs: snapshot.handoffs().cloned().collect(),
     })
 }
