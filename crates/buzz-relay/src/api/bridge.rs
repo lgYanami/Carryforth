@@ -609,6 +609,14 @@ fn truncate_reason(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn ingest_rejection_status(message: &str) -> StatusCode {
+    if message.starts_with("conflict:") || message.starts_with("expired:") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 /// Submit a signed Nostr event via HTTP bridge (NIP-98 auth).
 pub async fn submit_event(
     State(state): State<Arc<AppState>>,
@@ -676,11 +684,16 @@ pub async fn submit_event(
                 "HTTP bridge request"
             );
         }
-        SubmitOutcome::Rejected { kind, reason, .. } => {
+        SubmitOutcome::Rejected {
+            kind,
+            reason,
+            status,
+            ..
+        } => {
             tracing::warn!(
                 pubkey = %pubkey_hex,
                 route = "/events",
-                status = 400u16,
+                status = status.as_u16(),
                 accepted = false,
                 kind,
                 reason = %reason,
@@ -722,6 +735,7 @@ enum SubmitOutcome {
     Rejected {
         kind: u32,
         reason: String,
+        status: StatusCode,
         response: (StatusCode, Json<Value>),
     },
     /// Any other error (admission, replay, membership, auth, internal) —
@@ -849,10 +863,12 @@ async fn submit_event_authed(
             // in the HTTP response body (unchanged from prior behaviour).
             let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
             crate::handlers::ingest::reject_with_transport("http", "invalid");
+            let status = ingest_rejection_status(&msg);
             SubmitOutcome::Rejected {
                 kind: kind_u32,
                 reason,
-                response: api_error(StatusCode::BAD_REQUEST, &msg),
+                status,
+                response: api_error(status, &msg),
             }
         }
         Err(IngestError::AuthFailed(msg)) => {
@@ -998,10 +1014,27 @@ async fn query_events_authed(
     }
 
     // Get channels this user can access — same enforcement as WS REQ handler.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    let meeting_scope = crate::handlers::req::apply_meeting_read_scope(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await
+    .map_err(|error| internal_error(&format!("Meeting reader security check: {error}")))?;
+    if filters.iter().any(|filter| {
+        extract_channel_from_filter(filter)
+            .is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id))
+    }) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: meeting access revoked",
+        ));
+    }
 
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
@@ -1423,10 +1456,27 @@ async fn count_events_authed(
     }
 
     // Get channels this user can access.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    let meeting_scope = crate::handlers::req::apply_meeting_read_scope(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await
+    .map_err(|error| internal_error(&format!("Meeting reader security check: {error}")))?;
+    if filters.iter().any(|filter| {
+        extract_channel_from_filter(filter)
+            .is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id))
+    }) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: meeting access revoked",
+        ));
+    }
 
     let mut total: u64 = 0;
     for filter in &filters {
@@ -3256,6 +3306,22 @@ mod tests {
         let s = "invalid: kind 24620 rejected";
         let result = truncate_reason(s, 256);
         assert_eq!(result, s);
+    }
+
+    #[test]
+    fn meeting_terminal_conflicts_use_http_409() {
+        assert_eq!(
+            ingest_rejection_status("conflict: stale revision"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ingest_rejection_status("expired: offer timed out"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ingest_rejection_status("invalid: malformed tag"),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────

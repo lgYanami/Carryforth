@@ -15,9 +15,8 @@ use super::ingest::{extract_channel_id, IngestError, IngestResult};
 
 /// Route a Meeting speech by the Session's frozen protocol.
 ///
-/// Stage one intentionally has no V1 speech mutation yet. Persisted policy is
-/// resolved before any V0 tag validation so a V1 command can never enter the
-/// V0 floor state machine.
+/// Persisted policy is resolved before any protocol-specific tag validation so
+/// a command can never enter the other protocol's state machine.
 pub async fn handle_speech(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -31,9 +30,7 @@ pub async fn handle_speech(
     let protocol =
         MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
     if protocol == MeetingProtocol::ModeratedBatonV1 {
-        return Err(IngestError::Rejected(
-            "invalid: Meeting V1 speech is not available in stage one".into(),
-        ));
+        return super::meeting_baton::handle_speech(tenant, state, event).await;
     }
 
     handle_v0_speech(tenant, state, event, session_id).await

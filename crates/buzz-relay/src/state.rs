@@ -550,6 +550,9 @@ pub struct AppState {
     /// Per-community channel visibility string, used to gate the private-channel fan-out
     /// access check so open channels stay zero-cost. Invalidated on a flip.
     pub channel_visibility_cache: Arc<moka::sync::Cache<(CommunityId, Uuid), String>>,
+    /// Stable Meeting classification for Channel fan-out. The current-principal
+    /// reader decision is never cached; only `meeting_sessions` existence is.
+    pub meeting_channel_cache: Arc<moka::sync::Cache<(CommunityId, Uuid), bool>>,
 
     /// Bounded channel for audit logging, absent when audit logging is disabled.
     pub audit_tx: Option<mpsc::Sender<buzz_audit::NewAuditEntry>>,
@@ -758,6 +761,13 @@ impl AppState {
                     .support_invalidation_closures()
                     .build(),
             ),
+            meeting_channel_cache: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_live(std::time::Duration::from_secs(600))
+                    .support_invalidation_closures()
+                    .build(),
+            ),
             audit_tx: audit_enabled.then_some(audit_tx),
             media_storage: Arc::new(media_storage),
             storage_sweep: Arc::new(tokio::sync::Mutex::new(
@@ -872,6 +882,46 @@ impl AppState {
             .invalidate(&(community_id, pubkey.to_vec()));
     }
 
+    /// Invalidate all cached Channel access for one principal.
+    ///
+    /// Relay membership removal is wider than a single Channel membership
+    /// mutation: the principal must stop using every cached membership and
+    /// accessible-channel result in this community. Apply the local drop
+    /// synchronously, then carry the same principal-scoped drop to other pods.
+    pub fn invalidate_principal_access(&self, tenant: &TenantContext, pubkey: &[u8]) {
+        self.invalidate_principal_access_local(tenant.community(), pubkey);
+        self.spawn_cache_invalidation(
+            tenant,
+            CacheInvalidation::PrincipalAccess {
+                pubkey: pubkey.to_vec(),
+            },
+        );
+    }
+
+    /// Local-only principal access drop. The cross-pod consumer uses this
+    /// directly so received invalidations are never re-published.
+    pub(crate) fn invalidate_principal_access_local(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) {
+        let principal = pubkey.to_vec();
+        let predicate_principal = principal.clone();
+        if let Err(error) = self.membership_cache.invalidate_entries_if(
+            move |(entry_community, _, entry_pubkey), _| {
+                *entry_community == community_id && entry_pubkey == &predicate_principal
+            },
+        ) {
+            tracing::error!(
+                ?error,
+                "principal-scoped membership invalidation unavailable; falling back to full invalidation"
+            );
+            self.membership_cache.invalidate_all();
+        }
+        self.accessible_channels_cache
+            .invalidate(&(community_id, principal));
+    }
+
     /// Invalidate all users' accessible-channels cache (e.g. new open channel created).
     pub fn invalidate_all_accessible_channels(&self, tenant: &TenantContext) {
         self.invalidate_all_accessible_channels_local(tenant.community());
@@ -957,6 +1007,16 @@ impl AppState {
             );
             self.channel_visibility_cache.invalidate_all();
         }
+        if let Err(error) = self
+            .meeting_channel_cache
+            .invalidate_entries_if(move |(entry_community, _), _| *entry_community == community_id)
+        {
+            tracing::error!(
+                ?error,
+                "community-scoped Meeting classification invalidation unavailable; falling back to full invalidation"
+            );
+            self.meeting_channel_cache.invalidate_all();
+        }
     }
 
     /// Fire-and-forget publish of a cache-key drop to all other pods. Failures
@@ -985,6 +1045,9 @@ impl AppState {
         match invalidation {
             CacheInvalidation::Membership { channel_id, pubkey } => {
                 self.invalidate_membership_local(community_id, channel_id, &pubkey);
+            }
+            CacheInvalidation::PrincipalAccess { pubkey } => {
+                self.invalidate_principal_access_local(community_id, &pubkey);
             }
             CacheInvalidation::AccessibleAll => {
                 self.invalidate_all_accessible_channels_local(community_id);
@@ -1103,6 +1166,31 @@ impl AppState {
             .await?;
         self.accessible_channels_cache.insert(key, result.clone());
         Ok(result)
+    }
+
+    /// Classify one Channel as a Meeting.
+    ///
+    /// Only a positive `meeting_sessions` existence bit is cached. A Channel
+    /// can transition from ordinary to Meeting during Create, so caching
+    /// `false` would open a race where live fan-out bypasses the Meeting reader
+    /// gate. Meeting identity is immutable after creation, making positive
+    /// entries stable. Every current-principal reader decision remains an
+    /// uncached database check.
+    pub async fn is_meeting_channel_cached(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<bool, buzz_db::DbError> {
+        let key = (community_id, channel_id);
+        if let Some(cached) = self.meeting_channel_cache.get(&key) {
+            return Ok(cached);
+        }
+        let is_meeting =
+            buzz_db::meeting::is_meeting_channel(&self.db, community_id, channel_id).await?;
+        if is_meeting {
+            self.meeting_channel_cache.insert(key, true);
+        }
+        Ok(is_meeting)
     }
 
     /// Channel visibility string. Caches only `private` (10s); never caches a
@@ -1258,6 +1346,10 @@ mod tests {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
+        test_state_with_config(config).await
+    }
+
+    async fn test_state_with_config(config: crate::config::Config) -> Arc<AppState> {
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1506,6 +1598,166 @@ mod tests {
                 .get(&(community_b, pubkey.clone())),
             Some(channels_b),
             "A's cache drop must not evict B's accessible-channel entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_access_invalidation_drops_every_channel_only_for_target_scope() {
+        let state = test_state().await;
+        let community_a = CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
+        let community_b = CommunityId::from_uuid(Uuid::from_u128(0xBBBB));
+        let target = vec![7u8; 32];
+        let other = vec![8u8; 32];
+        let channel_one = Uuid::from_u128(1);
+        let channel_two = Uuid::from_u128(2);
+
+        for channel_id in [channel_one, channel_two] {
+            state
+                .membership_cache
+                .insert((community_a, channel_id, target.clone()), true);
+            state
+                .membership_cache
+                .insert((community_a, channel_id, other.clone()), true);
+            state
+                .membership_cache
+                .insert((community_b, channel_id, target.clone()), true);
+        }
+        state.accessible_channels_cache.insert(
+            (community_a, target.clone()),
+            vec![channel_one, channel_two],
+        );
+        state
+            .accessible_channels_cache
+            .insert((community_a, other.clone()), vec![channel_one]);
+        state
+            .accessible_channels_cache
+            .insert((community_b, target.clone()), vec![channel_two]);
+
+        state.invalidate_principal_access_local(community_a, &target);
+
+        for channel_id in [channel_one, channel_two] {
+            assert_eq!(
+                state
+                    .membership_cache
+                    .get(&(community_a, channel_id, target.clone())),
+                None
+            );
+            assert_eq!(
+                state
+                    .membership_cache
+                    .get(&(community_a, channel_id, other.clone())),
+                Some(true),
+                "another principal's membership cache must remain"
+            );
+            assert_eq!(
+                state
+                    .membership_cache
+                    .get(&(community_b, channel_id, target.clone())),
+                Some(true),
+                "the same principal in another community must remain"
+            );
+        }
+        assert_eq!(
+            state
+                .accessible_channels_cache
+                .get(&(community_a, target.clone())),
+            None
+        );
+        assert_eq!(
+            state
+                .accessible_channels_cache
+                .get(&(community_a, other.clone())),
+            Some(vec![channel_one])
+        );
+        assert_eq!(
+            state
+                .accessible_channels_cache
+                .get(&(community_b, target.clone())),
+            Some(vec![channel_two])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn meeting_classifier_does_not_cache_pre_create_negative_result() {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect to Meeting classification test database");
+        buzz_db::migration::run_migrations(&pool)
+            .await
+            .expect("apply Meeting classification migrations");
+
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id.as_uuid())
+            .bind(format!(
+                "meeting-classifier-{}.example",
+                community_id.as_uuid().simple()
+            ))
+            .execute(&pool)
+            .await
+            .expect("insert Meeting classification community");
+
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.database_url = database_url;
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let state = test_state_with_config(config).await;
+        let channel_id = Uuid::new_v4();
+        assert!(
+            !state
+                .is_meeting_channel_cached(community_id, channel_id)
+                .await
+                .expect("classify absent Session"),
+            "an unused Channel UUID is not yet a Meeting"
+        );
+        assert_eq!(
+            state.meeting_channel_cache.get(&(community_id, channel_id)),
+            None,
+            "negative Meeting classifications must not be cached"
+        );
+
+        let host = vec![0x91_u8; 32];
+        sqlx::query(
+            "INSERT INTO channels \
+                 (community_id, id, name, visibility, created_by, room_kind) \
+             VALUES ($1, $2, $3, 'private', $4, 'meeting')",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(format!("meeting-classifier-{channel_id}"))
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("insert Meeting Channel");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, \
+                  schema_version, floor_policy_version, status) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'active')",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind([0x92_u8; 32].as_slice())
+        .bind(&host)
+        .bind(buzz_db::meeting_floor::FLOOR_POLICY_VERSION)
+        .execute(&pool)
+        .await
+        .expect("insert Meeting Session");
+
+        assert!(
+            state
+                .is_meeting_channel_cached(community_id, channel_id)
+                .await
+                .expect("classify newly created Session"),
+            "the post-Create read must observe the Meeting"
+        );
+        assert_eq!(
+            state.meeting_channel_cache.get(&(community_id, channel_id)),
+            Some(true),
+            "positive Meeting classification is stable and may be cached"
         );
     }
 

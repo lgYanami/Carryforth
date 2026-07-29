@@ -183,6 +183,92 @@ pub enum MeetingPolicy {
     ModeratedBatonV1,
 }
 
+/// Meeting V1 moderator intent-rejection reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MeetingIntentRejectionReason {
+    /// The proposed contribution is outside the meeting topic.
+    #[value(name = "off_topic")]
+    OffTopic,
+    /// The proposed contribution duplicates another one.
+    Duplicate,
+    /// A newer contribution replaces this one.
+    Superseded,
+    /// The contribution cannot be supported in this meeting.
+    Unsupported,
+    /// The contribution does not fit the current agenda.
+    #[value(name = "agenda_mismatch")]
+    AgendaMismatch,
+}
+
+/// Meeting V1 moderator handoff-dismissal reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MeetingHandoffDismissReason {
+    /// A newer question or request replaces this one.
+    Superseded,
+    /// The question was answered through another path.
+    #[value(name = "answered_elsewhere")]
+    AnsweredElsewhere,
+    /// The question is outside the meeting scope.
+    #[value(name = "out_of_scope")]
+    OutOfScope,
+    /// The answer is no longer needed.
+    #[value(name = "no_longer_needed")]
+    NoLongerNeeded,
+}
+
+/// Observable stage reported by a Meeting V1 Grant holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MeetingGrantProgressStage {
+    /// Synchronizing context for the turn.
+    #[value(name = "context_sync")]
+    ContextSync,
+    /// Calling an allowed tool.
+    #[value(name = "tool_use")]
+    ToolUse,
+    /// Generating a response.
+    Generating,
+    /// A Human is composing input.
+    Composing,
+    /// Submitting the signed speech event.
+    Submitting,
+}
+
+/// Meeting V1 Grant Yield reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MeetingGrantYieldReason {
+    /// The turn is no longer needed.
+    #[value(name = "no_longer_needed")]
+    NoLongerNeeded,
+    /// The holder cannot provide a useful answer.
+    #[value(name = "unable_to_answer")]
+    UnableToAnswer,
+    /// Required context is unavailable.
+    #[value(name = "insufficient_context")]
+    InsufficientContext,
+    /// An allowed tool failed.
+    #[value(name = "tool_failure")]
+    ToolFailure,
+    /// The holder explicitly cancelled the turn.
+    Cancelled,
+}
+
+/// Meeting V1 directed-handoff type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MeetingHandoffType {
+    /// Ask the target a question.
+    Question,
+    /// Ask the target to provide information.
+    #[value(name = "information_request")]
+    InformationRequest,
+    /// Ask the target to clarify a point.
+    Clarification,
+    /// Ask the target to review something.
+    Review,
+    /// Explicitly request a response from the target.
+    #[value(name = "response_requested")]
+    ResponseRequested,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Draft owner-reviewed agent creation and updates
@@ -754,6 +840,38 @@ pub enum MeetingsCmd {
         /// Message text; use '-' to read from stdin
         #[arg(long)]
         content: String,
+        /// Mentioned participant pubkey (repeatable)
+        #[arg(long = "mention")]
+        mentions: Vec<String>,
+        /// Participant who should receive a directed handoff
+        #[arg(long)]
+        handoff_to: Option<String>,
+        /// Directed handoff semantic type
+        #[arg(long, requires = "handoff_to")]
+        handoff_type: Option<MeetingHandoffType>,
+        /// Required directed handoff explanation
+        #[arg(long, requires = "handoff_to")]
+        handoff_reason: Option<String>,
+    },
+    /// Read and manage Meeting V1 speech intents
+    Intents {
+        #[command(subcommand)]
+        command: MeetingIntentsCmd,
+    },
+    /// Submit Meeting V1 moderator decisions
+    Moderator {
+        #[command(subcommand)]
+        command: MeetingModeratorCmd,
+    },
+    /// Respond to the current Meeting V1 Offer
+    Offer {
+        #[command(subcommand)]
+        command: MeetingOfferCmd,
+    },
+    /// Maintain or yield the current Meeting V1 Grant
+    Grant {
+        #[command(subcommand)]
+        command: MeetingGrantCmd,
     },
     /// Inspect or claim the relay-authoritative speech floor
     Floor {
@@ -765,6 +883,174 @@ pub enum MeetingsCmd {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
+    },
+}
+
+/// Meeting V1 speech-intent operations.
+#[derive(Subcommand)]
+pub enum MeetingIntentsCmd {
+    /// List the Relay-authoritative pending intent pool
+    List {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Submit one pending speech intent
+    Submit {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// One-sentence summary; use '-' to read from stdin
+        #[arg(long)]
+        summary: String,
+        /// Optional participant whom the contribution addresses
+        #[arg(long)]
+        addressed_to: Option<String>,
+    },
+    /// Compare-and-swap refresh an existing pending intent
+    Refresh {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Stable ID of the original Intent Submit event
+        #[arg(long)]
+        intent: String,
+        /// Replacement summary; use '-' to read from stdin
+        #[arg(long)]
+        summary: String,
+        /// Optional replacement addressed participant
+        #[arg(long)]
+        addressed_to: Option<String>,
+    },
+    /// Compare-and-swap withdraw an existing pending intent
+    Withdraw {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Stable ID of the original Intent Submit event
+        #[arg(long)]
+        intent: String,
+    },
+}
+
+/// Meeting V1 moderator control operations.
+#[derive(Subcommand)]
+pub enum MeetingModeratorCmd {
+    /// Select exactly one pending intent or open handoff
+    Select {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Pending Intent ID
+        #[arg(long)]
+        intent: Option<String>,
+        /// Open Handoff ID
+        #[arg(long)]
+        handoff: Option<String>,
+        /// Optional short selection explanation
+        #[arg(long)]
+        reason: Option<String>,
+        /// Deferral in INTENT_ID:REASON form; repeatable
+        #[arg(long = "defer")]
+        deferrals: Vec<String>,
+    },
+    /// Reject one pending intent
+    Reject {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Stable Intent ID
+        #[arg(long)]
+        intent: String,
+        /// Machine-readable rejection reason
+        #[arg(long)]
+        reason_code: MeetingIntentRejectionReason,
+        /// Required human-readable explanation
+        #[arg(long)]
+        reason: String,
+    },
+    /// Close one unresolved directed handoff
+    #[command(name = "dismiss-handoff")]
+    DismissHandoff {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Stable Handoff ID
+        #[arg(long)]
+        handoff: String,
+        /// Machine-readable dismissal reason
+        #[arg(long)]
+        reason_code: MeetingHandoffDismissReason,
+        /// Required human-readable explanation
+        #[arg(long)]
+        reason: String,
+    },
+    /// Recall control after the current allocation chain
+    Recall {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Optional human-readable explanation
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// Meeting V1 Offer response operations.
+#[derive(Subcommand)]
+pub enum MeetingOfferCmd {
+    /// Acknowledge the current Offer
+    Ack {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Explicit Offer ID; defaults to the active Offer in State
+        #[arg(long)]
+        offer: Option<String>,
+    },
+    /// Decline the current Offer
+    Decline {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Explicit Offer ID; defaults to the active Offer in State
+        #[arg(long)]
+        offer: Option<String>,
+        /// Optional short explanation
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// Meeting V1 active Grant operations.
+#[derive(Subcommand)]
+pub enum MeetingGrantCmd {
+    /// Extend the active Grant's soft lease
+    Progress {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Observable local execution stage
+        #[arg(long)]
+        stage: MeetingGrantProgressStage,
+        /// Explicit Grant ID; defaults to the active Grant in State
+        #[arg(long)]
+        grant: Option<String>,
+    },
+    /// Immediately yield the active Grant
+    Yield {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Explicit Grant ID; defaults to the active Grant in State
+        #[arg(long)]
+        grant: Option<String>,
+        /// Optional machine-readable reason
+        #[arg(long)]
+        reason_code: Option<MeetingGrantYieldReason>,
+        /// Optional short explanation
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -784,6 +1070,21 @@ pub enum MeetingFloorCmd {
         /// Maximum number of control events to return
         #[arg(long, default_value_t = 500)]
         limit: u32,
+    },
+    /// Request the next available V1 floor slot as a Human participant
+    Request {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Withdraw the current identity's queued/offered V1 Human request
+    Withdraw {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Explicit Request ID; defaults to the active request in State
+        #[arg(long)]
+        request: Option<String>,
     },
     /// Submit one Claim for the current open/claiming round
     Claim {
@@ -2004,6 +2305,184 @@ mod tests {
     }
 
     #[test]
+    fn meeting_v1_baton_command_surface_is_parseable() {
+        let id = "aa".repeat(32);
+        let participant = "bb".repeat(32);
+        let cases = vec![
+            vec![
+                "buzz",
+                "meetings",
+                "intents",
+                "list",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "intents",
+                "submit",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--summary",
+                "A risk",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "intents",
+                "refresh",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--intent",
+                &id,
+                "--summary",
+                "A newer risk",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "intents",
+                "withdraw",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--intent",
+                &id,
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "moderator",
+                "select",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--intent",
+                &id,
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "moderator",
+                "reject",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--intent",
+                &id,
+                "--reason-code",
+                "off_topic",
+                "--reason",
+                "Not on agenda",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "moderator",
+                "dismiss-handoff",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--handoff",
+                &id,
+                "--reason-code",
+                "answered_elsewhere",
+                "--reason",
+                "Already answered",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "moderator",
+                "recall",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "floor",
+                "request",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "floor",
+                "withdraw",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--request",
+                &id,
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "offer",
+                "ack",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--offer",
+                &id,
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "offer",
+                "decline",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--offer",
+                &id,
+                "--reason",
+                "Unavailable",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "grant",
+                "progress",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--grant",
+                &id,
+                "--stage",
+                "tool_use",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "grant",
+                "yield",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--grant",
+                &id,
+                "--reason-code",
+                "tool_failure",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "say",
+                "--meeting",
+                "00000000-0000-4000-8000-000000000001",
+                "--content",
+                "Answer",
+                "--mention",
+                &participant,
+                "--handoff-to",
+                &participant,
+                "--handoff-type",
+                "question",
+                "--handoff-reason",
+                "Please answer",
+            ],
+        ];
+        for args in cases {
+            Cli::try_parse_from(args).expect("parse Meeting V1 Baton command");
+        }
+    }
+
+    #[test]
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
@@ -2120,8 +2599,12 @@ mod tests {
                 "create",
                 "end",
                 "floor",
+                "grant",
                 "history",
+                "intents",
                 "list",
+                "moderator",
+                "offer",
                 "participants",
                 "say",
                 "show"
@@ -2217,7 +2700,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
-            ("meetings", 8),
+            ("meetings", 12),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

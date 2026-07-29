@@ -297,6 +297,146 @@ async fn fetch_current_baton(
         }))
 }
 
+async fn fetch_required_v1_baton(
+    client: &BuzzClient,
+    meeting_id: Uuid,
+) -> Result<BatonState, CliError> {
+    let meeting_id_text = meeting_id.to_string();
+    if fetch_meeting_protocol(client, &meeting_id_text).await? != MeetingProtocol::ModeratedBatonV1
+    {
+        return Err(CliError::Usage(format!(
+            "meeting {meeting_id} does not use {}",
+            buzz_sdk::MEETING_V1_POLICY
+        )));
+    }
+    fetch_current_baton(client, &meeting_id_text)
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("Meeting V1 State not found: {meeting_id}")))
+}
+
+fn baton_u64(state: &BatonState, field: &str) -> Result<u64, CliError> {
+    state
+        .content
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "Meeting V1 State {} has no valid {field}",
+                state.state_event_id
+            ))
+        })
+}
+
+fn baton_array<'a>(
+    state: &'a BatonState,
+    field: &str,
+) -> Result<&'a [serde_json::Value], CliError> {
+    state
+        .content
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "Meeting V1 State {} has no valid {field}",
+                state.state_event_id
+            ))
+        })
+}
+
+fn baton_object<'a>(
+    state: &'a BatonState,
+    array_field: &str,
+    id_field: &str,
+    id: &str,
+) -> Result<&'a serde_json::Value, CliError> {
+    baton_array(state, array_field)?
+        .iter()
+        .find(|value| value.get(id_field).and_then(serde_json::Value::as_str) == Some(id))
+        .ok_or_else(|| {
+            CliError::Conflict(format!(
+                "{id_field} {id} is not canonical in State {}",
+                state.state_event_id
+            ))
+        })
+}
+
+fn baton_active_object<'a>(
+    state: &'a BatonState,
+    field: &str,
+) -> Result<&'a serde_json::Value, CliError> {
+    state
+        .content
+        .get(field)
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            CliError::Conflict(format!(
+                "there is no active {field} in State {}",
+                state.state_event_id
+            ))
+        })
+}
+
+fn object_string<'a>(
+    object: &'a serde_json::Value,
+    field: &str,
+    context: &str,
+) -> Result<&'a str, CliError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Other(format!("{context} has no valid {field}")))
+}
+
+async fn submit_v1_event(
+    client: &BuzzClient,
+    meeting_id: Uuid,
+    event: nostr::Event,
+) -> Result<String, CliError> {
+    match client.submit_event(event).await {
+        Ok(response) => Ok(response),
+        Err(CliError::Relay { status, body })
+            if status == 409 || (status == 400 && body.contains("conflict:")) =>
+        {
+            let canonical = fetch_current_baton(client, &meeting_id.to_string()).await?;
+            let state = canonical
+                .and_then(|state| serde_json::to_string(&state).ok())
+                .unwrap_or_else(|| "null".to_string());
+            Err(CliError::Conflict(format!(
+                "{body}; canonical_state={state}"
+            )))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn v1_write_response(response: &str, id_key: &str, id: &str) -> serde_json::Value {
+    let normalized = normalize_write_response(response);
+    let mut output = serde_json::from_str::<serde_json::Value>(&normalized).unwrap_or_else(|_| {
+        serde_json::json!({
+            "accepted": false,
+            "message": normalized,
+        })
+    });
+    output[id_key] = serde_json::json!(id);
+    if let Some(payload) = output
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|message| message.strip_prefix("response:"))
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| payload.as_object().cloned())
+    {
+        for (key, value) in payload {
+            output[&key] = value;
+        }
+    }
+    output
+}
+
+fn print_v1_write_response(response: &str, id_key: &str, id: &str) {
+    println!("{}", v1_write_response(response, id_key, id));
+}
+
 async fn fetch_meeting_create(
     client: &BuzzClient,
     meeting_id: &str,
@@ -617,14 +757,23 @@ pub async fn cmd_meeting_history(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
+    let protocol = fetch_meeting_protocol(client, &meeting_id).await?;
     let filter = serde_json::json!({
         "kinds": [KIND_MEETING_SPEECH],
         "#h": [&meeting_id],
     });
     let mut events = client.query_paginated(filter, limit).await?;
     events.sort_by(|left, right| {
-        event_round(left)
-            .cmp(&event_round(right))
+        let left_revision = match protocol {
+            MeetingProtocol::UniformV0 => event_round(left),
+            MeetingProtocol::ModeratedBatonV1 => event_speech_revision(left),
+        };
+        let right_revision = match protocol {
+            MeetingProtocol::UniformV0 => event_round(right),
+            MeetingProtocol::ModeratedBatonV1 => event_speech_revision(right),
+        };
+        left_revision
+            .cmp(&right_revision)
             .then_with(|| event_id(left).cmp(event_id(right)))
     });
 
@@ -633,9 +782,14 @@ pub async fn cmd_meeting_history(
         OutputFormat::Compact => events
             .iter()
             .map(|event| {
+                let grant = extract_tag_value(event, "meeting-grant");
                 serde_json::json!({
                     "event_id": event_id(event),
-                    "round_number": event_round(event),
+                    "round_number": (protocol == MeetingProtocol::UniformV0)
+                        .then(|| event_round(event)),
+                    "speech_revision": (protocol == MeetingProtocol::ModeratedBatonV1)
+                        .then(|| event_speech_revision(event)),
+                    "grant_id": (!grant.is_empty()).then_some(grant),
                     "author_pubkey": event.get("pubkey").and_then(serde_json::Value::as_str),
                     "content": event.get("content").and_then(serde_json::Value::as_str),
                 })
@@ -746,6 +900,622 @@ pub async fn cmd_floor_history(
         serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())
     );
     Ok(())
+}
+
+async fn cmd_intents_list(
+    client: &BuzzClient,
+    meeting_id: &str,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let intents = baton_array(&state, "pending_intents")?;
+    let output = match format {
+        OutputFormat::Json => serde_json::Value::Array(intents.to_vec()),
+        OutputFormat::Compact => serde_json::Value::Array(
+            intents
+                .iter()
+                .map(|intent| {
+                    serde_json::json!({
+                        "intent_id": intent.get("intent_id"),
+                        "current_event_id": intent.get("current_event_id"),
+                        "author_pubkey": intent.get("author_pubkey"),
+                        "summary": intent.get("summary"),
+                        "addressed_to": intent.get("addressed_to"),
+                        "deferred": intent.get("deferred"),
+                        "selection_attempt_count": intent.get("selection_attempt_count"),
+                    })
+                })
+                .collect(),
+        ),
+    };
+    println!("{output}");
+    Ok(())
+}
+
+async fn cmd_intent_submit(
+    client: &BuzzClient,
+    meeting_id: &str,
+    summary: &str,
+    addressed_to: Option<&str>,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let summary = read_or_stdin(summary)?;
+    let builder = buzz_sdk::build_meeting_v1_intent_submit(buzz_sdk::MeetingV1IntentSubmitParams {
+        session_id: meeting_id,
+        basis_speech_revision: state.speech_revision,
+        addressed_to,
+        summary: &summary,
+    })
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let intent_id = event.id.to_hex();
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "intent_id", &intent_id);
+    Ok(())
+}
+
+async fn cmd_intent_refresh(
+    client: &BuzzClient,
+    meeting_id: &str,
+    intent_id: &str,
+    summary: &str,
+    addressed_to: Option<&str>,
+) -> Result<(), CliError> {
+    validate_hex64(intent_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let intent = baton_object(
+        &state,
+        "pending_intents",
+        "intent_id",
+        &intent_id.to_ascii_lowercase(),
+    )?;
+    let previous_event_id = object_string(intent, "current_event_id", "canonical pending Intent")?;
+    let summary = read_or_stdin(summary)?;
+    let builder =
+        buzz_sdk::build_meeting_v1_intent_refresh(buzz_sdk::MeetingV1IntentRefreshParams {
+            session_id: meeting_id,
+            intent_id,
+            previous_event_id,
+            basis_speech_revision: state.speech_revision,
+            addressed_to,
+            summary: &summary,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let command_event_id = event.id.to_hex();
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "intent_event_id", &command_event_id);
+    Ok(())
+}
+
+async fn cmd_intent_withdraw(
+    client: &BuzzClient,
+    meeting_id: &str,
+    intent_id: &str,
+) -> Result<(), CliError> {
+    validate_hex64(intent_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let intent = baton_object(
+        &state,
+        "pending_intents",
+        "intent_id",
+        &intent_id.to_ascii_lowercase(),
+    )?;
+    let previous_event_id = object_string(intent, "current_event_id", "canonical pending Intent")?;
+    let builder =
+        buzz_sdk::build_meeting_v1_intent_withdraw(buzz_sdk::MeetingV1IntentWithdrawParams {
+            session_id: meeting_id,
+            intent_id,
+            previous_event_id,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "intent_id", intent_id);
+    Ok(())
+}
+
+fn sdk_rejection_reason(
+    reason: crate::MeetingIntentRejectionReason,
+) -> buzz_sdk::MeetingV1IntentRejectionReason {
+    match reason {
+        crate::MeetingIntentRejectionReason::OffTopic => {
+            buzz_sdk::MeetingV1IntentRejectionReason::OffTopic
+        }
+        crate::MeetingIntentRejectionReason::Duplicate => {
+            buzz_sdk::MeetingV1IntentRejectionReason::Duplicate
+        }
+        crate::MeetingIntentRejectionReason::Superseded => {
+            buzz_sdk::MeetingV1IntentRejectionReason::Superseded
+        }
+        crate::MeetingIntentRejectionReason::Unsupported => {
+            buzz_sdk::MeetingV1IntentRejectionReason::Unsupported
+        }
+        crate::MeetingIntentRejectionReason::AgendaMismatch => {
+            buzz_sdk::MeetingV1IntentRejectionReason::AgendaMismatch
+        }
+    }
+}
+
+fn sdk_dismiss_reason(
+    reason: crate::MeetingHandoffDismissReason,
+) -> buzz_sdk::MeetingV1HandoffDismissReason {
+    match reason {
+        crate::MeetingHandoffDismissReason::Superseded => {
+            buzz_sdk::MeetingV1HandoffDismissReason::Superseded
+        }
+        crate::MeetingHandoffDismissReason::AnsweredElsewhere => {
+            buzz_sdk::MeetingV1HandoffDismissReason::AnsweredElsewhere
+        }
+        crate::MeetingHandoffDismissReason::OutOfScope => {
+            buzz_sdk::MeetingV1HandoffDismissReason::OutOfScope
+        }
+        crate::MeetingHandoffDismissReason::NoLongerNeeded => {
+            buzz_sdk::MeetingV1HandoffDismissReason::NoLongerNeeded
+        }
+    }
+}
+
+async fn cmd_moderator_select(
+    client: &BuzzClient,
+    meeting_id: &str,
+    intent_id: Option<&str>,
+    handoff_id: Option<&str>,
+    reason: Option<&str>,
+    deferrals: &[String],
+) -> Result<(), CliError> {
+    let source_count = usize::from(intent_id.is_some()) + usize::from(handoff_id.is_some());
+    if source_count != 1 {
+        return Err(CliError::Usage(
+            "--intent and --handoff require exactly one value".into(),
+        ));
+    }
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let selection = if let Some(intent_id) = intent_id {
+        validate_hex64(intent_id)?;
+        baton_object(
+            &state,
+            "pending_intents",
+            "intent_id",
+            &intent_id.to_ascii_lowercase(),
+        )?;
+        buzz_sdk::MeetingV1Selection::Intent { intent_id }
+    } else {
+        let handoff_id = handoff_id.unwrap_or_default();
+        validate_hex64(handoff_id)?;
+        let handoff = baton_object(
+            &state,
+            "unresolved_handoffs",
+            "handoff_id",
+            &handoff_id.to_ascii_lowercase(),
+        )?;
+        let expected_attempt_count = handoff
+            .get("attempt_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| CliError::Other("canonical Handoff has no attempt_count".into()))?;
+        buzz_sdk::MeetingV1Selection::Handoff {
+            handoff_id,
+            expected_attempt_count,
+        }
+    };
+
+    let mut parsed_deferrals = Vec::with_capacity(deferrals.len());
+    for value in deferrals {
+        let (deferred_id, deferred_reason) = value
+            .split_once(':')
+            .ok_or_else(|| CliError::Usage("--defer must use INTENT_ID:REASON format".into()))?;
+        validate_hex64(deferred_id)?;
+        let deferred = baton_object(
+            &state,
+            "pending_intents",
+            "intent_id",
+            &deferred_id.to_ascii_lowercase(),
+        )?;
+        let previous_event_id =
+            object_string(deferred, "current_event_id", "canonical deferred Intent")?;
+        parsed_deferrals.push((
+            deferred_id.to_string(),
+            previous_event_id.to_string(),
+            deferred_reason.to_string(),
+        ));
+    }
+    let sdk_deferrals: Vec<buzz_sdk::MeetingV1IntentDeferral<'_>> = parsed_deferrals
+        .iter()
+        .map(
+            |(intent_id, previous_event_id, reason)| buzz_sdk::MeetingV1IntentDeferral {
+                intent_id,
+                previous_event_id,
+                reason,
+            },
+        )
+        .collect();
+    let builder =
+        buzz_sdk::build_meeting_v1_moderator_select(buzz_sdk::MeetingV1ModeratorSelectParams {
+            session_id: meeting_id,
+            selection,
+            expected_control_epoch: baton_u64(&state, "control_epoch")?,
+            expected_decision_epoch: baton_u64(&state, "decision_epoch")?,
+            expected_intent_revision: state.intent_revision,
+            expected_speech_revision: state.speech_revision,
+            selection_reason: reason,
+            deferrals: &sdk_deferrals,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let command_event_id = event.id.to_hex();
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "selection_event_id", &command_event_id);
+    Ok(())
+}
+
+async fn cmd_moderator_reject(
+    client: &BuzzClient,
+    meeting_id: &str,
+    intent_id: &str,
+    reason_code: crate::MeetingIntentRejectionReason,
+    reason: &str,
+) -> Result<(), CliError> {
+    validate_hex64(intent_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let intent = baton_object(
+        &state,
+        "pending_intents",
+        "intent_id",
+        &intent_id.to_ascii_lowercase(),
+    )?;
+    let previous_event_id = object_string(intent, "current_event_id", "canonical pending Intent")?;
+    let author_pubkey = object_string(intent, "author_pubkey", "canonical pending Intent")?;
+    let builder =
+        buzz_sdk::build_meeting_v1_moderator_reject(buzz_sdk::MeetingV1ModeratorRejectParams {
+            session_id: meeting_id,
+            intent_id,
+            previous_event_id,
+            intent_author_pubkey: author_pubkey,
+            reason_code: sdk_rejection_reason(reason_code),
+            reason_text: reason,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "intent_id", intent_id);
+    Ok(())
+}
+
+async fn cmd_moderator_dismiss_handoff(
+    client: &BuzzClient,
+    meeting_id: &str,
+    handoff_id: &str,
+    reason_code: crate::MeetingHandoffDismissReason,
+    reason: &str,
+) -> Result<(), CliError> {
+    validate_hex64(handoff_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let handoff = baton_object(
+        &state,
+        "unresolved_handoffs",
+        "handoff_id",
+        &handoff_id.to_ascii_lowercase(),
+    )?;
+    let expected_attempt_count = handoff
+        .get("attempt_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CliError::Other("canonical Handoff has no attempt_count".into()))?;
+    let builder = buzz_sdk::build_meeting_v1_moderator_dismiss_handoff(
+        buzz_sdk::MeetingV1ModeratorDismissHandoffParams {
+            session_id: meeting_id,
+            handoff_id,
+            expected_speech_revision: state.speech_revision,
+            expected_attempt_count,
+            reason_code: sdk_dismiss_reason(reason_code),
+            reason_text: reason,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "handoff_id", handoff_id);
+    Ok(())
+}
+
+async fn cmd_moderator_recall(
+    client: &BuzzClient,
+    meeting_id: &str,
+    reason: Option<&str>,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let builder =
+        buzz_sdk::build_meeting_v1_moderator_recall(buzz_sdk::MeetingV1ModeratorRecallParams {
+            session_id: meeting_id,
+            control_epoch: baton_u64(&state, "control_epoch")?,
+            reason,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let command_event_id = event.id.to_hex();
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "recall_event_id", &command_event_id);
+    Ok(())
+}
+
+async fn cmd_human_floor_request(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    fetch_required_v1_baton(client, meeting_id).await?;
+    let builder = buzz_sdk::build_meeting_v1_human_floor_request(
+        buzz_sdk::MeetingV1HumanFloorRequestParams {
+            session_id: meeting_id,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let request_id = event.id.to_hex();
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "request_id", &request_id);
+    Ok(())
+}
+
+async fn cmd_human_floor_withdraw(
+    client: &BuzzClient,
+    meeting_id: &str,
+    explicit_request_id: Option<&str>,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let self_pubkey = client.keys().public_key().to_hex();
+    let request = if let Some(request_id) = explicit_request_id {
+        validate_hex64(request_id)?;
+        baton_object(
+            &state,
+            "human_queue",
+            "request_id",
+            &request_id.to_ascii_lowercase(),
+        )?
+    } else {
+        baton_array(&state, "human_queue")?
+            .iter()
+            .find(|request| {
+                request
+                    .get("requester_pubkey")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(self_pubkey.as_str())
+            })
+            .ok_or_else(|| {
+                CliError::Conflict(format!(
+                    "current identity has no active Human request in State {}",
+                    state.state_event_id
+                ))
+            })?
+    };
+    let request_id = object_string(request, "request_id", "canonical Human request")?;
+    if request
+        .get("requester_pubkey")
+        .and_then(serde_json::Value::as_str)
+        != Some(self_pubkey.as_str())
+    {
+        return Err(CliError::Usage(
+            "Human Floor Request belongs to another participant".into(),
+        ));
+    }
+    let builder = buzz_sdk::build_meeting_v1_human_floor_withdraw(
+        buzz_sdk::MeetingV1HumanFloorWithdrawParams {
+            session_id: meeting_id,
+            request_id,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "request_id", request_id);
+    Ok(())
+}
+
+fn active_object_for_identity<'a>(
+    state: &'a BatonState,
+    field: &str,
+    object_id_field: &str,
+    explicit_id: Option<&str>,
+    identity_field: &str,
+    self_pubkey: &str,
+) -> Result<(&'a serde_json::Value, &'a str), CliError> {
+    let object = baton_active_object(state, field)?;
+    let canonical_id = object_string(object, object_id_field, &format!("active {field}"))?;
+    if let Some(explicit_id) = explicit_id {
+        validate_hex64(explicit_id)?;
+        if !canonical_id.eq_ignore_ascii_case(explicit_id) {
+            return Err(CliError::Conflict(format!(
+                "{object_id_field} {explicit_id} is stale; canonical {object_id_field} is {canonical_id}"
+            )));
+        }
+    }
+    if object
+        .get(identity_field)
+        .and_then(serde_json::Value::as_str)
+        != Some(self_pubkey)
+    {
+        return Err(CliError::Usage(format!(
+            "active {field} belongs to another participant"
+        )));
+    }
+    Ok((object, canonical_id))
+}
+
+async fn cmd_offer_ack(
+    client: &BuzzClient,
+    meeting_id: &str,
+    offer_id: Option<&str>,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let self_pubkey = client.keys().public_key().to_hex();
+    let (_, offer_id) = active_object_for_identity(
+        &state,
+        "offer",
+        "offer_id",
+        offer_id,
+        "target_pubkey",
+        &self_pubkey,
+    )?;
+    let builder = buzz_sdk::build_meeting_v1_offer_ack(buzz_sdk::MeetingV1OfferAckParams {
+        session_id: meeting_id,
+        offer_id,
+    })
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "offer_id", offer_id);
+    Ok(())
+}
+
+async fn cmd_offer_decline(
+    client: &BuzzClient,
+    meeting_id: &str,
+    offer_id: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let self_pubkey = client.keys().public_key().to_hex();
+    let (_, offer_id) = active_object_for_identity(
+        &state,
+        "offer",
+        "offer_id",
+        offer_id,
+        "target_pubkey",
+        &self_pubkey,
+    )?;
+    let builder = buzz_sdk::build_meeting_v1_offer_decline(buzz_sdk::MeetingV1OfferDeclineParams {
+        session_id: meeting_id,
+        offer_id,
+        reason,
+    })
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "offer_id", offer_id);
+    Ok(())
+}
+
+fn sdk_progress_stage(stage: crate::MeetingGrantProgressStage) -> buzz_sdk::MeetingV1ProgressStage {
+    match stage {
+        crate::MeetingGrantProgressStage::ContextSync => {
+            buzz_sdk::MeetingV1ProgressStage::ContextSync
+        }
+        crate::MeetingGrantProgressStage::ToolUse => buzz_sdk::MeetingV1ProgressStage::ToolUse,
+        crate::MeetingGrantProgressStage::Generating => {
+            buzz_sdk::MeetingV1ProgressStage::Generating
+        }
+        crate::MeetingGrantProgressStage::Composing => buzz_sdk::MeetingV1ProgressStage::Composing,
+        crate::MeetingGrantProgressStage::Submitting => {
+            buzz_sdk::MeetingV1ProgressStage::Submitting
+        }
+    }
+}
+
+fn sdk_yield_reason(reason: crate::MeetingGrantYieldReason) -> buzz_sdk::MeetingV1GrantYieldReason {
+    match reason {
+        crate::MeetingGrantYieldReason::NoLongerNeeded => {
+            buzz_sdk::MeetingV1GrantYieldReason::NoLongerNeeded
+        }
+        crate::MeetingGrantYieldReason::UnableToAnswer => {
+            buzz_sdk::MeetingV1GrantYieldReason::UnableToAnswer
+        }
+        crate::MeetingGrantYieldReason::InsufficientContext => {
+            buzz_sdk::MeetingV1GrantYieldReason::InsufficientContext
+        }
+        crate::MeetingGrantYieldReason::ToolFailure => {
+            buzz_sdk::MeetingV1GrantYieldReason::ToolFailure
+        }
+        crate::MeetingGrantYieldReason::Cancelled => buzz_sdk::MeetingV1GrantYieldReason::Cancelled,
+    }
+}
+
+async fn cmd_grant_progress(
+    client: &BuzzClient,
+    meeting_id: &str,
+    grant_id: Option<&str>,
+    stage: crate::MeetingGrantProgressStage,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let self_pubkey = client.keys().public_key().to_hex();
+    let (grant, grant_id) = active_object_for_identity(
+        &state,
+        "grant",
+        "grant_id",
+        grant_id,
+        "holder_pubkey",
+        &self_pubkey,
+    )?;
+    let progress_seq = grant
+        .get("progress_seq")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CliError::Other("canonical Grant has no valid progress_seq".into()))?
+        .checked_add(1)
+        .ok_or_else(|| CliError::Other("Grant progress sequence overflow".into()))?;
+    let builder =
+        buzz_sdk::build_meeting_v1_grant_progress(buzz_sdk::MeetingV1GrantProgressParams {
+            session_id: meeting_id,
+            grant_id,
+            progress_seq,
+            stage: sdk_progress_stage(stage),
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "grant_id", grant_id);
+    Ok(())
+}
+
+async fn cmd_grant_yield(
+    client: &BuzzClient,
+    meeting_id: &str,
+    grant_id: Option<&str>,
+    reason_code: Option<crate::MeetingGrantYieldReason>,
+    reason: Option<&str>,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let self_pubkey = client.keys().public_key().to_hex();
+    let (_, grant_id) = active_object_for_identity(
+        &state,
+        "grant",
+        "grant_id",
+        grant_id,
+        "holder_pubkey",
+        &self_pubkey,
+    )?;
+    let builder = buzz_sdk::build_meeting_v1_grant_yield(buzz_sdk::MeetingV1GrantYieldParams {
+        session_id: meeting_id,
+        grant_id,
+        reason_code: reason_code.map(sdk_yield_reason),
+        reason,
+    })
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    print_v1_write_response(&response, "grant_id", grant_id);
+    Ok(())
+}
+
+fn sdk_handoff_type(handoff_type: crate::MeetingHandoffType) -> buzz_sdk::MeetingV1HandoffType {
+    match handoff_type {
+        crate::MeetingHandoffType::Question => buzz_sdk::MeetingV1HandoffType::Question,
+        crate::MeetingHandoffType::InformationRequest => {
+            buzz_sdk::MeetingV1HandoffType::InformationRequest
+        }
+        crate::MeetingHandoffType::Clarification => buzz_sdk::MeetingV1HandoffType::Clarification,
+        crate::MeetingHandoffType::Review => buzz_sdk::MeetingV1HandoffType::Review,
+        crate::MeetingHandoffType::ResponseRequested => {
+            buzz_sdk::MeetingV1HandoffType::ResponseRequested
+        }
+    }
 }
 
 async fn current_open_floor(
@@ -947,41 +1717,102 @@ pub async fn cmd_say_meeting(
     client: &BuzzClient,
     meeting_id: &str,
     content: &str,
+    mentions: &[String],
+    handoff_to: Option<&str>,
+    handoff_type: Option<crate::MeetingHandoffType>,
+    handoff_reason: Option<&str>,
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
-    let state = fetch_current_floor(client, &meeting_id.to_string())
-        .await?
-        .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
-    if state.phase != "granted" {
-        return Err(CliError::Usage(format!(
-            "meeting round {} is {}; no active Grant can be used",
-            state.round_number, state.phase
-        )));
-    }
-    let self_pubkey = client.keys().public_key().to_hex();
-    if state.holder_pubkey.as_deref() != Some(self_pubkey.as_str()) {
-        return Err(CliError::Usage(format!(
-            "current Grant belongs to {}, not the current identity",
-            state.holder_pubkey.as_deref().unwrap_or("unknown")
-        )));
-    }
-    let grant_event_id = state
-        .grant_event_id
-        .as_deref()
-        .ok_or_else(|| CliError::Other("granted floor state has no Grant event ID".into()))?;
     let content = read_or_stdin(content)?;
-    let builder = buzz_sdk::build_meeting_speech(
-        meeting_id,
-        state.round_number,
-        grant_event_id,
-        &content,
-        &[],
-    )
-    .map_err(sdk_err)?;
-    let event = client.sign_event(builder)?;
-    let response = client.submit_event(event).await?;
-    println!("{}", normalize_write_response(&response));
-    Ok(())
+    let mention_refs: Vec<&str> = mentions.iter().map(String::as_str).collect();
+    match fetch_meeting_protocol(client, &meeting_id.to_string()).await? {
+        MeetingProtocol::UniformV0 => {
+            if handoff_to.is_some() || handoff_type.is_some() || handoff_reason.is_some() {
+                return Err(CliError::Usage(
+                    "directed handoff requires a moderated-baton-v1 meeting".into(),
+                ));
+            }
+            let state = fetch_current_floor(client, &meeting_id.to_string())
+                .await?
+                .ok_or_else(|| {
+                    CliError::NotFound(format!("meeting floor not found: {meeting_id}"))
+                })?;
+            if state.phase != "granted" {
+                return Err(CliError::Usage(format!(
+                    "meeting round {} is {}; no active Grant can be used",
+                    state.round_number, state.phase
+                )));
+            }
+            let self_pubkey = client.keys().public_key().to_hex();
+            if state.holder_pubkey.as_deref() != Some(self_pubkey.as_str()) {
+                return Err(CliError::Usage(format!(
+                    "current Grant belongs to {}, not the current identity",
+                    state.holder_pubkey.as_deref().unwrap_or("unknown")
+                )));
+            }
+            let grant_event_id = state.grant_event_id.as_deref().ok_or_else(|| {
+                CliError::Other("granted floor state has no Grant event ID".into())
+            })?;
+            let builder = buzz_sdk::build_meeting_speech(
+                meeting_id,
+                state.round_number,
+                grant_event_id,
+                &content,
+                &mention_refs,
+            )
+            .map_err(sdk_err)?;
+            let event = client.sign_event(builder)?;
+            let response = client.submit_event(event).await?;
+            println!("{}", normalize_write_response(&response));
+            Ok(())
+        }
+        MeetingProtocol::ModeratedBatonV1 => {
+            let handoff = match (handoff_to, handoff_type, handoff_reason) {
+                (None, None, None) => None,
+                (Some(target_pubkey), Some(handoff_type), Some(reason)) => {
+                    Some(buzz_sdk::MeetingV1DirectedHandoff {
+                        target_pubkey,
+                        handoff_type: sdk_handoff_type(handoff_type),
+                        reason,
+                    })
+                }
+                _ => {
+                    return Err(CliError::Usage(
+                        "--handoff-to, --handoff-type, and --handoff-reason must be supplied together"
+                            .into(),
+                    ));
+                }
+            };
+            let state = fetch_required_v1_baton(client, meeting_id).await?;
+            let self_pubkey = client.keys().public_key().to_hex();
+            let (_, grant_id) = active_object_for_identity(
+                &state,
+                "grant",
+                "grant_id",
+                None,
+                "holder_pubkey",
+                &self_pubkey,
+            )?;
+            let speech_revision = state
+                .speech_revision
+                .checked_add(1)
+                .ok_or_else(|| CliError::Other("speech revision overflow".into()))?;
+            let builder = buzz_sdk::build_meeting_v1_speech(buzz_sdk::MeetingV1SpeechParams {
+                session_id: meeting_id,
+                grant_id,
+                speech_revision,
+                content: &content,
+                mentions: &mention_refs,
+                handoff,
+            })
+            .map_err(sdk_err)?;
+            let event = client.sign_event(builder)?;
+            let speech_event_id = event.id.to_hex();
+            let response = submit_v1_event(client, meeting_id, event).await?;
+            print_v1_write_response(&response, "speech_event_id", &speech_event_id);
+            Ok(())
+        }
+    }
 }
 
 pub async fn cmd_end_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
@@ -1018,6 +1849,12 @@ fn event_round(event: &serde_json::Value) -> u64 {
 
 fn event_floor_revision(event: &serde_json::Value) -> u64 {
     extract_tag_value(event, "floor-revision")
+        .parse()
+        .unwrap_or(u64::MAX)
+}
+
+fn event_speech_revision(event: &serde_json::Value) -> u64 {
+    extract_tag_value(event, "speech-revision")
         .parse()
         .unwrap_or(u64::MAX)
 }
@@ -1064,13 +1901,140 @@ pub async fn dispatch(
         MeetingsCmd::History { meeting, limit } => {
             cmd_meeting_history(client, &meeting, limit, format).await
         }
-        MeetingsCmd::Say { meeting, content } => cmd_say_meeting(client, &meeting, &content).await,
+        MeetingsCmd::Say {
+            meeting,
+            content,
+            mentions,
+            handoff_to,
+            handoff_type,
+            handoff_reason,
+        } => {
+            cmd_say_meeting(
+                client,
+                &meeting,
+                &content,
+                &mentions,
+                handoff_to.as_deref(),
+                handoff_type,
+                handoff_reason.as_deref(),
+            )
+            .await
+        }
+        MeetingsCmd::Intents { command } => {
+            use crate::MeetingIntentsCmd;
+            match command {
+                MeetingIntentsCmd::List { meeting } => {
+                    cmd_intents_list(client, &meeting, format).await
+                }
+                MeetingIntentsCmd::Submit {
+                    meeting,
+                    summary,
+                    addressed_to,
+                } => cmd_intent_submit(client, &meeting, &summary, addressed_to.as_deref()).await,
+                MeetingIntentsCmd::Refresh {
+                    meeting,
+                    intent,
+                    summary,
+                    addressed_to,
+                } => {
+                    cmd_intent_refresh(client, &meeting, &intent, &summary, addressed_to.as_deref())
+                        .await
+                }
+                MeetingIntentsCmd::Withdraw { meeting, intent } => {
+                    cmd_intent_withdraw(client, &meeting, &intent).await
+                }
+            }
+        }
+        MeetingsCmd::Moderator { command } => {
+            use crate::MeetingModeratorCmd;
+            match command {
+                MeetingModeratorCmd::Select {
+                    meeting,
+                    intent,
+                    handoff,
+                    reason,
+                    deferrals,
+                } => {
+                    cmd_moderator_select(
+                        client,
+                        &meeting,
+                        intent.as_deref(),
+                        handoff.as_deref(),
+                        reason.as_deref(),
+                        &deferrals,
+                    )
+                    .await
+                }
+                MeetingModeratorCmd::Reject {
+                    meeting,
+                    intent,
+                    reason_code,
+                    reason,
+                } => cmd_moderator_reject(client, &meeting, &intent, reason_code, &reason).await,
+                MeetingModeratorCmd::DismissHandoff {
+                    meeting,
+                    handoff,
+                    reason_code,
+                    reason,
+                } => {
+                    cmd_moderator_dismiss_handoff(client, &meeting, &handoff, reason_code, &reason)
+                        .await
+                }
+                MeetingModeratorCmd::Recall { meeting, reason } => {
+                    cmd_moderator_recall(client, &meeting, reason.as_deref()).await
+                }
+            }
+        }
+        MeetingsCmd::Offer { command } => {
+            use crate::MeetingOfferCmd;
+            match command {
+                MeetingOfferCmd::Ack { meeting, offer } => {
+                    cmd_offer_ack(client, &meeting, offer.as_deref()).await
+                }
+                MeetingOfferCmd::Decline {
+                    meeting,
+                    offer,
+                    reason,
+                } => cmd_offer_decline(client, &meeting, offer.as_deref(), reason.as_deref()).await,
+            }
+        }
+        MeetingsCmd::Grant { command } => {
+            use crate::MeetingGrantCmd;
+            match command {
+                MeetingGrantCmd::Progress {
+                    meeting,
+                    stage,
+                    grant,
+                } => cmd_grant_progress(client, &meeting, grant.as_deref(), stage).await,
+                MeetingGrantCmd::Yield {
+                    meeting,
+                    grant,
+                    reason_code,
+                    reason,
+                } => {
+                    cmd_grant_yield(
+                        client,
+                        &meeting,
+                        grant.as_deref(),
+                        reason_code,
+                        reason.as_deref(),
+                    )
+                    .await
+                }
+            }
+        }
         MeetingsCmd::Floor { command } => {
             use crate::MeetingFloorCmd;
             match command {
                 MeetingFloorCmd::Status { meeting } => cmd_floor_status(client, &meeting).await,
                 MeetingFloorCmd::History { meeting, limit } => {
                     cmd_floor_history(client, &meeting, limit, format).await
+                }
+                MeetingFloorCmd::Request { meeting } => {
+                    cmd_human_floor_request(client, &meeting).await
+                }
+                MeetingFloorCmd::Withdraw { meeting, request } => {
+                    cmd_human_floor_withdraw(client, &meeting, request.as_deref()).await
                 }
                 MeetingFloorCmd::Claim {
                     meeting,
@@ -1155,5 +2119,28 @@ mod tests {
         assert_eq!(state.state_revision, 7);
         assert_eq!(state.floor_revision, 1);
         assert_eq!(state.phase, "moderator_idle");
+    }
+
+    #[test]
+    fn v1_write_response_exposes_canonical_object_and_local_id() {
+        let canonical_id = "aa".repeat(32);
+        let response = serde_json::json!({
+            "event_id": "bb".repeat(32),
+            "accepted": true,
+            "message": format!(
+                "response:{}",
+                serde_json::json!({
+                    "canonical_object_id": canonical_id,
+                    "state_revision": 9,
+                    "duplicate": false,
+                })
+            ),
+        })
+        .to_string();
+        let output = v1_write_response(&response, "intent_id", "cc");
+        assert_eq!(output["intent_id"], "cc");
+        assert_eq!(output["canonical_object_id"], "aa".repeat(32));
+        assert_eq!(output["state_revision"], 9);
+        assert_eq!(output["accepted"], true);
     }
 }

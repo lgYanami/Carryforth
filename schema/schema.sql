@@ -156,6 +156,8 @@ CREATE INDEX idx_channel_members_pubkey ON channel_members (community_id, pubkey
 -- Meeting V0 reuses a private stream channel for messages and membership. This
 -- table is the durable lifecycle projection; session_id is the channel UUID.
 
+CREATE SEQUENCE meeting_security_order_seq AS BIGINT START WITH 1;
+
 CREATE TABLE meeting_sessions (
     community_id      UUID NOT NULL REFERENCES communities(id),
     session_id        UUID NOT NULL,
@@ -165,7 +167,9 @@ CREATE TABLE meeting_sessions (
     schema_version    INT NOT NULL DEFAULT 1,
     status            TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'ended')),
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    security_order    BIGINT NOT NULL DEFAULT nextval('meeting_security_order_seq')
+        CHECK (security_order > 0),
     ended_at          TIMESTAMPTZ,
     ended_by          BYTEA,
     end_event_id      BYTEA,
@@ -442,6 +446,10 @@ CREATE INDEX idx_meeting_event_outbox_pending
     ON meeting_event_outbox (available_at, sequence)
     WHERE delivered_at IS NULL;
 
+CREATE INDEX idx_meeting_event_outbox_pending_session_sequence
+    ON meeting_event_outbox (community_id, session_id, sequence)
+    WHERE delivered_at IS NULL;
+
 -- Meeting V1 freezes identity and configuration independently of channel roles
 -- and persists every moderated-baton State snapshot.
 
@@ -566,6 +574,8 @@ CREATE TABLE meeting_baton_state (
     moderator_decision_started_at   TIMESTAMPTZ,
     moderator_decision_deadline     TIMESTAMPTZ,
     next_action_at                  TIMESTAMPTZ,
+    recovery_retry_at               TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    recovery_attempts               INT NOT NULL DEFAULT 0,
     created_at                      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at                      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (community_id, session_id),
@@ -599,6 +609,8 @@ CREATE TABLE meeting_baton_state (
         CHECK (handoff_depth BETWEEN 0 AND 255),
     CONSTRAINT chk_meeting_baton_moderator_speeches
         CHECK (consecutive_moderator_speeches >= 0),
+    CONSTRAINT chk_meeting_baton_recovery_attempts
+        CHECK (recovery_attempts >= 0),
     CONSTRAINT chk_meeting_baton_state_phase_shape CHECK (
         (phase = 'moderator_idle'
             AND active_offer_id IS NULL
@@ -639,6 +651,15 @@ CREATE TABLE meeting_baton_state (
 
 CREATE INDEX idx_meeting_baton_state_due
     ON meeting_baton_state (next_action_at, community_id, session_id)
+    WHERE next_action_at IS NOT NULL;
+
+CREATE INDEX idx_meeting_baton_state_recovery_due
+    ON meeting_baton_state (
+        next_action_at,
+        recovery_retry_at,
+        community_id,
+        session_id
+    )
     WHERE next_action_at IS NOT NULL;
 
 CREATE TABLE meeting_speech_intents (
@@ -1196,13 +1217,14 @@ CREATE TABLE meeting_grant_progress (
     grant_id              BYTEA NOT NULL,
     progress_seq          BIGINT NOT NULL,
     progress_event_id     BYTEA NOT NULL,
-    stage                 TEXT NOT NULL
+    stage                 TEXT NOT NULL,
+    CONSTRAINT chk_meeting_progress_stage
         CHECK (stage IN (
-            'planning',
-            'tooling',
-            'drafting',
+            'context_sync',
+            'tool_use',
+            'generating',
             'composing',
-            'finalizing'
+            'submitting'
         )),
     soft_lease_expires_at TIMESTAMPTZ NOT NULL,
     accepted_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -1415,6 +1437,8 @@ CREATE TABLE meeting_revocation_jobs (
     next_attempt_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     last_error          TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    security_order      BIGINT NOT NULL DEFAULT nextval('meeting_security_order_seq')
+        CHECK (security_order > 0),
     completed_at        TIMESTAMPTZ,
     PRIMARY KEY (community_id, job_id),
     UNIQUE (community_id, revocation_event_id),
@@ -1437,6 +1461,9 @@ CREATE INDEX idx_meeting_revocation_jobs_due
         job_id
     )
     WHERE state IN ('pending', 'running');
+
+CREATE INDEX idx_meeting_revocation_jobs_reader_fence
+    ON meeting_revocation_jobs (community_id, revoked_pubkey, security_order);
 
 ALTER TABLE meeting_baton_state
     ADD CONSTRAINT fk_meeting_baton_active_offer

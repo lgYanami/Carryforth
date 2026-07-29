@@ -15,6 +15,7 @@
 //! through the integration thread.
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest as _, Sha256};
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
@@ -319,7 +320,55 @@ pub async fn ban_member(
     reason: Option<&str>,
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
+    let revocation_event_id: [u8; 32] = rand::random();
+    ban_member_with_revocation(
+        pool,
+        community,
+        pubkey,
+        actor,
+        reason,
+        expires_at,
+        &revocation_event_id,
+    )
+    .await
+}
+
+/// Upsert a ban and atomically enqueue Meeting cleanup using the signed
+/// moderation event or audit identifier that caused the revocation.
+pub async fn ban_member_with_revocation(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &[u8],
+    actor: &[u8],
+    reason: Option<&str>,
+    expires_at: Option<DateTime<Utc>>,
+    revocation_event_id: &[u8],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    // Serialize Meeting roster validation with this revocation. Meeting Create
+    // holds KEY SHARE/SHARE on the same authoritative identity rows, so either
+    // the Meeting commits first (and falls before this job's cutoff) or Create
+    // observes the committed ban and rejects the roster.
+    let pubkey_hex = hex::encode(pubkey);
     sqlx::query(
+        "SELECT pubkey FROM relay_members \
+         WHERE community_id = $1 AND pubkey = $2 \
+         FOR UPDATE",
+    )
+    .bind(community.as_uuid())
+    .bind(&pubkey_hex)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT pubkey FROM users \
+         WHERE community_id = $1 AND pubkey = $2 \
+         FOR UPDATE",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let active: bool = sqlx::query_scalar(
         r#"
         INSERT INTO community_bans (
             community_id, pubkey, banned, ban_expires_at, ban_reason, actor_pubkey
@@ -330,6 +379,8 @@ pub async fn ban_member(
             ban_reason = EXCLUDED.ban_reason,
             actor_pubkey = EXCLUDED.actor_pubkey,
             updated_at = now()
+        RETURNING banned
+            AND (ban_expires_at IS NULL OR ban_expires_at > clock_timestamp())
         "#,
     )
     .bind(community.as_uuid())
@@ -337,10 +388,55 @@ pub async fn ban_member(
     .bind(expires_at)
     .bind(reason)
     .bind(actor)
-    .execute(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
+    if active {
+        crate::meeting_baton::enqueue_revocation_job_tx(
+            &mut tx,
+            community,
+            Uuid::new_v4(),
+            pubkey,
+            revocation_event_id,
+        )
+        .await?;
+        let owned_agents: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pubkey FROM users \
+             WHERE community_id = $1 AND agent_owner_pubkey = $2 \
+             ORDER BY pubkey",
+        )
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .fetch_all(&mut *tx)
+        .await?;
+        for agent_pubkey in owned_agents {
+            let agent_evidence =
+                agent_revocation_evidence(community, revocation_event_id, &agent_pubkey);
+            crate::meeting_baton::enqueue_revocation_job_tx(
+                &mut tx,
+                community,
+                Uuid::new_v4(),
+                &agent_pubkey,
+                &agent_evidence,
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
+}
+
+fn agent_revocation_evidence(
+    community: CommunityId,
+    owner_revocation_event_id: &[u8],
+    agent_pubkey: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"buzz/meeting-revocation/nip-oa-owner-ban/v1");
+    digest.update(community.as_uuid().as_bytes());
+    digest.update(owner_revocation_event_id);
+    digest.update(agent_pubkey);
+    digest.finalize().into()
 }
 
 /// Lift a ban. Returns `false` if the member was not banned.
@@ -376,6 +472,28 @@ pub async fn timeout_member(
     muted_until: DateTime<Utc>,
     reason: Option<&str>,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    // Meeting write gates hold SHARE locks in this same order. This makes an
+    // active timeout and an in-flight Meeting command linearizable even when
+    // the restriction row does not exist yet.
+    sqlx::query(
+        "SELECT pubkey FROM relay_members \
+         WHERE community_id = $1 AND pubkey = $2 \
+         FOR UPDATE",
+    )
+    .bind(community.as_uuid())
+    .bind(hex::encode(pubkey))
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT pubkey FROM users \
+         WHERE community_id = $1 AND pubkey = $2 \
+         FOR UPDATE",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
     sqlx::query(
         r#"
         INSERT INTO community_bans (
@@ -393,9 +511,10 @@ pub async fn timeout_member(
     .bind(muted_until)
     .bind(reason)
     .bind(actor)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -730,6 +849,107 @@ mod tests {
         assert!(
             restricted_b.iter().all(|row| row.pubkey != pubkey),
             "community B restricted list must not include community A's ban"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn active_ban_and_meeting_revocation_job_commit_atomically() {
+        let pool = setup_pool().await;
+        let community = make_test_community(&pool).await;
+        let pubkey = random_32();
+        let owned_agent = random_32();
+        let actor = random_32();
+        let revocation_event_id = [0x62_u8; 32];
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community.as_uuid())
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .expect("insert owner identity");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community.as_uuid())
+        .bind(&owned_agent)
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .expect("insert owned Agent identity");
+
+        ban_member_with_revocation(
+            &pool,
+            community,
+            &pubkey,
+            &actor,
+            Some("security revocation test"),
+            None,
+            &revocation_event_id,
+        )
+        .await
+        .expect("ban with durable Meeting cleanup");
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM meeting_revocation_jobs \
+                 WHERE community_id = $1 AND revocation_event_id = $2 \
+             )",
+        )
+        .bind(community.as_uuid())
+        .bind(revocation_event_id.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("read Meeting revocation job");
+        assert!(queued);
+        let revoked_pubkeys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT revoked_pubkey FROM meeting_revocation_jobs \
+             WHERE community_id = $1 ORDER BY revoked_pubkey",
+        )
+        .bind(community.as_uuid())
+        .fetch_all(&pool)
+        .await
+        .expect("read owner-ban cascade jobs");
+        assert_eq!(revoked_pubkeys.len(), 2);
+        assert!(revoked_pubkeys.contains(&pubkey));
+        assert!(revoked_pubkeys.contains(&owned_agent));
+        assert!(unban_member(&pool, community, &pubkey, &actor)
+            .await
+            .expect("rapidly unban owner"));
+        let durable_after_unban: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM meeting_revocation_jobs \
+             WHERE community_id = $1 AND revoked_pubkey IN ($2, $3)",
+        )
+        .bind(community.as_uuid())
+        .bind(&pubkey)
+        .bind(&owned_agent)
+        .fetch_one(&pool)
+        .await
+        .expect("count durable jobs after unban");
+        assert_eq!(
+            durable_after_unban, 2,
+            "rapid unban must not erase owner or Agent cleanup"
+        );
+
+        let rollback_pubkey = random_32();
+        assert!(
+            ban_member_with_revocation(
+                &pool,
+                community,
+                &rollback_pubkey,
+                &actor,
+                None,
+                None,
+                &[1_u8; 31],
+            )
+            .await
+            .is_err(),
+            "invalid job evidence must abort the ban transaction"
+        );
+        assert!(
+            !restriction_state(&pool, community, &rollback_pubkey)
+                .await
+                .expect("restriction survived rollback check")
+                .banned
         );
     }
 

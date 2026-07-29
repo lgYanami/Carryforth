@@ -166,12 +166,13 @@ async fn handle_ban(
 
     state
         .db
-        .ban_community_member(
+        .ban_community_member_with_revocation(
             tenant.community(),
             &target,
             actor,
             reason.as_deref(),
             expires_at,
+            event.id.as_bytes(),
         )
         .await
         .map_err(|e| error(format!("database error: {e}")))?;

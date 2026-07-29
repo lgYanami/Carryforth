@@ -33,6 +33,8 @@ pub mod meeting;
 pub mod meeting_baton;
 /// Meeting V0 speech-floor state machine and delivery outbox.
 pub mod meeting_floor;
+/// Durable cleanup for meetings affected by a real security revocation.
+pub mod meeting_revocation;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.
@@ -2978,6 +2980,23 @@ impl Db {
         relay_members::remove_relay_member(&self.pool, community, pubkey).await
     }
 
+    /// Removes a relay member and atomically enqueues Meeting cleanup keyed by
+    /// the signed event or audit record that authorized the revocation.
+    pub async fn remove_relay_member_with_revocation(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        revocation_event_id: &[u8],
+    ) -> Result<relay_members::RemoveResult> {
+        relay_members::remove_relay_member_with_revocation(
+            &self.pool,
+            community,
+            pubkey,
+            revocation_event_id,
+        )
+        .await
+    }
+
     /// Removes a relay member from `community` only if their current role matches `expected_role`.
     ///
     /// Atomic conditional delete — eliminates the TOCTOU race between a
@@ -2990,6 +3009,25 @@ impl Db {
     ) -> Result<relay_members::RemoveResult> {
         relay_members::remove_relay_member_if_role(&self.pool, community, pubkey, expected_role)
             .await
+    }
+
+    /// Removes a relay member with the expected role and atomically enqueues
+    /// Meeting cleanup keyed by the revocation event or audit record.
+    pub async fn remove_relay_member_if_role_with_revocation(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        expected_role: &str,
+        revocation_event_id: &[u8],
+    ) -> Result<relay_members::RemoveResult> {
+        relay_members::remove_relay_member_if_role_with_revocation(
+            &self.pool,
+            community,
+            pubkey,
+            expected_role,
+            revocation_event_id,
+        )
+        .await
     }
 
     /// Updates the role of an existing relay member in `community`. Returns `true` if updated.
@@ -3118,6 +3156,29 @@ impl Db {
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
         moderation::ban_member(&self.pool, community, pubkey, actor, reason, expires_at).await
+    }
+
+    /// Upsert a community ban and atomically enqueue Meeting cleanup keyed by
+    /// the signed moderation event or audit record.
+    pub async fn ban_community_member_with_revocation(
+        &self,
+        community: CommunityId,
+        pubkey: &[u8],
+        actor: &[u8],
+        reason: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+        revocation_event_id: &[u8],
+    ) -> Result<()> {
+        moderation::ban_member_with_revocation(
+            &self.pool,
+            community,
+            pubkey,
+            actor,
+            reason,
+            expires_at,
+            revocation_event_id,
+        )
+        .await
     }
 
     /// Lift a community ban for a member pubkey.

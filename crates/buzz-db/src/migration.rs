@@ -560,7 +560,9 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        // Stage 2 adds migration 0030 after the 28 migrations present in the
+        // Stage 1 baseline; keep this guard aligned with the embedded set.
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -932,6 +934,22 @@ mod tests {
         assert!(meeting_baton.contains("CREATE TABLE meeting_revocation_jobs"));
         assert!(meeting_baton.contains("chk_meeting_protocol_shape"));
         assert!(meeting_baton.contains("trg_meeting_session_protocol_immutable"));
+
+        // Stage 2 corrects the deterministic Progress vocabulary without
+        // rewriting the checksum-frozen Meeting V1 foundation migration.
+        assert_eq!(migrations[28].version, 30);
+        let meeting_baton_stage_two = migrations[28].sql.as_str();
+        assert!(meeting_baton_stage_two.contains("'context_sync'"));
+        assert!(meeting_baton_stage_two.contains("'tool_use'"));
+        assert!(meeting_baton_stage_two.contains("'generating'"));
+        assert!(meeting_baton_stage_two.contains("'submitting'"));
+        assert!(
+            meeting_baton_stage_two.contains("idx_meeting_event_outbox_pending_session_sequence")
+        );
+        assert!(meeting_baton_stage_two.contains("recovery_retry_at"));
+        assert!(meeting_baton_stage_two.contains("recovery_attempts"));
+        assert!(meeting_baton_stage_two.contains("idx_meeting_baton_state_recovery_due"));
+        assert!(meeting_baton_stage_two.contains("idx_meeting_revocation_jobs_reader_fence"));
     }
 
     #[test]

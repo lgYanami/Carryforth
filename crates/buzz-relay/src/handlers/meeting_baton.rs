@@ -1,0 +1,1275 @@
+//! Strict Meeting V1 moderated-baton command ingestion.
+//!
+//! Wire parsing belongs at the Relay boundary. The database receives a closed,
+//! typed command and remains authoritative for participant roles, revisions,
+//! deadlines, idempotency, lazy recovery, and state transitions.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use buzz_core::kind::{
+    KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND,
+    KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT,
+};
+use buzz_core::tenant::TenantContext;
+use buzz_db::meeting::MAX_MEETING_PARTICIPANTS;
+use buzz_db::meeting_baton::{
+    BatonCommand, BatonCommandOutcome, BatonCommandTxParams, BatonHandoffInput,
+    BatonIntentDeferral, BatonProgressStage, BatonSelectionSource,
+};
+use buzz_db::DbError;
+use nostr::Event;
+use serde::Deserialize;
+use uuid::Uuid;
+
+use crate::state::AppState;
+
+use super::command_executor::{
+    decode_event_id, map_meeting_db_error, optional_single_tag, parse_single_uuid_tag,
+    require_single_tag, validate_meeting_tag_schema, MeetingProtocol,
+};
+use super::ingest::{IngestAuth, IngestError, IngestResult};
+
+const V1_SCHEMA_VERSION: &str = "2";
+const MAX_INTENT_SUMMARY_BYTES: usize = 512;
+const MAX_SELECTION_REASON_BYTES: usize = 512;
+const MAX_CONTROL_REASON_BYTES: usize = 1_024;
+const MAX_RESPONSE_REASON_BYTES: usize = 512;
+const MAX_HANDOFF_REASON_BYTES: usize = 1_024;
+
+const REJECTION_REASON_CODES: &[&str] = &[
+    "off_topic",
+    "duplicate",
+    "superseded",
+    "unsupported",
+    "agenda_mismatch",
+];
+const HANDOFF_DISMISS_REASON_CODES: &[&str] = &[
+    "superseded",
+    "answered_elsewhere",
+    "out_of_scope",
+    "no_longer_needed",
+];
+const YIELD_REASON_CODES: &[&str] = &[
+    "no_longer_needed",
+    "unable_to_answer",
+    "insufficient_context",
+    "tool_failure",
+    "cancelled",
+];
+const HANDOFF_TYPES: &[&str] = &[
+    "question",
+    "information_request",
+    "clarification",
+    "review",
+    "response_requested",
+];
+
+/// Parse and execute one participant-authored Meeting V1 control command.
+pub(crate) async fn handle_command(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let (session_id, command) = parse_control_command(event)?;
+    authorize_participant_command(tenant, state, session_id, auth).await?;
+    execute(tenant, state, session_id, event, command).await
+}
+
+/// Parse and execute one Grant-bound Meeting V1 canonical speech.
+///
+/// The ordinary ingest path has already enforced channel token scope,
+/// membership, archival state, and message-size limits before reaching here.
+pub(crate) async fn handle_speech(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+) -> Result<IngestResult, IngestError> {
+    let (session_id, command) = parse_speech(event)?;
+    execute(tenant, state, session_id, event, command).await
+}
+
+async fn authorize_participant_command(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    session_id: Uuid,
+    auth: &IngestAuth,
+) -> Result<(), IngestError> {
+    if auth
+        .channel_ids()
+        .is_some_and(|ids| !ids.contains(&session_id))
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: token not authorized for this meeting".into(),
+        ));
+    }
+    let actor_pubkey = auth.pubkey().to_bytes();
+    let is_participant = state
+        .is_member_cached(tenant.community(), session_id, &actor_pubkey)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!(
+                "error: checking Meeting V1 participant access: {error}"
+            ))
+        })?;
+    if !is_participant {
+        return Err(IngestError::AuthFailed(
+            "restricted: not a participant in this meeting".into(),
+        ));
+    }
+    let persisted = buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
+        .await
+        .map_err(map_meeting_db_error)?;
+    if MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?
+        != MeetingProtocol::ModeratedBatonV1
+    {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting V1 command targets a V0 session".into(),
+        ));
+    }
+    let restriction = state
+        .db
+        .moderation_restriction_state(tenant.community(), auth.pubkey().as_bytes())
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!(
+                "error: checking Meeting V1 author restriction state: {error}"
+            ))
+        })?;
+    if restriction.banned {
+        return Err(IngestError::AuthFailed(
+            "blocked: you are banned from this community".into(),
+        ));
+    }
+    if restriction
+        .muted_until
+        .is_some_and(|until| until > chrono::Utc::now())
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: you are timed out from writing".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn execute(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    session_id: Uuid,
+    event: &Event,
+    command: BatonCommand,
+) -> Result<IngestResult, IngestError> {
+    let result = buzz_db::meeting_baton::execute_baton_command(
+        &state.db,
+        BatonCommandTxParams {
+            community_id: tenant.community(),
+            session_id,
+            event,
+            relay_keys: &state.relay_keypair,
+            command,
+        },
+    )
+    .await
+    .map_err(map_baton_db_error)?;
+
+    let recovery_count = result.recovery_transitions.len();
+    match result.command_outcome {
+        BatonCommandOutcome::Accepted {
+            canonical_object_id,
+            state_revision,
+        } => Ok(success_result(
+            event,
+            session_id,
+            canonical_object_id,
+            Some(state_revision),
+            recovery_count,
+            false,
+            "accepted",
+        )),
+        BatonCommandOutcome::Duplicate {
+            accepted: true,
+            canonical_object_id,
+            state_revision,
+            outcome_code,
+            ..
+        } => Ok(success_result(
+            event,
+            session_id,
+            canonical_object_id,
+            state_revision,
+            recovery_count,
+            true,
+            &outcome_code,
+        )),
+        BatonCommandOutcome::Duplicate {
+            accepted: false,
+            outcome_class,
+            canonical_object_id,
+            outcome_code,
+            ..
+        } => Err(command_rejection(
+            if outcome_class == "rejected_after_recovery" {
+                "expired"
+            } else {
+                "conflict"
+            },
+            &outcome_code,
+            canonical_object_id.as_deref(),
+            recovery_count,
+        )),
+        BatonCommandOutcome::RejectedTerminal {
+            code,
+            canonical_object_id,
+        } => Err(command_rejection(
+            "conflict",
+            &code,
+            canonical_object_id.as_deref(),
+            recovery_count,
+        )),
+        BatonCommandOutcome::RejectedAfterRecovery {
+            code,
+            canonical_object_id,
+        } => Err(command_rejection(
+            "expired",
+            &code,
+            canonical_object_id.as_deref(),
+            recovery_count,
+        )),
+    }
+}
+
+fn map_baton_db_error(error: DbError) -> IngestError {
+    match error {
+        DbError::AccessDenied(_) => IngestError::AuthFailed(
+            "restricted: not authorized for this Meeting V1 operation".into(),
+        ),
+        other => map_meeting_db_error(other),
+    }
+}
+
+fn success_result(
+    event: &Event,
+    session_id: Uuid,
+    canonical_object_id: Option<Vec<u8>>,
+    state_revision: Option<i64>,
+    recovery_count: usize,
+    duplicate: bool,
+    outcome_code: &str,
+) -> IngestResult {
+    IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "meeting_id": session_id,
+                "canonical_object_id": canonical_object_id.as_deref().map(hex::encode),
+                "state_revision": state_revision,
+                "recovery_transitions": recovery_count,
+                "duplicate": duplicate,
+                "outcome": outcome_code,
+            })
+        ),
+    }
+}
+
+fn command_rejection(
+    prefix: &str,
+    code: &str,
+    canonical_object_id: Option<&[u8]>,
+    recovery_count: usize,
+) -> IngestError {
+    let details = serde_json::json!({
+        "code": code,
+        "canonical_object_id": canonical_object_id.map(hex::encode),
+        "recovery_transitions": recovery_count,
+    });
+    IngestError::Rejected(format!("{prefix}: {details}"))
+}
+
+fn parse_control_command(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    match event.kind.as_u16() as u32 {
+        KIND_MEETING_SPEECH_INTENT => parse_intent(event),
+        KIND_MEETING_MODERATOR_COMMAND => parse_moderator_command(event),
+        KIND_MEETING_HUMAN_FLOOR_REQUEST => parse_human_request(event),
+        KIND_MEETING_OFFER_RESPONSE => parse_offer_response(event),
+        KIND_MEETING_GRANT_SIGNAL => parse_grant_signal(event),
+        kind => Err(IngestError::Rejected(format!(
+            "invalid: kind {kind} is not a Meeting V1 baton command"
+        ))),
+    }
+}
+
+fn parse_intent(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    let action = require_single_tag(event, "action")?;
+    let command = match action.as_str() {
+        "submit" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "v", "action", "basis-speech-revision"],
+                &["addressed-to"],
+                &[],
+            )?;
+            BatonCommand::IntentSubmit {
+                basis_speech_revision: parse_nonnegative_i64_tag(event, "basis-speech-revision")?,
+                summary: required_text(&event.content, MAX_INTENT_SUMMARY_BYTES, "Intent summary")?,
+                addressed_to: optional_pubkey_tag(event, "addressed-to")?,
+            }
+        }
+        "refresh" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "action",
+                    "intent",
+                    "prev",
+                    "basis-speech-revision",
+                ],
+                &["addressed-to"],
+                &[],
+            )?;
+            BatonCommand::IntentRefresh {
+                intent_id: event_id_tag(event, "intent")?,
+                previous_event_id: event_id_tag(event, "prev")?,
+                basis_speech_revision: parse_nonnegative_i64_tag(event, "basis-speech-revision")?,
+                summary: required_text(&event.content, MAX_INTENT_SUMMARY_BYTES, "Intent summary")?,
+                addressed_to: optional_pubkey_tag(event, "addressed-to")?,
+            }
+        }
+        "withdraw" => {
+            validate_meeting_tag_schema(event, &["h", "v", "action", "intent", "prev"], &[], &[])?;
+            require_empty_content(event, "Intent withdraw")?;
+            BatonCommand::IntentWithdraw {
+                intent_id: event_id_tag(event, "intent")?,
+                previous_event_id: event_id_tag(event, "prev")?,
+            }
+        }
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: Intent action must be submit, refresh, or withdraw".into(),
+            ));
+        }
+    };
+    Ok((parse_v1_session(event)?, command))
+}
+
+fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    let action = require_single_tag(event, "action")?;
+    let command = match action.as_str() {
+        "select" => parse_moderator_select(event)?,
+        "reject" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "v", "action", "intent", "prev", "reason-code", "p"],
+                &[],
+                &[],
+            )?;
+            BatonCommand::ModeratorReject {
+                intent_id: event_id_tag(event, "intent")?,
+                previous_event_id: event_id_tag(event, "prev")?,
+                author_pubkey: pubkey_tag(event, "p")?,
+                reason_code: closed_value_tag(
+                    event,
+                    "reason-code",
+                    REJECTION_REASON_CODES,
+                    "Intent rejection reason code",
+                )?,
+                reason_text: required_text(
+                    &event.content,
+                    MAX_CONTROL_REASON_BYTES,
+                    "Intent rejection reason",
+                )?,
+            }
+        }
+        "dismiss-handoff" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "action",
+                    "handoff",
+                    "expected-speech-revision",
+                    "expected-handoff-attempt-count",
+                    "reason-code",
+                ],
+                &[],
+                &[],
+            )?;
+            BatonCommand::ModeratorDismissHandoff {
+                handoff_id: event_id_tag(event, "handoff")?,
+                expected_speech_revision: parse_nonnegative_i64_tag(
+                    event,
+                    "expected-speech-revision",
+                )?,
+                expected_attempt_count: parse_nonnegative_i32_tag(
+                    event,
+                    "expected-handoff-attempt-count",
+                )?,
+                reason_code: closed_value_tag(
+                    event,
+                    "reason-code",
+                    HANDOFF_DISMISS_REASON_CODES,
+                    "Handoff dismissal reason code",
+                )?,
+                reason_text: required_text(
+                    &event.content,
+                    MAX_CONTROL_REASON_BYTES,
+                    "Handoff dismissal reason",
+                )?,
+            }
+        }
+        "recall" => {
+            validate_meeting_tag_schema(event, &["h", "v", "action", "control-epoch"], &[], &[])?;
+            BatonCommand::ModeratorRecall {
+                control_epoch: parse_positive_i64_tag(event, "control-epoch")?,
+                reason: optional_text(&event.content, MAX_CONTROL_REASON_BYTES, "Recall reason")?,
+            }
+        }
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: moderator action must be select, reject, dismiss-handoff, or recall"
+                    .into(),
+            ));
+        }
+    };
+    Ok((parse_v1_session(event)?, command))
+}
+
+fn parse_moderator_select(event: &Event) -> Result<BatonCommand, IngestError> {
+    validate_meeting_tag_schema(
+        event,
+        &[
+            "h",
+            "v",
+            "action",
+            "expected-control-epoch",
+            "expected-decision-epoch",
+            "expected-intent-revision",
+            "expected-speech-revision",
+        ],
+        &["intent", "handoff", "expected-handoff-attempt-count"],
+        &[],
+    )?;
+    let intent_id = optional_event_id_tag(event, "intent")?;
+    let handoff_id = optional_event_id_tag(event, "handoff")?;
+    let handoff_attempt = optional_nonnegative_i32_tag(event, "expected-handoff-attempt-count")?;
+    let source = match (intent_id, handoff_id, handoff_attempt) {
+        (Some(intent_id), None, None) => BatonSelectionSource::Intent { intent_id },
+        (None, Some(handoff_id), Some(expected_attempt_count)) => BatonSelectionSource::Handoff {
+            handoff_id,
+            expected_attempt_count,
+        },
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: Select must reference exactly one Intent, or one Handoff with its expected attempt count"
+                    .into(),
+            ));
+        }
+    };
+    let content: SelectContent = serde_json::from_str(&event.content).map_err(|error| {
+        IngestError::Rejected(format!("invalid: malformed Select content: {error}"))
+    })?;
+    if matches!(&source, BatonSelectionSource::Handoff { .. }) && !content.deferrals.is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: Handoff Select cannot carry Intent deferrals".into(),
+        ));
+    }
+    let selection_reason = content
+        .selection_reason
+        .map(|reason| required_text(&reason, MAX_SELECTION_REASON_BYTES, "selection reason"))
+        .transpose()?;
+    if content.deferrals.len() > MAX_MEETING_PARTICIPANTS {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Select has too many deferrals (max {MAX_MEETING_PARTICIPANTS})"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(content.deferrals.len());
+    let mut deferrals = Vec::with_capacity(content.deferrals.len());
+    for deferral in content.deferrals {
+        let intent_id = decode_event_id(&deferral.intent_id, "deferred Intent id")?;
+        if matches!(
+            &source,
+            BatonSelectionSource::Intent {
+                intent_id: selected
+            } if selected == &intent_id
+        ) {
+            return Err(IngestError::Rejected(
+                "invalid: selected Intent cannot defer itself".into(),
+            ));
+        }
+        if !seen.insert(intent_id.clone()) {
+            return Err(IngestError::Rejected(
+                "invalid: Select contains a duplicate deferred Intent".into(),
+            ));
+        }
+        deferrals.push(BatonIntentDeferral {
+            intent_id,
+            previous_event_id: decode_event_id(&deferral.prev, "deferred Intent current event id")?,
+            reason: required_text(
+                &deferral.reason,
+                MAX_CONTROL_REASON_BYTES,
+                "deferral reason",
+            )?,
+        });
+    }
+    Ok(BatonCommand::ModeratorSelect {
+        source,
+        expected_control_epoch: parse_positive_i64_tag(event, "expected-control-epoch")?,
+        expected_decision_epoch: parse_nonnegative_i64_tag(event, "expected-decision-epoch")?,
+        expected_intent_revision: parse_nonnegative_i64_tag(event, "expected-intent-revision")?,
+        expected_speech_revision: parse_nonnegative_i64_tag(event, "expected-speech-revision")?,
+        selection_reason,
+        deferrals,
+    })
+}
+
+fn parse_human_request(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    let action = require_single_tag(event, "action")?;
+    let command = match action.as_str() {
+        "request" => {
+            validate_meeting_tag_schema(event, &["h", "v", "action"], &[], &[])?;
+            require_empty_content(event, "Human request")?;
+            BatonCommand::HumanRequest
+        }
+        "withdraw" => {
+            validate_meeting_tag_schema(event, &["h", "v", "action", "request"], &[], &[])?;
+            require_empty_content(event, "Human request withdrawal")?;
+            BatonCommand::HumanWithdraw {
+                request_id: event_id_tag(event, "request")?,
+            }
+        }
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: Human floor action must be request or withdraw".into(),
+            ));
+        }
+    };
+    Ok((parse_v1_session(event)?, command))
+}
+
+fn parse_offer_response(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    validate_meeting_tag_schema(event, &["h", "v", "action", "meeting-offer"], &[], &[])?;
+    let offer_id = event_id_tag(event, "meeting-offer")?;
+    let command = match require_single_tag(event, "action")?.as_str() {
+        "ack" => {
+            require_empty_content(event, "Offer ACK")?;
+            BatonCommand::OfferAck { offer_id }
+        }
+        "decline" => BatonCommand::OfferDecline {
+            offer_id,
+            reason: optional_text(
+                &event.content,
+                MAX_RESPONSE_REASON_BYTES,
+                "Offer decline reason",
+            )?,
+        },
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: Offer response action must be ack or decline".into(),
+            ));
+        }
+    };
+    Ok((parse_v1_session(event)?, command))
+}
+
+fn parse_grant_signal(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    let action = require_single_tag(event, "action")?;
+    let command = match action.as_str() {
+        "progress" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "v", "action", "meeting-grant", "progress-seq", "stage"],
+                &[],
+                &[],
+            )?;
+            require_empty_content(event, "Grant Progress")?;
+            BatonCommand::GrantProgress {
+                grant_id: event_id_tag(event, "meeting-grant")?,
+                progress_seq: parse_positive_i64_tag(event, "progress-seq")?,
+                stage: parse_progress_stage(event)?,
+            }
+        }
+        "yield" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "v", "action", "meeting-grant"],
+                &["reason-code"],
+                &[],
+            )?;
+            BatonCommand::GrantYield {
+                grant_id: event_id_tag(event, "meeting-grant")?,
+                reason_code: optional_closed_value_tag(
+                    event,
+                    "reason-code",
+                    YIELD_REASON_CODES,
+                    "Yield reason code",
+                )?,
+                reason: optional_text(&event.content, MAX_RESPONSE_REASON_BYTES, "Yield reason")?,
+            }
+        }
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: Grant signal action must be progress or yield".into(),
+            ));
+        }
+    };
+    Ok((parse_v1_session(event)?, command))
+}
+
+fn parse_speech(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+    validate_meeting_tag_schema(
+        event,
+        &["h", "v", "meeting-grant", "speech-revision"],
+        &["handoff-to", "handoff-type", "handoff-reason"],
+        &["p"],
+    )?;
+    validate_speech_mentions(event)?;
+    if event.content.trim().is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: meeting speech content is required".into(),
+        ));
+    }
+    let handoff_to = optional_pubkey_tag(event, "handoff-to")?;
+    let handoff_type = optional_single_tag(event, "handoff-type")?;
+    let handoff_reason = optional_single_tag(event, "handoff-reason")?;
+    let handoff = match (handoff_to, handoff_type, handoff_reason) {
+        (None, None, None) => None,
+        (Some(to_pubkey), Some(reason_type), Some(reason_text)) => {
+            if !HANDOFF_TYPES.contains(&reason_type.as_str()) {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: unsupported Handoff type {reason_type}"
+                )));
+            }
+            Some(BatonHandoffInput {
+                to_pubkey,
+                reason_type,
+                reason_text: required_text(
+                    &reason_text,
+                    MAX_HANDOFF_REASON_BYTES,
+                    "Handoff reason",
+                )?,
+            })
+        }
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: handoff-to, handoff-type, and handoff-reason must appear together".into(),
+            ));
+        }
+    };
+    Ok((
+        parse_v1_session(event)?,
+        BatonCommand::Speech {
+            grant_id: event_id_tag(event, "meeting-grant")?,
+            speech_revision: parse_positive_i64_tag(event, "speech-revision")?,
+            handoff,
+        },
+    ))
+}
+
+fn parse_v1_session(event: &Event) -> Result<Uuid, IngestError> {
+    if require_single_tag(event, "v")? != V1_SCHEMA_VERSION {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting V1 command must use v=2".into(),
+        ));
+    }
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if session_id.is_nil() {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting V1 session id must not be nil".into(),
+        ));
+    }
+    Ok(session_id)
+}
+
+fn validate_speech_mentions(event: &Event) -> Result<(), IngestError> {
+    let mut mentions = HashSet::new();
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.first().map(String::as_str) != Some("p") {
+            continue;
+        }
+        let Some(value) = parts.get(1) else {
+            return Err(IngestError::Rejected(
+                "invalid: meeting p tag must contain a participant pubkey".into(),
+            ));
+        };
+        let mention = decode_pubkey(value, "meeting mention")?;
+        if !mentions.insert(mention) {
+            return Err(IngestError::Rejected(
+                "invalid: Meeting V1 speech cannot mention the same participant twice".into(),
+            ));
+        }
+    }
+    if mentions.len() > MAX_MEETING_PARTICIPANTS {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Meeting V1 speech cannot mention more than {MAX_MEETING_PARTICIPANTS} participants"
+        )));
+    }
+    Ok(())
+}
+
+fn event_id_tag(event: &Event, tag_name: &str) -> Result<Vec<u8>, IngestError> {
+    decode_event_id(
+        &require_single_tag(event, tag_name)?,
+        &format!("{tag_name} event id"),
+    )
+}
+
+fn optional_event_id_tag(event: &Event, tag_name: &str) -> Result<Option<Vec<u8>>, IngestError> {
+    optional_single_tag(event, tag_name)?
+        .map(|value| decode_event_id(&value, &format!("{tag_name} event id")))
+        .transpose()
+}
+
+fn pubkey_tag(event: &Event, tag_name: &str) -> Result<Vec<u8>, IngestError> {
+    decode_pubkey(&require_single_tag(event, tag_name)?, tag_name)
+}
+
+fn optional_pubkey_tag(event: &Event, tag_name: &str) -> Result<Option<Vec<u8>>, IngestError> {
+    optional_single_tag(event, tag_name)?
+        .map(|value| decode_pubkey(&value, tag_name))
+        .transpose()
+}
+
+fn decode_pubkey(value: &str, field_name: &str) -> Result<Vec<u8>, IngestError> {
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field_name} must be a 64-character pubkey"
+        )));
+    }
+    hex::decode(value).map_err(|_| IngestError::Rejected(format!("invalid: bad {field_name} hex")))
+}
+
+fn parse_nonnegative_i64_tag(event: &Event, tag_name: &str) -> Result<i64, IngestError> {
+    let value = require_single_tag(event, tag_name)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {tag_name} must be a non-negative decimal integer"
+        )));
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| {
+            IngestError::Rejected(format!(
+                "invalid: {tag_name} must be a non-negative integer"
+            ))
+        })
+}
+
+fn parse_positive_i64_tag(event: &Event, tag_name: &str) -> Result<i64, IngestError> {
+    let value = require_single_tag(event, tag_name)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {tag_name} must be a positive decimal integer"
+        )));
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            IngestError::Rejected(format!("invalid: {tag_name} must be a positive integer"))
+        })
+}
+
+fn parse_nonnegative_i32_tag(event: &Event, tag_name: &str) -> Result<i32, IngestError> {
+    let value = require_single_tag(event, tag_name)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {tag_name} must be a non-negative decimal integer"
+        )));
+    }
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| {
+            IngestError::Rejected(format!(
+                "invalid: {tag_name} must be a non-negative integer"
+            ))
+        })
+}
+
+fn optional_nonnegative_i32_tag(event: &Event, tag_name: &str) -> Result<Option<i32>, IngestError> {
+    optional_single_tag(event, tag_name)?
+        .map(|value| {
+            if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: {tag_name} must be a non-negative decimal integer"
+                )));
+            }
+            value
+                .parse::<i32>()
+                .ok()
+                .filter(|number| *number >= 0)
+                .ok_or_else(|| {
+                    IngestError::Rejected(format!(
+                        "invalid: {tag_name} must be a non-negative integer"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+fn parse_progress_stage(event: &Event) -> Result<BatonProgressStage, IngestError> {
+    match require_single_tag(event, "stage")?.as_str() {
+        "context_sync" => Ok(BatonProgressStage::ContextSync),
+        "tool_use" => Ok(BatonProgressStage::ToolUse),
+        "generating" => Ok(BatonProgressStage::Generating),
+        "composing" => Ok(BatonProgressStage::Composing),
+        "submitting" => Ok(BatonProgressStage::Submitting),
+        stage => Err(IngestError::Rejected(format!(
+            "invalid: unsupported Grant Progress stage {stage}"
+        ))),
+    }
+}
+
+fn closed_value_tag(
+    event: &Event,
+    tag_name: &str,
+    allowed: &[&str],
+    field_name: &str,
+) -> Result<String, IngestError> {
+    let value = require_single_tag(event, tag_name)?;
+    if !allowed.contains(&value.as_str()) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: unsupported {field_name} {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn optional_closed_value_tag(
+    event: &Event,
+    tag_name: &str,
+    allowed: &[&str],
+    field_name: &str,
+) -> Result<Option<String>, IngestError> {
+    optional_single_tag(event, tag_name)?
+        .map(|value| {
+            if allowed.contains(&value.as_str()) {
+                Ok(value)
+            } else {
+                Err(IngestError::Rejected(format!(
+                    "invalid: unsupported {field_name} {value}"
+                )))
+            }
+        })
+        .transpose()
+}
+
+fn required_text(value: &str, max_bytes: usize, field_name: &str) -> Result<String, IngestError> {
+    if value.is_empty() {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field_name} is required"
+        )));
+    }
+    validate_text(value, max_bytes, field_name)?;
+    Ok(value.to_string())
+}
+
+fn optional_text(
+    value: &str,
+    max_bytes: usize,
+    field_name: &str,
+) -> Result<Option<String>, IngestError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    validate_text(value, max_bytes, field_name)?;
+    Ok(Some(value.to_string()))
+}
+
+fn validate_text(value: &str, max_bytes: usize, field_name: &str) -> Result<(), IngestError> {
+    if value.trim() != value {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field_name} must not have leading or trailing whitespace"
+        )));
+    }
+    if value.len() > max_bytes {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field_name} exceeds {max_bytes} UTF-8 bytes"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field_name} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn require_empty_content(event: &Event, field_name: &str) -> Result<(), IngestError> {
+    if event.content.is_empty() {
+        Ok(())
+    } else {
+        Err(IngestError::Rejected(format!(
+            "invalid: {field_name} content must be empty"
+        )))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectContent {
+    selection_reason: Option<String>,
+    deferrals: Vec<SelectDeferral>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectDeferral {
+    intent_id: String,
+    prev: String,
+    reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn signed(kind: u32, content: &str, tags: Vec<Tag>) -> Event {
+        EventBuilder::new(
+            Kind::Custom(u16::try_from(kind).expect("test kind")),
+            content,
+        )
+        .tags(tags)
+        .sign_with_keys(&Keys::generate())
+        .expect("sign test event")
+    }
+
+    fn common(session_id: Uuid, action: &str) -> Vec<Tag> {
+        vec![
+            Tag::parse(["h", &session_id.to_string()]).expect("h"),
+            Tag::parse(["v", "2"]).expect("v"),
+            Tag::parse(["action", action]).expect("action"),
+        ]
+    }
+
+    #[test]
+    fn intent_submit_parses_strict_shape() {
+        let session_id = Uuid::new_v4();
+        let mut tags = common(session_id, "submit");
+        tags.push(Tag::parse(["basis-speech-revision", "0"]).expect("basis"));
+        let event = signed(KIND_MEETING_SPEECH_INTENT, "I have evidence", tags);
+        let (parsed_session, command) = parse_control_command(&event).expect("parse");
+        assert_eq!(parsed_session, session_id);
+        assert!(matches!(
+            command,
+            BatonCommand::IntentSubmit {
+                basis_speech_revision: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sdk_baton_builders_parse_at_the_relay_boundary() {
+        let session_id = Uuid::new_v4();
+        let intent = "aa".repeat(32);
+        let previous = "ab".repeat(32);
+        let handoff = "ac".repeat(32);
+        let offer = "ad".repeat(32);
+        let grant = "ae".repeat(32);
+        let participant = "bb".repeat(32);
+        let commands = vec![
+            buzz_sdk::build_meeting_v1_intent_submit(buzz_sdk::MeetingV1IntentSubmitParams {
+                session_id,
+                basis_speech_revision: 0,
+                addressed_to: Some(&participant),
+                summary: "I can explain the risk.",
+            }),
+            buzz_sdk::build_meeting_v1_intent_refresh(buzz_sdk::MeetingV1IntentRefreshParams {
+                session_id,
+                intent_id: &intent,
+                previous_event_id: &previous,
+                basis_speech_revision: 1,
+                addressed_to: None,
+                summary: "I can explain the updated risk.",
+            }),
+            buzz_sdk::build_meeting_v1_intent_withdraw(buzz_sdk::MeetingV1IntentWithdrawParams {
+                session_id,
+                intent_id: &intent,
+                previous_event_id: &previous,
+            }),
+            buzz_sdk::build_meeting_v1_moderator_select(buzz_sdk::MeetingV1ModeratorSelectParams {
+                session_id,
+                selection: buzz_sdk::MeetingV1Selection::Intent { intent_id: &intent },
+                expected_control_epoch: 1,
+                expected_decision_epoch: 0,
+                expected_intent_revision: 0,
+                expected_speech_revision: 0,
+                selection_reason: Some("Relevant."),
+                deferrals: &[],
+            }),
+            buzz_sdk::build_meeting_v1_moderator_select(buzz_sdk::MeetingV1ModeratorSelectParams {
+                session_id,
+                selection: buzz_sdk::MeetingV1Selection::Handoff {
+                    handoff_id: &handoff,
+                    expected_attempt_count: 0,
+                },
+                expected_control_epoch: 1,
+                expected_decision_epoch: 0,
+                expected_intent_revision: 0,
+                expected_speech_revision: 0,
+                selection_reason: None,
+                deferrals: &[],
+            }),
+            buzz_sdk::build_meeting_v1_moderator_reject(buzz_sdk::MeetingV1ModeratorRejectParams {
+                session_id,
+                intent_id: &intent,
+                previous_event_id: &previous,
+                intent_author_pubkey: &participant,
+                reason_code: buzz_sdk::MeetingV1IntentRejectionReason::Duplicate,
+                reason_text: "Already covered.",
+            }),
+            buzz_sdk::build_meeting_v1_moderator_dismiss_handoff(
+                buzz_sdk::MeetingV1ModeratorDismissHandoffParams {
+                    session_id,
+                    handoff_id: &handoff,
+                    expected_speech_revision: 0,
+                    expected_attempt_count: 0,
+                    reason_code: buzz_sdk::MeetingV1HandoffDismissReason::AnsweredElsewhere,
+                    reason_text: "Already answered.",
+                },
+            ),
+            buzz_sdk::build_meeting_v1_moderator_recall(buzz_sdk::MeetingV1ModeratorRecallParams {
+                session_id,
+                control_epoch: 1,
+                reason: Some("Agenda check."),
+            }),
+            buzz_sdk::build_meeting_v1_human_floor_request(
+                buzz_sdk::MeetingV1HumanFloorRequestParams { session_id },
+            ),
+            buzz_sdk::build_meeting_v1_human_floor_withdraw(
+                buzz_sdk::MeetingV1HumanFloorWithdrawParams {
+                    session_id,
+                    request_id: &previous,
+                },
+            ),
+            buzz_sdk::build_meeting_v1_offer_ack(buzz_sdk::MeetingV1OfferAckParams {
+                session_id,
+                offer_id: &offer,
+            }),
+            buzz_sdk::build_meeting_v1_offer_decline(buzz_sdk::MeetingV1OfferDeclineParams {
+                session_id,
+                offer_id: &offer,
+                reason: Some("Unavailable."),
+            }),
+            buzz_sdk::build_meeting_v1_grant_progress(buzz_sdk::MeetingV1GrantProgressParams {
+                session_id,
+                grant_id: &grant,
+                progress_seq: 1,
+                stage: buzz_sdk::MeetingV1ProgressStage::ToolUse,
+            }),
+            buzz_sdk::build_meeting_v1_grant_yield(buzz_sdk::MeetingV1GrantYieldParams {
+                session_id,
+                grant_id: &grant,
+                reason_code: Some(buzz_sdk::MeetingV1GrantYieldReason::InsufficientContext),
+                reason: Some("Context unavailable."),
+            }),
+        ];
+        let keys = Keys::generate();
+        for builder in commands {
+            let event = builder
+                .expect("valid SDK builder")
+                .sign_with_keys(&keys)
+                .expect("sign SDK event");
+            parse_control_command(&event).expect("Relay must accept SDK command");
+        }
+
+        let speech = buzz_sdk::build_meeting_v1_speech(buzz_sdk::MeetingV1SpeechParams {
+            session_id,
+            grant_id: &grant,
+            speech_revision: 1,
+            content: "The risk is contained.",
+            mentions: &[&participant],
+            handoff: Some(buzz_sdk::MeetingV1DirectedHandoff {
+                target_pubkey: &participant,
+                handoff_type: buzz_sdk::MeetingV1HandoffType::Review,
+                reason: "Please verify.",
+            }),
+        })
+        .expect("valid SDK speech")
+        .sign_with_keys(&keys)
+        .expect("sign SDK speech");
+        parse_speech(&speech).expect("Relay must accept SDK speech");
+    }
+
+    #[test]
+    fn select_requires_exactly_one_source_and_deferrals_array() {
+        let session_id = Uuid::new_v4();
+        let mut tags = common(session_id, "select");
+        for (name, value) in [
+            ("expected-control-epoch", "0"),
+            ("expected-decision-epoch", "0"),
+            ("expected-intent-revision", "0"),
+            ("expected-speech-revision", "0"),
+        ] {
+            tags.push(Tag::parse([name, value]).expect("revision"));
+        }
+        let event = signed(KIND_MEETING_MODERATOR_COMMAND, r#"{"deferrals":[]}"#, tags);
+        assert!(parse_control_command(&event).is_err());
+    }
+
+    #[test]
+    fn select_requires_positive_control_epoch() {
+        let session_id = Uuid::new_v4();
+        let mut tags = common(session_id, "select");
+        tags.push(Tag::parse(["intent", &"55".repeat(32)]).expect("intent"));
+        for (name, value) in [
+            ("expected-control-epoch", "0"),
+            ("expected-decision-epoch", "0"),
+            ("expected-intent-revision", "0"),
+            ("expected-speech-revision", "0"),
+        ] {
+            tags.push(Tag::parse([name, value]).expect("revision"));
+        }
+        let event = signed(KIND_MEETING_MODERATOR_COMMAND, r#"{"deferrals":[]}"#, tags);
+        assert!(parse_control_command(&event).is_err());
+    }
+
+    #[test]
+    fn select_rejects_deferrals_incompatible_with_its_source() {
+        let session_id = Uuid::new_v4();
+        let selected = "55".repeat(32);
+        let previous = "66".repeat(32);
+
+        let mut intent_tags = common(session_id, "select");
+        intent_tags.push(Tag::parse(["intent", &selected]).expect("intent"));
+        for (name, value) in [
+            ("expected-control-epoch", "1"),
+            ("expected-decision-epoch", "0"),
+            ("expected-intent-revision", "0"),
+            ("expected-speech-revision", "0"),
+        ] {
+            intent_tags.push(Tag::parse([name, value]).expect("revision"));
+        }
+        let self_deferral = serde_json::json!({
+            "deferrals": [{
+                "intent_id": selected,
+                "prev": previous,
+                "reason": "Later."
+            }]
+        })
+        .to_string();
+        let event = signed(KIND_MEETING_MODERATOR_COMMAND, &self_deferral, intent_tags);
+        assert!(parse_control_command(&event).is_err());
+
+        let mut handoff_tags = common(session_id, "select");
+        handoff_tags.extend([
+            Tag::parse(["handoff", &"77".repeat(32)]).expect("handoff"),
+            Tag::parse(["expected-handoff-attempt-count", "0"]).expect("attempt"),
+        ]);
+        for (name, value) in [
+            ("expected-control-epoch", "1"),
+            ("expected-decision-epoch", "0"),
+            ("expected-intent-revision", "0"),
+            ("expected-speech-revision", "0"),
+        ] {
+            handoff_tags.push(Tag::parse([name, value]).expect("revision"));
+        }
+        let handoff_deferral = serde_json::json!({
+            "deferrals": [{
+                "intent_id": "88".repeat(32),
+                "prev": "99".repeat(32),
+                "reason": "Later."
+            }]
+        })
+        .to_string();
+        let event = signed(
+            KIND_MEETING_MODERATOR_COMMAND,
+            &handoff_deferral,
+            handoff_tags,
+        );
+        assert!(parse_control_command(&event).is_err());
+    }
+
+    #[test]
+    fn commands_reject_nil_session_ids() {
+        let mut tags = common(Uuid::nil(), "submit");
+        tags.push(Tag::parse(["basis-speech-revision", "0"]).expect("basis"));
+        let event = signed(KIND_MEETING_SPEECH_INTENT, "I have evidence", tags);
+        assert!(parse_control_command(&event).is_err());
+    }
+
+    #[test]
+    fn progress_uses_frozen_stage_vocabulary() {
+        let session_id = Uuid::new_v4();
+        let grant = "11".repeat(32);
+        let mut tags = common(session_id, "progress");
+        tags.extend([
+            Tag::parse(["meeting-grant", &grant]).expect("grant"),
+            Tag::parse(["progress-seq", "1"]).expect("sequence"),
+            Tag::parse(["stage", "planning"]).expect("old stage"),
+        ]);
+        let event = signed(KIND_MEETING_GRANT_SIGNAL, "", tags);
+        assert!(parse_control_command(&event).is_err());
+    }
+
+    #[test]
+    fn directed_handoff_is_all_or_none() {
+        let session_id = Uuid::new_v4();
+        let event = signed(
+            9,
+            "Can you verify this?",
+            vec![
+                Tag::parse(["h", &session_id.to_string()]).expect("h"),
+                Tag::parse(["v", "2"]).expect("v"),
+                Tag::parse(["meeting-grant", &"22".repeat(32)]).expect("grant"),
+                Tag::parse(["speech-revision", "1"]).expect("revision"),
+                Tag::parse(["handoff-to", &"33".repeat(32)]).expect("target"),
+            ],
+        );
+        assert!(parse_speech(&event).is_err());
+    }
+
+    #[test]
+    fn speech_mentions_are_unique_and_bounded_by_the_roster_limit() {
+        let session_id = Uuid::new_v4();
+        let base_tags = || {
+            vec![
+                Tag::parse(["h", &session_id.to_string()]).expect("h"),
+                Tag::parse(["v", "2"]).expect("v"),
+                Tag::parse(["meeting-grant", &"22".repeat(32)]).expect("grant"),
+                Tag::parse(["speech-revision", "1"]).expect("revision"),
+            ]
+        };
+
+        let duplicate = "33".repeat(32);
+        let mut duplicate_tags = base_tags();
+        duplicate_tags.extend([
+            Tag::parse(["p", &duplicate]).expect("first mention"),
+            Tag::parse(["p", &duplicate.to_ascii_uppercase()]).expect("duplicate mention"),
+        ]);
+        let event = signed(9, "Speech", duplicate_tags);
+        assert!(parse_speech(&event).is_err());
+
+        let mut excessive_tags = base_tags();
+        for index in 1..=(MAX_MEETING_PARTICIPANTS + 1) {
+            let mention = format!("{index:064x}");
+            excessive_tags.push(Tag::parse(["p", mention.as_str()]).expect("mention"));
+        }
+        let event = signed(9, "Speech", excessive_tags);
+        assert!(parse_speech(&event).is_err());
+    }
+
+    #[test]
+    fn yield_reason_code_is_closed() {
+        let session_id = Uuid::new_v4();
+        let mut tags = common(session_id, "yield");
+        tags.extend([
+            Tag::parse(["meeting-grant", &"44".repeat(32)]).expect("grant"),
+            Tag::parse(["reason-code", "anything"]).expect("reason code"),
+        ]);
+        let event = signed(KIND_MEETING_GRANT_SIGNAL, "", tags);
+        assert!(parse_control_command(&event).is_err());
+    }
+}

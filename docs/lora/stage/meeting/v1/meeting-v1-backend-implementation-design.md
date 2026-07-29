@@ -1,6 +1,6 @@
 # Meeting V1 后端实现设计
 
-> 状态：后端实现设计 V1；阶段一已交付，阶段二待实施
+> 状态：后端实现设计 V1；阶段一、阶段二已交付，阶段三待实施
 >
 > 前置概念设计：[Meeting V1：主持式发言权接力协议](./meeting-v1.md)
 >
@@ -564,7 +564,9 @@ min(database_now + soft_lease, hard_deadline)
 tags:
   ["action", "yield"]
   ["meeting-grant", "<grant_id>"]
-  optional ["reason-code", "<enum>"]
+  optional ["reason-code", "no_longer_needed" | "unable_to_answer" |
+                           "insufficient_context" | "tool_failure" |
+                           "cancelled"]
 
 content:
   optional short reason
@@ -978,8 +980,8 @@ domain revision 继续表达 speech/intent/floor 各自是否变化，但不再�
 
 ## 8. 数据库设计
 
-下一条迁移预计为 `0029_meeting_v1_baton.sql`，实际开发时以仓库中的最新迁移号为准。
-迁移必须是 additive，不删除 V0 数据和约束语义。
+阶段一使用 `0029_meeting_v1_baton.sql`，阶段二使用
+`0030_meeting_v1_stage2.sql`。迁移保持 additive，不删除 V0 数据和约束语义。
 
 下文子表字段清单为主要字段；除非特别说明，每张表都包含
 `community_id, session_id`，并以复合外键指向 `meeting_sessions`。pubkey、event ID 和
@@ -993,12 +995,17 @@ Intent/Request/Offer/Grant 使用 partial unique index 约束各自唯一槽位�
 - `schema_version` 允许 `1 | 2`；
 - `floor_policy_version` 允许 `uniform-v0 | moderated-baton-v1`；
 - `moderator_pubkey BYTEA NULL`，V1 必填；
+- `security_order BIGINT` 从全局 `meeting_security_order_seq` 分配；
 - 原有 `host_pubkey` 保持“创建者/Channel Owner”语义；
 - shape constraint 保证 V0 行没有被错误解释为 V1。
 
 V0 的 `current_round` 和 `floor_revision` 继续保留，但只由 `uniform-v0` 读取。V1 不以
 round 作为调度主键，也不把三种 V1 revision 镜像到 `meeting_sessions`；
 `meeting_baton_state` 是 V1 current revision 的唯一数据库权威，避免跨表漂移。
+
+`security_order` 不是业务 revision，而是 Meeting Create 与安全撤权共享的数据库因果序。
+Create 和撤权事务先通过同一组身份行锁线性化，再分别为 Session 或 revocation job 取得
+下一个序号。它避免使用事务开始时间或同一微秒的 wall-clock 时间猜测“旧会议/新会议”。
 
 ### 8.2 `meeting_participants`
 
@@ -1401,6 +1408,7 @@ job_id
 community_id
 revoked_pubkey
 revocation_event_id
+security_order
 state: pending | running | completed
 cursor_session_id
 attempts
@@ -1409,8 +1417,10 @@ last_error
 created_at, completed_at
 ```
 
-`revocation_event_id` 唯一。每场目标 Session 的 End 本身幂等，worker 可以在崩溃后从头
-枚举或从 cursor 继续；不能把 NIP-IA archive 写入此队列。
+`revocation_event_id` 唯一。只有
+`job.security_order > session.security_order` 时，该 job 才永久作用于该 Session；
+恢复身份后创建的新 Session 不继承旧撤权。每场目标 Session 的 End 本身幂等，worker
+可以在崩溃后从头枚举或从 cursor 继续；不能把 NIP-IA archive 写入此队列。
 
 ### 8.15 Outbox
 
@@ -1740,6 +1750,10 @@ V1 固定名单中的任一身份发生 security revocation 时，会议整体�
 任意 Meeting 写事务也执行轻量 roster security check；若发现尚未被 worker 处理的撤权，
 它先提交同一终止迁移，再拒绝原命令，形成 lazy recovery。这样 job 延迟不会让已撤权者
 恢复访问，也不会让其他写操作长期延续无效名单。
+
+历史读取和 live fan-out 不把冻结名单或 Channel membership cache 当成持续授权。它们先
+检查当前主体状态，再以冻结名单和 `security_order` 撤权栅栏作为最终过滤；成员被快速
+重新加入或解禁，也不能恢复对旧 Session 的读取、receipt 或实时事件。
 
 终止事务中：
 
@@ -2237,6 +2251,10 @@ Meeting 的目的仍是讨论，不是在会议内执行任务。
 
 `buzz-dev-mcp` 和 ACP tool policy 都要执行此边界，不能只依赖 prompt。
 
+同一边界也适用于 Relay 的通用 Workflow Engine：Meeting outbox 中的 speech、State 和
+控制事件只做持久化与订阅 fan-out，不作为通用 Workflow trigger。需要执行的后续工作应在
+会议之外通过显式决议/任务机制创建，不能把一条会议发言隐式解释为有副作用的任务命令。
+
 ### 14.5 Prompt 分层
 
 建议拆成三个独立 prompt，而不是在一个 prompt 中让模型自行识别阶段：
@@ -2533,7 +2551,7 @@ BUZZ_MEETING_V1_CREATE_ENABLED
 
 阶段验收不要求完整发言闭环。
 
-### 阶段二：Baton 协议闭环
+### 阶段二：Baton 协议闭环（已交付）
 
 目标：
 

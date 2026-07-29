@@ -1,0 +1,173 @@
+{
+  "fixture_version": 1,
+  "session_id": "00000000-0000-4000-8000-000000000002",
+  "ids": {
+    "intent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "previous": "abababababababababababababababababababababababababababababababab",
+    "handoff": "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac",
+    "offer": "adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+    "grant": "aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae",
+    "participant": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "intent_submit": {
+    "content": "I can explain the migration risk.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "submit"],
+      ["basis-speech-revision", "4"],
+      ["addressed-to", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+    ]
+  },
+  "intent_refresh": {
+    "content": "I can explain the rollback risk.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "refresh"],
+      ["intent", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      ["prev", "abababababababababababababababababababababababababababababababab"],
+      ["basis-speech-revision", "5"]
+    ]
+  },
+  "intent_withdraw": {
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "withdraw"],
+      ["intent", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      ["prev", "abababababababababababababababababababababababababababababababab"]
+    ]
+  },
+  "moderator_select_intent": {
+    "content": {
+      "selection_reason": "Highest-impact risk.",
+      "deferrals": []
+    },
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "select"],
+      ["intent", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      ["expected-control-epoch", "3"],
+      ["expected-decision-epoch", "5"],
+      ["expected-intent-revision", "7"],
+      ["expected-speech-revision", "4"]
+    ]
+  },
+  "moderator_select_handoff": {
+    "content": {
+      "selection_reason": null,
+      "deferrals": []
+    },
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "select"],
+      ["handoff", "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac"],
+      ["expected-handoff-attempt-count", "2"],
+      ["expected-control-epoch", "3"],
+      ["expected-decision-epoch", "5"],
+      ["expected-intent-revision", "7"],
+      ["expected-speech-revision", "4"]
+    ]
+  },
+  "moderator_reject": {
+    "content": "This duplicates the rollback discussion.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "reject"],
+      ["intent", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      ["prev", "abababababababababababababababababababababababababababababababab"],
+      ["reason-code", "duplicate"],
+      ["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+    ]
+  },
+  "moderator_dismiss_handoff": {
+    "content": "The source speech already answered it.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "dismiss-handoff"],
+      ["handoff", "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac"],
+      ["expected-speech-revision", "4"],
+      ["expected-handoff-attempt-count", "2"],
+      ["reason-code", "answered_elsewhere"]
+    ]
+  },
+  "moderator_recall": {
+    "content": "Return for an agenda check.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "recall"],
+      ["control-epoch", "3"]
+    ]
+  },
+  "human_request": {
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "request"]
+    ]
+  },
+  "human_withdraw": {
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "withdraw"],
+      ["request", "abababababababababababababababababababababababababababababababab"]
+    ]
+  },
+  "offer_ack": {
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "ack"],
+      ["meeting-offer", "adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad"]
+    ]
+  },
+  "offer_decline": {
+    "content": "I am unavailable.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "decline"],
+      ["meeting-offer", "adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad"]
+    ]
+  },
+  "grant_progress": {
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "progress"],
+      ["meeting-grant", "aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae"],
+      ["progress-seq", "3"],
+      ["stage", "tool_use"]
+    ]
+  },
+  "grant_yield": {
+    "content": "The required project view is unavailable.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["action", "yield"],
+      ["meeting-grant", "aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae"],
+      ["reason-code", "insufficient_context"]
+    ]
+  },
+  "speech": {
+    "content": "The migration is reversible.",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["meeting-grant", "aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae"],
+      ["speech-revision", "5"],
+      ["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      ["handoff-to", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      ["handoff-type", "review"],
+      ["handoff-reason", "Please validate the rollback plan."]
+    ]
+  }
+}

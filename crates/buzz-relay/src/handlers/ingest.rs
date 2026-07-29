@@ -1919,7 +1919,11 @@ async fn ingest_event_inner(
         // remove_relay_member handles both the NotFound and IsOwner cases atomically.
         let remove_result = state
             .db
-            .remove_relay_member(tenant.community(), &sender_hex)
+            .remove_relay_member_with_revocation(
+                tenant.community(),
+                &sender_hex,
+                event.id.as_bytes(),
+            )
             .await
             .map_err(|e| IngestError::Internal(format!("database error: {e}")))?;
 

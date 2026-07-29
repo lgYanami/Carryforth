@@ -11,6 +11,8 @@ use buzz_core::{
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
+        KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST,
+        KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
         KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
@@ -63,6 +65,346 @@ pub struct MeetingV1EndParams<'a> {
     pub create_event_id: &'a str,
 }
 
+/// Inputs for submitting a Meeting V1 speech intent.
+pub struct MeetingV1IntentSubmitParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Speech revision against which the summary was prepared.
+    pub basis_speech_revision: u64,
+    /// Optional participant whom the proposed contribution addresses.
+    pub addressed_to: Option<&'a str>,
+    /// One-sentence summary visible in the shared intent pool.
+    pub summary: &'a str,
+}
+
+/// Inputs for compare-and-swap refreshing a Meeting V1 speech intent.
+pub struct MeetingV1IntentRefreshParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Stable ID of the original submit event.
+    pub intent_id: &'a str,
+    /// Current canonical event ID being replaced.
+    pub previous_event_id: &'a str,
+    /// Speech revision against which the new summary was prepared.
+    pub basis_speech_revision: u64,
+    /// Optional participant whom the proposed contribution addresses.
+    pub addressed_to: Option<&'a str>,
+    /// Replacement one-sentence summary.
+    pub summary: &'a str,
+}
+
+/// Inputs for compare-and-swap withdrawing a Meeting V1 speech intent.
+pub struct MeetingV1IntentWithdrawParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Stable ID of the original submit event.
+    pub intent_id: &'a str,
+    /// Current canonical event ID being withdrawn.
+    pub previous_event_id: &'a str,
+}
+
+/// One pending intent deferred atomically by a moderator-self selection.
+pub struct MeetingV1IntentDeferral<'a> {
+    /// Stable ID of the pending intent.
+    pub intent_id: &'a str,
+    /// Current canonical event ID used as the compare-and-swap basis.
+    pub previous_event_id: &'a str,
+    /// Required human-readable explanation.
+    pub reason: &'a str,
+}
+
+/// Source selected by a Meeting V1 moderator.
+pub enum MeetingV1Selection<'a> {
+    /// Select a pending speech intent.
+    Intent {
+        /// Stable ID of the original intent submit event.
+        intent_id: &'a str,
+    },
+    /// Select an unresolved directed handoff.
+    Handoff {
+        /// Stable handoff ID, equal to its source speech event ID.
+        handoff_id: &'a str,
+        /// Current persisted attempt count used as a compare-and-swap basis.
+        expected_attempt_count: u64,
+    },
+}
+
+/// Inputs for a Meeting V1 moderator Select command.
+pub struct MeetingV1ModeratorSelectParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Intent or handoff selected by the moderator.
+    pub selection: MeetingV1Selection<'a>,
+    /// Expected current control epoch.
+    pub expected_control_epoch: u64,
+    /// Expected current decision epoch.
+    pub expected_decision_epoch: u64,
+    /// Expected current intent revision.
+    pub expected_intent_revision: u64,
+    /// Expected current speech revision.
+    pub expected_speech_revision: u64,
+    /// Optional short explanation for the selection.
+    pub selection_reason: Option<&'a str>,
+    /// Atomic deferrals; only valid when Relay confirms a moderator-self intent.
+    pub deferrals: &'a [MeetingV1IntentDeferral<'a>],
+}
+
+/// Closed reason codes for rejecting a Meeting V1 intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV1IntentRejectionReason {
+    /// The proposed contribution is outside the meeting topic.
+    OffTopic,
+    /// The proposed contribution duplicates another one.
+    Duplicate,
+    /// A newer contribution replaces this one.
+    Superseded,
+    /// The contribution cannot be supported in this meeting.
+    Unsupported,
+    /// The contribution does not fit the current agenda.
+    AgendaMismatch,
+}
+
+impl MeetingV1IntentRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OffTopic => "off_topic",
+            Self::Duplicate => "duplicate",
+            Self::Superseded => "superseded",
+            Self::Unsupported => "unsupported",
+            Self::AgendaMismatch => "agenda_mismatch",
+        }
+    }
+}
+
+/// Inputs for a Meeting V1 moderator Reject command.
+pub struct MeetingV1ModeratorRejectParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Stable ID of the pending intent.
+    pub intent_id: &'a str,
+    /// Current canonical intent event ID.
+    pub previous_event_id: &'a str,
+    /// Persisted author of the intent, used as a notification index.
+    pub intent_author_pubkey: &'a str,
+    /// Closed machine-readable reason.
+    pub reason_code: MeetingV1IntentRejectionReason,
+    /// Required human-readable explanation.
+    pub reason_text: &'a str,
+}
+
+/// Closed reason codes for dismissing a Meeting V1 handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV1HandoffDismissReason {
+    /// A newer question or request replaces this one.
+    Superseded,
+    /// The question was answered through another path.
+    AnsweredElsewhere,
+    /// The question is outside the meeting scope.
+    OutOfScope,
+    /// The answer is no longer needed.
+    NoLongerNeeded,
+}
+
+impl MeetingV1HandoffDismissReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Superseded => "superseded",
+            Self::AnsweredElsewhere => "answered_elsewhere",
+            Self::OutOfScope => "out_of_scope",
+            Self::NoLongerNeeded => "no_longer_needed",
+        }
+    }
+}
+
+/// Inputs for a Meeting V1 moderator Dismiss Handoff command.
+pub struct MeetingV1ModeratorDismissHandoffParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Stable ID of the open handoff.
+    pub handoff_id: &'a str,
+    /// Expected current speech revision.
+    pub expected_speech_revision: u64,
+    /// Expected current handoff attempt count.
+    pub expected_attempt_count: u64,
+    /// Closed machine-readable reason.
+    pub reason_code: MeetingV1HandoffDismissReason,
+    /// Required human-readable explanation.
+    pub reason_text: &'a str,
+}
+
+/// Inputs for a Meeting V1 moderator Recall command.
+pub struct MeetingV1ModeratorRecallParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Control epoch to which the recall applies.
+    pub control_epoch: u64,
+    /// Optional human-readable explanation.
+    pub reason: Option<&'a str>,
+}
+
+/// Inputs for a Meeting V1 Human Floor Request command.
+pub struct MeetingV1HumanFloorRequestParams {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+}
+
+/// Inputs for withdrawing a Meeting V1 Human Floor Request.
+pub struct MeetingV1HumanFloorWithdrawParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Stable ID of the active request event.
+    pub request_id: &'a str,
+}
+
+/// Inputs for acknowledging a Meeting V1 Offer.
+pub struct MeetingV1OfferAckParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Relay-generated active Offer ID.
+    pub offer_id: &'a str,
+}
+
+/// Inputs for declining a Meeting V1 Offer.
+pub struct MeetingV1OfferDeclineParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Relay-generated active Offer ID.
+    pub offer_id: &'a str,
+    /// Optional short explanation.
+    pub reason: Option<&'a str>,
+}
+
+/// Observable execution stages accepted by Meeting V1 Progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV1ProgressStage {
+    /// Synchronizing context needed for the turn.
+    ContextSync,
+    /// Calling an allowed tool.
+    ToolUse,
+    /// Generating a response.
+    Generating,
+    /// A Human is composing input.
+    Composing,
+    /// Submitting the signed speech event.
+    Submitting,
+}
+
+impl MeetingV1ProgressStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextSync => "context_sync",
+            Self::ToolUse => "tool_use",
+            Self::Generating => "generating",
+            Self::Composing => "composing",
+            Self::Submitting => "submitting",
+        }
+    }
+}
+
+/// Inputs for a Meeting V1 Grant Progress signal.
+pub struct MeetingV1GrantProgressParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Relay-generated active Grant ID.
+    pub grant_id: &'a str,
+    /// Strictly increasing sequence number for this Grant.
+    pub progress_seq: u64,
+    /// Observable local execution stage.
+    pub stage: MeetingV1ProgressStage,
+}
+
+/// Closed reason codes accepted by Meeting V1 Grant Yield.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV1GrantYieldReason {
+    /// The turn is no longer needed.
+    NoLongerNeeded,
+    /// The holder cannot provide a useful answer.
+    UnableToAnswer,
+    /// Required context is unavailable.
+    InsufficientContext,
+    /// An allowed tool failed.
+    ToolFailure,
+    /// The holder explicitly cancelled the turn.
+    Cancelled,
+}
+
+impl MeetingV1GrantYieldReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoLongerNeeded => "no_longer_needed",
+            Self::UnableToAnswer => "unable_to_answer",
+            Self::InsufficientContext => "insufficient_context",
+            Self::ToolFailure => "tool_failure",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Inputs for a Meeting V1 Grant Yield signal.
+pub struct MeetingV1GrantYieldParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Relay-generated active Grant ID.
+    pub grant_id: &'a str,
+    /// Optional closed machine-readable reason.
+    pub reason_code: Option<MeetingV1GrantYieldReason>,
+    /// Optional short human-readable explanation.
+    pub reason: Option<&'a str>,
+}
+
+/// Directed handoff types carried atomically by a Meeting V1 speech.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV1HandoffType {
+    /// Ask the target a question.
+    Question,
+    /// Ask the target to provide information.
+    InformationRequest,
+    /// Ask the target to clarify a point.
+    Clarification,
+    /// Ask the target to review something.
+    Review,
+    /// Explicitly request a response from the target.
+    ResponseRequested,
+}
+
+impl MeetingV1HandoffType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::InformationRequest => "information_request",
+            Self::Clarification => "clarification",
+            Self::Review => "review",
+            Self::ResponseRequested => "response_requested",
+        }
+    }
+}
+
+/// Optional directed handoff attached atomically to Meeting V1 speech.
+pub struct MeetingV1DirectedHandoff<'a> {
+    /// Another frozen participant who should receive the next Offer.
+    pub target_pubkey: &'a str,
+    /// Semantic type of the handoff.
+    pub handoff_type: MeetingV1HandoffType,
+    /// Required explanation shown to the target.
+    pub reason: &'a str,
+}
+
+/// Inputs for a Grant-bound Meeting V1 speech.
+pub struct MeetingV1SpeechParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Relay-generated active Grant ID.
+    pub grant_id: &'a str,
+    /// Exactly the current speech revision plus one.
+    pub speech_revision: u64,
+    /// Non-empty speech content.
+    pub content: &'a str,
+    /// Mentioned participant pubkeys.
+    pub mentions: &'a [&'a str],
+    /// Optional atomic directed handoff.
+    pub handoff: Option<MeetingV1DirectedHandoff<'a>>,
+}
+
 /// Parse a tag slice, mapping errors to `SdkError::InvalidTag`.
 fn tag(parts: &[&str]) -> Result<Tag, SdkError> {
     Tag::parse(parts.iter().copied()).map_err(|e| SdkError::InvalidTag(e.to_string()))
@@ -110,6 +452,70 @@ fn check_pubkey_hex(s: &str, field: &str) -> Result<String, SdkError> {
         )));
     }
     Ok(s.to_ascii_lowercase())
+}
+
+fn check_meeting_v1_session(session_id: Uuid) -> Result<(), SdkError> {
+    if session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_meeting_v1_text<'a>(
+    value: &'a str,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str, SdkError> {
+    if value.is_empty() || value.len() > max_bytes {
+        return Err(SdkError::InvalidInput(format!(
+            "{field} must be 1-{max_bytes} bytes"
+        )));
+    }
+    if value.trim() != value || value.chars().any(char::is_control) {
+        return Err(SdkError::InvalidInput(format!(
+            "{field} must not have surrounding whitespace or control characters"
+        )));
+    }
+    Ok(value)
+}
+
+fn check_meeting_v1_optional_text<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<Option<&'a str>, SdkError> {
+    value
+        .map(|value| check_meeting_v1_text(value, field, max_bytes))
+        .transpose()
+}
+
+fn check_meeting_v1_i64(value: u64, field: &str) -> Result<(), SdkError> {
+    if value > i64::MAX as u64 {
+        return Err(SdkError::InvalidInput(format!(
+            "{field} exceeds the signed 64-bit wire range"
+        )));
+    }
+    Ok(())
+}
+
+fn check_meeting_v1_i32(value: u64, field: &str) -> Result<(), SdkError> {
+    if value > i32::MAX as u64 {
+        return Err(SdkError::InvalidInput(format!(
+            "{field} exceeds the signed 32-bit wire range"
+        )));
+    }
+    Ok(())
+}
+
+fn meeting_v1_command_tags(session_id: Uuid, action: &str) -> Result<Vec<Tag>, SdkError> {
+    check_meeting_v1_session(session_id)?;
+    Ok(vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["v", MEETING_V1_SCHEMA_VERSION])?,
+        tag(&["action", action])?,
+    ])
 }
 
 /// Validate an exact-length hex string (event ids), returning it lowercased.
@@ -1779,6 +2185,359 @@ pub fn build_meeting_v1_end(params: MeetingV1EndParams<'_>) -> Result<EventBuild
         tag(&["reason", "manual"])?,
     ];
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 speech-intent Submit command (kind 42105).
+pub fn build_meeting_v1_intent_submit(
+    params: MeetingV1IntentSubmitParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_i64(params.basis_speech_revision, "basis speech revision")?;
+    let summary = check_meeting_v1_text(params.summary, "meeting intent summary", 512)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "submit")?;
+    tags.push(tag(&[
+        "basis-speech-revision",
+        &params.basis_speech_revision.to_string(),
+    ])?);
+    if let Some(addressed_to) = params.addressed_to {
+        let addressed_to = check_pubkey_hex(addressed_to, "addressed-to pubkey")?;
+        tags.push(tag(&["addressed-to", &addressed_to])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_SPEECH_INTENT as u16), summary).tags(tags))
+}
+
+/// Build a Meeting V1 speech-intent Refresh command (kind 42105).
+pub fn build_meeting_v1_intent_refresh(
+    params: MeetingV1IntentRefreshParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_i64(params.basis_speech_revision, "basis speech revision")?;
+    let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
+    let previous_event_id =
+        check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
+    let summary = check_meeting_v1_text(params.summary, "meeting intent summary", 512)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "refresh")?;
+    tags.push(tag(&["intent", &intent_id])?);
+    tags.push(tag(&["prev", &previous_event_id])?);
+    tags.push(tag(&[
+        "basis-speech-revision",
+        &params.basis_speech_revision.to_string(),
+    ])?);
+    if let Some(addressed_to) = params.addressed_to {
+        let addressed_to = check_pubkey_hex(addressed_to, "addressed-to pubkey")?;
+        tags.push(tag(&["addressed-to", &addressed_to])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_SPEECH_INTENT as u16), summary).tags(tags))
+}
+
+/// Build a Meeting V1 speech-intent Withdraw command (kind 42105).
+pub fn build_meeting_v1_intent_withdraw(
+    params: MeetingV1IntentWithdrawParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
+    let previous_event_id =
+        check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "withdraw")?;
+    tags.push(tag(&["intent", &intent_id])?);
+    tags.push(tag(&["prev", &previous_event_id])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_SPEECH_INTENT as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 moderator Select command (kind 42106).
+pub fn build_meeting_v1_moderator_select(
+    params: MeetingV1ModeratorSelectParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.expected_control_epoch == 0 {
+        return Err(SdkError::InvalidInput(
+            "expected control epoch must be positive".into(),
+        ));
+    }
+    for (value, field) in [
+        (params.expected_control_epoch, "expected control epoch"),
+        (params.expected_decision_epoch, "expected decision epoch"),
+        (params.expected_intent_revision, "expected intent revision"),
+        (params.expected_speech_revision, "expected speech revision"),
+    ] {
+        check_meeting_v1_i64(value, field)?;
+    }
+    let selection_reason =
+        check_meeting_v1_optional_text(params.selection_reason, "selection reason", 512)?;
+    if params.deferrals.len() > 12 {
+        return Err(SdkError::InvalidInput(
+            "meeting Select cannot defer more than 12 intents".into(),
+        ));
+    }
+    let mut tags = meeting_v1_command_tags(params.session_id, "select")?;
+    let selected_intent_id = match params.selection {
+        MeetingV1Selection::Intent { intent_id } => {
+            let intent_id = check_hex_exact(intent_id, 64, "meeting intent id")?;
+            tags.push(tag(&["intent", &intent_id])?);
+            Some(intent_id)
+        }
+        MeetingV1Selection::Handoff {
+            handoff_id,
+            expected_attempt_count,
+        } => {
+            check_meeting_v1_i32(expected_attempt_count, "expected handoff attempt count")?;
+            if !params.deferrals.is_empty() {
+                return Err(SdkError::InvalidInput(
+                    "handoff selection cannot carry intent deferrals".into(),
+                ));
+            }
+            let handoff_id = check_hex_exact(handoff_id, 64, "meeting handoff id")?;
+            tags.push(tag(&["handoff", &handoff_id])?);
+            tags.push(tag(&[
+                "expected-handoff-attempt-count",
+                &expected_attempt_count.to_string(),
+            ])?);
+            None
+        }
+    };
+    tags.push(tag(&[
+        "expected-control-epoch",
+        &params.expected_control_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-decision-epoch",
+        &params.expected_decision_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-intent-revision",
+        &params.expected_intent_revision.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-speech-revision",
+        &params.expected_speech_revision.to_string(),
+    ])?);
+
+    let mut seen = std::collections::HashSet::with_capacity(params.deferrals.len());
+    let mut deferrals = Vec::with_capacity(params.deferrals.len());
+    for deferral in params.deferrals {
+        let intent_id = check_hex_exact(deferral.intent_id, 64, "deferred intent id")?;
+        if selected_intent_id.as_deref() == Some(intent_id.as_str()) {
+            return Err(SdkError::InvalidInput(
+                "selected intent cannot defer itself".into(),
+            ));
+        }
+        if !seen.insert(intent_id.clone()) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate deferred intent: {intent_id}"
+            )));
+        }
+        let previous_event_id = check_hex_exact(
+            deferral.previous_event_id,
+            64,
+            "deferred intent prev event id",
+        )?;
+        let reason = check_meeting_v1_text(deferral.reason, "deferral reason", 1024)?;
+        deferrals.push(serde_json::json!({
+            "intent_id": intent_id,
+            "prev": previous_event_id,
+            "reason": reason,
+        }));
+    }
+    let content = serde_json::to_string(&serde_json::json!({
+        "selection_reason": selection_reason,
+        "deferrals": deferrals,
+    }))
+    .map_err(|error| SdkError::InvalidInput(format!("invalid moderator selection: {error}")))?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), content).tags(tags))
+}
+
+/// Build a Meeting V1 moderator Reject command (kind 42106).
+pub fn build_meeting_v1_moderator_reject(
+    params: MeetingV1ModeratorRejectParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
+    let previous_event_id =
+        check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
+    let author = check_pubkey_hex(params.intent_author_pubkey, "intent author pubkey")?;
+    let reason_text = check_meeting_v1_text(params.reason_text, "intent rejection reason", 1024)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "reject")?;
+    tags.push(tag(&["intent", &intent_id])?);
+    tags.push(tag(&["prev", &previous_event_id])?);
+    tags.push(tag(&["reason-code", params.reason_code.as_str()])?);
+    tags.push(tag(&["p", &author])?);
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16),
+        reason_text,
+    )
+    .tags(tags))
+}
+
+/// Build a Meeting V1 moderator Dismiss Handoff command (kind 42106).
+pub fn build_meeting_v1_moderator_dismiss_handoff(
+    params: MeetingV1ModeratorDismissHandoffParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_i64(params.expected_speech_revision, "expected speech revision")?;
+    check_meeting_v1_i32(
+        params.expected_attempt_count,
+        "expected handoff attempt count",
+    )?;
+    let handoff_id = check_hex_exact(params.handoff_id, 64, "meeting handoff id")?;
+    let reason_text = check_meeting_v1_text(params.reason_text, "handoff dismiss reason", 1024)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "dismiss-handoff")?;
+    tags.push(tag(&["handoff", &handoff_id])?);
+    tags.push(tag(&[
+        "expected-speech-revision",
+        &params.expected_speech_revision.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-handoff-attempt-count",
+        &params.expected_attempt_count.to_string(),
+    ])?);
+    tags.push(tag(&["reason-code", params.reason_code.as_str()])?);
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16),
+        reason_text,
+    )
+    .tags(tags))
+}
+
+/// Build a Meeting V1 moderator Recall command (kind 42106).
+pub fn build_meeting_v1_moderator_recall(
+    params: MeetingV1ModeratorRecallParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.control_epoch == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting control epoch must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.control_epoch, "meeting control epoch")?;
+    let reason = check_meeting_v1_optional_text(params.reason, "recall reason", 1024)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "recall")?;
+    tags.push(tag(&["control-epoch", &params.control_epoch.to_string()])?);
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16),
+        reason.unwrap_or(""),
+    )
+    .tags(tags))
+}
+
+/// Build a Meeting V1 Human Floor Request command (kind 42107).
+pub fn build_meeting_v1_human_floor_request(
+    params: MeetingV1HumanFloorRequestParams,
+) -> Result<EventBuilder, SdkError> {
+    let tags = meeting_v1_command_tags(params.session_id, "request")?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_HUMAN_FLOOR_REQUEST as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 Human Floor Request Withdraw command (kind 42107).
+pub fn build_meeting_v1_human_floor_withdraw(
+    params: MeetingV1HumanFloorWithdrawParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let request_id = check_hex_exact(params.request_id, 64, "human floor request id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "withdraw")?;
+    tags.push(tag(&["request", &request_id])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_HUMAN_FLOOR_REQUEST as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 Offer ACK command (kind 42108).
+pub fn build_meeting_v1_offer_ack(
+    params: MeetingV1OfferAckParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let offer_id = check_hex_exact(params.offer_id, 64, "meeting offer id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "ack")?;
+    tags.push(tag(&["meeting-offer", &offer_id])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_OFFER_RESPONSE as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 Offer Decline command (kind 42108).
+pub fn build_meeting_v1_offer_decline(
+    params: MeetingV1OfferDeclineParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let offer_id = check_hex_exact(params.offer_id, 64, "meeting offer id")?;
+    let reason = check_meeting_v1_optional_text(params.reason, "offer decline reason", 512)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "decline")?;
+    tags.push(tag(&["meeting-offer", &offer_id])?);
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_MEETING_OFFER_RESPONSE as u16),
+        reason.unwrap_or(""),
+    )
+    .tags(tags))
+}
+
+/// Build a Meeting V1 Grant Progress signal (kind 42109).
+pub fn build_meeting_v1_grant_progress(
+    params: MeetingV1GrantProgressParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.progress_seq == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting Grant progress sequence must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.progress_seq, "meeting Grant progress sequence")?;
+    let grant_id = check_hex_exact(params.grant_id, 64, "meeting grant id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "progress")?;
+    tags.push(tag(&["meeting-grant", &grant_id])?);
+    tags.push(tag(&["progress-seq", &params.progress_seq.to_string()])?);
+    tags.push(tag(&["stage", params.stage.as_str()])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_GRANT_SIGNAL as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 Grant Yield signal (kind 42109).
+pub fn build_meeting_v1_grant_yield(
+    params: MeetingV1GrantYieldParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let grant_id = check_hex_exact(params.grant_id, 64, "meeting grant id")?;
+    let reason = check_meeting_v1_optional_text(params.reason, "meeting Grant Yield reason", 512)?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "yield")?;
+    tags.push(tag(&["meeting-grant", &grant_id])?);
+    if let Some(reason_code) = params.reason_code {
+        tags.push(tag(&["reason-code", reason_code.as_str()])?);
+    }
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_MEETING_GRANT_SIGNAL as u16),
+        reason.unwrap_or(""),
+    )
+    .tags(tags))
+}
+
+/// Build a Grant-bound Meeting V1 speech message (kind 9).
+pub fn build_meeting_v1_speech(
+    params: MeetingV1SpeechParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_session(params.session_id)?;
+    if params.speech_revision == 0 {
+        return Err(SdkError::InvalidInput(
+            "meeting speech revision must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.speech_revision, "meeting speech revision")?;
+    let grant_id = check_hex_exact(params.grant_id, 64, "meeting grant id")?;
+    if params.content.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "meeting speech content is required".into(),
+        ));
+    }
+    check_content(params.content, 256 * 1024)?;
+    let mut tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["v", MEETING_V1_SCHEMA_VERSION])?,
+        tag(&["meeting-grant", &grant_id])?,
+        tag(&["speech-revision", &params.speech_revision.to_string()])?,
+    ];
+    if params.mentions.len() > 12 {
+        return Err(SdkError::InvalidInput(
+            "meeting speech cannot mention more than 12 participants".into(),
+        ));
+    }
+    let mut seen_mentions = std::collections::HashSet::with_capacity(params.mentions.len());
+    for mention in params.mentions {
+        let mention = check_pubkey_hex(mention, "meeting mention")?;
+        if !seen_mentions.insert(mention.clone()) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate meeting mention: {mention}"
+            )));
+        }
+        tags.push(tag(&["p", &mention])?);
+    }
+    if let Some(handoff) = params.handoff {
+        let target = check_pubkey_hex(handoff.target_pubkey, "meeting handoff target")?;
+        let reason = check_meeting_v1_text(handoff.reason, "meeting handoff reason", 1024)?;
+        tags.push(tag(&["handoff-to", &target])?);
+        tags.push(tag(&["handoff-type", handoff.handoff_type.as_str()])?);
+        tags.push(tag(&["handoff-reason", reason])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), params.content).tags(tags))
 }
 
 /// Build a Meeting V0 floor claim (kind 42102).

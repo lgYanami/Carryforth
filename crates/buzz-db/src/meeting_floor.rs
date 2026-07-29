@@ -355,6 +355,19 @@ pub async fn claim_floor(
 
     let mut tx = db.begin_transaction().await?;
     let mut session = lock_session(&mut tx, community_id, session_id).await?;
+    if crate::meeting_revocation::recover_revoked_roster_v0_tx(
+        &mut tx,
+        community_id,
+        session_id,
+        relay_keys,
+    )
+    .await?
+    {
+        tx.commit().await?;
+        return Err(participant_revoked_error());
+    }
+    ensure_actor_security_active_tx(&mut tx, community_id, session_id, event.pubkey.as_bytes())
+        .await?;
 
     if let Some(row) = sqlx::query(
         "SELECT round_number, floor_revision, claim_event_id \
@@ -593,6 +606,19 @@ pub async fn signal_intent(
 
     let mut tx = db.begin_transaction().await?;
     let mut session = lock_session(&mut tx, community_id, session_id).await?;
+    if crate::meeting_revocation::recover_revoked_roster_v0_tx(
+        &mut tx,
+        community_id,
+        session_id,
+        relay_keys,
+    )
+    .await?
+    {
+        tx.commit().await?;
+        return Err(participant_revoked_error());
+    }
+    ensure_actor_security_active_tx(&mut tx, community_id, session_id, event.pubkey.as_bytes())
+        .await?;
 
     if let Some(row) = sqlx::query(
         "SELECT round_number, floor_revision, signal_event_id \
@@ -817,6 +843,19 @@ pub async fn yield_floor(
 
     let mut tx = db.begin_transaction().await?;
     let mut session = lock_session(&mut tx, community_id, session_id).await?;
+    if crate::meeting_revocation::recover_revoked_roster_v0_tx(
+        &mut tx,
+        community_id,
+        session_id,
+        relay_keys,
+    )
+    .await?
+    {
+        tx.commit().await?;
+        return Err(participant_revoked_error());
+    }
+    ensure_actor_security_active_tx(&mut tx, community_id, session_id, event.pubkey.as_bytes())
+        .await?;
     if let Some(row) = sqlx::query(
         "SELECT round_number, signal_event_id \
          FROM meeting_floor_signals \
@@ -992,6 +1031,19 @@ pub async fn say(
 
     let mut tx = db.begin_transaction().await?;
     let mut session = lock_session(&mut tx, community_id, session_id).await?;
+    if crate::meeting_revocation::recover_revoked_roster_v0_tx(
+        &mut tx,
+        community_id,
+        session_id,
+        relay_keys,
+    )
+    .await?
+    {
+        tx.commit().await?;
+        return Err(participant_revoked_error());
+    }
+    ensure_actor_security_active_tx(&mut tx, community_id, session_id, event.pubkey.as_bytes())
+        .await?;
 
     if let Some(row) = sqlx::query(
         "SELECT round_number, speech_event_id FROM meeting_rounds \
@@ -1275,6 +1327,18 @@ pub async fn recover_due_floors(
             tx.rollback().await?;
             continue;
         }
+        if crate::meeting_revocation::recover_revoked_roster_v0_tx(
+            &mut tx,
+            community_id,
+            session_id,
+            relay_keys,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            advanced += 1;
+            continue;
+        }
         let now = database_now(&mut tx).await?;
         let round = ensure_current_round_locked(
             &mut tx,
@@ -1336,6 +1400,11 @@ pub async fn get_floor_snapshot(
 }
 
 /// Claim a batch of transactional meeting events for post-commit delivery.
+///
+/// At most the earliest undelivered event for each Meeting Session is eligible.
+/// A claimed, backed-off, or otherwise unfinished predecessor therefore blocks
+/// every later event in that Session, preserving the canonical control-log
+/// order across delivery failures and concurrent workers.
 pub async fn claim_outbox_batch(
     db: &Db,
     worker_id: Uuid,
@@ -1350,12 +1419,21 @@ pub async fn claim_outbox_batch(
         .map_err(|_| DbError::InvalidData("meeting outbox lease is too large".to_string()))?;
     let rows = sqlx::query(
         "WITH candidates AS ( \
-             SELECT community_id, sequence \
-             FROM meeting_event_outbox \
-             WHERE delivered_at IS NULL \
-               AND available_at <= clock_timestamp() \
-               AND (claimed_until IS NULL OR claimed_until <= clock_timestamp()) \
-             ORDER BY available_at, sequence \
+             SELECT pending.community_id, pending.sequence \
+             FROM meeting_event_outbox pending \
+             WHERE pending.delivered_at IS NULL \
+               AND pending.available_at <= clock_timestamp() \
+               AND (pending.claimed_until IS NULL \
+                    OR pending.claimed_until <= clock_timestamp()) \
+               AND NOT EXISTS ( \
+                   SELECT 1 \
+                   FROM meeting_event_outbox predecessor \
+                   WHERE predecessor.community_id = pending.community_id \
+                     AND predecessor.session_id = pending.session_id \
+                     AND predecessor.sequence < pending.sequence \
+                     AND predecessor.delivered_at IS NULL \
+               ) \
+             ORDER BY pending.available_at, pending.sequence \
              FOR UPDATE SKIP LOCKED \
              LIMIT $1 \
          ), claimed AS ( \
@@ -2258,6 +2336,36 @@ fn parse_tag<const N: usize>(parts: [&str; N]) -> Result<Tag> {
     Tag::parse(parts).map_err(|error| DbError::InvalidData(format!("build meeting tag: {error}")))
 }
 
+async fn ensure_actor_security_active_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    actor_pubkey: &[u8],
+) -> Result<()> {
+    let durably_revoked = crate::meeting_revocation::actor_durably_revoked_for_session_tx(
+        tx,
+        community_id,
+        session_id,
+        actor_pubkey,
+    )
+    .await?;
+    if !durably_revoked
+        && crate::meeting::actor_security_active_tx(tx, community_id, actor_pubkey).await?
+    {
+        Ok(())
+    } else {
+        Err(DbError::AccessDenied(
+            "meeting actor is no longer an active writable community principal".to_string(),
+        ))
+    }
+}
+
+fn participant_revoked_error() -> DbError {
+    DbError::AccessDenied(
+        "meeting ended because a participant authorization was revoked".to_string(),
+    )
+}
+
 fn validate_event_identity(event: &Event, session_id: Uuid, round_number: i64) -> Result<()> {
     if round_number <= 0 {
         return Err(DbError::InvalidData(
@@ -2546,6 +2654,25 @@ mod tests {
         .expect("insert floor test channel");
         for (index, participant) in participants.iter().enumerate() {
             sqlx::query(
+                "INSERT INTO relay_members (community_id, pubkey, role) \
+                 VALUES ($1, $2, 'member')",
+            )
+            .bind(community_uuid)
+            .bind(participant.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .expect("insert floor test relay member");
+            sqlx::query(
+                "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(community_uuid)
+            .bind(participant.public_key().as_bytes())
+            .bind((index != 0).then_some(host.as_slice()))
+            .execute(&pool)
+            .await
+            .expect("insert floor test authoritative identity");
+            sqlx::query(
                 "INSERT INTO channel_members \
                      (community_id, channel_id, pubkey, role, invited_by) \
                  VALUES ($1, $2, $3, $4::member_role, $5)",
@@ -2654,6 +2781,146 @@ mod tests {
         ])
         .sign_with_keys(keys)
         .expect("sign Yield")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn late_v0_write_commits_lazy_owner_deactivation_end_without_the_command() {
+        let (db, community_id, session_id, relay_keys, participants) = setup_meeting().await;
+        let owner_pubkey = participants[0].public_key();
+        sqlx::query(
+            "UPDATE users SET deactivated_at = clock_timestamp() \
+             WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner_pubkey.as_bytes())
+        .execute(&db.pool)
+        .await
+        .expect("deactivate authoritative Agent owner");
+
+        let late_claim = claim_event(&participants[1], session_id, 1);
+        let error = claim_floor(
+            &db,
+            community_id,
+            session_id,
+            1,
+            &late_claim,
+            &relay_keys,
+            FloorConfig::default(),
+            WinnerSelector::FixedIndex(0),
+        )
+        .await
+        .expect_err("late V0 command must be rejected after lazy termination");
+        assert!(matches!(
+            error,
+            DbError::AccessDenied(message)
+                if message == "meeting ended because a participant authorization was revoked"
+        ));
+
+        let persisted_late_command: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM events WHERE community_id = $1 AND id = $2 \
+             )",
+        )
+        .bind(community_id.as_uuid())
+        .bind(late_claim.id.as_bytes())
+        .fetch_one(&db.pool)
+        .await
+        .expect("check rejected command persistence");
+        assert!(
+            !persisted_late_command,
+            "the command that discovered revocation must not enter the event log"
+        );
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM meeting_sessions \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("load lazily-ended V0 Meeting");
+        assert_eq!(status, "ended");
+        let terminal_outcome: String = sqlx::query_scalar(
+            "SELECT outcome FROM meeting_rounds \
+             WHERE community_id = $1 AND session_id = $2 AND round_number = 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("load terminal V0 floor");
+        assert_eq!(terminal_outcome, "ended");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn v0_sweeper_ends_revoked_roster_before_a_due_grant_transition() {
+        let (db, community_id, session_id, relay_keys, participants) = setup_meeting().await;
+        let config = FloorConfig {
+            claim_settle_delay: StdDuration::from_millis(1),
+            claim_window: StdDuration::from_secs(2),
+            grant_lease: StdDuration::from_secs(2),
+        };
+        let claim = claim_event(&participants[1], session_id, 1);
+        claim_floor(
+            &db,
+            community_id,
+            session_id,
+            1,
+            &claim,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+        )
+        .await
+        .expect("open a due V0 Claim round");
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+        sqlx::query(
+            "UPDATE users SET deactivated_at = clock_timestamp() \
+             WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(participants[0].public_key().as_bytes())
+        .execute(&db.pool)
+        .await
+        .expect("deactivate authoritative Agent owner");
+
+        assert_eq!(
+            recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10,)
+                .await
+                .expect("recover due V0 floor"),
+            1
+        );
+        let round = sqlx::query(
+            "SELECT phase, outcome, grant_event_id \
+             FROM meeting_rounds \
+             WHERE community_id = $1 AND session_id = $2 AND round_number = 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("load security-terminal round");
+        assert_eq!(
+            round.try_get::<String, _>("phase").expect("phase"),
+            "closed"
+        );
+        assert_eq!(
+            round
+                .try_get::<Option<String>, _>("outcome")
+                .expect("outcome")
+                .as_deref(),
+            Some("ended")
+        );
+        assert!(
+            round
+                .try_get::<Option<Vec<u8>>, _>("grant_event_id")
+                .expect("Grant event id")
+                .is_none(),
+            "deadline recovery must not publish a Grant before security End"
+        );
     }
 
     #[tokio::test]
@@ -2814,6 +3081,129 @@ mod tests {
             .expect("next floor");
         assert_eq!(next.round_number, 2);
         assert_eq!(next.phase, FloorPhase::Open);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn outbox_blocks_later_session_events_behind_an_unfinished_predecessor() {
+        let (db, community_id, session_id, relay_keys, _) = setup_meeting().await;
+        let now = Utc::now();
+        let mut tx = db.begin_transaction().await.expect("begin outbox setup");
+        for content in ["second", "third"] {
+            let event = EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_MEETING_STATE as u16),
+                content,
+            )
+            .tags([Tag::parse(["h", &session_id.to_string()]).expect("h tag")])
+            .sign_with_keys(&relay_keys)
+            .expect("sign outbox event");
+            persist_meeting_event_tx(&mut tx, community_id, session_id, &event, now)
+                .await
+                .expect("persist outbox event");
+        }
+        tx.commit().await.expect("commit outbox setup");
+
+        let expected_sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM meeting_event_outbox \
+             WHERE community_id = $1 AND session_id = $2 \
+             ORDER BY sequence",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("load target outbox sequence");
+        assert_eq!(expected_sequences.len(), 3);
+
+        let first_worker = Uuid::new_v4();
+        let first_batch = claim_outbox_batch(&db, first_worker, StdDuration::from_secs(30), 10_000)
+            .await
+            .expect("claim first outbox event");
+        let first_for_session: Vec<_> = first_batch
+            .iter()
+            .filter(|item| item.session_id == session_id)
+            .collect();
+        assert_eq!(first_for_session.len(), 1);
+        assert_eq!(first_for_session[0].sequence, expected_sequences[0]);
+
+        let concurrent_batch =
+            claim_outbox_batch(&db, Uuid::new_v4(), StdDuration::from_secs(30), 10_000)
+                .await
+                .expect("claim while predecessor is held");
+        assert!(
+            concurrent_batch
+                .iter()
+                .all(|item| item.session_id != session_id),
+            "a concurrent worker must not claim a later event for the same session"
+        );
+
+        assert!(release_outbox(
+            &db,
+            community_id,
+            expected_sequences[0],
+            first_worker,
+            "simulated delivery failure",
+        )
+        .await
+        .expect("release failed predecessor"));
+        sqlx::query(
+            "UPDATE meeting_event_outbox \
+             SET available_at = clock_timestamp() + interval '1 hour' \
+             WHERE community_id = $1 AND sequence = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(expected_sequences[0])
+        .execute(&db.pool)
+        .await
+        .expect("hold predecessor in backoff");
+
+        let backed_off_batch =
+            claim_outbox_batch(&db, Uuid::new_v4(), StdDuration::from_secs(30), 10_000)
+                .await
+                .expect("claim while predecessor is backed off");
+        assert!(
+            backed_off_batch
+                .iter()
+                .all(|item| item.session_id != session_id),
+            "a backed-off predecessor must continue to block later session events"
+        );
+
+        sqlx::query(
+            "UPDATE meeting_event_outbox \
+             SET available_at = clock_timestamp() \
+             WHERE community_id = $1 AND sequence = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(expected_sequences[0])
+        .execute(&db.pool)
+        .await
+        .expect("make predecessor retryable");
+        let retry_worker = Uuid::new_v4();
+        let retry_batch = claim_outbox_batch(&db, retry_worker, StdDuration::from_secs(30), 10_000)
+            .await
+            .expect("reclaim predecessor");
+        let retry_for_session: Vec<_> = retry_batch
+            .iter()
+            .filter(|item| item.session_id == session_id)
+            .collect();
+        assert_eq!(retry_for_session.len(), 1);
+        assert_eq!(retry_for_session[0].sequence, expected_sequences[0]);
+        assert!(
+            mark_outbox_delivered(&db, community_id, expected_sequences[0], retry_worker,)
+                .await
+                .expect("mark predecessor delivered")
+        );
+
+        let next_batch =
+            claim_outbox_batch(&db, Uuid::new_v4(), StdDuration::from_secs(30), 10_000)
+                .await
+                .expect("claim successor");
+        let next_for_session: Vec<_> = next_batch
+            .iter()
+            .filter(|item| item.session_id == session_id)
+            .collect();
+        assert_eq!(next_for_session.len(), 1);
+        assert_eq!(next_for_session[0].sequence, expected_sequences[1]);
     }
 
     #[tokio::test]
@@ -3156,6 +3546,12 @@ mod tests {
         let outbox = claim_outbox_batch(&db, Uuid::new_v4(), StdDuration::from_secs(1), 100)
             .await
             .expect("claim durable meeting outbox");
-        assert!(outbox.len() >= 10);
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|item| item.session_id == session_id)
+                .count(),
+            1
+        );
     }
 }

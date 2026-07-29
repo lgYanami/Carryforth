@@ -437,7 +437,7 @@ async fn meeting_stage_one_lifecycle_is_atomic_private_frozen_and_terminal() {
 
 #[tokio::test]
 #[ignore = "requires a running relay with BUZZ_MEETING_V1_CREATE_ENABLED=true, Postgres, and Redis"]
-async fn meeting_v1_stage_one_create_query_isolate_and_end() {
+async fn meeting_v1_create_query_isolate_and_end() {
     let pool = test_pool().await;
     let community_id = ensure_community(&pool).await;
     let owner = Keys::generate();
@@ -456,7 +456,7 @@ async fn meeting_v1_stage_one_create_query_isolate_and_end() {
     let participant_refs: Vec<&str> = participant_pubkeys.iter().map(String::as_str).collect();
     let create = buzz_sdk::build_meeting_v1_create(buzz_sdk::MeetingV1CreateParams {
         session_id: meeting_id,
-        title: "Meeting V1 Stage One",
+        title: "Meeting V1",
         description: Some("moderated baton persistence proof"),
         source_channel_id: None,
         author_pubkey: &owner.public_key().to_hex(),
@@ -636,23 +636,22 @@ async fn meeting_v1_stage_one_create_query_isolate_and_end() {
     .expect("sign cross-policy V0-shaped speech");
     let (status, body) = post_event(&agent, &v0_shaped_speech).await;
     assert!(
-        !status.is_success() && body.contains("Meeting V1 speech is not available in stage one"),
-        "kind 9 must route by persisted V1 policy before V0 validation, got HTTP {status}: {body}"
+        !status.is_success() && !body.contains("not available"),
+        "kind 9 must route by persisted V1 policy and reject the V0 wire shape, got HTTP {status}: {body}"
     );
 
-    let unavailable_v1_command =
+    let malformed_v1_command =
         EventBuilder::new(Kind::Custom(KIND_MEETING_SPEECH_INTENT as u16), "")
             .tags([
                 Tag::parse(["h", &meeting_id.to_string()]).expect("h tag"),
                 Tag::parse(["v", "2"]).expect("v tag"),
             ])
             .sign_with_keys(&agent)
-            .expect("sign stage-one V1 command");
-    let (status, body) = post_event(&agent, &unavailable_v1_command).await;
+            .expect("sign malformed V1 command");
+    let (status, body) = post_event(&agent, &malformed_v1_command).await;
     assert!(
-        !status.is_success()
-            && body.contains("Meeting V1 baton commands are not available in stage one"),
-        "participant must receive the explicit stage-one command boundary, got HTTP {status}: {body}"
+        !status.is_success() && body.contains("action") && !body.contains("not available"),
+        "participant must receive a strict wire-shape rejection, got HTTP {status}: {body}"
     );
 
     let outsider_probe = EventBuilder::new(Kind::Custom(KIND_MEETING_SPEECH_INTENT as u16), "")
@@ -666,7 +665,7 @@ async fn meeting_v1_stage_one_create_query_isolate_and_end() {
     assert!(
         !status.is_success()
             && body.contains("not a participant in this meeting")
-            && !body.contains("baton commands are not available"),
+            && !body.contains("not available"),
         "non-participant must fail before persisted policy is disclosed, got HTTP {status}: {body}"
     );
 

@@ -116,7 +116,7 @@ pub async fn handle_command(
         | KIND_MEETING_HUMAN_FLOOR_REQUEST
         | KIND_MEETING_OFFER_RESPONSE
         | KIND_MEETING_GRANT_SIGNAL => {
-            reject_stage_one_meeting_v1_command(tenant, state, &event, &auth).await
+            super::meeting_baton::handle_command(tenant, state, &event, &auth).await
         }
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
@@ -126,51 +126,6 @@ pub async fn handle_command(
             "unknown command kind: {kind}"
         ))),
     }
-}
-
-async fn reject_stage_one_meeting_v1_command(
-    tenant: &TenantContext,
-    state: &Arc<AppState>,
-    event: &Event,
-    auth: &IngestAuth,
-) -> Result<IngestResult, IngestError> {
-    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
-    if auth
-        .channel_ids()
-        .is_some_and(|ids| !ids.contains(&session_id))
-    {
-        return Err(IngestError::AuthFailed(
-            "restricted: token not authorized for this meeting".into(),
-        ));
-    }
-    let actor_pubkey = auth.pubkey().to_bytes();
-    let is_participant = state
-        .is_member_cached(tenant.community(), session_id, &actor_pubkey)
-        .await
-        .map_err(|error| {
-            IngestError::Internal(format!(
-                "error: checking Meeting V1 participant access: {error}"
-            ))
-        })?;
-    if !is_participant {
-        return Err(IngestError::AuthFailed(
-            "restricted: not a participant in this meeting".into(),
-        ));
-    }
-    let persisted = buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
-        .await
-        .map_err(map_meeting_db_error)?;
-    let protocol =
-        MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
-    if protocol != MeetingProtocol::ModeratedBatonV1 {
-        return Err(IngestError::Rejected(format!(
-            "invalid: kind {} is only valid for {MEETING_V1_POLICY} sessions",
-            event.kind.as_u16()
-        )));
-    }
-    Err(IngestError::Rejected(
-        "invalid: Meeting V1 baton commands are not available in stage one".into(),
-    ))
 }
 
 /// Result of persisting a command event: either a duplicate (already processed)
@@ -567,7 +522,7 @@ async fn handle_meeting_create(
                     create_event_id: event.id.as_bytes(),
                     participant_pubkeys: &participant_pubkeys,
                     relay_keys: &state.relay_keypair,
-                    config: buzz_db::meeting_baton::BatonConfig::default(),
+                    config: crate::meeting_runtime::baton_config_from_env(),
                 },
             )
             .await
@@ -715,6 +670,19 @@ async fn handle_meeting_end(
     let actor_pubkey = auth.pubkey().to_bytes().to_vec();
     let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
         PersistResult::Duplicate => {
+            if !buzz_db::meeting::is_meeting_actor_session_security_active(
+                &state.db,
+                tenant.community(),
+                session_id,
+                &actor_pubkey,
+            )
+            .await
+            .map_err(map_meeting_db_error)?
+            {
+                return Err(IngestError::AuthFailed(
+                    "restricted: meeting End author is no longer active".into(),
+                ));
+            }
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
@@ -724,7 +692,13 @@ async fn handle_meeting_end(
         PersistResult::Inserted(tx) => tx,
     };
 
-    let already_ended = match protocol {
+    enum ManualEndResult {
+        Ended,
+        AlreadyEnded,
+        ParticipantRevoked,
+    }
+
+    let end_result = match protocol {
         MeetingProtocol::UniformV0 => {
             let outcome = buzz_db::meeting::end_meeting_tx(
                 &mut tx,
@@ -734,6 +708,7 @@ async fn handle_meeting_end(
                     actor_pubkey: &actor_pubkey,
                     create_event_id: &create_event_id,
                     end_event_id: event.id.as_bytes(),
+                    relay_keys: &state.relay_keypair,
                 },
             )
             .await
@@ -756,44 +731,65 @@ async fn handle_meeting_end(
                 .await
                 .map_err(map_meeting_db_error)?;
             }
-            outcome == EndMeetingOutcome::AlreadyEnded
+            match outcome {
+                EndMeetingOutcome::Ended => ManualEndResult::Ended,
+                EndMeetingOutcome::AlreadyEnded => ManualEndResult::AlreadyEnded,
+                EndMeetingOutcome::ParticipantRevoked => ManualEndResult::ParticipantRevoked,
+            }
         }
         MeetingProtocol::ModeratedBatonV1 => {
-            matches!(
-                buzz_db::meeting_baton::end_meeting_v1_tx(
-                    &mut tx,
-                    buzz_db::meeting_baton::EndMeetingV1Params {
-                        community_id: tenant.community(),
-                        session_id,
-                        actor_pubkey: &actor_pubkey,
-                        create_event_id: &create_event_id,
-                        end_event_id: event.id.as_bytes(),
-                        relay_keys: &state.relay_keypair,
-                    },
-                )
-                .await
-                .map_err(map_meeting_db_error)?,
-                buzz_db::meeting_baton::EndMeetingV1Outcome::AlreadyEnded
+            match buzz_db::meeting_baton::end_meeting_v1_tx(
+                &mut tx,
+                buzz_db::meeting_baton::EndMeetingV1Params {
+                    community_id: tenant.community(),
+                    session_id,
+                    actor_pubkey: &actor_pubkey,
+                    create_event_id: &create_event_id,
+                    end_event_id: event.id.as_bytes(),
+                    relay_keys: &state.relay_keypair,
+                },
             )
+            .await
+            .map_err(map_meeting_db_error)?
+            {
+                buzz_db::meeting_baton::EndMeetingV1Outcome::Ended(_) => ManualEndResult::Ended,
+                buzz_db::meeting_baton::EndMeetingV1Outcome::AlreadyEnded => {
+                    ManualEndResult::AlreadyEnded
+                }
+                buzz_db::meeting_baton::EndMeetingV1Outcome::ParticipantRevoked(_) => {
+                    ManualEndResult::ParticipantRevoked
+                }
+            }
         }
     };
 
-    if already_ended {
-        tx.rollback()
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: rollback duplicate end: {e}")))?;
-        return Ok(IngestResult {
-            event_id: event.id.to_hex(),
-            accepted: true,
-            message: format!(
-                "response:{}",
-                serde_json::json!({
-                    "meeting_id": session_id.to_string(),
-                    "status": "ended",
-                    "already_ended": true,
-                })
-            ),
-        });
+    match end_result {
+        ManualEndResult::Ended => {}
+        ManualEndResult::AlreadyEnded => {
+            tx.rollback().await.map_err(|e| {
+                IngestError::Internal(format!("error: rollback duplicate end: {e}"))
+            })?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::json!({
+                        "meeting_id": session_id.to_string(),
+                        "status": "ended",
+                        "already_ended": true,
+                    })
+                ),
+            });
+        }
+        ManualEndResult::ParticipantRevoked => {
+            tx.commit().await.map_err(|e| {
+                IngestError::Internal(format!("error: commit meeting revocation recovery: {e}"))
+            })?;
+            return Err(IngestError::AuthFailed(
+                "restricted: meeting ended because a participant was revoked".into(),
+            ));
+        }
     }
 
     tx.commit()
@@ -1088,7 +1084,7 @@ pub(crate) fn validate_meeting_tag_vocabulary(
     validate_meeting_tag_schema(event, required, &[], repeatable)
 }
 
-fn validate_meeting_tag_schema(
+pub(crate) fn validate_meeting_tag_schema(
     event: &Event,
     required: &[&str],
     optional: &[&str],
@@ -1256,7 +1252,7 @@ fn tag_values(event: &Event, tag_name: &str) -> Vec<String> {
         .collect()
 }
 
-fn require_single_tag(event: &Event, tag_name: &str) -> Result<String, IngestError> {
+pub(crate) fn require_single_tag(event: &Event, tag_name: &str) -> Result<String, IngestError> {
     let values = tag_values(event, tag_name);
     match values.as_slice() {
         [value] if !value.is_empty() => Ok(value.clone()),
@@ -1272,7 +1268,10 @@ fn require_single_tag(event: &Event, tag_name: &str) -> Result<String, IngestErr
     }
 }
 
-fn optional_single_tag(event: &Event, tag_name: &str) -> Result<Option<String>, IngestError> {
+pub(crate) fn optional_single_tag(
+    event: &Event,
+    tag_name: &str,
+) -> Result<Option<String>, IngestError> {
     let values = tag_values(event, tag_name);
     match values.as_slice() {
         [] => Ok(None),
@@ -1283,7 +1282,7 @@ fn optional_single_tag(event: &Event, tag_name: &str) -> Result<Option<String>, 
     }
 }
 
-fn parse_single_uuid_tag(
+pub(crate) fn parse_single_uuid_tag(
     event: &Event,
     tag_name: &str,
     field_name: &str,
@@ -1292,7 +1291,7 @@ fn parse_single_uuid_tag(
     Uuid::parse_str(&value).map_err(|_| IngestError::Rejected(format!("invalid: bad {field_name}")))
 }
 
-fn decode_event_id(value: &str, field_name: &str) -> Result<Vec<u8>, IngestError> {
+pub(crate) fn decode_event_id(value: &str, field_name: &str) -> Result<Vec<u8>, IngestError> {
     if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
         return Err(IngestError::Rejected(format!(
             "invalid: {field_name} must be 64 hex characters"

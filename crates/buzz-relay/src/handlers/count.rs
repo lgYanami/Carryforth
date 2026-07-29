@@ -7,7 +7,7 @@ use tracing::warn;
 
 use crate::connection::{AuthState, ConnectionState};
 use crate::handlers::req::{
-    event_visible_to_reader, filter_can_match_persona_shared_kinds,
+    apply_meeting_read_scope, event_visible_to_reader, filter_can_match_persona_shared_kinds,
     filter_can_match_result_gated_kinds, result_gated_count_safe_for_pushdown,
 };
 use crate::protocol::RelayMessage;
@@ -96,6 +96,32 @@ pub async fn handle_count(
         accessible_channels.retain(|channel_id| allowed.contains(channel_id));
     }
 
+    let meeting_scope = match apply_meeting_read_scope(
+        &state,
+        conn.tenant.community(),
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(error) => {
+            warn!(sub_id = %sub_id, "Meeting reader security check failed: {error}");
+            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            return;
+        }
+    };
+    if filters.iter().any(|filter| {
+        extract_channel_from_filter(filter)
+            .is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id))
+    }) {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "restricted: meeting access revoked",
+        ));
+        return;
+    }
+
     // For each filter, count matching events with channel access enforcement.
     let mut total: u64 = 0;
     for filter in &filters {
@@ -148,6 +174,31 @@ pub async fn handle_count(
                 db_is_member,
             ) {
                 continue; // Skip filters targeting inaccessible channels.
+            }
+            if !meeting_scope.meeting_channels.contains(&ch_id) {
+                match buzz_db::meeting::is_meeting_reader_authorized_for_channel(
+                    &state.db,
+                    conn.tenant.community(),
+                    ch_id,
+                    &pubkey_bytes,
+                )
+                .await
+                {
+                    Ok(Some(false)) => {
+                        accessible_channels.retain(|channel_id| *channel_id != ch_id);
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            "restricted: meeting access revoked",
+                        ));
+                        return;
+                    }
+                    Ok(Some(true) | None) => {}
+                    Err(error) => {
+                        warn!(sub_id = %sub_id, "Meeting reader authorization check failed: {error}");
+                        conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                        return;
+                    }
+                }
             }
             // Channel is accessible — count with pushability check.
             let mut query = super::req::build_event_query_from_filter(

@@ -16,6 +16,10 @@ use uuid::Uuid;
 use crate::meeting::{MAX_MEETING_AGENTS, MAX_MEETING_PARTICIPANTS};
 use crate::{Db, DbError, Result};
 
+mod commands;
+
+pub use commands::*;
+
 /// Meeting V1 wire schema version.
 pub const SCHEMA_VERSION: i32 = 2;
 /// Persisted moderated-baton policy identifier.
@@ -24,6 +28,8 @@ pub const BATON_POLICY_VERSION: &str = "moderated-baton-v1";
 pub const DEFAULT_TIMING_PROFILE_VERSION: &str = "moderated-baton-v1-default";
 /// Default deterministic fallback policy.
 pub const DEFAULT_FALLBACK_POLICY_VERSION: &str = "fallback-v1";
+/// Largest accepted persisted Meeting V1 duration (24 hours).
+pub const MAX_BATON_DURATION_MS: i64 = 86_400_000;
 
 /// Frozen Meeting V1 protocol configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +254,9 @@ pub enum EndMeetingV1Outcome {
     Ended(Box<BatonSnapshot>),
     /// The meeting was already terminal; no command or State was committed.
     AlreadyEnded,
+    /// Roster security recovery committed a Relay-authored End instead of the
+    /// uncommitted manual command.
+    ParticipantRevoked(Box<BatonSnapshot>),
 }
 
 /// One claimed durable security-revocation job.
@@ -261,6 +270,11 @@ pub struct MeetingRevocationJob {
     pub revoked_pubkey: Vec<u8>,
     /// Event or audit identifier that caused the security revocation.
     pub revocation_event_id: Vec<u8>,
+    /// Database time at which access was revoked and this job became durable.
+    pub created_at: DateTime<Utc>,
+    /// Database-monotonic security order allocated after the producer locks
+    /// the affected authoritative identity rows.
+    pub security_order: i64,
     /// Optional cursor used by a bounded worker.
     pub cursor_session_id: Option<Uuid>,
     /// Number of times the job has been claimed.
@@ -342,12 +356,13 @@ pub async fn create_meeting_v1_tx(
         .await?;
     }
 
-    let session_insert = sqlx::query(
+    let now: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO meeting_sessions \
              (community_id, session_id, create_event_id, host_pubkey, \
               source_channel_id, schema_version, status, floor_policy_version, \
-              moderator_pubkey) \
-         VALUES ($1, $2, $3, $4, $5, 2, 'active', $6, $7)",
+              moderator_pubkey, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 2, 'active', $6, $7, clock_timestamp()) \
+         RETURNING created_at",
     )
     .bind(params.community_id.as_uuid())
     .bind(params.session_id)
@@ -356,17 +371,8 @@ pub async fn create_meeting_v1_tx(
     .bind(params.source_channel_id)
     .bind(BATON_POLICY_VERSION)
     .bind(params.moderator_pubkey)
-    .execute(tx.as_mut())
+    .fetch_one(tx.as_mut())
     .await?;
-    if session_insert.rows_affected() != 1 {
-        return Err(DbError::InvalidData(format!(
-            "failed to create meeting session {}",
-            params.session_id
-        )));
-    }
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(tx.as_mut())
-        .await?;
 
     for participant in &participants {
         sqlx::query(
@@ -517,6 +523,65 @@ pub async fn end_meeting_v1_tx(
             "meeting end references the wrong create event".to_string(),
         ));
     }
+    if session.status == "active" {
+        if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
+            tx,
+            params.community_id,
+            params.session_id,
+            params.relay_keys,
+        )
+        .await?
+        {
+            crate::meeting::discard_unenqueued_manual_end_event_tx(
+                tx,
+                params.community_id,
+                params.session_id,
+                params.end_event_id,
+                params.actor_pubkey,
+            )
+            .await?;
+            return Ok(EndMeetingV1Outcome::ParticipantRevoked(Box::new(snapshot)));
+        }
+    }
+    if crate::meeting_revocation::actor_durably_revoked_for_session_tx(
+        tx,
+        params.community_id,
+        params.session_id,
+        params.actor_pubkey,
+    )
+    .await?
+    {
+        return Err(DbError::AccessDenied(
+            "meeting End author was durably revoked from this Session".to_string(),
+        ));
+    }
+    if !crate::meeting::actor_security_active_tx(tx, params.community_id, params.actor_pubkey)
+        .await?
+    {
+        if session.status == "active" {
+            if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
+                tx,
+                params.community_id,
+                params.session_id,
+                params.relay_keys,
+            )
+            .await?
+            {
+                crate::meeting::discard_unenqueued_manual_end_event_tx(
+                    tx,
+                    params.community_id,
+                    params.session_id,
+                    params.end_event_id,
+                    params.actor_pubkey,
+                )
+                .await?;
+                return Ok(EndMeetingV1Outcome::ParticipantRevoked(Box::new(snapshot)));
+            }
+        }
+        return Err(DbError::AccessDenied(
+            "meeting End author is no longer an active writable community principal".to_string(),
+        ));
+    }
     authorize_end_tx(
         tx,
         params.community_id,
@@ -603,35 +668,19 @@ pub async fn get_baton_snapshot(
     load_snapshot_pool(&db.pool, community_id, session_id).await
 }
 
-/// Enqueue one real security revocation for durable Meeting cleanup.
-///
-/// NIP-IA archival is a presentation concern and must not call this API.
-pub async fn enqueue_revocation_job(
-    db: &Db,
-    community_id: CommunityId,
-    job_id: Uuid,
-    revoked_pubkey: &[u8],
-    revocation_event_id: &[u8],
-) -> Result<bool> {
-    let mut tx = db.begin_transaction().await?;
-    let inserted = enqueue_revocation_job_tx(
-        &mut tx,
-        community_id,
-        job_id,
-        revoked_pubkey,
-        revocation_event_id,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(inserted)
-}
-
 /// Enqueue a real security revocation inside the producer's authorization
 /// transaction.
 ///
 /// Producers must use this form when removing membership, banning an identity,
 /// or deactivating its authoritative user row so the authorization change and
 /// cleanup job cannot commit independently.
+///
+/// An authoritative owner ban/deactivation also revokes every Agent whose
+/// `users.agent_owner_pubkey` names that owner. Such a producer must enqueue
+/// one child job per owned Agent in this same transaction. The repository has
+/// no production account-deactivation mutation today, so Meeting command
+/// lazy-recovery checks owner liveness as the immediate backstop until that
+/// producer is introduced. NIP-IA archival must never call this API.
 pub async fn enqueue_revocation_job_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -693,7 +742,8 @@ pub async fn claim_revocation_jobs(
          WHERE jobs.community_id = candidates.community_id \
            AND jobs.job_id = candidates.job_id \
          RETURNING jobs.community_id, jobs.job_id, jobs.revoked_pubkey, \
-                   jobs.revocation_event_id, jobs.cursor_session_id, jobs.attempts",
+                   jobs.revocation_event_id, jobs.created_at, jobs.security_order, \
+                   jobs.cursor_session_id, jobs.attempts",
     )
     .bind(limit)
     .bind(lease_ms)
@@ -706,6 +756,8 @@ pub async fn claim_revocation_jobs(
                 job_id: row.try_get("job_id")?,
                 revoked_pubkey: row.try_get("revoked_pubkey")?,
                 revocation_event_id: row.try_get("revocation_event_id")?,
+                created_at: row.try_get("created_at")?,
+                security_order: row.try_get("security_order")?,
                 cursor_session_id: row.try_get("cursor_session_id")?,
                 attempts: row.try_get("attempts")?,
             })
@@ -833,27 +885,269 @@ async fn close_baton_locked_tx(
     let config = load_config_tx(tx, community_id, session_id).await?;
     let participants = load_participants_tx(tx, community_id, session_id).await?;
     let moderator_pubkey = load_moderator_tx(tx, community_id, session_id).await?;
+
+    // End every live protocol object before publishing the terminal snapshot.
+    // Historical terminal rows remain untouched. These updates deliberately
+    // share the Meeting Session lock held by both manual End and revocation End.
+    let mut ended_intents = sqlx::query(
+        "SELECT intent_id, state \
+         FROM meeting_speech_intents \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND state IN ('pending', 'selected') \
+         ORDER BY intent_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_all(tx.as_mut())
+    .await?
+    .into_iter()
+    .map(|row| Ok((row.try_get("intent_id")?, row.try_get("state")?)))
+    .collect::<std::result::Result<Vec<(Vec<u8>, String)>, sqlx::Error>>()?;
+    ended_intents.sort_by(|left, right| left.0.cmp(&right.0));
+    let ended_intent_count = sqlx::query(
+        "UPDATE meeting_speech_intents \
+         SET state = 'ended', terminal_event_id = $3, terminal_at = $4, \
+             updated_at = $4, last_attempt_outcome = 'ended', \
+             deferred_by_offer_id = NULL, defer_event_id = NULL, defer_reason = NULL \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND state IN ('pending', 'selected')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(caused_by_event_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let mut ended_requests = sqlx::query(
+        "SELECT request_id, state \
+         FROM meeting_human_floor_requests \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND state IN ('queued', 'offered') \
+         ORDER BY request_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_all(tx.as_mut())
+    .await?
+    .into_iter()
+    .map(|row| Ok((row.try_get("request_id")?, row.try_get("state")?)))
+    .collect::<std::result::Result<Vec<(Vec<u8>, String)>, sqlx::Error>>()?;
+    ended_requests.sort_by(|left, right| left.0.cmp(&right.0));
+    let ended_request_count = sqlx::query(
+        "UPDATE meeting_human_floor_requests \
+         SET state = 'ended', terminal_event_id = $3, terminal_at = $4 \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND state IN ('queued', 'offered')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(caused_by_event_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let mut ended_offer_ids: Vec<Vec<u8>> = sqlx::query(
+        "SELECT offer_id \
+         FROM meeting_baton_offers \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
+         ORDER BY offer_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_all(tx.as_mut())
+    .await?
+    .into_iter()
+    .map(|row| row.try_get("offer_id"))
+    .collect::<std::result::Result<_, sqlx::Error>>()?;
+    ended_offer_ids.sort();
+    let ended_offer_count = sqlx::query(
+        "UPDATE meeting_baton_offers \
+         SET state = 'ended', resolved_at = $3 \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'pending'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let mut ended_grant_ids: Vec<Vec<u8>> = sqlx::query(
+        "SELECT grant_id \
+         FROM meeting_baton_grants \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'active' \
+         ORDER BY grant_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_all(tx.as_mut())
+    .await?
+    .into_iter()
+    .map(|row| row.try_get("grant_id"))
+    .collect::<std::result::Result<_, sqlx::Error>>()?;
+    ended_grant_ids.sort();
+    let ended_grant_count = sqlx::query(
+        "UPDATE meeting_baton_grants \
+         SET state = 'ended', terminal_event_id = $3, \
+             terminal_reason = $4, terminal_at = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'active'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(caused_by_event_id)
+    .bind(primary_type)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let mut ended_handoff_ids: Vec<Vec<u8>> = sqlx::query(
+        "SELECT handoff_id \
+         FROM meeting_directed_handoffs \
+         WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
+         ORDER BY handoff_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_all(tx.as_mut())
+    .await?
+    .into_iter()
+    .map(|row| row.try_get("handoff_id"))
+    .collect::<std::result::Result<_, sqlx::Error>>()?;
+    ended_handoff_ids.sort();
+    let ended_handoff_count = sqlx::query(
+        "UPDATE meeting_directed_handoffs \
+         SET question_state = 'ended', last_attempt_outcome = 'ended', terminal_at = $3 \
+         WHERE community_id = $1 AND session_id = $2 AND question_state = 'open'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+
+    for (label, actual, expected) in [
+        (
+            "Intent",
+            ended_intent_count.rows_affected(),
+            ended_intents.len(),
+        ),
+        (
+            "Human Request",
+            ended_request_count.rows_affected(),
+            ended_requests.len(),
+        ),
+        (
+            "Offer",
+            ended_offer_count.rows_affected(),
+            ended_offer_ids.len(),
+        ),
+        (
+            "Grant",
+            ended_grant_count.rows_affected(),
+            ended_grant_ids.len(),
+        ),
+        (
+            "Directed Handoff",
+            ended_handoff_count.rows_affected(),
+            ended_handoff_ids.len(),
+        ),
+    ] {
+        if actual
+            != u64::try_from(expected).map_err(|_| {
+                DbError::InvalidData(format!("{label} end projection count does not fit u64"))
+            })?
+        {
+            return Err(DbError::InvalidData(format!(
+                "{label} projection changed while ending meeting {session_id}"
+            )));
+        }
+    }
+
     let next_state_revision = state.state_revision + 1;
     let next_floor_revision = state.floor_revision + 1;
-    let transition = meeting_transition(
-        primary_type,
-        "accepted",
-        session_id,
-        Some(caused_by_event_id),
-        now,
-        primary_type,
-        Some("active"),
-        Some("ended"),
-        Some(state.phase.as_str()),
-        Some(BatonPhase::Ended.as_str()),
-    );
+    let next_intent_revision =
+        state.intent_revision + i64::from(!ended_intents.is_empty() || !ended_requests.is_empty());
+    let mut effects = vec![serde_json::json!({
+        "type": primary_type,
+        "object_type": "meeting",
+        "object_id": session_id.to_string(),
+        "from": "active",
+        "to": "ended",
+    })];
+    effects.extend(ended_offer_ids.iter().map(|offer_id| {
+        serde_json::json!({
+            "type": "offer_ended",
+            "object_type": "offer",
+            "object_id": hex::encode(offer_id),
+            "from": "pending",
+            "to": "ended",
+        })
+    }));
+    effects.extend(ended_grant_ids.iter().map(|grant_id| {
+        serde_json::json!({
+            "type": "grant_ended",
+            "object_type": "grant",
+            "object_id": hex::encode(grant_id),
+            "from": "active",
+            "to": "ended",
+        })
+    }));
+    effects.extend(ended_intents.iter().map(|(intent_id, from)| {
+        serde_json::json!({
+            "type": "intent_ended",
+            "object_type": "intent",
+            "object_id": hex::encode(intent_id),
+            "from": from,
+            "to": "ended",
+        })
+    }));
+    effects.extend(ended_requests.iter().map(|(request_id, from)| {
+        serde_json::json!({
+            "type": "human_ended",
+            "object_type": "human_request",
+            "object_id": hex::encode(request_id),
+            "from": from,
+            "to": "ended",
+        })
+    }));
+    effects.extend(ended_handoff_ids.iter().map(|handoff_id| {
+        serde_json::json!({
+            "type": "handoff_ended",
+            "object_type": "handoff",
+            "object_id": hex::encode(handoff_id),
+            "from": "open",
+            "to": "ended",
+        })
+    }));
+    if let Some(recall_event_id) = state.recall_event_id.as_deref() {
+        effects.push(serde_json::json!({
+            "type": "recall_cleared",
+            "object_type": "recall",
+            "object_id": hex::encode(recall_event_id),
+            "from": "latched",
+            "to": "cleared",
+        }));
+    }
+    effects.push(serde_json::json!({
+        "type": "phase_changed",
+        "object_type": "phase",
+        "object_id": session_id.to_string(),
+        "from": state.phase.as_str(),
+        "to": BatonPhase::Ended.as_str(),
+    }));
+    let transition = serde_json::json!({
+        "primary_type": primary_type,
+        "outcome": "accepted",
+        "primary_object_id": session_id.to_string(),
+        "caused_by_event_id": hex::encode(caused_by_event_id),
+        "deadline_type": null,
+        "blocked_by": null,
+        "at_ms": now.timestamp_millis(),
+        "effects": effects,
+    });
     let state_event = build_state_event(
         relay_keys,
         session_id,
         &moderator_pubkey,
         BatonPhase::Ended,
         next_floor_revision,
-        state.intent_revision,
+        next_intent_revision,
         state.speech_revision,
         next_state_revision,
         state.control_epoch,
@@ -871,7 +1165,7 @@ async fn close_baton_locked_tx(
         &state_event,
         next_state_revision,
         next_floor_revision,
-        state.intent_revision,
+        next_intent_revision,
         state.speech_revision,
         state.control_epoch,
         state.decision_epoch,
@@ -885,15 +1179,20 @@ async fn close_baton_locked_tx(
     .await?;
     sqlx::query(
         "UPDATE meeting_baton_state \
-         SET phase = 'ended', floor_revision = $3, state_revision = $4, \
-             state_event_id = $5, active_offer_id = NULL, active_grant_id = NULL, \
+         SET phase = 'ended', floor_revision = $3, intent_revision = $4, \
+             state_revision = $5, state_event_id = $6, \
+             active_offer_id = NULL, active_grant_id = NULL, handoff_depth = 0, \
+             consecutive_moderator_speeches = 0, forced_return_to_moderator = FALSE, \
+             recall_event_id = NULL, \
              moderator_decision_started_at = NULL, moderator_decision_deadline = NULL, \
-             next_action_at = NULL, updated_at = $6 \
+             next_action_at = NULL, recovery_retry_at = '-infinity', \
+             recovery_attempts = 0, updated_at = $7 \
          WHERE community_id = $1 AND session_id = $2",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(next_floor_revision)
+    .bind(next_intent_revision)
     .bind(next_state_revision)
     .bind(state_event.id.as_bytes().as_slice())
     .bind(now)
@@ -905,7 +1204,7 @@ async fn close_baton_locked_tx(
         moderator_pubkey,
         phase: BatonPhase::Ended,
         floor_revision: next_floor_revision,
-        intent_revision: state.intent_revision,
+        intent_revision: next_intent_revision,
         speech_revision: state.speech_revision,
         state_revision: next_state_revision,
         control_epoch: state.control_epoch,
@@ -913,9 +1212,9 @@ async fn close_baton_locked_tx(
         state_event_id: state_event.id.as_bytes().to_vec(),
         active_offer_id: None,
         active_grant_id: None,
-        handoff_depth: state.handoff_depth,
-        consecutive_moderator_speeches: state.consecutive_moderator_speeches,
-        forced_return_to_moderator: state.forced_return_to_moderator,
+        handoff_depth: 0,
+        consecutive_moderator_speeches: 0,
+        forced_return_to_moderator: false,
         moderator_decision_deadline: None,
         next_action_at: None,
         config,
@@ -925,7 +1224,32 @@ async fn close_baton_locked_tx(
     })
 }
 
-#[derive(Debug)]
+/// Close a locked, terminal Meeting V1 after a real participant security
+/// revocation.
+///
+/// The caller owns the `meeting_sessions` row lock, has already persisted the
+/// Relay-authored End, and remains responsible for enqueuing the returned State.
+pub(crate) async fn close_baton_for_security_revocation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    end_event_id: &[u8],
+    relay_keys: &Keys,
+    ended_at: DateTime<Utc>,
+) -> Result<BatonSnapshot> {
+    close_baton_locked_tx(
+        tx,
+        community_id,
+        session_id,
+        end_event_id,
+        "participant_revoked",
+        relay_keys,
+        ended_at,
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
 struct StateRow {
     phase: BatonPhase,
     floor_revision: i64,
@@ -940,6 +1264,8 @@ struct StateRow {
     handoff_depth: i32,
     consecutive_moderator_speeches: i32,
     forced_return_to_moderator: bool,
+    recall_event_id: Option<Vec<u8>>,
+    moderator_decision_started_at: Option<DateTime<Utc>>,
     moderator_decision_deadline: Option<DateTime<Utc>>,
     next_action_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
@@ -958,6 +1284,7 @@ async fn load_state_tx(
                     state_revision, control_epoch, decision_epoch, state_event_id, \
                     active_offer_id, active_grant_id, handoff_depth, \
                     consecutive_moderator_speeches, forced_return_to_moderator, \
+                    recall_event_id, moderator_decision_started_at, \
                     moderator_decision_deadline, next_action_at, created_at, updated_at \
              FROM meeting_baton_state \
              WHERE community_id = $1 AND session_id = $2 \
@@ -973,6 +1300,7 @@ async fn load_state_tx(
                     state_revision, control_epoch, decision_epoch, state_event_id, \
                     active_offer_id, active_grant_id, handoff_depth, \
                     consecutive_moderator_speeches, forced_return_to_moderator, \
+                    recall_event_id, moderator_decision_started_at, \
                     moderator_decision_deadline, next_action_at, created_at, updated_at \
              FROM meeting_baton_state \
              WHERE community_id = $1 AND session_id = $2",
@@ -1002,6 +1330,8 @@ fn state_row_from_pg(row: sqlx::postgres::PgRow) -> Result<StateRow> {
         handoff_depth: row.try_get("handoff_depth")?,
         consecutive_moderator_speeches: row.try_get("consecutive_moderator_speeches")?,
         forced_return_to_moderator: row.try_get("forced_return_to_moderator")?,
+        recall_event_id: row.try_get("recall_event_id")?,
+        moderator_decision_started_at: row.try_get("moderator_decision_started_at")?,
         moderator_decision_deadline: row.try_get("moderator_decision_deadline")?,
         next_action_at: row.try_get("next_action_at")?,
         created_at: row.try_get("created_at")?,
@@ -1020,6 +1350,7 @@ async fn load_snapshot_pool(
                 state_revision, control_epoch, decision_epoch, state_event_id, \
                 active_offer_id, active_grant_id, handoff_depth, \
                 consecutive_moderator_speeches, forced_return_to_moderator, \
+                recall_event_id, moderator_decision_started_at, \
                 moderator_decision_deadline, next_action_at, created_at, updated_at \
          FROM meeting_baton_state \
          WHERE community_id = $1 AND session_id = $2",
@@ -1322,6 +1653,22 @@ async fn resolve_participants_tx(
                 "participant {pubkey_hex} is not a member of this community"
             )));
         }
+        let participant_banned: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM community_bans \
+                 WHERE community_id = $1 AND pubkey = $2 AND banned \
+                   AND (ban_expires_at IS NULL OR ban_expires_at > clock_timestamp()) \
+             )",
+        )
+        .bind(community_id.as_uuid())
+        .bind(pubkey)
+        .fetch_one(tx.as_mut())
+        .await?;
+        if participant_banned {
+            return Err(DbError::AccessDenied(format!(
+                "participant {pubkey_hex} is banned from this community"
+            )));
+        }
         let identity = sqlx::query(
             "SELECT agent_owner_pubkey, channel_add_policy::text AS channel_add_policy \
              FROM users \
@@ -1345,6 +1692,39 @@ async fn resolve_participants_tx(
             ParticipantType::Human
         };
         if participant_type == ParticipantType::Agent {
+            if let Some(owner_pubkey) = agent_owner.as_deref() {
+                let owner_active: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM users \
+                     WHERE community_id = $1 AND pubkey = $2 AND deactivated_at IS NULL \
+                     FOR SHARE",
+                )
+                .bind(community_id.as_uuid())
+                .bind(owner_pubkey)
+                .fetch_optional(tx.as_mut())
+                .await?;
+                if owner_active.is_none() {
+                    return Err(DbError::AccessDenied(format!(
+                        "participant {pubkey_hex} has no active authoritative owner"
+                    )));
+                }
+                let owner_banned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM community_bans \
+                         WHERE community_id = $1 AND pubkey = $2 AND banned \
+                           AND (ban_expires_at IS NULL \
+                                OR ban_expires_at > clock_timestamp()) \
+                     )",
+                )
+                .bind(community_id.as_uuid())
+                .bind(owner_pubkey)
+                .fetch_one(tx.as_mut())
+                .await?;
+                if owner_banned {
+                    return Err(DbError::AccessDenied(format!(
+                        "participant {pubkey_hex} has a banned authoritative owner"
+                    )));
+                }
+            }
             agent_count += 1;
             if pubkey.as_slice() != host_pubkey {
                 match add_policy.as_str() {
@@ -1794,13 +2174,18 @@ fn validate_config(config: &BatonConfig) -> Result<()> {
             "meeting V1 policy versions must contain 1-128 bytes".to_string(),
         ));
     }
-    if config.agent_offer_ack_ms <= 0
-        || config.human_offer_ack_ms <= 0
-        || config.moderator_decision_ms <= 0
-        || config.grant_soft_lease_ms <= 0
-        || config.progress_interval_ms <= 0
-        || config.grant_hard_deadline_ms <= 0
-        || config.agent_safety_margin_ms <= 0
+    let durations = [
+        config.agent_offer_ack_ms,
+        config.human_offer_ack_ms,
+        config.moderator_decision_ms,
+        config.grant_soft_lease_ms,
+        config.progress_interval_ms,
+        config.grant_hard_deadline_ms,
+        config.agent_safety_margin_ms,
+    ];
+    if durations
+        .iter()
+        .any(|duration| !(1..=MAX_BATON_DURATION_MS).contains(duration))
         || config.progress_interval_ms > config.grant_soft_lease_ms
         || config.grant_soft_lease_ms > config.grant_hard_deadline_ms
         || config.agent_safety_margin_ms >= config.grant_hard_deadline_ms
@@ -1954,6 +2339,23 @@ mod tests {
         assert_eq!(config.moderator_decision_ms, 180_000);
         assert_eq!(config.grant_hard_deadline_ms, 300_000);
         assert_eq!(config.max_handoff_depth, 5);
+    }
+
+    #[test]
+    fn config_rejects_durations_beyond_safe_datetime_arithmetic() {
+        for mutate in [
+            |config: &mut BatonConfig| config.agent_offer_ack_ms = MAX_BATON_DURATION_MS + 1,
+            |config: &mut BatonConfig| config.human_offer_ack_ms = MAX_BATON_DURATION_MS + 1,
+            |config: &mut BatonConfig| config.moderator_decision_ms = MAX_BATON_DURATION_MS + 1,
+            |config: &mut BatonConfig| config.grant_soft_lease_ms = MAX_BATON_DURATION_MS + 1,
+            |config: &mut BatonConfig| config.progress_interval_ms = MAX_BATON_DURATION_MS + 1,
+            |config: &mut BatonConfig| config.grant_hard_deadline_ms = MAX_BATON_DURATION_MS + 1,
+            |config: &mut BatonConfig| config.agent_safety_margin_ms = MAX_BATON_DURATION_MS + 1,
+        ] {
+            let mut config = BatonConfig::default();
+            mutate(&mut config);
+            assert!(validate_config(&config).is_err());
+        }
     }
 
     #[test]
@@ -2266,6 +2668,7 @@ mod tests {
                 actor_pubkey: &host,
                 create_event_id: &create_event_id,
                 end_event_id: &wrong_end_event_id,
+                relay_keys: &relay_keys,
             },
         )
         .await
@@ -2367,6 +2770,226 @@ mod tests {
         .await
         .expect("count terminal outbox");
         assert_eq!((history_count, outbox_count), (2, 4));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn manual_end_prioritizes_v1_roster_revocation_and_discards_the_command() {
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let host = vec![0x91_u8; 32];
+        let participant = vec![0x92_u8; 32];
+        let session_id = Uuid::new_v4();
+        let create_event_id = vec![0x93_u8; 32];
+        let manual_end_event_id = vec![0x94_u8; 32];
+        let relay_keys = Keys::generate();
+        seed_identity(&pool, community_id, &host, "owner", None, "anyone").await;
+        seed_identity(&pool, community_id, &participant, "member", None, "anyone").await;
+        let roster = vec![host.clone(), participant.clone()];
+        let mut create_tx = pool.begin().await.expect("begin V1 security create");
+        insert_command_event_tx(
+            &mut create_tx,
+            community_id,
+            &create_event_id,
+            &host,
+            buzz_core::kind::KIND_MEETING_CREATE as i32,
+            session_id,
+        )
+        .await;
+        create_meeting_v1_tx(
+            &mut create_tx,
+            CreateMeetingV1Params {
+                community_id,
+                session_id,
+                title: "V1 manual End security",
+                description: None,
+                source_channel_id: None,
+                host_pubkey: &host,
+                moderator_pubkey: &host,
+                create_event_id: &create_event_id,
+                participant_pubkeys: &roster,
+                relay_keys: &relay_keys,
+                config: BatonConfig::default(),
+            },
+        )
+        .await
+        .expect("create V1 security Meeting");
+        create_tx.commit().await.expect("commit V1 security create");
+
+        crate::moderation::ban_member_with_revocation(
+            &pool,
+            community_id,
+            &host,
+            &participant,
+            Some("manual End must lose to revocation"),
+            None,
+            &[0x95; 32],
+        )
+        .await
+        .expect("ban V1 host");
+        let mut end_tx = pool.begin().await.expect("begin V1 security End");
+        insert_command_event_tx(
+            &mut end_tx,
+            community_id,
+            &manual_end_event_id,
+            &host,
+            buzz_core::kind::KIND_MEETING_END as i32,
+            session_id,
+        )
+        .await;
+        let outcome = end_meeting_v1_tx(
+            &mut end_tx,
+            EndMeetingV1Params {
+                community_id,
+                session_id,
+                actor_pubkey: &host,
+                create_event_id: &create_event_id,
+                end_event_id: &manual_end_event_id,
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect("recover revoked V1 roster before manual End");
+        let EndMeetingV1Outcome::ParticipantRevoked(snapshot) = outcome else {
+            panic!("V1 roster revocation must win over manual End");
+        };
+        end_tx.commit().await.expect("commit V1 roster recovery");
+        assert_eq!(snapshot.phase, BatonPhase::Ended);
+        let state_content: String = sqlx::query_scalar(
+            "SELECT content FROM events \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&snapshot.state_event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load V1 revocation State");
+        let state_json: serde_json::Value =
+            serde_json::from_str(&state_content).expect("parse V1 revocation State");
+        assert_eq!(
+            state_json["transition"]["primary_type"],
+            "participant_revoked"
+        );
+        let manual_persistence: (bool, bool) = sqlx::query_as(
+            "SELECT \
+                 EXISTS(SELECT 1 FROM events \
+                        WHERE community_id = $1 AND id = $2), \
+                 EXISTS(SELECT 1 FROM meeting_event_outbox \
+                        WHERE community_id = $1 AND event_id = $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&manual_end_event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("check discarded V1 manual End");
+        assert_eq!(manual_persistence, (false, false));
+
+        let active_host = vec![0x96_u8; 32];
+        let active_participant = vec![0x97_u8; 32];
+        let timed_out_admin = vec![0x98_u8; 32];
+        let active_session_id = Uuid::new_v4();
+        let active_create_event_id = vec![0x99_u8; 32];
+        let rejected_end_event_id = vec![0x9a_u8; 32];
+        seed_identity(&pool, community_id, &active_host, "owner", None, "anyone").await;
+        seed_identity(
+            &pool,
+            community_id,
+            &active_participant,
+            "member",
+            None,
+            "anyone",
+        )
+        .await;
+        seed_identity(
+            &pool,
+            community_id,
+            &timed_out_admin,
+            "admin",
+            None,
+            "anyone",
+        )
+        .await;
+        let roster = vec![active_host.clone(), active_participant];
+        let mut create_tx = pool.begin().await.expect("begin timeout-only V1 create");
+        insert_command_event_tx(
+            &mut create_tx,
+            community_id,
+            &active_create_event_id,
+            &active_host,
+            buzz_core::kind::KIND_MEETING_CREATE as i32,
+            active_session_id,
+        )
+        .await;
+        create_meeting_v1_tx(
+            &mut create_tx,
+            CreateMeetingV1Params {
+                community_id,
+                session_id: active_session_id,
+                title: "V1 timeout-only End rejection",
+                description: None,
+                source_channel_id: None,
+                host_pubkey: &active_host,
+                moderator_pubkey: &active_host,
+                create_event_id: &active_create_event_id,
+                participant_pubkeys: &roster,
+                relay_keys: &relay_keys,
+                config: BatonConfig::default(),
+            },
+        )
+        .await
+        .expect("create timeout-only V1 Meeting");
+        create_tx
+            .commit()
+            .await
+            .expect("commit timeout-only V1 Meeting");
+        crate::moderation::timeout_member(
+            &pool,
+            community_id,
+            &timed_out_admin,
+            &active_host,
+            Utc::now() + chrono::Duration::hours(1),
+            Some("cannot issue recovery End"),
+        )
+        .await
+        .expect("timeout non-roster admin");
+        let mut end_tx = pool.begin().await.expect("begin timed-out admin End");
+        insert_command_event_tx(
+            &mut end_tx,
+            community_id,
+            &rejected_end_event_id,
+            &timed_out_admin,
+            buzz_core::kind::KIND_MEETING_END as i32,
+            active_session_id,
+        )
+        .await;
+        let error = end_meeting_v1_tx(
+            &mut end_tx,
+            EndMeetingV1Params {
+                community_id,
+                session_id: active_session_id,
+                actor_pubkey: &timed_out_admin,
+                create_event_id: &active_create_event_id,
+                end_event_id: &rejected_end_event_id,
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect_err("timeout-only admin cannot end a Meeting");
+        assert!(matches!(error, DbError::AccessDenied(_)));
+        end_tx
+            .rollback()
+            .await
+            .expect("discard timed-out admin End event");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM meeting_sessions \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load Meeting after timeout-only rejection");
+        assert_eq!(status, "active");
     }
 
     #[tokio::test]

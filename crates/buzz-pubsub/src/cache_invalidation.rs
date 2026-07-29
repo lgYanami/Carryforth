@@ -64,6 +64,13 @@ pub enum CacheInvalidation {
         /// Affected member's pubkey bytes.
         pubkey: Vec<u8>,
     },
+    /// Drop every channel-membership entry and the accessible-channels entry
+    /// for one principal. Relay membership revocation uses this broader key
+    /// drop because it is principal-wide rather than a change to one Channel.
+    PrincipalAccess {
+        /// Principal whose cached Channel access must be re-evaluated.
+        pubkey: Vec<u8>,
+    },
     /// Drop every user's accessible-channels entry. Mirrors
     /// `invalidate_all_accessible_channels` (e.g. a new open channel).
     AccessibleAll,
@@ -223,6 +230,18 @@ mod tests {
     fn membership_roundtrips_through_json() {
         let msg = CacheInvalidation::Membership {
             channel_id: Uuid::from_u128(0x1234),
+            pubkey: vec![1, 2, 3, 4],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CacheInvalidation>(&json).unwrap(),
+            msg
+        );
+    }
+
+    #[test]
+    fn principal_access_roundtrips_through_json() {
+        let msg = CacheInvalidation::PrincipalAccess {
             pubkey: vec![1, 2, 3, 4],
         };
         let json = serde_json::to_string(&msg).unwrap();
