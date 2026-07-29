@@ -350,6 +350,15 @@ pub enum ProjectViewCmd {
 pub enum RolesCmd {
     /// List canonical Roles with their current assignee or vacancy
     List,
+    /// Render the verified current Role Brief for one Member
+    Brief {
+        /// Member public key (hex or npub); defaults to the CLI signer.
+        #[arg(long)]
+        member: Option<String>,
+        /// Render the shared prompt/human Markdown form instead of JSON.
+        #[arg(long)]
+        markdown: bool,
+    },
     /// Read one canonical Role and its current Assignment
     Get {
         /// Stable Role UUID.
@@ -2222,6 +2231,7 @@ mod tests {
             names(&cmd, "roles"),
             vec![
                 "assignment",
+                "brief",
                 "current",
                 "get",
                 "list",
@@ -2350,7 +2360,7 @@ mod tests {
             ("project-view", 6),
             ("reactions", 3),
             ("repos", 4),
-            ("roles", 8),
+            ("roles", 9),
             ("social", 7),
             ("upload", 1),
             ("users", 4),

@@ -197,6 +197,14 @@ const ROLE_STATE_IDS = {
   handoff: "20000000-0000-4000-8000-000000000004",
 } as const;
 
+const ROLE_BRIEF_SOURCE = {
+  event_id: "d".repeat(64),
+  project_revision: 7,
+  item_revision: 1,
+  change_id: "e".repeat(64),
+  source_type: "nostr_event",
+};
+
 const V2_READY_VIEW = {
   ...structuredClone(READY_VIEW),
   schema_version: 2,
@@ -276,6 +284,69 @@ const V2_READY_VIEW = {
       { pubkey: HUMAN, role: "owner" },
       { pubkey: ACTOR, role: "admin" },
       { pubkey: FORMER_ASSIGNEE, role: "member" },
+    ],
+    briefs: [
+      {
+        generated_at: NOW,
+        project_id: IDS.profile,
+        project_revision: 7,
+        projection_generation: 2,
+        member_pubkey: ACTOR,
+        community_role: "admin",
+        project: {
+          profile: {
+            object: profile,
+            source: ROLE_BRIEF_SOURCE,
+          },
+          goals: [
+            {
+              object: goal,
+              source: ROLE_BRIEF_SOURCE,
+            },
+          ],
+        },
+        state: {
+          status: "assigned",
+          role: {
+            role: {
+              role_id: IDS.role,
+              name: "Context steward",
+              purpose: "Keep project intent coherent.",
+              responsibilities: ["Review project structure"],
+              boundaries: ["Does not grant unscoped authority"],
+              level: "admin",
+              active: true,
+              object_revision: 1,
+              project_revision: 7,
+              created_at: NOW,
+              updated_at: NOW,
+              created_by: ACTOR,
+              updated_by: ACTOR,
+            },
+            source: ROLE_BRIEF_SOURCE,
+          },
+          assignment: {
+            assignment: {
+              assignment_id: ROLE_STATE_IDS.currentAssignment,
+              role_id: IDS.role,
+              member_pubkey: ACTOR,
+              proposal_id: ROLE_STATE_IDS.proposal,
+              started_at: NOW,
+              started_by: HUMAN,
+              entity_revision: 1,
+              project_revision: 7,
+            },
+            source: ROLE_BRIEF_SOURCE,
+          },
+        },
+        related_objects: [],
+        source_revisions: {
+          meta_event_id: "f".repeat(64),
+          meta_change_id: "a".repeat(64),
+          membership_event_id: "c".repeat(64),
+          project_updated_at: NOW,
+        },
+      },
     ],
   },
 } as RawProjectViewLoadResult;
@@ -357,6 +428,7 @@ function vacantV2View() {
   next.role_continuity.proposals = [];
   next.role_continuity.assignments = [];
   next.role_continuity.handoffs = [];
+  next.role_continuity.briefs = [];
   next.role_continuity.members = [
     { pubkey: HUMAN, role: "owner" },
     { pubkey: ACTOR, role: "member" },
@@ -446,6 +518,12 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
   const inspector = page.getByTestId("project-view-inspector");
   await expect(inspector).toContainText("Leader · admin");
   await expect(inspector).toContainText("Current tenure");
+  await expect(page.getByTestId("project-role-brief")).toContainText(
+    "Verified Role Brief",
+  );
+  await expect(page.getByTestId("project-role-brief")).toContainText(
+    "Make project context legible",
+  );
   await expect(inspector).toContainText(
     "Return to project context stewardship",
   );

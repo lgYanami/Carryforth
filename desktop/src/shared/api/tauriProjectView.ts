@@ -18,6 +18,7 @@ export type {
   ProjectCommunityMemberRole,
   ProjectRoleAssignment,
   ProjectRoleAssignmentEndReason,
+  ProjectRoleBrief,
   ProjectRoleDefinition,
   ProjectRoleHandoff,
   ProjectRoleLevel,

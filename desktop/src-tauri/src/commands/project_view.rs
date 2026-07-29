@@ -1,6 +1,6 @@
 //! Verified, read-only Project View bridge for the desktop client.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use buzz_core_pkg::kind::{
@@ -26,6 +26,7 @@ use buzz_sdk_pkg::project_view_v2::{
     parse_project_object_projection as parse_v2_project_object_projection, V2MembershipProjection,
     V2MetaProjection, V2ProjectedObject,
 };
+use buzz_sdk_pkg::role_brief::{RoleBrief, VerifiedRoleBriefSnapshot};
 use chrono::{DateTime, Utc};
 use nostr::Event;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,7 @@ pub struct ProjectViewRoleContinuity {
     assignments: Vec<RoleAssignment>,
     handoffs: Vec<RoleHandoff>,
     members: Vec<ProjectViewMembershipMember>,
+    briefs: Vec<RoleBrief>,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,6 +438,7 @@ async fn fetch_v2_snapshot_once(
     let mut event_ids = HashSet::with_capacity(ordinary_events.len() + entity_events.len());
     let mut object_ids = HashSet::new();
     let mut entries = Vec::new();
+    let mut object_projections = Vec::with_capacity(ordinary_events.len());
     for event in &ordinary_events {
         if !event_ids.insert(event.id) {
             return Err(integrity_read_error(
@@ -450,20 +453,22 @@ async fn fetch_v2_snapshot_once(
             projection.project_revision,
             &meta,
         )?;
-        if let V2ProjectedObject::Active(object) = projection.object {
+        if let V2ProjectedObject::Active(object) = &projection.object {
             if !object_ids.insert(object.id) {
                 return Err(integrity_read_error(
                     "v2 snapshot contains a duplicate active object ID",
                 ));
             }
-            entries.push(ProjectViewEntry::Active(*object));
+            entries.push(ProjectViewEntry::Active((**object).clone()));
         }
+        object_projections.push(projection);
     }
 
     let mut roles = Vec::new();
     let mut proposals = Vec::new();
     let mut assignments = Vec::new();
     let mut handoffs = Vec::new();
+    let mut entity_projections = Vec::with_capacity(entity_events.len());
     for event in &entity_events {
         if !event_ids.insert(event.id) {
             return Err(integrity_read_error(
@@ -477,20 +482,21 @@ async fn fetch_v2_snapshot_once(
             projection.project_revision,
             &meta,
         )?;
-        match projection.entity {
+        match &projection.entity {
             RoleContinuityChange::Role(role) => {
                 if !object_ids.insert(role.role_id) {
                     return Err(integrity_read_error(
                         "v2 Role head collides with another active object ID",
                     ));
                 }
-                entries.push(ProjectViewEntry::Active(project_object_from_role(&role)));
-                roles.push(role);
+                entries.push(ProjectViewEntry::Active(project_object_from_role(role)));
+                roles.push(role.clone());
             }
-            RoleContinuityChange::Proposal(proposal) => proposals.push(proposal),
-            RoleContinuityChange::Assignment(assignment) => assignments.push(assignment),
-            RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff),
+            RoleContinuityChange::Proposal(proposal) => proposals.push(proposal.clone()),
+            RoleContinuityChange::Assignment(assignment) => assignments.push(assignment.clone()),
+            RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff.clone()),
         }
+        entity_projections.push(projection);
     }
     let membership = read_v2_membership(state, identity, &meta).await?;
     validate_v2_counts_and_membership(
@@ -525,7 +531,7 @@ async fn fetch_v2_snapshot_once(
         entries,
     )
     .map_err(|error| integrity_read_error(format!("invalid v2 Project snapshot: {error}")))?;
-    let view = ProjectView::assemble(&project_state).map_err(|error| {
+    ProjectView::assemble(&project_state).map_err(|error| {
         integrity_read_error(format!("cannot assemble v2 Project View: {error}"))
     })?;
 
@@ -537,6 +543,28 @@ async fn fetch_v2_snapshot_once(
             "Project View v2 changed while assembling the snapshot",
         ));
     }
+    let verified = VerifiedRoleBriefSnapshot::new(
+        meta.clone(),
+        membership.clone(),
+        object_projections,
+        entity_projections,
+    )
+    .map_err(|error| integrity_read_error(error.to_string()))?;
+    let view = verified.project_view().clone();
+    let brief_members = assignments
+        .iter()
+        .filter(|assignment| assignment.is_active())
+        .map(|assignment| assignment.member_pubkey)
+        .collect::<BTreeSet<_>>();
+    let brief_generated_at = Utc::now();
+    let briefs = brief_members
+        .into_iter()
+        .map(|member| {
+            verified
+                .brief_for(member, brief_generated_at)
+                .map_err(|error| integrity_read_error(error.to_string()))
+        })
+        .collect::<ProjectViewReadResult<Vec<_>>>()?;
     roles.sort_by_key(|role| role.role_id);
     proposals.sort_by_key(|proposal| proposal.proposal_id);
     assignments.sort_by_key(|assignment| assignment.assignment_id);
@@ -558,6 +586,7 @@ async fn fetch_v2_snapshot_once(
             assignments,
             handoffs,
             members,
+            briefs,
         },
     }))
 }

@@ -4,42 +4,36 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use buzz_core::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
-use buzz_core::{CommunityId, PublicKey};
+use buzz_core::CommunityId;
+use buzz_project_view::v2::ProjectObjectCommand;
 use buzz_project_view::{
-    GoalView, InitializeGoal, IssueView, PlanView, ProjectProfile, ProjectView, ProjectViewEntry,
-    ProjectViewObject, ProjectViewObjectType, ProjectViewState, RequirementView, UpdateMutation,
+    CreateMutation, DeleteMutation, GoalView, InitializeGoal, IssueView, MutationRequest, PlanView,
+    ProjectProfile, ProjectView, ProjectViewEntry, ProjectViewObject, ProjectViewObjectType,
+    ProjectViewState, RequirementView, UpdateMutation,
 };
 use buzz_sdk::project_view::{
     build_create, build_delete, build_initialize, build_update, object_projection_coordinate,
     parse_meta_projection, parse_object_projection, MetaProjection, ObjectProjection,
     ProjectedObject,
 };
+use buzz_sdk::project_view_v2::{build_project_object_command, V2MetaProjection};
+use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
 use nostr::Event;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::{create_response_with_id, normalize_write_response, BuzzClient};
+use crate::commands::project_view_v2_snapshot::{
+    is_managed_runtime, read_identity, read_verified_v2_snapshot, ProjectViewIdentity,
+    ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
+};
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
 use crate::{OutputFormat, ProjectViewCmd};
 
-const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
-
-#[derive(Debug, Clone, Copy)]
-struct ProjectViewIdentity {
-    relay_pubkey: PublicKey,
-}
-
-#[derive(Deserialize)]
-struct Nip11Document {
-    #[serde(default)]
-    supported_extensions: Vec<String>,
-    #[serde(rename = "self")]
-    relay_self: Option<String>,
-}
 
 struct ProjectSnapshot {
     meta: MetaProjection,
@@ -90,6 +84,31 @@ impl ProjectViewOutput {
         Self {
             initialized: true,
             project_revision: meta.project_revision,
+            project: Some(profile),
+            goals,
+            unbound_plans,
+            unplanned_requirements,
+            unplanned_issues,
+            roles,
+            resources,
+            issue_references_by_target,
+        }
+    }
+
+    fn initialized_v2(snapshot: &VerifiedRoleBriefSnapshot) -> Self {
+        let ProjectView {
+            profile,
+            goals,
+            unbound_plans,
+            unplanned_requirements,
+            unplanned_issues,
+            roles,
+            resources,
+            issue_references_by_target,
+        } = snapshot.project_view().clone();
+        Self {
+            initialized: true,
+            project_revision: snapshot.meta().project_revision,
             project: Some(profile),
             goals,
             unbound_plans,
@@ -159,9 +178,15 @@ pub async fn dispatch(
 
 async fn cmd_get(client: &BuzzClient, format: &OutputFormat) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
-    let output = match fetch_consistent_snapshot(client, identity).await? {
-        Some(snapshot) => ProjectViewOutput::initialized(&snapshot.meta, snapshot.view),
-        None => ProjectViewOutput::uninitialized(),
+    let output = match identity.schema {
+        ProjectViewSchema::V1 => match fetch_consistent_snapshot(client, identity).await? {
+            Some(snapshot) => ProjectViewOutput::initialized(&snapshot.meta, snapshot.view),
+            None => ProjectViewOutput::uninitialized(),
+        },
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            ProjectViewOutput::initialized_v2(&snapshot)
+        }
     };
     print_read_output(&output, format)
 }
@@ -173,6 +198,22 @@ async fn cmd_get_object(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
+    if identity.schema == ProjectViewSchema::V2 {
+        let snapshot = read_verified_v2_snapshot(client, identity).await?;
+        let entry = snapshot.entry(object_id).ok_or_else(|| {
+            CliError::NotFound(format!(
+                "Project View object {}:{} was not found",
+                object_type.as_str(),
+                object_id
+            ))
+        })?;
+        if entry.object_type() != object_type {
+            return Err(integrity_error(
+                "point lookup found the object ID under a different type",
+            ));
+        }
+        return print_read_output(&v2_object_output(entry, snapshot.meta()), format);
+    }
     let meta = read_meta(client, identity)
         .await?
         .ok_or_else(|| CliError::NotFound("Project View is not initialized".to_owned()))?;
@@ -192,6 +233,12 @@ async fn cmd_get_object(
 async fn cmd_init(client: &BuzzClient, profile: &str, goals: &[String]) -> Result<(), CliError> {
     require_single_stdin(std::iter::once(profile).chain(goals.iter().map(String::as_str)))?;
     let identity = require_capability(client).await?;
+    if identity.schema == ProjectViewSchema::V2 {
+        return Err(CliError::Usage(
+            "Project View v2 is already initialized; `project-view init` only applies to v1"
+                .to_owned(),
+        ));
+    }
     let profile: ProjectProfile = read_json_file(profile, "profile")?;
     let goals: Vec<InitializeGoal> = goals
         .iter()
@@ -232,8 +279,21 @@ async fn cmd_create(
     let identity = require_capability(client).await?;
     let object_id = Uuid::new_v4();
     let object = create_input(object_type, object_id, read_json_value(data_path, "data")?)?;
-    let event = client
-        .sign_event_exact(build_create(expected_project_revision, object).map_err(sdk_err)?)?;
+    let event = match identity.schema {
+        ProjectViewSchema::V1 => client
+            .sign_event_exact(build_create(expected_project_revision, object).map_err(sdk_err)?)?,
+        ProjectViewSchema::V2 => {
+            let acting_assignment = v2_acting_assignment(client, identity).await?;
+            client.sign_event_exact(
+                build_project_object_command(ProjectObjectCommand::new(
+                    expected_project_revision,
+                    acting_assignment,
+                    MutationRequest::Create(CreateMutation { object }),
+                ))
+                .map_err(sdk_err)?,
+            )?
+        }
+    };
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, object_id, false)?;
     confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
@@ -261,8 +321,21 @@ async fn cmd_update(
         object_id,
         read_json_value(patch_path, "patch")?,
     )?;
-    let event = client
-        .sign_event_exact(build_update(expected_project_revision, update).map_err(sdk_err)?)?;
+    let event = match identity.schema {
+        ProjectViewSchema::V1 => client
+            .sign_event_exact(build_update(expected_project_revision, update).map_err(sdk_err)?)?,
+        ProjectViewSchema::V2 => {
+            let acting_assignment = v2_acting_assignment(client, identity).await?;
+            client.sign_event_exact(
+                build_project_object_command(ProjectObjectCommand::new(
+                    expected_project_revision,
+                    acting_assignment,
+                    MutationRequest::Update(update),
+                ))
+                .map_err(sdk_err)?,
+            )?
+        }
+    };
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, object_id, false)?;
     confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
@@ -277,9 +350,25 @@ async fn cmd_delete(
     expected_project_revision: u64,
 ) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
-    let event = client.sign_event_exact(
-        build_delete(expected_project_revision, object_type, object_id).map_err(sdk_err)?,
-    )?;
+    let event = match identity.schema {
+        ProjectViewSchema::V1 => client.sign_event_exact(
+            build_delete(expected_project_revision, object_type, object_id).map_err(sdk_err)?,
+        )?,
+        ProjectViewSchema::V2 => {
+            let acting_assignment = v2_acting_assignment(client, identity).await?;
+            client.sign_event_exact(
+                build_project_object_command(ProjectObjectCommand::new(
+                    expected_project_revision,
+                    acting_assignment,
+                    MutationRequest::Delete(DeleteMutation {
+                        object_type,
+                        object_id,
+                    }),
+                ))
+                .map_err(sdk_err)?,
+            )?
+        }
+    };
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, object_id, true)?;
     confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
@@ -288,29 +377,11 @@ async fn cmd_delete(
 }
 
 async fn require_capability(client: &BuzzClient) -> Result<ProjectViewIdentity, CliError> {
-    let raw = client.get_public("/info").await?;
-    let info: Nip11Document = serde_json::from_str(&raw)
-        .map_err(|error| integrity_error(format!("invalid NIP-11 document: {error}")))?;
-    if !info
-        .supported_extensions
-        .iter()
-        .any(|extension| extension == PROJECT_VIEW_EXTENSION)
-    {
-        return Err(CliError::Other(format!(
-            "unsupported: relay does not advertise {PROJECT_VIEW_EXTENSION}"
-        )));
-    }
-    let relay_self = info.relay_self.ok_or_else(|| {
-        integrity_error("NIP-11 advertises Project View without a relay `self` key")
-    })?;
-    let relay_pubkey = PublicKey::from_hex(&relay_self)
-        .map_err(|error| integrity_error(format!("invalid NIP-11 relay `self`: {error}")))?;
-    if relay_pubkey.to_hex() != relay_self {
-        return Err(integrity_error(
-            "NIP-11 relay `self` is not canonical lowercase hex",
-        ));
-    }
-    Ok(ProjectViewIdentity { relay_pubkey })
+    read_identity(client).await?.ok_or_else(|| {
+        CliError::Other(format!(
+            "unsupported: relay does not advertise {PROJECT_VIEW_V1_EXTENSION} or buzz-project-view-v2"
+        ))
+    })
 }
 
 async fn read_meta(
@@ -550,6 +621,60 @@ fn object_output(projection: &ObjectProjection, meta: &MetaProjection) -> Value 
     }
 }
 
+fn v2_object_output(entry: &ProjectViewEntry, meta: &V2MetaProjection) -> Value {
+    match entry {
+        ProjectViewEntry::Active(object) => json!({
+            "project_revision": meta.project_revision,
+            "projection_generation": meta.projection_generation,
+            "deleted": false,
+            "object": object,
+        }),
+        ProjectViewEntry::Tombstone(tombstone) => json!({
+            "project_revision": meta.project_revision,
+            "projection_generation": meta.projection_generation,
+            "deleted": true,
+            "tombstone": {
+                "object_id": tombstone.id,
+                "object_type": tombstone.object_type,
+                "object_revision": tombstone.object_revision,
+                "project_revision": tombstone.project_revision,
+                "created_at": tombstone.created_at,
+                "deleted_at": tombstone.deleted_at,
+                "created_by": tombstone.created_by,
+                "deleted_by": tombstone.deleted_by,
+            },
+        }),
+    }
+}
+
+async fn v2_acting_assignment(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+) -> Result<Option<Uuid>, CliError> {
+    if !is_managed_runtime() {
+        return Ok(None);
+    }
+    let snapshot = read_verified_v2_snapshot(client, identity)
+        .await
+        .map_err(|error| {
+            CliError::Auth(format!(
+                "assignment_unavailable: current Assignment could not be verified: {error}"
+            ))
+        })?;
+    let assignment_id = snapshot
+        .assignments()
+        .find(|assignment| {
+            assignment.member_pubkey == client.public_key() && assignment.is_active()
+        })
+        .map(|assignment| assignment.assignment_id)
+        .ok_or_else(|| {
+            CliError::Auth(
+                "assignment_unavailable: managed Agent has no active Assignment".to_owned(),
+            )
+        })?;
+    Ok(Some(assignment_id))
+}
+
 fn create_input(
     object_type: ProjectViewObjectType,
     object_id: Uuid,
@@ -670,6 +795,30 @@ async fn confirm_object_receipt(
     object_id: Uuid,
     receipt: &ProjectViewReceipt,
 ) -> Result<(), CliError> {
+    if identity.schema == ProjectViewSchema::V2 {
+        let snapshot = read_verified_v2_snapshot(client, identity).await?;
+        if snapshot.meta().project_revision < receipt.project_revision {
+            return Err(integrity_error(
+                "v2 metadata projection is older than the successful mutation receipt",
+            ));
+        }
+        let entry = snapshot
+            .entry(object_id)
+            .ok_or_else(|| integrity_error("successful v2 mutation has no object projection"))?;
+        if entry.object_type() != object_type
+            || entry.object_revision() < receipt.object_revision.unwrap_or_default()
+        {
+            return Err(integrity_error(
+                "v2 object projection does not confirm the mutation receipt",
+            ));
+        }
+        if receipt.deleted == Some(true) && !matches!(entry, ProjectViewEntry::Tombstone(_)) {
+            return Err(integrity_error(
+                "v2 delete receipt was not confirmed by a tombstone projection",
+            ));
+        }
+        return Ok(());
+    }
     let meta = read_meta(client, identity)
         .await?
         .ok_or_else(|| integrity_error("successful mutation has no metadata projection"))?;
@@ -893,7 +1042,7 @@ mod tests {
 
     async fn snapshot_info(State(state): State<SnapshotServerState>) -> Json<Value> {
         Json(json!({
-            "supported_extensions": [PROJECT_VIEW_EXTENSION],
+            "supported_extensions": [PROJECT_VIEW_V1_EXTENSION],
             "self": state.relay_pubkey,
         }))
     }
@@ -1034,7 +1183,7 @@ mod tests {
 
     async fn conflict_info(State(state): State<ConflictServerState>) -> Json<Value> {
         Json(json!({
-            "supported_extensions": [PROJECT_VIEW_EXTENSION],
+            "supported_extensions": [PROJECT_VIEW_V1_EXTENSION],
             "self": state.relay_pubkey,
         }))
     }

@@ -1,5 +1,70 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 4：Managed Agent 绑定与最小 Role Brief
+
+### 共享 verified Role Brief
+
+- 在 `buzz-sdk` 增加唯一的 `VerifiedRoleBriefSnapshot` 组装边界。CLI、ACP 和 Desktop
+  先使用既有 v2 parser 验证 Relay 签名，再由共享组装器统一校验 project/generation/
+  revision、meta counts、membership pointer、Project View 关系、Role/Assignment 唯一性
+  以及 Leader 与 Community `admin` 的一致性；任一部分不一致都不会产出 Brief。
+- 增加 canonical `RoleBrief` JSON DTO 和共享 Markdown renderer，区分
+  `candidate` 与 `assigned`。最小 Brief 包含 Project Profile、全部 active Goal、Role
+  定义与 level、当前 Assignment fence、与 Role 直接相关的 Issue/Work 切片，以及
+  meta、membership、对象和实体各自的 signed source reference。
+- Role Brief 仍是从当前投影即时派生的 read model，不新增表、不保存 `role.md`，也不成为
+  第二份规范状态。相同 verified snapshot 供 JSON、CLI Markdown、ACP prompt 和 Desktop
+  展示共同使用。
+
+### Managed Agent 动态绑定与写入 fencing
+
+- ACP 在 Relay 连接后的启动阶段解析一次 Role 状态，并在每个 channel turn 和 heartbeat
+  创建 session 前重新读取 NIP-11 Relay identity、meta、完整 v2 heads 和 meta 精确指向的
+  membership snapshot。读取使用前后 meta bracket；Brief 不能验证或超时时只注入
+  `State: unavailable`，不缓存、不回退到旧 Assignment。
+- 最新 Brief 作为动态 `[Role Brief]` user-context section 注入。它不进入长期
+  `systemPrompt`；slash command 仍保持首 block，Brief 紧随其后。ACP 同时发出
+  `role_context_resolved` observer frame，记录状态、Assignment、project revision、
+  projection generation 和失败类别。
+- 所有 managed Agent 的首次启动、lazy wake、slot refill、panic recovery 和 respawn
+  都由 harness 强制携带 `BUZZ_MANAGED_AGENT=1`；persona 和父进程环境不能覆盖。该标记也
+  传入 developer MCP，使 Agent 通过 shell 或 MCP 调用 `buzz` 时进入同一 managed 模式。
+- managed CLI 在每次 Role 或 Project View v2 写入签名前重新读取 verified snapshot。
+  已分配 Agent 自动携带当前 `acting_assignment_id`；显式提供的旧 fence 会在本地拒绝，
+  Relay 继续执行最终 Assignment fencing。未分配 Agent 可以读取、请求或处理属于自己的
+  Proposal，但不能进行普通 Project View 角色身份写入。
+- `buzz project-view` 补齐 schema-v2 read/create/update/delete，使 Agent 与 Desktop
+  修改同一份 Project View；v1 路径保持兼容。v2 写入后的 receipt 使用完整 verified
+  snapshot 确认，不把数据库或未验证事件作为客户端事实源。
+
+### CLI 与 Desktop 展示
+
+- 增加 `buzz roles brief [--member <pubkey>] [--markdown]`。默认输出 canonical JSON，
+  `--markdown` 输出与 ACP prompt 相同的共享 renderer 结果。
+- Desktop Tauri 从同一个共享组装器为每条 active Assignment 生成 Brief；React 只消费
+  该 verified DTO。Role Inspector 展示 Project 摘要、Goals、相关 Issue/Work 数量、
+  project revision 和 projection generation，并继续与当前任期、Proposal、Handoff
+  共用同一 v2 snapshot。
+
+### 验证
+
+- `buzz-sdk` 完整测试 `246/246`、`buzz-cli` `259/259`、`buzz-acp` library
+  `600/600` 和 pool lifecycle `9/9` 通过。
+- Desktop 单元测试 `3507/3507`、Biome/file-size/px-text/pubkey guards、TypeScript
+  production build 和 E2E build 均通过。
+- Project View Playwright smoke `24/24` 通过；新增断言覆盖 Inspector 的 verified
+  Role Brief。Desktop Tauri Project View 定向测试 `12/12` 通过。
+- `buzz-sdk`、`buzz-cli`、`buzz-acp` 和 Desktop Tauri 的
+  `clippy --all-targets -D warnings` 均通过；workspace Rust fmt 与差异 whitespace
+  检查通过。
+
+### 范围边界
+
+- 本阶段完成的是 Assignment 身份绑定和最小上下文，不包含 Work
+  `responsible_role_id`、Commitment 或 `waiting-for-continuation`；这些属于阶段 5。
+- 结构化 Checkpoint、成员撰写的完整 Handoff、Role 时间线和完整 Role Brief 属于阶段
+  6；runtime lease、epoch、可信 supervisor 和自动 `unrecoverable` 属于阶段 7。
+
 ## 2026-07-28 — 阶段 3：Desktop Human 治理
 
 ### v2 普通 Project View 对象写入

@@ -18,6 +18,8 @@ pub mod nip_oa;
 pub mod project_view;
 /// Project View v2 Role continuity command and projection wire format.
 pub mod project_view_v2;
+/// Verified Project View v2 Role Brief assembly and Markdown rendering.
+pub mod role_brief;
 
 pub use builders::*;
 

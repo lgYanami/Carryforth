@@ -85,12 +85,72 @@ type RawProjectRoleHandoff = {
   project_revision: number;
 };
 
+type RawRoleBriefSource = {
+  event_id: string;
+  project_revision: number;
+  item_revision: number;
+  change_id: string;
+  source_type: string;
+};
+
+type RawRoleBriefObject = {
+  object: {
+    id: string;
+    object_type: string;
+    data: {
+      object_type: string;
+      data: Record<string, unknown>;
+    };
+  };
+  source: RawRoleBriefSource;
+};
+
+type RawProjectRoleBrief = {
+  generated_at: string;
+  project_id: string;
+  project_revision: number;
+  projection_generation: number;
+  member_pubkey: string;
+  community_role?: ProjectCommunityMemberRole;
+  project: {
+    profile: RawRoleBriefObject;
+    goals: RawRoleBriefObject[];
+  };
+  state:
+    | {
+        status: "candidate";
+        open_proposals: Array<{
+          proposal: RawProjectRoleProposal;
+          source: RawRoleBriefSource;
+        }>;
+      }
+    | {
+        status: "assigned";
+        role: {
+          role: RawProjectRoleDefinition;
+          source: RawRoleBriefSource;
+        };
+        assignment: {
+          assignment: RawProjectRoleAssignment;
+          source: RawRoleBriefSource;
+        };
+      };
+  related_objects: RawRoleBriefObject[];
+  source_revisions: {
+    meta_event_id: string;
+    meta_change_id: string;
+    membership_event_id: string;
+    project_updated_at: string;
+  };
+};
+
 export type RawProjectViewRoleContinuity = {
   roles: RawProjectRoleDefinition[];
   proposals: RawProjectRoleProposal[];
   assignments: RawProjectRoleAssignment[];
   handoffs: RawProjectRoleHandoff[];
   members: Array<{ pubkey: string; role: ProjectCommunityMemberRole }>;
+  briefs: RawProjectRoleBrief[];
 };
 
 export type ProjectRoleDefinition = {
@@ -160,13 +220,150 @@ export type ProjectRoleHandoff = {
   projectRevision: number;
 };
 
+export type ProjectRoleBrief = {
+  generatedAt: string;
+  projectId: string;
+  projectRevision: number;
+  projectionGeneration: number;
+  memberPubkey: string;
+  communityRole?: ProjectCommunityMemberRole;
+  project: {
+    name: string;
+    purpose: string;
+    positioning: string;
+    scope: string;
+    goals: Array<{ title: string; desiredOutcome: string }>;
+  };
+  state:
+    | {
+        status: "candidate";
+        openProposalIds: string[];
+      }
+    | {
+        status: "assigned";
+        roleId: string;
+        roleName: string;
+        level: ProjectRoleLevel;
+        assignmentId: string;
+        startedAt: string;
+      };
+  relatedObjects: Array<{
+    id: string;
+    objectType: string;
+    title: string;
+  }>;
+  sourceRevisions: {
+    metaEventId: string;
+    metaChangeId: string;
+    membershipEventId: string;
+    projectUpdatedAt: string;
+  };
+};
+
 export type ProjectViewRoleContinuity = {
   roles: ProjectRoleDefinition[];
   proposals: ProjectRoleProposal[];
   assignments: ProjectRoleAssignment[];
   handoffs: ProjectRoleHandoff[];
   members: Array<{ pubkey: string; role: ProjectCommunityMemberRole }>;
+  briefs: ProjectRoleBrief[];
 };
+
+function briefObjectTitle(object: RawRoleBriefObject["object"]) {
+  const data = object.data.data;
+  const candidate =
+    data.title ??
+    data.name ??
+    data.description ??
+    `${object.object_type} ${object.id}`;
+  return typeof candidate === "string" ? candidate : String(candidate);
+}
+
+function normalizeRoleBrief(
+  raw: RawProjectRoleBrief,
+  projectRevision: number,
+): ProjectRoleBrief {
+  const profile = raw.project.profile.object;
+  if (
+    profile.object_type !== "project_profile" ||
+    profile.data.object_type !== "project_profile" ||
+    raw.project_revision !== projectRevision
+  ) {
+    throw new ProjectViewIntegrityError(
+      "Role Brief does not match the verified Project snapshot",
+    );
+  }
+  const profileData = profile.data.data;
+  const stringField = (name: string) => {
+    const value = profileData[name];
+    if (typeof value !== "string") {
+      throw new ProjectViewIntegrityError(
+        `Role Brief Project Profile is missing ${name}`,
+      );
+    }
+    return value;
+  };
+  const goals = raw.project.goals.map((goal) => {
+    const data = goal.object.data.data;
+    if (
+      goal.object.object_type !== "goal" ||
+      goal.object.data.object_type !== "goal" ||
+      typeof data.title !== "string" ||
+      typeof data.desired_outcome !== "string"
+    ) {
+      throw new ProjectViewIntegrityError(
+        "Role Brief contains an invalid Goal summary",
+      );
+    }
+    return {
+      title: data.title,
+      desiredOutcome: data.desired_outcome,
+    };
+  });
+  const state: ProjectRoleBrief["state"] =
+    raw.state.status === "assigned"
+      ? {
+          status: "assigned",
+          roleId: raw.state.role.role.role_id,
+          roleName: raw.state.role.role.name,
+          level: raw.state.role.role.level,
+          assignmentId: raw.state.assignment.assignment.assignment_id,
+          startedAt: raw.state.assignment.assignment.started_at,
+        }
+      : {
+          status: "candidate",
+          openProposalIds: raw.state.open_proposals.map(
+            (proposal) => proposal.proposal.proposal_id,
+          ),
+        };
+  return {
+    generatedAt: raw.generated_at,
+    projectId: raw.project_id,
+    projectRevision: raw.project_revision,
+    projectionGeneration: raw.projection_generation,
+    memberPubkey: raw.member_pubkey,
+    communityRole: raw.community_role,
+    project: {
+      name: stringField("name"),
+      purpose: stringField("purpose"),
+      positioning: stringField("positioning"),
+      scope: stringField("scope"),
+      goals,
+    },
+    state,
+    relatedObjects: raw.related_objects.map((related) => ({
+      id: related.object.id,
+      objectType: related.object.object_type,
+      title: briefObjectTitle(related.object),
+    })),
+    sourceRevisions: {
+      metaEventId: raw.source_revisions.meta_event_id,
+      metaChangeId: raw.source_revisions.meta_change_id,
+      membershipEventId: raw.source_revisions.membership_event_id,
+      projectUpdatedAt: raw.source_revisions.project_updated_at,
+    },
+  };
+}
 
 export function normalizeRoleContinuity(
   raw: RawProjectViewRoleContinuity,
@@ -238,6 +435,9 @@ export function normalizeRoleContinuity(
     entityRevision: handoff.entity_revision,
     projectRevision: handoff.project_revision,
   }));
+  const briefs = raw.briefs.map((brief) =>
+    normalizeRoleBrief(brief, projectRevision),
+  );
   const roleObjectIds = new Set(view.roles.map((role) => role.id));
   const roleIds = new Set<string>();
   for (const role of roles) {
@@ -278,12 +478,33 @@ export function normalizeRoleContinuity(
       activeMemberPubkeys.add(assignment.memberPubkey);
     }
   }
+  for (const brief of briefs) {
+    if (brief.state.status === "assigned") {
+      const assignedState = brief.state;
+      const assignment = assignments.find(
+        (candidate) =>
+          candidate.assignmentId === assignedState.assignmentId &&
+          !candidate.endedAt,
+      );
+      if (
+        !assignment ||
+        assignment.memberPubkey.toLowerCase() !==
+          brief.memberPubkey.toLowerCase() ||
+        assignment.roleId !== assignedState.roleId
+      ) {
+        throw new ProjectViewIntegrityError(
+          "Role Brief Assignment disagrees with Role continuity",
+        );
+      }
+    }
+  }
   return {
     roles,
     proposals,
     assignments,
     handoffs,
     members: raw.members,
+    briefs,
   };
 }
 

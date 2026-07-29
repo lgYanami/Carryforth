@@ -13,6 +13,7 @@ pub mod pack;
 pub mod patches;
 pub mod pr;
 pub mod project_view;
+pub(crate) mod project_view_v2_snapshot;
 pub mod reactions;
 pub mod repos;
 pub mod roles;

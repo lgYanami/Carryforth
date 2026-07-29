@@ -90,6 +90,13 @@ export function ProjectRoleInspector({
     continuity.assignments,
     definition.roleId,
   );
+  const currentBrief = currentAssignment
+    ? continuity.briefs.find(
+        (brief) =>
+          brief.state.status === "assigned" &&
+          brief.state.assignmentId === currentAssignment.assignmentId,
+      )
+    : undefined;
   const viewerMembership = continuity.members.find(
     (member) => member.pubkey.toLowerCase() === normalizedCurrentPubkey,
   );
@@ -247,6 +254,52 @@ export function ProjectRoleInspector({
           </p>
         )}
       </div>
+
+      {currentBrief ? (
+        <div
+          className="rounded-xl border border-border/70 bg-muted/20 p-3"
+          data-testid="project-role-brief"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Verified Role Brief
+            </div>
+            <Badge variant="outline">
+              Revision {currentBrief.projectRevision}
+            </Badge>
+          </div>
+          <div className="mt-2 text-sm font-medium">
+            {currentBrief.project.name}
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            {currentBrief.project.purpose}
+          </p>
+          <div className="mt-3 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Goals
+          </div>
+          <ul className="mt-1.5 space-y-1 text-xs">
+            {currentBrief.project.goals.map((goal) => (
+              <li key={goal.title}>
+                <span className="font-medium">{goal.title}</span>
+                <span className="text-muted-foreground">
+                  {" "}
+                  · {goal.desiredOutcome}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {currentBrief.relatedObjects.length > 0 ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              {currentBrief.relatedObjects.length} related Issue/Work{" "}
+              {currentBrief.relatedObjects.length === 1 ? "object" : "objects"}
+            </p>
+          ) : null}
+          <p className="mt-2 text-2xs text-muted-foreground">
+            Projection generation {currentBrief.projectionGeneration} · built
+            from the same verified projection model used by assigned Agents.
+          </p>
+        </div>
+      ) : null}
 
       {canGovernRole || canRequest ? (
         <div className="flex flex-wrap gap-2">

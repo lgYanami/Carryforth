@@ -1,45 +1,26 @@
 //! `buzz roles` — verified Project View v2 Role continuity reads and writes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
-use buzz_core::kind::{
-    KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
-};
 use buzz_core::PublicKey;
 use buzz_project_view::v2::{
-    CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCommand,
-    RoleCommandRequest, RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel,
+    ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCommand, RoleCommandRequest,
+    RoleDefinition, RoleHandoff,
 };
-use buzz_sdk::project_view_v2::{
-    build_role_command, parse_entity_projection, parse_membership_projection,
-    parse_meta_projection, V2MembershipProjection, V2MetaProjection,
-};
+use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
+use buzz_sdk::role_brief::render_role_brief_markdown;
 use chrono::{Duration, Utc};
-use nostr::Event;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::{normalize_write_response, BuzzClient};
+use crate::commands::project_view_v2_snapshot::{
+    is_managed_runtime, read_current_v2_snapshot, read_verified_v2_snapshot, require_v2_identity,
+};
 use crate::error::CliError;
 use crate::validate::sdk_err;
 use crate::{OutputFormat, RoleAssignmentCmd, RoleProposalCmd, RoleProposalStatusArg, RolesCmd};
-
-const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
-const SNAPSHOT_ATTEMPTS: usize = 3;
-
-#[derive(Debug, Clone, Copy)]
-struct RoleIdentity {
-    relay_pubkey: PublicKey,
-}
-
-#[derive(Deserialize)]
-struct Nip11Document {
-    #[serde(default)]
-    supported_extensions: Vec<String>,
-    #[serde(rename = "self")]
-    relay_self: Option<String>,
-}
 
 #[derive(Debug)]
 struct RoleSnapshot {
@@ -66,6 +47,9 @@ pub async fn dispatch(
 ) -> Result<(), CliError> {
     match command {
         RolesCmd::List => list_roles(client, format).await,
+        RolesCmd::Brief { member, markdown } => {
+            show_brief(client, member.as_deref(), markdown, format).await
+        }
         RolesCmd::Get { role } => get_role(client, role, format).await,
         RolesCmd::Current { member } => current_assignment(client, member.as_deref(), format).await,
         RolesCmd::Proposals { status } => list_proposals(client, status, format).await,
@@ -118,6 +102,31 @@ pub async fn dispatch(
         RolesCmd::Proposal { command } => submit_proposal(client, command).await,
         RolesCmd::Assignment { command } => dispatch_assignment(client, command, format).await,
     }
+}
+
+async fn show_brief(
+    client: &BuzzClient,
+    member: Option<&str>,
+    markdown: bool,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let member = member
+        .map(parse_pubkey)
+        .transpose()?
+        .unwrap_or_else(|| client.public_key());
+    let snapshot = read_current_v2_snapshot(client).await?;
+    let brief = snapshot
+        .brief_for(member, Utc::now())
+        .map_err(|error| integrity_error(error.to_string()))?;
+    if markdown {
+        print!("{}", render_role_brief_markdown(&brief));
+        return Ok(());
+    }
+    print_json(
+        &serde_json::to_value(brief)
+            .map_err(|error| CliError::Other(format!("serialize Role Brief: {error}")))?,
+        format,
+    )
 }
 
 async fn list_roles(client: &BuzzClient, format: &OutputFormat) -> Result<(), CliError> {
@@ -426,8 +435,43 @@ async fn dispatch_assignment(
     }
 }
 
-async fn submit(client: &BuzzClient, command: RoleCommand) -> Result<(), CliError> {
-    require_identity(client).await?;
+async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), CliError> {
+    let identity = require_v2_identity(client).await?;
+    if is_managed_runtime() {
+        let snapshot = read_verified_v2_snapshot(client, identity)
+            .await
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "assignment_unavailable: current Assignment could not be verified: {error}"
+                ))
+            })?;
+        let current_assignment = snapshot
+            .assignments()
+            .find(|assignment| {
+                assignment.member_pubkey == client.public_key() && assignment.is_active()
+            })
+            .map(|assignment| assignment.assignment_id);
+        if command
+            .acting_assignment_id
+            .is_some_and(|provided| Some(provided) != current_assignment)
+        {
+            return Err(CliError::Conflict(
+                "provided acting Assignment is not the verified current Assignment".to_owned(),
+            ));
+        }
+        match &command.request {
+            RoleCommandRequest::RequestReplacement { assignment_id, .. }
+            | RoleCommandRequest::ReportUnableToContinue { assignment_id, .. }
+                if Some(*assignment_id) != current_assignment =>
+            {
+                return Err(CliError::Conflict(
+                    "target Assignment is not the verified current Assignment".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        command.acting_assignment_id = current_assignment;
+    }
     let event = client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?;
     let response = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&response));
@@ -435,231 +479,14 @@ async fn submit(client: &BuzzClient, command: RoleCommand) -> Result<(), CliErro
 }
 
 async fn read_snapshot(client: &BuzzClient) -> Result<RoleSnapshot, CliError> {
-    let identity = require_identity(client).await?;
-    for attempt in 0..SNAPSHOT_ATTEMPTS {
-        let before = read_meta(client, identity).await?;
-        let filter = json!({
-            "kinds": [KIND_PROJECT_VIEW_OBJECT],
-            "authors": [identity.relay_pubkey.to_hex()],
-            "#t": ["buzz-project-view-v2-entity"],
-        });
-        let raw_events = client.query_all(filter).await?;
-        let mut event_ids = HashSet::with_capacity(raw_events.len());
-        let mut roles = Vec::new();
-        let mut proposals = Vec::new();
-        let mut assignments = Vec::new();
-        let mut handoffs = Vec::new();
-        for raw in raw_events {
-            let event: Event = serde_json::from_value(raw)
-                .map_err(|error| integrity_error(format!("invalid entity event: {error}")))?;
-            if !event_ids.insert(event.id) {
-                return Err(integrity_error("entity query returned a duplicate event"));
-            }
-            let projection =
-                parse_entity_projection(&event, &identity.relay_pubkey, before.project_id)
-                    .map_err(|error| integrity_error(error.to_string()))?;
-            if projection.projection_generation != before.projection_generation
-                || projection.project_revision > before.project_revision
-            {
-                return Err(CliError::Conflict(
-                    "Role projection snapshot changed during read".to_owned(),
-                ));
-            }
-            match projection.entity {
-                RoleContinuityChange::Role(role) => roles.push(role),
-                RoleContinuityChange::Proposal(proposal) => proposals.push(proposal),
-                RoleContinuityChange::Assignment(assignment) => assignments.push(assignment),
-                RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff),
-            }
-        }
-        let membership = read_membership(client, identity, &before).await?;
-        let after = read_meta(client, identity).await?;
-        if before.event_id != after.event_id {
-            if attempt + 1 < SNAPSHOT_ATTEMPTS {
-                continue;
-            }
-            return Err(CliError::Conflict(
-                "Role projection changed during every bounded snapshot attempt".to_owned(),
-            ));
-        }
-        let active_assignments = assignments
-            .iter()
-            .filter(|assignment| assignment.is_active())
-            .count();
-        let open_proposals = proposals
-            .iter()
-            .filter(|proposal| proposal.status == ProposalStatus::Open)
-            .count();
-        if usize::try_from(before.entity_counts.active_assignments).ok() != Some(active_assignments)
-            || usize::try_from(before.entity_counts.open_proposals).ok() != Some(open_proposals)
-            || usize::try_from(before.entity_counts.handoffs).ok() != Some(handoffs.len())
-        {
-            return Err(integrity_error(
-                "v2 metadata counts disagree with verified entity heads",
-            ));
-        }
-        validate_membership_assignment_consistency(&roles, &assignments, &membership)?;
-        roles.sort_by_key(|role| role.role_id);
-        proposals.sort_by_key(|proposal| proposal.proposal_id);
-        assignments.sort_by_key(|assignment| assignment.assignment_id);
-        handoffs.sort_by_key(|handoff| handoff.handoff_id);
-        return Ok(RoleSnapshot {
-            meta: before,
-            roles,
-            proposals,
-            assignments,
-            handoffs,
-        });
-    }
-    Err(CliError::Conflict(
-        "Role projection snapshot could not be stabilized".to_owned(),
-    ))
-}
-
-async fn read_membership(
-    client: &BuzzClient,
-    identity: RoleIdentity,
-    meta: &V2MetaProjection,
-) -> Result<V2MembershipProjection, CliError> {
-    let filter = json!({
-        "ids": [meta.membership_snapshot_event_id.to_hex()],
-        "kinds": [KIND_NIP43_MEMBERSHIP_LIST],
-        "authors": [identity.relay_pubkey.to_hex()],
-        "limit": 2,
-    });
-    let raw = client.query(&filter).await?;
-    let values: Vec<Value> = serde_json::from_str(&raw)
-        .map_err(|error| integrity_error(format!("invalid membership response: {error}")))?;
-    if values.len() != 1 {
-        return Err(integrity_error(
-            "metadata membership pointer did not resolve to exactly one live snapshot",
-        ));
-    }
-    let event: Event = serde_json::from_value(
-        values
-            .into_iter()
-            .next()
-            .ok_or_else(|| integrity_error("membership response is empty"))?,
-    )
-    .map_err(|error| integrity_error(format!("invalid membership event: {error}")))?;
-    if event.id != meta.membership_snapshot_event_id {
-        return Err(integrity_error(
-            "membership query returned an event other than the metadata pointer",
-        ));
-    }
-    parse_membership_projection(&event, &identity.relay_pubkey)
-        .map_err(|error| integrity_error(error.to_string()))
-}
-
-fn validate_membership_assignment_consistency(
-    roles: &[RoleDefinition],
-    assignments: &[RoleAssignment],
-    membership: &V2MembershipProjection,
-) -> Result<(), CliError> {
-    let roles = roles
-        .iter()
-        .map(|role| (role.role_id, role))
-        .collect::<BTreeMap<_, _>>();
-    let members = membership
-        .members
-        .iter()
-        .map(|member| (member.pubkey, member.role))
-        .collect::<BTreeMap<_, _>>();
-    let mut assigned_members = HashSet::new();
-    for assignment in assignments
-        .iter()
-        .filter(|assignment| assignment.is_active())
-    {
-        if !assigned_members.insert(assignment.member_pubkey) {
-            return Err(integrity_error(
-                "one Member has multiple active Assignment heads",
-            ));
-        }
-        let role = roles.get(&assignment.role_id).ok_or_else(|| {
-            integrity_error("an active Assignment references a missing Role head")
-        })?;
-        let community_role = members.get(&assignment.member_pubkey).ok_or_else(|| {
-            integrity_error("an active Assignment assignee is absent from membership")
-        })?;
-        let expected = match role.level {
-            RoleLevel::Admin => CommunityMemberRole::Admin,
-            RoleLevel::Member => CommunityMemberRole::Member,
-        };
-        if *community_role != CommunityMemberRole::Owner && *community_role != expected {
-            return Err(integrity_error(
-                "an active Assignment disagrees with the assignee's Community role",
-            ));
-        }
-    }
-    for (pubkey, role) in members {
-        if role == CommunityMemberRole::Admin
-            && !assignments.iter().any(|assignment| {
-                assignment.is_active()
-                    && assignment.member_pubkey == pubkey
-                    && roles
-                        .get(&assignment.role_id)
-                        .is_some_and(|role| role.level == RoleLevel::Admin)
-            })
-        {
-            return Err(integrity_error(
-                "a non-owner Community admin has no active Leader Assignment",
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn read_meta(
-    client: &BuzzClient,
-    identity: RoleIdentity,
-) -> Result<V2MetaProjection, CliError> {
-    let filter = json!({
-        "kinds": [KIND_PROJECT_VIEW_META],
-        "authors": [identity.relay_pubkey.to_hex()],
-        "limit": 2,
-    });
-    let raw = client.query(&filter).await?;
-    let values: Vec<Value> = serde_json::from_str(&raw)
-        .map_err(|error| integrity_error(format!("invalid metadata response: {error}")))?;
-    if values.len() != 1 {
-        return Err(integrity_error(
-            "v2 metadata query did not return exactly one current head",
-        ));
-    }
-    let event: Event = serde_json::from_value(
-        values
-            .into_iter()
-            .next()
-            .ok_or_else(|| integrity_error("v2 metadata response is empty"))?,
-    )
-    .map_err(|error| integrity_error(format!("invalid metadata event: {error}")))?;
-    parse_meta_projection(&event, &identity.relay_pubkey)
-        .map_err(|error| integrity_error(error.to_string()))
-}
-
-async fn require_identity(client: &BuzzClient) -> Result<RoleIdentity, CliError> {
-    let raw = client.get_public("/info").await?;
-    let info: Nip11Document = serde_json::from_str(&raw)
-        .map_err(|error| integrity_error(format!("invalid NIP-11 document: {error}")))?;
-    if !info
-        .supported_extensions
-        .iter()
-        .any(|extension| extension == PROJECT_VIEW_V2_EXTENSION)
-    {
-        return Err(CliError::Other(format!(
-            "unsupported: relay does not advertise {PROJECT_VIEW_V2_EXTENSION}"
-        )));
-    }
-    let relay_self = info.relay_self.ok_or_else(|| {
-        integrity_error("NIP-11 advertises Project View v2 without a relay `self` key")
-    })?;
-    let relay_pubkey = parse_pubkey(&relay_self)?;
-    if relay_pubkey.to_hex() != relay_self {
-        return Err(integrity_error(
-            "NIP-11 relay `self` is not canonical lowercase hex",
-        ));
-    }
-    Ok(RoleIdentity { relay_pubkey })
+    let snapshot = read_current_v2_snapshot(client).await?;
+    Ok(RoleSnapshot {
+        meta: snapshot.meta().clone(),
+        roles: snapshot.roles().cloned().collect(),
+        proposals: snapshot.proposals().cloned().collect(),
+        assignments: snapshot.assignments().cloned().collect(),
+        handoffs: snapshot.handoffs().cloned().collect(),
+    })
 }
 
 fn parse_pubkey(value: &str) -> Result<PublicKey, CliError> {

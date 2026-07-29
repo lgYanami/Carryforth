@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod role_brief;
 mod setup_mode;
 mod usage;
 
@@ -1355,6 +1356,24 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("connected to relay at {}", config.relay_url);
 
+    let role_brief_resolver =
+        role_brief::RoleBriefResolver::new(relay.rest_client(), config.keys.public_key());
+    let startup_role_context = role_brief_resolver.resolve_bounded().await;
+    match startup_role_context.error_code {
+        Some(code) => tracing::warn!(
+            status = startup_role_context.status,
+            error_code = code,
+            "managed Agent startup could not verify a Role Brief; writes remain fail-closed"
+        ),
+        None => tracing::info!(
+            status = startup_role_context.status,
+            assignment_id = ?startup_role_context.assignment_id,
+            project_revision = ?startup_role_context.project_revision,
+            projection_generation = ?startup_role_context.projection_generation,
+            "managed Agent startup Role context resolved"
+        ),
+    }
+
     relay
         .subscribe_membership_notifications()
         .await
@@ -1549,6 +1568,7 @@ async fn tokio_main() -> Result<()> {
             .to_string_lossy()
             .to_string(),
         rest_client: relay.rest_client(),
+        role_brief_resolver,
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
@@ -1759,7 +1779,7 @@ async fn tokio_main() -> Result<()> {
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
+                let env = managed_agent_env(&config.persona_env_vars);
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -3485,7 +3505,7 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = managed_agent_env(&config.persona_env_vars);
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3663,7 +3683,7 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = managed_agent_env(&config.persona_env_vars);
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3730,12 +3750,22 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env: managed_agent_env(&config.persona_env_vars),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
         }
     }
+}
+
+fn managed_agent_env(persona_env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = persona_env
+        .iter()
+        .filter(|(name, _)| name != "BUZZ_MANAGED_AGENT")
+        .cloned()
+        .collect::<Vec<_>>();
+    env.push(("BUZZ_MANAGED_AGENT".to_owned(), "1".to_owned()));
+    env
 }
 
 async fn initialize_agent_pool(
@@ -4166,6 +4196,10 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         .secret_key()
                         .to_bech32()
                         .expect("secret key bech32 encoding should never fail"),
+                },
+                EnvVar {
+                    name: "BUZZ_MANAGED_AGENT".into(),
+                    value: "1".into(),
                 },
             ];
             // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
@@ -5004,6 +5038,35 @@ mod build_mcp_servers_tests {
             names.contains(&"BUZZ_PRIVATE_KEY"),
             "missing BUZZ_PRIVATE_KEY; got {names:?}"
         );
+        assert!(
+            names.contains(&"BUZZ_MANAGED_AGENT"),
+            "missing BUZZ_MANAGED_AGENT; got {names:?}"
+        );
+        assert_eq!(
+            server
+                .env
+                .iter()
+                .find(|env| env.name == "BUZZ_MANAGED_AGENT")
+                .map(|env| env.value.as_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn managed_runtime_marker_overrides_persona_value() {
+        let env = managed_agent_env(&[
+            ("PERSONA".to_owned(), "developer".to_owned()),
+            ("BUZZ_MANAGED_AGENT".to_owned(), "0".to_owned()),
+        ]);
+        let marker_values = env
+            .iter()
+            .filter(|(name, _)| name == "BUZZ_MANAGED_AGENT")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(marker_values, vec!["1"]);
+        assert!(env
+            .iter()
+            .any(|(name, value)| name == "PERSONA" && value == "developer"));
     }
 
     #[test]

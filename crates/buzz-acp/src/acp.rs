@@ -452,6 +452,12 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
+            if key == "BUZZ_MANAGED_AGENT" {
+                // This is a harness-owned security-mode marker. A parent-shell
+                // value must not downgrade a managed child to an unfenced CLI.
+                cmd.env(key, value);
+                continue;
+            }
             if std::env::var(key).is_err() {
                 cmd.env(key, value);
             }

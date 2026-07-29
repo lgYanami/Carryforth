@@ -502,6 +502,8 @@ pub struct PromptContext {
     pub cwd: String,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
+    /// Stateless verified Project View v2 resolver refreshed before every turn.
+    pub role_brief_resolver: crate::role_brief::RoleBriefResolver,
     /// Shared channel metadata for startup-known and dynamically joined channels.
     pub channel_info: ChannelInfoResolver,
     /// Max messages to include in thread/DM context. 0 = disabled.
@@ -1118,6 +1120,15 @@ pub(crate) fn prepend_canvas_for_legacy(
     }
 }
 
+/// Prepend the freshly verified dynamic Role Brief to one prompt body.
+///
+/// Unlike base/persona/canvas context this is never folded into
+/// `session/new`: a long-lived session must observe Assignment replacement on
+/// its very next turn.
+pub(crate) fn prepend_role_brief(role_brief: &str, body: &str) -> String {
+    format!("{role_brief}\n{body}")
+}
+
 /// Frame the `session/new` `systemPrompt` so each present prompt carries its own
 /// header, keeping the base/persona boundary recoverable downstream.
 ///
@@ -1349,6 +1360,37 @@ pub async fn run_prompt_task(
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+
+    // Role identity is dynamic authorization context, not session configuration.
+    // Resolve it before session creation on every channel prompt and heartbeat.
+    // The resolver never reuses an older Brief: failure produces an explicit
+    // fail-closed `[Role Brief]` section instead.
+    let role_context = ctx.role_brief_resolver.resolve_bounded().await;
+    agent.acp.observe(
+        "role_context_resolved",
+        serde_json::json!({
+            "status": role_context.status,
+            "assignmentId": role_context.assignment_id,
+            "projectRevision": role_context.project_revision,
+            "projectionGeneration": role_context.projection_generation,
+            "errorCode": role_context.error_code,
+        }),
+    );
+    if let Some(code) = role_context.error_code {
+        tracing::warn!(
+            target: "pool::role_brief",
+            error_code = code,
+            "current Role Brief unavailable; injecting fail-closed context"
+        );
+    } else {
+        tracing::info!(
+            target: "pool::role_brief",
+            status = role_context.status,
+            assignment_id = ?role_context.assignment_id,
+            project_revision = ?role_context.project_revision,
+            "current Role Brief verified"
+        );
+    }
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -1608,6 +1650,7 @@ pub async fn run_prompt_task(
                 agent_canvas.as_deref(),
                 &init_msg,
             );
+            let init_msg = prepend_role_brief(&role_context.markdown, &init_msg);
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -1815,9 +1858,12 @@ pub async fn run_prompt_task(
     // of its own leaf — so the "Prompt context" panel counts every section.
     let prompt_blocks: Vec<&str> = match slash_command {
         Some(ref cmd) => std::iter::once(cmd.as_str())
+            .chain(std::iter::once(role_context.markdown.as_str()))
             .chain(prompt_sections.iter().map(String::as_str))
             .collect(),
-        None => prompt_sections.iter().map(String::as_str).collect(),
+        None => std::iter::once(role_context.markdown.as_str())
+            .chain(prompt_sections.iter().map(String::as_str))
+            .collect(),
     };
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
@@ -3776,6 +3822,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn role_brief_is_dynamic_user_context_before_initial_message() {
+        let composed = prepend_role_brief(
+            "[Role Brief]\nState: assigned\nAssignment: abc",
+            "Begin work",
+        );
+        assert_eq!(
+            composed,
+            "[Role Brief]\nState: assigned\nAssignment: abc\nBegin work"
+        );
+    }
+
     // Pin the session/new systemPrompt framing: each present prompt carries its
     // own header so the desktop observer can split into labeled sub-sections.
 
@@ -5272,6 +5330,12 @@ mod tests {
         owner_pubkey: Option<nostr::PublicKey>,
     ) -> PromptContext {
         use crate::relay::RestClient;
+        let rest_client = RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".to_string(),
+            keys: agent_keys.clone(),
+            auth_tag_json: None,
+        };
         PromptContext {
             mcp_servers: vec![],
             initial_message: None,
@@ -5284,21 +5348,12 @@ mod tests {
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),
-            rest_client: RestClient {
-                http: reqwest::Client::new(),
-                base_url: "http://127.0.0.1:0".to_string(),
-                keys: agent_keys.clone(),
-                auth_tag_json: None,
-            },
-            channel_info: ChannelInfoResolver::new(
-                std::collections::HashMap::new(),
-                RestClient {
-                    http: reqwest::Client::new(),
-                    base_url: "http://127.0.0.1:0".to_string(),
-                    keys: agent_keys.clone(),
-                    auth_tag_json: None,
-                },
+            rest_client: rest_client.clone(),
+            role_brief_resolver: crate::role_brief::RoleBriefResolver::new(
+                rest_client.clone(),
+                agent_keys.public_key(),
             ),
+            channel_info: ChannelInfoResolver::new(std::collections::HashMap::new(), rest_client),
             context_message_limit: 0,
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,

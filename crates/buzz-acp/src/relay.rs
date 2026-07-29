@@ -392,6 +392,23 @@ impl RestClient {
         .await
     }
 
+    /// GET a public Relay metadata endpoint without NIP-98 authentication.
+    pub async fn get_public(&self, path: &str) -> Result<Value, RelayError> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .request_with_retry("GET", path, || {
+                self.http
+                    .get(&url)
+                    .header(reqwest::header::ACCEPT, "application/nostr+json")
+                    .send()
+            })
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))
+    }
+
     /// Query events via the HTTP bridge: `POST /query` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
