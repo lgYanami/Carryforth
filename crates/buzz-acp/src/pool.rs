@@ -211,6 +211,8 @@ impl OwnedAgent {
 /// tasks for panic recovery.
 pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
+    /// Idle slots held for Relay-issued Meeting V1 Grants.
+    reserved_meeting_slots: usize,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
@@ -513,8 +515,8 @@ pub struct PromptContext {
     pub permission_mode: PermissionMode,
     /// Fail session creation unless the requested permission mode is enforced.
     ///
-    /// Meeting turns set this for read-only Plan mode; ordinary channel turns
-    /// retain the historical best-effort fallback.
+    /// Legacy V0 Meeting turns retain their original enforced Plan profile;
+    /// ordinary and V1 advisory turns keep best-effort permission handling.
     pub require_permission_mode: bool,
     /// Agent identity — used to derive the NIP-AE conversation key at
     /// session creation for core injection.
@@ -548,6 +550,7 @@ impl AgentPool {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         Self {
             agents: slots,
+            reserved_meeting_slots: 0,
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -560,8 +563,22 @@ impl AgentPool {
     /// Pass 1: prefer an agent that already has a session for `channel_id`.
     /// Pass 2: any idle agent.
     ///
-    /// Returns `None` if all agents are checked out.
+    /// Returns `None` when no idle agent remains above the Meeting reservation
+    /// floor, even if a reserved idle slot still exists.
     pub fn try_claim(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
+        if self.idle_count() <= self.reserved_meeting_slots {
+            return None;
+        }
+        self.try_claim_inner(channel_id)
+    }
+
+    /// Claim a slot for a controller-owned Meeting turn, including one held by
+    /// the local V1 Offer reservation floor.
+    pub fn try_claim_meeting(&mut self, channel_id: Uuid) -> Option<OwnedAgent> {
+        self.try_claim_inner(Some(channel_id))
+    }
+
+    fn try_claim_inner(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this channel.
         if let Some(cid) = channel_id {
             let idx = self.agents.iter().position(|slot| {
@@ -577,6 +594,11 @@ impl AgentPool {
         // Pass 2: first idle agent.
         let idx = self.agents.iter().position(|slot| slot.is_some());
         idx.map(|i| self.agents[i].take().unwrap())
+    }
+
+    /// Hold this many live slots for accepted Meeting V1 Offers/Grants.
+    pub fn set_reserved_meeting_slots(&mut self, reserved: usize) {
+        self.reserved_meeting_slots = reserved.min(self.live_count());
     }
 
     /// Return an agent to its slot after a task completes.
@@ -598,6 +620,12 @@ impl AgentPool {
     /// Whether any agent is currently idle (sitting in its slot).
     pub fn any_idle(&self) -> bool {
         self.agents.iter().any(|slot| slot.is_some())
+    }
+
+    /// Number of live Agent subprocesses that are not currently executing a
+    /// turn. Meeting V1 uses this snapshot when atomically reserving an Offer.
+    pub fn idle_count(&self) -> usize {
+        self.agents.iter().filter(|slot| slot.is_some()).count()
     }
 
     /// Whether any idle agent already has a session for `channel_id`.
@@ -3697,6 +3725,248 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    async fn meeting_pool_test_agent(index: usize) -> OwnedAgent {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 30".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn pool test agent");
+        OwnedAgent {
+            index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    async fn meeting_granted_turn_fake_agent() -> OwnedAgent {
+        // This is a real ACP stdio peer, not a mocked AcpClient. It exits as
+        // soon as the V1 harness fails to pass the ordinary context MCP through
+        // unchanged or inserts the V0 read-only profile / Plan mode before the
+        // Granted Speech prompt.
+        let script = r#"
+            set -eu
+
+            fail() {
+                printf 'meeting fake agent rejected request: %s\n' "$1" >&2
+                exit "$2"
+            }
+
+            IFS= read -r INIT
+            [[ "$INIT" == *'"method":"initialize"'* ]] ||
+                fail "expected initialize" 40
+            printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":2,"agentCapabilities":{},"agentInfo":{"name":"meeting-fake-agent","version":"test"}}}'
+
+            IFS= read -r SESSION_NEW
+            [[ "$SESSION_NEW" == *'"method":"session/new"'* ]] ||
+                fail "expected session/new" 41
+            [[ "$SESSION_NEW" == *'"name":"project-context-mcp"'* ]] ||
+                fail "missing inherited project context MCP" 42
+            [[ "$SESSION_NEW" == *'"name":"NORMAL_CONTEXT"'* ]] ||
+                fail "missing inherited MCP environment" 43
+            [[ "$SESSION_NEW" != *'"name":"BUZZ_DEV_MCP_READ_ONLY"'* ]] ||
+                fail "Meeting V0 read-only profile must not be injected into V1" 44
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"meeting-session","modes":{"availableModes":[{"id":"plan","name":"Plan"}],"currentModeId":"default"}}}'
+
+            IFS= read -r PROMPT
+            [[ "$PROMPT" == *'"method":"session/prompt"'* ]] ||
+                fail "expected prompt directly after session/new" 45
+            [[ "$PROMPT" == *'granted_speech'* ]] ||
+                fail "expected Meeting Granted Speech prompt" 46
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"meeting-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"{\"action\":\"SAY\",\"content\":\"The Meeting"}}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"meeting-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" state is coherent.\",\"mention_pubkeys\":[],\"handoff\":null,\"reason\":null}"}}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+        "#;
+
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script.to_string()], &[], false)
+            .await
+            .expect("failed to spawn Meeting Granted Turn fake agent");
+        acp.initialize()
+            .await
+            .expect("Meeting Granted Turn fake agent must initialize");
+
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "meeting-fake-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn meeting_v1_granted_turn_inherits_context_mcp_without_forced_plan_mode() {
+        const EXPECTED_SAY: &str = r#"{"action":"SAY","content":"The Meeting state is coherent.","mention_pubkeys":[],"handoff":null,"reason":null}"#;
+        let meeting_id = Uuid::new_v4();
+        let agent_keys = nostr::Keys::generate();
+        let mut agent = meeting_granted_turn_fake_agent().await;
+
+        // Avoid an unrelated canvas REST lookup while retaining a real channel
+        // source and a fresh session/new for the Meeting turn.
+        agent.state.canvas_sections.insert(
+            meeting_id,
+            "[Channel Canvas]\nNo canvas needed for this protocol test.".into(),
+        );
+
+        let mut ctx = make_prompt_context_impl(&agent_keys, None);
+        ctx.cwd = std::env::current_dir()
+            .expect("test current directory")
+            .to_string_lossy()
+            .into_owned();
+        ctx.mcp_servers = vec![McpServer {
+            name: "project-context-mcp".into(),
+            command: "project-context-mcp".into(),
+            args: vec![],
+            env: vec![crate::acp::EnvVar {
+                name: "NORMAL_CONTEXT".into(),
+                value: "1".into(),
+            }],
+        }];
+        ctx.require_permission_mode = false;
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                meeting_id,
+                ChannelInfo {
+                    name: "Meeting protocol acceptance".into(),
+                    channel_type: "stream".into(),
+                    room_kind: "community".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+
+        let granted_prompt = format!(
+            "[Meeting Protocol — Granted Speech]\n\
+             {{\"turn_type\":\"granted_speech\",\"meeting_id\":\"{meeting_id}\"}}\n\
+             Return exactly one strict controller action as JSON."
+        );
+        let batch = FlushBatch {
+            channel_id: meeting_id,
+            events: vec![],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_prompt_task(
+                agent,
+                Some(batch),
+                Some(granted_prompt),
+                Arc::new(ctx),
+                result_tx,
+                PromptExecution {
+                    control_rx: None,
+                    absolute_hard_deadline: None,
+                    turn_id: "meeting-granted-turn-test".into(),
+                },
+            ),
+        )
+        .await
+        .expect("Meeting Granted Turn must complete without timing out");
+
+        let mut result = result_rx
+            .recv()
+            .await
+            .expect("run_prompt_task must return its agent");
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "fake agent only completes after validating advisory Meeting setup"
+        );
+        assert!(
+            matches!(result.source, PromptSource::Channel(id) if id == meeting_id),
+            "Meeting Granted Turn must remain scoped to its Meeting channel"
+        );
+        assert_eq!(
+            result.agent.acp.take_agent_message(),
+            EXPECTED_SAY,
+            "the harness must assemble the complete strict SAY JSON across ACP chunks"
+        );
+        result.agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reserved_meeting_slot_blocks_ordinary_claim_but_allows_meeting_claim() {
+        let meeting_id = Uuid::new_v4();
+        let mut agent = meeting_pool_test_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(meeting_id, "meeting-session".into());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.set_reserved_meeting_slots(1);
+
+        assert!(
+            pool.try_claim(Some(meeting_id)).is_none(),
+            "ordinary affinity must not bypass the Meeting reservation floor"
+        );
+        assert_eq!(pool.idle_count(), 1);
+
+        let meeting_agent = pool
+            .try_claim_meeting(meeting_id)
+            .expect("Meeting claim may consume the reserved idle slot");
+        assert_eq!(meeting_agent.index, 0);
+        assert_eq!(pool.idle_count(), 0);
+
+        pool.return_agent(meeting_agent);
+        assert!(
+            pool.try_claim(None).is_none(),
+            "returning the Meeting agent must not implicitly release the floor"
+        );
+
+        let mut agent = pool
+            .try_claim_meeting(meeting_id)
+            .expect("Meeting can reclaim its reserved slot");
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lowering_and_releasing_meeting_floor_restores_ordinary_claims() {
+        let first = meeting_pool_test_agent(0).await;
+        let second = meeting_pool_test_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+
+        pool.set_reserved_meeting_slots(2);
+        assert!(
+            pool.try_claim(None).is_none(),
+            "a floor equal to idle capacity reserves every slot"
+        );
+
+        pool.set_reserved_meeting_slots(1);
+        let first_claim = pool
+            .try_claim(None)
+            .expect("lowering the floor must expose capacity above it");
+        assert_eq!(pool.idle_count(), 1);
+        assert!(
+            pool.try_claim(None).is_none(),
+            "ordinary claims must stop once idle capacity reaches the new floor"
+        );
+
+        pool.set_reserved_meeting_slots(0);
+        let second_claim = pool
+            .try_claim(None)
+            .expect("releasing the floor must restore the final ordinary slot");
+        assert_eq!(pool.idle_count(), 0);
+
+        let mut claimed = [first_claim, second_claim];
+        for agent in &mut claimed {
+            agent.acp.shutdown().await;
+        }
+    }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
     // a legacy agent WITH a base_prompt must get [Base] prepended to the user

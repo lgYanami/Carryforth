@@ -1,8 +1,10 @@
 # Meeting V1 后端实现设计
 
-> 状态：后端实现设计 V1；阶段一、阶段二已交付，阶段三待实施
+> 状态：后端实现设计 V1；阶段一、阶段二、阶段三已交付，阶段四待实施
 >
 > 前置概念设计：[Meeting V1：主持式发言权接力协议](./meeting-v1.md)
+>
+> 决策变更记录：[Meeting V1 Changelog](./changelog.md)
 >
 > 实现范围：Relay、数据库、协议事件、SDK、CLI、ACP Agent 和后端测试
 >
@@ -60,7 +62,7 @@ V1 后端采用以下总体方案：
 - `buzz-relay`：鉴权、命令处理、State 签名、outbox 投递和 deadline runtime；
 - `buzz-cli`：Agent-first 和测试用的完整协议操作面；
 - `buzz-acp`：普通参会 Agent、主持 Agent、确定性 ACK、Progress 和恢复账本；
-- `buzz-dev-mcp`：Meeting Turn 的只读工具能力约束；
+- `buzz-dev-mcp`：Meeting Turn 可复用的会议历史与项目上下文工具；
 - `buzz-test-client`：协议 fixture、Relay E2E、并发和恢复测试；
 - `schema/schema.sql`：与迁移后的最终 schema 保持同步。
 
@@ -2204,8 +2206,12 @@ active Offer/Grant 的 reservation，清理所有孤儿 reservation。
 #### Granted Speech Controller
 
 - 只为自己的活动 Grant 启动；
-- 上下文包含完整 speech、当前 Intent、Handoff reason、参会名单和最新 State；
-- 可以调用允许的只读工具查看项目现状、文件、视图和证据；
+- 共享同步器保存完整权威 speech；模型 prompt 提供近期精确窗口、窗口边界、当前 Intent、
+  Handoff reason、参会名单和最新 State，较早原文可通过 `meeting_read` 上下文工具按需
+  查询。不能为了“完整记录”把无界历史一次性塞入模型窗口；
+- Stage 3 的 `meeting_read history` 单次最多返回最近 500 条且尚无游标；超长会议的更早
+  原文仍由 Relay 和同步器完整保存，但跨 500 条的模型按需回看留作后续游标增强；
+- 可以调用 Agent 正常暴露的工具查看项目现状、文件、任务、工作流、视图和其他证据；
 - Progress heartbeat 与 LLM/tool future 分离，每 10 秒按可观察阶段续租；
 - 输出严格结构：
 
@@ -2230,26 +2236,36 @@ SAY(content, optional_handoff) | YIELD(reason?)
 - 本地 decision Turn 的安全预算小于 Relay 的 3 分钟绝对 deadline；
 - 迟到计划只记私有 telemetry，不可提交。
 
-### 14.4 LLM 与工具隔离
+### 14.4 LLM 与工具约定
 
 Meeting 的目的仍是讨论，不是在会议内执行任务。
 
-允许：
+Meeting V1 初版采用 advisory 工具策略。Meeting Turn 继承 Agent 的正常 MCP、CLI、HTTP
+和原生工具能力，不强制 Plan mode，也不由 Harness 缩减为专用只读 MCP。system prompt
+要求 Agent：
 
-- 读取仓库、文档、项目视图和已有状态；
-- 搜索已授权上下文；
-- 使用计算或分析型只读工具；
-- 根据证据形成结论、问题或建议。
+- 仅为形成发言而调查仓库、文档、任务、工作流、项目视图和其他已授权上下文；
+- 不修改文件、Git、任务、工作流、项目状态或外部资源；
+- 不发送会议之外的消息，不在 Meeting Turn 中执行后续任务；
+- 发现需要执行的事项时，把它作为结论、问题或后续行动建议写入发言；
+- 不通过工具自行发布 Meeting speech 或控制事件。
 
-禁止：
+前四项是 Agent 行为约定，不是 Runtime、MCP 或 OS 级安全隔离。Codex 等 ACP Runtime
+可能拥有不经过 `buzz-dev-mcp` 的原生工具；V1 不宣称能阻止受到提示注入或行为失控的
+模型通过这些工具产生副作用。
 
-- 修改文件或项目状态；
-- 提交代码；
-- 创建、更新或删除外部资源；
-- 发送会议之外的消息；
-- 把 Meeting sender 暴露为任意 kind 的通用发布工具。
+Harness 管理的自动发布路径仍由代码约束：模型对该路径只返回结构化提议，Harness 在重新
+校验最新权威 State 后构造、签名并提交协议事件，不会把模型文本直接当作待发布事件。
 
-`buzz-dev-mcp` 和 ACP tool policy 都要执行此边界，不能只依赖 prompt。
+但“不通过工具自行发布”与其他无副作用要求一样属于 advisory 约定。正常工具面可能包含
+Shell、带参会身份凭据的 Buzz CLI 或第三方客户端，因此 V1 不声称代码能阻止模型绕过
+Harness 自动路径尝试提交事件。无论事件来自 Harness 还是普通工具，Relay 都必须执行相同
+的成员身份、revision、Grant、deadline 和其他协议校验。
+
+Project View 与 Meeting 仍按既定计划并行开发。Project View 后端尚未进入本分支时，
+Meeting Stage 3 先提供会议历史、仓库文档、代码和已有文件状态的上下文读取能力；等
+Project View 后端或 CLI 契约可用后，Meeting Agent 可以通过其正常工具面查询。工具是否
+可用由 Agent Runtime 和部署配置决定，Meeting Harness 不为此维护独立 allowlist。
 
 同一边界也适用于 Relay 的通用 Workflow Engine：Meeting outbox 中的 speech、State 和
 控制事件只做持久化与订阅 fan-out，不作为通用 Workflow trigger。需要执行的后续工作应在
@@ -2443,7 +2459,7 @@ meeting_granted_speech_prompt.md
 1. Agent 异步提交 Intent；
 2. Agent moderator 在别人发言时准备 ModeratorPlan；
 3. Human 请求下一席；
-4. Agent deterministic ACK 后使用只读工具；
+4. Agent deterministic ACK 后使用正常上下文工具调查证据；
 5. Agent speech 携带 Handoff reason；
 6. 目标 Agent Decline 和重试恢复；
 7. 连续五次 Handoff 强制归还；
@@ -2608,7 +2624,7 @@ speech 不变量和基础幂等测试通过。
 
 这是 V1 后端协议可行性的核心里程碑。
 
-### 阶段三：普通 Agent 参会
+### 阶段三：普通 Agent 参会（已交付）
 
 目标：
 
@@ -2621,7 +2637,7 @@ speech 不变量和基础幂等测试通过。
 - 确定性 Offer ACK/Decline 与本地容量预留；
 - Granted Speech Controller；
 - 独立 Progress heartbeat；
-- 只读工具策略；
+- advisory 工具策略和正常上下文工具继承；
 - prepared ACK/SAY/YIELD 的重试和重启恢复；
 - Participant 与 Granted prompts。
 
@@ -2629,7 +2645,7 @@ speech 不变量和基础幂等测试通过。
 
 - Agent 不为每个控制事件调用 LLM；
 - 未获 Grant 的 Agent 不生成完整候选发言；
-- 获 Grant 的 Agent 可调用只读工具并在 5 分钟内 SAY/YIELD；
+- 获 Grant 的 Agent 可调用正常上下文工具并在 5 分钟内 SAY/YIELD；
 - Agent 慢、离线、ACK 丢失和 late result 都不冻结会议；
 - 普通 Agent E2E 与 token/latency metrics 可观察。
 
@@ -2717,7 +2733,7 @@ Meeting V1 后端完成需要同时满足：
 5. 任何时刻至多一个 Offer 或 Grant；
 6. Human 下一席、Recall 和五次 Handoff 上限由 Relay 权威执行；
 7. Agent ACK 不调用 LLM，完整发言只在 Grant 后生成；
-8. Agent 能在 Granted Turn 中调用只读工具获取项目上下文；
+8. Agent 能在 Granted Turn 中调用正常工具获取项目上下文，并由 prompt 约定不执行写操作；
 9. Grant 最多 5 分钟且提前完成立即推进；
 10. moderator 最多等待 3 分钟且有确定性 fallback；
 11. Relay/ACP 重启和网络结果不明确不会产生重复 speech；

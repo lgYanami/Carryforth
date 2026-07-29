@@ -3,6 +3,8 @@
 > 状态：概念设计已完成，后端实现设计见
 > [Meeting V1 后端实现设计](./meeting-v1-backend-implementation-design.md)
 >
+> 冻结后的决策调整见：[Meeting V1 决策变更记录](./changelog.md)
+>
 > 协议名称：Moderated Baton Protocol（主持式发言权接力协议）
 >
 > 本文定义 Meeting V1 的产品语义、参与角色、发言意图、发言权传递、Human 介入、
@@ -319,7 +321,7 @@ Grant 规则：
 9. Grant、Yield、Expiry 和 ACK 重试都以事件 ID 幂等。
 
 推荐实现以短 soft lease 检测 Agent 崩溃，以最长 5 分钟 hard deadline 容纳模型推理和
-只读工具调用。具体时长属于实现参数。
+为发言调查上下文的工具调用。具体时长属于实现参数。
 
 ## 8. Directed Handoff
 
@@ -552,9 +554,11 @@ Meeting V1 把 Agent 工作分成三类：
 ### 13.3 Granted Speech
 
 - 只有 Grant holder 运行完整发言 Turn；
-- 可以调用允许的只读工具获取项目上下文和证据；
+- 可以调用 Agent 正常暴露的工具获取项目上下文和证据；初版通过 Meeting prompt 约定
+  只调查、不执行任务或持久写操作；
 - 最终输出 SAY 或 YIELD；
-- SAY 只能经 Meeting sender 提交；
+- Harness 规范路径中的 SAY 只能经专用 Meeting sender 提交；初版不对 Agent 的普通工具
+  建立能力隔离，绕行禁令由 prompt 约定，所有来源的事件仍由 Relay 做协议校验；
 - Progress、ACK、重试、过期和格式失败回退由 Harness 确定性处理，不需要 LLM；
 - 晚于 Grant hard deadline 的结果必须丢弃。
 
@@ -650,7 +654,7 @@ Meeting V1 必须始终满足：
 - 单 Grant、单 speech、事务消费和幂等重试；
 - 通用 Query、Count、WebSocket 和 outbox；
 - ACP Meeting discovery、完整历史同步、私有 Agent Ledger；
-- 专用 Meeting sender 和只读工具边界。
+- Harness 内部的专用 Meeting sender，以及 Meeting Turn 的 advisory 工具行为约定。
 
 这里的“归档”特指 Meeting End 后的 Session/Channel 终态，不等于 NIP-IA identity
 archive。后者只是身份可见性提示，不自动撤权或结束会议；只有 Community membership

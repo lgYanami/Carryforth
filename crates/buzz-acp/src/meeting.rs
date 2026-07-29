@@ -5,15 +5,18 @@
 //! durable idempotency state, and the only Agent-side meeting sender.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use buzz_core::kind::{
-    KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
-    KIND_MEETING_ROUND_STATE, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
-    KIND_STREAM_MESSAGE,
+    KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
+    KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND,
+    KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_ROUND_STATE, KIND_MEETING_SPEECH_INTENT,
+    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_STREAM_MESSAGE,
 };
+use futures_util::FutureExt;
 use nostr::{Alphabet, Event, EventBuilder, Filter, Keys, Kind, PublicKey, SingleLetterTag};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +29,11 @@ use crate::relay::{BuzzEvent, RestClient};
 const LEDGER_VERSION: u32 = 1;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Legacy V0 I/O still shares the ACP main loop. Bound each slice so it cannot
+/// consume a V1 Agent Offer's five-second ACK window.
+const MAIN_LOOP_IO_BUDGET: Duration = Duration::from_secs(1);
+const DETECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const V0_TURN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const INTENT_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const GRANT_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 const HISTORY_PAGE_SIZE: usize = 500;
@@ -37,18 +45,26 @@ const MAX_EVIDENCE_ITEMS: usize = 32;
 const MAX_EVIDENCE_ITEM_BYTES: usize = 2 * 1024;
 const MAX_MENTIONS: usize = 32;
 
-/// Meeting-specific system policy installed for every controller-owned turn.
-pub(crate) const SYSTEM_PROMPT: &str = include_str!("meeting_prompt.md");
+/// Legacy Meeting V0 system policy installed for uniform-floor turns.
+pub(crate) const V0_SYSTEM_PROMPT: &str = include_str!("meeting_prompt.md");
+/// Meeting V1 advisory system policy installed for moderated baton turns.
+pub(crate) const V1_SYSTEM_PROMPT: &str = include_str!("meeting_v1_prompt.md");
 
 /// The dedicated room subscription used independently of ordinary ACP rules.
 pub(crate) fn subscription_filter() -> ChannelFilter {
     ChannelFilter {
         kinds: Some(vec![
             KIND_STREAM_MESSAGE,
+            KIND_MEETING_CREATE,
             KIND_MEETING_END,
             KIND_MEETING_FLOOR_CLAIM,
             KIND_MEETING_ROUND_STATE,
             KIND_MEETING_FLOOR_SIGNAL,
+            KIND_MEETING_SPEECH_INTENT,
+            KIND_MEETING_MODERATOR_COMMAND,
+            KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            KIND_MEETING_OFFER_RESPONSE,
+            KIND_MEETING_GRANT_SIGNAL,
         ]),
         require_mention: false,
     }
@@ -60,19 +76,28 @@ pub(crate) struct MeetingTurnRequest {
     pub session_id: Uuid,
     pub prompt: String,
     pub hard_deadline_unix_ms: i64,
-    kind: MeetingTurnKind,
-    format_retry: bool,
-    basis_id: String,
-    round_number: u64,
-    speech_cursor: Option<String>,
-    floor_revision: u64,
-    grant_event_id: Option<String>,
+    pub(super) kind: MeetingTurnKind,
+    pub(super) format_retry: bool,
+    pub(super) basis_id: String,
+    pub(super) round_number: u64,
+    pub(super) speech_cursor: Option<String>,
+    pub(super) floor_revision: u64,
+    pub(super) grant_event_id: Option<String>,
+    pub(super) queued_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MeetingTurnKind {
-    Intent,
-    Granted,
+pub(super) enum MeetingTurnKind {
+    V0Intent,
+    V0Granted,
+    V1Intent,
+    V1Granted,
+}
+
+impl MeetingTurnKind {
+    pub(super) fn is_v1(self) -> bool {
+        matches!(self, Self::V1Intent | Self::V1Granted)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -260,8 +285,613 @@ struct GrantedOutput {
     reason: Option<String>,
 }
 
-/// Per-process coordinator for every Meeting V0 room visible to this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisteredMeetingProtocol {
+    UniformV0,
+    ModeratedBatonV1,
+}
+
+struct PendingV0TurnCompletion {
+    turn_id: String,
+    session_id: Uuid,
+    raw_output: String,
+    succeeded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V0TurnCompletionStatus {
+    Completed,
+    TimedOut,
+    Panicked,
+}
+
+struct FinishedV0TurnCompletion {
+    coordinator: V0MeetingCoordinator,
+    turn_id: String,
+    session_id: Uuid,
+    status: V0TurnCompletionStatus,
+}
+
+/// Per-process protocol-neutral coordinator for every visible Meeting room.
+///
+/// Registration probes the Relay-signed State once, then delegates the room to
+/// exactly one protocol controller. V0 and V1 therefore share the Agent-pool
+/// scheduling surface without running competing synchronizers for one Session.
 pub(crate) struct MeetingCoordinator {
+    rest: RestClient,
+    v0: Option<V0MeetingCoordinator>,
+    v0_keys: Keys,
+    v0_observer: Option<ObserverHandle>,
+    v0_turns: HashMap<String, Uuid>,
+    v0_completion_queue: VecDeque<PendingV0TurnCompletion>,
+    v0_completion_task: Option<tokio::task::JoinHandle<FinishedV0TurnCompletion>>,
+    v0_deferred_requeues: VecDeque<MeetingTurnRequest>,
+    v0_deferred_registers: BTreeSet<Uuid>,
+    v0_deferred_removals: BTreeSet<Uuid>,
+    v0_deferred_resyncs: BTreeSet<Uuid>,
+    v0_deferred_resync_all: bool,
+    v1: crate::meeting_v1::MeetingV1Coordinator,
+    protocols: HashMap<Uuid, RegisteredMeetingProtocol>,
+    detection_retry_at: HashMap<Uuid, Instant>,
+    next_detection_generation: u64,
+    detection_in_flight: HashMap<Uuid, u64>,
+    detection_tasks: tokio::task::JoinSet<(
+        Uuid,
+        u64,
+        std::result::Result<RegisteredMeetingProtocol, String>,
+    )>,
+}
+
+impl MeetingCoordinator {
+    pub(crate) fn new(
+        rest: RestClient,
+        keys: Keys,
+        observer: Option<ObserverHandle>,
+        agent_capacity: usize,
+    ) -> Self {
+        Self {
+            rest: rest.clone(),
+            v0: Some(V0MeetingCoordinator::new(
+                rest.clone(),
+                keys.clone(),
+                observer.clone(),
+            )),
+            v0_keys: keys.clone(),
+            v0_observer: observer.clone(),
+            v0_turns: HashMap::new(),
+            v0_completion_queue: VecDeque::new(),
+            v0_completion_task: None,
+            v0_deferred_requeues: VecDeque::new(),
+            v0_deferred_registers: BTreeSet::new(),
+            v0_deferred_removals: BTreeSet::new(),
+            v0_deferred_resyncs: BTreeSet::new(),
+            v0_deferred_resync_all: false,
+            v1: crate::meeting_v1::MeetingV1Coordinator::new(rest, keys, observer, agent_capacity),
+            protocols: HashMap::new(),
+            detection_retry_at: HashMap::new(),
+            next_detection_generation: 0,
+            detection_in_flight: HashMap::new(),
+            detection_tasks: tokio::task::JoinSet::new(),
+        }
+    }
+
+    pub(crate) fn contains(&self, session_id: Uuid) -> bool {
+        self.protocols.contains_key(&session_id)
+            || self.detection_retry_at.contains_key(&session_id)
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.v0
+            .as_ref()
+            .is_some_and(V0MeetingCoordinator::has_pending)
+            || self.v1.has_pending()
+    }
+
+    pub(crate) fn pop_pending(&mut self) -> Option<MeetingTurnRequest> {
+        if self.v1.front_kind() == Some(MeetingTurnKind::V1Granted) {
+            return self.v1.pop_pending();
+        }
+        if self
+            .v0
+            .as_ref()
+            .and_then(|v0| v0.pending.front())
+            .is_some_and(|request| request.kind == MeetingTurnKind::V0Granted)
+        {
+            return self.v0.as_mut().and_then(V0MeetingCoordinator::pop_pending);
+        }
+        self.v1
+            .pop_pending()
+            .or_else(|| self.v0.as_mut().and_then(V0MeetingCoordinator::pop_pending))
+    }
+
+    pub(crate) fn requeue_front(&mut self, request: MeetingTurnRequest) {
+        if request.kind.is_v1() {
+            self.v1.requeue_front(request);
+        } else if let Some(v0) = self.v0.as_mut() {
+            v0.requeue_front(request);
+        } else {
+            self.v0_deferred_requeues.push_back(request);
+        }
+    }
+
+    pub(crate) fn mark_dispatched(&mut self, turn_id: String, request: MeetingTurnRequest) {
+        if request.kind.is_v1() {
+            self.v1.mark_dispatched(turn_id, request);
+        } else if let Some(v0) = self.v0.as_mut() {
+            self.v0_turns.insert(turn_id.clone(), request.session_id);
+            v0.mark_dispatched(turn_id, request);
+        } else {
+            tracing::error!(
+                meeting = %request.session_id,
+                turn = %turn_id,
+                "BUG: V0 Meeting turn was dispatched while its controller was completing another turn"
+            );
+            self.v0_deferred_requeues.push_front(request);
+        }
+    }
+
+    pub(crate) fn owns_turn(&self, turn_id: &str) -> bool {
+        self.v1.owns_turn(turn_id) || self.v0_turns.contains_key(turn_id)
+    }
+
+    pub(crate) async fn register(&mut self, session_id: Uuid) {
+        if self.protocols.contains_key(&session_id)
+            || self.detection_in_flight.contains_key(&session_id)
+        {
+            return;
+        }
+        self.detection_retry_at.insert(session_id, Instant::now());
+        self.schedule_due_detections();
+    }
+
+    pub(crate) fn remove(&mut self, session_id: Uuid) {
+        self.detection_retry_at.remove(&session_id);
+        self.detection_in_flight.remove(&session_id);
+        self.v0_completion_queue
+            .retain(|completion| completion.session_id != session_id);
+        self.v0_deferred_requeues
+            .retain(|request| request.session_id != session_id);
+        match self.protocols.remove(&session_id) {
+            Some(RegisteredMeetingProtocol::UniformV0) => {
+                if let Some(v0) = self.v0.as_mut() {
+                    v0.remove(session_id);
+                } else {
+                    self.v0_deferred_registers.remove(&session_id);
+                    self.v0_deferred_resyncs.remove(&session_id);
+                    self.v0_deferred_removals.insert(session_id);
+                }
+            }
+            Some(RegisteredMeetingProtocol::ModeratedBatonV1) => self.v1.remove(session_id),
+            None => {}
+        }
+    }
+
+    pub(crate) fn mark_all_for_resync(&mut self) {
+        let now = Instant::now();
+        for retry_at in self.detection_retry_at.values_mut() {
+            *retry_at = now;
+        }
+        if let Some(v0) = self.v0.as_mut() {
+            v0.mark_all_for_resync();
+        } else {
+            self.v0_deferred_resync_all = true;
+        }
+        self.v1.mark_all_for_resync();
+    }
+
+    pub(crate) async fn handle_event(&mut self, event: &BuzzEvent) {
+        if !self.contains(event.channel_id) {
+            return;
+        }
+        if !self.protocols.contains_key(&event.channel_id) {
+            // A live State is stronger evidence that detection should be
+            // retried now, but the query itself stays in a background task.
+            if !self.detection_in_flight.contains_key(&event.channel_id) {
+                self.detection_retry_at
+                    .insert(event.channel_id, Instant::now());
+                self.schedule_due_detections();
+            }
+            return;
+        }
+        match self.protocols.get(&event.channel_id) {
+            Some(RegisteredMeetingProtocol::UniformV0) => {
+                if let Some(v0) = self.v0.as_mut() {
+                    match tokio::time::timeout(MAIN_LOOP_IO_BUDGET, v0.handle_event(event)).await {
+                        Ok(()) => {}
+                        Err(_) => {
+                            v0.mark_all_for_resync();
+                            tracing::warn!(
+                                meeting = %event.channel_id,
+                                "Meeting V0 event sync yielded to the V1 ACK latency budget"
+                            );
+                        }
+                    }
+                } else {
+                    // The completion worker owns the V0 controller. A fresh
+                    // sync after it returns subsumes every missed V0 frame.
+                    self.v0_deferred_resyncs.insert(event.channel_id);
+                }
+            }
+            Some(RegisteredMeetingProtocol::ModeratedBatonV1) => self.v1.handle_event(event).await,
+            None => {}
+        }
+    }
+
+    pub(crate) async fn tick(&mut self) {
+        // V1 lease maintenance always runs before best-effort legacy recovery.
+        self.v1.tick().await;
+        self.drain_v0_completion().await;
+        self.drain_detection_results().await;
+        self.schedule_due_detections();
+        if let Some(v0) = self.v0.as_mut() {
+            if tokio::time::timeout(MAIN_LOOP_IO_BUDGET, v0.tick())
+                .await
+                .is_err()
+            {
+                tracing::warn!("Meeting V0 periodic sync yielded to the V1 ACK latency budget");
+            }
+        }
+    }
+
+    pub(crate) async fn handle_turn_result(
+        &mut self,
+        turn_id: &str,
+        raw_output: String,
+        succeeded: bool,
+    ) {
+        if self.v1.owns_turn(turn_id) {
+            self.v1
+                .handle_turn_result(turn_id, raw_output, succeeded)
+                .await;
+            return;
+        }
+        let Some(session_id) = self.v0_turns.remove(turn_id) else {
+            return;
+        };
+        self.v0_completion_queue.push_back(PendingV0TurnCompletion {
+            turn_id: turn_id.to_string(),
+            session_id,
+            raw_output,
+            succeeded,
+        });
+        self.start_next_v0_completion();
+    }
+
+    pub(crate) async fn handle_turn_failure(&mut self, turn_id: &str) {
+        self.handle_turn_result(turn_id, String::new(), false).await;
+    }
+
+    /// Drain sessions whose lower-priority V1 Intent turn should be cancelled
+    /// after an Offer/Grant arrived. The main loop owns the Agent pool and
+    /// performs the actual control-signal send.
+    pub(crate) fn take_preemptions(&mut self) -> Vec<Uuid> {
+        self.v1.take_preemptions()
+    }
+
+    /// Update the physical Agent slots currently available for a deterministic
+    /// V1 Offer decision. Durable Meeting reservations are accounted for by the
+    /// V1 controller separately.
+    pub(crate) fn set_available_agent_slots(&mut self, available: usize) {
+        self.v1.set_available_agent_slots(available);
+    }
+
+    /// Physical Agent slots that ordinary queue dispatch must leave available
+    /// for V1 Offers already ACKed by this process.
+    pub(crate) fn unassigned_reserved_slots(&self) -> usize {
+        self.v1.unassigned_reserved_slots()
+    }
+
+    fn start_next_v0_completion(&mut self) {
+        if self.v0_completion_task.is_some() {
+            return;
+        }
+        let Some(completion) = self.v0_completion_queue.pop_front() else {
+            return;
+        };
+        let Some(mut coordinator) = self.v0.take() else {
+            self.v0_completion_queue.push_front(completion);
+            return;
+        };
+        self.v0_completion_task = Some(tokio::spawn(async move {
+            let PendingV0TurnCompletion {
+                turn_id,
+                session_id,
+                raw_output,
+                succeeded,
+            } = completion;
+            let attempt = AssertUnwindSafe(tokio::time::timeout(
+                V0_TURN_COMPLETION_TIMEOUT,
+                coordinator.handle_turn_result(&turn_id, raw_output, succeeded),
+            ))
+            .catch_unwind()
+            .await;
+            let status = match attempt {
+                Ok(Ok(())) => V0TurnCompletionStatus::Completed,
+                Ok(Err(_)) => V0TurnCompletionStatus::TimedOut,
+                Err(_) => V0TurnCompletionStatus::Panicked,
+            };
+            FinishedV0TurnCompletion {
+                coordinator,
+                turn_id,
+                session_id,
+                status,
+            }
+        }));
+    }
+
+    async fn drain_v0_completion(&mut self) {
+        if !self
+            .v0_completion_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return;
+        }
+        let Some(task) = self.v0_completion_task.take() else {
+            return;
+        };
+        match task.await {
+            Ok(finished) => {
+                match finished.status {
+                    V0TurnCompletionStatus::Completed => {}
+                    V0TurnCompletionStatus::TimedOut => {
+                        self.v0_deferred_resyncs.insert(finished.session_id);
+                        tracing::warn!(
+                            meeting = %finished.session_id,
+                            turn = %finished.turn_id,
+                            timeout_ms = V0_TURN_COMPLETION_TIMEOUT.as_millis() as u64,
+                            "Meeting V0 turn completion timed out in the background"
+                        );
+                    }
+                    V0TurnCompletionStatus::Panicked => {
+                        self.v0_deferred_resyncs.insert(finished.session_id);
+                        tracing::error!(
+                            meeting = %finished.session_id,
+                            turn = %finished.turn_id,
+                            "Meeting V0 turn completion panicked in the background"
+                        );
+                    }
+                }
+                self.restore_v0(finished.coordinator);
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Meeting V0 completion task was lost before returning its controller: {error}"
+                );
+                self.v0_deferred_resync_all = true;
+                self.v0_deferred_registers
+                    .extend(self.protocols.iter().filter_map(|(session_id, protocol)| {
+                        (*protocol == RegisteredMeetingProtocol::UniformV0).then_some(*session_id)
+                    }));
+                let coordinator = V0MeetingCoordinator::new(
+                    self.rest.clone(),
+                    self.v0_keys.clone(),
+                    self.v0_observer.clone(),
+                );
+                self.restore_v0(coordinator);
+            }
+        }
+        self.start_next_v0_completion();
+    }
+
+    fn restore_v0(&mut self, mut coordinator: V0MeetingCoordinator) {
+        let removals = std::mem::take(&mut self.v0_deferred_removals);
+        for session_id in &removals {
+            coordinator.remove(*session_id);
+        }
+        for session_id in std::mem::take(&mut self.v0_deferred_registers) {
+            if self.protocols.get(&session_id) == Some(&RegisteredMeetingProtocol::UniformV0) {
+                coordinator.register_local(session_id);
+            }
+        }
+        if std::mem::take(&mut self.v0_deferred_resync_all) {
+            coordinator.mark_all_for_resync();
+        }
+        for session_id in std::mem::take(&mut self.v0_deferred_resyncs) {
+            coordinator.mark_for_resync(session_id);
+        }
+        for request in std::mem::take(&mut self.v0_deferred_requeues) {
+            if self.protocols.get(&request.session_id)
+                == Some(&RegisteredMeetingProtocol::UniformV0)
+            {
+                coordinator.requeue_front(request);
+            }
+        }
+        self.v0 = Some(coordinator);
+    }
+
+    async fn finish_detection(
+        &mut self,
+        session_id: Uuid,
+        generation: u64,
+        detected: std::result::Result<RegisteredMeetingProtocol, String>,
+    ) {
+        if !consume_detection_generation(&mut self.detection_in_flight, session_id, generation) {
+            return;
+        }
+        // Membership may have been removed while the background query ran.
+        if !self.detection_retry_at.contains_key(&session_id) {
+            return;
+        }
+        match detected {
+            Ok(RegisteredMeetingProtocol::UniformV0) => {
+                self.detection_retry_at.remove(&session_id);
+                self.protocols
+                    .insert(session_id, RegisteredMeetingProtocol::UniformV0);
+                if let Some(v0) = self.v0.as_mut() {
+                    let _ =
+                        tokio::time::timeout(MAIN_LOOP_IO_BUDGET, v0.register(session_id)).await;
+                } else {
+                    self.v0_deferred_registers.insert(session_id);
+                }
+            }
+            Ok(RegisteredMeetingProtocol::ModeratedBatonV1) => {
+                self.detection_retry_at.remove(&session_id);
+                self.protocols
+                    .insert(session_id, RegisteredMeetingProtocol::ModeratedBatonV1);
+                let _ =
+                    tokio::time::timeout(MAIN_LOOP_IO_BUDGET, self.v1.register(session_id)).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    meeting = %session_id,
+                    "Meeting protocol detection failed: {error}"
+                );
+                self.detection_retry_at
+                    .insert(session_id, Instant::now() + SYNC_RETRY_INTERVAL);
+            }
+        }
+    }
+
+    fn schedule_due_detections(&mut self) {
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .detection_retry_at
+            .iter()
+            .filter_map(|(session_id, retry_at)| {
+                (now >= *retry_at && !self.detection_in_flight.contains_key(session_id))
+                    .then_some(*session_id)
+            })
+            .collect();
+        for session_id in due {
+            self.next_detection_generation =
+                self.next_detection_generation.saturating_add(1).max(1);
+            let generation = self.next_detection_generation;
+            self.detection_in_flight.insert(session_id, generation);
+            let rest = self.rest.clone();
+            self.detection_tasks.spawn(async move {
+                let attempt = AssertUnwindSafe(tokio::time::timeout(
+                    DETECTION_ATTEMPT_TIMEOUT,
+                    detect_meeting_protocol(&rest, session_id),
+                ))
+                .catch_unwind()
+                .await;
+                let result = match attempt {
+                    Ok(Ok(Ok(protocol))) => Ok(protocol),
+                    Ok(Ok(Err(error))) => Err(error.to_string()),
+                    Ok(Err(_)) => Err(format!(
+                        "Meeting protocol detection exceeded {}ms",
+                        DETECTION_ATTEMPT_TIMEOUT.as_millis()
+                    )),
+                    Err(_) => Err("Meeting protocol detection task panicked".to_string()),
+                };
+                (session_id, generation, result)
+            });
+        }
+    }
+
+    async fn drain_detection_results(&mut self) {
+        while let Some(result) = self.detection_tasks.try_join_next() {
+            match result {
+                Ok((session_id, generation, detected)) => {
+                    self.finish_detection(session_id, generation, detected)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!("Meeting protocol detection task failed: {error}");
+                    let stranded = std::mem::take(&mut self.detection_in_flight);
+                    for (session_id, _) in stranded {
+                        if self.detection_retry_at.contains_key(&session_id) {
+                            self.detection_retry_at
+                                .insert(session_id, Instant::now() + SYNC_RETRY_INTERVAL);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn consume_detection_generation(
+    in_flight: &mut HashMap<Uuid, u64>,
+    session_id: Uuid,
+    generation: u64,
+) -> bool {
+    if in_flight.get(&session_id).copied() != Some(generation) {
+        return false;
+    }
+    in_flight.remove(&session_id);
+    true
+}
+
+async fn detect_meeting_protocol(
+    rest: &RestClient,
+    session_id: Uuid,
+) -> Result<RegisteredMeetingProtocol> {
+    let session = session_id.to_string();
+    let filters = [
+        Filter::new()
+            .kind(Kind::Custom(KIND_NIP29_GROUP_METADATA as u16))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), session.clone())
+            .limit(4),
+        Filter::new()
+            .kind(Kind::Custom(KIND_MEETING_ROUND_STATE as u16))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::H), session.clone())
+            .limit(32),
+    ];
+    let value = rest.query(&filters).await?;
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("Meeting protocol query returned a non-array response"))?;
+    let mut events = Vec::with_capacity(values.len());
+    for value in values {
+        let event: Event = serde_json::from_value(value.clone())
+            .context("Meeting protocol query contained a malformed event")?;
+        event
+            .verify()
+            .map_err(|error| anyhow!("Meeting protocol event signature is invalid: {error}"))?;
+        events.push(event);
+    }
+    classify_meeting_protocol(&events, session_id)
+}
+
+fn classify_meeting_protocol(
+    events: &[Event],
+    session_id: Uuid,
+) -> Result<RegisteredMeetingProtocol> {
+    let session = session_id.to_string();
+    let metadata = latest_kind(events, KIND_NIP29_GROUP_METADATA)
+        .filter(|event| {
+            tag_value(event, "d") == Some(session.as_str())
+                && tag_value(event, "room_kind") == Some("meeting")
+        })
+        .ok_or_else(|| anyhow!("Meeting protocol metadata is missing"))?;
+    let relay_pubkey = metadata.pubkey;
+    let mut saw_v0 = false;
+    let mut saw_v1 = false;
+    for event in events {
+        if event.kind.as_u16() as u32 != KIND_MEETING_ROUND_STATE
+            || event.pubkey != relay_pubkey
+            || tag_value(event, "h") != Some(session.as_str())
+        {
+            continue;
+        }
+        if tag_value(event, "v") == Some("2")
+            && tag_value(event, "policy") == Some("moderated-baton-v1")
+        {
+            saw_v1 = true;
+        } else if tag_value(event, "v").is_none()
+            && tag_value(event, "policy") == Some("uniform-v0")
+        {
+            saw_v0 = true;
+        } else {
+            return Err(anyhow!(
+                "Meeting contains an unsupported authoritative State version"
+            ));
+        }
+    }
+    match (saw_v0, saw_v1) {
+        (false, true) => Ok(RegisteredMeetingProtocol::ModeratedBatonV1),
+        (true, false) => Ok(RegisteredMeetingProtocol::UniformV0),
+        (true, true) => Err(anyhow!(
+            "Meeting contains conflicting authoritative protocol States"
+        )),
+        (false, false) => Err(anyhow!("Meeting has no authoritative State event")),
+    }
+}
+
+/// V0-only controller retained behind the protocol-neutral coordinator.
+struct V0MeetingCoordinator {
     rest: RestClient,
     keys: Keys,
     agent_pubkey: String,
@@ -273,8 +903,8 @@ pub(crate) struct MeetingCoordinator {
     in_flight: HashMap<String, MeetingTurnRequest>,
 }
 
-impl MeetingCoordinator {
-    pub(crate) fn new(rest: RestClient, keys: Keys, observer: Option<ObserverHandle>) -> Self {
+impl V0MeetingCoordinator {
+    fn new(rest: RestClient, keys: Keys, observer: Option<ObserverHandle>) -> Self {
         let agent_pubkey = keys.public_key().to_hex();
         let ledger_path = ledger_path_for(&agent_pubkey);
         let mut ledger = load_ledger(&ledger_path).unwrap_or_else(|error| {
@@ -350,13 +980,16 @@ impl MeetingCoordinator {
         self.in_flight.insert(turn_id, request);
     }
 
-    pub(crate) fn owns_turn(&self, turn_id: &str) -> bool {
-        self.in_flight.contains_key(turn_id)
+    pub(crate) async fn register(&mut self, session_id: Uuid) {
+        if !self.register_local(session_id) {
+            return;
+        }
+        self.sync_and_reconcile(session_id).await;
     }
 
-    pub(crate) async fn register(&mut self, session_id: Uuid) {
+    fn register_local(&mut self, session_id: Uuid) -> bool {
         if self.meetings.contains_key(&session_id) {
-            return;
+            return false;
         }
         self.meetings.insert(session_id, MeetingRuntime::new());
         self.ensure_meeting_ledger(session_id);
@@ -366,12 +999,14 @@ impl MeetingCoordinator {
             None,
             json!({ "session_id": session_id }),
         );
-        self.sync_and_reconcile(session_id).await;
+        true
     }
 
     pub(crate) fn remove(&mut self, session_id: Uuid) {
         self.pending
             .retain(|request| request.session_id != session_id);
+        self.in_flight
+            .retain(|_, request| request.session_id != session_id);
         self.meetings.remove(&session_id);
         self.emit(
             "meeting_ended",
@@ -383,6 +1018,13 @@ impl MeetingCoordinator {
 
     pub(crate) fn mark_all_for_resync(&mut self) {
         for runtime in self.meetings.values_mut() {
+            runtime.last_sync = None;
+            runtime.retry_at = Instant::now();
+        }
+    }
+
+    fn mark_for_resync(&mut self, session_id: Uuid) {
+        if let Some(runtime) = self.meetings.get_mut(&session_id) {
             runtime.last_sync = None;
             runtime.retry_at = Instant::now();
         }
@@ -430,20 +1072,19 @@ impl MeetingCoordinator {
 
         self.sync_only(request.session_id).await;
         match request.kind {
-            MeetingTurnKind::Intent => {
+            MeetingTurnKind::V0Intent => {
                 self.handle_intent_result(&request, &raw_output, succeeded)
                     .await;
             }
-            MeetingTurnKind::Granted => {
+            MeetingTurnKind::V0Granted => {
                 self.handle_granted_result(&request, &raw_output, succeeded)
                     .await;
             }
+            MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted => {
+                tracing::error!("V1 Meeting turn was routed to the V0 controller");
+            }
         }
         self.reconcile(request.session_id).await;
-    }
-
-    pub(crate) async fn handle_turn_failure(&mut self, turn_id: &str) {
-        self.handle_turn_result(turn_id, String::new(), false).await;
     }
 
     fn ensure_meeting_ledger(&mut self, session_id: Uuid) {
@@ -783,13 +1424,14 @@ impl MeetingCoordinator {
                 session_id,
                 prompt,
                 hard_deadline_unix_ms,
-                kind: MeetingTurnKind::Granted,
+                kind: MeetingTurnKind::V0Granted,
                 format_retry: false,
                 basis_id: basis,
                 round_number: view.floor.round_number,
                 speech_cursor: view.speech_cursor.clone(),
                 floor_revision: view.floor.floor_revision,
                 grant_event_id: Some(grant_id.clone()),
+                queued_at_unix_ms: now_ms(),
             });
             self.emit(
                 "grant_received",
@@ -869,13 +1511,14 @@ impl MeetingCoordinator {
             session_id,
             prompt,
             hard_deadline_unix_ms,
-            kind: MeetingTurnKind::Intent,
+            kind: MeetingTurnKind::V0Intent,
             format_retry: false,
             basis_id: basis.clone(),
             round_number: updated_view.floor.round_number,
             speech_cursor: updated_view.speech_cursor.clone(),
             floor_revision: updated_view.floor.floor_revision,
             grant_event_id: None,
+            queued_at_unix_ms: now_ms(),
         });
         self.emit(
             "intent_started",
@@ -968,8 +1611,11 @@ impl MeetingCoordinator {
             runtime.queued = true;
         }
         match request.kind {
-            MeetingTurnKind::Granted => self.pending.push_front(request),
-            MeetingTurnKind::Intent => self.pending.push_back(request),
+            MeetingTurnKind::V0Granted => self.pending.push_front(request),
+            MeetingTurnKind::V0Intent => self.pending.push_back(request),
+            MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted => {
+                tracing::error!("V1 Meeting turn was queued in the V0 controller");
+            }
         }
     }
 
@@ -1142,7 +1788,7 @@ impl MeetingCoordinator {
         self.persist_ledger_best_effort();
         let mut retry = request.clone();
         retry.format_retry = true;
-        retry.prompt = format_correction_prompt(MeetingTurnKind::Intent);
+        retry.prompt = format_correction_prompt(MeetingTurnKind::V0Intent);
         self.queue_turn(retry);
         self.emit(
             "intent_format_retry",
@@ -1326,7 +1972,7 @@ impl MeetingCoordinator {
         self.persist_ledger_best_effort();
         let mut retry = request.clone();
         retry.format_retry = true;
-        retry.prompt = format_correction_prompt(MeetingTurnKind::Granted);
+        retry.prompt = format_correction_prompt(MeetingTurnKind::V0Granted);
         self.queue_turn(retry);
         self.emit(
             "grant_format_retry",
@@ -1892,7 +2538,7 @@ async fn fetch_meeting_view(rest: &RestClient, session_id: Uuid) -> Result<Meeti
     })
 }
 
-async fn fetch_meeting_history(rest: &RestClient, filter: Filter) -> Result<Vec<Event>> {
+pub(super) async fn fetch_meeting_history(rest: &RestClient, filter: Filter) -> Result<Vec<Event>> {
     let mut filter =
         serde_json::to_value(filter).context("serialize meeting history query filter")?;
     let mut events = Vec::new();
@@ -2044,7 +2690,7 @@ fn positive_round(event: &Event) -> Option<u64> {
         .filter(|round| *round > 0)
 }
 
-fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+pub(super) fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event.tags.iter().find_map(|tag| {
         let values = tag.as_slice();
         (values.len() >= 2 && values[0] == name).then(|| values[1].as_str())
@@ -2142,7 +2788,7 @@ fn build_granted_prompt(
 
 fn format_correction_prompt(kind: MeetingTurnKind) -> String {
     match kind {
-        MeetingTurnKind::Intent => {
+        MeetingTurnKind::V0Intent => {
             "FORMAT CORRECTION ONLY. Your previous Meeting Intent answer was rejected because it \
              was not one exact raw JSON object. Preserve the same decision and semantics; do not \
              inspect more evidence and do not add commentary. Return exactly either \
@@ -2151,7 +2797,7 @@ fn format_correction_prompt(kind: MeetingTurnKind) -> String {
              Do not use Markdown or code fences."
                 .to_string()
         }
-        MeetingTurnKind::Granted => {
+        MeetingTurnKind::V0Granted => {
             "FORMAT CORRECTION ONLY. Your previous Meeting Granted answer was rejected because it \
              was not one exact raw JSON object. Preserve the same decision and semantics; do not \
              inspect more evidence and do not add commentary. Return exactly either \
@@ -2159,6 +2805,9 @@ fn format_correction_prompt(kind: MeetingTurnKind) -> String {
              {\"action\":\"YIELD\",\"content\":null,\"mention_pubkeys\":[],\"reason\":\"...\"}. \
              Do not use Markdown or code fences."
                 .to_string()
+        }
+        MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted => {
+            "V1 Meeting format correction is owned by the V1 controller.".to_string()
         }
     }
 }
@@ -2251,20 +2900,20 @@ fn parse_granted_output(raw: &str) -> Result<GrantedOutput> {
     Ok(output)
 }
 
-fn validate_bounded_text(value: &str, max_bytes: usize, field: &str) -> Result<()> {
+pub(super) fn validate_bounded_text(value: &str, max_bytes: usize, field: &str) -> Result<()> {
     if value.trim().is_empty() || value.len() > max_bytes {
         return Err(anyhow!("{field} is empty or exceeds {max_bytes} bytes"));
     }
     Ok(())
 }
 
-fn sign_builder(builder: EventBuilder, keys: &Keys) -> Result<Event> {
+pub(super) fn sign_builder(builder: EventBuilder, keys: &Keys) -> Result<Event> {
     builder
         .sign_with_keys(keys)
         .map_err(|error| anyhow!("meeting event signing failed: {error}"))
 }
 
-async fn submit_checked(rest: &RestClient, event: &Event) -> Result<Value> {
+pub(super) async fn submit_checked(rest: &RestClient, event: &Event) -> Result<Value> {
     let response = rest.submit_event(event).await?;
     if response.get("accepted").and_then(Value::as_bool) == Some(false) {
         let message = response
@@ -2346,7 +2995,7 @@ fn persist_ledger(path: &Path, ledger: &AgentLedger) -> Result<()> {
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2370,12 +3019,188 @@ fn short_pubkey(pubkey: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::Tag;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn gated_rest_responder(
+        keys: Keys,
+    ) -> (
+        RestClient,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gated test HTTP bridge");
+        let address = listener.local_addr().expect("read gated HTTP address");
+        let (request_started_tx, request_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept gated test HTTP request");
+                let request_started_tx = request_started_tx.clone();
+                let mut release_rx = release_rx.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 16 * 1024];
+                    let bytes_read = socket
+                        .read(&mut request)
+                        .await
+                        .expect("read gated test HTTP request");
+                    assert!(bytes_read > 0, "gated HTTP request must not be empty");
+                    request_started_tx
+                        .send(())
+                        .expect("report gated HTTP request");
+                    while !*release_rx.borrow() {
+                        release_rx
+                            .changed()
+                            .await
+                            .expect("gated HTTP response release sender");
+                    }
+                    const BODY: &str = "[]";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                        BODY.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write gated test HTTP response");
+                });
+            }
+        });
+        (
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: format!("http://{address}"),
+                keys,
+                auth_tag_json: None,
+            },
+            request_started_rx,
+            release_tx,
+            server,
+        )
+    }
+
+    fn v0_intent_request(session_id: Uuid, basis_id: &str) -> MeetingTurnRequest {
+        MeetingTurnRequest {
+            session_id,
+            prompt: "test V0 intent".to_string(),
+            hard_deadline_unix_ms: now_ms() + 60_000,
+            kind: MeetingTurnKind::V0Intent,
+            format_retry: false,
+            basis_id: basis_id.to_string(),
+            round_number: 1,
+            speech_cursor: None,
+            floor_revision: 1,
+            grant_event_id: None,
+            queued_at_unix_ms: now_ms(),
+        }
+    }
+
+    fn signed_meeting_metadata(keys: &Keys, session_id: Uuid) -> Event {
+        let session = session_id.to_string();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_NIP29_GROUP_METADATA as u16),
+            "meeting metadata",
+        )
+        .tags([
+            Tag::parse(["d", session.as_str()]).expect("metadata d tag"),
+            Tag::parse(["room_kind", "meeting"]).expect("meeting room kind tag"),
+        ])
+        .sign_with_keys(keys)
+        .expect("sign meeting metadata");
+        event.verify().expect("valid metadata signature");
+        event
+    }
+
+    fn signed_meeting_state(
+        keys: &Keys,
+        session_id: Uuid,
+        protocol: RegisteredMeetingProtocol,
+    ) -> Event {
+        let session = session_id.to_string();
+        let mut tags = vec![Tag::parse(["h", session.as_str()]).expect("state h tag")];
+        match protocol {
+            RegisteredMeetingProtocol::UniformV0 => {
+                tags.push(Tag::parse(["policy", "uniform-v0"]).expect("V0 policy tag"));
+            }
+            RegisteredMeetingProtocol::ModeratedBatonV1 => {
+                tags.push(Tag::parse(["v", "2"]).expect("V1 version tag"));
+                tags.push(Tag::parse(["policy", "moderated-baton-v1"]).expect("V1 policy tag"));
+            }
+        }
+        let event = EventBuilder::new(Kind::Custom(KIND_MEETING_ROUND_STATE as u16), "{}")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign meeting State");
+        event.verify().expect("valid State signature");
+        event
+    }
 
     #[test]
     fn subscription_is_room_scoped_without_mentions() {
         let filter = subscription_filter();
         assert!(!filter.require_mention);
-        assert_eq!(filter.kinds, Some(vec![9, 42101, 42102, 42103, 42104]));
+        assert_eq!(
+            filter.kinds,
+            Some(vec![
+                9, 42100, 42101, 42102, 42103, 42104, 42105, 42106, 42107, 42108, 42109
+            ])
+        );
+    }
+
+    #[test]
+    fn meeting_v0_prompts_keep_enforced_read_only_policy() {
+        let system_prompt = V0_SYSTEM_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(system_prompt.contains("enforced read-only Plan mode"));
+        assert!(!system_prompt.contains("advisory-v1"));
+
+        let view = MeetingView {
+            session_id: Uuid::new_v4(),
+            title: "Advisory policy test".into(),
+            description: None,
+            ended: false,
+            relay_pubkey: "a".repeat(64),
+            roster: BTreeMap::new(),
+            speeches: Vec::new(),
+            speech_cursor: None,
+            floor: FloorView {
+                state_event_id: "b".repeat(64),
+                round_number: 1,
+                floor_revision: 1,
+                phase: "collecting_intent".into(),
+                holder_pubkey: None,
+                settle_not_before_ms: None,
+                claim_deadline_ms: None,
+                lease_expires_at_ms: None,
+                decision_cohort: Vec::new(),
+                ready: Vec::new(),
+                passed: Vec::new(),
+                claimants: Vec::new(),
+                previous_round: None,
+                previous_outcome: None,
+                previous_speech_event_id: None,
+                outcome: None,
+                speech_event_id: None,
+            },
+            claims: BTreeMap::new(),
+            grants: BTreeMap::new(),
+        };
+        let intent_prompt = build_intent_prompt(&view, "meeting:create", now_ms() + 60_000);
+        let granted_prompt = build_granted_prompt(&view, "grant:test", now_ms() + 300_000, None);
+
+        for prompt in [&intent_prompt, &granted_prompt] {
+            assert!(prompt.contains("read-only inspection tools"));
+            assert!(!prompt.contains("advisory-v1"));
+        }
+        assert!(intent_prompt.contains("optional read-only evidence need"));
     }
 
     #[test]
@@ -2494,5 +3319,301 @@ mod tests {
         assert_eq!(recovered.grants[&grant_id].state, "received");
         assert_eq!(recovered.grants[&grant_id].format_attempts, 1);
         assert_eq!(recover_interrupted_turns(&mut ledger), (0, 0));
+    }
+
+    #[test]
+    fn protocol_detection_accepts_v1_state_from_metadata_signer() {
+        let session_id = Uuid::new_v4();
+        let relay = Keys::generate();
+        let events = vec![
+            signed_meeting_metadata(&relay, session_id),
+            signed_meeting_state(
+                &relay,
+                session_id,
+                RegisteredMeetingProtocol::ModeratedBatonV1,
+            ),
+        ];
+
+        assert_eq!(
+            classify_meeting_protocol(&events, session_id).expect("detect V1"),
+            RegisteredMeetingProtocol::ModeratedBatonV1
+        );
+    }
+
+    #[test]
+    fn protocol_detection_ignores_wrong_signer_v1_and_selects_authoritative_v0() {
+        let session_id = Uuid::new_v4();
+        let relay = Keys::generate();
+        let other = Keys::generate();
+        let events = vec![
+            signed_meeting_metadata(&relay, session_id),
+            signed_meeting_state(
+                &other,
+                session_id,
+                RegisteredMeetingProtocol::ModeratedBatonV1,
+            ),
+            signed_meeting_state(&relay, session_id, RegisteredMeetingProtocol::UniformV0),
+        ];
+
+        assert_eq!(
+            classify_meeting_protocol(&events, session_id).expect("detect authoritative V0"),
+            RegisteredMeetingProtocol::UniformV0
+        );
+    }
+
+    #[test]
+    fn protocol_detection_rejects_only_states_from_wrong_signer() {
+        let session_id = Uuid::new_v4();
+        let relay = Keys::generate();
+        let other = Keys::generate();
+        let events = vec![
+            signed_meeting_metadata(&relay, session_id),
+            signed_meeting_state(
+                &other,
+                session_id,
+                RegisteredMeetingProtocol::ModeratedBatonV1,
+            ),
+        ];
+
+        let error =
+            classify_meeting_protocol(&events, session_id).expect_err("wrong signer must fail");
+        assert!(error.to_string().contains("no authoritative State event"));
+    }
+
+    #[test]
+    fn protocol_detection_rejects_v0_v1_conflict_from_metadata_signer() {
+        let session_id = Uuid::new_v4();
+        let relay = Keys::generate();
+        let events = vec![
+            signed_meeting_metadata(&relay, session_id),
+            signed_meeting_state(&relay, session_id, RegisteredMeetingProtocol::UniformV0),
+            signed_meeting_state(
+                &relay,
+                session_id,
+                RegisteredMeetingProtocol::ModeratedBatonV1,
+            ),
+        ];
+
+        let error = classify_meeting_protocol(&events, session_id)
+            .expect_err("mixed authoritative protocols must fail");
+        assert!(error
+            .to_string()
+            .contains("conflicting authoritative protocol States"));
+    }
+
+    #[test]
+    fn stale_detection_result_cannot_consume_reregistered_generation() {
+        let session_id = Uuid::new_v4();
+        let old_generation = 1;
+        let new_generation = 2;
+        let mut in_flight = HashMap::from([(session_id, old_generation)]);
+
+        // Membership removal invalidates the old registration. Re-registering
+        // the same Session starts a distinct detection generation while the old
+        // background query may still be running.
+        in_flight.remove(&session_id);
+        in_flight.insert(session_id, new_generation);
+
+        assert!(!consume_detection_generation(
+            &mut in_flight,
+            session_id,
+            old_generation,
+        ));
+        assert_eq!(in_flight.get(&session_id), Some(&new_generation));
+        assert!(consume_detection_generation(
+            &mut in_flight,
+            session_id,
+            new_generation,
+        ));
+        assert!(!in_flight.contains_key(&session_id));
+    }
+
+    #[test]
+    fn deferred_v0_operations_restore_final_membership_without_losing_turn_ownership() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            keys: keys.clone(),
+            auth_tag_json: None,
+        };
+        let mut coordinator = MeetingCoordinator::new(rest, keys, None, 2);
+        let reregistered_session = Uuid::new_v4();
+        let removed_session = Uuid::new_v4();
+        let retained_session = Uuid::new_v4();
+        {
+            let v0 = coordinator.v0.as_mut().expect("available V0 controller");
+            v0.ledger_path = dir.path().join("meeting-ledger.json");
+            v0.ledger = AgentLedger {
+                version: LEDGER_VERSION,
+                agent_pubkey: v0.agent_pubkey.clone(),
+                meetings: BTreeMap::new(),
+            };
+            assert!(v0.register_local(reregistered_session));
+            assert!(v0.register_local(removed_session));
+            assert!(v0.register_local(retained_session));
+            v0.meetings
+                .get_mut(&reregistered_session)
+                .expect("reregistered runtime")
+                .queued = true;
+            v0.meetings
+                .get_mut(&retained_session)
+                .expect("retained runtime")
+                .last_sync = Some(Instant::now());
+        }
+        coordinator.protocols.extend([
+            (reregistered_session, RegisteredMeetingProtocol::UniformV0),
+            (removed_session, RegisteredMeetingProtocol::UniformV0),
+            (retained_session, RegisteredMeetingProtocol::UniformV0),
+        ]);
+        let removed_turn = "removed-session-turn".to_string();
+        coordinator.mark_dispatched(
+            removed_turn.clone(),
+            v0_intent_request(removed_session, "activation:removed"),
+        );
+
+        let held_v0 = coordinator.v0.take().expect("simulate completion owner");
+        coordinator.requeue_front(v0_intent_request(
+            reregistered_session,
+            "activation:stale-requeue",
+        ));
+        coordinator.requeue_front(v0_intent_request(
+            retained_session,
+            "activation:retained-requeue",
+        ));
+        coordinator.remove(reregistered_session);
+        coordinator.remove(removed_session);
+        // A later detection represents remove -> rejoin while the completion
+        // worker still owns V0. Restoration must remove old state first.
+        coordinator
+            .protocols
+            .insert(reregistered_session, RegisteredMeetingProtocol::UniformV0);
+        coordinator
+            .v0_deferred_registers
+            .insert(reregistered_session);
+        coordinator.v0_deferred_resyncs.insert(retained_session);
+
+        coordinator.restore_v0(held_v0);
+
+        let v0 = coordinator.v0.as_ref().expect("restored V0 controller");
+        assert!(v0.contains(reregistered_session));
+        assert!(
+            !v0.meetings[&reregistered_session].queued,
+            "rejoin must receive a fresh runtime rather than its removed state"
+        );
+        assert!(!v0.contains(removed_session));
+        assert!(
+            !v0.in_flight.contains_key(&removed_turn),
+            "removed runtime must release its internal turn record"
+        );
+        assert!(
+            coordinator.owns_turn(&removed_turn),
+            "outer ownership must consume the late Agent result instead of routing it as a normal reply"
+        );
+        assert_eq!(v0.pending.len(), 1);
+        assert_eq!(v0.pending[0].session_id, retained_session);
+        assert!(
+            v0.meetings[&retained_session].last_sync.is_none(),
+            "missed V0 events must request a recovery sync after restoration"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_v0_completion_does_not_block_result_return_or_main_tick() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        // Hold every Relay response so the test observes the completion worker
+        // in flight, regardless of how many reconciliation reads it performs.
+        let (rest, mut request_started, release_responses, server) =
+            gated_rest_responder(keys.clone()).await;
+        let mut coordinator = MeetingCoordinator::new(rest, keys, None, 2);
+        let completed_session = Uuid::new_v4();
+        let untouched_session = Uuid::new_v4();
+        coordinator
+            .protocols
+            .insert(completed_session, RegisteredMeetingProtocol::UniformV0);
+        coordinator
+            .protocols
+            .insert(untouched_session, RegisteredMeetingProtocol::UniformV0);
+        {
+            let v0 = coordinator.v0.as_mut().expect("available V0 controller");
+            v0.ledger_path = dir.path().join("meeting-ledger.json");
+            v0.ledger = AgentLedger {
+                version: LEDGER_VERSION,
+                agent_pubkey: v0.agent_pubkey.clone(),
+                meetings: BTreeMap::new(),
+            };
+            assert!(v0.register_local(completed_session));
+            assert!(v0.register_local(untouched_session));
+        }
+
+        let completed_turn = "v0-completed-turn".to_string();
+        let untouched_turn = "v0-untouched-turn".to_string();
+        coordinator.mark_dispatched(
+            completed_turn.clone(),
+            v0_intent_request(completed_session, "activation:completed"),
+        );
+        coordinator.mark_dispatched(
+            untouched_turn.clone(),
+            v0_intent_request(untouched_session, "activation:untouched"),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            coordinator.handle_turn_failure(&completed_turn),
+        )
+        .await
+        .expect("V0 result handling must enqueue without waiting for Relay HTTP");
+        assert!(
+            coordinator.v0.is_none(),
+            "completion worker owns the legacy controller"
+        );
+        assert!(!coordinator.owns_turn(&completed_turn));
+        assert!(coordinator.owns_turn(&untouched_turn));
+
+        tokio::time::timeout(Duration::from_secs(1), request_started.recv())
+            .await
+            .expect("V0 completion must start its Relay query")
+            .expect("gated HTTP server must report the request");
+
+        // MeetingCoordinator::tick runs V1 maintenance first. It must remain
+        // responsive while the legacy completion task is parked in HTTP.
+        tokio::time::timeout(Duration::from_millis(250), coordinator.tick())
+            .await
+            .expect("slow V0 completion must not block the V1-capable main tick");
+        assert!(coordinator.v0_completion_task.is_some());
+
+        release_responses
+            .send(true)
+            .expect("release gated HTTP responses");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                coordinator.drain_v0_completion().await;
+                if coordinator.v0.is_some() && coordinator.v0_completion_task.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("V0 controller must return after Relay HTTP completes");
+        server.abort();
+
+        let v0 = coordinator.v0.as_ref().expect("restored V0 controller");
+        assert!(!v0.in_flight.contains_key(&completed_turn));
+        assert!(v0.in_flight.contains_key(&untouched_turn));
+        assert_eq!(
+            v0.meetings
+                .get(&completed_session)
+                .and_then(|runtime| runtime.in_flight_turn.as_deref()),
+            None
+        );
+        assert_eq!(
+            v0.meetings
+                .get(&untouched_session)
+                .and_then(|runtime| runtime.in_flight_turn.as_deref()),
+            Some(untouched_turn.as_str())
+        );
     }
 }

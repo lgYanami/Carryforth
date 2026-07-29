@@ -5,6 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod meeting;
+mod meeting_v1;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1571,15 +1572,16 @@ async fn tokio_main() -> Result<()> {
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
-    let meeting_mcp_servers = build_meeting_mcp_servers(&mcp_servers);
-    if !mcp_servers.is_empty() && meeting_mcp_servers.is_empty() {
+    let meeting_v0_mcp_servers = build_meeting_v0_mcp_servers(&mcp_servers);
+    if !mcp_servers.is_empty() && meeting_v0_mcp_servers.is_empty() {
         tracing::warn!(
-            "Meeting turns will not receive the configured MCP server because only buzz-dev-mcp \
-             has an enforced read-only profile in Meeting V0"
+            "Meeting V0 turns will not receive the configured MCP server because only \
+             buzz-dev-mcp has an enforced read-only profile"
         );
     }
-    let meeting_ctx = Arc::new(PromptContext {
-        mcp_servers: meeting_mcp_servers,
+    let meeting_v0_ctx = Arc::new(PromptContext {
+        // V0 keeps its original enforced Plan/read-only execution profile.
+        mcp_servers: meeting_v0_mcp_servers,
         initial_message: None,
         idle_timeout: ctx.idle_timeout,
         max_turn_duration: Duration::from_secs(270),
@@ -1587,7 +1589,7 @@ async fn tokio_main() -> Result<()> {
         dedup_mode: DedupMode::Drop,
         system_prompt: ctx.system_prompt.clone(),
         team_instructions: ctx.team_instructions.clone(),
-        base_prompt: Some(meeting::SYSTEM_PROMPT),
+        base_prompt: Some(meeting::V0_SYSTEM_PROMPT),
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
         rest_client: ctx.rest_client.clone(),
@@ -1602,15 +1604,47 @@ async fn tokio_main() -> Result<()> {
         harness_name: ctx.harness_name.clone(),
         relay_url: ctx.relay_url.clone(),
     });
+    let meeting_v1_ctx = Arc::new(PromptContext {
+        // V1 uses an advisory tool policy: the Agent keeps its normal tools,
+        // while the prompt asks it not to create persistent side effects.
+        // Protocol event publication remains Harness-owned.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V1_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
     let mut meeting_controller = meeting::MeetingCoordinator::new(
         ctx.rest_client.clone(),
         config.keys.clone(),
         observer.clone(),
+        config.agents as usize,
     );
+    pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+    meeting_controller.set_available_agent_slots(if pool_ready { pool.idle_count() } else { 0 });
     for channel_id in meeting_channel_ids {
         meeting_controller.register(channel_id).await;
     }
-    let mut meeting_tick = tokio::time::interval(Duration::from_secs(2));
+    // V1 Agent Offers have a 5-second ACK window. A sub-second controller tick
+    // leaves room to replay one prepared ACK after an uncertain HTTP result.
+    let mut meeting_tick = tokio::time::interval(Duration::from_millis(500));
     meeting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if !config.memory_enabled {
@@ -1756,8 +1790,24 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+        meeting_controller.set_available_agent_slots(if pool_ready {
+            pool.idle_count()
+        } else {
+            0
+        });
         if pool_ready {
-            dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
+            for channel_id in meeting_controller.take_preemptions() {
+                let _ = signal_in_flight_task(&mut pool, channel_id, ControlSignal::Cancel);
+            }
+            dispatch_meeting_pending(
+                &mut pool,
+                &mut meeting_controller,
+                &meeting_v0_ctx,
+                &meeting_v1_ctx,
+            );
+            pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+            meeting_controller.set_available_agent_slots(pool.idle_count());
         }
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -1865,7 +1915,12 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
+            dispatch_meeting_pending(
+                &mut pool,
+                &mut meeting_controller,
+                &meeting_v0_ctx,
+                &meeting_v1_ctx,
+            );
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                 typing_channels.insert(channel_id, thread_tags);
             }
@@ -2036,7 +2091,7 @@ async fn tokio_main() -> Result<()> {
                                             meeting_controller.register(ch).await;
                                         }
                                     } else if is_meeting {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to Meeting V0 room");
+                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to Meeting room");
                                         if let Err(e) = relay
                                             .subscribe_channel_from(
                                                 ch,
@@ -2504,7 +2559,12 @@ async fn tokio_main() -> Result<()> {
                 if drain_action == LoopAction::Exit {
                     break;
                 }
-                dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
+                dispatch_meeting_pending(
+                    &mut pool,
+                    &mut meeting_controller,
+                    &meeting_v0_ctx,
+                    &meeting_v1_ctx,
+                );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -2536,7 +2596,12 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
+                dispatch_meeting_pending(
+                    &mut pool,
+                    &mut meeting_controller,
+                    &meeting_v0_ctx,
+                    &meeting_v1_ctx,
+                );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -2683,7 +2748,12 @@ async fn tokio_main() -> Result<()> {
                             "ready",
                             None,
                         );
-                        dispatch_meeting_pending(&mut pool, &mut meeting_controller, &meeting_ctx);
+                        dispatch_meeting_pending(
+                            &mut pool,
+                            &mut meeting_controller,
+                            &meeting_v0_ctx,
+                            &meeting_v1_ctx,
+                        );
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
                         {
@@ -3022,11 +3092,25 @@ fn try_native_steer(
 fn dispatch_meeting_pending(
     pool: &mut AgentPool,
     controller: &mut meeting::MeetingCoordinator,
-    ctx: &Arc<PromptContext>,
+    v0_ctx: &Arc<PromptContext>,
+    v1_ctx: &Arc<PromptContext>,
 ) {
     while let Some(request) = controller.pop_pending() {
         let channel_id = request.session_id;
-        let mut agent = match pool.try_claim(Some(channel_id)) {
+        let ctx = if request.kind.is_v1() {
+            Arc::clone(v1_ctx)
+        } else {
+            Arc::clone(v0_ctx)
+        };
+        // Only a V1 Granted turn owns a slot protected by the local Offer
+        // reservation. Intent turns (including V1 Intent) must respect that
+        // floor or they could consume the exact slot an ACK promised.
+        let claimed = if request.kind == meeting::MeetingTurnKind::V1Granted {
+            pool.try_claim_meeting(channel_id)
+        } else {
+            pool.try_claim(Some(channel_id))
+        };
+        let mut agent = match claimed {
             Some(agent) => agent,
             None => {
                 controller.requeue_front(request);
@@ -3034,7 +3118,6 @@ fn dispatch_meeting_pending(
             }
         };
         let result_tx = pool.result_tx();
-        let ctx = Arc::clone(ctx);
         let agent_index = agent.index;
         let prompt = request.prompt.clone();
         let batch = FlushBatch {
@@ -4399,7 +4482,7 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
     }]
 }
 
-fn build_meeting_mcp_servers(servers: &[McpServer]) -> Vec<McpServer> {
+fn build_meeting_v0_mcp_servers(servers: &[McpServer]) -> Vec<McpServer> {
     servers
         .iter()
         .filter(|server| server.name == "buzz-dev-mcp")
@@ -4422,7 +4505,7 @@ mod heartbeat_base_prompt_tests {
     use super::*;
 
     #[test]
-    fn meeting_mcp_allowlist_keeps_only_enforced_read_only_dev_mcp() {
+    fn meeting_v0_mcp_allowlist_keeps_only_enforced_read_only_dev_mcp() {
         let servers = vec![
             McpServer {
                 name: "buzz-dev-mcp".into(),
@@ -4441,7 +4524,7 @@ mod heartbeat_base_prompt_tests {
             },
         ];
 
-        let allowed = build_meeting_mcp_servers(&servers);
+        let allowed = build_meeting_v0_mcp_servers(&servers);
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0].name, "buzz-dev-mcp");
         assert!(allowed[0].env.iter().any(|variable| {
