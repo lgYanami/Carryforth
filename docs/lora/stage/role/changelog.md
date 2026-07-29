@@ -1,5 +1,56 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 5：Work Responsibility 与 Commitment
+
+### Project-owned Work 责任
+
+- v2 Work head 增加独立于既有 v1 object body 的 `responsible_role_id` 关系；普通 Project
+  View Work 内容仍复用原模型，Role 责任则由 Relay 签名的同一 Work projection 携带。
+- `set_work_responsibility` 只允许 Community owner 或携带当前 Leader Assignment fence
+  的 admin 执行；目标必须是 active Role。有 active Commitment 时不能单独改派或清除
+  责任，Role 仍被 Work 引用时也不能停用或删除。
+- Work responsibility 的改变与 Work object revision、全局 project revision、旧 head
+  retirement、receipt 和 v2 meta head 在同一事务中推进，不产生第二份旁路状态。
+
+### Assignment-owned Commitment
+
+- 增加 first-class `WorkCommitment` 生命周期实体，固定记录 Work、Assignment、Member、
+  接受者、开始时间、终止者、终止时间与原因。Member 归因在创建后不可改写，继任者只能
+  创建自己的新 Commitment。
+- 增加 `accept_work`、`end_commitment` 和原子 `replace_commitment` command。只有
+  Work responsible Role 的当前 assignee 能接受；释放与替换必须携带该 Member 的精确
+  active Assignment fence，并以 observed Commitment ID 防止覆盖并发状态。
+- Assignment 结束会在同一 project revision 中结束其全部 active Commitment，但不修改
+  Work status 或 responsible Role。Work 进入 completed/cancelled 或被删除时，也会在
+  普通对象事务内以 `work_closed` 结束 active Commitment。
+- additive migration `0028_project_work_commitments.sql` 补齐 immutable
+  `member_pubkey`、entity revision、latest change 和更新时间，并用 deferred constraint
+  校验 Assignment/Member/签名者一致、active Commitment 只指向非终态 Work。materialized
+  active Commitment count、canonical row、signed entity head 和 meta count 同事务提交。
+
+### 同一 verified state 的 Agent 与 Human 入口
+
+- 共享 `VerifiedRoleBriefSnapshot` 现在验证 Work responsibility、Commitment、
+  Assignment 和 meta count 的一致性，并把当前 Role 的非终态 Work 派生为
+  `committed` 或 `waiting_for_continuation`。JSON、共享 Markdown renderer、ACP 动态
+  Role Brief 与 Desktop 继续来自同一个 assembler。
+- CLI 增加 `buzz roles work assign|unassign|accept|release|recommit`；managed Agent
+  继续在签名前刷新完整 verified snapshot，并自动携带当前 Assignment fence。
+- Desktop Role Inspector 展示 responsible Work 与接续状态；Work Inspector 允许 Human
+  owner/Leader 分配责任，允许当前 assignee 接受或释放 Work。React 只提交 revision-fenced
+  intent，Tauri/Relay 执行最终校验并在冲突时要求 Human 查看新状态。
+
+### 验证与范围
+
+- 纯领域测试覆盖跨 Role 接受拒绝、active Commitment 改派拒绝、Assignment 结束不改变
+  Work、等待接续，以及 recommit 保留前任归因；SDK 测试覆盖责任 projection、
+  Commitment verified snapshot 和 Role Brief 派生。
+- migration/schema 静态门禁、workspace all-targets check、Desktop Tauri all-targets
+  check、TypeScript 与 Biome 检查通过；Desktop E2E 覆盖 verified Commitment 展示和
+  owner 的 revision-fenced Work 分配。
+- 本阶段不实现结构化 Checkpoint、成员撰写的完整 Handoff、Role 历史分页或完整 Role
+  Brief 时间线；这些属于阶段 6。
+
 ## 2026-07-29 — 阶段 4：Managed Agent 绑定与最小 Role Brief
 
 ### 共享 verified Role Brief

@@ -14,11 +14,11 @@ mod role_continuity;
 
 pub use project_object::ProjectObjectCommand;
 pub use role_continuity::{
-    AssignmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, MemberGovernance,
-    ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal, RoleCommand,
-    RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity, RoleContinuityError,
-    RoleContinuityOutcome, RoleContinuityState, RoleDefinition, RoleHandoff, RoleSlot,
-    MAX_PROPOSAL_LIFETIME_DAYS,
+    AssignmentEndReason, CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds,
+    MemberGovernance, ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal,
+    RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity,
+    RoleContinuityError, RoleContinuityOutcome, RoleContinuityState, RoleDefinition, RoleHandoff,
+    RoleSlot, WorkCommitment, WorkResponsibility, MAX_PROPOSAL_LIFETIME_DAYS,
 };
 
 const CHANGE_ID_DOMAIN: &[u8] = b"buzz-project-view-v2:change-id\0";

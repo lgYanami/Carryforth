@@ -10,6 +10,7 @@ use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::{
     CommunityMemberRole, ProjectObjectCommand, RoleAssignment, RoleAssignmentProposal, RoleCommand,
     RoleContinuityChange, RoleContinuityEntity, RoleDefinition, RoleHandoff, SchemaVersion,
+    WorkCommitment,
 };
 use buzz_project_view::{
     validate_projected_object, ProjectViewEntry, ProjectViewObject, ProjectViewObjectType,
@@ -339,6 +340,8 @@ pub struct V2ProjectObjectProjection {
     pub source: V2ProjectionSource,
     /// Complete object or tombstone.
     pub object: V2ProjectedObject,
+    /// Stable Role responsible for an active Work.
+    pub responsible_role_id: Option<Uuid>,
     /// Relay canonical emission time.
     pub updated_at: DateTime<Utc>,
 }
@@ -412,6 +415,16 @@ pub fn build_project_object_projection(
     context: &V2ProjectionContext,
     entry: &ProjectViewEntry,
 ) -> Result<EventBuilder, SdkError> {
+    build_project_object_projection_with_responsibility(context, entry, None)
+}
+
+/// Build one unsigned v2 head while preserving the Work responsibility
+/// relation that is intentionally absent from the closed v1 object body.
+pub fn build_project_object_projection_with_responsibility(
+    context: &V2ProjectionContext,
+    entry: &ProjectViewEntry,
+    responsible_role_id: Option<Uuid>,
+) -> Result<EventBuilder, SdkError> {
     validate_context(context)?;
     if entry.id().is_nil() {
         return Err(SdkError::InvalidInput(
@@ -428,6 +441,18 @@ pub fn build_project_object_projection(
         validate_projected_object(object)
             .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
         validate_v2_object_identity(context.project_id, object.object_type, object.id)?;
+    }
+    if responsible_role_id.is_some_and(|role_id| role_id.is_nil())
+        || (responsible_role_id.is_some()
+            && !matches!(
+                entry,
+                ProjectViewEntry::Active(object)
+                    if object.object_type == ProjectViewObjectType::Work
+            ))
+    {
+        return Err(SdkError::InvalidInput(
+            "responsible_role_id is only valid for one active Work".to_owned(),
+        ));
     }
 
     let coordinate = crate::project_view::object_projection_coordinate(
@@ -472,6 +497,7 @@ pub fn build_project_object_projection(
         deleted,
         object,
         tombstone,
+        responsible_role_id,
         updated_at: context.updated_at,
     })
     .map_err(|error| SdkError::InvalidInput(format!("serialize v2 Project object: {error}")))?;
@@ -530,6 +556,20 @@ pub fn parse_project_object_projection(
             ));
         }
     };
+    if raw
+        .responsible_role_id
+        .is_some_and(|role_id| role_id.is_nil())
+        || (raw.responsible_role_id.is_some()
+            && !matches!(
+                &object,
+                V2ProjectedObject::Active(object)
+                    if object.object_type == ProjectViewObjectType::Work
+            ))
+    {
+        return Err(invalid_projection(
+            "responsible_role_id is only valid for one active Work",
+        ));
+    }
     if object.object_revision() != raw.object_revision {
         return Err(invalid_projection(
             "v2 object revision disagrees with its payload",
@@ -556,6 +596,7 @@ pub fn parse_project_object_projection(
         project_revision: raw.project_revision,
         source: raw.source,
         object,
+        responsible_role_id: raw.responsible_role_id,
         updated_at,
     })
 }
@@ -982,6 +1023,8 @@ struct ProjectObjectProjectionContent<'a> {
     object: Option<&'a ProjectViewObject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstone: Option<V2ObjectTombstone>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    responsible_role_id: Option<Uuid>,
     updated_at: DateTime<Utc>,
 }
 
@@ -1000,6 +1043,8 @@ struct RawProjectObjectProjection {
     object: Option<ProjectViewObject>,
     #[serde(default)]
     tombstone: Option<V2ObjectTombstone>,
+    #[serde(default)]
+    responsible_role_id: Option<Uuid>,
     updated_at: String,
 }
 
@@ -1043,6 +1088,7 @@ fn entity_parts(
         RoleContinuityChange::Role(value) => serde_json::to_value(value),
         RoleContinuityChange::Proposal(value) => serde_json::to_value(value),
         RoleContinuityChange::Assignment(value) => serde_json::to_value(value),
+        RoleContinuityChange::Commitment(value) => serde_json::to_value(value),
         RoleContinuityChange::Handoff(value) => serde_json::to_value(value),
     }
     .map_err(|error| SdkError::InvalidInput(format!("serialize v2 entity: {error}")))?;
@@ -1063,6 +1109,9 @@ fn parse_entity(
         }
         RoleContinuityEntity::RoleAssignment => {
             serde_json::from_value::<RoleAssignment>(value).map(RoleContinuityChange::Assignment)
+        }
+        RoleContinuityEntity::WorkCommitment => {
+            serde_json::from_value::<WorkCommitment>(value).map(RoleContinuityChange::Commitment)
         }
         RoleContinuityEntity::RoleHandoff => {
             serde_json::from_value::<RoleHandoff>(value).map(RoleContinuityChange::Handoff)
@@ -1358,6 +1407,10 @@ mod tests {
     use buzz_project_view::v2::{
         ProposalStatus, ProposalType, RoleAssignmentProposal, RoleContinuityChange,
     };
+    use buzz_project_view::{
+        ObjectRef, Priority, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
+        ProjectViewObjectType, ProjectViewRelations, ProjectWork, WorkStatus,
+    };
     use chrono::Duration;
 
     #[test]
@@ -1449,5 +1502,57 @@ mod tests {
             .sign_with_keys(&relay)
             .expect("sign unordered membership snapshot");
         assert!(parse_membership_projection(&unordered, &relay.public_key()).is_err());
+    }
+
+    #[test]
+    fn work_projection_round_trips_responsible_role_outside_v1_body() {
+        let relay = Keys::generate();
+        let actor = Keys::generate().public_key();
+        let project_id = CommunityId::from_uuid(Uuid::new_v4());
+        let role_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("timestamp");
+        let entry = ProjectViewEntry::Active(ProjectViewObject {
+            id: Uuid::new_v4(),
+            object_type: ProjectViewObjectType::Work,
+            object_revision: 2,
+            project_revision: 9,
+            created_at: now - Duration::seconds(5),
+            updated_at: now,
+            created_by: actor,
+            updated_by: actor,
+            data: ProjectViewObjectData::Work(ProjectWork {
+                title: "Project Role continuity".to_owned(),
+                description: "Keep responsibility stable across runtimes".to_owned(),
+                status: WorkStatus::InProgress,
+                priority: Priority::High,
+            }),
+            relations: ProjectViewRelations {
+                handles: Some(ObjectRef {
+                    object_type: ProjectViewObjectType::Issue,
+                    object_id: Uuid::new_v4(),
+                }),
+                ..ProjectViewRelations::default()
+            },
+        });
+        let source_id = EventId::all_zeros();
+        let context = V2ProjectionContext {
+            project_id,
+            projection_generation: 2,
+            project_revision: 9,
+            source: V2ProjectionSource::NostrEvent {
+                change_id: source_id,
+                event_id: source_id,
+            },
+            updated_at: now,
+        };
+        let event =
+            build_project_object_projection_with_responsibility(&context, &entry, Some(role_id))
+                .expect("builder")
+                .sign_with_keys(&relay)
+                .expect("signed projection");
+        let parsed = parse_project_object_projection(&event, &relay.public_key(), project_id)
+            .expect("verified Work projection");
+        assert_eq!(parsed.responsible_role_id, Some(role_id));
+        assert_eq!(parsed.object.id(), entry.id());
     }
 }

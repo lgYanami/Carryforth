@@ -9,7 +9,7 @@ use buzz_core_pkg::kind::{
 use buzz_core_pkg::PublicKey;
 use buzz_project_view_pkg::v2::{
     CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal,
-    RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel,
+    RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel, WorkCommitment,
 };
 use buzz_project_view_pkg::{
     ProjectRole, ProjectView, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
@@ -82,9 +82,18 @@ pub struct ProjectViewRoleContinuity {
     roles: Vec<RoleDefinition>,
     proposals: Vec<RoleAssignmentProposal>,
     assignments: Vec<RoleAssignment>,
+    commitments: Vec<WorkCommitment>,
+    work_responsibilities: Vec<ProjectViewWorkResponsibility>,
     handoffs: Vec<RoleHandoff>,
     members: Vec<ProjectViewMembershipMember>,
     briefs: Vec<RoleBrief>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectViewWorkResponsibility {
+    work_id: uuid::Uuid,
+    role_id: uuid::Uuid,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,6 +447,7 @@ async fn fetch_v2_snapshot_once(
     let mut event_ids = HashSet::with_capacity(ordinary_events.len() + entity_events.len());
     let mut object_ids = HashSet::new();
     let mut entries = Vec::new();
+    let mut work_responsibilities = Vec::new();
     let mut object_projections = Vec::with_capacity(ordinary_events.len());
     for event in &ordinary_events {
         if !event_ids.insert(event.id) {
@@ -459,6 +469,14 @@ async fn fetch_v2_snapshot_once(
                     "v2 snapshot contains a duplicate active object ID",
                 ));
             }
+            if object.object_type == ProjectViewObjectType::Work {
+                if let Some(role_id) = projection.responsible_role_id {
+                    work_responsibilities.push(ProjectViewWorkResponsibility {
+                        work_id: object.id,
+                        role_id,
+                    });
+                }
+            }
             entries.push(ProjectViewEntry::Active((**object).clone()));
         }
         object_projections.push(projection);
@@ -467,6 +485,7 @@ async fn fetch_v2_snapshot_once(
     let mut roles = Vec::new();
     let mut proposals = Vec::new();
     let mut assignments = Vec::new();
+    let mut commitments = Vec::new();
     let mut handoffs = Vec::new();
     let mut entity_projections = Vec::with_capacity(entity_events.len());
     for event in &entity_events {
@@ -494,6 +513,7 @@ async fn fetch_v2_snapshot_once(
             }
             RoleContinuityChange::Proposal(proposal) => proposals.push(proposal.clone()),
             RoleContinuityChange::Assignment(assignment) => assignments.push(assignment.clone()),
+            RoleContinuityChange::Commitment(commitment) => commitments.push(commitment.clone()),
             RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff.clone()),
         }
         entity_projections.push(projection);
@@ -504,6 +524,7 @@ async fn fetch_v2_snapshot_once(
         &roles,
         &proposals,
         &assignments,
+        &commitments,
         &handoffs,
         &membership,
     )?;
@@ -568,6 +589,8 @@ async fn fetch_v2_snapshot_once(
     roles.sort_by_key(|role| role.role_id);
     proposals.sort_by_key(|proposal| proposal.proposal_id);
     assignments.sort_by_key(|assignment| assignment.assignment_id);
+    commitments.sort_by_key(|commitment| commitment.commitment_id);
+    work_responsibilities.sort_by_key(|responsibility| responsibility.work_id);
     handoffs.sort_by_key(|handoff| handoff.handoff_id);
     let members = membership
         .members
@@ -584,6 +607,8 @@ async fn fetch_v2_snapshot_once(
             roles,
             proposals,
             assignments,
+            commitments,
+            work_responsibilities,
             handoffs,
             members,
             briefs,
@@ -664,6 +689,7 @@ fn validate_v2_counts_and_membership(
     roles: &[RoleDefinition],
     proposals: &[RoleAssignmentProposal],
     assignments: &[RoleAssignment],
+    commitments: &[WorkCommitment],
     handoffs: &[RoleHandoff],
     membership: &V2MembershipProjection,
 ) -> ProjectViewReadResult<()> {
@@ -675,8 +701,13 @@ fn validate_v2_counts_and_membership(
         .iter()
         .filter(|assignment| assignment.is_active())
         .count();
+    let active_commitments = commitments
+        .iter()
+        .filter(|commitment| commitment.is_active())
+        .count();
     if usize::try_from(meta.entity_counts.open_proposals).ok() != Some(open_proposals)
         || usize::try_from(meta.entity_counts.active_assignments).ok() != Some(active_assignments)
+        || usize::try_from(meta.entity_counts.active_commitments).ok() != Some(active_commitments)
         || usize::try_from(meta.entity_counts.handoffs).ok() != Some(handoffs.len())
     {
         return Err(integrity_read_error(

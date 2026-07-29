@@ -106,6 +106,48 @@ pub enum ProjectViewRoleMutationInput {
         /// Active Leader tenure; owner may omit it.
         acting_assignment_id: Option<Uuid>,
     },
+    /// Owner or Leader changes the stable Role responsible for Work.
+    SetWorkResponsibility {
+        /// Verified Project revision on which the Human acts.
+        expected_project_revision: u64,
+        /// Work being assigned or unassigned.
+        work_id: Uuid,
+        /// New responsible Role; absent clears responsibility.
+        responsible_role_id: Option<Uuid>,
+        /// Active Leader tenure; owner may omit it.
+        acting_assignment_id: Option<Uuid>,
+    },
+    /// The current Role assignee explicitly accepts its Work.
+    AcceptWork {
+        /// Verified Project revision on which the Human acts.
+        expected_project_revision: u64,
+        /// Work owned by the current Assignment's Role.
+        work_id: Uuid,
+        /// Current Assignment tenure.
+        acting_assignment_id: Option<Uuid>,
+    },
+    /// The current assignee releases one active Commitment.
+    EndCommitment {
+        /// Verified Project revision on which the Human acts.
+        expected_project_revision: u64,
+        /// Commitment to release.
+        commitment_id: Uuid,
+        /// Optional release context.
+        reason: Option<String>,
+        /// Current Assignment tenure.
+        acting_assignment_id: Option<Uuid>,
+    },
+    /// The current assignee atomically recommits to the same Work.
+    ReplaceCommitment {
+        /// Verified Project revision on which the Human acts.
+        expected_project_revision: u64,
+        /// Work being recommitted.
+        work_id: Uuid,
+        /// Active Commitment observed by the Human.
+        expected_commitment_id: Uuid,
+        /// Current Assignment tenure.
+        acting_assignment_id: Option<Uuid>,
+    },
 }
 
 /// Result of one non-replayed desktop Role intent.
@@ -129,6 +171,15 @@ pub enum ProjectViewRoleMutationResult {
         /// Assignment explicitly targeted by an end/report operation.
         #[serde(skip_serializing_if = "Option::is_none")]
         target_assignment_id: Option<Uuid>,
+        /// Work touched by a responsibility or Commitment command.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        work_id: Option<Uuid>,
+        /// New Work responsibility, absent for other commands or after clear.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        responsible_role_id: Option<Uuid>,
+        /// Commitment created or targeted by the command.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commitment_id: Option<Uuid>,
         /// Canonical changed entity coordinates from the receipt.
         changed_entities: Vec<RoleChangedEntity>,
     },
@@ -146,7 +197,7 @@ pub enum ProjectViewRoleMutationResult {
 
 /// One changed Role-continuity entity reported by the canonical receipt.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct RoleChangedEntity {
     entity_type: String,
     entity_id: Uuid,
@@ -161,6 +212,9 @@ struct RoleReceipt {
     proposal_id: Option<Uuid>,
     assignment_id: Option<Uuid>,
     target_assignment_id: Option<Uuid>,
+    work_id: Option<Uuid>,
+    responsible_role_id: Option<Uuid>,
+    commitment_id: Option<Uuid>,
 }
 
 struct RoleMutationContext {
@@ -228,6 +282,9 @@ async fn execute_role_mutation(
         proposal_id: receipt.proposal_id,
         assignment_id: receipt.assignment_id,
         target_assignment_id: receipt.target_assignment_id,
+        work_id: receipt.work_id,
+        responsible_role_id: receipt.responsible_role_id,
+        commitment_id: receipt.commitment_id,
         changed_entities: receipt.changed_entities,
     })
 }
@@ -323,6 +380,58 @@ fn prepare_role_command(input: ProjectViewRoleMutationInput) -> Result<(RoleComm
             RoleCommandRequest::EndAssignment {
                 assignment_id,
                 reason,
+            },
+        ),
+        ProjectViewRoleMutationInput::SetWorkResponsibility {
+            expected_project_revision,
+            work_id,
+            responsible_role_id,
+            acting_assignment_id,
+        } => (
+            expected_project_revision,
+            acting_assignment_id,
+            RoleCommandRequest::SetWorkResponsibility {
+                work_id,
+                responsible_role_id,
+            },
+        ),
+        ProjectViewRoleMutationInput::AcceptWork {
+            expected_project_revision,
+            work_id,
+            acting_assignment_id,
+        } => (
+            expected_project_revision,
+            acting_assignment_id,
+            RoleCommandRequest::AcceptWork {
+                commitment_id: Uuid::new_v4(),
+                work_id,
+            },
+        ),
+        ProjectViewRoleMutationInput::EndCommitment {
+            expected_project_revision,
+            commitment_id,
+            reason,
+            acting_assignment_id,
+        } => (
+            expected_project_revision,
+            acting_assignment_id,
+            RoleCommandRequest::EndCommitment {
+                commitment_id,
+                reason,
+            },
+        ),
+        ProjectViewRoleMutationInput::ReplaceCommitment {
+            expected_project_revision,
+            work_id,
+            expected_commitment_id,
+            acting_assignment_id,
+        } => (
+            expected_project_revision,
+            acting_assignment_id,
+            RoleCommandRequest::ReplaceCommitment {
+                commitment_id: Uuid::new_v4(),
+                work_id,
+                expected_commitment_id,
             },
         ),
     };
@@ -462,5 +571,49 @@ mod tests {
         assert!(proposal_deadline(0).is_err());
         assert!(proposal_deadline(721).is_err());
         assert!(proposal_deadline(72).is_ok());
+    }
+
+    #[test]
+    fn work_acceptance_and_recommit_generate_new_commitment_ids() {
+        let work_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let observed_commitment_id = Uuid::new_v4();
+        let (accept, revision) = prepare_role_command(ProjectViewRoleMutationInput::AcceptWork {
+            expected_project_revision: 12,
+            work_id,
+            acting_assignment_id: Some(assignment_id),
+        })
+        .expect("prepare Work acceptance");
+        let RoleCommandRequest::AcceptWork {
+            commitment_id: accepted_id,
+            work_id: accepted_work_id,
+        } = accept.request
+        else {
+            panic!("expected Work acceptance");
+        };
+        assert_eq!(revision, 12);
+        assert_eq!(accept.acting_assignment_id, Some(assignment_id));
+        assert_eq!(accepted_work_id, work_id);
+        assert!(!accepted_id.is_nil());
+
+        let (replacement, _) =
+            prepare_role_command(ProjectViewRoleMutationInput::ReplaceCommitment {
+                expected_project_revision: 13,
+                work_id,
+                expected_commitment_id: observed_commitment_id,
+                acting_assignment_id: Some(assignment_id),
+            })
+            .expect("prepare Work recommit");
+        assert!(matches!(
+            replacement.request,
+            RoleCommandRequest::ReplaceCommitment {
+                commitment_id,
+                work_id: actual_work_id,
+                expected_commitment_id,
+            } if !commitment_id.is_nil()
+                && commitment_id != observed_commitment_id
+                && actual_work_id == work_id
+                && expected_commitment_id == observed_commitment_id
+        ));
     }
 }

@@ -195,6 +195,7 @@ const ROLE_STATE_IDS = {
   formerAssignment: "20000000-0000-4000-8000-000000000002",
   proposal: "20000000-0000-4000-8000-000000000003",
   handoff: "20000000-0000-4000-8000-000000000004",
+  commitment: "20000000-0000-4000-8000-000000000005",
 } as const;
 
 const ROLE_BRIEF_SOURCE = {
@@ -267,6 +268,19 @@ const V2_READY_VIEW = {
         project_revision: 6,
       },
     ],
+    commitments: [
+      {
+        commitment_id: ROLE_STATE_IDS.commitment,
+        work_id: IDS.work,
+        assignment_id: ROLE_STATE_IDS.currentAssignment,
+        member_pubkey: ACTOR,
+        started_at: NOW,
+        started_by: ACTOR,
+        entity_revision: 1,
+        project_revision: 7,
+      },
+    ],
+    workResponsibilities: [{ workId: IDS.work, roleId: IDS.role }],
     handoffs: [
       {
         handoff_id: ROLE_STATE_IDS.handoff,
@@ -339,6 +353,31 @@ const V2_READY_VIEW = {
             source: ROLE_BRIEF_SOURCE,
           },
         },
+        responsible_work: [
+          {
+            work: {
+              object: work,
+              responsible_role_id: IDS.role,
+              source: ROLE_BRIEF_SOURCE,
+            },
+            state: {
+              status: "committed",
+              commitment: {
+                commitment: {
+                  commitment_id: ROLE_STATE_IDS.commitment,
+                  work_id: IDS.work,
+                  assignment_id: ROLE_STATE_IDS.currentAssignment,
+                  member_pubkey: ACTOR,
+                  started_at: NOW,
+                  started_by: ACTOR,
+                  entity_revision: 1,
+                  project_revision: 7,
+                },
+                source: ROLE_BRIEF_SOURCE,
+              },
+            },
+          },
+        ],
         related_objects: [],
         source_revisions: {
           meta_event_id: "f".repeat(64),
@@ -427,6 +466,8 @@ function vacantV2View() {
   next.relay_pubkey = "c".repeat(64);
   next.role_continuity.proposals = [];
   next.role_continuity.assignments = [];
+  next.role_continuity.commitments = [];
+  next.role_continuity.workResponsibilities = [];
   next.role_continuity.handoffs = [];
   next.role_continuity.briefs = [];
   next.role_continuity.members = [
@@ -524,6 +565,12 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
   await expect(page.getByTestId("project-role-brief")).toContainText(
     "Make project context legible",
   );
+  await expect(page.getByTestId("project-role-brief")).toContainText(
+    "Add the View entry",
+  );
+  await expect(page.getByTestId("project-role-brief")).toContainText(
+    "Committed",
+  );
   await expect(inspector).toContainText(
     "Return to project context stewardship",
   );
@@ -536,6 +583,56 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
 
   await inspector.getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Active role")).toBeDisabled();
+});
+
+test("Work Inspector shows the verified responsibility and Commitment", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: V2_READY_VIEW,
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Work Add the View entry" })
+    .click();
+
+  const continuity = page.getByTestId("project-work-continuity");
+  await expect(continuity).toContainText("Context steward");
+  await expect(continuity).toContainText("Committed");
+  await expect(page.getByLabel("Responsible Role")).toBeDisabled();
+});
+
+test("owner assigns uncommitted Work to a Role with a revision fence", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: vacantV2View(),
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Work Add the View entry" })
+    .click();
+  await page.getByLabel("Responsible Role").selectOption(IDS.role);
+  await page.getByRole("button", { name: "Save responsibility" }).click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const intent = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.[0],
+  );
+  expect(intent).toMatchObject({
+    operation: "set_work_responsibility",
+    expected_project_revision: 7,
+    work_id: IDS.work,
+    responsible_role_id: IDS.role,
+  });
 });
 
 test("owner creates a revision-fenced Role offer from the Inspector", async ({

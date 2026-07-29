@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -930,6 +930,15 @@ mod tests {
         assert!(role_assignment_state.contains("ADD COLUMN entity_revision"));
         assert!(role_assignment_state.contains("ADD COLUMN replaced_by_assignment_id"));
         assert!(role_assignment_state.contains("project_role_continuity_validate_counts"));
+
+        // Stage 5 promotes the reserved Commitment relation into a complete
+        // projected lifecycle entity with immutable Member attribution.
+        assert_eq!(migrations[27].version, 28);
+        let work_commitments = migrations[27].sql.as_str();
+        assert!(work_commitments.contains("ADD COLUMN member_pubkey"));
+        assert!(work_commitments.contains("ADD COLUMN entity_revision"));
+        assert!(work_commitments.contains("ADD COLUMN last_change_id"));
+        assert!(work_commitments.contains("project_work_commitments_validate_stage5_community"));
     }
 
     #[test]
@@ -952,6 +961,8 @@ mod tests {
             "project_role_continuity_validate_community",
             "open_proposal_count INTEGER NOT NULL DEFAULT 0",
             "project_role_continuity_validate_counts",
+            "project_work_commitments_member_pubkey_check",
+            "project_work_commitments_validate_stage5_community",
         ] {
             assert!(
                 schema.contains(fragment),
@@ -1242,8 +1253,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0027");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+            .expect("upgrade scratch database through 0028");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1375,15 +1386,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(28));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version IN (25, 26, 27) AND success",
+             WHERE version IN (25, 26, 27, 28) AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 3);
+        assert_eq!(project_view_migration_count, 4);
 
         first.close().await;
         second.close().await;
@@ -1463,7 +1474,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]

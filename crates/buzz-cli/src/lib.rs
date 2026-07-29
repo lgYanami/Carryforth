@@ -425,6 +425,11 @@ pub enum RolesCmd {
         #[command(subcommand)]
         command: RoleAssignmentCmd,
     },
+    /// Assign, accept, release, or recommit Role-owned Work
+    Work {
+        #[command(subcommand)]
+        command: RoleWorkCmd,
+    },
 }
 
 /// Effective Proposal status accepted by `buzz roles proposals`.
@@ -563,6 +568,80 @@ pub enum RoleAssignmentCmd {
         /// Optional context.
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+/// Commands targeting Work responsibility and Commitment.
+#[derive(Subcommand)]
+pub enum RoleWorkCmd {
+    /// Assign one Work to a stable Role
+    Assign {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Responsible Role UUID.
+        #[arg(long)]
+        role: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Clear the responsible Role from one uncommitted Work
+    Unassign {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Accept Work owned by the caller's current Role
+    Accept {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Release the caller's active Commitment without changing Work status
+    Release {
+        /// Commitment UUID.
+        #[arg(long)]
+        commitment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional release context.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Atomically replace the caller's active Commitment to the same Work
+    Recommit {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Active Commitment observed by the caller.
+        #[arg(long)]
+        commitment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
     },
 }
 
@@ -2238,8 +2317,27 @@ mod tests {
                 "offer",
                 "proposal",
                 "proposals",
-                "request"
+                "request",
+                "work"
             ]
+        );
+        let roles = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "roles")
+            .expect("roles command");
+        let work = roles
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "work")
+            .expect("roles work command");
+        let mut work_names: Vec<String> = work
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_string())
+            .filter(|name| name != "help")
+            .collect();
+        work_names.sort();
+        assert_eq!(
+            work_names,
+            vec!["accept", "assign", "recommit", "release", "unassign"]
         );
         assert_eq!(
             names(&cmd, "channels"),
@@ -2360,7 +2458,7 @@ mod tests {
             ("project-view", 6),
             ("reactions", 3),
             ("repos", 4),
-            ("roles", 9),
+            ("roles", 10),
             ("social", 7),
             ("upload", 1),
             ("users", 4),

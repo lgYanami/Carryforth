@@ -1401,12 +1401,15 @@ impl ProjectViewWriteTx {
                 command_event_id,
                 projection.id.as_bytes(),
                 entry,
-                i16::try_from(MUTATION_SCHEMA_VERSION).map_err(|_| {
-                    ProjectViewWriteError::InvalidCommit(
-                        "mutation schema version does not fit PostgreSQL SMALLINT".to_owned(),
-                    )
-                })?,
-                None,
+                ProjectViewEntryStorageMetadata {
+                    schema_version: i16::try_from(MUTATION_SCHEMA_VERSION).map_err(|_| {
+                        ProjectViewWriteError::InvalidCommit(
+                            "mutation schema version does not fit PostgreSQL SMALLINT".to_owned(),
+                        )
+                    })?,
+                    role_level: None,
+                    responsible_role_id: None,
+                },
             )
             .await?;
 
@@ -1789,15 +1792,25 @@ impl ProjectViewReprojectTx {
     }
 }
 
+pub(crate) struct ProjectViewEntryStorageMetadata<'a> {
+    pub(crate) schema_version: i16,
+    pub(crate) role_level: Option<&'a str>,
+    pub(crate) responsible_role_id: Option<Uuid>,
+}
+
 pub(crate) async fn write_project_view_entry(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     source_event_id: &[u8],
     projection_event_id: &[u8],
     entry: &ProjectViewEntry,
-    schema_version: i16,
-    role_level: Option<&str>,
+    metadata: ProjectViewEntryStorageMetadata<'_>,
 ) -> ProjectViewWriteResult<()> {
+    let ProjectViewEntryStorageMetadata {
+        schema_version,
+        role_level,
+        responsible_role_id,
+    } = metadata;
     let (
         object_id,
         object_type,
@@ -1854,6 +1867,17 @@ pub(crate) async fn write_project_view_entry(
             "only schema-v2 Roles may carry role_level".to_owned(),
         ));
     }
+    let carries_work_responsibility = schema_version == 2
+        && matches!(
+            entry,
+            ProjectViewEntry::Active(object)
+                if object.object_type == ProjectViewObjectType::Work
+        );
+    if responsible_role_id.is_some() && !carries_work_responsibility {
+        return Err(ProjectViewWriteError::InvalidCommit(
+            "only active schema-v2 Work may carry responsible_role_id".to_owned(),
+        ));
+    }
     let created_by = created_by.to_bytes();
     let updated_by = updated_by.to_bytes();
     let about_object_id = relations.about.map(|reference| reference.object_id);
@@ -1872,10 +1896,10 @@ pub(crate) async fn write_project_view_entry(
              under_plan_id, planned_in_stage_id, about_object_id, \
              about_object_type, handles_object_id, handles_object_type, \
              created_at, updated_at, created_by, updated_by, source_event_id, \
-             projection_event_id, deleted_at, role_level) \
+             projection_event_id, deleted_at, role_level, responsible_role_id) \
          VALUES \
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-             $14, $15, $16, $17, $18, $19, $20, $21, $22) \
+             $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
          ON CONFLICT (community_id, object_id) DO UPDATE SET \
              object_type = EXCLUDED.object_type, \
              schema_version = EXCLUDED.schema_version, \
@@ -1896,7 +1920,8 @@ pub(crate) async fn write_project_view_entry(
              source_event_id = EXCLUDED.source_event_id, \
              projection_event_id = EXCLUDED.projection_event_id, \
              deleted_at = EXCLUDED.deleted_at, \
-             role_level = EXCLUDED.role_level \
+             role_level = EXCLUDED.role_level, \
+             responsible_role_id = EXCLUDED.responsible_role_id \
          WHERE project_view_objects.deleted_at IS NULL \
            AND project_view_objects.object_type = EXCLUDED.object_type \
            AND project_view_objects.object_revision + 1 = EXCLUDED.object_revision \
@@ -1924,6 +1949,7 @@ pub(crate) async fn write_project_view_entry(
     .bind(projection_event_id)
     .bind(deleted_at)
     .bind(role_level)
+    .bind(responsible_role_id)
     .execute(&mut **tx)
     .await?;
 
@@ -2436,12 +2462,13 @@ mod tests {
     };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
-        NewProjectViewObject, Patch, ProjectProfile, RolePatch, UpdateMutation,
+        NewProjectViewObject, ObjectRef, Patch, Priority, ProjectProfile, ProjectViewObjectType,
+        RequirementStatus, RolePatch, UpdateMutation, WorkStatus,
     };
     use buzz_sdk::project_view_v2::{
         build_entity_projection as build_v2_entity_projection,
         build_meta_projection as build_v2_meta_projection, build_project_object_command,
-        build_project_object_projection, build_role_command,
+        build_project_object_projection_with_responsibility, build_role_command,
         changed_head_for as v2_changed_head_for, changed_head_for_project_object, V2EntityCounts,
         V2ProjectionContext, V2ProjectionSource,
     };
@@ -2816,7 +2843,9 @@ mod tests {
             updated_at: prepared.canonical_time,
         };
         let mut entity_projections = Vec::with_capacity(prepared.changes.len());
-        let mut changed_heads = Vec::with_capacity(prepared.changes.len());
+        let mut object_projections = Vec::with_capacity(prepared.work_heads.len());
+        let mut changed_heads =
+            Vec::with_capacity(prepared.changes.len() + prepared.work_heads.len());
         for entity in &prepared.changes {
             let event = build_v2_entity_projection(&context, entity)
                 .expect("build v2 entity projection")
@@ -2830,6 +2859,28 @@ mod tests {
                 entity_id: entity.entity_id(),
                 event,
             });
+        }
+        for head in &prepared.work_heads {
+            let PreparedV2ProjectObjectHead::Object {
+                entry,
+                responsible_role_id,
+            } = head
+            else {
+                panic!("Role command may only prepare ordinary Work heads");
+            };
+            let event = build_project_object_projection_with_responsibility(
+                &context,
+                entry,
+                *responsible_role_id,
+            )
+            .expect("build responsibility Work projection")
+            .sign_with_keys(relay)
+            .expect("sign responsibility Work projection");
+            changed_heads.push(
+                changed_head_for_project_object(&context, entry, &event)
+                    .expect("bind responsibility Work head"),
+            );
+            object_projections.push(PreparedObjectProjection::new(entry.id(), event));
         }
         let meta_projection = build_v2_meta_projection(
             &context,
@@ -2852,6 +2903,7 @@ mod tests {
             .commit_role_command(PreparedV2RoleCommit {
                 command_event,
                 entity_projections,
+                object_projections,
                 meta_projection,
                 membership_projection,
             })
@@ -2895,14 +2947,23 @@ mod tests {
             updated_at: prepared.canonical_time,
         };
         let mut object_projections = Vec::with_capacity(prepared.heads.len());
-        let mut changed_heads = Vec::with_capacity(prepared.heads.len());
+        let mut entity_projections = Vec::with_capacity(prepared.entity_changes.len());
+        let mut changed_heads =
+            Vec::with_capacity(prepared.heads.len() + prepared.entity_changes.len());
         for head in &prepared.heads {
             let (object_id, event, changed_head) = match head {
-                PreparedV2ProjectObjectHead::Object(entry) => {
-                    let event = build_project_object_projection(&context, entry)
-                        .expect("build v2 ordinary-object projection")
-                        .sign_with_keys(relay)
-                        .expect("sign v2 ordinary-object projection");
+                PreparedV2ProjectObjectHead::Object {
+                    entry,
+                    responsible_role_id,
+                } => {
+                    let event = build_project_object_projection_with_responsibility(
+                        &context,
+                        entry,
+                        *responsible_role_id,
+                    )
+                    .expect("build v2 ordinary-object projection")
+                    .sign_with_keys(relay)
+                    .expect("sign v2 ordinary-object projection");
                     let changed_head = changed_head_for_project_object(&context, entry, &event)
                         .expect("bind v2 ordinary-object head");
                     (entry.id(), event, changed_head)
@@ -2920,6 +2981,21 @@ mod tests {
             };
             object_projections.push(PreparedObjectProjection::new(object_id, event));
             changed_heads.push(changed_head);
+        }
+        for entity in &prepared.entity_changes {
+            let event = build_v2_entity_projection(&context, entity)
+                .expect("build terminal Work side-effect projection")
+                .sign_with_keys(relay)
+                .expect("sign terminal Work side-effect projection");
+            changed_heads.push(
+                v2_changed_head_for(&context, entity, &event)
+                    .expect("bind terminal Work side-effect head"),
+            );
+            entity_projections.push(PreparedV2EntityProjection {
+                entity_type: entity.entity_type(),
+                entity_id: entity.entity_id(),
+                event,
+            });
         }
         let meta_projection = build_v2_meta_projection(
             &context,
@@ -2942,6 +3018,7 @@ mod tests {
             .commit_project_object_command(PreparedV2ProjectObjectCommit {
                 command_event,
                 object_projections,
+                entity_projections,
                 meta_projection,
             })
             .await
@@ -4669,6 +4746,91 @@ mod tests {
             ProjectViewV2WriteError::Domain(RoleContinuityError::SelfEndForbidden)
         ));
 
+        let requirement_id = Uuid::new_v4();
+        commit_v2_object_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            ProjectObjectCommand::new(
+                5,
+                None,
+                MutationRequest::Create(CreateMutation {
+                    object: NewProjectViewObject::Requirement {
+                        id: requirement_id,
+                        title: "Keep Work attributable".to_owned(),
+                        description: "Role responsibility survives Runtime replacement".to_owned(),
+                        status: RequirementStatus::InProgress,
+                        priority: Priority::High,
+                        planned_in_stage_id: None,
+                    },
+                }),
+            ),
+        )
+        .await;
+        let work_id = Uuid::new_v4();
+        commit_v2_object_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            ProjectObjectCommand::new(
+                6,
+                None,
+                MutationRequest::Create(CreateMutation {
+                    object: NewProjectViewObject::Work {
+                        id: work_id,
+                        title: "Continue across Assignments".to_owned(),
+                        description: "The Role owns Work; each assignee accepts separately"
+                            .to_owned(),
+                        status: WorkStatus::InProgress,
+                        priority: Priority::High,
+                        handles: ObjectRef {
+                            object_type: ProjectViewObjectType::Requirement,
+                            object_id: requirement_id,
+                        },
+                    },
+                }),
+            ),
+        )
+        .await;
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            RoleCommand::new(
+                7,
+                None,
+                RoleCommandRequest::SetWorkResponsibility {
+                    work_id,
+                    responsible_role_id: Some(role_id),
+                },
+            ),
+        )
+        .await;
+        let first_commitment = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &first_agent,
+            &relay,
+            RoleCommand::new(
+                8,
+                Some(first_assignment),
+                RoleCommandRequest::AcceptWork {
+                    commitment_id: Uuid::new_v4(),
+                    work_id,
+                },
+            ),
+        )
+        .await;
+        let first_commitment_id = Uuid::parse_str(
+            first_commitment.receipt.result["commitment_id"]
+                .as_str()
+                .expect("first Commitment ID"),
+        )
+        .expect("valid first Commitment UUID");
+
         let second_proposal = Uuid::new_v4();
         commit_v2_role_for_test(
             &db,
@@ -4676,7 +4838,7 @@ mod tests {
             &owner,
             &relay,
             RoleCommand::new(
-                5,
+                9,
                 None,
                 RoleCommandRequest::OfferRole {
                     proposal_id: second_proposal,
@@ -4694,7 +4856,7 @@ mod tests {
             &second_agent,
             &relay,
             RoleCommand::new(
-                6,
+                10,
                 None,
                 RoleCommandRequest::AcceptProposal {
                     proposal_id: second_proposal,
@@ -4745,13 +4907,81 @@ mod tests {
         .await
         .expect("count replacement Handoffs");
         assert_eq!(handoff_count, 1);
+        let first_commitment_terminal: (String, String) = sqlx::query_as(
+            "SELECT member_pubkey, ended_reason \
+             FROM project_work_commitments \
+             WHERE community_id = $1 AND commitment_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(first_commitment_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read predecessor Commitment");
+        assert_eq!(
+            first_commitment_terminal,
+            (
+                first_agent.public_key().to_hex(),
+                "assignment_ended".to_owned()
+            )
+        );
+        let retained_work: (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT body->>'status', responsible_role_id \
+             FROM project_view_objects \
+             WHERE community_id = $1 AND object_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(work_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read Work retained across Assignment replacement");
+        assert_eq!(
+            retained_work,
+            ("in_progress".to_owned(), Some(role_id)),
+            "Assignment replacement must not alter Work state or Role responsibility"
+        );
+        let second_commitment = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &second_agent,
+            &relay,
+            RoleCommand::new(
+                11,
+                Some(second_assignment),
+                RoleCommandRequest::AcceptWork {
+                    commitment_id: Uuid::new_v4(),
+                    work_id,
+                },
+            ),
+        )
+        .await;
+        let second_commitment_id = Uuid::parse_str(
+            second_commitment.receipt.result["commitment_id"]
+                .as_str()
+                .expect("successor Commitment ID"),
+        )
+        .expect("valid successor Commitment UUID");
+        assert_ne!(second_commitment_id, first_commitment_id);
+        let active_commitment: (Uuid, String) = sqlx::query_as(
+            "SELECT commitment_id, member_pubkey \
+             FROM project_work_commitments \
+             WHERE community_id = $1 AND work_id = $2 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(work_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read successor active Commitment");
+        assert_eq!(
+            active_commitment,
+            (second_commitment_id, second_agent.public_key().to_hex())
+        );
 
         let stale = reject_v2_role_for_test(
             &db,
             community_id,
             &first_agent,
             RoleCommand::new(
-                7,
+                12,
                 Some(first_assignment),
                 RoleCommandRequest::ReportUnableToContinue {
                     assignment_id: first_assignment,
@@ -4772,7 +5002,7 @@ mod tests {
             &owner,
             &relay,
             ProjectObjectCommand::new(
-                7,
+                12,
                 None,
                 MutationRequest::Create(CreateMutation {
                     object: NewProjectViewObject::Goal {
@@ -4785,7 +5015,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(created.receipt.project_revision, 8);
+        assert_eq!(created.receipt.project_revision, 13);
         assert_eq!(
             created.receipt.result["object_id"].as_str(),
             Some(goal_id.to_string().as_str())
@@ -4798,8 +5028,56 @@ mod tests {
             "ordinary v2 writes must emit a signed object head"
         );
 
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            RoleCommand::new(
+                13,
+                None,
+                RoleCommandRequest::EndAssignment {
+                    assignment_id: second_assignment,
+                    reason: Some("exercise explicit governance handoff".to_owned()),
+                },
+            ),
+        )
+        .await;
+        let successor_commitment_terminal: (String, Option<String>) = sqlx::query_as(
+            "SELECT member_pubkey, ended_reason \
+             FROM project_work_commitments \
+             WHERE community_id = $1 AND commitment_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(second_commitment_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read successor Commitment after Assignment end");
+        assert_eq!(
+            successor_commitment_terminal,
+            (
+                second_agent.public_key().to_hex(),
+                Some("assignment_ended".to_owned())
+            )
+        );
+        let waiting_work: (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT body->>'status', responsible_role_id \
+             FROM project_view_objects \
+             WHERE community_id = $1 AND object_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(work_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read waiting Work after Assignment end");
+        assert_eq!(
+            waiting_work,
+            ("in_progress".to_owned(), Some(role_id)),
+            "Assignment end must leave Work waiting under the same Role"
+        );
+
         let deactivate = ProjectObjectCommand::new(
-            8,
+            14,
             None,
             MutationRequest::Update(UpdateMutation::Role {
                 object_id: role_id,
@@ -4820,7 +5098,7 @@ mod tests {
         let error = write
             .prepare_project_object_command(&deactivate_event, &deactivate)
             .await
-            .expect_err("an assigned Role cannot be deactivated through the generic editor");
+            .expect_err("a Role that still owns Work cannot be deactivated");
         assert!(matches!(
             error,
             ProjectViewV2WriteError::ObjectDomain(DomainError::InvalidField {
@@ -4833,15 +5111,16 @@ mod tests {
             .await
             .expect("roll back rejected Role deactivation");
 
-        let final_state: (i64, i32, i32, i32) = sqlx::query_as(
-            "SELECT project_revision, open_proposal_count, active_assignment_count, handoff_count \
+        let final_state: (i64, i32, i32, i32, i32) = sqlx::query_as(
+            "SELECT project_revision, open_proposal_count, active_assignment_count, \
+                    active_commitment_count, handoff_count \
              FROM project_view_state WHERE community_id = $1",
         )
         .bind(community_id.as_uuid())
         .fetch_one(&scratch.pool)
         .await
         .expect("read final v2 materialized counts");
-        assert_eq!(final_state, (8, 0, 1, 1));
+        assert_eq!(final_state, (14, 0, 0, 0, 1));
         assert!(db
             .project_view_v2_capability_ready(community_id, &relay.public_key())
             .await

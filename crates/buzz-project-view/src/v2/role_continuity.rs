@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{RoleLevel, SchemaVersion};
-use crate::MAX_SAFE_REVISION;
+use crate::{WorkStatus, MAX_SAFE_REVISION};
 
 const MAX_REASON_BYTES: usize = 4_096;
 
@@ -312,6 +312,114 @@ impl RoleAssignment {
     }
 }
 
+/// Current responsibility relation and lifecycle facts for one Work object.
+///
+/// `status = None` represents a retained Work tombstone. Tombstones preserve
+/// historical Commitment foreign keys but cannot receive responsibility or a
+/// new Commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkResponsibility {
+    /// Stable Work object identifier.
+    pub work_id: Uuid,
+    /// Current Work status, absent after deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorkStatus>,
+    /// Stable Role responsible for this Work across Assignment replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responsible_role_id: Option<Uuid>,
+    /// Canonical Project View object revision.
+    pub object_revision: u64,
+    /// Project revision at which responsibility or the Work last changed.
+    pub project_revision: u64,
+    /// Canonical update time.
+    pub updated_at: DateTime<Utc>,
+    /// Verified latest Work editor.
+    pub updated_by: PublicKey,
+}
+
+impl WorkResponsibility {
+    /// Return whether the Work can still be executed.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        matches!(
+            self.status,
+            Some(
+                WorkStatus::Pending
+                    | WorkStatus::InProgress
+                    | WorkStatus::Paused
+                    | WorkStatus::Submitted
+            )
+        )
+    }
+}
+
+/// Why one Work Commitment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitmentEndReason {
+    /// The assignee explicitly released the Work.
+    Released,
+    /// A new Commitment superseded this one atomically.
+    Replaced,
+    /// The owning Assignment ended.
+    AssignmentEnded,
+    /// The Work reached a terminal lifecycle state.
+    WorkClosed,
+}
+
+impl CommitmentEndReason {
+    /// Return the stable database and wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::Replaced => "replaced",
+            Self::AssignmentEnded => "assignment_ended",
+            Self::WorkClosed => "work_closed",
+        }
+    }
+}
+
+/// One immutable-attribution commitment by a concrete Assignment to a Work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCommitment {
+    /// Stable Commitment identifier.
+    pub commitment_id: Uuid,
+    /// Work being accepted.
+    pub work_id: Uuid,
+    /// Assignment through which the Member accepted the Work.
+    pub assignment_id: Uuid,
+    /// Member attributed with this Commitment.
+    pub member_pubkey: PublicKey,
+    /// Canonical acceptance time.
+    pub started_at: DateTime<Utc>,
+    /// Signer that accepted the Work.
+    pub started_by: PublicKey,
+    /// Canonical terminal time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Signer or governor that ended the Commitment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<PublicKey>,
+    /// Stable terminal cause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_reason: Option<CommitmentEndReason>,
+    /// Per-entity revision.
+    pub entity_revision: u64,
+    /// Project revision at which this version was written.
+    pub project_revision: u64,
+}
+
+impl WorkCommitment {
+    /// Return whether this Commitment is current.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.ended_at.is_none()
+    }
+}
+
 /// Minimal system-generated record created whenever an Assignment is
 /// replaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +553,43 @@ impl RoleCommand {
                 require_id(*assignment_id, "assignment_id")?;
                 validate_optional_reason(reason)?;
             }
+            RoleCommandRequest::SetWorkResponsibility {
+                work_id,
+                responsible_role_id,
+            } => {
+                require_id(*work_id, "work_id")?;
+                if let Some(role_id) = responsible_role_id {
+                    require_id(*role_id, "responsible_role_id")?;
+                }
+            }
+            RoleCommandRequest::AcceptWork {
+                commitment_id,
+                work_id,
+            } => {
+                require_id(*commitment_id, "commitment_id")?;
+                require_id(*work_id, "work_id")?;
+            }
+            RoleCommandRequest::EndCommitment {
+                commitment_id,
+                reason,
+            } => {
+                require_id(*commitment_id, "commitment_id")?;
+                validate_optional_reason(reason)?;
+            }
+            RoleCommandRequest::ReplaceCommitment {
+                commitment_id,
+                work_id,
+                expected_commitment_id,
+            } => {
+                require_id(*commitment_id, "commitment_id")?;
+                require_id(*work_id, "work_id")?;
+                require_id(*expected_commitment_id, "expected_commitment_id")?;
+                if commitment_id == expected_commitment_id {
+                    return Err(RoleContinuityError::InvalidCommand(
+                        "replacement Commitment must use a new identifier".to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -456,7 +601,7 @@ impl RoleCommand {
     }
 }
 
-/// Closed Role continuity operation set for stage 2.
+/// Closed Role continuity operation set through stage 5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoleCommandRequest {
@@ -541,6 +686,37 @@ pub enum RoleCommandRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Assign or clear the stable Role responsible for one Work.
+    SetWorkResponsibility {
+        /// Target Work.
+        work_id: Uuid,
+        /// New responsible Role, or `null` to leave the Work unassigned.
+        responsible_role_id: Option<Uuid>,
+    },
+    /// Accept one Work through the signer's current Assignment.
+    AcceptWork {
+        /// Client-generated Commitment UUID.
+        commitment_id: Uuid,
+        /// Work being accepted.
+        work_id: Uuid,
+    },
+    /// Release the signer's active Commitment without changing Work status.
+    EndCommitment {
+        /// Active Commitment to end.
+        commitment_id: Uuid,
+        /// Optional release context retained by the signed command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Atomically supersede the signer's current Commitment to the same Work.
+    ReplaceCommitment {
+        /// Client-generated replacement Commitment UUID.
+        commitment_id: Uuid,
+        /// Work being recommitted.
+        work_id: Uuid,
+        /// Active Commitment observed by the caller.
+        expected_commitment_id: Uuid,
+    },
 }
 
 impl RoleCommandRequest {
@@ -558,6 +734,10 @@ impl RoleCommandRequest {
             Self::EndAssignment { .. } => "end_assignment",
             Self::RequestReplacement { .. } => "request_replacement",
             Self::ReportUnableToContinue { .. } => "report_unable_to_continue",
+            Self::SetWorkResponsibility { .. } => "set_work_responsibility",
+            Self::AcceptWork { .. } => "accept_work",
+            Self::EndCommitment { .. } => "end_commitment",
+            Self::ReplaceCommitment { .. } => "replace_commitment",
         }
     }
 }
@@ -576,9 +756,11 @@ pub struct GeneratedRoleContinuityIds {
 pub struct RoleContinuityState {
     project_revision: u64,
     roles: BTreeMap<Uuid, RoleSlot>,
+    works: BTreeMap<Uuid, WorkResponsibility>,
     members: BTreeMap<PublicKey, MemberGovernance>,
     proposals: BTreeMap<Uuid, RoleAssignmentProposal>,
     assignments: BTreeMap<Uuid, RoleAssignment>,
+    commitments: BTreeMap<Uuid, WorkCommitment>,
     handoffs: BTreeMap<Uuid, RoleHandoff>,
 }
 
@@ -592,15 +774,46 @@ impl RoleContinuityState {
         assignments: Vec<RoleAssignment>,
         handoffs: Vec<RoleHandoff>,
     ) -> Result<Self, RoleContinuityError> {
+        Self::from_complete_snapshot(
+            project_revision,
+            roles,
+            Vec::new(),
+            members,
+            proposals,
+            assignments,
+            Vec::new(),
+            handoffs,
+        )
+    }
+
+    /// Reconstruct the complete stage-5 state loaded under the Community
+    /// Project lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_complete_snapshot(
+        project_revision: u64,
+        roles: Vec<RoleSlot>,
+        works: Vec<WorkResponsibility>,
+        members: Vec<MemberGovernance>,
+        proposals: Vec<RoleAssignmentProposal>,
+        assignments: Vec<RoleAssignment>,
+        commitments: Vec<WorkCommitment>,
+        handoffs: Vec<RoleHandoff>,
+    ) -> Result<Self, RoleContinuityError> {
         let state = Self {
             project_revision,
             roles: collect_unique(roles, |role| role.role_id, "Role")?,
+            works: collect_unique(works, |work| work.work_id, "Work")?,
             members: collect_unique(members, |member| member.pubkey, "Member")?,
             proposals: collect_unique(proposals, |proposal| proposal.proposal_id, "Proposal")?,
             assignments: collect_unique(
                 assignments,
                 |assignment| assignment.assignment_id,
                 "Assignment",
+            )?,
+            commitments: collect_unique(
+                commitments,
+                |commitment| commitment.commitment_id,
+                "Commitment",
             )?,
             handoffs: collect_unique(handoffs, |handoff| handoff.handoff_id, "Handoff")?,
         };
@@ -622,6 +835,16 @@ impl RoleContinuityState {
     /// All Assignments in stable ID order.
     pub fn assignments(&self) -> impl Iterator<Item = &RoleAssignment> {
         self.assignments.values()
+    }
+
+    /// All Work responsibility rows in stable Work ID order.
+    pub fn works(&self) -> impl Iterator<Item = &WorkResponsibility> {
+        self.works.values()
+    }
+
+    /// All Work Commitment heads in stable Commitment ID order.
+    pub fn commitments(&self) -> impl Iterator<Item = &WorkCommitment> {
+        self.commitments.values()
     }
 
     /// Re-run the current membership and active-Assignment security fence
@@ -663,6 +886,7 @@ impl RoleContinuityState {
 
         let mut next = self.clone();
         let before = self.entity_map();
+        let before_works = self.works.clone();
         let mut membership_roles = BTreeMap::new();
         let mut affected_commitments = BTreeMap::<Uuid, Vec<Uuid>>::new();
 
@@ -830,7 +1054,7 @@ impl RoleContinuityState {
                 if next.assignment_end_requires_role_authority(actor, &assignment)? {
                     next.require_governor_fence(command, actor)?;
                 }
-                next.end_assignment(
+                let commitment_ids = next.end_assignment(
                     *assignment_id,
                     actor,
                     AssignmentEndReason::Revoked,
@@ -838,6 +1062,7 @@ impl RoleContinuityState {
                     canonical_time,
                     next_revision,
                 )?;
+                affected_commitments.insert(*assignment_id, commitment_ids);
                 next.record_desired_member_role(assignment.member_pubkey, &mut membership_roles)?;
             }
             RoleCommandRequest::RequestReplacement {
@@ -872,14 +1097,109 @@ impl RoleContinuityState {
                 assignment.unable_report_reason = reason.clone();
                 touch_assignment(assignment, next_revision)?;
             }
+            RoleCommandRequest::SetWorkResponsibility {
+                work_id,
+                responsible_role_id,
+            } => {
+                next.require_governor_fence(command, actor)?;
+                if next.active_commitment_for_work(*work_id).is_some() {
+                    return Err(RoleContinuityError::ActiveCommitmentConflict);
+                }
+                if let Some(role_id) = responsible_role_id {
+                    let role = next
+                        .roles
+                        .get(role_id)
+                        .ok_or(RoleContinuityError::RoleNotFound)?;
+                    if !role.active {
+                        return Err(RoleContinuityError::RoleInactive);
+                    }
+                }
+                let work = next
+                    .works
+                    .get_mut(work_id)
+                    .filter(|work| work.status.is_some())
+                    .ok_or(RoleContinuityError::WorkNotFound)?;
+                if work.responsible_role_id == *responsible_role_id {
+                    return Err(RoleContinuityError::ResponsibilityUnchanged);
+                }
+                work.responsible_role_id = *responsible_role_id;
+                touch_work(work, actor, canonical_time, next_revision)?;
+            }
+            RoleCommandRequest::AcceptWork {
+                commitment_id,
+                work_id,
+            } => {
+                let assignment_id = command
+                    .acting_assignment_id
+                    .ok_or(RoleContinuityError::ActingAssignmentRequired)?;
+                next.require_assignee_action(command, actor, assignment_id)?;
+                next.create_commitment(
+                    *commitment_id,
+                    *work_id,
+                    assignment_id,
+                    actor,
+                    canonical_time,
+                    next_revision,
+                )?;
+            }
+            RoleCommandRequest::EndCommitment { commitment_id, .. } => {
+                let assignment_id = command
+                    .acting_assignment_id
+                    .ok_or(RoleContinuityError::ActingAssignmentRequired)?;
+                next.require_assignee_action(command, actor, assignment_id)?;
+                let commitment = next.active_commitment(*commitment_id)?.clone();
+                if commitment.assignment_id != assignment_id || commitment.member_pubkey != actor {
+                    return Err(RoleContinuityError::CommitmentAssigneeRequired);
+                }
+                next.end_commitment(
+                    *commitment_id,
+                    actor,
+                    CommitmentEndReason::Released,
+                    canonical_time,
+                    next_revision,
+                )?;
+            }
+            RoleCommandRequest::ReplaceCommitment {
+                commitment_id,
+                work_id,
+                expected_commitment_id,
+            } => {
+                let assignment_id = command
+                    .acting_assignment_id
+                    .ok_or(RoleContinuityError::ActingAssignmentRequired)?;
+                next.require_assignee_action(command, actor, assignment_id)?;
+                let current = next.active_commitment(*expected_commitment_id)?.clone();
+                if current.work_id != *work_id
+                    || current.assignment_id != assignment_id
+                    || current.member_pubkey != actor
+                {
+                    return Err(RoleContinuityError::CommitmentFenceConflict);
+                }
+                next.end_commitment(
+                    *expected_commitment_id,
+                    actor,
+                    CommitmentEndReason::Replaced,
+                    canonical_time,
+                    next_revision,
+                )?;
+                next.create_commitment(
+                    *commitment_id,
+                    *work_id,
+                    assignment_id,
+                    actor,
+                    canonical_time,
+                    next_revision,
+                )?;
+            }
         }
 
         next.project_revision = next_revision;
         next.validate()?;
         let changes = changed_entities(before, &next.entity_map());
-        if changes.is_empty() {
+        let work_changes = changed_works(before_works, &next.works);
+        if changes.is_empty() && work_changes.is_empty() {
             return Err(RoleContinuityError::InvalidState(
-                "accepted command produced no entity change".to_owned(),
+                "accepted command produced no canonical change".to_owned(),
             ));
         }
         Ok((
@@ -887,6 +1207,7 @@ impl RoleContinuityState {
             RoleContinuityOutcome {
                 project_revision: next_revision,
                 changes,
+                work_changes,
                 membership_roles,
                 ended_commitments: affected_commitments,
             },
@@ -939,6 +1260,57 @@ impl RoleContinuityState {
                 ));
             }
         }
+        for work in self.works.values() {
+            if let Some(role_id) = work.responsible_role_id {
+                let role = self
+                    .roles
+                    .get(&role_id)
+                    .ok_or(RoleContinuityError::RoleNotFound)?;
+                if work.status.is_none() || !role.active {
+                    return Err(RoleContinuityError::InvalidState(
+                        "responsible Work must be active and reference an active Role".to_owned(),
+                    ));
+                }
+            }
+        }
+        let mut active_work = BTreeSet::new();
+        for commitment in self.commitments.values() {
+            let assignment = self
+                .assignments
+                .get(&commitment.assignment_id)
+                .ok_or(RoleContinuityError::AssignmentNotFound)?;
+            let work = self
+                .works
+                .get(&commitment.work_id)
+                .ok_or(RoleContinuityError::WorkNotFound)?;
+            if commitment.member_pubkey != assignment.member_pubkey {
+                return Err(RoleContinuityError::InvalidState(
+                    "Commitment Member differs from its Assignment".to_owned(),
+                ));
+            }
+            if commitment.is_active() {
+                if !assignment.is_active() {
+                    return Err(RoleContinuityError::InvalidState(
+                        "ended Assignment retains an active Commitment".to_owned(),
+                    ));
+                }
+                if !work.is_open() {
+                    return Err(RoleContinuityError::WorkClosed);
+                }
+                if work.responsible_role_id != Some(assignment.role_id) {
+                    return Err(RoleContinuityError::WorkRoleMismatch);
+                }
+                if !active_work.insert(commitment.work_id) {
+                    return Err(RoleContinuityError::InvalidState(
+                        "a Work has multiple active Commitments".to_owned(),
+                    ));
+                }
+            } else if commitment.ended_by.is_none() || commitment.ended_reason.is_none() {
+                return Err(RoleContinuityError::InvalidState(
+                    "ended Commitment is missing terminal attribution".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -967,6 +1339,9 @@ impl RoleContinuityState {
             &command.request,
             RoleCommandRequest::RequestReplacement { .. }
                 | RoleCommandRequest::ReportUnableToContinue { .. }
+                | RoleCommandRequest::AcceptWork { .. }
+                | RoleCommandRequest::EndCommitment { .. }
+                | RoleCommandRequest::ReplaceCommitment { .. }
         );
         if role_action_requires_fence && command.acting_assignment_id.is_none() {
             return Err(RoleContinuityError::ActingAssignmentRequired);
@@ -1109,7 +1484,7 @@ impl RoleContinuityState {
 
         for (assignment_id, handoff_id) in ended_ids.iter().zip(handoff_ids) {
             let old = self.active_assignment(*assignment_id)?.clone();
-            self.end_assignment(
+            let commitment_ids = self.end_assignment(
                 *assignment_id,
                 authorizer,
                 AssignmentEndReason::Replaced,
@@ -1119,9 +1494,7 @@ impl RoleContinuityState {
             )?;
             let to_assignment_id =
                 (old.role_id == proposal.role_id).then_some(generated_ids.assignment_id);
-            let commitment_ids = affected_commitments
-                .remove(assignment_id)
-                .unwrap_or_default();
+            affected_commitments.insert(*assignment_id, commitment_ids.clone());
             self.handoffs.insert(
                 handoff_id,
                 RoleHandoff {
@@ -1332,6 +1705,19 @@ impl RoleContinuityState {
                 RoleContinuityError::ActingAssignmentRequired
             });
         }
+        let assignment = self
+            .assignments
+            .get(&active_assignment)
+            .ok_or(RoleContinuityError::ActingAssignmentInvalid)?;
+        let role = self
+            .roles
+            .get(&assignment.role_id)
+            .ok_or(RoleContinuityError::RoleNotFound)?;
+        if member.community_role != Some(CommunityMemberRole::Admin)
+            || role.level != RoleLevel::Admin
+        {
+            return Err(RoleContinuityError::NotAuthorized);
+        }
         Ok(())
     }
 
@@ -1365,7 +1751,7 @@ impl RoleContinuityState {
         replaced_by_assignment_id: Option<Uuid>,
         canonical_time: DateTime<Utc>,
         next_revision: u64,
-    ) -> Result<(), RoleContinuityError> {
+    ) -> Result<Vec<Uuid>, RoleContinuityError> {
         let assignment = self
             .assignments
             .get_mut(&assignment_id)
@@ -1377,7 +1763,99 @@ impl RoleContinuityState {
         assignment.ended_by = Some(actor);
         assignment.ended_reason = Some(reason);
         assignment.replaced_by_assignment_id = replaced_by_assignment_id;
-        touch_assignment(assignment, next_revision)
+        touch_assignment(assignment, next_revision)?;
+
+        let commitment_ids = self
+            .commitments
+            .values()
+            .filter(|commitment| {
+                commitment.assignment_id == assignment_id && commitment.is_active()
+            })
+            .map(|commitment| commitment.commitment_id)
+            .collect::<Vec<_>>();
+        for commitment_id in &commitment_ids {
+            self.end_commitment(
+                *commitment_id,
+                actor,
+                CommitmentEndReason::AssignmentEnded,
+                canonical_time,
+                next_revision,
+            )?;
+        }
+        Ok(commitment_ids)
+    }
+
+    fn create_commitment(
+        &mut self,
+        commitment_id: Uuid,
+        work_id: Uuid,
+        assignment_id: Uuid,
+        actor: PublicKey,
+        canonical_time: DateTime<Utc>,
+        next_revision: u64,
+    ) -> Result<(), RoleContinuityError> {
+        if self.commitments.contains_key(&commitment_id) {
+            return Err(RoleContinuityError::IdCollision);
+        }
+        if self.active_commitment_for_work(work_id).is_some() {
+            return Err(RoleContinuityError::ActiveCommitmentConflict);
+        }
+        let assignment = self.active_assignment(assignment_id)?;
+        if assignment.member_pubkey != actor {
+            return Err(RoleContinuityError::CommitmentAssigneeRequired);
+        }
+        let work = self
+            .works
+            .get(&work_id)
+            .filter(|work| work.status.is_some())
+            .ok_or(RoleContinuityError::WorkNotFound)?;
+        if !work.is_open() {
+            return Err(RoleContinuityError::WorkClosed);
+        }
+        let Some(responsible_role_id) = work.responsible_role_id else {
+            return Err(RoleContinuityError::ResponsibilityRequired);
+        };
+        if responsible_role_id != assignment.role_id {
+            return Err(RoleContinuityError::WorkRoleMismatch);
+        }
+        self.commitments.insert(
+            commitment_id,
+            WorkCommitment {
+                commitment_id,
+                work_id,
+                assignment_id,
+                member_pubkey: actor,
+                started_at: canonical_time,
+                started_by: actor,
+                ended_at: None,
+                ended_by: None,
+                ended_reason: None,
+                entity_revision: 1,
+                project_revision: next_revision,
+            },
+        );
+        Ok(())
+    }
+
+    fn end_commitment(
+        &mut self,
+        commitment_id: Uuid,
+        actor: PublicKey,
+        reason: CommitmentEndReason,
+        canonical_time: DateTime<Utc>,
+        next_revision: u64,
+    ) -> Result<(), RoleContinuityError> {
+        let commitment = self
+            .commitments
+            .get_mut(&commitment_id)
+            .ok_or(RoleContinuityError::CommitmentNotFound)?;
+        if !commitment.is_active() {
+            return Err(RoleContinuityError::CommitmentEnded);
+        }
+        commitment.ended_at = Some(canonical_time);
+        commitment.ended_by = Some(actor);
+        commitment.ended_reason = Some(reason);
+        touch_commitment(commitment, next_revision)
     }
 
     fn require_assignee_action(
@@ -1443,6 +1921,28 @@ impl RoleContinuityState {
             .map(|assignment| assignment.assignment_id)
     }
 
+    fn active_commitment(
+        &self,
+        commitment_id: Uuid,
+    ) -> Result<&WorkCommitment, RoleContinuityError> {
+        self.commitments
+            .get(&commitment_id)
+            .ok_or(RoleContinuityError::CommitmentNotFound)
+            .and_then(|commitment| {
+                commitment
+                    .is_active()
+                    .then_some(commitment)
+                    .ok_or(RoleContinuityError::CommitmentEnded)
+            })
+    }
+
+    fn active_commitment_for_work(&self, work_id: Uuid) -> Option<Uuid> {
+        self.commitments
+            .values()
+            .find(|commitment| commitment.work_id == work_id && commitment.is_active())
+            .map(|commitment| commitment.commitment_id)
+    }
+
     fn desired_member_role(
         &self,
         member_pubkey: PublicKey,
@@ -1499,6 +1999,15 @@ impl RoleContinuityState {
                 RoleContinuityChange::Assignment(assignment.clone()),
             );
         }
+        for commitment in self.commitments.values() {
+            entities.insert(
+                (
+                    RoleContinuityEntity::WorkCommitment,
+                    commitment.commitment_id,
+                ),
+                RoleContinuityChange::Commitment(commitment.clone()),
+            );
+        }
         for handoff in self.handoffs.values() {
             entities.insert(
                 (RoleContinuityEntity::RoleHandoff, handoff.handoff_id),
@@ -1519,6 +2028,8 @@ pub enum RoleContinuityEntity {
     RoleAssignmentProposal,
     /// Role Assignment tenure.
     RoleAssignment,
+    /// Work Commitment tenure.
+    WorkCommitment,
     /// Append-only Role Handoff.
     RoleHandoff,
 }
@@ -1531,6 +2042,7 @@ impl RoleContinuityEntity {
             Self::Role => "role",
             Self::RoleAssignmentProposal => "role_assignment_proposal",
             Self::RoleAssignment => "role_assignment",
+            Self::WorkCommitment => "work_commitment",
             Self::RoleHandoff => "role_handoff",
         }
     }
@@ -1546,6 +2058,8 @@ pub enum RoleContinuityChange {
     Proposal(RoleAssignmentProposal),
     /// Assignment head.
     Assignment(RoleAssignment),
+    /// Work Commitment head.
+    Commitment(WorkCommitment),
     /// Handoff head.
     Handoff(RoleHandoff),
 }
@@ -1558,6 +2072,7 @@ impl RoleContinuityChange {
             Self::Role(_) => RoleContinuityEntity::Role,
             Self::Proposal(_) => RoleContinuityEntity::RoleAssignmentProposal,
             Self::Assignment(_) => RoleContinuityEntity::RoleAssignment,
+            Self::Commitment(_) => RoleContinuityEntity::WorkCommitment,
             Self::Handoff(_) => RoleContinuityEntity::RoleHandoff,
         }
     }
@@ -1569,6 +2084,7 @@ impl RoleContinuityChange {
             Self::Role(role) => role.role_id,
             Self::Proposal(proposal) => proposal.proposal_id,
             Self::Assignment(assignment) => assignment.assignment_id,
+            Self::Commitment(commitment) => commitment.commitment_id,
             Self::Handoff(handoff) => handoff.handoff_id,
         }
     }
@@ -1580,6 +2096,7 @@ impl RoleContinuityChange {
             Self::Role(role) => role.object_revision,
             Self::Proposal(proposal) => proposal.entity_revision,
             Self::Assignment(assignment) => assignment.entity_revision,
+            Self::Commitment(commitment) => commitment.entity_revision,
             Self::Handoff(handoff) => handoff.entity_revision,
         }
     }
@@ -1592,10 +2109,12 @@ pub struct RoleContinuityOutcome {
     pub project_revision: u64,
     /// Complete changed entity heads.
     pub changes: Vec<RoleContinuityChange>,
+    /// Work objects whose stable responsible Role changed.
+    pub work_changes: Vec<WorkResponsibility>,
     /// Final Community role for every affected Member.
     pub membership_roles: BTreeMap<PublicKey, CommunityMemberRole>,
-    /// Commitments to end for each ended Assignment. The database fills this
-    /// map before persisting Handoff bodies.
+    /// Commitments ended for each ended Assignment, also embedded into any
+    /// system-generated Handoff from the same transition.
     pub ended_commitments: BTreeMap<Uuid, Vec<Uuid>>,
 }
 
@@ -1670,6 +2189,37 @@ pub enum RoleContinuityError {
     /// Assignment action used by a non-assignee.
     #[error("active Assignment assignee authorization is required")]
     AssigneeRequired,
+    /// Work does not exist or has been deleted.
+    #[error("Work was not found")]
+    WorkNotFound,
+    /// Work is already completed or cancelled.
+    #[error("Work is closed")]
+    WorkClosed,
+    /// Work has no responsible Role and therefore cannot be accepted.
+    #[error("Work requires a responsible Role before it can be accepted")]
+    ResponsibilityRequired,
+    /// Requested responsibility is identical to current state.
+    #[error("Work already has the requested responsible Role")]
+    ResponsibilityUnchanged,
+    /// One active Commitment prevents responsibility from changing or another
+    /// Commitment from being created.
+    #[error("Work already has an active Commitment")]
+    ActiveCommitmentConflict,
+    /// Work responsible Role differs from the acting Assignment Role.
+    #[error("Work responsible Role does not match the acting Assignment")]
+    WorkRoleMismatch,
+    /// Commitment does not exist.
+    #[error("Work Commitment was not found")]
+    CommitmentNotFound,
+    /// Commitment is already terminal.
+    #[error("Work Commitment has ended")]
+    CommitmentEnded,
+    /// Commitment action used by another Assignment or Member.
+    #[error("active Commitment assignee authorization is required")]
+    CommitmentAssigneeRequired,
+    /// Replacement did not fence the exact active Commitment.
+    #[error("expected Work Commitment no longer matches")]
+    CommitmentFenceConflict,
     /// Governor authority is insufficient.
     #[error("actor is not authorized for this Role change")]
     NotAuthorized,
@@ -1729,6 +2279,16 @@ impl RoleContinuityError {
             Self::ActingAssignmentRequired => "acting_assignment_required",
             Self::ActingAssignmentInvalid => "acting_assignment",
             Self::AssigneeRequired => "assignee_required",
+            Self::WorkNotFound => "work_not_found",
+            Self::WorkClosed => "work_closed",
+            Self::ResponsibilityRequired => "responsibility_required",
+            Self::ResponsibilityUnchanged => "responsibility_unchanged",
+            Self::ActiveCommitmentConflict => "commitment_active",
+            Self::WorkRoleMismatch => "work_role_mismatch",
+            Self::CommitmentNotFound => "commitment_not_found",
+            Self::CommitmentEnded => "commitment_ended",
+            Self::CommitmentAssigneeRequired => "commitment_assignee_required",
+            Self::CommitmentFenceConflict => "commitment_fence",
             Self::NotAuthorized => "authorization",
             Self::OwnerRequired => "owner_required",
             Self::SelfEndForbidden => "self_end",
@@ -1785,6 +2345,38 @@ fn touch_assignment(
     Ok(())
 }
 
+fn touch_commitment(
+    commitment: &mut WorkCommitment,
+    next_revision: u64,
+) -> Result<(), RoleContinuityError> {
+    if commitment.project_revision != next_revision {
+        commitment.entity_revision = commitment
+            .entity_revision
+            .checked_add(1)
+            .filter(|revision| *revision <= MAX_SAFE_REVISION)
+            .ok_or(RoleContinuityError::RevisionOverflow)?;
+    }
+    commitment.project_revision = next_revision;
+    Ok(())
+}
+
+fn touch_work(
+    work: &mut WorkResponsibility,
+    actor: PublicKey,
+    canonical_time: DateTime<Utc>,
+    next_revision: u64,
+) -> Result<(), RoleContinuityError> {
+    work.object_revision = work
+        .object_revision
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_REVISION)
+        .ok_or(RoleContinuityError::RevisionOverflow)?;
+    work.project_revision = next_revision;
+    work.updated_at = canonical_time;
+    work.updated_by = actor;
+    Ok(())
+}
+
 fn require_id(id: Uuid, field: &str) -> Result<(), RoleContinuityError> {
     if id.is_nil() {
         return Err(RoleContinuityError::InvalidCommand(format!(
@@ -1832,6 +2424,16 @@ fn changed_entities(
     after
         .iter()
         .filter_map(|(key, value)| (before.get(key) != Some(value)).then_some(value.clone()))
+        .collect()
+}
+
+fn changed_works(
+    before: BTreeMap<Uuid, WorkResponsibility>,
+    after: &BTreeMap<Uuid, WorkResponsibility>,
+) -> Vec<WorkResponsibility> {
+    after
+        .iter()
+        .filter_map(|(work_id, work)| (before.get(work_id) != Some(work)).then_some(work.clone()))
         .collect()
 }
 
@@ -1888,6 +2490,42 @@ mod tests {
             assignment_id: Uuid::new_v4(),
             handoff_ids: (0..handoffs).map(|_| Uuid::new_v4()).collect(),
         }
+    }
+
+    fn work(
+        work_id: Uuid,
+        responsible_role_id: Option<Uuid>,
+        actor: PublicKey,
+    ) -> WorkResponsibility {
+        WorkResponsibility {
+            work_id,
+            status: Some(WorkStatus::Pending),
+            responsible_role_id,
+            object_revision: 1,
+            project_revision: 6,
+            updated_at: DateTime::from_timestamp(1_800_000_000, 0).expect("timestamp"),
+            updated_by: actor,
+        }
+    }
+
+    fn complete_state(
+        roles: Vec<RoleSlot>,
+        works: Vec<WorkResponsibility>,
+        members: Vec<MemberGovernance>,
+        assignments: Vec<RoleAssignment>,
+        commitments: Vec<WorkCommitment>,
+    ) -> RoleContinuityState {
+        RoleContinuityState::from_complete_snapshot(
+            7,
+            roles,
+            works,
+            members,
+            Vec::new(),
+            assignments,
+            commitments,
+            Vec::new(),
+        )
+        .expect("valid complete test state")
     }
 
     #[test]
@@ -2171,5 +2809,270 @@ mod tests {
             )
             .expect("active Leader Assignment authorizes ordinary Role offer");
         assert!(next.proposals.contains_key(&proposal_id));
+    }
+
+    #[test]
+    fn only_governance_can_assign_work_and_only_its_role_can_accept() {
+        let owner = pubkey();
+        let agent_a = pubkey();
+        let agent_b = pubkey();
+        let role_a = Uuid::new_v4();
+        let role_b = Uuid::new_v4();
+        let assignment_a = Uuid::new_v4();
+        let assignment_b = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let current = complete_state(
+            vec![
+                RoleSlot {
+                    role_id: role_a,
+                    level: RoleLevel::Member,
+                    active: true,
+                },
+                RoleSlot {
+                    role_id: role_b,
+                    level: RoleLevel::Member,
+                    active: true,
+                },
+            ],
+            vec![work(work_id, None, owner)],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(agent_a, Some(CommunityMemberRole::Member)),
+                member(agent_b, Some(CommunityMemberRole::Member)),
+            ],
+            vec![
+                assignment(assignment_a, role_a, agent_a),
+                assignment(assignment_b, role_b, agent_b),
+            ],
+            Vec::new(),
+        );
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let set_responsibility = RoleCommandRequest::SetWorkResponsibility {
+            work_id,
+            responsible_role_id: Some(role_a),
+        };
+        assert_eq!(
+            current.reduce(
+                &RoleCommand::new(7, Some(assignment_a), set_responsibility.clone()),
+                agent_a,
+                now,
+                &ids(0),
+            ),
+            Err(RoleContinuityError::NotAuthorized)
+        );
+        let (assigned, outcome) = current
+            .reduce(
+                &RoleCommand::new(7, None, set_responsibility),
+                owner,
+                now,
+                &ids(0),
+            )
+            .expect("owner assigns Work");
+        assert_eq!(outcome.work_changes.len(), 1);
+        assert_eq!(outcome.work_changes[0].responsible_role_id, Some(role_a));
+
+        let other_commitment = Uuid::new_v4();
+        assert_eq!(
+            assigned.reduce(
+                &RoleCommand::new(
+                    8,
+                    Some(assignment_b),
+                    RoleCommandRequest::AcceptWork {
+                        commitment_id: other_commitment,
+                        work_id,
+                    },
+                ),
+                agent_b,
+                now + Duration::seconds(1),
+                &ids(0),
+            ),
+            Err(RoleContinuityError::WorkRoleMismatch)
+        );
+
+        let commitment_id = Uuid::new_v4();
+        let (accepted, outcome) = assigned
+            .reduce(
+                &RoleCommand::new(
+                    8,
+                    Some(assignment_a),
+                    RoleCommandRequest::AcceptWork {
+                        commitment_id,
+                        work_id,
+                    },
+                ),
+                agent_a,
+                now + Duration::seconds(1),
+                &ids(0),
+            )
+            .expect("responsible Role assignee accepts Work");
+        assert!(accepted
+            .commitments
+            .get(&commitment_id)
+            .is_some_and(WorkCommitment::is_active));
+        assert!(matches!(
+            outcome.changes.as_slice(),
+            [RoleContinuityChange::Commitment(commitment)]
+                if commitment.commitment_id == commitment_id
+        ));
+    }
+
+    #[test]
+    fn ending_assignment_ends_commitment_without_changing_work() {
+        let owner = pubkey();
+        let agent = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let commitment_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let current = complete_state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            vec![work(work_id, Some(role_id), owner)],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(agent, Some(CommunityMemberRole::Member)),
+            ],
+            vec![assignment(assignment_id, role_id, agent)],
+            vec![WorkCommitment {
+                commitment_id,
+                work_id,
+                assignment_id,
+                member_pubkey: agent,
+                started_at: now - Duration::seconds(5),
+                started_by: agent,
+                ended_at: None,
+                ended_by: None,
+                ended_reason: None,
+                entity_revision: 1,
+                project_revision: 7,
+            }],
+        );
+        assert_eq!(
+            current.reduce(
+                &RoleCommand::new(
+                    7,
+                    None,
+                    RoleCommandRequest::SetWorkResponsibility {
+                        work_id,
+                        responsible_role_id: None,
+                    },
+                ),
+                owner,
+                now,
+                &ids(0),
+            ),
+            Err(RoleContinuityError::ActiveCommitmentConflict)
+        );
+        let (ended, outcome) = current
+            .reduce(
+                &RoleCommand::new(
+                    7,
+                    None,
+                    RoleCommandRequest::EndAssignment {
+                        assignment_id,
+                        reason: None,
+                    },
+                ),
+                owner,
+                now,
+                &ids(0),
+            )
+            .expect("owner ends Assignment");
+
+        let commitment = ended.commitments.get(&commitment_id).expect("commitment");
+        assert_eq!(
+            commitment.ended_reason,
+            Some(CommitmentEndReason::AssignmentEnded)
+        );
+        assert_eq!(
+            ended.works.get(&work_id).expect("work").status,
+            Some(WorkStatus::Pending)
+        );
+        assert_eq!(
+            ended.works.get(&work_id).expect("work").responsible_role_id,
+            Some(role_id)
+        );
+        assert!(outcome.work_changes.is_empty());
+        assert_eq!(
+            outcome.ended_commitments.get(&assignment_id),
+            Some(&vec![commitment_id])
+        );
+    }
+
+    #[test]
+    fn recommit_preserves_predecessor_attribution() {
+        let owner = pubkey();
+        let agent = pubkey();
+        let role_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let old_commitment_id = Uuid::new_v4();
+        let new_commitment_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let current = complete_state(
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            vec![work(work_id, Some(role_id), owner)],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                member(agent, Some(CommunityMemberRole::Member)),
+            ],
+            vec![assignment(assignment_id, role_id, agent)],
+            vec![WorkCommitment {
+                commitment_id: old_commitment_id,
+                work_id,
+                assignment_id,
+                member_pubkey: agent,
+                started_at: now - Duration::seconds(5),
+                started_by: agent,
+                ended_at: None,
+                ended_by: None,
+                ended_reason: None,
+                entity_revision: 1,
+                project_revision: 7,
+            }],
+        );
+        let (recommitted, outcome) = current
+            .reduce(
+                &RoleCommand::new(
+                    7,
+                    Some(assignment_id),
+                    RoleCommandRequest::ReplaceCommitment {
+                        commitment_id: new_commitment_id,
+                        work_id,
+                        expected_commitment_id: old_commitment_id,
+                    },
+                ),
+                agent,
+                now,
+                &ids(0),
+            )
+            .expect("assignee recommits atomically");
+
+        let old = recommitted
+            .commitments
+            .get(&old_commitment_id)
+            .expect("old Commitment retained");
+        assert_eq!(old.ended_reason, Some(CommitmentEndReason::Replaced));
+        assert_eq!(old.member_pubkey, agent);
+        assert!(recommitted
+            .commitments
+            .get(&new_commitment_id)
+            .is_some_and(WorkCommitment::is_active));
+        assert_eq!(
+            outcome
+                .changes
+                .iter()
+                .filter(|change| matches!(change, RoleContinuityChange::Commitment(_)))
+                .count(),
+            2
+        );
     }
 }

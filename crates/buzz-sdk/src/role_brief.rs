@@ -12,12 +12,12 @@ use std::fmt::Write as _;
 use buzz_core::{EventId, PublicKey};
 use buzz_project_view::v2::{
     CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal,
-    RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel,
+    RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel, WorkCommitment,
 };
 use buzz_project_view::{
     Goal, ObjectRef, ProjectIssue, ProjectRole, ProjectView, ProjectViewEntry, ProjectViewObject,
     ProjectViewObjectData, ProjectViewObjectType, ProjectViewRelations, ProjectViewState,
-    ProjectViewTombstone, ProjectWork,
+    ProjectViewTombstone, ProjectWork, WorkStatus,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,9 @@ pub struct RoleBriefSourceReference {
 pub struct RoleBriefObject {
     /// Complete canonical object.
     pub object: ProjectViewObject,
+    /// Stable Role responsible for an active Work, when this object is Work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responsible_role_id: Option<Uuid>,
     /// Exact signed source revision.
     pub source: RoleBriefSourceReference,
 }
@@ -83,6 +86,39 @@ pub struct RoleBriefProposal {
     pub proposal: RoleAssignmentProposal,
     /// Exact signed source revision.
     pub source: RoleBriefSourceReference,
+}
+
+/// One Work Commitment and the projection that proves its lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleBriefCommitment {
+    /// Complete Commitment tenure.
+    pub commitment: WorkCommitment,
+    /// Exact signed source revision.
+    pub source: RoleBriefSourceReference,
+}
+
+/// Execution state derived for one Work owned by the assigned Role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleBriefWorkState {
+    /// The current Assignment has explicitly accepted the Work.
+    Committed {
+        /// Active Commitment that attributes execution to this Assignment.
+        commitment: Box<RoleBriefCommitment>,
+    },
+    /// The Role still owns the Work, but no current Assignment has accepted it.
+    WaitingForContinuation,
+}
+
+/// One non-terminal Work for which the assigned Role is responsible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleBriefResponsibleWork {
+    /// Canonical Work object and signed projection source.
+    pub work: RoleBriefObject,
+    /// Derived current execution state.
+    pub state: RoleBriefWorkState,
 }
 
 /// Minimal project-wide context carried by every Role Brief.
@@ -168,6 +204,9 @@ pub struct RoleBrief {
     pub project: RoleBriefProjectSummary,
     /// Candidate or assigned entry state.
     pub state: RoleBriefMemberState,
+    /// Non-terminal Work owned by the assigned Role, with current Commitment
+    /// or an explicit waiting-for-continuation state.
+    pub responsible_work: Vec<RoleBriefResponsibleWork>,
     /// Role-related Issues and their handling Work in deterministic order.
     pub related_objects: Vec<RoleBriefObject>,
     /// Signed snapshot boundaries.
@@ -196,6 +235,7 @@ pub struct VerifiedRoleBriefSnapshot {
     roles: BTreeMap<Uuid, EntityHead<RoleDefinition>>,
     proposals: BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
     assignments: BTreeMap<Uuid, EntityHead<RoleAssignment>>,
+    commitments: BTreeMap<Uuid, EntityHead<WorkCommitment>>,
     handoffs: BTreeMap<Uuid, EntityHead<RoleHandoff>>,
     view: ProjectView,
 }
@@ -203,6 +243,7 @@ pub struct VerifiedRoleBriefSnapshot {
 #[derive(Debug, Clone)]
 struct ObjectHead {
     object: ProjectViewObject,
+    responsible_role_id: Option<Uuid>,
     source: RoleBriefSourceReference,
 }
 
@@ -251,6 +292,7 @@ impl VerifiedRoleBriefSnapshot {
                 projection.object.object_revision(),
                 &projection.source,
             );
+            let responsible_role_id = projection.responsible_role_id;
             match projection.object {
                 V2ProjectedObject::Active(object) => {
                     let object = *object;
@@ -265,7 +307,14 @@ impl VerifiedRoleBriefSnapshot {
                         return Err(invalid("v2 snapshot contains a duplicate object ID"));
                     }
                     entries.push(ProjectViewEntry::Active(object.clone()));
-                    objects.insert(object.id, ObjectHead { object, source });
+                    objects.insert(
+                        object.id,
+                        ObjectHead {
+                            object,
+                            responsible_role_id,
+                            source,
+                        },
+                    );
                 }
                 V2ProjectedObject::Tombstone(tombstone) => {
                     if tombstone.project_revision != projection.project_revision
@@ -296,6 +345,7 @@ impl VerifiedRoleBriefSnapshot {
         let mut roles = BTreeMap::new();
         let mut proposals = BTreeMap::new();
         let mut assignments = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
         let mut handoffs = BTreeMap::new();
         for projection in entity_projections {
             validate_projection_basis(
@@ -375,6 +425,20 @@ impl VerifiedRoleBriefSnapshot {
                         },
                     );
                 }
+                RoleContinuityChange::Commitment(commitment) => {
+                    if commitment.project_revision != projection.project_revision {
+                        return Err(invalid(
+                            "Commitment body disagrees with its projection revision",
+                        ));
+                    }
+                    commitments.insert(
+                        commitment.commitment_id,
+                        EntityHead {
+                            entity: commitment,
+                            source,
+                        },
+                    );
+                }
                 RoleContinuityChange::Handoff(handoff) => {
                     if handoff.project_revision != projection.project_revision {
                         return Err(invalid(
@@ -397,6 +461,7 @@ impl VerifiedRoleBriefSnapshot {
             objects.len() + roles.len(),
             &proposals,
             &assignments,
+            &commitments,
             handoffs.len(),
         )?;
         let entries_by_id = entries
@@ -406,11 +471,15 @@ impl VerifiedRoleBriefSnapshot {
             .collect::<BTreeMap<_, _>>();
         let view = validate_project_state(&meta, entries)?;
         validate_continuity(
-            &entries_by_id,
-            &roles,
-            &proposals,
-            &assignments,
-            &handoffs,
+            ContinuityHeads {
+                entries: &entries_by_id,
+                roles: &roles,
+                proposals: &proposals,
+                assignments: &assignments,
+                commitments: &commitments,
+                handoffs: &handoffs,
+                objects: &objects,
+            },
             &membership,
         )?;
 
@@ -422,6 +491,7 @@ impl VerifiedRoleBriefSnapshot {
             roles,
             proposals,
             assignments,
+            commitments,
             handoffs,
             view,
         })
@@ -466,6 +536,11 @@ impl VerifiedRoleBriefSnapshot {
         self.assignments.values().map(|head| &head.entity)
     }
 
+    /// Iterate over Work Commitment heads by stable Commitment ID.
+    pub fn commitments(&self) -> impl Iterator<Item = &WorkCommitment> {
+        self.commitments.values().map(|head| &head.entity)
+    }
+
     /// Iterate over Handoff heads by stable Handoff ID.
     pub fn handoffs(&self) -> impl Iterator<Item = &RoleHandoff> {
         self.handoffs.values().map(|head| &head.entity)
@@ -493,48 +568,50 @@ impl VerifiedRoleBriefSnapshot {
             .assignments
             .values()
             .find(|head| head.entity.member_pubkey == member_pubkey && head.entity.is_active());
-        let (state, related_objects) = if let Some(assignment) = active_assignment {
-            let role = self
-                .roles
-                .get(&assignment.entity.role_id)
-                .ok_or_else(|| invalid("active Assignment references a missing verified Role"))?;
-            (
-                RoleBriefMemberState::Assigned {
-                    role: Box::new(RoleBriefRole {
-                        role: role.entity.clone(),
-                        source: role.source.clone(),
-                    }),
-                    assignment: Box::new(RoleBriefAssignment {
-                        assignment: assignment.entity.clone(),
-                        source: assignment.source.clone(),
-                    }),
-                },
-                self.related_objects(role.entity.role_id),
-            )
-        } else {
-            let mut open_proposals = self
-                .proposals
-                .values()
-                .filter(|head| {
-                    head.entity.candidate_pubkey == member_pubkey
-                        && head.entity.effective_status(generated_at) == ProposalStatus::Open
-                })
-                .map(|head| RoleBriefProposal {
-                    proposal: head.entity.clone(),
-                    source: head.source.clone(),
-                })
-                .collect::<Vec<_>>();
-            open_proposals.sort_by(|left, right| {
-                left.proposal
-                    .created_at
-                    .cmp(&right.proposal.created_at)
-                    .then(left.proposal.proposal_id.cmp(&right.proposal.proposal_id))
-            });
-            (
-                RoleBriefMemberState::Candidate { open_proposals },
-                Vec::new(),
-            )
-        };
+        let (state, responsible_work, related_objects) =
+            if let Some(assignment) = active_assignment {
+                let role = self.roles.get(&assignment.entity.role_id).ok_or_else(|| {
+                    invalid("active Assignment references a missing verified Role")
+                })?;
+                (
+                    RoleBriefMemberState::Assigned {
+                        role: Box::new(RoleBriefRole {
+                            role: role.entity.clone(),
+                            source: role.source.clone(),
+                        }),
+                        assignment: Box::new(RoleBriefAssignment {
+                            assignment: assignment.entity.clone(),
+                            source: assignment.source.clone(),
+                        }),
+                    },
+                    self.responsible_work(role.entity.role_id),
+                    self.related_objects(role.entity.role_id),
+                )
+            } else {
+                let mut open_proposals = self
+                    .proposals
+                    .values()
+                    .filter(|head| {
+                        head.entity.candidate_pubkey == member_pubkey
+                            && head.entity.effective_status(generated_at) == ProposalStatus::Open
+                    })
+                    .map(|head| RoleBriefProposal {
+                        proposal: head.entity.clone(),
+                        source: head.source.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                open_proposals.sort_by(|left, right| {
+                    left.proposal
+                        .created_at
+                        .cmp(&right.proposal.created_at)
+                        .then(left.proposal.proposal_id.cmp(&right.proposal.proposal_id))
+                });
+                (
+                    RoleBriefMemberState::Candidate { open_proposals },
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
         let community_role = self
             .membership
             .members
@@ -554,6 +631,7 @@ impl VerifiedRoleBriefSnapshot {
                 goals: goals.into_iter().map(role_brief_object).collect(),
             },
             state,
+            responsible_work,
             related_objects,
             source_revisions: RoleBriefSourceRevisions {
                 meta_event_id: self.meta.event_id,
@@ -562,6 +640,36 @@ impl VerifiedRoleBriefSnapshot {
                 project_updated_at: self.meta.updated_at,
             },
         })
+    }
+
+    fn responsible_work(&self, role_id: Uuid) -> Vec<RoleBriefResponsibleWork> {
+        let mut work = self
+            .objects
+            .values()
+            .filter(|head| head.responsible_role_id == Some(role_id) && work_is_open(&head.object))
+            .map(|head| {
+                let state = self
+                    .commitments
+                    .values()
+                    .find(|commitment| {
+                        commitment.entity.work_id == head.object.id && commitment.entity.is_active()
+                    })
+                    .map_or(RoleBriefWorkState::WaitingForContinuation, |commitment| {
+                        RoleBriefWorkState::Committed {
+                            commitment: Box::new(RoleBriefCommitment {
+                                commitment: commitment.entity.clone(),
+                                source: commitment.source.clone(),
+                            }),
+                        }
+                    });
+                RoleBriefResponsibleWork {
+                    work: role_brief_object(head),
+                    state,
+                }
+            })
+            .collect::<Vec<_>>();
+        work.sort_by(|left, right| object_order(&left.work.object, &right.work.object));
+        work
     }
 
     fn related_objects(&self, role_id: Uuid) -> Vec<RoleBriefObject> {
@@ -685,6 +793,38 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
         }
     }
 
+    if matches!(&brief.state, RoleBriefMemberState::Assigned { .. }) {
+        if brief.responsible_work.is_empty() {
+            output.push_str("Responsible Work: none\n");
+        } else {
+            output.push_str("Responsible Work:\n");
+            for responsible in &brief.responsible_work {
+                let ProjectViewObjectData::Work(work) = &responsible.work.object.data else {
+                    continue;
+                };
+                match &responsible.state {
+                    RoleBriefWorkState::Committed { commitment } => {
+                        let _ = writeln!(
+                            output,
+                            "- {} [{}] — committed via {}",
+                            one_line(&work.title),
+                            work.status.as_str(),
+                            commitment.commitment.commitment_id
+                        );
+                    }
+                    RoleBriefWorkState::WaitingForContinuation => {
+                        let _ = writeln!(
+                            output,
+                            "- {} [{}] — waiting for continuation",
+                            one_line(&work.title),
+                            work.status.as_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     if !brief.related_objects.is_empty() {
         output.push_str("Related Project View slice:\n");
         for related in &brief.related_objects {
@@ -759,6 +899,7 @@ fn validate_counts(
     active_objects: usize,
     proposals: &BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
     assignments: &BTreeMap<Uuid, EntityHead<RoleAssignment>>,
+    commitments: &BTreeMap<Uuid, EntityHead<WorkCommitment>>,
     handoffs: usize,
 ) -> Result<(), SdkError> {
     let open_proposals = proposals
@@ -769,12 +910,16 @@ fn validate_counts(
         .values()
         .filter(|head| head.entity.is_active())
         .count();
+    let active_commitments = commitments
+        .values()
+        .filter(|head| head.entity.is_active())
+        .count();
     let counts = meta.entity_counts;
     if usize::try_from(counts.active_objects).ok() != Some(active_objects)
         || usize::try_from(counts.open_proposals).ok() != Some(open_proposals)
         || usize::try_from(counts.active_assignments).ok() != Some(active_assignments)
+        || usize::try_from(counts.active_commitments).ok() != Some(active_commitments)
         || usize::try_from(counts.handoffs).ok() != Some(handoffs)
-        || counts.active_commitments != 0
         || counts.checkpoints != 0
     {
         return Err(invalid(
@@ -808,14 +953,30 @@ fn validate_project_state(
         .map_err(|error| invalid(format!("cannot assemble Project View: {error}")))
 }
 
+struct ContinuityHeads<'a> {
+    entries: &'a BTreeMap<Uuid, ProjectViewEntry>,
+    roles: &'a BTreeMap<Uuid, EntityHead<RoleDefinition>>,
+    proposals: &'a BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
+    assignments: &'a BTreeMap<Uuid, EntityHead<RoleAssignment>>,
+    commitments: &'a BTreeMap<Uuid, EntityHead<WorkCommitment>>,
+    handoffs: &'a BTreeMap<Uuid, EntityHead<RoleHandoff>>,
+    objects: &'a BTreeMap<Uuid, ObjectHead>,
+}
+
 fn validate_continuity(
-    entries: &BTreeMap<Uuid, ProjectViewEntry>,
-    roles: &BTreeMap<Uuid, EntityHead<RoleDefinition>>,
-    proposals: &BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
-    assignments: &BTreeMap<Uuid, EntityHead<RoleAssignment>>,
-    handoffs: &BTreeMap<Uuid, EntityHead<RoleHandoff>>,
+    heads: ContinuityHeads<'_>,
     membership: &V2MembershipProjection,
 ) -> Result<(), SdkError> {
+    let ContinuityHeads {
+        entries,
+        roles,
+        proposals,
+        assignments,
+        commitments,
+        handoffs,
+        objects,
+    } = heads;
+
     for proposal in proposals.values() {
         if entries
             .get(&proposal.entity.role_id)
@@ -853,6 +1014,60 @@ fn validate_continuity(
                 .is_some_and(|id| !assignments.contains_key(&id))
         {
             return Err(invalid("Handoff references a missing Role or Assignment"));
+        }
+    }
+
+    for work in objects
+        .values()
+        .filter(|head| head.object.object_type == ProjectViewObjectType::Work)
+    {
+        if let Some(role_id) = work.responsible_role_id {
+            if !roles.get(&role_id).is_some_and(|role| role.entity.active) {
+                return Err(invalid(
+                    "Work responsibility references a missing or inactive Role",
+                ));
+            }
+        }
+    }
+
+    let mut actively_committed_work = HashSet::new();
+    for commitment in commitments.values() {
+        let assignment = assignments
+            .get(&commitment.entity.assignment_id)
+            .ok_or_else(|| invalid("Commitment references a missing Assignment"))?;
+        if assignment.entity.member_pubkey != commitment.entity.member_pubkey {
+            return Err(invalid("Commitment member disagrees with its Assignment"));
+        }
+        if !matches!(
+            (
+                commitment.entity.ended_at,
+                commitment.entity.ended_by,
+                commitment.entity.ended_reason
+            ),
+            (None, None, None) | (Some(_), Some(_), Some(_))
+        ) {
+            return Err(invalid("Commitment terminal attribution is incomplete"));
+        }
+        if commitment.entity.is_active() {
+            if !assignment.entity.is_active() {
+                return Err(invalid("active Commitment references an ended Assignment"));
+            }
+            let work = objects
+                .get(&commitment.entity.work_id)
+                .ok_or_else(|| invalid("active Commitment references a missing Work"))?;
+            if !work_is_open(&work.object) {
+                return Err(invalid(
+                    "active Commitment references terminal or non-Work state",
+                ));
+            }
+            if work.responsible_role_id != Some(assignment.entity.role_id) {
+                return Err(invalid(
+                    "active Commitment disagrees with Work responsibility",
+                ));
+            }
+            if !actively_committed_work.insert(commitment.entity.work_id) {
+                return Err(invalid("one Work has multiple active Commitments"));
+            }
         }
     }
 
@@ -925,8 +1140,22 @@ fn source_reference(
 fn role_brief_object(head: &ObjectHead) -> RoleBriefObject {
     RoleBriefObject {
         object: head.object.clone(),
+        responsible_role_id: head.responsible_role_id,
         source: head.source.clone(),
     }
+}
+
+fn work_is_open(object: &ProjectViewObject) -> bool {
+    matches!(
+        &object.data,
+        ProjectViewObjectData::Work(ProjectWork {
+            status: WorkStatus::Pending
+                | WorkStatus::InProgress
+                | WorkStatus::Paused
+                | WorkStatus::Submitted,
+            ..
+        })
+    )
 }
 
 fn project_object_from_role(role: &RoleDefinition) -> ProjectViewObject {
@@ -1026,20 +1255,26 @@ mod tests {
                 if role.role.role_id == fixture.role_id
         ));
         assert_eq!(brief.project.goals.len(), 1);
+        assert_eq!(brief.responsible_work.len(), 1);
+        assert!(matches!(
+            brief.responsible_work[0].state,
+            RoleBriefWorkState::Committed { .. }
+        ));
         assert_eq!(brief.related_objects.len(), 2);
-        assert_eq!(
-            brief
-                .related_objects
-                .iter()
-                .map(|item| item.object.object_type)
-                .collect::<Vec<_>>(),
-            vec![ProjectViewObjectType::Issue, ProjectViewObjectType::Work]
-        );
+        let related_types = brief
+            .related_objects
+            .iter()
+            .map(|item| item.object.object_type)
+            .collect::<Vec<_>>();
+        assert!(related_types.contains(&ProjectViewObjectType::Issue));
+        assert!(related_types.contains(&ProjectViewObjectType::Work));
 
         let markdown = render_role_brief_markdown(&brief);
         assert!(markdown.starts_with("[Role Brief]\nState: assigned"));
         assert!(markdown.contains("Community role: member"));
         assert!(markdown.contains(&fixture.assignment_id.to_string()));
+        assert!(markdown.contains("Responsible Work:"));
+        assert!(markdown.contains("committed via"));
         assert!(markdown.contains("Related Project View slice:"));
         assert!(markdown.contains("Source revisions: project=4 generation=1"));
     }
@@ -1061,6 +1296,37 @@ mod tests {
         let markdown = render_role_brief_markdown(&brief);
         assert!(markdown.contains("State: candidate"));
         assert!(markdown.contains("no active Assignment is verified"));
+    }
+
+    #[test]
+    fn responsible_work_without_commitment_is_explicitly_waiting() {
+        let fixture = fixture();
+        let mut meta = fixture.snapshot.meta.clone();
+        meta.entity_counts.active_commitments = 0;
+        let objects = object_projections(&fixture.snapshot);
+        let entities = entity_projections(&fixture.snapshot)
+            .into_iter()
+            .filter(|projection| !matches!(&projection.entity, RoleContinuityChange::Commitment(_)))
+            .collect();
+        let snapshot = VerifiedRoleBriefSnapshot::new(
+            meta,
+            fixture.snapshot.membership.clone(),
+            objects,
+            entities,
+        )
+        .expect("snapshot without active Commitment");
+        let brief = snapshot
+            .brief_for(fixture.agent, instant())
+            .expect("waiting Brief");
+
+        assert!(matches!(
+            brief.responsible_work.as_slice(),
+            [RoleBriefResponsibleWork {
+                state: RoleBriefWorkState::WaitingForContinuation,
+                ..
+            }]
+        ));
+        assert!(render_role_brief_markdown(&brief).contains("waiting for continuation"));
     }
 
     #[test]
@@ -1089,7 +1355,9 @@ mod tests {
         let role_id = Uuid::new_v4();
         let proposal_id = Uuid::new_v4();
         let assignment_id = Uuid::new_v4();
+        let commitment_id = Uuid::new_v4();
         let issue_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
         let now = instant();
         let source = source(90);
 
@@ -1142,7 +1410,7 @@ mod tests {
             now,
         );
         let work = object(
-            Uuid::new_v4(),
+            work_id,
             ProjectViewObjectType::Work,
             4,
             ProjectViewObjectData::Work(ProjectWork {
@@ -1162,10 +1430,10 @@ mod tests {
             now,
         );
         let ordinary = vec![
-            projected_object(1, project_id, profile, source.clone(), now),
-            projected_object(2, project_id, goal, source.clone(), now),
-            projected_object(3, project_id, issue, source.clone(), now),
-            projected_object(4, project_id, work, source.clone(), now),
+            projected_object(1, project_id, profile, None, source.clone(), now),
+            projected_object(2, project_id, goal, None, source.clone(), now),
+            projected_object(3, project_id, issue, None, source.clone(), now),
+            projected_object(4, project_id, work, Some(role_id), source.clone(), now),
         ];
 
         let role = RoleDefinition {
@@ -1220,6 +1488,19 @@ mod tests {
             entity_revision: 1,
             project_revision: 3,
         };
+        let commitment = WorkCommitment {
+            commitment_id,
+            work_id,
+            assignment_id,
+            member_pubkey: agent,
+            started_at: now,
+            started_by: agent,
+            ended_at: None,
+            ended_by: None,
+            ended_reason: None,
+            entity_revision: 1,
+            project_revision: 4,
+        };
         let entities = vec![
             projected_entity(
                 5,
@@ -1248,9 +1529,18 @@ mod tests {
                 source.clone(),
                 now,
             ),
+            projected_entity(
+                8,
+                project_id,
+                4,
+                1,
+                RoleContinuityChange::Commitment(commitment),
+                source.clone(),
+                now,
+            ),
         ];
 
-        let membership_event_id = event_id(8);
+        let membership_event_id = event_id(9);
         let mut members = vec![
             V2MembershipMember {
                 pubkey: owner,
@@ -1268,7 +1558,7 @@ mod tests {
             created_at: Timestamp::from(now.timestamp() as u64),
         };
         let meta = V2MetaProjection {
-            event_id: event_id(9),
+            event_id: event_id(10),
             project_id,
             projection_generation: 1,
             project_revision: 4,
@@ -1276,7 +1566,7 @@ mod tests {
                 active_objects: 5,
                 open_proposals: 0,
                 active_assignments: 1,
-                active_commitments: 0,
+                active_commitments: 1,
                 checkpoints: 0,
                 handoffs: 0,
             },
@@ -1323,6 +1613,7 @@ mod tests {
         byte: u8,
         project_id: CommunityId,
         object: ProjectViewObject,
+        responsible_role_id: Option<Uuid>,
         source: V2ProjectionSource,
         now: DateTime<Utc>,
     ) -> V2ProjectObjectProjection {
@@ -1333,6 +1624,7 @@ mod tests {
             project_revision: object.project_revision,
             source,
             object: V2ProjectedObject::Active(Box::new(object)),
+            responsible_role_id,
             updated_at: now,
         }
     }
@@ -1386,6 +1678,7 @@ mod tests {
                 project_revision: head.object.project_revision,
                 source: source(u8::try_from(index + 40).unwrap()),
                 object: V2ProjectedObject::Active(Box::new(head.object.clone())),
+                responsible_role_id: head.responsible_role_id,
                 updated_at: head.object.updated_at,
             })
             .collect()
@@ -1423,6 +1716,17 @@ mod tests {
                 assignment.entity.entity_revision,
                 RoleContinuityChange::Assignment(assignment.entity.clone()),
                 source(u8::try_from(index + 110).unwrap()),
+                instant(),
+            ));
+        }
+        for (index, commitment) in snapshot.commitments.values().enumerate() {
+            entities.push(projected_entity(
+                u8::try_from(index + 120).unwrap(),
+                snapshot.meta.project_id,
+                commitment.entity.project_revision,
+                commitment.entity.entity_revision,
+                RoleContinuityChange::Commitment(commitment.entity.clone()),
+                source(u8::try_from(index + 130).unwrap()),
                 instant(),
             ));
         }

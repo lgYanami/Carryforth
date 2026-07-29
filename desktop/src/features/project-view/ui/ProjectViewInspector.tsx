@@ -19,6 +19,7 @@ import {
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
 import { ProjectRoleInspector } from "@/features/project-view/ui/ProjectRoleInspector";
+import { ProjectWorkContinuity } from "@/features/project-view/ui/ProjectWorkContinuity";
 import type {
   ProjectRoleDefinition,
   ProjectView,
@@ -226,6 +227,14 @@ function ProjectViewInspectorContent({
           assignment.roleId === roleDefinition.roleId && !assignment.endedAt,
       ),
   );
+  const roleHasResponsibleWork = Boolean(
+    roleDefinition &&
+      roleContinuity?.workResponsibilities.some(
+        (responsibility) => responsibility.roleId === roleDefinition.roleId,
+      ),
+  );
+  const roleLifecycleBlocked =
+    roleHasActiveAssignment || roleHasResponsibleWork;
 
   return (
     <>
@@ -271,12 +280,14 @@ function ProjectViewInspectorContent({
             Edit
           </Button>
           <Button
-            disabled={roleHasActiveAssignment}
+            disabled={roleLifecycleBlocked}
             onClick={() => onDelete(object)}
             title={
               roleHasActiveAssignment
                 ? "End the active Assignment before deleting this Role."
-                : undefined
+                : roleHasResponsibleWork
+                  ? "Clear or reassign this Role's Work before deleting it."
+                  : undefined
             }
             type="button"
             variant="outline"
@@ -290,13 +301,14 @@ function ProjectViewInspectorContent({
           <ObjectDetails object={object} />
         </div>
 
-        {roleHasActiveAssignment ? (
+        {roleLifecycleBlocked ? (
           <p
             className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-muted-foreground"
             data-testid="project-role-lifecycle-guard"
           >
-            This Role has an active Assignment. End or replace the tenure before
-            deactivating or deleting the Role.
+            {roleHasActiveAssignment
+              ? "This Role has an active Assignment. End or replace the tenure before deactivating or deleting the Role."
+              : "This Role is responsible for Work. Clear or reassign that responsibility before deactivating or deleting the Role."}
           </p>
         ) : null}
 
@@ -307,6 +319,15 @@ function ProjectViewInspectorContent({
             currentPubkey={currentPubkey}
             definition={roleDefinition}
             projectRevision={projectRevision}
+          />
+        ) : null}
+
+        {object.objectType === "work" && roleContinuity ? (
+          <ProjectWorkContinuity
+            continuity={roleContinuity}
+            currentPubkey={currentPubkey}
+            projectRevision={projectRevision}
+            workId={object.id}
           />
         ) : null}
 

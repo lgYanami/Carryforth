@@ -288,6 +288,41 @@ export function ProjectRoleInspector({
               </li>
             ))}
           </ul>
+          <div className="mt-3 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Responsible Work
+          </div>
+          {currentBrief.responsibleWork.length === 0 ? (
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              No non-terminal Work is assigned to this Role.
+            </p>
+          ) : (
+            <ul className="mt-1.5 space-y-2 text-xs">
+              {currentBrief.responsibleWork.map((work) => (
+                <li
+                  className="rounded-lg border border-border/70 px-2.5 py-2"
+                  key={work.workId}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-medium">{work.title}</span>
+                    <Badge
+                      variant={
+                        work.commitment.status === "committed"
+                          ? "success"
+                          : "warning"
+                      }
+                    >
+                      {work.commitment.status === "committed"
+                        ? "Committed"
+                        : "Waiting for continuation"}
+                    </Badge>
+                  </div>
+                  <div className="mt-1 capitalize text-muted-foreground">
+                    {work.status.replaceAll("_", " ")}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
           {currentBrief.relatedObjects.length > 0 ? (
             <p className="mt-3 text-xs text-muted-foreground">
               {currentBrief.relatedObjects.length} related Issue/Work{" "}

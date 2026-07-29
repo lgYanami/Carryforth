@@ -14,14 +14,15 @@ use buzz_core::kind::{
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::ChangeSource;
 use buzz_project_view::v2::{
-    AssignmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, MemberGovernance,
-    ProjectObjectCommand, ProposalStatus, ProposalType, RoleAssignment, RoleAssignmentProposal,
-    RoleCommand, RoleContinuityChange, RoleContinuityEntity, RoleContinuityError,
-    RoleContinuityState, RoleDefinition, RoleHandoff, RoleLevel, RoleSlot,
+    AssignmentEndReason, CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds,
+    MemberGovernance, ProjectObjectCommand, ProposalStatus, ProposalType, RoleAssignment,
+    RoleAssignmentProposal, RoleCommand, RoleContinuityChange, RoleContinuityEntity,
+    RoleContinuityError, RoleContinuityState, RoleDefinition, RoleHandoff, RoleLevel, RoleSlot,
+    WorkCommitment, WorkResponsibility,
 };
 use buzz_project_view::{
     DomainError, MutationOutcome, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
-    ProjectViewObjectType, ProjectViewState,
+    ProjectViewObjectType, ProjectViewState, WorkStatus,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -120,6 +121,8 @@ pub struct PreparedV2RoleChange {
     pub canonical_time: DateTime<Utc>,
     /// Exact changed entity heads.
     pub changes: Vec<RoleContinuityChange>,
+    /// Work object heads whose stable responsible Role changed.
+    pub work_heads: Vec<PreparedV2ProjectObjectHead>,
     /// Counts after the staged change.
     pub counts: V2CanonicalCounts,
     /// NIP-43 rows before the staged change.
@@ -136,7 +139,12 @@ pub struct PreparedV2RoleChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedV2ProjectObjectHead {
     /// An ordinary active object or tombstone.
-    Object(ProjectViewEntry),
+    Object {
+        /// Complete canonical object or tombstone.
+        entry: ProjectViewEntry,
+        /// Stable Role responsible for an active Work.
+        responsible_role_id: Option<Uuid>,
+    },
     /// An active Role carrying its v2 governance level.
     Role(RoleDefinition),
 }
@@ -146,8 +154,20 @@ impl PreparedV2ProjectObjectHead {
     #[must_use]
     pub const fn object_id(&self) -> Uuid {
         match self {
-            Self::Object(entry) => entry.id(),
+            Self::Object { entry, .. } => entry.id(),
             Self::Role(role) => role.role_id,
+        }
+    }
+
+    /// Stable Work responsibility carried outside the closed v1 object body.
+    #[must_use]
+    pub const fn responsible_role_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Object {
+                responsible_role_id,
+                ..
+            } => *responsible_role_id,
+            Self::Role(_) => None,
         }
     }
 }
@@ -167,6 +187,8 @@ pub struct PreparedV2ProjectObjectChange {
     pub canonical_time: DateTime<Utc>,
     /// Changed object/entity heads.
     pub heads: Vec<PreparedV2ProjectObjectHead>,
+    /// Commitment heads ended by a terminal Work transition.
+    pub entity_changes: Vec<RoleContinuityChange>,
     /// Counts after the staged change.
     pub counts: V2CanonicalCounts,
     /// Existing exact NIP-43 snapshot pointer.
@@ -203,6 +225,8 @@ pub struct PreparedV2RoleCommit {
     pub command_event: Event,
     /// One signed head per changed entity.
     pub entity_projections: Vec<PreparedV2EntityProjection>,
+    /// One signed head per changed Work responsibility.
+    pub object_projections: Vec<crate::project_view::PreparedObjectProjection>,
     /// Signed kind `40904` metadata head.
     pub meta_projection: Event,
     /// New NIP-43 snapshot when canonical membership changed.
@@ -216,6 +240,8 @@ pub struct PreparedV2ProjectObjectCommit {
     pub command_event: Event,
     /// One signed head per changed canonical object.
     pub object_projections: Vec<crate::project_view::PreparedObjectProjection>,
+    /// Commitment heads ended by a terminal Work transition.
+    pub entity_projections: Vec<PreparedV2EntityProjection>,
     /// Signed kind `40904` metadata head.
     pub meta_projection: Event,
 }
@@ -302,6 +328,7 @@ struct V2PreparedBasis {
     preparation: PreparedV2RoleChange,
     old_meta_projection_id: [u8; 32],
     old_projection_ids: BTreeMap<(RoleContinuityEntity, Uuid), [u8; 32]>,
+    old_object_projection_ids: BTreeMap<Uuid, [u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,9 +339,11 @@ struct V2PreparedProjectObjectBasis {
     preparation: PreparedV2ProjectObjectChange,
     next_state: ProjectViewState,
     outcome: MutationOutcome,
+    continuity_changes: Vec<RoleContinuityChange>,
     role_levels: BTreeMap<Uuid, RoleLevel>,
     old_meta_projection_id: [u8; 32],
     old_projection_ids: BTreeMap<Uuid, [u8; 32]>,
+    old_entity_projection_ids: BTreeMap<(RoleContinuityEntity, Uuid), [u8; 32]>,
 }
 
 impl std::fmt::Debug for ProjectViewV2WriteTx {
@@ -1283,25 +1312,25 @@ impl ProjectViewV2WriteTx {
             assignment_id: Uuid::new_v4(),
             handoff_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
         };
-        let (_next_state, mut outcome) = loaded.state.reduce(
+        let (_next_state, outcome) = loaded.state.reduce(
             command,
             command_event.pubkey,
             loaded.canonical_time,
             &generated_ids,
         )?;
-        end_commitments_for_changed_assignments(
+        let (work_heads, old_object_projection_ids) = prepare_work_responsibility_heads(
             &mut self.tx,
             self.community_id,
-            command_event.pubkey,
-            command_event.id.as_bytes(),
-            outcome.project_revision,
-            loaded.canonical_time,
-            &mut outcome.changes,
-            &mut outcome.ended_commitments,
+            &outcome.work_changes,
         )
         .await?;
 
-        let receipt_result = role_receipt(command, &outcome.changes, outcome.project_revision);
+        let receipt_result = role_receipt(
+            command,
+            &outcome.changes,
+            &outcome.work_changes,
+            outcome.project_revision,
+        );
         insert_change(
             &mut self.tx,
             self.community_id,
@@ -1341,6 +1370,7 @@ impl ProjectViewV2WriteTx {
             projection_pubkey: loaded.projection_pubkey,
             canonical_time: loaded.canonical_time,
             changes: outcome.changes,
+            work_heads,
             counts,
             membership_before,
             membership_after,
@@ -1354,6 +1384,7 @@ impl ProjectViewV2WriteTx {
             preparation: preparation.clone(),
             old_meta_projection_id: loaded.meta_projection_event_id,
             old_projection_ids,
+            old_object_projection_ids,
         });
         Ok(ProjectViewV2PrepareOutcome::Prepared(preparation))
     }
@@ -1403,6 +1434,15 @@ impl ProjectViewV2WriteTx {
             &outcome.changed_entries,
         )
         .await?;
+        let continuity_changes = close_commitments_for_terminal_work(
+            &mut self.tx,
+            self.community_id,
+            &outcome.changed_entries,
+            command_event.pubkey,
+            loaded.canonical_time,
+            outcome.project_revision,
+        )
+        .await?;
 
         let mut role_levels = loaded.role_levels;
         for entry in &outcome.changed_entries {
@@ -1425,7 +1465,20 @@ impl ProjectViewV2WriteTx {
                     role_definition_from_object(object, level)
                         .map(PreparedV2ProjectObjectHead::Role)
                 }
-                _ => Ok(PreparedV2ProjectObjectHead::Object(entry.clone())),
+                _ => {
+                    let responsible_role_id = match entry {
+                        ProjectViewEntry::Active(object)
+                            if object.object_type == ProjectViewObjectType::Work =>
+                        {
+                            loaded.work_responsibilities.get(&object.id).copied()
+                        }
+                        ProjectViewEntry::Active(_) | ProjectViewEntry::Tombstone(_) => None,
+                    };
+                    Ok(PreparedV2ProjectObjectHead::Object {
+                        entry: entry.clone(),
+                        responsible_role_id,
+                    })
+                }
             })
             .collect::<ProjectViewV2WriteResult<Vec<_>>>()?;
 
@@ -1455,9 +1508,14 @@ impl ProjectViewV2WriteTx {
                 ))
             })
             .collect::<ProjectViewV2WriteResult<BTreeMap<_, _>>>()?;
+        let old_entity_projection_ids =
+            load_old_projection_ids(&mut self.tx, self.community_id, &continuity_changes).await?;
 
-        let receipt_result =
-            project_object_receipt(&outcome.changed_entries, outcome.project_revision);
+        let receipt_result = project_object_receipt(
+            &outcome.changed_entries,
+            &continuity_changes,
+            outcome.project_revision,
+        );
         insert_project_object_change(
             &mut self.tx,
             self.community_id,
@@ -1466,6 +1524,14 @@ impl ProjectViewV2WriteTx {
             outcome.project_revision,
             loaded.canonical_time,
             &receipt_result,
+        )
+        .await?;
+        persist_changes(
+            &mut self.tx,
+            self.community_id,
+            command_event.id.as_bytes(),
+            loaded.canonical_time,
+            &continuity_changes,
         )
         .await?;
         let mut counts = load_counts(&mut self.tx, self.community_id).await?;
@@ -1488,6 +1554,7 @@ impl ProjectViewV2WriteTx {
             projection_pubkey: loaded.projection_pubkey,
             canonical_time: loaded.canonical_time,
             heads,
+            entity_changes: continuity_changes.clone(),
             counts,
             membership_snapshot_event_id,
             receipt_result,
@@ -1499,9 +1566,11 @@ impl ProjectViewV2WriteTx {
             preparation: preparation.clone(),
             next_state,
             outcome,
+            continuity_changes,
             role_levels,
             old_meta_projection_id: loaded.meta_projection_event_id,
             old_projection_ids,
+            old_entity_projection_ids,
         });
         Ok(ProjectViewV2ProjectObjectPrepareOutcome::Prepared(
             preparation,
@@ -1547,6 +1616,20 @@ impl ProjectViewV2WriteTx {
                 ));
             }
         }
+        for old_event_id in basis.old_entity_projection_ids.values() {
+            if !crate::event::retire_projection_head_in_tx(
+                &mut self.tx,
+                self.community_id,
+                old_event_id,
+                KIND_PROJECT_VIEW_OBJECT,
+            )
+            .await?
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "stored Work Commitment projection pointer is not live".to_owned(),
+                ));
+            }
+        }
         if !crate::event::retire_projection_head_in_tx(
             &mut self.tx,
             self.community_id,
@@ -1565,6 +1648,12 @@ impl ProjectViewV2WriteTx {
             .iter()
             .map(|projection| (projection.object_id(), projection.event()))
             .collect::<BTreeMap<_, _>>();
+        let prepared_heads = basis
+            .preparation
+            .heads
+            .iter()
+            .map(|head| (head.object_id(), head))
+            .collect::<BTreeMap<_, _>>();
         let mut events = vec![commit.command_event.clone()];
         for entry in &basis.outcome.changed_entries {
             let projection = projections.get(&entry.id()).ok_or_else(|| {
@@ -1577,14 +1666,20 @@ impl ProjectViewV2WriteTx {
                 .role_levels
                 .get(&entry.id())
                 .map(|level| level.as_str());
+            let responsible_role_id = prepared_heads
+                .get(&entry.id())
+                .and_then(|head| head.responsible_role_id());
             crate::project_view::write_project_view_entry(
                 &mut self.tx,
                 self.community_id,
                 basis.command_event_id.as_slice(),
                 projection.id.as_bytes(),
                 entry,
-                2,
-                role_level,
+                crate::project_view::ProjectViewEntryStorageMetadata {
+                    schema_version: 2,
+                    role_level,
+                    responsible_role_id,
+                },
             )
             .await
             .map_err(|error| {
@@ -1602,6 +1697,30 @@ impl ProjectViewV2WriteTx {
                 )));
             }
             events.push((*projection).clone());
+        }
+        for projection in &commit.entity_projections {
+            let (_, inserted) = crate::event::insert_event_in_tx(
+                &mut self.tx,
+                self.community_id,
+                &projection.event,
+                None,
+            )
+            .await?;
+            if !inserted {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "v2 Commitment projection {} already exists",
+                    projection.entity_id
+                )));
+            }
+            update_projection_pointer(
+                &mut self.tx,
+                self.community_id,
+                projection.entity_type,
+                projection.entity_id,
+                projection.event.id.as_bytes(),
+            )
+            .await?;
+            events.push(projection.event.clone());
         }
 
         let (_, meta_inserted) = crate::event::insert_event_in_tx(
@@ -1621,9 +1740,10 @@ impl ProjectViewV2WriteTx {
             "UPDATE project_view_state SET \
                  project_revision = $2, updated_at = $3, last_event_id = $4, \
                  last_actor_pubkey = $5, meta_projection_event_id = $6, \
+                 active_commitment_count = $7, \
                  schema_version = 2, last_change_id = $4, \
                  last_source_event_id = $4 \
-             WHERE community_id = $1 AND project_revision = $7 \
+             WHERE community_id = $1 AND project_revision = $8 \
                AND schema_version = 2",
         )
         .bind(self.community_id.as_uuid())
@@ -1635,6 +1755,13 @@ impl ProjectViewV2WriteTx {
         .bind(basis.command_event_id.as_slice())
         .bind(actor_bytes.as_slice())
         .bind(commit.meta_projection.id.as_bytes().as_slice())
+        .bind(
+            i32::try_from(basis.preparation.counts.active_commitments).map_err(|_| {
+                ProjectViewV2WriteError::InvalidCommit(
+                    "active Commitment count exceeds the storage range".to_owned(),
+                )
+            })?,
+        )
         .bind(revision_i64(
             basis.command.expected_project_revision,
             "expected_project_revision",
@@ -1649,15 +1776,24 @@ impl ProjectViewV2WriteTx {
                 },
             ));
         }
-        let active_count: i32 = sqlx::query_scalar(
-            "SELECT active_object_count FROM project_view_state WHERE community_id = $1",
+        let (active_object_count, active_commitment_count): (i32, i32) = sqlx::query_as(
+            "SELECT active_object_count, active_commitment_count \
+             FROM project_view_state WHERE community_id = $1",
         )
         .bind(self.community_id.as_uuid())
         .fetch_one(&mut *self.tx)
         .await?;
-        if u32::try_from(active_count).ok() != Some(basis.preparation.counts.active_objects) {
+        if u32::try_from(active_object_count).ok() != Some(basis.preparation.counts.active_objects)
+        {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "active-object count differs from the prepared v2 state".to_owned(),
+            ));
+        }
+        if u32::try_from(active_commitment_count).ok()
+            != Some(basis.preparation.counts.active_commitments)
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "active Commitment count differs from the prepared v2 state".to_owned(),
             ));
         }
 
@@ -1761,6 +1897,20 @@ impl ProjectViewV2WriteTx {
                 ));
             }
         }
+        for old_event_id in basis.old_object_projection_ids.values() {
+            if !crate::event::retire_projection_head_in_tx(
+                &mut self.tx,
+                self.community_id,
+                old_event_id,
+                KIND_PROJECT_VIEW_OBJECT,
+            )
+            .await?
+            {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "stored v2 Work projection pointer is not live".to_owned(),
+                ));
+            }
+        }
         if !crate::event::retire_projection_head_in_tx(
             &mut self.tx,
             self.community_id,
@@ -1772,6 +1922,58 @@ impl ProjectViewV2WriteTx {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "stored v2 metadata pointer is not live".to_owned(),
             ));
+        }
+
+        let work_projections = commit
+            .object_projections
+            .iter()
+            .map(|projection| (projection.object_id(), projection.event()))
+            .collect::<BTreeMap<_, _>>();
+        for head in &basis.preparation.work_heads {
+            let PreparedV2ProjectObjectHead::Object {
+                entry,
+                responsible_role_id,
+            } = head
+            else {
+                return Err(ProjectViewV2WriteError::InvalidCommit(
+                    "Role command prepared a non-Work object head".to_owned(),
+                ));
+            };
+            let projection = work_projections.get(&entry.id()).ok_or_else(|| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "missing signed Work responsibility head {}",
+                    entry.id()
+                ))
+            })?;
+            crate::project_view::write_project_view_entry(
+                &mut self.tx,
+                self.community_id,
+                basis.command_event_id.as_slice(),
+                projection.id.as_bytes(),
+                entry,
+                crate::project_view::ProjectViewEntryStorageMetadata {
+                    schema_version: 2,
+                    role_level: None,
+                    responsible_role_id: *responsible_role_id,
+                },
+            )
+            .await
+            .map_err(|error| {
+                ProjectViewV2WriteError::InvalidCommit(format!(
+                    "persist Work responsibility {}: {error}",
+                    entry.id()
+                ))
+            })?;
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut self.tx, self.community_id, projection, None)
+                    .await?;
+            if !inserted {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "v2 Work projection {} already exists",
+                    entry.id()
+                )));
+            }
+            events.push((*projection).clone());
         }
 
         for projection in &commit.entity_projections {
@@ -2090,15 +2292,19 @@ async fn load_v2_state(
         })
         .collect::<ProjectViewV2WriteResult<Vec<_>>>()?;
     let members = load_member_governance(tx, community_id).await?;
+    let works = load_work_responsibilities(tx, community_id).await?;
     let proposals = load_proposals(tx, community_id).await?;
     let assignments = load_assignments(tx, community_id).await?;
+    let commitments = load_commitments(tx, community_id).await?;
     let handoffs = load_handoffs(tx, community_id).await?;
-    let state = RoleContinuityState::from_snapshot(
+    let state = RoleContinuityState::from_complete_snapshot(
         project_revision,
         roles,
+        works,
         members,
         proposals,
         assignments,
+        commitments,
         handoffs,
     )?;
     Ok(LoadedV2State {
@@ -2111,6 +2317,51 @@ async fn load_v2_state(
     })
 }
 
+async fn load_work_responsibilities(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+) -> ProjectViewV2WriteResult<Vec<WorkResponsibility>> {
+    let rows = sqlx::query(
+        "SELECT object_id, body->>'status' AS status, responsible_role_id, \
+                object_revision, project_revision, updated_at, updated_by, deleted_at \
+         FROM project_view_objects \
+         WHERE community_id = $1 AND object_type = 'work' \
+         ORDER BY object_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let deleted_at: Option<DateTime<Utc>> = row.try_get("deleted_at")?;
+            let status = if deleted_at.is_some() {
+                None
+            } else {
+                let value: String = row.try_get("status")?;
+                Some(parse_work_status(&value)?)
+            };
+            Ok(WorkResponsibility {
+                work_id: row.try_get("object_id")?,
+                status,
+                responsible_role_id: row.try_get("responsible_role_id")?,
+                object_revision: db_revision(
+                    row.try_get("object_revision")?,
+                    "work.object_revision",
+                )?,
+                project_revision: db_revision(
+                    row.try_get("project_revision")?,
+                    "work.project_revision",
+                )?,
+                updated_at: row.try_get("updated_at")?,
+                updated_by: public_key(
+                    &row.try_get::<Vec<u8>, _>("updated_by")?,
+                    "work.updated_by",
+                )?,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct LoadedV2ProjectObjectState {
     state: ProjectViewState,
@@ -2120,6 +2371,7 @@ struct LoadedV2ProjectObjectState {
     meta_projection_event_id: [u8; 32],
     membership_snapshot_event_id: Option<EventId>,
     role_levels: BTreeMap<Uuid, RoleLevel>,
+    work_responsibilities: BTreeMap<Uuid, Uuid>,
 }
 
 async fn load_v2_project_object_state(
@@ -2142,16 +2394,22 @@ async fn load_v2_project_object_state(
                 under_goal_id, under_plan_id, planned_in_stage_id, \
                 about_object_id, about_object_type, handles_object_id, \
                 handles_object_type, created_at, updated_at, created_by, \
-                updated_by, deleted_at \
+                updated_by, deleted_at, responsible_role_id \
          FROM project_view_objects \
          WHERE community_id = $1 ORDER BY object_id",
     )
     .bind(community_id.as_uuid())
     .fetch_all(&mut **tx)
     .await?;
+    let mut work_responsibilities = BTreeMap::new();
     let entries = rows
         .into_iter()
         .map(|row| {
+            let object_id: Uuid = row.try_get("object_id")?;
+            let responsible_role_id: Option<Uuid> = row.try_get("responsible_role_id")?;
+            if let Some(role_id) = responsible_role_id {
+                work_responsibilities.insert(object_id, role_id);
+            }
             crate::project_view::entry_from_row(row).map_err(|error| {
                 ProjectViewV2WriteError::InvalidCommit(format!(
                     "load schema-v2 Project object: {error}"
@@ -2190,6 +2448,7 @@ async fn load_v2_project_object_state(
         meta_projection_event_id: continuity.meta_projection_event_id,
         membership_snapshot_event_id: continuity.membership_snapshot_event_id,
         role_levels,
+        work_responsibilities,
     })
 }
 
@@ -2281,6 +2540,27 @@ async fn reject_assigned_role_deactivation(
                 field: "active",
                 reason: format!(
                     "Role {role_id} has an active Assignment; end the Assignment before deactivating or deleting the Role"
+                ),
+            },
+        ));
+    }
+    let responsible_role: Option<Uuid> = sqlx::query_scalar(
+        "SELECT responsible_role_id FROM project_view_objects \
+         WHERE community_id = $1 \
+           AND responsible_role_id = ANY($2) \
+           AND object_type = 'work' AND deleted_at IS NULL \
+         ORDER BY responsible_role_id LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(&role_ids)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(role_id) = responsible_role {
+        return Err(ProjectViewV2WriteError::ObjectDomain(
+            DomainError::InvalidField {
+                field: "active",
+                reason: format!(
+                    "Role {role_id} still owns Work; clear or reassign that responsibility before deactivating or deleting the Role"
                 ),
             },
         ));
@@ -2500,6 +2780,57 @@ async fn load_assignments(
         .collect()
 }
 
+async fn load_commitments(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+) -> ProjectViewV2WriteResult<Vec<WorkCommitment>> {
+    let rows = sqlx::query(
+        "SELECT commitment_id, work_id, assignment_id, member_pubkey, \
+                accepted_at, accepted_by, ended_at, ended_by, ended_reason, \
+                entity_revision, project_revision \
+         FROM project_work_commitments \
+         WHERE community_id = $1 ORDER BY commitment_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let ended_reason: Option<String> = row.try_get("ended_reason")?;
+            Ok(WorkCommitment {
+                commitment_id: row.try_get("commitment_id")?,
+                work_id: row.try_get("work_id")?,
+                assignment_id: row.try_get("assignment_id")?,
+                member_pubkey: parse_pubkey(
+                    &row.try_get::<String, _>("member_pubkey")?,
+                    "commitment.member_pubkey",
+                )?,
+                started_at: row.try_get("accepted_at")?,
+                started_by: public_key(
+                    &row.try_get::<Vec<u8>, _>("accepted_by")?,
+                    "commitment.accepted_by",
+                )?,
+                ended_at: row.try_get("ended_at")?,
+                ended_by: row
+                    .try_get::<Option<Vec<u8>>, _>("ended_by")?
+                    .map(|bytes| public_key(&bytes, "commitment.ended_by"))
+                    .transpose()?,
+                ended_reason: ended_reason
+                    .map(|reason| parse_commitment_end_reason(&reason))
+                    .transpose()?,
+                entity_revision: db_revision(
+                    row.try_get("entity_revision")?,
+                    "commitment.entity_revision",
+                )?,
+                project_revision: db_revision(
+                    row.try_get("project_revision")?,
+                    "commitment.project_revision",
+                )?,
+            })
+        })
+        .collect()
+}
+
 async fn load_handoffs(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -2628,7 +2959,11 @@ async fn insert_change(
     Ok(())
 }
 
-fn project_object_receipt(entries: &[ProjectViewEntry], project_revision: u64) -> Value {
+fn project_object_receipt(
+    entries: &[ProjectViewEntry],
+    continuity_changes: &[RoleContinuityChange],
+    project_revision: u64,
+) -> Value {
     let mut result = serde_json::Map::new();
     result.insert("project_revision".to_owned(), Value::from(project_revision));
     if let [entry] = entries {
@@ -2643,6 +2978,23 @@ fn project_object_receipt(entries: &[ProjectViewEntry], project_revision: u64) -
         result.insert(
             "deleted".to_owned(),
             Value::Bool(matches!(entry, ProjectViewEntry::Tombstone(_))),
+        );
+    }
+    if !continuity_changes.is_empty() {
+        result.insert(
+            "changed_entities".to_owned(),
+            Value::Array(
+                continuity_changes
+                    .iter()
+                    .map(|change| {
+                        json!({
+                            "entity_type": change.entity_type().as_str(),
+                            "entity_id": change.entity_id(),
+                            "entity_revision": change.entity_revision(),
+                        })
+                    })
+                    .collect(),
+            ),
         );
     }
     Value::Object(result)
@@ -2720,6 +3072,15 @@ async fn load_old_projection_ids(
             .fetch_optional(&mut **tx)
             .await?
             .flatten(),
+            RoleContinuityEntity::WorkCommitment => sqlx::query_scalar(
+                "SELECT projection_event_id FROM project_work_commitments \
+                 WHERE community_id = $1 AND commitment_id = $2 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .bind(change.entity_id())
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten(),
             RoleContinuityEntity::RoleHandoff => sqlx::query_scalar(
                 "SELECT projection_event_id FROM project_role_handoffs \
                  WHERE community_id = $1 AND handoff_id = $2 FOR UPDATE",
@@ -2745,6 +3106,165 @@ async fn load_old_projection_ids(
     Ok(result)
 }
 
+async fn prepare_work_responsibility_heads(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    changes: &[WorkResponsibility],
+) -> ProjectViewV2WriteResult<(Vec<PreparedV2ProjectObjectHead>, BTreeMap<Uuid, [u8; 32]>)> {
+    if changes.is_empty() {
+        return Ok((Vec::new(), BTreeMap::new()));
+    }
+    let ids = changes.iter().map(|work| work.work_id).collect::<Vec<_>>();
+    let rows = sqlx::query(
+        "SELECT object_id, object_type, object_revision, project_revision, body, \
+                under_goal_id, under_plan_id, planned_in_stage_id, \
+                about_object_id, about_object_type, handles_object_id, \
+                handles_object_type, created_at, updated_at, created_by, \
+                updated_by, deleted_at, projection_event_id \
+         FROM project_view_objects \
+         WHERE community_id = $1 AND object_id = ANY($2) \
+         ORDER BY object_id FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(&ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let by_id = changes
+        .iter()
+        .map(|work| (work.work_id, work))
+        .collect::<BTreeMap<_, _>>();
+    let mut heads = Vec::with_capacity(rows.len());
+    let mut old_projection_ids = BTreeMap::new();
+    for row in rows {
+        let object_id: Uuid = row.try_get("object_id")?;
+        let projection_event_id = bytes32(
+            row.try_get("projection_event_id")?,
+            "work.projection_event_id",
+        )?;
+        let entry = crate::project_view::entry_from_row(row).map_err(|error| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "load responsibility Work {object_id}: {error}"
+            ))
+        })?;
+        let work = by_id.get(&object_id).ok_or_else(|| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "loaded unexpected responsibility Work {object_id}"
+            ))
+        })?;
+        let ProjectViewEntry::Active(mut object) = entry else {
+            return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                "responsibility Work {object_id} is deleted"
+            )));
+        };
+        let current_status = match &object.data {
+            ProjectViewObjectData::Work(work) => work.status,
+            _ => {
+                return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                    "responsibility target {object_id} is not Work"
+                )));
+            }
+        };
+        if work.status != Some(current_status)
+            || object.object_revision.checked_add(1) != Some(work.object_revision)
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+                "responsibility Work {object_id} disagrees with canonical object state"
+            )));
+        }
+        object.object_revision = work.object_revision;
+        object.project_revision = work.project_revision;
+        object.updated_at = work.updated_at;
+        object.updated_by = work.updated_by;
+        heads.push(PreparedV2ProjectObjectHead::Object {
+            entry: ProjectViewEntry::Active(object),
+            responsible_role_id: work.responsible_role_id,
+        });
+        old_projection_ids.insert(object_id, projection_event_id);
+    }
+    if heads.len() != changes.len() {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "one or more responsibility Work rows are missing".to_owned(),
+        ));
+    }
+    Ok((heads, old_projection_ids))
+}
+
+async fn close_commitments_for_terminal_work(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    changed_entries: &[ProjectViewEntry],
+    actor: PublicKey,
+    canonical_time: DateTime<Utc>,
+    project_revision: u64,
+) -> ProjectViewV2WriteResult<Vec<RoleContinuityChange>> {
+    let work_ids = changed_entries
+        .iter()
+        .filter(|entry| match entry {
+            ProjectViewEntry::Active(object)
+                if object.object_type == ProjectViewObjectType::Work =>
+            {
+                matches!(
+                    &object.data,
+                    ProjectViewObjectData::Work(work)
+                        if matches!(work.status, WorkStatus::Completed | WorkStatus::Cancelled)
+                )
+            }
+            ProjectViewEntry::Tombstone(tombstone) => {
+                tombstone.object_type == ProjectViewObjectType::Work
+            }
+            ProjectViewEntry::Active(_) => false,
+        })
+        .map(ProjectViewEntry::id)
+        .collect::<Vec<_>>();
+    if work_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT commitment_id, work_id, assignment_id, member_pubkey, \
+                accepted_at, accepted_by, entity_revision \
+         FROM project_work_commitments \
+         WHERE community_id = $1 AND work_id = ANY($2) AND ended_at IS NULL \
+         ORDER BY commitment_id FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(&work_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let entity_revision = db_revision(
+                row.try_get("entity_revision")?,
+                "commitment.entity_revision",
+            )?
+            .checked_add(1)
+            .ok_or_else(|| {
+                ProjectViewV2WriteError::InvalidCommit(
+                    "Commitment entity revision overflow".to_owned(),
+                )
+            })?;
+            Ok(RoleContinuityChange::Commitment(WorkCommitment {
+                commitment_id: row.try_get("commitment_id")?,
+                work_id: row.try_get("work_id")?,
+                assignment_id: row.try_get("assignment_id")?,
+                member_pubkey: parse_pubkey(
+                    &row.try_get::<String, _>("member_pubkey")?,
+                    "commitment.member_pubkey",
+                )?,
+                started_at: row.try_get("accepted_at")?,
+                started_by: public_key(
+                    &row.try_get::<Vec<u8>, _>("accepted_by")?,
+                    "commitment.accepted_by",
+                )?,
+                ended_at: Some(canonical_time),
+                ended_by: Some(actor),
+                ended_reason: Some(CommitmentEndReason::WorkClosed),
+                entity_revision,
+                project_revision,
+            }))
+        })
+        .collect()
+}
+
 async fn persist_changes(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -2758,13 +3278,25 @@ async fn persist_changes(
     }) {
         persist_proposal(tx, community_id, change_id, canonical_time, proposal).await?;
     }
-    // End old seats before inserting the new seat so both partial unique
-    // indexes remain satisfied throughout the transaction, not only at commit.
+    // End old Commitments and seats before inserting their replacements so
+    // partial unique indexes remain satisfied throughout the transaction.
+    for commitment in changes.iter().filter_map(|change| match change {
+        RoleContinuityChange::Commitment(commitment) if !commitment.is_active() => Some(commitment),
+        _ => None,
+    }) {
+        persist_commitment(tx, community_id, change_id, canonical_time, commitment).await?;
+    }
     for assignment in changes.iter().filter_map(|change| match change {
         RoleContinuityChange::Assignment(assignment) if !assignment.is_active() => Some(assignment),
         _ => None,
     }) {
         persist_assignment(tx, community_id, change_id, canonical_time, assignment).await?;
+    }
+    for commitment in changes.iter().filter_map(|change| match change {
+        RoleContinuityChange::Commitment(commitment) if commitment.is_active() => Some(commitment),
+        _ => None,
+    }) {
+        persist_commitment(tx, community_id, change_id, canonical_time, commitment).await?;
     }
     for assignment in changes.iter().filter_map(|change| match change {
         RoleContinuityChange::Assignment(assignment) if assignment.is_active() => Some(assignment),
@@ -2777,6 +3309,72 @@ async fn persist_changes(
         _ => None,
     }) {
         persist_handoff(tx, community_id, change_id, handoff).await?;
+    }
+    Ok(())
+}
+
+async fn persist_commitment(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    change_id: &[u8],
+    canonical_time: DateTime<Utc>,
+    commitment: &WorkCommitment,
+) -> ProjectViewV2WriteResult<()> {
+    let member = commitment.member_pubkey.to_hex();
+    let started_by = commitment.started_by.to_bytes();
+    let ended_by = commitment.ended_by.map(PublicKey::to_bytes);
+    let ended_change_id = commitment.ended_at.map(|_| change_id);
+    let result = sqlx::query(
+        "INSERT INTO project_work_commitments \
+            (community_id, commitment_id, work_id, assignment_id, member_pubkey, \
+             accepted_at, accepted_by, ended_at, ended_by, ended_reason, \
+             source_change_id, ended_source_change_id, last_change_id, \
+             entity_revision, project_revision, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$11,$13,$14,$15) \
+         ON CONFLICT (community_id, commitment_id) DO UPDATE SET \
+             ended_at = EXCLUDED.ended_at, ended_by = EXCLUDED.ended_by, \
+             ended_reason = EXCLUDED.ended_reason, \
+             ended_source_change_id = EXCLUDED.ended_source_change_id, \
+             last_change_id = EXCLUDED.last_change_id, \
+             entity_revision = EXCLUDED.entity_revision, \
+             project_revision = EXCLUDED.project_revision, \
+             updated_at = EXCLUDED.updated_at \
+         WHERE project_work_commitments.work_id = EXCLUDED.work_id \
+           AND project_work_commitments.assignment_id = EXCLUDED.assignment_id \
+           AND project_work_commitments.member_pubkey = EXCLUDED.member_pubkey \
+           AND project_work_commitments.accepted_at = EXCLUDED.accepted_at \
+           AND project_work_commitments.accepted_by = EXCLUDED.accepted_by \
+           AND project_work_commitments.ended_at IS NULL \
+           AND project_work_commitments.entity_revision + 1 = EXCLUDED.entity_revision",
+    )
+    .bind(community_id.as_uuid())
+    .bind(commitment.commitment_id)
+    .bind(commitment.work_id)
+    .bind(commitment.assignment_id)
+    .bind(member)
+    .bind(commitment.started_at)
+    .bind(started_by.as_slice())
+    .bind(commitment.ended_at)
+    .bind(ended_by.as_ref().map(<[u8; 32]>::as_slice))
+    .bind(commitment.ended_reason.map(CommitmentEndReason::as_str))
+    .bind(change_id)
+    .bind(ended_change_id)
+    .bind(revision_i64(
+        commitment.entity_revision,
+        "commitment.entity_revision",
+    )?)
+    .bind(revision_i64(
+        commitment.project_revision,
+        "commitment.project_revision",
+    )?)
+    .bind(canonical_time)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(ProjectViewV2WriteError::InvalidCommit(format!(
+            "Commitment {} did not advance exactly one entity revision",
+            commitment.commitment_id
+        )));
     }
     Ok(())
 }
@@ -2968,68 +3566,6 @@ async fn persist_handoff(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn end_commitments_for_changed_assignments(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    actor: PublicKey,
-    change_id: &[u8],
-    project_revision: u64,
-    canonical_time: DateTime<Utc>,
-    changes: &mut [RoleContinuityChange],
-    ended_commitments: &mut BTreeMap<Uuid, Vec<Uuid>>,
-) -> ProjectViewV2WriteResult<()> {
-    let ended_assignment_ids = changes
-        .iter()
-        .filter_map(|change| match change {
-            RoleContinuityChange::Assignment(assignment)
-                if assignment.ended_at == Some(canonical_time) =>
-            {
-                Some(assignment.assignment_id)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let actor = actor.to_bytes();
-    for assignment_id in ended_assignment_ids {
-        let commitment_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT commitment_id FROM project_work_commitments \
-             WHERE community_id = $1 AND assignment_id = $2 AND ended_at IS NULL \
-             ORDER BY commitment_id FOR UPDATE",
-        )
-        .bind(community_id.as_uuid())
-        .bind(assignment_id)
-        .fetch_all(&mut **tx)
-        .await?;
-        if !commitment_ids.is_empty() {
-            sqlx::query(
-                "UPDATE project_work_commitments SET ended_at = $3, ended_by = $4, \
-                     ended_reason = 'assignment_ended', ended_source_change_id = $5, \
-                     project_revision = $6 \
-                 WHERE community_id = $1 AND assignment_id = $2 AND ended_at IS NULL",
-            )
-            .bind(community_id.as_uuid())
-            .bind(assignment_id)
-            .bind(canonical_time)
-            .bind(actor.as_slice())
-            .bind(change_id)
-            .bind(revision_i64(project_revision, "project_revision")?)
-            .execute(&mut **tx)
-            .await?;
-        }
-        ended_commitments.insert(assignment_id, commitment_ids);
-    }
-    for change in changes {
-        if let RoleContinuityChange::Handoff(handoff) = change {
-            handoff.affected_commitment_ids = ended_commitments
-                .get(&handoff.from_assignment_id)
-                .cloned()
-                .unwrap_or_default();
-        }
-    }
-    Ok(())
-}
-
 async fn apply_membership_roles(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -3168,22 +3704,31 @@ fn validate_commit_bundle(
         change_id: commit.command_event.id,
         event_id: commit.command_event.id,
     };
-    let expected = basis
+    let expected_entities = basis
         .preparation
         .changes
         .iter()
         .map(|change| ((change.entity_type(), change.entity_id()), change))
         .collect::<BTreeMap<_, _>>();
-    if commit.entity_projections.len() != expected.len() {
+    if commit.entity_projections.len() != expected_entities.len()
+        || commit.object_projections.len() != basis.preparation.work_heads.len()
+    {
         return Err(ProjectViewV2WriteError::InvalidCommit(
-            "projection count does not match changed entities".to_owned(),
+            "projection counts do not match changed Role entities and Work objects".to_owned(),
         ));
     }
-    let mut actual = BTreeSet::new();
+    let context = buzz_sdk::project_view_v2::V2ProjectionContext {
+        project_id: basis.preparation.community_id,
+        projection_generation: basis.preparation.projection_generation,
+        project_revision: basis.preparation.project_revision,
+        source: expected_source.clone(),
+        updated_at: basis.preparation.canonical_time,
+    };
     let mut expected_heads = BTreeMap::new();
+    let mut actual_entities = BTreeSet::new();
     for projection in &commit.entity_projections {
         let key = (projection.entity_type, projection.entity_id);
-        if !actual.insert(key) || !expected.contains_key(&key) {
+        if !actual_entities.insert(key) || !expected_entities.contains_key(&key) {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "projection set does not exactly match changed entities".to_owned(),
             ));
@@ -3198,24 +3743,74 @@ fn validate_commit_bundle(
             || parsed.projection_generation != basis.preparation.projection_generation
             || parsed.source != expected_source
             || parsed.updated_at != basis.preparation.canonical_time
-            || Some(&parsed.entity) != expected.get(&key).copied()
+            || Some(&parsed.entity) != expected_entities.get(&key).copied()
         {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "signed entity projection differs from canonical change".to_owned(),
             ));
         }
-        expected_heads.insert(
-            buzz_sdk::project_view_v2::entity_projection_coordinate(
-                basis.preparation.community_id,
-                projection.entity_type,
-                projection.entity_id,
-            ),
-            (
-                projection.event.id,
-                projection.entity_type,
-                parsed.entity_revision,
-            ),
-        );
+        let changed_head = buzz_sdk::project_view_v2::changed_head_for(
+            &context,
+            &parsed.entity,
+            &projection.event,
+        )
+        .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+        expected_heads.insert(changed_head.coordinate().to_owned(), changed_head);
+    }
+    let object_projections = commit
+        .object_projections
+        .iter()
+        .map(|projection| (projection.object_id(), projection.event()))
+        .collect::<BTreeMap<_, _>>();
+    if object_projections.len() != commit.object_projections.len() {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "Role command contains duplicate Work object projections".to_owned(),
+        ));
+    }
+    for head in &basis.preparation.work_heads {
+        let PreparedV2ProjectObjectHead::Object {
+            entry,
+            responsible_role_id,
+        } = head
+        else {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "Role command prepared a non-Work object head".to_owned(),
+            ));
+        };
+        let event = object_projections.get(&entry.id()).ok_or_else(|| {
+            ProjectViewV2WriteError::InvalidCommit(format!(
+                "missing Work projection for responsibility change {}",
+                entry.id()
+            ))
+        })?;
+        let parsed = buzz_sdk::project_view_v2::parse_project_object_projection(
+            event,
+            &basis.preparation.projection_pubkey,
+            basis.preparation.community_id,
+        )
+        .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+        if parsed.project_revision != basis.preparation.project_revision
+            || parsed.projection_generation != basis.preparation.projection_generation
+            || parsed.source != expected_source
+            || parsed.updated_at != basis.preparation.canonical_time
+            || parsed.responsible_role_id != *responsible_role_id
+            || !projected_object_matches_entry(&parsed.object, entry)
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "signed Work projection differs from canonical responsibility change".to_owned(),
+            ));
+        }
+        let changed_head =
+            buzz_sdk::project_view_v2::changed_head_for_project_object(&context, entry, event)
+                .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+        if expected_heads
+            .insert(changed_head.coordinate().to_owned(), changed_head)
+            .is_some()
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "Role command contains duplicate changed-head coordinates".to_owned(),
+            ));
+        }
     }
     let meta = buzz_sdk::project_view_v2::parse_meta_projection(
         &commit.meta_projection,
@@ -3246,7 +3841,7 @@ fn validate_commit_bundle(
                     )
                 })?
         || meta.reset
-        || meta.changed_heads.len() != expected.len()
+        || meta.changed_heads.len() != expected_heads.len()
         || meta.source != expected_source
         || meta.updated_at != basis.preparation.canonical_time
     {
@@ -3257,27 +3852,11 @@ fn validate_commit_bundle(
     let actual_heads = meta
         .changed_heads
         .iter()
-        .map(|head| match head {
-            buzz_sdk::project_view_v2::V2ChangedHead::Entity {
-                coordinate,
-                event_id,
-                entity_type,
-                entity_revision,
-            } => Ok((
-                coordinate.clone(),
-                (*event_id, *entity_type, *entity_revision),
-            )),
-            buzz_sdk::project_view_v2::V2ChangedHead::Object { .. } => {
-                Err(ProjectViewV2WriteError::InvalidCommit(
-                    "Role command metadata contains an ordinary-object changed head".to_owned(),
-                ))
-            }
-        })
-        .collect::<ProjectViewV2WriteResult<BTreeMap<_, _>>>()?;
+        .map(|head| (head.coordinate().to_owned(), head.clone()))
+        .collect::<BTreeMap<_, _>>();
     if actual_heads.len() != meta.changed_heads.len() || actual_heads != expected_heads {
         return Err(ProjectViewV2WriteError::InvalidCommit(
-            "metadata changed heads do not exactly bind the signed canonical entity heads"
-                .to_owned(),
+            "metadata changed heads do not exactly bind Role entities and Work objects".to_owned(),
         ));
     }
     Ok(())
@@ -3317,6 +3896,7 @@ fn validate_project_object_commit_bundle(
     }
     if basis.next_state.project_revision() != basis.preparation.project_revision
         || basis.outcome.project_revision != basis.preparation.project_revision
+        || basis.continuity_changes != basis.preparation.entity_changes
     {
         return Err(ProjectViewV2WriteError::InvalidCommit(
             "prepared object state and outcome revisions disagree".to_owned(),
@@ -3378,7 +3958,10 @@ fn validate_project_object_commit_bundle(
                     event,
                 )
             }
-            PreparedV2ProjectObjectHead::Object(entry) => {
+            PreparedV2ProjectObjectHead::Object {
+                entry,
+                responsible_role_id,
+            } => {
                 let parsed = buzz_sdk::project_view_v2::parse_project_object_projection(
                     event,
                     &basis.preparation.projection_pubkey,
@@ -3389,6 +3972,7 @@ fn validate_project_object_commit_bundle(
                     || parsed.projection_generation != basis.preparation.projection_generation
                     || parsed.source != expected_source
                     || parsed.updated_at != basis.preparation.canonical_time
+                    || parsed.responsible_role_id != *responsible_role_id
                     || !projected_object_matches_entry(&parsed.object, entry)
                 {
                     return Err(ProjectViewV2WriteError::InvalidCommit(
@@ -3405,6 +3989,56 @@ fn validate_project_object_commit_bundle(
         {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "prepared object change contains duplicate coordinates".to_owned(),
+            ));
+        }
+    }
+    let expected_entities = basis
+        .preparation
+        .entity_changes
+        .iter()
+        .map(|change| ((change.entity_type(), change.entity_id()), change))
+        .collect::<BTreeMap<_, _>>();
+    if commit.entity_projections.len() != expected_entities.len() {
+        return Err(ProjectViewV2WriteError::InvalidCommit(
+            "entity projections do not exactly cover terminal Work side effects".to_owned(),
+        ));
+    }
+    let mut actual_entities = BTreeSet::new();
+    for projection in &commit.entity_projections {
+        let key = (projection.entity_type, projection.entity_id);
+        if !actual_entities.insert(key) || !expected_entities.contains_key(&key) {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "unexpected entity projection in ordinary-object command".to_owned(),
+            ));
+        }
+        let parsed = buzz_sdk::project_view_v2::parse_entity_projection(
+            &projection.event,
+            &basis.preparation.projection_pubkey,
+            basis.preparation.community_id,
+        )
+        .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+        if parsed.project_revision != basis.preparation.project_revision
+            || parsed.projection_generation != basis.preparation.projection_generation
+            || parsed.source != expected_source
+            || parsed.updated_at != basis.preparation.canonical_time
+            || Some(&parsed.entity) != expected_entities.get(&key).copied()
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "signed Commitment head differs from terminal Work side effect".to_owned(),
+            ));
+        }
+        let changed_head = buzz_sdk::project_view_v2::changed_head_for(
+            &context,
+            &parsed.entity,
+            &projection.event,
+        )
+        .map_err(|error| ProjectViewV2WriteError::InvalidCommit(error.to_string()))?;
+        if expected_heads
+            .insert(changed_head.coordinate().to_owned(), changed_head)
+            .is_some()
+        {
+            return Err(ProjectViewV2WriteError::InvalidCommit(
+                "ordinary-object change contains duplicate changed-head coordinates".to_owned(),
             ));
         }
     }
@@ -3585,6 +4219,17 @@ async fn update_projection_pointer(
             .execute(&mut **tx)
             .await?
         }
+        RoleContinuityEntity::WorkCommitment => {
+            sqlx::query(
+                "UPDATE project_work_commitments SET projection_event_id = $3 \
+             WHERE community_id = $1 AND commitment_id = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(entity_id)
+            .bind(event_id)
+            .execute(&mut **tx)
+            .await?
+        }
         RoleContinuityEntity::RoleHandoff => {
             sqlx::query(
                 "UPDATE project_role_handoffs SET projection_event_id = $3 \
@@ -3608,6 +4253,7 @@ async fn update_projection_pointer(
 fn role_receipt(
     command: &RoleCommand,
     changes: &[RoleContinuityChange],
+    work_changes: &[WorkResponsibility],
     project_revision: u64,
 ) -> Value {
     let changed_entities = changes
@@ -3617,6 +4263,17 @@ fn role_receipt(
                 "entity_type": change.entity_type().as_str(),
                 "entity_id": change.entity_id(),
                 "entity_revision": change.entity_revision(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let changed_objects = work_changes
+        .iter()
+        .map(|work| {
+            json!({
+                "object_type": "work",
+                "object_id": work.work_id,
+                "object_revision": work.object_revision,
+                "responsible_role_id": work.responsible_role_id,
             })
         })
         .collect::<Vec<_>>();
@@ -3638,6 +4295,7 @@ fn role_receipt(
         "changed_entities".to_owned(),
         Value::Array(changed_entities),
     );
+    result.insert("changed_objects".to_owned(), Value::Array(changed_objects));
     if let Some(assignment_id) = new_assignment_id {
         result.insert(
             "assignment_id".to_owned(),
@@ -3665,6 +4323,38 @@ fn role_receipt(
             result.insert(
                 "target_assignment_id".to_owned(),
                 Value::String(assignment_id.to_string()),
+            );
+        }
+        buzz_project_view::v2::RoleCommandRequest::SetWorkResponsibility {
+            work_id,
+            responsible_role_id,
+        } => {
+            result.insert("work_id".to_owned(), Value::String(work_id.to_string()));
+            result.insert(
+                "responsible_role_id".to_owned(),
+                responsible_role_id
+                    .map_or(Value::Null, |role_id| Value::String(role_id.to_string())),
+            );
+        }
+        buzz_project_view::v2::RoleCommandRequest::AcceptWork {
+            commitment_id,
+            work_id,
+        }
+        | buzz_project_view::v2::RoleCommandRequest::ReplaceCommitment {
+            commitment_id,
+            work_id,
+            ..
+        } => {
+            result.insert("work_id".to_owned(), Value::String(work_id.to_string()));
+            result.insert(
+                "commitment_id".to_owned(),
+                Value::String(commitment_id.to_string()),
+            );
+        }
+        buzz_project_view::v2::RoleCommandRequest::EndCommitment { commitment_id, .. } => {
+            result.insert(
+                "commitment_id".to_owned(),
+                Value::String(commitment_id.to_string()),
             );
         }
     }
@@ -3724,6 +4414,32 @@ fn parse_end_reason(value: &str) -> ProjectViewV2WriteResult<AssignmentEndReason
         "role_deactivated" => Ok(AssignmentEndReason::RoleDeactivated),
         _ => Err(ProjectViewV2WriteError::InvalidCommit(format!(
             "invalid Assignment end reason {value}"
+        ))),
+    }
+}
+
+fn parse_commitment_end_reason(value: &str) -> ProjectViewV2WriteResult<CommitmentEndReason> {
+    match value {
+        "released" => Ok(CommitmentEndReason::Released),
+        "replaced" => Ok(CommitmentEndReason::Replaced),
+        "assignment_ended" => Ok(CommitmentEndReason::AssignmentEnded),
+        "work_closed" => Ok(CommitmentEndReason::WorkClosed),
+        _ => Err(ProjectViewV2WriteError::InvalidCommit(format!(
+            "invalid Commitment end reason {value}"
+        ))),
+    }
+}
+
+fn parse_work_status(value: &str) -> ProjectViewV2WriteResult<WorkStatus> {
+    match value {
+        "pending" => Ok(WorkStatus::Pending),
+        "in_progress" => Ok(WorkStatus::InProgress),
+        "paused" => Ok(WorkStatus::Paused),
+        "submitted" => Ok(WorkStatus::Submitted),
+        "completed" => Ok(WorkStatus::Completed),
+        "cancelled" => Ok(WorkStatus::Cancelled),
+        _ => Err(ProjectViewV2WriteError::InvalidCommit(format!(
+            "invalid Work status {value}"
         ))),
     }
 }

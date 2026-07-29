@@ -408,7 +408,9 @@ async fn handle_v2_project_object_mutation(
         updated_at: prepared.canonical_time,
     };
     let mut projections = Vec::with_capacity(prepared.heads.len());
-    let mut changed_heads = Vec::with_capacity(prepared.heads.len());
+    let mut entity_projections = Vec::with_capacity(prepared.entity_changes.len());
+    let mut changed_heads =
+        Vec::with_capacity(prepared.heads.len() + prepared.entity_changes.len());
     for head in &prepared.heads {
         let (object_id, projection, changed_head) = match head {
             PreparedV2ProjectObjectHead::Role(role) => {
@@ -435,20 +437,27 @@ async fn handle_v2_project_object_mutation(
                         })?;
                 (role.role_id, projection, changed_head)
             }
-            PreparedV2ProjectObjectHead::Object(entry) => {
+            PreparedV2ProjectObjectHead::Object {
+                entry,
+                responsible_role_id,
+            } => {
                 let projection =
-                    buzz_sdk::project_view_v2::build_project_object_projection(&context, entry)
-                        .map_err(|error| {
-                            IngestError::Internal(format!(
-                                "error: build v2 Project object projection: {error}"
-                            ))
-                        })?
-                        .sign_with_keys(&state.relay_keypair)
-                        .map_err(|error| {
-                            IngestError::Internal(format!(
-                                "error: sign v2 Project object projection: {error}"
-                            ))
-                        })?;
+                    buzz_sdk::project_view_v2::build_project_object_projection_with_responsibility(
+                        &context,
+                        entry,
+                        *responsible_role_id,
+                    )
+                    .map_err(|error| {
+                        IngestError::Internal(format!(
+                            "error: build v2 Project object projection: {error}"
+                        ))
+                    })?
+                    .sign_with_keys(&state.relay_keypair)
+                    .map_err(|error| {
+                        IngestError::Internal(format!(
+                            "error: sign v2 Project object projection: {error}"
+                        ))
+                    })?;
                 let changed_head = buzz_sdk::project_view_v2::changed_head_for_project_object(
                     &context,
                     entry,
@@ -464,6 +473,34 @@ async fn handle_v2_project_object_mutation(
         };
         projections.push(PreparedObjectProjection::new(object_id, projection));
         changed_heads.push(changed_head);
+    }
+    for entity in &prepared.entity_changes {
+        let projection = buzz_sdk::project_view_v2::build_entity_projection(&context, entity)
+            .map_err(|error| {
+                IngestError::Internal(format!(
+                    "error: build terminal Work side-effect projection: {error}"
+                ))
+            })?
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(|error| {
+                IngestError::Internal(format!(
+                    "error: sign terminal Work side-effect projection: {error}"
+                ))
+            })?;
+        changed_heads.push(
+            buzz_sdk::project_view_v2::changed_head_for(&context, entity, &projection).map_err(
+                |error| {
+                    IngestError::Internal(format!(
+                        "error: bind terminal Work side-effect head: {error}"
+                    ))
+                },
+            )?,
+        );
+        entity_projections.push(PreparedV2EntityProjection {
+            entity_type: entity.entity_type(),
+            entity_id: entity.entity_id(),
+            event: projection,
+        });
     }
     let counts = buzz_sdk::project_view_v2::V2EntityCounts {
         active_objects: prepared.counts.active_objects,
@@ -491,6 +528,7 @@ async fn handle_v2_project_object_mutation(
         .commit_project_object_command(PreparedV2ProjectObjectCommit {
             command_event: event.clone(),
             object_projections: projections,
+            entity_projections,
             meta_projection,
         })
         .await
@@ -568,7 +606,8 @@ async fn handle_v2_role_mutation(
         updated_at: prepared.canonical_time,
     };
     let mut entity_projections = Vec::with_capacity(prepared.changes.len());
-    let mut changed_heads = Vec::with_capacity(prepared.changes.len());
+    let mut object_projections = Vec::with_capacity(prepared.work_heads.len());
+    let mut changed_heads = Vec::with_capacity(prepared.changes.len() + prepared.work_heads.len());
     for entity in &prepared.changes {
         let projection = buzz_sdk::project_view_v2::build_entity_projection(&context, entity)
             .map_err(|error| {
@@ -588,6 +627,47 @@ async fn handle_v2_role_mutation(
             entity_id: entity.entity_id(),
             event: projection,
         });
+    }
+    for head in &prepared.work_heads {
+        let PreparedV2ProjectObjectHead::Object {
+            entry,
+            responsible_role_id,
+        } = head
+        else {
+            return Err(IngestError::Internal(
+                "error: Role command prepared a non-Work object head".to_owned(),
+            ));
+        };
+        let projection =
+            buzz_sdk::project_view_v2::build_project_object_projection_with_responsibility(
+                &context,
+                entry,
+                *responsible_role_id,
+            )
+            .map_err(|error| {
+                IngestError::Internal(format!(
+                    "error: build Work responsibility projection: {error}"
+                ))
+            })?
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(|error| {
+                IngestError::Internal(format!(
+                    "error: sign Work responsibility projection: {error}"
+                ))
+            })?;
+        changed_heads.push(
+            buzz_sdk::project_view_v2::changed_head_for_project_object(
+                &context,
+                entry,
+                &projection,
+            )
+            .map_err(|error| {
+                IngestError::Internal(format!(
+                    "error: bind Work responsibility changed head: {error}"
+                ))
+            })?,
+        );
+        object_projections.push(PreparedObjectProjection::new(entry.id(), projection));
     }
     let counts = buzz_sdk::project_view_v2::V2EntityCounts {
         active_objects: prepared.counts.active_objects,
@@ -615,6 +695,7 @@ async fn handle_v2_role_mutation(
         .commit_role_command(PreparedV2RoleCommit {
             command_event: event.clone(),
             entity_projections,
+            object_projections,
             meta_projection,
             membership_projection,
         })
@@ -736,6 +817,10 @@ fn bounded_operation(operation: &str) -> &'static str {
         "end_assignment" => "end_assignment",
         "request_replacement" => "request_replacement",
         "report_unable_to_continue" => "report_unable_to_continue",
+        "set_work_responsibility" => "set_work_responsibility",
+        "accept_work" => "accept_work",
+        "end_commitment" => "end_commitment",
+        "replace_commitment" => "replace_commitment",
         _ => "unknown",
     }
 }

@@ -16,6 +16,11 @@ export type ProjectRoleAssignmentEndReason =
   | "unrecoverable"
   | "membership_ended"
   | "role_deactivated";
+export type ProjectWorkCommitmentEndReason =
+  | "released"
+  | "replaced"
+  | "assignment_ended"
+  | "work_closed";
 export type ProjectCommunityMemberRole = "owner" | "admin" | "member";
 
 type RawProjectRoleDefinition = {
@@ -73,6 +78,20 @@ type RawProjectRoleAssignment = {
   project_revision: number;
 };
 
+type RawProjectWorkCommitment = {
+  commitment_id: string;
+  work_id: string;
+  assignment_id: string;
+  member_pubkey: string;
+  started_at: string;
+  started_by: string;
+  ended_at?: string;
+  ended_by?: string;
+  ended_reason?: ProjectWorkCommitmentEndReason;
+  entity_revision: number;
+  project_revision: number;
+};
+
 type RawProjectRoleHandoff = {
   handoff_id: string;
   role_id: string;
@@ -102,6 +121,7 @@ type RawRoleBriefObject = {
       data: Record<string, unknown>;
     };
   };
+  responsible_role_id?: string;
   source: RawRoleBriefSource;
 };
 
@@ -135,6 +155,18 @@ type RawProjectRoleBrief = {
           source: RawRoleBriefSource;
         };
       };
+  responsible_work: Array<{
+    work: RawRoleBriefObject;
+    state:
+      | {
+          status: "committed";
+          commitment: {
+            commitment: RawProjectWorkCommitment;
+            source: RawRoleBriefSource;
+          };
+        }
+      | { status: "waiting_for_continuation" };
+  }>;
   related_objects: RawRoleBriefObject[];
   source_revisions: {
     meta_event_id: string;
@@ -148,6 +180,8 @@ export type RawProjectViewRoleContinuity = {
   roles: RawProjectRoleDefinition[];
   proposals: RawProjectRoleProposal[];
   assignments: RawProjectRoleAssignment[];
+  commitments: RawProjectWorkCommitment[];
+  workResponsibilities: Array<{ workId: string; roleId: string }>;
   handoffs: RawProjectRoleHandoff[];
   members: Array<{ pubkey: string; role: ProjectCommunityMemberRole }>;
   briefs: RawProjectRoleBrief[];
@@ -208,6 +242,20 @@ export type ProjectRoleAssignment = {
   projectRevision: number;
 };
 
+export type ProjectWorkCommitment = {
+  commitmentId: string;
+  workId: string;
+  assignmentId: string;
+  memberPubkey: string;
+  startedAt: string;
+  startedBy: string;
+  endedAt?: string;
+  endedBy?: string;
+  endedReason?: ProjectWorkCommitmentEndReason;
+  entityRevision: number;
+  projectRevision: number;
+};
+
 export type ProjectRoleHandoff = {
   handoffId: string;
   roleId: string;
@@ -247,6 +295,21 @@ export type ProjectRoleBrief = {
         assignmentId: string;
         startedAt: string;
       };
+  responsibleWork: Array<{
+    workId: string;
+    title: string;
+    status: string;
+    responsibleRoleId: string;
+    commitment:
+      | {
+          status: "committed";
+          commitmentId: string;
+          assignmentId: string;
+          memberPubkey: string;
+          startedAt: string;
+        }
+      | { status: "waiting_for_continuation" };
+  }>;
   relatedObjects: Array<{
     id: string;
     objectType: string;
@@ -264,6 +327,8 @@ export type ProjectViewRoleContinuity = {
   roles: ProjectRoleDefinition[];
   proposals: ProjectRoleProposal[];
   assignments: ProjectRoleAssignment[];
+  commitments: ProjectWorkCommitment[];
+  workResponsibilities: Array<{ workId: string; roleId: string }>;
   handoffs: ProjectRoleHandoff[];
   members: Array<{ pubkey: string; role: ProjectCommunityMemberRole }>;
   briefs: ProjectRoleBrief[];
@@ -336,6 +401,37 @@ function normalizeRoleBrief(
             (proposal) => proposal.proposal.proposal_id,
           ),
         };
+  const responsibleWork = raw.responsible_work.map((item) => {
+    const object = item.work.object;
+    const data = object.data.data;
+    if (
+      object.object_type !== "work" ||
+      object.data.object_type !== "work" ||
+      typeof data.title !== "string" ||
+      typeof data.status !== "string" ||
+      !item.work.responsible_role_id
+    ) {
+      throw new ProjectViewIntegrityError(
+        "Role Brief contains invalid responsible Work",
+      );
+    }
+    return {
+      workId: object.id,
+      title: data.title,
+      status: data.status,
+      responsibleRoleId: item.work.responsible_role_id,
+      commitment:
+        item.state.status === "committed"
+          ? {
+              status: "committed" as const,
+              commitmentId: item.state.commitment.commitment.commitment_id,
+              assignmentId: item.state.commitment.commitment.assignment_id,
+              memberPubkey: item.state.commitment.commitment.member_pubkey,
+              startedAt: item.state.commitment.commitment.started_at,
+            }
+          : { status: "waiting_for_continuation" as const },
+    };
+  });
   return {
     generatedAt: raw.generated_at,
     projectId: raw.project_id,
@@ -351,6 +447,7 @@ function normalizeRoleBrief(
       goals,
     },
     state,
+    responsibleWork,
     relatedObjects: raw.related_objects.map((related) => ({
       id: related.object.id,
       objectType: related.object.object_type,
@@ -424,6 +521,22 @@ export function normalizeRoleContinuity(
       projectRevision: assignment.project_revision,
     }),
   );
+  const commitments = raw.commitments.map<ProjectWorkCommitment>(
+    (commitment) => ({
+      commitmentId: commitment.commitment_id,
+      workId: commitment.work_id,
+      assignmentId: commitment.assignment_id,
+      memberPubkey: commitment.member_pubkey,
+      startedAt: commitment.started_at,
+      startedBy: commitment.started_by,
+      endedAt: commitment.ended_at,
+      endedBy: commitment.ended_by,
+      endedReason: commitment.ended_reason,
+      entityRevision: commitment.entity_revision,
+      projectRevision: commitment.project_revision,
+    }),
+  );
+  const workResponsibilities = raw.workResponsibilities;
   const handoffs = raw.handoffs.map<ProjectRoleHandoff>((handoff) => ({
     handoffId: handoff.handoff_id,
     roleId: handoff.role_id,
@@ -478,6 +591,39 @@ export function normalizeRoleContinuity(
       activeMemberPubkeys.add(assignment.memberPubkey);
     }
   }
+  const assignmentsById = new Map(
+    assignments.map((assignment) => [assignment.assignmentId, assignment]),
+  );
+  const responsibleRolesByWork = new Map(
+    workResponsibilities.map((responsibility) => [
+      responsibility.workId,
+      responsibility.roleId,
+    ]),
+  );
+  const activeCommittedWork = new Set<string>();
+  for (const commitment of commitments) {
+    const assignment = assignmentsById.get(commitment.assignmentId);
+    if (
+      !assignment ||
+      assignment.memberPubkey.toLowerCase() !==
+        commitment.memberPubkey.toLowerCase()
+    ) {
+      throw new ProjectViewIntegrityError(
+        `Commitment ${commitment.commitmentId} disagrees with its Assignment`,
+      );
+    }
+    if (
+      !commitment.endedAt &&
+      (assignment.endedAt ||
+        activeCommittedWork.has(commitment.workId) ||
+        responsibleRolesByWork.get(commitment.workId) !== assignment.roleId)
+    ) {
+      throw new ProjectViewIntegrityError(
+        "verified Role continuity contains an invalid active Commitment",
+      );
+    }
+    if (!commitment.endedAt) activeCommittedWork.add(commitment.workId);
+  }
   for (const brief of briefs) {
     if (brief.state.status === "assigned") {
       const assignedState = brief.state;
@@ -502,6 +648,8 @@ export function normalizeRoleContinuity(
     roles,
     proposals,
     assignments,
+    commitments,
+    workResponsibilities,
     handoffs,
     members: raw.members,
     briefs,
@@ -549,6 +697,25 @@ export type ProjectViewRoleMutationIntent =
       operation: "end_assignment";
       assignmentId: string;
       reason?: string;
+    })
+  | (ProjectViewRoleMutationBase & {
+      operation: "set_work_responsibility";
+      workId: string;
+      responsibleRoleId?: string;
+    })
+  | (ProjectViewRoleMutationBase & {
+      operation: "accept_work";
+      workId: string;
+    })
+  | (ProjectViewRoleMutationBase & {
+      operation: "end_commitment";
+      commitmentId: string;
+      reason?: string;
+    })
+  | (ProjectViewRoleMutationBase & {
+      operation: "replace_commitment";
+      workId: string;
+      expectedCommitmentId: string;
     });
 
 export type RawProjectViewRoleMutationResult =
@@ -560,6 +727,9 @@ export type RawProjectViewRoleMutationResult =
       proposal_id?: string;
       assignment_id?: string;
       target_assignment_id?: string;
+      work_id?: string;
+      responsible_role_id?: string;
+      commitment_id?: string;
       changed_entities: Array<{
         entityType: string;
         entityId: string;
@@ -582,6 +752,9 @@ export type ProjectViewRoleMutationResult =
       proposalId?: string;
       assignmentId?: string;
       targetAssignmentId?: string;
+      workId?: string;
+      responsibleRoleId?: string;
+      commitmentId?: string;
       changedEntities: Array<{
         entityType: string;
         entityId: string;
@@ -635,6 +808,26 @@ export function serializeProjectViewRoleMutationIntent(
         assignment_id: intent.assignmentId,
         reason: intent.reason,
       };
+    case "set_work_responsibility":
+      return {
+        ...common,
+        work_id: intent.workId,
+        responsible_role_id: intent.responsibleRoleId,
+      };
+    case "accept_work":
+      return { ...common, work_id: intent.workId };
+    case "end_commitment":
+      return {
+        ...common,
+        commitment_id: intent.commitmentId,
+        reason: intent.reason,
+      };
+    case "replace_commitment":
+      return {
+        ...common,
+        work_id: intent.workId,
+        expected_commitment_id: intent.expectedCommitmentId,
+      };
   }
 }
 
@@ -661,6 +854,9 @@ export async function mutateProjectViewRole(
     proposalId: raw.proposal_id,
     assignmentId: raw.assignment_id,
     targetAssignmentId: raw.target_assignment_id,
+    workId: raw.work_id,
+    responsibleRoleId: raw.responsible_role_id,
+    commitmentId: raw.commitment_id,
     changedEntities: raw.changed_entities,
   };
 }

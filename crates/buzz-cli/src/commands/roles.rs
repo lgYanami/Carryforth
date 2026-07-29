@@ -20,7 +20,9 @@ use crate::commands::project_view_v2_snapshot::{
 };
 use crate::error::CliError;
 use crate::validate::sdk_err;
-use crate::{OutputFormat, RoleAssignmentCmd, RoleProposalCmd, RoleProposalStatusArg, RolesCmd};
+use crate::{
+    OutputFormat, RoleAssignmentCmd, RoleProposalCmd, RoleProposalStatusArg, RoleWorkCmd, RolesCmd,
+};
 
 #[derive(Debug)]
 struct RoleSnapshot {
@@ -101,6 +103,7 @@ pub async fn dispatch(
         }
         RolesCmd::Proposal { command } => submit_proposal(client, command).await,
         RolesCmd::Assignment { command } => dispatch_assignment(client, command, format).await,
+        RolesCmd::Work { command } => dispatch_work(client, command).await,
     }
 }
 
@@ -433,6 +436,76 @@ async fn dispatch_assignment(
             .await
         }
     }
+}
+
+async fn dispatch_work(client: &BuzzClient, command: RoleWorkCmd) -> Result<(), CliError> {
+    let (expected, acting, request) = match command {
+        RoleWorkCmd::Assign {
+            work,
+            role,
+            expected_project_revision,
+            acting_assignment,
+        } => (
+            expected_project_revision,
+            acting_assignment,
+            RoleCommandRequest::SetWorkResponsibility {
+                work_id: work,
+                responsible_role_id: Some(role),
+            },
+        ),
+        RoleWorkCmd::Unassign {
+            work,
+            expected_project_revision,
+            acting_assignment,
+        } => (
+            expected_project_revision,
+            acting_assignment,
+            RoleCommandRequest::SetWorkResponsibility {
+                work_id: work,
+                responsible_role_id: None,
+            },
+        ),
+        RoleWorkCmd::Accept {
+            work,
+            expected_project_revision,
+            acting_assignment,
+        } => (
+            expected_project_revision,
+            acting_assignment,
+            RoleCommandRequest::AcceptWork {
+                commitment_id: Uuid::new_v4(),
+                work_id: work,
+            },
+        ),
+        RoleWorkCmd::Release {
+            commitment,
+            expected_project_revision,
+            reason,
+            acting_assignment,
+        } => (
+            expected_project_revision,
+            acting_assignment,
+            RoleCommandRequest::EndCommitment {
+                commitment_id: commitment,
+                reason,
+            },
+        ),
+        RoleWorkCmd::Recommit {
+            work,
+            commitment,
+            expected_project_revision,
+            acting_assignment,
+        } => (
+            expected_project_revision,
+            acting_assignment,
+            RoleCommandRequest::ReplaceCommitment {
+                commitment_id: Uuid::new_v4(),
+                work_id: work,
+                expected_commitment_id: commitment,
+            },
+        ),
+    };
+    submit(client, RoleCommand::new(expected, acting, request)).await
 }
 
 async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), CliError> {
