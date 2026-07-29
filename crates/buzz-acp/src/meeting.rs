@@ -91,12 +91,17 @@ pub(super) enum MeetingTurnKind {
     V0Intent,
     V0Granted,
     V1Intent,
+    V1ModeratorAgenda,
+    V1ModeratorControl,
     V1Granted,
 }
 
 impl MeetingTurnKind {
     pub(super) fn is_v1(self) -> bool {
-        matches!(self, Self::V1Intent | Self::V1Granted)
+        matches!(
+            self,
+            Self::V1Intent | Self::V1ModeratorAgenda | Self::V1ModeratorControl | Self::V1Granted
+        )
     }
 }
 
@@ -1080,7 +1085,10 @@ impl V0MeetingCoordinator {
                 self.handle_granted_result(&request, &raw_output, succeeded)
                     .await;
             }
-            MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted => {
+            MeetingTurnKind::V1Intent
+            | MeetingTurnKind::V1ModeratorAgenda
+            | MeetingTurnKind::V1ModeratorControl
+            | MeetingTurnKind::V1Granted => {
                 tracing::error!("V1 Meeting turn was routed to the V0 controller");
             }
         }
@@ -1613,7 +1621,10 @@ impl V0MeetingCoordinator {
         match request.kind {
             MeetingTurnKind::V0Granted => self.pending.push_front(request),
             MeetingTurnKind::V0Intent => self.pending.push_back(request),
-            MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted => {
+            MeetingTurnKind::V1Intent
+            | MeetingTurnKind::V1ModeratorAgenda
+            | MeetingTurnKind::V1ModeratorControl
+            | MeetingTurnKind::V1Granted => {
                 tracing::error!("V1 Meeting turn was queued in the V0 controller");
             }
         }
@@ -2806,7 +2817,10 @@ fn format_correction_prompt(kind: MeetingTurnKind) -> String {
              Do not use Markdown or code fences."
                 .to_string()
         }
-        MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted => {
+        MeetingTurnKind::V1Intent
+        | MeetingTurnKind::V1ModeratorAgenda
+        | MeetingTurnKind::V1ModeratorControl
+        | MeetingTurnKind::V1Granted => {
             "V1 Meeting format correction is owned by the V1 controller.".to_string()
         }
     }
@@ -3151,6 +3165,14 @@ mod tests {
                 9, 42100, 42101, 42102, 42103, 42104, 42105, 42106, 42107, 42108, 42109
             ])
         );
+    }
+
+    #[test]
+    fn moderator_turn_kinds_route_to_the_v1_controller() {
+        assert!(MeetingTurnKind::V1ModeratorAgenda.is_v1());
+        assert!(MeetingTurnKind::V1ModeratorControl.is_v1());
+        assert!(!MeetingTurnKind::V0Intent.is_v1());
+        assert!(!MeetingTurnKind::V0Granted.is_v1());
     }
 
     #[test]

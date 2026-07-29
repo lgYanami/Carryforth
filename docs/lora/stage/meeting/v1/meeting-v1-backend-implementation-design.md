@@ -1,6 +1,6 @@
 # Meeting V1 后端实现设计
 
-> 状态：后端实现设计 V1；阶段一、阶段二、阶段三已交付，阶段四待实施
+> 状态：后端实现设计 V1；阶段一、阶段二、阶段三、阶段四已交付，阶段五待实施
 >
 > 前置概念设计：[Meeting V1：主持式发言权接力协议](./meeting-v1.md)
 >
@@ -1818,7 +1818,7 @@ AgendaRanking:
   proposed_rejections[]
   proposed_handoff_dismissals[]
   proposed_moderator_summary?
-  state: preparing | ready | stale
+  state: preparing | ready | retryable | failed | stale
 
 ControlDecision:
   control_epoch
@@ -1830,15 +1830,16 @@ ControlDecision:
   rejections[]
   handoff_dismissals[]
   deferrals[]
-  next_action: select_intent | select_handoff | moderator_speak | idle
+  next_action: select_intent | select_handoff | moderator_speak | withdraw_self | idle
   selected_intent_id?
   selected_handoff_id?
-  state: preparing | ready | stale | consumed
+  state: preparing | ready | retryable | failed | stale | consumed
 ```
 
-`moderator_speak` 必须引用 moderator 已有的 pending self Intent；如果计划首次提出主持人
-要讲的新内容，Harness 先以 participant 身份提交 self Intent，重新同步后再 Select，不能让
-ModeratorPlan 绕过共享 Intent 记录。
+`moderator_speak` 必须引用 moderator 已有的 pending self Intent；`withdraw_self` 允许
+主持人撤回已经过时的 self Intent。如果计划首次提出主持人要讲的新内容，Harness 先以
+participant 身份提交 self Intent，重新同步后再 Select，不能让 ModeratorPlan 绕过共享
+Intent 记录。
 
 其他人发言期间可以生成 AgendaRanking。它不以 `floor_revision` 判 stale：Progress、
 soft-lease 延长等事件不改变排名语义。当前 speaker 的最终 speech 尚未出现，因此
@@ -2649,7 +2650,7 @@ speech 不变量和基础幂等测试通过。
 - Agent 慢、离线、ACK 丢失和 late result 都不冻结会议；
 - 普通 Agent E2E 与 token/latency metrics 可观察。
 
-### 阶段四：Agent 主持人
+### 阶段四：Agent 主持人（已交付）
 
 目标：
 
@@ -2658,13 +2659,13 @@ speech 不变量和基础幂等测试通过。
 开发内容：
 
 - ModeratorPlan 私有模型和 revision revalidation；
-- Moderator prompt；
+- Moderator prompt，以及共享发言窗口的截断元数据与 `meeting_read history` 提示；
 - pending Intent/open Handoff 排名、Reject + 单一 next action 的结构化输出；
 - 带原因的 Handoff Dismiss proposal、逐项重验和 active-attempt conflict 处理；
-- Granted > Moderator > Participant 的本地调度优先级；
+- V1 Controller 内 Granted > Moderator > Participant 的本地调度优先级；
 - 3 分钟 deadline 的本地 safety budget；
 - stale plan 丢弃、Human 优先和 Relay fallback 协作；
-- moderator 重启恢复。
+- moderator 重启恢复，恢复后的状态立即持久化且不会重置模型尝试次数。
 
 交付：
 
@@ -2672,8 +2673,15 @@ speech 不变量和基础幂等测试通过。
 - Human Request 永远能够覆盖 ModeratorPlan；
 - stale ModeratorPlan 不产生错误选择；
 - Agent moderator 能在容量耗尽前关闭 stale open Handoff，且不会关闭活动 attempt；
-- moderator LLM 故障时 Relay 在 3 分钟后确定性继续会议；
+- 存在 Relay decision window 与 deterministic fallback candidate 时，moderator LLM
+  故障后 Relay 在 3 分钟内确定性继续会议；
 - Agent moderator 与普通 Agent 可在同一进程/模型池内稳定运行。
+
+实现收口采用保守的逐项执行：每次 ControlDecision 至多提交一个 Reject 或 Dismiss，
+随后重新同步并重新规划，最终再提交一个 Select 或 self Intent Withdraw。主持模型在同一
+绝对 deadline 内最多尝试两次；不会因重试延长 Relay 的 3 分钟 decision window。
+`moderator_idle` 没有 Relay decision deadline；若其本地两次尝试均失败，Harness 会等待
+当前 3 分钟本地窗口结束后再开启一个新的两次尝试窗口，既避免永久停顿，也避免热循环。
 
 阶段三和阶段四可以在共享同步器、ledger schema 和 Stage 2 协议冻结后部分并行开发；最终
 验收仍以二者集成为准。
@@ -2691,6 +2699,8 @@ speech 不变量和基础幂等测试通过。
 - 长会议与多 Session 负载；
 - metrics、日志和告警；
 - V0/V1 共存及灰度开关；
+- V0/V1 统一运行中 Turn 登记与跨协议抢占：V1 Offer 可回收 V0 Intent，V0 Granted
+  可抢占 V1 Moderator/Intent；
 - 运维、测试和协议文档收口。
 
 交付：

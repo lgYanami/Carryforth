@@ -3103,8 +3103,8 @@ fn dispatch_meeting_pending(
             Arc::clone(v0_ctx)
         };
         // Only a V1 Granted turn owns a slot protected by the local Offer
-        // reservation. Intent turns (including V1 Intent) must respect that
-        // floor or they could consume the exact slot an ACK promised.
+        // reservation. Participant and moderator planning turns must respect
+        // that floor or they could consume the exact slot an ACK promised.
         let claimed = if request.kind == meeting::MeetingTurnKind::V1Granted {
             pool.try_claim_meeting(channel_id)
         } else {
