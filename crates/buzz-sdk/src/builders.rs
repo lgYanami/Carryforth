@@ -1,4 +1,4 @@
-//! Typed event builder functions (38 builders).
+//! Typed event builder functions.
 //!
 //! All functions return `Result<nostr::EventBuilder, SdkError>`.
 //! The caller signs: `builder.sign_with_keys(&keys)?`.
@@ -26,6 +26,42 @@ use uuid::Uuid;
 use crate::{
     ChannelKind, CustomEmoji, DiffMeta, MemberRole, SdkError, ThreadRef, Visibility, VoteDirection,
 };
+
+/// Wire schema version emitted by Meeting V1 builders.
+pub const MEETING_V1_SCHEMA_VERSION: &str = "2";
+/// Floor policy emitted by Meeting V1 builders.
+pub const MEETING_V1_POLICY: &str = "moderated-baton-v1";
+
+/// Inputs for a strict Meeting V1 Create command.
+///
+/// `participant_pubkeys` contains every participant except `author_pubkey`.
+/// The author is supplied separately so the SDK can reject duplicate rosters
+/// and require the moderator to belong to the complete frozen roster. The
+/// caller must sign the returned builder with the matching author key.
+pub struct MeetingV1CreateParams<'a> {
+    /// Stable Meeting UUID; also the private backing Channel UUID.
+    pub session_id: Uuid,
+    /// Human-readable Meeting title.
+    pub title: &'a str,
+    /// Optional Meeting description.
+    pub description: Option<&'a str>,
+    /// Optional source Channel used as a context/navigation reference.
+    pub source_channel_id: Option<Uuid>,
+    /// Pubkey that will sign the returned event.
+    pub author_pubkey: &'a str,
+    /// Frozen moderator pubkey. It must be the author or one listed participant.
+    pub moderator_pubkey: &'a str,
+    /// Frozen participants other than the event author.
+    pub participant_pubkeys: &'a [&'a str],
+}
+
+/// Inputs for a strict manual Meeting V1 End command.
+pub struct MeetingV1EndParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Event ID of the corresponding V1 Create command.
+    pub create_event_id: &'a str,
+}
 
 /// Parse a tag slice, mapping errors to `SdkError::InvalidTag`.
 fn tag(parts: &[&str]) -> Result<Tag, SdkError> {
@@ -1639,6 +1675,106 @@ pub fn build_meeting_end(
     let create_event_id = check_hex_exact(create_event_id, 64, "meeting create event id")?;
     let tags = vec![
         tag(&["h", &session_id.to_string()])?,
+        tag(&["e", &create_event_id])?,
+        tag(&["reason", "manual"])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), "").tags(tags))
+}
+
+/// Build a strict Meeting V1 create command (kind 42100).
+///
+/// The returned event always carries `v=2`, `policy=moderated-baton-v1`, and
+/// an explicit moderator. V0 callers must continue using
+/// [`build_meeting_create`].
+pub fn build_meeting_v1_create(
+    params: MeetingV1CreateParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    let title = buzz_core::channel::canonical_channel_name(params.title);
+    if title.is_empty() {
+        return Err(SdkError::InvalidInput("meeting title is required".into()));
+    }
+    if title.chars().count() > 255 {
+        return Err(SdkError::InvalidInput(
+            "meeting title exceeds 255 characters".into(),
+        ));
+    }
+    if params.participant_pubkeys.is_empty() || params.participant_pubkeys.len() > 11 {
+        return Err(SdkError::InvalidInput(
+            "meeting create requires 1-11 other participant pubkeys".into(),
+        ));
+    }
+    if params.source_channel_id == Some(params.session_id) {
+        return Err(SdkError::InvalidInput(
+            "meeting cannot use itself as its source channel".into(),
+        ));
+    }
+
+    let author_pubkey = check_pubkey_hex(params.author_pubkey, "meeting author pubkey")?;
+    let moderator_pubkey = check_pubkey_hex(params.moderator_pubkey, "meeting moderator pubkey")?;
+    let mut seen = std::collections::HashSet::with_capacity(params.participant_pubkeys.len() + 1);
+    seen.insert(author_pubkey.clone());
+
+    let mut participant_pubkeys = Vec::with_capacity(params.participant_pubkeys.len());
+    for pubkey in params.participant_pubkeys {
+        let normalized = check_pubkey_hex(pubkey, "participant pubkey")?;
+        if !seen.insert(normalized.clone()) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate meeting participant: {normalized}"
+            )));
+        }
+        participant_pubkeys.push(normalized);
+    }
+    if !seen.contains(&moderator_pubkey) {
+        return Err(SdkError::InvalidInput(
+            "meeting moderator must belong to the complete frozen roster".into(),
+        ));
+    }
+
+    let mut tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["name", title])?,
+        tag(&["v", MEETING_V1_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V1_POLICY])?,
+        tag(&["moderator", &moderator_pubkey])?,
+    ];
+    if let Some(description) = params.description {
+        tags.push(tag(&["about", description])?);
+    }
+    if let Some(source_channel_id) = params.source_channel_id {
+        if source_channel_id.is_nil() {
+            return Err(SdkError::InvalidInput(
+                "source channel id must not be nil".into(),
+            ));
+        }
+        tags.push(tag(&["source", &source_channel_id.to_string()])?);
+    }
+    for participant_pubkey in &participant_pubkeys {
+        tags.push(tag(&["p", participant_pubkey])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), "").tags(tags))
+}
+
+/// Build a strict manual Meeting V1 end command (kind 42101).
+///
+/// The reason is fixed to `manual`; Relay-authored security termination uses a
+/// separate internal builder because it also carries the revoked participant.
+pub fn build_meeting_v1_end(params: MeetingV1EndParams<'_>) -> Result<EventBuilder, SdkError> {
+    if params.session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    let create_event_id = check_hex_exact(params.create_event_id, 64, "meeting create event id")?;
+    let tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["v", MEETING_V1_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V1_POLICY])?,
         tag(&["e", &create_event_id])?,
         tag(&["reason", "manual"])?,
     ];

@@ -30,7 +30,13 @@ abstract final class EventKind {
   static const meetingEnd = 42101;
   static const meetingFloorClaim = 42102;
   static const meetingRoundState = 42103;
+  static const meetingState = meetingRoundState;
   static const meetingFloorSignal = 42104;
+  static const meetingSpeechIntent = 42105;
+  static const meetingModeratorCommand = 42106;
+  static const meetingHumanFloorRequest = 42107;
+  static const meetingOfferResponse = 42108;
+  static const meetingGrantSignal = 42109;
   static const jobRequest = 43001;
   static const jobAccepted = 43002;
   static const jobProgress = 43003;

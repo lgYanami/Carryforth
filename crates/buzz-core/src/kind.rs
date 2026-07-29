@@ -453,16 +453,28 @@ pub const KIND_DM_HIDE: u32 = 41012;
 pub const KIND_DM_CREATED: u32 = 41001;
 
 // Meeting protocol (42100–42199)
-/// Create a Meeting V0 session and its complete frozen participant roster.
+/// Create a versioned Meeting session and its complete frozen participant roster.
 pub const KIND_MEETING_CREATE: u32 = 42100;
-/// End a Meeting V0 session and archive its backing channel.
+/// End a versioned Meeting session and archive its backing channel.
 pub const KIND_MEETING_END: u32 = 42101;
 /// Apply for the current Meeting V0 speech round.
 pub const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
-/// Relay-signed authoritative Meeting V0 round/floor state.
+/// Relay-signed authoritative Meeting state.
 pub const KIND_MEETING_ROUND_STATE: u32 = 42103;
+/// Protocol-neutral alias for the Relay-signed authoritative Meeting state.
+pub const KIND_MEETING_STATE: u32 = KIND_MEETING_ROUND_STATE;
 /// Participant-signed Meeting V0 Ready, Pass, or Yield floor signal.
 pub const KIND_MEETING_FLOOR_SIGNAL: u32 = 42104;
+/// Participant-signed Meeting V1 speech-intent command.
+pub const KIND_MEETING_SPEECH_INTENT: u32 = 42105;
+/// Moderator-signed Meeting V1 baton command.
+pub const KIND_MEETING_MODERATOR_COMMAND: u32 = 42106;
+/// Human participant-signed Meeting V1 floor request.
+pub const KIND_MEETING_HUMAN_FLOOR_REQUEST: u32 = 42107;
+/// Offer target-signed Meeting V1 ACK or decline response.
+pub const KIND_MEETING_OFFER_RESPONSE: u32 = 42108;
+/// Grant holder-signed Meeting V1 progress or yield signal.
+pub const KIND_MEETING_GRANT_SIGNAL: u32 = 42109;
 
 // Agent job protocol (43000–43999)
 // Not using NIP-90 kinds (5000–6999) — Buzz requires auth chains (depth ≤ 3, breadth ≤ 10).
@@ -662,6 +674,11 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEETING_FLOOR_CLAIM,
     KIND_MEETING_ROUND_STATE,
     KIND_MEETING_FLOOR_SIGNAL,
+    KIND_MEETING_SPEECH_INTENT,
+    KIND_MEETING_MODERATOR_COMMAND,
+    KIND_MEETING_HUMAN_FLOOR_REQUEST,
+    KIND_MEETING_OFFER_RESPONSE,
+    KIND_MEETING_GRANT_SIGNAL,
     KIND_JOB_REQUEST,
     KIND_JOB_ACCEPTED,
     KIND_JOB_PROGRESS,
@@ -768,6 +785,11 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_MEETING_END
             | KIND_MEETING_FLOOR_CLAIM
             | KIND_MEETING_FLOOR_SIGNAL
+            | KIND_MEETING_SPEECH_INTENT
+            | KIND_MEETING_MODERATOR_COMMAND
+            | KIND_MEETING_HUMAN_FLOOR_REQUEST
+            | KIND_MEETING_OFFER_RESPONSE
+            | KIND_MEETING_GRANT_SIGNAL
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
@@ -858,6 +880,22 @@ mod tests {
     fn nip43_membership_snapshot_is_relay_only() {
         assert!(is_relay_only_kind(KIND_NIP43_MEMBERSHIP_LIST));
         assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
+    }
+
+    #[test]
+    fn meeting_v1_kinds_have_expected_registry_roles() {
+        assert_eq!(KIND_MEETING_STATE, KIND_MEETING_ROUND_STATE);
+        assert!(is_relay_only_kind(KIND_MEETING_STATE));
+        for kind in [
+            KIND_MEETING_SPEECH_INTENT,
+            KIND_MEETING_MODERATOR_COMMAND,
+            KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            KIND_MEETING_OFFER_RESPONSE,
+            KIND_MEETING_GRANT_SIGNAL,
+        ] {
+            assert!(is_command_kind(kind), "Meeting V1 kind {kind}");
+            assert!(!is_relay_only_kind(kind), "Meeting V1 kind {kind}");
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Restart-safe Meeting V0 deadline and delivery runtime.
+//! Restart-safe Meeting deadline recovery and durable delivery runtime.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +37,11 @@ pub(crate) fn floor_config_from_env() -> FloorConfig {
     }
 }
 
-/// Run deadline recovery and transactional outbox delivery for Meeting V0.
+/// Run V0 deadline recovery and the policy-neutral Meeting outbox worker.
+///
+/// Meeting V1 Create/End/State events share the durable outbox with V0. The
+/// V1 creation rollout gate intentionally does not control this worker:
+/// disabling new V1 sessions must never strand events for an existing session.
 pub async fn run(state: Arc<AppState>) {
     let floor_config = floor_config_from_env();
     let sweep_interval = env_duration_ms("BUZZ_MEETING_SWEEP_INTERVAL_MS", DEFAULT_SWEEP_INTERVAL);
@@ -55,7 +59,8 @@ pub async fn run(state: Arc<AppState>) {
         grant_lease_ms = floor_config.grant_lease.as_millis(),
         sweep_interval_ms = sweep_interval.as_millis(),
         batch_limit,
-        "Meeting V0 runtime started"
+        meeting_v1_create_enabled = state.config.meeting_v1_create_enabled,
+        "Meeting runtime started"
     );
 
     let mut ticker = tokio::time::interval(sweep_interval);
@@ -78,7 +83,7 @@ pub async fn run(state: Arc<AppState>) {
         if let Err(error) =
             dispatch_outbox_batch(&state, worker_id, outbox_lease, batch_limit).await
         {
-            error!("Meeting V0 outbox delivery failed: {error}");
+            error!("Meeting outbox delivery failed: {error}");
         }
     }
 }
@@ -95,20 +100,42 @@ async fn dispatch_outbox_batch(
         let tenant = TenantContext::resolved(item.community_id, item.host);
         let kind = item.stored_event.event.kind.as_u16() as u32;
         let actor = item.stored_event.event.pubkey.to_hex();
-        dispatch_persistent_event_now(&tenant, state, &item.stored_event, kind, &actor, None).await;
-        if !buzz_db::meeting_floor::mark_outbox_delivered(
-            &state.db,
-            item.community_id,
-            item.sequence,
-            worker_id,
-        )
-        .await?
+        match dispatch_persistent_event_now(&tenant, state, &item.stored_event, kind, &actor, None)
+            .await
         {
-            warn!(
-                meeting = %item.session_id,
-                sequence = item.sequence,
-                "Meeting V0 outbox claim was lost before delivery acknowledgement"
-            );
+            Ok(_) => {
+                if !buzz_db::meeting_floor::mark_outbox_delivered(
+                    &state.db,
+                    item.community_id,
+                    item.sequence,
+                    worker_id,
+                )
+                .await?
+                {
+                    warn!(
+                        meeting = %item.session_id,
+                        sequence = item.sequence,
+                        "Meeting outbox claim was lost before delivery acknowledgement"
+                    );
+                }
+            }
+            Err(error) => {
+                if !buzz_db::meeting_floor::release_outbox(
+                    &state.db,
+                    item.community_id,
+                    item.sequence,
+                    worker_id,
+                    &error,
+                )
+                .await?
+                {
+                    warn!(
+                        meeting = %item.session_id,
+                        sequence = item.sequence,
+                        "Meeting outbox claim was lost before failed delivery could be released"
+                    );
+                }
+            }
         }
     }
     Ok(())

@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -911,6 +911,27 @@ mod tests {
         assert!(meeting_agent_floor.contains("CREATE TABLE meeting_round_decision_cohort"));
         assert!(meeting_agent_floor
             .contains("PRIMARY KEY (community_id, session_id, round_number, participant_pubkey)"));
+
+        // Meeting V1 remains additive and persists a policy-isolated,
+        // recoverable moderated-baton projection.
+        assert_eq!(migrations[27].version, 29);
+        let meeting_baton = migrations[27].sql.as_str();
+        assert!(meeting_baton.contains("moderated-baton-v1"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_participants"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_config"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_state_history"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_state"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_speech_intents"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_human_floor_requests"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_offers"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_grants"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_grant_progress"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_directed_handoffs"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_fallback_attempts"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_v1_command_receipts"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_revocation_jobs"));
+        assert!(meeting_baton.contains("chk_meeting_protocol_shape"));
+        assert!(meeting_baton.contains("trg_meeting_session_protocol_immutable"));
     }
 
     #[test]

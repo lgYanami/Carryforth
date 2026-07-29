@@ -171,6 +171,18 @@ pub enum OutputFormat {
     Compact,
 }
 
+/// Meeting floor-allocation protocol selected at creation time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum MeetingPolicy {
+    /// Meeting V0 uniform claim arbitration.
+    #[default]
+    #[value(name = "uniform-v0")]
+    UniformV0,
+    /// Meeting V1 moderator-controlled baton passing.
+    #[value(name = "moderated-baton-v1")]
+    ModeratedBatonV1,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Draft owner-reviewed agent creation and updates
@@ -182,7 +194,7 @@ enum Cmd {
     /// Create, configure, and manage channels
     #[command(subcommand)]
     Channels(ChannelsCmd),
-    /// Create, inspect, and end shared Meeting V0 rooms
+    /// Create, inspect, and end versioned shared Meeting rooms
     #[command(subcommand)]
     Meetings(MeetingsCmd),
     /// Get and set channel canvas documents
@@ -682,7 +694,7 @@ pub enum ChannelsCmd {
 pub enum MeetingsCmd {
     /// Create a private meeting with a frozen initial roster
     #[command(
-        after_help = "Example:\n  buzz meetings create --title \"Design review\" --participant <PUBKEY> --participant <PUBKEY>"
+        after_help = "Examples:\n  buzz meetings create --title \"Design review\" --participant <PUBKEY>\n  buzz meetings create --policy moderated-baton-v1 --moderator <PUBKEY> --title \"Design review\" --participant <PUBKEY>"
     )]
     Create {
         /// Meeting title
@@ -694,6 +706,12 @@ pub enum MeetingsCmd {
         /// Optional source channel UUID; every participant must already be able to read it
         #[arg(long)]
         source: Option<String>,
+        /// Floor-allocation protocol; defaults to the existing V0 behavior
+        #[arg(long, value_enum, default_value = "uniform-v0")]
+        policy: MeetingPolicy,
+        /// V1 moderator pubkey; defaults to the creator and is invalid for V0
+        #[arg(long)]
+        moderator: Option<String>,
         /// Other participant pubkeys (repeat once per participant; the creator is implicit)
         #[arg(long = "participant", required = true)]
         participants: Vec<String>,
@@ -1932,6 +1950,57 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn meeting_create_defaults_to_v0_policy() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "create",
+            "--title",
+            "Review",
+            "--participant",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("parse default Meeting Create");
+        let Cmd::Meetings(MeetingsCmd::Create {
+            policy, moderator, ..
+        }) = cli.command
+        else {
+            panic!("expected Meeting Create");
+        };
+        assert_eq!(policy, MeetingPolicy::UniformV0);
+        assert!(moderator.is_none());
+    }
+
+    #[test]
+    fn meeting_create_parses_explicit_v1_policy_and_moderator() {
+        let moderator = "bb".repeat(32);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "create",
+            "--policy",
+            "moderated-baton-v1",
+            "--moderator",
+            &moderator,
+            "--title",
+            "Review",
+            "--participant",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("parse Meeting V1 Create");
+        let Cmd::Meetings(MeetingsCmd::Create {
+            policy,
+            moderator: parsed_moderator,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Meeting Create");
+        };
+        assert_eq!(policy, MeetingPolicy::ModeratedBatonV1);
+        assert_eq!(parsed_moderator.as_deref(), Some(moderator.as_str()));
     }
 
     #[test]

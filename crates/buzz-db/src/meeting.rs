@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::{DbError, Result};
+use crate::{Db, DbError, Result};
 use buzz_core::CommunityId;
 
 /// Maximum number of participants in a Meeting V0 session.
@@ -76,6 +76,17 @@ pub struct MeetingRecord {
     pub floor_revision: i64,
     /// Persisted winner-selection policy version.
     pub floor_policy_version: String,
+}
+
+/// Persisted protocol discriminator used before policy-specific dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingPolicy {
+    /// Protocol schema version.
+    pub schema_version: i32,
+    /// Frozen floor-control policy identifier.
+    pub floor_policy_version: String,
+    /// V1 moderator, absent for V0.
+    pub moderator_pubkey: Option<Vec<u8>>,
 }
 
 /// Outcome of an idempotent Meeting End mutation.
@@ -334,7 +345,8 @@ pub async fn end_meeting_tx(
     validate_end_shape(&params)?;
 
     let row = sqlx::query(
-        "SELECT host_pubkey, create_event_id, status \
+        "SELECT host_pubkey, create_event_id, status, schema_version, \
+                floor_policy_version \
          FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 \
          FOR UPDATE",
@@ -348,6 +360,14 @@ pub async fn end_meeting_tx(
     let host_pubkey: Vec<u8> = row.try_get("host_pubkey")?;
     let stored_create_event_id: Vec<u8> = row.try_get("create_event_id")?;
     let status: String = row.try_get("status")?;
+    let schema_version: i32 = row.try_get("schema_version")?;
+    let floor_policy_version: String = row.try_get("floor_policy_version")?;
+    if schema_version != 1 || floor_policy_version != "uniform-v0" {
+        return Err(DbError::InvalidData(format!(
+            "meeting {} is not a uniform-v0 session",
+            params.session_id
+        )));
+    }
 
     if stored_create_event_id != params.create_event_id {
         return Err(DbError::InvalidData(
@@ -449,6 +469,63 @@ pub async fn get_meeting(
         floor_revision: row.try_get("floor_revision")?,
         floor_policy_version: row.try_get("floor_policy_version")?,
     })
+}
+
+/// Read the persisted protocol discriminator for policy-aware command routing.
+pub async fn get_meeting_policy(
+    db: &Db,
+    community_id: CommunityId,
+    session_id: Uuid,
+) -> Result<MeetingPolicy> {
+    let row = sqlx::query(
+        "SELECT schema_version, floor_policy_version, moderator_pubkey \
+         FROM meeting_sessions \
+         WHERE community_id = $1 AND session_id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_optional(&db.pool)
+    .await?
+    .ok_or_else(|| DbError::NotFound(format!("meeting {session_id}")))?;
+    Ok(MeetingPolicy {
+        schema_version: row.try_get("schema_version")?,
+        floor_policy_version: row.try_get("floor_policy_version")?,
+        moderator_pubkey: row.try_get("moderator_pubkey")?,
+    })
+}
+
+/// Enqueue an already-persisted meeting event for post-commit delivery.
+///
+/// The event must belong to the same private meeting channel in the caller's
+/// open transaction. Callers control causal ordering by invoking this before
+/// later relay-signed State events are persisted and enqueued.
+pub async fn enqueue_meeting_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event_id: &[u8],
+) -> Result<()> {
+    validate_32_bytes(event_id, "meeting outbox event id")?;
+    let result = sqlx::query(
+        "INSERT INTO meeting_event_outbox (community_id, session_id, event_id) \
+         SELECT $1, $2, $3 \
+         WHERE EXISTS( \
+             SELECT 1 FROM events \
+             WHERE community_id = $1 AND id = $3 AND channel_id = $2 \
+         ) \
+         ON CONFLICT (community_id, event_id) DO NOTHING",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(event_id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DbError::InvalidData(
+            "meeting outbox event is missing or already enqueued".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_create_shape(params: &CreateMeetingParams<'_>) -> Result<()> {

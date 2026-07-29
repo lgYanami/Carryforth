@@ -372,7 +372,7 @@ pub(crate) async fn dispatch_persistent_event(
 
     metrics::counter!("buzz_post_commit_dispatch_scheduled_total").increment(1);
     tokio::spawn(async move {
-        let recipients = dispatch_persistent_event_inner(
+        let recipients = match dispatch_persistent_event_inner(
             &tenant,
             &state,
             &stored_event,
@@ -381,7 +381,16 @@ pub(crate) async fn dispatch_persistent_event(
             false,
             threaded_visibility,
         )
-        .await;
+        .await
+        {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "publish")
+                    .increment(1);
+                warn!(event_id = %event_id_hex, "post-commit dispatch failed: {error}");
+                0
+            }
+        };
         debug!(
             event_id = %event_id_hex,
             recipients,
@@ -404,8 +413,18 @@ pub(crate) async fn dispatch_persistent_event_now(
     kind_u32: u32,
     actor_pubkey_hex: &str,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
-) -> usize {
+) -> Result<usize, String> {
     let event_id_hex = stored_event.event.id.to_hex();
+    let recipients = dispatch_persistent_event_inner(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        false,
+        threaded_visibility,
+    )
+    .await?;
     enqueue_event_created_audit(
         tenant,
         state,
@@ -415,17 +434,7 @@ pub(crate) async fn dispatch_persistent_event_now(
         &event_id_hex,
     )
     .await;
-
-    dispatch_persistent_event_inner(
-        tenant,
-        state,
-        stored_event,
-        kind_u32,
-        actor_pubkey_hex,
-        false,
-        threaded_visibility,
-    )
-    .await
+    Ok(recipients)
 }
 
 /// Run post-commit delivery/side effects for a stored event.
@@ -437,7 +446,7 @@ async fn dispatch_persistent_event_inner(
     actor_pubkey_hex: &str,
     enqueue_audit: bool,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
-) -> usize {
+) -> Result<usize, String> {
     // No `crate::conformance` emit here — the spec doesn't have a
     // separate fan-out action. Acceptance was already recorded at the
     // ingest seam (`crates/buzz-relay/src/handlers/ingest.rs`'s
@@ -451,7 +460,7 @@ async fn dispatch_persistent_event_inner(
         None => EventTopic::Global,
     };
     state.mark_local_event(tenant.community(), &stored_event.event.id);
-    if let Err(e) = state
+    let publish_error = if let Err(error) = state
         .pubsub
         .publish_event(tenant, topic, &stored_event.event)
         .await
@@ -459,8 +468,11 @@ async fn dispatch_persistent_event_inner(
         state
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
-        warn!(event_id = %event_id_hex, "Redis publish failed: {e}");
-    }
+        warn!(event_id = %event_id_hex, "Redis publish failed: {error}");
+        Some(format!("Redis publish failed: {error}"))
+    } else {
+        None
+    };
 
     let matches = state
         .sub_registry
@@ -487,7 +499,7 @@ async fn dispatch_persistent_event_inner(
             error!(event_id = %event_id_hex, "Failed to serialize event for fan-out: {e}");
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
-            return 0;
+            return Err(format!("serialize event for fan-out: {e}"));
         }
     };
     // For viewer-private events (kind:30622 DM visibility, kind:44200 agent turn
@@ -561,7 +573,11 @@ async fn dispatch_persistent_event_inner(
             .iter()
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("buzz:workflow"));
 
-    if !buzz_core::kind::is_workflow_execution_kind(kind_u32)
+    // A transactional outbox retries this whole dispatch when Redis publish
+    // fails. Defer workflow side effects until a publish succeeds so one
+    // canonical meeting event cannot start the same workflow on every retry.
+    if publish_error.is_none()
+        && !buzz_core::kind::is_workflow_execution_kind(kind_u32)
         && !buzz_core::kind::is_command_kind(kind_u32)
         && !is_relay_workflow_msg
         && kind_u32 != KIND_GIFT_WRAP
@@ -593,7 +609,11 @@ async fn dispatch_persistent_event_inner(
         });
     }
 
-    matches.len()
+    if let Some(error) = publish_error {
+        Err(error)
+    } else {
+        Ok(matches.len())
+    }
 }
 
 async fn enqueue_event_created_audit(
@@ -1841,7 +1861,8 @@ mod tests {
                 true,
                 None,
             )
-            .await;
+            .await
+            .expect("dispatch audited event");
 
             // Flush the audit worker so the row is committed before we read it.
             audit_shutdown
@@ -1943,7 +1964,8 @@ mod tests {
                 true,
                 None,
             )
-            .await;
+            .await
+            .expect("dispatch tenant A event");
             super::super::dispatch_persistent_event_inner(
                 &tb,
                 &state,
@@ -1953,7 +1975,8 @@ mod tests {
                 true,
                 None,
             )
-            .await;
+            .await
+            .expect("dispatch tenant B event");
 
             audit_shutdown
                 .drain(std::time::Duration::from_secs(5))

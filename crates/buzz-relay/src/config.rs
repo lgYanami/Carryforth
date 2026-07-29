@@ -128,6 +128,13 @@ pub struct Config {
     /// service lands.
     pub huddle_audio_available: bool,
 
+    /// Whether clients may create new Meeting V1 sessions.
+    ///
+    /// This rollout gate defaults to `false`. It is checked only when
+    /// accepting a `v=2 + moderated-baton-v1` Meeting Create command; existing
+    /// V1 sessions continue to be routed and recovered when the gate is off.
+    pub meeting_v1_create_enabled: bool,
+
     /// Inter-relay mesh configuration (`BUZZ_MESH`, `BUZZ_MESH_BIND_ADDR`).
     /// Opt-in: mesh forms only when `BUZZ_MESH=on` is explicit. The default
     /// (absent/off) is exact single-instance behavior — no bind, no Redis
@@ -489,6 +496,8 @@ impl Config {
         let huddle_audio_available = std::env::var("BUZZ_HUDDLE_AUDIO_AVAILABLE")
             .map(|v| !(v == "false" || v == "0"))
             .unwrap_or(true);
+
+        let meeting_v1_create_enabled = parse_optional_bool("BUZZ_MEETING_V1_CREATE_ENABLED")?;
 
         // Mesh opt-in: default OFF. Strict rollout no-regression — an image
         // upgrade with untouched env must not bind a new UDP port or write a
@@ -892,6 +901,7 @@ impl Config {
             pubkey_allowlist_enabled,
             require_relay_membership,
             huddle_audio_available,
+            meeting_v1_create_enabled,
             mesh,
             mesh_demo_echo,
             relay_owner_pubkey,
@@ -982,6 +992,45 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+        assert!(
+            !config.meeting_v1_create_enabled,
+            "Meeting V1 creation must remain opt-in during the backend rollout"
+        );
+    }
+
+    #[test]
+    fn meeting_v1_create_gate_is_strict_and_defaults_off() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_MEETING_V1_CREATE_ENABLED");
+
+        std::env::remove_var("BUZZ_MEETING_V1_CREATE_ENABLED");
+        assert!(
+            !Config::from_env()
+                .expect("unset gate is valid")
+                .meeting_v1_create_enabled
+        );
+
+        std::env::set_var("BUZZ_MEETING_V1_CREATE_ENABLED", "true");
+        assert!(
+            Config::from_env()
+                .expect("enabled gate is valid")
+                .meeting_v1_create_enabled
+        );
+
+        std::env::set_var("BUZZ_MEETING_V1_CREATE_ENABLED", "sometimes");
+        let invalid = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_MEETING_V1_CREATE_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_MEETING_V1_CREATE_ENABLED");
+        }
+
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_MEETING_V1_CREATE_ENABLED")
+        ));
     }
 
     #[test]

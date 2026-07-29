@@ -1,0 +1,62 @@
+{
+  "fixture_version": 1,
+  "protocol": {
+    "meeting_version": "2",
+    "floor_policy": "moderated-baton-v1",
+    "kinds": {
+      "create": 42100,
+      "end": 42101,
+      "state": 42103,
+      "speech_intent": 42105,
+      "moderator_command": 42106,
+      "human_floor_request": 42107,
+      "offer_response": 42108,
+      "grant_signal": 42109
+    }
+  },
+  "create": {
+    "session_id": "00000000-0000-4000-8000-000000000002",
+    "title": "# Architecture review",
+    "canonical_title": "Architecture review",
+    "description": "Meeting V1 conformance fixture",
+    "source_channel_id": "00000000-0000-4000-8000-000000000001",
+    "author_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "moderator_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "participant_pubkeys": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ],
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["name", "Architecture review"],
+      ["v", "2"],
+      ["policy", "moderated-baton-v1"],
+      ["moderator", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      ["about", "Meeting V1 conformance fixture"],
+      ["source", "00000000-0000-4000-8000-000000000001"],
+      ["p", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      ["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+    ]
+  },
+  "end": {
+    "create_event_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000002"],
+      ["v", "2"],
+      ["policy", "moderated-baton-v1"],
+      ["e", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+      ["reason", "manual"]
+    ]
+  },
+  "invalid_create_cases": [
+    "nil_session",
+    "self_source",
+    "empty_roster",
+    "duplicate_author",
+    "moderator_outside_roster"
+  ],
+  "invalid_end_cases": [
+    "nil_session",
+    "malformed_create_event_id"
+  ]
+}

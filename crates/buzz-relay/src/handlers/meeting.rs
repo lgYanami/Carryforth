@@ -1,4 +1,4 @@
-//! Meeting V0 canonical speech ingestion.
+//! Policy-aware Meeting canonical speech ingestion.
 
 use std::sync::Arc;
 
@@ -9,15 +9,41 @@ use nostr::Event;
 use crate::state::AppState;
 
 use super::command_executor::{
-    map_meeting_db_error, parse_positive_round, validate_meeting_tag_vocabulary,
+    map_meeting_db_error, parse_positive_round, validate_meeting_tag_vocabulary, MeetingProtocol,
 };
 use super::ingest::{extract_channel_id, IngestError, IngestResult};
 
-/// Validate and atomically persist one Grant-bound Meeting V0 speech.
+/// Route a Meeting speech by the Session's frozen protocol.
+///
+/// Stage one intentionally has no V1 speech mutation yet. Persisted policy is
+/// resolved before any V0 tag validation so a V1 command can never enter the
+/// V0 floor state machine.
 pub async fn handle_speech(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
+) -> Result<IngestResult, IngestError> {
+    let session_id = extract_channel_id(event)
+        .ok_or_else(|| IngestError::Rejected("invalid: bad meeting session id".into()))?;
+    let persisted = buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
+        .await
+        .map_err(map_meeting_db_error)?;
+    let protocol =
+        MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
+    if protocol == MeetingProtocol::ModeratedBatonV1 {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting V1 speech is not available in stage one".into(),
+        ));
+    }
+
+    handle_v0_speech(tenant, state, event, session_id).await
+}
+
+async fn handle_v0_speech(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    session_id: uuid::Uuid,
 ) -> Result<IngestResult, IngestError> {
     if event.content.trim().is_empty() {
         return Err(IngestError::Rejected(
@@ -25,8 +51,6 @@ pub async fn handle_speech(
         ));
     }
     validate_meeting_tag_vocabulary(event, &["h", "meeting-round", "meeting-grant"], &["p"])?;
-    let session_id = extract_channel_id(event)
-        .ok_or_else(|| IngestError::Rejected("invalid: bad meeting session id".into()))?;
     let round_number = parse_positive_round(event)?;
     let grant_event_id = single_hex_event_tag(event, "meeting-grant")?;
     let config = crate::meeting_runtime::floor_config_from_env();

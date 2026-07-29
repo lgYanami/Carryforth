@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use buzz_core::kind::*;
 use buzz_core::tenant::{CommunityId, TenantContext};
-use buzz_core::StoredEvent;
 use buzz_db::meeting::{
     CreateMeetingParams, EndMeetingOutcome, EndMeetingParams, MAX_MEETING_PARTICIPANTS,
 };
@@ -33,12 +32,45 @@ use buzz_workflow::executor::TriggerContext;
 use crate::state::AppState;
 use crate::webhook_secret;
 
-use super::event::dispatch_persistent_event;
 use super::ingest::{extract_channel_id, IngestAuth, IngestError, IngestResult};
 use super::side_effects::{
     emit_group_discovery_events, emit_membership_notification, emit_system_message,
     publish_dm_visibility_snapshot,
 };
+
+const MEETING_V1_POLICY: &str = buzz_sdk::MEETING_V1_POLICY;
+
+/// Frozen Meeting floor-control protocol selected by the persisted Session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeetingProtocol {
+    /// Meeting V0 uniform floor competition.
+    UniformV0,
+    /// Meeting V1 moderator-controlled baton.
+    ModeratedBatonV1,
+}
+
+impl MeetingProtocol {
+    fn policy(self) -> &'static str {
+        match self {
+            Self::UniformV0 => buzz_db::meeting_floor::FLOOR_POLICY_VERSION,
+            Self::ModeratedBatonV1 => MEETING_V1_POLICY,
+        }
+    }
+
+    /// Fail closed when a Session contains an unsupported schema/policy pair.
+    pub(crate) fn from_persisted(
+        schema_version: i32,
+        floor_policy_version: &str,
+    ) -> Result<Self, IngestError> {
+        match (schema_version, floor_policy_version) {
+            (1, buzz_db::meeting_floor::FLOOR_POLICY_VERSION) => Ok(Self::UniformV0),
+            (2, MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
+            _ => Err(IngestError::Internal(format!(
+                "error: meeting has unsupported persisted protocol v={schema_version}, policy={floor_policy_version}"
+            ))),
+        }
+    }
+}
 
 /// Route a command-kind event to the appropriate handler.
 pub async fn handle_command(
@@ -79,6 +111,13 @@ pub async fn handle_command(
         KIND_MEETING_FLOOR_SIGNAL => {
             handle_meeting_floor_signal(tenant, state, &event, &auth).await
         }
+        KIND_MEETING_SPEECH_INTENT
+        | KIND_MEETING_MODERATOR_COMMAND
+        | KIND_MEETING_HUMAN_FLOOR_REQUEST
+        | KIND_MEETING_OFFER_RESPONSE
+        | KIND_MEETING_GRANT_SIGNAL => {
+            reject_stage_one_meeting_v1_command(tenant, state, &event, &auth).await
+        }
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
@@ -87,6 +126,51 @@ pub async fn handle_command(
             "unknown command kind: {kind}"
         ))),
     }
+}
+
+async fn reject_stage_one_meeting_v1_command(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if auth
+        .channel_ids()
+        .is_some_and(|ids| !ids.contains(&session_id))
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: token not authorized for this meeting".into(),
+        ));
+    }
+    let actor_pubkey = auth.pubkey().to_bytes();
+    let is_participant = state
+        .is_member_cached(tenant.community(), session_id, &actor_pubkey)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!(
+                "error: checking Meeting V1 participant access: {error}"
+            ))
+        })?;
+    if !is_participant {
+        return Err(IngestError::AuthFailed(
+            "restricted: not a participant in this meeting".into(),
+        ));
+    }
+    let persisted = buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
+        .await
+        .map_err(map_meeting_db_error)?;
+    let protocol =
+        MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
+    if protocol != MeetingProtocol::ModeratedBatonV1 {
+        return Err(IngestError::Rejected(format!(
+            "invalid: kind {} is only valid for {MEETING_V1_POLICY} sessions",
+            event.kind.as_u16()
+        )));
+    }
+    Err(IngestError::Rejected(
+        "invalid: Meeting V1 baton commands are not available in stage one".into(),
+    ))
 }
 
 /// Result of persisting a command event: either a duplicate (already processed)
@@ -336,6 +420,8 @@ async fn handle_meeting_create(
         ));
     }
 
+    let protocol = meeting_create_protocol(event)?;
+
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
     if session_id.is_nil() {
         return Err(IngestError::Rejected(
@@ -359,12 +445,6 @@ async fn handle_meeting_create(
         return Err(IngestError::Rejected(
             "invalid: meeting title exceeds 255 characters".into(),
         ));
-    }
-    let version = require_single_tag(event, "v")?;
-    if version != "1" {
-        return Err(IngestError::Rejected(format!(
-            "invalid: unsupported meeting schema version {version}"
-        )));
     }
     let description = optional_single_tag(event, "about")?;
     let source_channel_id = optional_single_tag(event, "source")?
@@ -404,6 +484,17 @@ async fn handle_meeting_create(
             "invalid: meeting requires 2-{MAX_MEETING_PARTICIPANTS} participants"
         )));
     }
+    let moderator_pubkey = if protocol == MeetingProtocol::ModeratedBatonV1 {
+        let moderator = decode_pubkey(&require_single_tag(event, "moderator")?)?;
+        if !participant_pubkeys.contains(&moderator) {
+            return Err(IngestError::Rejected(
+                "invalid: meeting moderator must be in the frozen participant roster".into(),
+            ));
+        }
+        Some(moderator)
+    } else {
+        None
+    };
 
     let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
         PersistResult::Duplicate => {
@@ -415,30 +506,79 @@ async fn handle_meeting_create(
         }
         PersistResult::Inserted(tx) => tx,
     };
+    // Apply the rollout gate only after the idempotency guard: replaying the
+    // exact Create of an existing V1 remains a successful duplicate even when
+    // operators later disable creation of *new* V1 sessions. For a new event,
+    // returning here drops and rolls back the still-open transaction.
+    ensure_meeting_create_enabled(protocol, state.config.meeting_v1_create_enabled)?;
 
-    let (_, participants) = buzz_db::meeting::create_meeting_tx(
-        &mut tx,
-        CreateMeetingParams {
-            community_id: tenant.community(),
-            session_id,
-            title: &title,
-            description: description.as_deref(),
-            source_channel_id,
-            host_pubkey: &host_pubkey,
-            create_event_id: event.id.as_bytes(),
-            participant_pubkeys: &participant_pubkeys,
-        },
-    )
-    .await
-    .map_err(map_meeting_db_error)?;
-    buzz_db::meeting_floor::initialize_floor_tx(
-        &mut tx,
-        tenant.community(),
-        session_id,
-        &state.relay_keypair,
-    )
-    .await
-    .map_err(map_meeting_db_error)?;
+    let created_participant_pubkeys = match protocol {
+        MeetingProtocol::UniformV0 => {
+            let (_, participants) = buzz_db::meeting::create_meeting_tx(
+                &mut tx,
+                CreateMeetingParams {
+                    community_id: tenant.community(),
+                    session_id,
+                    title: &title,
+                    description: description.as_deref(),
+                    source_channel_id,
+                    host_pubkey: &host_pubkey,
+                    create_event_id: event.id.as_bytes(),
+                    participant_pubkeys: &participant_pubkeys,
+                },
+            )
+            .await
+            .map_err(map_meeting_db_error)?;
+            buzz_db::meeting::enqueue_meeting_event_tx(
+                &mut tx,
+                tenant.community(),
+                session_id,
+                event.id.as_bytes(),
+            )
+            .await
+            .map_err(map_meeting_db_error)?;
+            buzz_db::meeting_floor::initialize_floor_tx(
+                &mut tx,
+                tenant.community(),
+                session_id,
+                &state.relay_keypair,
+            )
+            .await
+            .map_err(map_meeting_db_error)?;
+            participants
+                .into_iter()
+                .map(|participant| participant.pubkey)
+                .collect::<Vec<_>>()
+        }
+        MeetingProtocol::ModeratedBatonV1 => {
+            let moderator_pubkey = moderator_pubkey.as_deref().ok_or_else(|| {
+                IngestError::Internal("error: missing validated V1 moderator".into())
+            })?;
+            let snapshot = buzz_db::meeting_baton::create_meeting_v1_tx(
+                &mut tx,
+                buzz_db::meeting_baton::CreateMeetingV1Params {
+                    community_id: tenant.community(),
+                    session_id,
+                    title: &title,
+                    description: description.as_deref(),
+                    source_channel_id,
+                    host_pubkey: &host_pubkey,
+                    moderator_pubkey,
+                    create_event_id: event.id.as_bytes(),
+                    participant_pubkeys: &participant_pubkeys,
+                    relay_keys: &state.relay_keypair,
+                    config: buzz_db::meeting_baton::BatonConfig::default(),
+                },
+            )
+            .await
+            .map_err(map_meeting_db_error)?;
+            snapshot
+                .participants
+                .into_iter()
+                .map(|participant| participant.pubkey)
+                .collect::<Vec<_>>()
+        }
+    };
 
     tx.commit()
         .await
@@ -451,21 +591,22 @@ async fn handle_meeting_create(
     )
     .increment(1);
 
-    for participant in &participants {
-        state.invalidate_membership(tenant, session_id, &participant.pubkey);
+    for participant_pubkey in &created_participant_pubkeys {
+        state.invalidate_membership(tenant, session_id, participant_pubkey);
     }
 
-    dispatch_meeting_command_event(tenant, state, event, session_id).await;
-
+    // Discovery metadata and membership notifications are non-canonical,
+    // best-effort side effects. Create and initial State ordering is owned by
+    // the transactional meeting outbox above.
     if let Err(error) = emit_group_discovery_events(tenant, state, session_id).await {
         warn!(meeting = %session_id, "meeting create: discovery emission failed: {error}");
     }
-    for participant in &participants {
+    for participant_pubkey in &created_participant_pubkeys {
         if let Err(error) = emit_membership_notification(
             tenant,
             state,
             session_id,
-            &participant.pubkey,
+            participant_pubkey,
             &host_pubkey,
             KIND_MEMBER_ADDED_NOTIFICATION,
         )
@@ -473,7 +614,7 @@ async fn handle_meeting_create(
         {
             warn!(
                 meeting = %session_id,
-                participant = %hex::encode(&participant.pubkey),
+                participant = %hex::encode(participant_pubkey),
                 "meeting create: membership notification failed: {error}"
             );
         }
@@ -488,7 +629,13 @@ async fn handle_meeting_create(
                 "meeting_id": session_id.to_string(),
                 "room_kind": "meeting",
                 "status": "active",
-                "participant_count": participants.len(),
+                "participant_count": created_participant_pubkeys.len(),
+                "schema_version": match protocol {
+                    MeetingProtocol::UniformV0 => 1,
+                    MeetingProtocol::ModeratedBatonV1 => 2,
+                },
+                "floor_policy_version": protocol.policy(),
+                "moderator": moderator_pubkey.as_deref().map(hex::encode),
             })
         ),
     })
@@ -514,6 +661,48 @@ async fn handle_meeting_end(
             "restricted: token not authorized for this meeting".into(),
         ));
     }
+    let actor_pubkey = auth.pubkey().to_bytes();
+    let is_participant = state
+        .is_member_cached(tenant.community(), session_id, &actor_pubkey)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!(
+                "error: checking meeting participant access: {error}"
+            ))
+        })?;
+    let community_role = if is_participant {
+        None
+    } else {
+        state
+            .db
+            .get_relay_member(tenant.community(), &auth.pubkey().to_hex())
+            .await
+            .map_err(map_meeting_db_error)?
+            .map(|member| member.role)
+    };
+    if !meeting_end_preflight_allowed(is_participant, community_role.as_deref()) {
+        return Err(IngestError::AuthFailed(
+            "restricted: not authorized for this meeting".into(),
+        ));
+    }
+    let persisted_policy =
+        buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
+            .await
+            .map_err(map_meeting_db_error)?;
+    let protocol = MeetingProtocol::from_persisted(
+        persisted_policy.schema_version,
+        &persisted_policy.floor_policy_version,
+    )?;
+    match (protocol, persisted_policy.moderator_pubkey.as_ref()) {
+        (MeetingProtocol::UniformV0, None) | (MeetingProtocol::ModeratedBatonV1, Some(_)) => {}
+        _ => {
+            return Err(IngestError::Internal(
+                "error: meeting persisted protocol has an invalid moderator shape".into(),
+            ));
+        }
+    }
+    validate_meeting_end_protocol(event, protocol)?;
+
     let create_event_id_hex = require_single_tag(event, "e")?;
     let create_event_id = decode_event_id(&create_event_id_hex, "meeting create event id")?;
     let reason = require_single_tag(event, "reason")?;
@@ -535,20 +724,61 @@ async fn handle_meeting_end(
         PersistResult::Inserted(tx) => tx,
     };
 
-    let outcome = buzz_db::meeting::end_meeting_tx(
-        &mut tx,
-        EndMeetingParams {
-            community_id: tenant.community(),
-            session_id,
-            actor_pubkey: &actor_pubkey,
-            create_event_id: &create_event_id,
-            end_event_id: event.id.as_bytes(),
-        },
-    )
-    .await
-    .map_err(map_meeting_db_error)?;
+    let already_ended = match protocol {
+        MeetingProtocol::UniformV0 => {
+            let outcome = buzz_db::meeting::end_meeting_tx(
+                &mut tx,
+                EndMeetingParams {
+                    community_id: tenant.community(),
+                    session_id,
+                    actor_pubkey: &actor_pubkey,
+                    create_event_id: &create_event_id,
+                    end_event_id: event.id.as_bytes(),
+                },
+            )
+            .await
+            .map_err(map_meeting_db_error)?;
+            if outcome == EndMeetingOutcome::Ended {
+                buzz_db::meeting::enqueue_meeting_event_tx(
+                    &mut tx,
+                    tenant.community(),
+                    session_id,
+                    event.id.as_bytes(),
+                )
+                .await
+                .map_err(map_meeting_db_error)?;
+                buzz_db::meeting_floor::close_floor_for_end_tx(
+                    &mut tx,
+                    tenant.community(),
+                    session_id,
+                    &state.relay_keypair,
+                )
+                .await
+                .map_err(map_meeting_db_error)?;
+            }
+            outcome == EndMeetingOutcome::AlreadyEnded
+        }
+        MeetingProtocol::ModeratedBatonV1 => {
+            matches!(
+                buzz_db::meeting_baton::end_meeting_v1_tx(
+                    &mut tx,
+                    buzz_db::meeting_baton::EndMeetingV1Params {
+                        community_id: tenant.community(),
+                        session_id,
+                        actor_pubkey: &actor_pubkey,
+                        create_event_id: &create_event_id,
+                        end_event_id: event.id.as_bytes(),
+                        relay_keys: &state.relay_keypair,
+                    },
+                )
+                .await
+                .map_err(map_meeting_db_error)?,
+                buzz_db::meeting_baton::EndMeetingV1Outcome::AlreadyEnded
+            )
+        }
+    };
 
-    if outcome == EndMeetingOutcome::AlreadyEnded {
+    if already_ended {
         tx.rollback()
             .await
             .map_err(|e| IngestError::Internal(format!("error: rollback duplicate end: {e}")))?;
@@ -566,20 +796,12 @@ async fn handle_meeting_end(
         });
     }
 
-    buzz_db::meeting_floor::close_floor_for_end_tx(
-        &mut tx,
-        tenant.community(),
-        session_id,
-        &state.relay_keypair,
-    )
-    .await
-    .map_err(map_meeting_db_error)?;
-
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit meeting end: {e}")))?;
 
-    dispatch_meeting_command_event(tenant, state, event, session_id).await;
+    // Discovery metadata remains a best-effort projection. The canonical End
+    // and terminal State are delivered in causal order by the meeting outbox.
     if let Err(error) = emit_group_discovery_events(tenant, state, session_id).await {
         warn!(meeting = %session_id, "meeting end: discovery emission failed: {error}");
     }
@@ -593,6 +815,8 @@ async fn handle_meeting_end(
                 "meeting_id": session_id.to_string(),
                 "status": "ended",
                 "already_ended": false,
+                "schema_version": persisted_policy.schema_version,
+                "floor_policy_version": persisted_policy.floor_policy_version,
             })
         ),
     })
@@ -846,24 +1070,6 @@ async fn handle_meeting_floor_signal(
     }
 }
 
-async fn dispatch_meeting_command_event(
-    tenant: &TenantContext,
-    state: &Arc<AppState>,
-    event: &Event,
-    session_id: Uuid,
-) {
-    let stored = StoredEvent::with_received_at(event.clone(), Utc::now(), Some(session_id), true);
-    dispatch_persistent_event(
-        tenant,
-        state,
-        &stored,
-        event.kind.as_u16() as u32,
-        &event.pubkey.to_hex(),
-        None,
-    )
-    .await;
-}
-
 pub(crate) fn map_meeting_db_error(error: DbError) -> IngestError {
     match error {
         DbError::AccessDenied(_)
@@ -877,6 +1083,15 @@ pub(crate) fn map_meeting_db_error(error: DbError) -> IngestError {
 pub(crate) fn validate_meeting_tag_vocabulary(
     event: &Event,
     required: &[&str],
+    repeatable: &[&str],
+) -> Result<(), IngestError> {
+    validate_meeting_tag_schema(event, required, &[], repeatable)
+}
+
+fn validate_meeting_tag_schema(
+    event: &Event,
+    required: &[&str],
+    optional: &[&str],
     repeatable: &[&str],
 ) -> Result<(), IngestError> {
     let mut seen = std::collections::HashSet::with_capacity(event.tags.len());
@@ -922,9 +1137,9 @@ pub(crate) fn validate_meeting_tag_vocabulary(
             }
             continue;
         }
-        if !required.contains(&name) {
+        if !required.contains(&name) && !optional.contains(&name) {
             return Err(IngestError::Rejected(format!(
-                "invalid: tag {name} is not allowed on this Meeting V0 event"
+                "invalid: tag {name} is not allowed on this meeting event"
             )));
         }
         if parts.len() != 2 {
@@ -946,6 +1161,74 @@ pub(crate) fn validate_meeting_tag_vocabulary(
         }
     }
     Ok(())
+}
+
+fn meeting_create_protocol(event: &Event) -> Result<MeetingProtocol, IngestError> {
+    match require_single_tag(event, "v")?.as_str() {
+        "1" => {
+            validate_meeting_tag_schema(event, &["h", "name", "v"], &["about", "source"], &["p"])?;
+            Ok(MeetingProtocol::UniformV0)
+        }
+        "2" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "name", "v", "policy", "moderator"],
+                &["about", "source"],
+                &["p"],
+            )?;
+            let policy = require_single_tag(event, "policy")?;
+            if policy != MEETING_V1_POLICY {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: Meeting V1 policy must be {MEETING_V1_POLICY}"
+                )));
+            }
+            Ok(MeetingProtocol::ModeratedBatonV1)
+        }
+        version => Err(IngestError::Rejected(format!(
+            "invalid: unsupported meeting schema version {version}"
+        ))),
+    }
+}
+
+fn ensure_meeting_create_enabled(
+    protocol: MeetingProtocol,
+    meeting_v1_create_enabled: bool,
+) -> Result<(), IngestError> {
+    if protocol == MeetingProtocol::ModeratedBatonV1 && !meeting_v1_create_enabled {
+        return Err(IngestError::Rejected(
+            "restricted: Meeting V1 creation is disabled".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn meeting_end_preflight_allowed(is_participant: bool, community_role: Option<&str>) -> bool {
+    is_participant || matches!(community_role, Some("owner" | "admin"))
+}
+
+fn validate_meeting_end_protocol(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(), IngestError> {
+    match protocol {
+        MeetingProtocol::UniformV0 => {
+            validate_meeting_tag_schema(event, &["h", "e", "reason"], &[], &[])
+        }
+        MeetingProtocol::ModeratedBatonV1 => {
+            validate_meeting_tag_schema(event, &["h", "v", "policy", "e", "reason"], &[], &[])?;
+            if require_single_tag(event, "v")? != "2" {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting V1 End must use schema version 2".into(),
+                ));
+            }
+            if require_single_tag(event, "policy")? != MEETING_V1_POLICY {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: Meeting V1 End policy must be {MEETING_V1_POLICY}"
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn parse_positive_round(event: &Event) -> Result<i64, IngestError> {
@@ -2035,4 +2318,147 @@ async fn resume_workflow_after_approval(
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+}
+
+#[cfg(test)]
+mod meeting_protocol_tests {
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    use super::*;
+
+    fn meeting_create(tags: Vec<Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), "")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("test meeting event")
+    }
+
+    fn meeting_end(tags: Vec<Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), "")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("test meeting event")
+    }
+
+    fn tag(values: &[&str]) -> Tag {
+        Tag::parse(values.to_vec()).expect("test tag")
+    }
+
+    #[test]
+    fn v1_create_requires_exact_version_policy_and_tag_vocabulary() {
+        let session = Uuid::new_v4().to_string();
+        let moderator = "11".repeat(32);
+        let participant = "22".repeat(32);
+        let canonical = meeting_create(vec![
+            tag(&["h", &session]),
+            tag(&["name", "Protocol review"]),
+            tag(&["v", "2"]),
+            tag(&["policy", MEETING_V1_POLICY]),
+            tag(&["moderator", &moderator]),
+            tag(&["p", &participant]),
+        ]);
+        assert_eq!(
+            meeting_create_protocol(&canonical).expect("valid V1 create"),
+            MeetingProtocol::ModeratedBatonV1
+        );
+
+        let wrong_policy = meeting_create(vec![
+            tag(&["h", &session]),
+            tag(&["name", "Protocol review"]),
+            tag(&["v", "2"]),
+            tag(&["policy", "uniform-v0"]),
+            tag(&["moderator", &moderator]),
+            tag(&["p", &participant]),
+        ]);
+        assert!(meeting_create_protocol(&wrong_policy).is_err());
+
+        let unknown_tag = meeting_create(vec![
+            tag(&["h", &session]),
+            tag(&["name", "Protocol review"]),
+            tag(&["v", "2"]),
+            tag(&["policy", MEETING_V1_POLICY]),
+            tag(&["moderator", &moderator]),
+            tag(&["p", &participant]),
+            tag(&["unexpected", "value"]),
+        ]);
+        assert!(meeting_create_protocol(&unknown_tag).is_err());
+    }
+
+    #[test]
+    fn v0_create_cannot_smuggle_v1_policy_tags() {
+        let session = Uuid::new_v4().to_string();
+        let moderator = "11".repeat(32);
+        let participant = "22".repeat(32);
+        let event = meeting_create(vec![
+            tag(&["h", &session]),
+            tag(&["name", "Protocol review"]),
+            tag(&["v", "1"]),
+            tag(&["policy", MEETING_V1_POLICY]),
+            tag(&["moderator", &moderator]),
+            tag(&["p", &participant]),
+        ]);
+
+        assert!(meeting_create_protocol(&event).is_err());
+    }
+
+    #[test]
+    fn end_shape_is_selected_by_persisted_protocol() {
+        let session = Uuid::new_v4().to_string();
+        let create_event_id = "11".repeat(32);
+        let v1 = meeting_end(vec![
+            tag(&["h", &session]),
+            tag(&["v", "2"]),
+            tag(&["policy", MEETING_V1_POLICY]),
+            tag(&["e", &create_event_id]),
+            tag(&["reason", "manual"]),
+        ]);
+
+        assert!(validate_meeting_end_protocol(&v1, MeetingProtocol::ModeratedBatonV1).is_ok());
+        assert!(
+            validate_meeting_end_protocol(&v1, MeetingProtocol::UniformV0).is_err(),
+            "V1 tags must not be accepted merely because the kind is shared"
+        );
+
+        let v0 = meeting_end(vec![
+            tag(&["h", &session]),
+            tag(&["e", &create_event_id]),
+            tag(&["reason", "manual"]),
+        ]);
+        assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::UniformV0).is_ok());
+        assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::ModeratedBatonV1).is_err());
+    }
+
+    #[test]
+    fn persisted_protocol_mapping_fails_closed() {
+        assert_eq!(
+            MeetingProtocol::from_persisted(1, buzz_db::meeting_floor::FLOOR_POLICY_VERSION)
+                .expect("V0 mapping"),
+            MeetingProtocol::UniformV0
+        );
+        assert_eq!(
+            MeetingProtocol::from_persisted(2, MEETING_V1_POLICY).expect("V1 mapping"),
+            MeetingProtocol::ModeratedBatonV1
+        );
+        assert!(MeetingProtocol::from_persisted(1, MEETING_V1_POLICY).is_err());
+        assert!(
+            MeetingProtocol::from_persisted(2, buzz_db::meeting_floor::FLOOR_POLICY_VERSION)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn create_gate_only_controls_new_v1_sessions() {
+        assert!(ensure_meeting_create_enabled(MeetingProtocol::UniformV0, false).is_ok());
+        assert!(ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, true).is_ok());
+        assert!(ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, false).is_err());
+    }
+
+    #[test]
+    fn meeting_end_privacy_preflight_allows_participants_and_community_admins_only() {
+        assert!(meeting_end_preflight_allowed(true, None));
+        assert!(meeting_end_preflight_allowed(false, Some("owner")));
+        assert!(meeting_end_preflight_allowed(false, Some("admin")));
+        assert!(!meeting_end_preflight_allowed(false, Some("member")));
+        assert!(!meeting_end_preflight_allowed(false, None));
+    }
 }

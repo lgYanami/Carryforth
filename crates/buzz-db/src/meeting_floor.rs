@@ -1244,6 +1244,8 @@ pub async fn recover_due_floors(
           AND mr.session_id = ms.session_id \
           AND mr.round_number = ms.current_round \
          WHERE ms.status = 'active' \
+           AND ms.schema_version = 1 \
+           AND ms.floor_policy_version = 'uniform-v0' \
            AND ( \
              mr.session_id IS NULL \
              OR (mr.phase = 'claiming' AND ( \
@@ -1310,7 +1312,8 @@ pub async fn get_floor_snapshot(
     session_id: Uuid,
 ) -> Result<FloorSnapshot> {
     let row = sqlx::query(
-        "SELECT current_round FROM meeting_sessions \
+        "SELECT current_round, schema_version, floor_policy_version \
+         FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2",
     )
     .bind(community_id.as_uuid())
@@ -1318,6 +1321,13 @@ pub async fn get_floor_snapshot(
     .fetch_optional(&db.pool)
     .await?
     .ok_or_else(|| DbError::NotFound(format!("meeting {session_id}")))?;
+    let schema_version: i32 = row.try_get("schema_version")?;
+    let policy: String = row.try_get("floor_policy_version")?;
+    if schema_version != 1 || policy != FLOOR_POLICY_VERSION {
+        return Err(DbError::InvalidData(format!(
+            "meeting {session_id} is not a {FLOOR_POLICY_VERSION} session"
+        )));
+    }
     let current_round: i64 = row.try_get("current_round")?;
     let round = load_round_pool(db, community_id, session_id, current_round)
         .await?
@@ -1450,7 +1460,8 @@ async fn lock_session(
     session_id: Uuid,
 ) -> Result<SessionLock> {
     let row = sqlx::query(
-        "SELECT status, current_round, floor_revision \
+        "SELECT status, current_round, floor_revision, schema_version, \
+                floor_policy_version \
          FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 \
          FOR UPDATE",
@@ -1460,6 +1471,13 @@ async fn lock_session(
     .fetch_optional(tx.as_mut())
     .await?
     .ok_or_else(|| DbError::NotFound(format!("meeting {session_id}")))?;
+    let schema_version: i32 = row.try_get("schema_version")?;
+    let policy: String = row.try_get("floor_policy_version")?;
+    if schema_version != 1 || policy != FLOOR_POLICY_VERSION {
+        return Err(DbError::InvalidData(format!(
+            "meeting {session_id} is not a {FLOOR_POLICY_VERSION} session"
+        )));
+    }
     Ok(SessionLock {
         status: row.try_get("status")?,
         current_round: row.try_get("current_round")?,
@@ -2082,12 +2100,14 @@ async fn set_session_floor(
     let result = sqlx::query(
         "UPDATE meeting_sessions \
          SET current_round = $3, floor_revision = $4 \
-         WHERE community_id = $1 AND session_id = $2",
+         WHERE community_id = $1 AND session_id = $2 \
+           AND schema_version = 1 AND floor_policy_version = $5",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(round_number)
     .bind(floor_revision)
+    .bind(FLOOR_POLICY_VERSION)
     .execute(tx.as_mut())
     .await?;
     if result.rows_affected() != 1 {
