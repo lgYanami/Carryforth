@@ -1384,18 +1384,17 @@ async fn tokio_main(
         ));
     }
 
-    let mut runtime_supervisor = runtime_supervisor::RuntimeSupervisor::prepare(
+    let mut runtime_supervisor = runtime_supervisor::RuntimeSupervisorCoordinator::new(
         runtime_supervisor_config,
-        &relay.rest_client(),
+        relay.rest_client(),
         config.keys.public_key(),
-        startup_role_context.assignment_id,
-        &config.relay_url,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("Runtime supervision failed closed: {error}"))?;
-    config.runtime_fence = runtime_supervisor
-        .as_ref()
-        .map(runtime_supervisor::RuntimeSupervisor::fence);
+        config.relay_url.clone(),
+    );
+    config.runtime_fence_path = runtime_supervisor.fence_path();
+    runtime_supervisor
+        .prepare_startup(startup_role_context.assignment_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("Runtime supervision failed closed: {error}"))?;
 
     if !config.lazy_pool {
         match initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None)
@@ -1406,19 +1405,20 @@ async fn tokio_main(
                 pool_ready = true;
             }
             Err(error) => {
-                if let Some(supervisor) = runtime_supervisor.as_mut() {
-                    let _ = supervisor.mark_start_failed(error.to_string()).await;
-                }
+                let _ = runtime_supervisor
+                    .mark_start_failed(error.to_string())
+                    .await;
                 return Err(error);
             }
         }
     }
-    if let Some(supervisor) = runtime_supervisor.as_mut() {
-        supervisor
-            .mark_healthy()
-            .await
-            .map_err(|error| anyhow::anyhow!("Runtime health receipt failed: {error}"))?;
-    }
+    runtime_supervisor
+        .mark_healthy()
+        .await
+        .map_err(|error| anyhow::anyhow!("Runtime health receipt failed: {error}"))?;
+    let (runtime_supervisor, runtime_supervisor_task) = runtime_supervisor.spawn();
+    let role_brief_resolver =
+        role_brief_resolver.with_runtime_supervisor(runtime_supervisor.clone());
 
     relay
         .subscribe_membership_notifications()
@@ -1831,7 +1831,10 @@ async fn tokio_main(
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = managed_agent_env(&config.persona_env_vars, config.runtime_fence);
+                let env = managed_agent_env(
+                    &config.persona_env_vars,
+                    config.runtime_fence_path.as_deref(),
+                );
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -2660,29 +2663,34 @@ async fn tokio_main(
     // Agent-pool failure must retain state and open recovery instead of silently
     // minting a replacement logical Runtime. A timeout keeps local shutdown
     // authoritative and leaves state for the next trusted generation.
-    if let Some(supervisor) = runtime_supervisor.as_mut() {
-        let evidence_result = tokio::time::timeout(Duration::from_millis(750), async {
-            match main_loop_exit {
-                MainLoopExit::Graceful => supervisor.graceful_stop().await,
-                MainLoopExit::Abnormal(summary) => supervisor.abnormal_stop(summary).await,
+    let evidence_result = tokio::time::timeout(Duration::from_millis(750), async {
+        match main_loop_exit {
+            MainLoopExit::Graceful => runtime_supervisor.graceful_stop().await,
+            MainLoopExit::Abnormal(summary) => runtime_supervisor.abnormal_stop(summary).await,
+        }
+    })
+    .await;
+    match evidence_result {
+        Ok(Ok(())) => match main_loop_exit {
+            MainLoopExit::Graceful => {
+                tracing::info!("Runtime supervisor reconciled graceful harness stop")
             }
-        })
-        .await;
-        match evidence_result {
-            Ok(Ok(())) => match main_loop_exit {
-                MainLoopExit::Graceful => tracing::info!("managed Runtime retired gracefully"),
-                MainLoopExit::Abnormal(summary) => {
-                    tracing::warn!(summary, "managed Runtime recorded an abnormal harness exit")
-                }
-            },
-            Ok(Err(error)) => {
-                tracing::warn!("managed Runtime exit evidence failed: {error}")
+            MainLoopExit::Abnormal(summary) => {
+                tracing::warn!(
+                    summary,
+                    "Runtime supervisor reconciled abnormal harness exit"
+                )
             }
-            Err(_) => {
-                tracing::warn!("managed Runtime exit evidence timed out; recovery state retained")
-            }
+        },
+        Ok(Err(error)) => {
+            tracing::warn!("managed Runtime exit evidence failed: {error}")
+        }
+        Err(_) => {
+            tracing::warn!("managed Runtime exit evidence timed out; recovery state retained")
         }
     }
+    runtime_supervisor_task.abort();
+    let _ = runtime_supervisor_task.await;
 
     // Drain wake tasks gracefully rather than aborting: an in-flight
     // initialize_agent_pool observes the shutdown watch at its biased per-slot
@@ -3591,7 +3599,10 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = managed_agent_env(&config.persona_env_vars, config.runtime_fence);
+    let env = managed_agent_env(
+        &config.persona_env_vars,
+        config.runtime_fence_path.as_deref(),
+    );
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3769,7 +3780,10 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = managed_agent_env(&config.persona_env_vars, config.runtime_fence);
+    let env = managed_agent_env(
+        &config.persona_env_vars,
+        config.runtime_fence_path.as_deref(),
+    );
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3836,7 +3850,10 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: managed_agent_env(&config.persona_env_vars, config.runtime_fence),
+            extra_env: managed_agent_env(
+                &config.persona_env_vars,
+                config.runtime_fence_path.as_deref(),
+            ),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
@@ -3846,24 +3863,26 @@ impl PoolStartup {
 
 fn managed_agent_env(
     persona_env: &[(String, String)],
-    runtime_fence: Option<buzz_project_view::v2::RuntimeFence>,
+    runtime_fence_path: Option<&std::path::Path>,
 ) -> Vec<(String, String)> {
     let mut env = persona_env
         .iter()
         .filter(|(name, _)| {
             !matches!(
                 name.as_str(),
-                "BUZZ_MANAGED_AGENT" | "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH"
+                "BUZZ_MANAGED_AGENT"
+                    | "BUZZ_RUNTIME_ID"
+                    | "BUZZ_RUNTIME_EPOCH"
+                    | runtime_supervisor::RUNTIME_FENCE_PATH_ENV
             )
         })
         .cloned()
         .collect::<Vec<_>>();
     env.push(("BUZZ_MANAGED_AGENT".to_owned(), "1".to_owned()));
-    if let Some(fence) = runtime_fence {
-        env.push(("BUZZ_RUNTIME_ID".to_owned(), fence.runtime_id.to_string()));
+    if let Some(path) = runtime_fence_path {
         env.push((
-            "BUZZ_RUNTIME_EPOCH".to_owned(),
-            fence.runtime_epoch.to_string(),
+            runtime_supervisor::RUNTIME_FENCE_PATH_ENV.to_owned(),
+            path.to_string_lossy().into_owned(),
         ));
     }
     env
@@ -4303,6 +4322,12 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                     value: "1".into(),
                 },
             ];
+            if let Some(path) = &config.runtime_fence_path {
+                env.push(EnvVar {
+                    name: runtime_supervisor::RUNTIME_FENCE_PATH_ENV.into(),
+                    value: path.to_string_lossy().into_owned(),
+                });
+            }
             // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
             // so the MCP server can attach it to every signed event.
             if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
@@ -5113,7 +5138,7 @@ mod build_mcp_servers_tests {
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
-            runtime_fence: None,
+            runtime_fence_path: None,
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
@@ -5155,6 +5180,21 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn session_new_mcp_server_receives_dynamic_runtime_fence_path() {
+        let mut config = test_config();
+        config.runtime_fence_path = Some(std::path::PathBuf::from("/tmp/buzz-runtime.fence.json"));
+        let servers = build_mcp_servers(&config);
+        assert_eq!(
+            servers[0]
+                .env
+                .iter()
+                .find(|env| env.name == runtime_supervisor::RUNTIME_FENCE_PATH_ENV)
+                .map(|env| env.value.as_str()),
+            Some("/tmp/buzz-runtime.fence.json")
+        );
+    }
+
+    #[test]
     fn managed_runtime_marker_overrides_persona_value() {
         let env = managed_agent_env(
             &[
@@ -5175,31 +5215,28 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn runtime_fence_overrides_persona_values_as_one_pair() {
-        let runtime_id = Uuid::new_v4();
-        let expected_runtime_id = runtime_id.to_string();
+    fn runtime_fence_path_overrides_persona_and_removes_static_pair() {
+        let expected_path = std::path::Path::new("/tmp/buzz-runtime.fence.json");
         let env = managed_agent_env(
             &[
                 ("BUZZ_RUNTIME_ID".to_owned(), Uuid::new_v4().to_string()),
                 ("BUZZ_RUNTIME_EPOCH".to_owned(), "999".to_owned()),
+                (
+                    runtime_supervisor::RUNTIME_FENCE_PATH_ENV.to_owned(),
+                    "/tmp/persona-controlled".to_owned(),
+                ),
             ],
-            Some(buzz_project_view::v2::RuntimeFence {
-                runtime_id,
-                runtime_epoch: 7,
-            }),
+            Some(expected_path),
         );
         assert_eq!(
             env.iter()
-                .find(|(name, _)| name == "BUZZ_RUNTIME_ID")
+                .find(|(name, _)| name == runtime_supervisor::RUNTIME_FENCE_PATH_ENV)
                 .map(|(_, value)| value.as_str()),
-            Some(expected_runtime_id.as_str())
+            expected_path.to_str()
         );
-        assert_eq!(
-            env.iter()
-                .find(|(name, _)| name == "BUZZ_RUNTIME_EPOCH")
-                .map(|(_, value)| value.as_str()),
-            Some("7")
-        );
+        assert!(!env
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH")));
     }
 
     #[test]
@@ -5340,7 +5377,7 @@ mod error_outcome_emission_tests {
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
-            runtime_fence: None,
+            runtime_fence_path: None,
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,

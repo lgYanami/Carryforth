@@ -1,6 +1,8 @@
 //! Shared verified Project View v2 snapshot reader for CLI commands.
 
 use std::collections::HashSet;
+use std::io::Read as _;
+use std::path::Path;
 use std::time::Duration;
 
 use buzz_core::kind::{
@@ -24,6 +26,8 @@ pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
 pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_ENTITY_PAGE_SIZE: usize = 500;
+const RUNTIME_FENCE_FILE_MAX_BYTES: u64 = 4 * 1024;
+const RUNTIME_FENCE_PATH_ENV: &str = "BUZZ_RUNTIME_FENCE_PATH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectViewSchema {
@@ -464,8 +468,62 @@ pub(crate) fn is_managed_runtime() -> bool {
 }
 
 pub(crate) fn runtime_fence_from_env() -> Result<Option<RuntimeFence>, CliError> {
-    let runtime_id = std::env::var("BUZZ_RUNTIME_ID").ok();
-    let runtime_epoch = std::env::var("BUZZ_RUNTIME_EPOCH").ok();
+    if let Some(path) = std::env::var_os(RUNTIME_FENCE_PATH_ENV) {
+        return runtime_fence_from_file(Path::new(&path));
+    }
+    runtime_fence_from_legacy_env(
+        std::env::var("BUZZ_RUNTIME_ID").ok().as_deref(),
+        std::env::var("BUZZ_RUNTIME_EPOCH").ok().as_deref(),
+    )
+}
+
+fn runtime_fence_from_file(path: &Path) -> Result<Option<RuntimeFence>, CliError> {
+    if !path.is_absolute() {
+        return Err(CliError::Auth(format!(
+            "{RUNTIME_FENCE_PATH_ENV} must be an absolute path"
+        )));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::Auth(format!(
+                "read managed Runtime fence {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(RUNTIME_FENCE_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            CliError::Auth(format!(
+                "read managed Runtime fence {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > RUNTIME_FENCE_FILE_MAX_BYTES {
+        return Err(CliError::Auth(format!(
+            "managed Runtime fence {} exceeds {RUNTIME_FENCE_FILE_MAX_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let runtime_fence: RuntimeFence = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::Auth(format!(
+            "invalid managed Runtime fence {}: {error}",
+            path.display()
+        ))
+    })?;
+    runtime_fence
+        .validate()
+        .map_err(|error| CliError::Auth(format!("invalid managed runtime fence: {error}")))?;
+    Ok(Some(runtime_fence))
+}
+
+fn runtime_fence_from_legacy_env(
+    runtime_id: Option<&str>,
+    runtime_epoch: Option<&str>,
+) -> Result<Option<RuntimeFence>, CliError> {
     match (runtime_id, runtime_epoch) {
         (None, None) => Ok(None),
         (Some(runtime_id), Some(runtime_epoch)) => {
@@ -549,9 +607,10 @@ pub(crate) fn integrity_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_history_cursor, history_cursor_precedes, parse_history_cursor, RoleHistoryCursor,
+        format_history_cursor, history_cursor_precedes, parse_history_cursor,
+        runtime_fence_from_file, runtime_fence_from_legacy_env, RoleHistoryCursor,
     };
-    use buzz_project_view::v2::RoleContinuityEntity;
+    use buzz_project_view::v2::{RoleContinuityEntity, RuntimeFence};
     use uuid::Uuid;
 
     #[test]
@@ -588,5 +647,49 @@ mod tests {
         assert!(history_cursor_precedes(high, low_id));
         assert!(history_cursor_precedes(high, handoff));
         assert!(!history_cursor_precedes(low_id, high));
+    }
+
+    #[test]
+    fn runtime_fence_file_is_authoritative_and_fail_closed() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let path = directory.path().join("runtime.fence.json");
+        let expected = RuntimeFence {
+            runtime_id: Uuid::new_v4(),
+            runtime_epoch: 7,
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&expected).expect("serialize Runtime fence"),
+        )
+        .expect("write Runtime fence");
+        assert_eq!(
+            runtime_fence_from_file(&path).expect("read Runtime fence"),
+            Some(expected)
+        );
+
+        std::fs::write(&path, br#"{"runtime_id":"not-a-uuid","runtime_epoch":7}"#)
+            .expect("write malformed Runtime fence");
+        assert!(runtime_fence_from_file(&path).is_err());
+        std::fs::remove_file(&path).expect("remove Runtime fence");
+        assert_eq!(
+            runtime_fence_from_file(&path).expect("missing fence is unsupervised"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_fence_requires_one_valid_pair() {
+        let runtime_id = Uuid::new_v4();
+        let runtime_id_text = runtime_id.to_string();
+        assert_eq!(
+            runtime_fence_from_legacy_env(Some(&runtime_id_text), Some("3"))
+                .expect("parse legacy Runtime fence"),
+            Some(RuntimeFence {
+                runtime_id,
+                runtime_epoch: 3,
+            })
+        );
+        assert!(runtime_fence_from_legacy_env(Some(&runtime_id_text), None).is_err());
+        assert!(runtime_fence_from_legacy_env(Some("not-a-uuid"), Some("3")).is_err());
     }
 }

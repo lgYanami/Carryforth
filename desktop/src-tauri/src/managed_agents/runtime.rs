@@ -1727,6 +1727,7 @@ pub fn spawn_agent_child(
     command
         .env_remove("BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY")
         .env_remove("BUZZ_RUNTIME_SUPERVISION_STATE_PATH")
+        .env_remove("BUZZ_RUNTIME_FENCE_PATH")
         .env_remove("BUZZ_RUNTIME_ID")
         .env_remove("BUZZ_RUNTIME_EPOCH");
     match std::env::var("BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY") {

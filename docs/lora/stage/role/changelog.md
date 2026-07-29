@@ -1,5 +1,55 @@
 # 角色连续性变更记录
 
+## 2026-07-29 — 阶段 9：运行中 Runtime 动态收敛
+
+### 每轮 Role context 与 Runtime 原子对账
+
+- `buzz-acp` 增加独立的 Runtime supervisor coordinator worker。启动时仍在首个模型进程
+  之前取得初始 epoch；启动完成后，每个完整 turn 的 verified Role Brief 必须先携带当前
+  Assignment 与 coordinator 对账，得到确认后才会作为 `assigned/candidate` context
+  交给 Agent。
+- coordinator 在每轮重新读取 authenticated Runtime status，并串行处理 Assignment
+  替换、candidate/assigned 转换以及 supervisor binding 的新增、撤销和重新注册。仍然
+  current 且 lease 有效的 Runtime 保持原 logical Runtime/epoch；失效或切换时先暂停旧
+  续租并撤下本地 fence，再按既有持久 recovery/backoff 规则恢复或启动新 Runtime。
+  因而不需要重启 ACP 或 Agent pool，就能在下一完整 turn 收敛。
+- Role Brief snapshot、Assignment 组装或 Runtime 对账失败时，不复用旧 Brief；ACP 注入
+  明确的 `project_view_unavailable` 或 `runtime_supervision_unavailable`。两段读取共用
+  原有 12 秒 turn-context deadline。长 recovery/backoff 在独立 worker 内继续，不阻塞
+  Relay 主循环；超时请求的后续 suspend 命令会再次撤下 fence。
+- verified Assignment 消失时才清除 pair-scoped 恢复状态；单纯 snapshot/网络故障只暂停
+  Agent 写入并保留受信恢复坐标。Assignment 结束后仍由 Relay 最终 fencing，正在执行的
+  旧 turn 不能借本地切换复活旧任期。
+
+### 动态 fence 文件与进程边界
+
+- ACP 不再把启动时静态 `BUZZ_RUNTIME_ID`/`BUZZ_RUNTIME_EPOCH` 复制给长期运行的模型
+  进程，而是为每个 harness generation 生成与私有恢复路径不可互推的独立
+  `BUZZ_RUNTIME_FENCE_PATH`。当前 `RuntimeFence` 以原子写和仅 owner 可读权限发布；
+  同一路径在 Runtime/epoch 改变时更新，在不可验证、binding 撤销或 harness 停止时删除。
+- `buzz-cli` 的 managed Project View/Role 写入在每次签名前重新读取该文件，并优先于旧的
+  静态 pair。文件缺失表示当前不附带 fence，格式损坏、超限或非绝对路径则 fail closed；
+  legacy `BUZZ_RUNTIME_ID`/`BUZZ_RUNTIME_EPOCH` 仅保留给非 ACP 的兼容调用。
+- fence 文件不是授权根，也不包含 supervisor 私钥或持久恢复状态。模型进程能够读取或
+  破坏它，但最多让自己的 CLI 写入失败；Assignment、binding、runtime ID、epoch、lease
+  与签名者仍由 Relay 在 Project 事务内做最终校验。
+- Agent 子进程和 session MCP server 只接收 harness 派生的 fence 路径。persona、父进程
+  和 Desktop 自定义环境不能覆盖该路径；Desktop 同时把它加入 reserved/ambient-strip
+  集合。supervisor 私钥与恢复状态路径继续只存在于受信 ACP harness。
+
+### 验证与范围
+
+- 新增真实 HTTP mock 纵向测试，覆盖运行中 binding 撤销、重新注册、Assignment 替换、
+  新 Runtime fence 发布及 graceful stop；另覆盖 current lease/epoch 判断、动态 fence
+  权限与 round-trip、CLI 文件损坏/缺失/legacy pair，以及 Agent/MCP 环境隔离。
+- `buzz-acp` `610/610`、`buzz-cli` `264/264`、Desktop Tauri `1644/1644` 非 ignored
+  测试通过；workspace 与 Desktop all-targets check/clippy（warnings denied）及 Rust
+  formatting gate 通过。
+- 本阶段关闭阶段 8 “运行中新增 Assignment 或 binding 需要下一次 harness generation”
+  的限制。operator supervisor 私钥仍必须在 ACP 启动前配置；运行中不能把新的秘密身份
+  注入既有受信进程。动态收敛发生在完整 turn 边界，长 turn 中途的并发变化继续由 Relay
+  command fencing 保底。
+
 ## 2026-07-29 — 阶段 8：ACP Supervisor Adapter
 
 ### 受信 harness 与 Agent 进程隔离

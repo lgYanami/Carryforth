@@ -23,6 +23,7 @@ use crate::relay::RestClient;
 
 const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 const ROLE_BRIEF_TIMEOUT: Duration = Duration::from_secs(12);
+const RUNTIME_SUSPEND_TIMEOUT: Duration = Duration::from_secs(1);
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_ENTITY_PAGE_SIZE: usize = 500;
 
@@ -56,11 +57,12 @@ impl RoleContextResolution {
     }
 }
 
-/// Stateless resolver that re-reads and verifies the current v2 snapshot.
+/// Resolver that re-reads the current v2 snapshot and optionally gates Runtime.
 #[derive(Debug, Clone)]
 pub struct RoleBriefResolver {
     rest_client: RestClient,
     member_pubkey: PublicKey,
+    runtime_supervisor: Option<crate::runtime_supervisor::RuntimeSupervisorClient>,
 }
 
 impl RoleBriefResolver {
@@ -70,40 +72,95 @@ impl RoleBriefResolver {
         Self {
             rest_client,
             member_pubkey,
+            runtime_supervisor: None,
         }
+    }
+
+    /// Gate assigned/candidate Briefs through the trusted Runtime coordinator.
+    #[must_use]
+    pub(crate) fn with_runtime_supervisor(
+        mut self,
+        runtime_supervisor: crate::runtime_supervisor::RuntimeSupervisorClient,
+    ) -> Self {
+        self.runtime_supervisor = Some(runtime_supervisor);
+        self
     }
 
     /// Resolve with a hard outer bound and convert every failure into a
     /// fail-closed prompt section. No previous Brief is cached or reused.
     pub async fn resolve_bounded(&self) -> RoleContextResolution {
-        match tokio::time::timeout(ROLE_BRIEF_TIMEOUT, self.resolve_verified()).await {
-            Ok(Ok(snapshot)) => match snapshot.brief_for(self.member_pubkey, Utc::now()) {
-                Ok(brief) => {
-                    let status = match &brief.state {
-                        RoleBriefMemberState::Candidate { .. } => "candidate",
-                        RoleBriefMemberState::Assigned { .. } => "assigned",
-                    };
-                    RoleContextResolution {
-                        markdown: render_role_brief_markdown(&brief),
-                        status,
-                        assignment_id: brief.assignment_id(),
-                        project_revision: Some(brief.project_revision),
-                        projection_generation: Some(brief.projection_generation),
-                        error_code: None,
-                    }
-                }
-                Err(error) => RoleContextResolution::unavailable(
+        let deadline = tokio::time::Instant::now() + ROLE_BRIEF_TIMEOUT;
+        let snapshot = match tokio::time::timeout_at(deadline, self.resolve_verified()).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
+                self.suspend_runtime().await;
+                return RoleContextResolution::unavailable("project_view_unavailable", &error);
+            }
+            Err(_) => {
+                self.suspend_runtime().await;
+                return RoleContextResolution::unavailable(
+                    "project_view_unavailable",
+                    "Role Brief resolution timed out",
+                );
+            }
+        };
+        let brief = match snapshot.brief_for(self.member_pubkey, Utc::now()) {
+            Ok(brief) => brief,
+            Err(error) => {
+                self.suspend_runtime().await;
+                return RoleContextResolution::unavailable(
                     "project_view_unavailable",
                     &error.to_string(),
-                ),
-            },
-            Ok(Err(error)) => {
-                RoleContextResolution::unavailable("project_view_unavailable", &error)
+                );
             }
-            Err(_) => RoleContextResolution::unavailable(
-                "project_view_unavailable",
-                "Role Brief resolution timed out",
-            ),
+        };
+        if let Some(supervisor) = &self.runtime_supervisor {
+            match tokio::time::timeout_at(deadline, supervisor.reconcile(brief.assignment_id()))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.suspend_runtime().await;
+                    return RoleContextResolution::unavailable(
+                        "runtime_supervision_unavailable",
+                        &error,
+                    );
+                }
+                Err(_) => {
+                    self.suspend_runtime().await;
+                    return RoleContextResolution::unavailable(
+                        "runtime_supervision_unavailable",
+                        "Runtime supervision reconciliation timed out",
+                    );
+                }
+            }
+        }
+        let status = match &brief.state {
+            RoleBriefMemberState::Candidate { .. } => "candidate",
+            RoleBriefMemberState::Assigned { .. } => "assigned",
+        };
+        RoleContextResolution {
+            markdown: render_role_brief_markdown(&brief),
+            status,
+            assignment_id: brief.assignment_id(),
+            project_revision: Some(brief.project_revision),
+            projection_generation: Some(brief.projection_generation),
+            error_code: None,
+        }
+    }
+
+    async fn suspend_runtime(&self) {
+        let Some(supervisor) = &self.runtime_supervisor else {
+            return;
+        };
+        match tokio::time::timeout(RUNTIME_SUSPEND_TIMEOUT, supervisor.suspend()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("failed to suspend managed Runtime fence: {error}");
+            }
+            Err(_) => {
+                tracing::warn!("timed out suspending managed Runtime fence");
+            }
         }
     }
 

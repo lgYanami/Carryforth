@@ -65,6 +65,7 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_API_TOKEN",
     "BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY",
     "BUZZ_RUNTIME_SUPERVISION_STATE_PATH",
+    "BUZZ_RUNTIME_FENCE_PATH",
     "BUZZ_RUNTIME_ID",
     "BUZZ_RUNTIME_EPOCH",
     // Relay URL: overriding would let a malicious config redirect the

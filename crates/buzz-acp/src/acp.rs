@@ -425,10 +425,12 @@ impl AcpClient {
         // The harness may be a trusted Runtime supervisor, but the
         // model-facing Agent process never is. Strip both the supervisor key
         // and its durable state capability even if an embedding forgot to
-        // consume them before starting Tokio. Only BUZZ_RUNTIME_ID/EPOCH may
-        // cross this boundary through the explicit extra_env allowlist below.
+        // consume them before starting Tokio. Only the derived, non-secret
+        // Runtime fence file path may cross this boundary through the explicit
+        // extra_env allowlist below.
         cmd.env_remove(crate::runtime_supervisor::SUPERVISOR_PRIVATE_KEY_ENV)
             .env_remove(crate::runtime_supervisor::SUPERVISION_STATE_PATH_ENV)
+            .env_remove(crate::runtime_supervisor::RUNTIME_FENCE_PATH_ENV)
             .env_remove("BUZZ_RUNTIME_ID")
             .env_remove("BUZZ_RUNTIME_EPOCH");
 
@@ -461,13 +463,18 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
+            if matches!(key.as_str(), "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH") {
+                // Static coordinates go stale when Assignment/binding changes.
+                // ACP children must use the dynamic fence file exclusively.
+                continue;
+            }
             if matches!(
                 key.as_str(),
-                "BUZZ_MANAGED_AGENT" | "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH"
+                "BUZZ_MANAGED_AGENT" | crate::runtime_supervisor::RUNTIME_FENCE_PATH_ENV
             ) {
                 // These are harness-owned security and fencing values. A
                 // parent-shell value must neither downgrade managed mode nor
-                // replace the server-issued runtime coordinate.
+                // redirect the Agent to a different fence file.
                 cmd.env(key, value);
                 continue;
             }
