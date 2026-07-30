@@ -2322,6 +2322,7 @@ async fn unresolved_handoffs_json_tx(
         "SELECT handoff_id, source_speech_event_id, from_pubkey, to_pubkey, \
                 reason_type, reason_text, created_at, question_state, attempt_count, \
                 last_offer_id, last_grant_id, last_attempt_outcome, blocked_by, \
+                moderator_retry_blocked_fingerprint IS NOT NULL AS moderator_retry_blocked, \
                 eligible_decision_epoch \
          FROM meeting_directed_handoffs \
          WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
@@ -2354,6 +2355,7 @@ async fn unresolved_handoffs_json_tx(
                 "last_grant_id": last_grant_id.as_deref().map(hex::encode),
                 "last_attempt_outcome": row.try_get::<Option<String>, _>("last_attempt_outcome")?,
                 "blocked_by": row.try_get::<Option<String>, _>("blocked_by")?,
+                "moderator_retry_blocked": row.try_get::<bool, _>("moderator_retry_blocked")?,
                 "eligible_decision_epoch": row.try_get::<i64, _>("eligible_decision_epoch")?,
             }))
         })
@@ -9703,6 +9705,20 @@ mod tests {
         .expect("load timed-out Handoff suppression");
         assert_eq!(question_state, "open");
         assert!(suppression.is_some());
+        let suppressed_state = latest_state_content(&meeting).await;
+        let projected_handoff = suppressed_state["unresolved_handoffs"]
+            .as_array()
+            .and_then(|handoffs| {
+                handoffs
+                    .iter()
+                    .find(|handoff| handoff["handoff_id"] == hex::encode(&handoff_id))
+            })
+            .expect("suppressed Handoff remains visible in Relay State");
+        assert_eq!(
+            projected_handoff["moderator_retry_blocked"],
+            Value::Bool(true),
+            "ACP must be able to distinguish a timeout-suppressed Handoff from a startable one"
+        );
 
         let recovered = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
             .await

@@ -91,7 +91,6 @@ pub(super) enum MeetingTurnKind {
     V0Intent,
     V0Granted,
     V1Intent,
-    V1ModeratorAgenda,
     V1ModeratorControl,
     V1Granted,
 }
@@ -100,7 +99,7 @@ impl MeetingTurnKind {
     pub(super) fn is_v1(self) -> bool {
         matches!(
             self,
-            Self::V1Intent | Self::V1ModeratorAgenda | Self::V1ModeratorControl | Self::V1Granted
+            Self::V1Intent | Self::V1ModeratorControl | Self::V1Granted
         )
     }
 }
@@ -626,12 +625,7 @@ impl MeetingCoordinator {
             .filter(|running| {
                 running.cancellation_requested
                     && running.v0_grant_capacity_credit
-                    && matches!(
-                        running.request.kind,
-                        MeetingTurnKind::V1Intent
-                            | MeetingTurnKind::V1ModeratorAgenda
-                            | MeetingTurnKind::V1ModeratorControl
-                    )
+                    && matches!(running.request.kind, MeetingTurnKind::V1Intent)
             })
             .count();
         let required =
@@ -641,20 +635,13 @@ impl MeetingCoordinator {
             .values()
             .filter(|running| {
                 !running.cancellation_requested
-                    && matches!(
-                        running.request.kind,
-                        MeetingTurnKind::V1Intent
-                            | MeetingTurnKind::V1ModeratorAgenda
-                            | MeetingTurnKind::V1ModeratorControl
-                    )
+                    && matches!(running.request.kind, MeetingTurnKind::V1Intent)
             })
             .map(|running| {
                 (
                     match running.request.kind {
                         MeetingTurnKind::V1Intent => 0,
-                        MeetingTurnKind::V1ModeratorAgenda
-                        | MeetingTurnKind::V1ModeratorControl => 1,
-                        _ => 2,
+                        _ => 1,
                     },
                     running.request.session_id,
                 )
@@ -666,11 +653,7 @@ impl MeetingCoordinator {
             self.v1.mark_cross_protocol_preempted(session_id);
             if self.mark_running_turn_for_cancellation(
                 session_id,
-                Some(&[
-                    MeetingTurnKind::V1Intent,
-                    MeetingTurnKind::V1ModeratorAgenda,
-                    MeetingTurnKind::V1ModeratorControl,
-                ]),
+                Some(&[MeetingTurnKind::V1Intent]),
                 true,
             ) {
                 ready.insert(session_id);
@@ -1224,7 +1207,6 @@ impl V0MeetingCoordinator {
                     .await;
             }
             MeetingTurnKind::V1Intent
-            | MeetingTurnKind::V1ModeratorAgenda
             | MeetingTurnKind::V1ModeratorControl
             | MeetingTurnKind::V1Granted => {
                 tracing::error!("V1 Meeting turn was routed to the V0 controller");
@@ -1760,7 +1742,6 @@ impl V0MeetingCoordinator {
             MeetingTurnKind::V0Granted => self.pending.push_front(request),
             MeetingTurnKind::V0Intent => self.pending.push_back(request),
             MeetingTurnKind::V1Intent
-            | MeetingTurnKind::V1ModeratorAgenda
             | MeetingTurnKind::V1ModeratorControl
             | MeetingTurnKind::V1Granted => {
                 tracing::error!("V1 Meeting turn was queued in the V0 controller");
@@ -2956,7 +2937,6 @@ fn format_correction_prompt(kind: MeetingTurnKind) -> String {
                 .to_string()
         }
         MeetingTurnKind::V1Intent
-        | MeetingTurnKind::V1ModeratorAgenda
         | MeetingTurnKind::V1ModeratorControl
         | MeetingTurnKind::V1Granted => {
             "V1 Meeting format correction is owned by the V1 controller.".to_string()
@@ -3616,14 +3596,13 @@ mod tests {
 
     #[test]
     fn moderator_turn_kinds_route_to_the_v1_controller() {
-        assert!(MeetingTurnKind::V1ModeratorAgenda.is_v1());
         assert!(MeetingTurnKind::V1ModeratorControl.is_v1());
         assert!(!MeetingTurnKind::V0Intent.is_v1());
         assert!(!MeetingTurnKind::V0Granted.is_v1());
     }
 
     #[test]
-    fn queued_v0_grants_preempt_v1_lower_priority_turns_but_never_granted() {
+    fn queued_v0_grants_preempt_v1_intent_but_not_moderator_or_granted_turns() {
         let keys = Keys::generate();
         let rest = RestClient {
             http: reqwest::Client::new(),
@@ -3676,10 +3655,7 @@ mod tests {
         ));
 
         let preemptions: BTreeSet<_> = coordinator.take_preemptions().into_iter().collect();
-        assert_eq!(
-            preemptions,
-            BTreeSet::from([v1_intent_session, v1_moderator_session])
-        );
+        assert_eq!(preemptions, BTreeSet::from([v1_intent_session]));
         assert!(coordinator
             .running_turns
             .values()
@@ -3689,7 +3665,7 @@ mod tests {
             .running_turns
             .values()
             .find(|running| running.request.session_id == v1_moderator_session)
-            .is_some_and(|running| running.cancellation_requested));
+            .is_some_and(|running| !running.cancellation_requested));
         for granted_session in [v1_granted_session, v0_granted_session] {
             assert!(coordinator
                 .running_turns
