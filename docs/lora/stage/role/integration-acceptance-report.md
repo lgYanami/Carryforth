@@ -1,58 +1,73 @@
 # 角色连续性集成验收报告
 
-> 结论：**不通过**
+> 结论：**有条件通过**
 >
-> 原因：真实 Relay/CLI 纵向测试在 v1→v2 cutover 后稳定产生一份无法由共享 SDK
-> 组装的 Project View 快照。该问题阻断第一个 Human–Agent 黄金路径，属于 P1。
+> Project View、Role Continuity、ACP Role Context、Runtime supervision、数据库事务、
+> 真实 Relay/CLI 纵向链路以及全仓回归均通过；没有发现未关闭的 P0/P1。
 >
-> 本报告对应
-> [角色连续性集成验收方案](./integration-acceptance-plan.md)。验收期间未修改生产实现。
+> 唯一未完成的必选观察项是：本轮无法自动驱动真实 Tauri WebView 连接临时 Relay，
+> 因而没有把“真实 Desktop dev build 中点击 View 并观察 live Checkpoint”记为已验证。
+> Desktop 的 JS、Tauri native boundary、E2E build 和 28 项 mock Playwright 均通过，
+> 但这些证据没有被冒充为真实 WebView smoke。
+
+本报告对应
+[角色连续性集成验收方案](./integration-acceptance-plan.md)。
 
 ## 1. Run 信息
 
 | 项目 | 值 |
 |---|---|
-| Run ID | `F724D000-31C7-4F8A-8FE8-4450F958FB9F` |
-| Commit | `8faf6917b81485d17cb15f5eabe3cce118877bd4` |
+| Run ID | `505CCAB4-B34F-4563-9867-96F29F714FB6` |
+| 初始修复基线 | `651afb227307ed4b5b31ba9f3e295208242d9cfe` |
+| 最终验收树 | `504ef027ce3c6d49aaa4a6cc2f1060f3c04365bc` |
 | Branch | `feat/project-view-v0` |
-| 开始时间 | `2026-07-29T14:02:12Z` |
-| 结束时间 | `2026-07-29T14:10:24Z` |
+| 开始时间 | `2026-07-29T22:38:00+08:00` |
+| 结束时间 | `2026-07-29T23:34:49+08:00` |
 | Rust | `rustc 1.95.0` / `cargo 1.95.0` |
 | Node / pnpm | `v24.14.0` / `11.4.0` |
 | Docker | `29.5.3`，Compose `5.1.4` |
 | 服务 | `buzz-postgres`、`buzz-redis`、`buzz-minio` 均 healthy |
+| 本地证据目录 | `test-results/role-acceptance-505CCAB4/` |
 
-执行前 `BUZZ_AUTH_TAG`、`BUZZ_RELAY_URL`、`BUZZ_PRIVATE_KEY`、`DATABASE_URL` 和
-`REDIS_URL` 均未设置；每个测试进程仍显式移除了这些外部变量。验收没有连接
-staging/production。
+初始基线 `651afb2` 修复了上一轮发现的 v1→v2 cutover head revision 缺陷，并补充共享
+assembler 回归。专项门禁和真实 Role/ACP/Runtime 纵向编排在该提交上执行。
 
-执行前工作区仅有以下两个未跟踪文档：
+最终 `just ci` 首次运行时发现 `desktop/src-tauri/src/managed_agents/runtime.rs` 超过既有
+文件行数门禁。函数实现随后只按职责移动到 `runtime/metadata.rs`，函数签名和行为均未
+改变，并以 `504ef027` 独立提交。相关 3 项 targeted test 和完整 `just ci` 在与最终提交
+字节一致的工作树上重新执行并通过。
+
+执行前外部 `BUZZ_AUTH_TAG`、`BUZZ_RELAY_URL`、`BUZZ_PRIVATE_KEY`、`DATABASE_URL` 和
+`REDIS_URL` 均未设置；临时进程也显式使用自己的 Relay、数据库、Community host 和密钥。
+验收没有连接 staging/production。
+
+执行前工作区仅有用户自己的未跟踪文件：
 
 ```text
-docs/lora/stage/role/integration-acceptance-plan.md
 docs/lora/stage/role/log.md
 ```
 
-`log.md` 未被修改或纳入验收产物。
+该文件未被读取、修改、暂存或提交。
 
 ## 2. 总体判定
 
 | 层级 | 结果 | 说明 |
 |---|---|---|
-| L0 领域与协议 | PASS | Project View、core、SDK、Relay、CLI 共 93 项专项测试通过 |
-| L1 数据库与迁移 | PASS | 18 项事务测试、6 项迁移/schema-drift 测试通过 |
-| L2 Relay 与真实 CLI | FAIL | v1 流程通过；v2 cutover 后第一次 Agent 快照读取失败 |
-| L3 Desktop | BLOCKED | JS、Tauri、build、28 项 mock Playwright 通过；真实 Relay smoke 被 L2 阻断 |
-| L4 ACP 与 Runtime | BLOCKED | ACP/component tests 通过；真实 Relay + ACP + supervisor 纵向链路无有效 Role 前置状态 |
-| L5 真实模型 smoke | SKIPPED | 可选项，且 L2 已失败 |
-| L6 全仓回归 | SKIPPED | 方案规定专项通过后才执行 `just ci`；本轮不满足前置条件 |
+| L0 领域与协议 | PASS | Project View domain/core/SDK/Relay/CLI 共 93 项专项测试通过 |
+| L1 数据库与迁移 | PASS | PostgreSQL 19 项，migration/schema-drift 6 项通过 |
+| L2 Relay 与真实 CLI | PASS | 现有真实 E2E 通过；新增 Human–Agent 纵向 E2E 通过 |
+| L3 Desktop | CONDITIONAL | JS、Tauri、build、28 项 Playwright 通过；真实 WebView smoke 未执行 |
+| L4 ACP 与 Runtime | PASS | 确定性 child + 真实 Relay + ACP + supervisor 纵向编排通过 |
+| L5 真实模型 smoke | SKIPPED | 可选项；本轮按方案使用确定性 fake ACP child |
+| L6 全仓回归 | PASS | 最终树完整 `just ci` 通过 |
 
-按照验收方案，只要任一必选纵向一致性场景失败就不能判定通过。L2 已出现稳定 P1，
-因此不能用其余绿色单元测试降级为“有条件通过”。
+本轮所有规范状态、安全 fence、原子性、恢复和故障结束条件均通过。L3 剩余项属于无法由
+当前自动化驱动的人工 UI smoke，不影响已经取得的后端与 Agent 正确性证据，因此结论为
+“有条件通过”，而不是“不通过”或无条件“通过”。
 
-## 3. 已执行门禁
+## 3. 自动化门禁
 
-### 3.1 Project View 专项
+### 3.1 Project View
 
 命令：
 
@@ -69,23 +84,12 @@ just project-view-test
 | `buzz-sdk` Project View | 9 | 0 |
 | `buzz-relay` Project View | 8 | 0 |
 | `buzz-cli` Project View | 13 | 0 |
-| PostgreSQL transaction/concurrency | 18 | 0 |
+| PostgreSQL transaction/concurrency | 19 | 0 |
 | migration/schema drift | 6 | 0 |
-| 真实 Relay/CLI E2E | 0 | 1 |
+| 独立 Relay + 真实 CLI E2E | 1 | 0 |
 
-真实 E2E 在独立数据库、随机 Community host 和随机端口上执行。v1 阶段已经完成：
-
-- WS 初始化；
-- HTTP Agent mutation；
-- revision-pinned 分页；
-- 真实 Human `buzz` CLI 写入；
-- live membership revoke；
-- stale page 与 stale mutation conflict；
-- v1 Role 创建；
-- v1→v2 cutover；
-- owner 发出 v2 Role offer。
-
-随后 Agent 执行 `roles proposals --status open` 时，共享 SDK 拒绝快照。
+上一轮失败的 v1→v2 cutover 现在能用 Human、CLI 和 ACP 共用的 verified assembler 组装。
+数据库回归同时覆盖“保留已有 head revision”和“完整 verified snapshot”。
 
 ### 3.2 ACP 与 CLI
 
@@ -99,9 +103,9 @@ cargo test -p buzz-cli --lib
 - ACP：613 passed，0 failed；
 - CLI：264 passed，0 failed。
 
-其中 Role Brief cache/refresh、dynamic runtime fence、supervisor state、binding/assignment
-convergence 等 component tests 均通过。它们没有覆盖本次失败的真实 cutover 投影组合，
-因此不能替代 L2/L4。
+这些测试覆盖 Role Brief cache/refresh、candidate/assigned/unavailable、dynamic runtime
+fence、runtime supervisor state、binding/assignment convergence 和完整 Role history
+pagination。
 
 ### 3.3 Desktop
 
@@ -122,138 +126,213 @@ pnpm exec playwright test --project=smoke tests/e2e/project-view.spec.ts
 - Project View Playwright：28 passed，0 failed。
 
 Playwright 覆盖 verified map、Role/Work Inspector、历史分页、offer、Checkpoint/Handoff、
-Human/Agent 交替修改、replacement、revision invalidation、可信读取失败、断线 stale 状态和
-Community 隔离。但其数据来自 E2E mock bridge，不能证明真实 Relay cutover 快照可用。
+Human/Agent 交替修改、replacement、revision invalidation、可信读取失败、断线 stale 状态
+和 Community 隔离。其后端是 E2E mock bridge，所以真实 WebView smoke 仍单独列为限制。
 
-## 4. P1 缺陷
+### 3.4 全仓回归
 
-### 4.1 现象
+最终树执行：
 
-真实 CLI 返回退出码 4：
-
-```json
-{
-  "error": "error",
-  "message": "Project View v2 integrity error: invalid Project View projection: ordinary object body disagrees with its projection revision",
-  "retryable": false
-}
+```bash
+just ci
 ```
 
-首轮失败后只进行了一次带 backtrace 和日志归档的诊断复现。第二次结果相同，触发位置为：
+结果：PASS。
+
+覆盖 Rust workspace 与 Tauri 的 fmt/clippy，Desktop/Web/Mobile 检查，Rust/Desktop/Tauri/
+Mobile 测试，以及 Desktop/Web 构建。最终 Tauri 单元结果为 1644 passed、14 ignored，
+Mobile 为 568 passed、1 skipped。
+
+## 4. Human–Agent–ACP–Runtime 真实纵向验收
+
+新增的临时验收 harness 使用：
+
+- 独立 PostgreSQL database；
+- 随机 Community host 和 Relay port；
+- Human Owner、Leader、Agent A、Agent B、Supervisor 的独立临时身份；
+- 真实 `buzz-relay`、真实 `buzz` CLI、真实 `buzz-acp`；
+- 确定性的本地 fake ACP child；
+- 真实 runtime fence 文件、SIGKILL、restart、lease 与 recovery deadline。
+
+最终结果：
 
 ```text
-e2e_project_view.rs:779
-roles proposals --status open
+role_continuity_human_agent_acp_and_runtime_vertical ... ok
+1 passed; 0 failed; finished in 134.53s
 ```
 
-诊断日志：
+临时 Rust 测试源码在执行后删除，没有纳入生产实现；运行脚本和长日志仅保留在 gitignored
+的 `test-results/role-acceptance-505CCAB4/`。
 
-```text
-test-results/role-acceptance-F724D000/project-view-e2e-diagnostic.log
-SHA-256 9179742551211fd4ec96298a8eb504e9f1e46d1dbdfa9f08e45b5af8f9c1a8b6
-```
+### 4.1 关键坐标
 
-### 4.2 已确认的数据路径
+| 对象 | 验收值 |
+|---|---|
+| Project | `00000000-0000-4000-8000-00000000a11c` |
+| 最终 project revision | `20` |
+| 普通 Role | `fea3af09-6e5e-411e-910a-97509fd0be3d` |
+| Leader Role | `eeeba121-0fc4-4802-ad45-1d1572f093a1` |
+| Agent A Assignment | `72eb589a-bdc5-413e-99d0-ef5e8b943d0a` |
+| Agent B Assignment | `126dfaf1-2d0f-44e7-8908-3240814cdf98` |
+| Agent A Commitment | `8c19d2d0-09c1-48da-ba0d-6127df174569` |
+| Agent B Commitment | `5c723321-81fa-4642-a40e-ecf9c56fe3cb` |
+| 首个 Checkpoint | `f01b4207-14f8-40c7-a972-65d4b230eb40` |
+| 修正 Checkpoint | `8de1b41f-e874-4ffe-b436-794fb49f06f4` |
+| member Handoff | `ab869cc0-617c-4018-9f2c-bc8a15a0a44b` |
+| 恢复 Runtime | `e11b044c-68ee-4082-a930-1f21ab6ebabf`，epoch `1→2` |
+| 恢复耗尽 Runtime | `c5c9faae-577b-4ab4-8561-6f88dfba3fd2`，epoch `2` |
+| 健康 sibling Runtime | `163a09cc-1ddc-4016-adbd-f716987bf972` |
+| 自动结束 system change 数 | `1` |
 
-cutover 读取既有 canonical object，保留 object body 中原来的 `project_revision`：
+### 4.2 已验证行为
 
-- `crates/buzz-db/src/project_view_v2.rs:924`
-- `crates/buzz-db/src/project_view_v2.rs:946`
+1. v1 初始化 Profile/Goal/Issue/Work 后完成 v2 cutover；既有 Community admin 被映射为
+   active Leader Assignment，membership 仍为 admin。
+2. Owner offer Agent A；A 接受并承担唯一 active Assignment；A 自行 end 被拒绝。
+3. Owner 指定 responsible Work；A 接受形成 Commitment。
+4. A 追加结构化 Checkpoint、context-only Handoff 和 superseding correction；
+   Handoff 不结束 Assignment。
+5. Role history newest-first、无重复；跨 Role cursor 被拒绝；直接 UPDATE Checkpoint 和
+   DELETE Handoff 被数据库 append-only guard 拒绝。
+6. Agent A 的新 ACP session 收到完整 `[Role Brief]`，之后收到 compact
+   `[Role Binding]`；子进程只有 mode `0600` fence path，没有 supervisor 私钥或 state
+   path。
+7. Owner 原子替换 A→B；A 收到 candidate Brief，旧 fence 删除，旧 Assignment 写入被
+   Relay 拒绝。
+8. B 的 Brief 包含 waiting-for-continuation、最新修正 Checkpoint、member/system
+   Handoff；B 显式接受 Work 后形成自己的 Commitment。
+9. Leader 只能用精确 active Assignment 治理普通 Role；同级 admin Role 操作返回稳定
+   `owner_required`；Owner 结束 Leader 后 membership 原子降为 member，Owner 保持 owner。
+10. stale authorizer 不会部分消费 proposal；stale Leader fence 被拒绝。
+11. binding revoke 动态删除 runtime fence；重新注册无需重启 ACP 即产生新的可信 runtime。
+12. SIGKILL 后以相同 supervisor state 重启，同一 runtime ID 从 epoch 1 恢复为 epoch 2。
+13. 拷贝的旧 fence 即使带 `BUZZ_MANAGED_AGENT=1`，role-bearing 写入仍被拒绝。
+14. graceful stop、普通离线和 opt-out 不自动结束 Assignment。
+15. recovery 尝试耗尽后 runtime 进入 unavailable；仍健康且持续续租的 sibling runtime
+    阻止自动结束。
+16. sibling 停止后，supervisor heartbeat 触发一次且仅一次
+    `end_unrecoverable_assignment`：Assignment/Commitment 原子结束，生成 system
+    Handoff，membership 同步。
 
-随后用 cutover 的 `next_revision` 构造所有新 generation 的外层投影：
+## 5. 黄金路径
 
-- `crates/buzz-db/src/project_view_v2.rs:960`
-- `crates/buzz-db/src/project_view_v2.rs:1016`
-
-cutover 内部验证只比较外层 `parsed.project_revision == next_revision`，没有比较
-`parsed.object.project_revision`：
-
-- `crates/buzz-db/src/project_view_v2.rs:1028`
-- `crates/buzz-db/src/project_view_v2.rs:1038`
-
-共享 verified assembler 明确要求 object body revision 与该 object projection revision
-相等：
-
-- `crates/buzz-sdk/src/role_brief.rs:363`
-
-因此 cutover 事务可以成功、NIP-11 可以宣告 v2 ready、owner 也可以提交不依赖完整快照的
-offer，但 Agent/Human 一旦读取完整 v2 snapshot，就会被 SDK 正确地 fail closed。
-
-### 4.3 影响
-
-- Human 与 Agent 无法在 cutover 后读取同一份可验证 Project View；
-- Agent 无法查看或接受 Role Proposal；
-- Assignment、Work、Checkpoint、Handoff 和 Role Brief 的真实纵向路径无法开始；
-- Desktop 连接真实 Relay 后同样应拒绝该快照；
-- 现有数据库 cutover 测试存在覆盖缺口：验证了 event envelope 和 schema，却没有用共享
-  `VerifiedRoleBriefSnapshot` 组装完整 cutover 结果。
-
-该缺陷没有造成越权或静默接受坏状态；客户端按设计 fail closed。但它使 Role Continuity
-主流程不可用，所以分级为 P1，而不是 P2 或 ENV。
-
-### 4.4 修复验收要求
-
-本轮不选择具体修复方案。修复必须先对齐 cutover 中“未变化对象的 body revision、投影
-revision、updated_at 与 source”语义，然后至少补充以下回归：
-
-1. cutover 事务提交前，用与 CLI/ACP 相同的共享 assembler 验证完整 snapshot；
-2. 对包含多个不同历史 `project_revision` 的 Profile/Goal/Plan/Issue/Work/Role 执行
-   cutover；
-3. cutover 后立即通过真实 CLI 读取 `project-view get`、`roles proposals` 和
-   `roles current`；
-4. offer 提交后再次读取，证明未变化 ordinary heads 仍能与新 meta revision 组装；
-5. 修复后从新的 commit 重新执行整份集成验收，而不是只重跑失败断言。
-
-## 5. 黄金路径结果
-
-| 故事 | 结果 | 停止位置 |
+| 故事 | 结果 | 说明 |
 |---|---|---|
-| E2E-01 Human 建项目、Agent A 承担 Role | FAIL | owner offer 已接受；Agent A 无法读取 Proposal |
-| E2E-02 Agent A 追加 Checkpoint/Handoff | SKIPPED | 没有可验证的 active Assignment |
-| E2E-03 Human 原子替换 A→B | SKIPPED | E2E-01 未形成规范前置状态 |
-| E2E-04 Leader 与 Community 权限一致 | SKIPPED | 无法建立可信 Leader Assignment |
+| E2E-01 Human 建项目、Agent A 承担 Role | PASS / Desktop ENV | DB、Relay、CLI、ACP 全链通过；真实 WebView 卡片观察未执行 |
+| E2E-02 Agent A 追加 Checkpoint/Handoff | PASS / Desktop ENV | append-only、Brief、history 全链通过；真实 WebView live 观察未执行 |
+| E2E-03 Human 原子替换 A→B | PASS / Desktop ENV | 原子替换、旧 fence、B 接续通过；真实 WebView 中间态观察未执行 |
+| E2E-04 Leader 与 Community 权限一致 | PASS | 精确 Assignment fence、owner-only、membership 降级均通过 |
 
-不能通过直接写数据库或注入 mock snapshot 绕过 E2E-01，因为那会跳过本轮需要验收的
-canonical cutover 与 Relay projection 路径。
+这里的 `Desktop ENV` 不是后端或 Desktop 自动化失败，而是明确保留的真实 Tauri 人工观察项。
 
 ## 6. 专项矩阵摘要
 
-| 范围 | 结果 | 说明 |
+| 范围 | 结果 | 证据摘要 |
 |---|---|---|
-| PV-01～PV-07 | PASS | L0/L1 与 v1 真实 Relay 场景通过 |
-| PV-08 v1→v2 cutover | FAIL | generation/schema 切换成功，但完整投影内部 revision 不一致 |
-| RC-01～RC-06 | SKIPPED | component tests 通过；真实 Role 链路被 PV-08 阻断 |
-| WORK-01～WORK-04 | SKIPPED | component tests 通过；无可信 Assignment 前置状态 |
-| CT-01～CT-06 | SKIPPED | component/Playwright tests 通过；真实 append/history 链路未开始 |
-| ACP-01～ACP-08 | SKIPPED | unit/mock 通过；真实 Brief 无法从坏快照生成 |
-| RT-01～RT-12 | SKIPPED | DB/ACP component tests 通过；真实 Relay + ACP + supervisor 未编排 |
+| PV-01～PV-08 | PASS | unit/DB/migration/真实 Relay CLI；cutover verified snapshot 已回归 |
+| RC-01～RC-06 | PASS | 状态机与 DB guard，加真实 self-end、replacement、owner/Leader stale fence |
+| WORK-01～WORK-04 | PASS | 非 responsible 拒绝、Commitment 原子结束、B 显式接续 |
+| CT-01～CT-06 | PASS | 真实 append/history/correction，加领域 reference 与 DB append-only guard |
+| ACP-01～ACP-06 | PASS | 真实 candidate/full/compact/unavailable/dynamic refresh，加 component tests |
+| ACP-07 | PASS | component native-steer 覆盖，加真实 stale Assignment/Runtime 写入拒绝 |
+| ACP-08 | PASS | component Community reset 覆盖；跨 identity/Relay supervisor state fail closed |
+| RT-01～RT-12 | PASS | 真实 ACP child、fence、epoch、kill/restart、sibling health 与自动结束 |
 
-“SKIPPED”不代表对应能力失败，而是本轮没有获得方案要求的纵向证据，因此不能记为 PASS。
+上述 PASS 使用方案要求的组合证据：真实 Relay/ACP 纵向链路证明授权边界，component/
+property/DB tests 补足难以在单条黄金路径中穷举的 closed-schema 和负向组合。
 
-## 7. 清理结果
+## 7. 缺陷、限制与验收编排校正
 
-- 两次 E2E Relay 进程及其随机监听端口均已停止；
-- 两次 `buzz_pv_e2e_*` 临时数据库均由测试脚本删除；
-- Playwright HTTP server 已停止；
-- 共享 `buzz-postgres`、`buzz-redis` 和 `buzz-minio` 保持运行且未被重置；
-- 执行前记录的 8 个既有 `buzz_pv_*` 数据库仍原样存在；
-- 没有遗留本轮数据库、Relay 或端口；
-- 诊断日志保存在 gitignored `test-results`；
-- 仓库生产代码无修改。
+### 7.1 未关闭问题
 
-报告生成前的工作区状态为：
+- P0：无；
+- P1：无；
+- P2：无未关闭项；
+- ENV：真实 Desktop dev build + Tauri WebView + 临时 Relay 的人工/半自动 smoke 未执行；
+- 可选 L5：真实外部模型 smoke 未执行。
+
+### 7.2 验收中发现并关闭的门禁问题
+
+首次 `just ci` 在 Desktop 文件大小检查停止：
 
 ```text
-?? docs/lora/stage/role/integration-acceptance-plan.md
-?? docs/lora/stage/role/integration-acceptance-report.md
+src-tauri/src/managed_agents/runtime.rs: 2251 lines (limit 2216)
+```
+
+没有提高限制。两个 runtime metadata helper 被移动到独立子模块，主文件降为 2197 行。
+targeted tests 和第二次完整 `just ci` 通过。修复提交：
+
+```text
+504ef027 refactor(desktop): split runtime metadata helpers
+```
+
+### 7.3 临时 harness 校正
+
+正式纵向断言编排期间保存了 9 份失败日志。逐项定位后均为验收 harness 本身的问题，而非
+生产实现缺陷：
+
+1. 把 admin 文本输出当 JSON 解析；
+2. 临时 hostname 含不合法下划线；
+3. 测试 heartbeat 低于协议最小值；
+4. max-turn 小于默认 idle-timeout；
+5. prompt 断言使用了错误的 JSON 文本形态；
+6. 权限断言没有匹配稳定错误码 `owner_required`；
+7. stale runtime CLI 漏传 `BUZZ_MANAGED_AGENT=1`，因更早的 acting-assignment gate 被拒；
+8. 重跑残留 state 被正确识别为其他 identity/Relay，并 fail closed；
+9. 等待 recovery deadline 时没有给健康 sibling 续租，导致它按设计变为 unavailable。
+
+校正后的最终 harness 一次完整通过。第 8 项还提供了 supervisor state 不跨身份/Relay
+复用的额外 fail-closed 证据；第 9 项改为每 5 秒真实续租后，准确验证健康 sibling 会
+阻止自动结束。
+
+## 8. 关键证据与校验和
+
+| 证据 | SHA-256 |
+|---|---|
+| `project-view-test.log` | `cd3b7d4b3549195ef45f020d4a5c5e14a8a0761e72cd59650231cb973a1590ce` |
+| `buzz-acp-lib.log` | `e90e53f5d760e80f8952ef92f86685ff1238ee828081beae2894e85d63252223` |
+| `buzz-cli-lib.log` | `f8048a858ffd6b2b74503b8af6113bb479e90316af0e8e8db2a03b6c8390a593` |
+| `desktop-test.log` | `030a4dae5dcc43a5a8720b0e8507d0de583ae920261279765b44481cb9841f71` |
+| `desktop-tauri-test.log` | `b7e11ae405bf54e35fb0e6242494b7ff9a4ff504226d05c011899768838800fe` |
+| `desktop-build-e2e.log` | `b441d9ed94af5527125e351b60cc4ea7615cae53d83566992efe2c3bc9e8ec8c` |
+| `playwright-project-view.log` | `15dd18f863ef1845fcdd490e133027b8173eb7883584de7f38f73a069d511e0e` |
+| `role-vertical.log` | `23f1fe6f50600bd6c0f74aed2de83b610fda6ef73c322bc17595922355819a7a` |
+| `role-vertical-relay.log` | `0e6639a919271efc8747866a5983a7a9a32c0ce547e45596eb5ee0e0b9c51211` |
+| `vertical-evidence.json` | `86146f9467137469beed9146e8a4ea9e282924fa4b7ca69bcc1f6315fa952d99` |
+| `just-ci.log` | `b566407c9e73151f3d72475274f95c1e62f5afdc2edb6301cdc80f4d57fde194` |
+
+这些文件位于 `test-results/role-acceptance-505CCAB4/`，目录已被 gitignore。报告不包含
+私钥、NIP-98 header、supervisor secret 或可复用 token。
+
+## 9. 清理结果
+
+- 没有遗留 `buzz-relay` 或 `buzz-acp` 验收进程；
+- 没有遗留 `buzz_role_accept_*` 数据库；
+- 执行前记录的 8 个 `buzz_pv_*` 数据库仍全部存在；
+- 共享 `buzz-postgres`、`buzz-redis`、`buzz-minio` 保持运行且未被重置；
+- 临时 Rust 验收源码已删除；
+- 长日志、fake child、无效 fence 和运行脚本只保留在 gitignored `test-results`；
+- 用户的 `docs/lora/stage/role/log.md` 保持未跟踪且未修改；
+- 生产变更只有独立提交的 runtime metadata 文件拆分；验收报告已确认纳入收口提交。
+
+报告提交后的预期工作区状态：
+
+```text
 ?? docs/lora/stage/role/log.md
 ```
 
-## 8. 最终结论
+## 10. 最终结论
 
-角色连续性目前不能判定为完整交付。领域状态机、数据库原子性、权限 fencing、ACP/Runtime
-组件和 Desktop mock 交互已经有较强覆盖，但真实 v1→v2 cutover 产生的 snapshot 无法被
-Human/Agent 共用的 SDK 读取。
+角色连续性 v0 的核心目标已经获得集成证据：
 
-下一步应先修复并回归 PV-08；修复提交完成后重新执行 L0～L6、E2E-01～E2E-04 和
-ACP/Runtime 纵向编排，再给出新的发布结论。
+- Human 与 Agent 通过同一 verified Project View 读取和修改 Role/Work；
+- 连续性归属于 Project-owned Assignment、Commitment、Checkpoint 和 Handoff，而不是
+  某个 Agent session；
+- Agent A→B 后，A 的旧 Assignment/Runtime 无法写，B 能从项目状态继续；
+- Leader 权限、Community membership 和 Assignment 原子一致；
+- ACP session、binding、Runtime epoch 和 supervisor 恢复均 fail closed；
+- 自动 `unrecoverable` 只在全部条件满足后执行一次原子 system change。
+
+因此本轮可以判定为**有条件通过**。补做一次方案 8.3 的真实 Desktop Relay smoke 并通过
+后，可以把结论升级为“通过”；如果期间没有相关代码变化，不需要重跑已经通过的后端、
+ACP 和 Runtime 纵向链路。
