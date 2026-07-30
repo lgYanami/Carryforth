@@ -482,6 +482,13 @@ Meeting End 高于所有优先级，并使 Intent、Request、Offer、Grant 和 
 
 ## 11. 主持人的异步 Agent 模式
 
+> 2026-07-30 变更：本节的投机 `ModeratorPlan`、完整 fingerprint 失效和“取消后重判”
+> 语义已由
+> [主持人乐观决策设计](./meeting-v1-moderator-optimistic-decision-design.md)
+> 替代。当前语义只在主持人取得 Control Token 后启动完整 LLM 判断，late Agent Intent
+> 进入下一候选批次，判断期间不因 Meeting State 变化物理 Cancel。下文保留为变更前的
+> 概念背景，不再作为待实现规范。
+
 主持人是 Agent 时，不能等到 Control Token 返回后才开始理解 Intent 池。Moderator
 Controller 应当在其他人发言期间异步维护：
 

@@ -9,6 +9,7 @@ use super::*;
 
 use chrono::Duration;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 /// Parsed Meeting V1 command executed atomically with its State and outbox rows.
 pub struct BatonCommandTxParams<'a> {
@@ -50,6 +51,24 @@ pub struct BatonIntentDeferral {
     pub previous_event_id: Vec<u8>,
     /// Required moderator explanation.
     pub reason: String,
+}
+
+/// Terminal outcome reported for a registered moderator decision attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatonDecisionAttemptFinishOutcome {
+    /// The model completed and no further protocol action is required.
+    Completed,
+    /// The result became irrelevant because a shared protocol prerequisite changed.
+    Discarded,
+}
+
+impl BatonDecisionAttemptFinishOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Discarded => "discarded",
+        }
+    }
 }
 
 /// Deterministic, non-LLM Grant work stage.
@@ -138,6 +157,10 @@ pub enum BatonCommand {
         selection_reason: Option<String>,
         /// Atomic deferrals permitted only for moderator-self selection.
         deferrals: Vec<BatonIntentDeferral>,
+        /// Registered model attempt; required for an Agent moderator.
+        attempt_id: Option<Vec<u8>>,
+        /// Intent version observed by the model; required for attempt-bound Intent selection.
+        expected_source_event_id: Option<Vec<u8>>,
     },
     /// Reject a pending Speech Intent.
     ModeratorReject {
@@ -151,6 +174,8 @@ pub enum BatonCommand {
         reason_code: String,
         /// Required moderator explanation.
         reason_text: String,
+        /// Registered model attempt; required for an Agent moderator.
+        attempt_id: Option<Vec<u8>>,
     },
     /// Close an unresolved Handoff that has no active attempt.
     ModeratorDismissHandoff {
@@ -164,6 +189,70 @@ pub enum BatonCommand {
         reason_code: String,
         /// Required moderator explanation.
         reason_text: String,
+        /// Registered model attempt; required for an Agent moderator.
+        attempt_id: Option<Vec<u8>>,
+    },
+    /// Withdraw the Agent moderator's own Intent as an attempt-bound management action.
+    ModeratorWithdrawSelf {
+        /// Registered model attempt.
+        attempt_id: Vec<u8>,
+        /// Stable self Intent ID.
+        intent_id: Vec<u8>,
+        /// Intent version observed by the model.
+        previous_event_id: Vec<u8>,
+    },
+    /// Register the authoritative candidate snapshot immediately before model dispatch.
+    ModeratorDecisionAttemptStart {
+        /// Control-token compare-and-swap epoch.
+        expected_control_epoch: i64,
+        /// Moderator-window compare-and-swap epoch.
+        expected_decision_epoch: i64,
+        /// Intent-pool compare-and-swap revision.
+        expected_intent_revision: i64,
+        /// Speech-timeline compare-and-swap revision.
+        expected_speech_revision: i64,
+        /// Relay State event observed by the Controller before starting.
+        expected_state_event_id: Vec<u8>,
+        /// Abandoned attempt replaced after Runtime recovery, when applicable.
+        replacement_of_attempt_id: Option<Vec<u8>>,
+    },
+    /// Terminalize a registered model attempt that has no primary protocol action.
+    ModeratorDecisionAttemptFinish {
+        /// Registered attempt.
+        attempt_id: Vec<u8>,
+        /// Completed or discarded terminal class.
+        outcome: BatonDecisionAttemptFinishOutcome,
+        /// Closed, machine-readable terminal explanation.
+        reason_code: String,
+    },
+    /// Consume Relay-issued selected-source evidence and atomically register a replacement attempt.
+    ModeratorDecisionRetry {
+        /// Failed attempt.
+        attempt_id: Vec<u8>,
+        /// One-use Relay retry ticket.
+        retry_ticket_id: Vec<u8>,
+        /// Signed primary action whose rejection created the ticket.
+        failed_action_event_id: Vec<u8>,
+        /// Current control-token compare-and-swap epoch.
+        expected_control_epoch: i64,
+        /// Current moderator-window compare-and-swap epoch.
+        expected_decision_epoch: i64,
+        /// Failed attempt number.
+        expected_attempt_number: i32,
+    },
+    /// Close an exhausted current Cohort and atomically expose the next eligible batch.
+    ModeratorCompleteCohort {
+        /// Registered attempt responsible for completing the Cohort.
+        attempt_id: Vec<u8>,
+        /// Current control-token compare-and-swap epoch.
+        expected_control_epoch: i64,
+        /// Current moderator-window compare-and-swap epoch.
+        expected_decision_epoch: i64,
+    },
+    /// Mark a running attempt abandoned after its owning Runtime was lost.
+    ModeratorDecisionAttemptAbandon {
+        /// Registered attempt.
+        attempt_id: Vec<u8>,
     },
     /// Recall control now or latch a forced moderator return.
     ModeratorRecall {
@@ -229,6 +318,12 @@ impl BatonCommand {
             Self::ModeratorSelect { .. }
             | Self::ModeratorReject { .. }
             | Self::ModeratorDismissHandoff { .. }
+            | Self::ModeratorWithdrawSelf { .. }
+            | Self::ModeratorDecisionAttemptStart { .. }
+            | Self::ModeratorDecisionAttemptFinish { .. }
+            | Self::ModeratorDecisionRetry { .. }
+            | Self::ModeratorCompleteCohort { .. }
+            | Self::ModeratorDecisionAttemptAbandon { .. }
             | Self::ModeratorRecall { .. } => buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
             Self::HumanRequest | Self::HumanWithdraw { .. } => {
                 buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST
@@ -251,6 +346,12 @@ impl BatonCommand {
             Self::ModeratorSelect { .. } => "moderator_select",
             Self::ModeratorReject { .. } => "moderator_reject",
             Self::ModeratorDismissHandoff { .. } => "moderator_dismiss_handoff",
+            Self::ModeratorWithdrawSelf { .. } => "moderator_withdraw_self",
+            Self::ModeratorDecisionAttemptStart { .. } => "decision_attempt_start",
+            Self::ModeratorDecisionAttemptFinish { .. } => "decision_attempt_finish",
+            Self::ModeratorDecisionRetry { .. } => "decision_retry",
+            Self::ModeratorCompleteCohort { .. } => "complete_cohort",
+            Self::ModeratorDecisionAttemptAbandon { .. } => "decision_attempt_abandon",
             Self::ModeratorRecall { .. } => "moderator_recall",
             Self::HumanRequest => "human_request",
             Self::HumanWithdraw { .. } => "human_withdraw",
@@ -285,6 +386,8 @@ pub enum BatonCommandOutcome {
         state_revision: Option<i64>,
         /// First execution's outcome code.
         outcome_code: String,
+        /// One-use retry evidence returned by the first execution, when any.
+        retry_ticket_id: Option<Vec<u8>>,
     },
     /// A semantic conflict was terminal without a deadline transition.
     RejectedTerminal {
@@ -292,6 +395,8 @@ pub enum BatonCommandOutcome {
         code: String,
         /// Canonical object that won the race, when known.
         canonical_object_id: Option<Vec<u8>>,
+        /// One-use selected-source conflict evidence.
+        retry_ticket_id: Option<Vec<u8>>,
     },
     /// Lazy recovery committed first and made this command terminally late.
     RejectedAfterRecovery {
@@ -299,6 +404,8 @@ pub enum BatonCommandOutcome {
         code: String,
         /// Canonical expired/timed-out object, when known.
         canonical_object_id: Option<Vec<u8>>,
+        /// One-use selected-source conflict evidence.
+        retry_ticket_id: Option<Vec<u8>>,
     },
 }
 
@@ -386,6 +493,8 @@ struct StateTarget {
     next_action_at: Option<DateTime<Utc>>,
     control_epoch: i64,
     decision_epoch: i64,
+    decision_attempt: i32,
+    active_decision_attempt_id: Option<Vec<u8>>,
 }
 
 impl StateTarget {
@@ -403,6 +512,8 @@ impl StateTarget {
             next_action_at: state.next_action_at,
             control_epoch: state.control_epoch,
             decision_epoch: state.decision_epoch,
+            decision_attempt: state.decision_attempt,
+            active_decision_attempt_id: state.active_decision_attempt_id.clone(),
         }
     }
 
@@ -679,6 +790,8 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
             expected_speech_revision,
             selection_reason,
             deferrals,
+            attempt_id,
+            expected_source_event_id,
         } => {
             for (field, value) in [
                 ("expected control epoch", *expected_control_epoch),
@@ -699,7 +812,13 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
             }
             match source {
                 BatonSelectionSource::Intent { intent_id } => {
-                    validate_id(intent_id, "selected Intent id")?
+                    validate_id(intent_id, "selected Intent id")?;
+                    if let Some(expected_source_event_id) = expected_source_event_id {
+                        validate_id(
+                            expected_source_event_id,
+                            "selected Intent snapshot event id",
+                        )?;
+                    }
                 }
                 BatonSelectionSource::Handoff {
                     handoff_id,
@@ -711,7 +830,15 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
                             "expected Handoff attempt count must be non-negative".to_string(),
                         ));
                     }
+                    if expected_source_event_id.is_some() {
+                        return Err(DbError::InvalidData(
+                            "Handoff Select cannot carry an Intent source event id".to_string(),
+                        ));
+                    }
                 }
+            }
+            if let Some(attempt_id) = attempt_id {
+                validate_id(attempt_id, "moderator decision attempt id")?;
             }
             validate_optional_text(selection_reason.as_deref(), "selection reason", 512)?;
             if deferrals.len() > MAX_MEETING_PARTICIPANTS {
@@ -740,6 +867,7 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
             author_pubkey,
             reason_code,
             reason_text,
+            attempt_id,
         } => {
             validate_id(intent_id, "rejected Intent id")?;
             validate_id(previous_event_id, "previous Intent event id")?;
@@ -753,6 +881,9 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
                 ));
             }
             validate_text(reason_text, "Intent rejection reason", 1, 1024)?;
+            if let Some(attempt_id) = attempt_id {
+                validate_id(attempt_id, "moderator decision attempt id")?;
+            }
         }
         BatonCommand::ModeratorDismissHandoff {
             handoff_id,
@@ -760,6 +891,7 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
             expected_attempt_count,
             reason_code,
             reason_text,
+            attempt_id,
         } => {
             validate_id(handoff_id, "dismissed Handoff id")?;
             if *expected_speech_revision < 0 || *expected_attempt_count < 0 {
@@ -776,6 +908,106 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
                 ));
             }
             validate_text(reason_text, "Handoff dismissal reason", 1, 1024)?;
+            if let Some(attempt_id) = attempt_id {
+                validate_id(attempt_id, "moderator decision attempt id")?;
+            }
+        }
+        BatonCommand::ModeratorWithdrawSelf {
+            attempt_id,
+            intent_id,
+            previous_event_id,
+        } => {
+            validate_id(attempt_id, "moderator decision attempt id")?;
+            validate_id(intent_id, "withdrawn moderator Intent id")?;
+            validate_id(previous_event_id, "previous moderator Intent event id")?;
+        }
+        BatonCommand::ModeratorDecisionAttemptStart {
+            expected_control_epoch,
+            expected_decision_epoch,
+            expected_intent_revision,
+            expected_speech_revision,
+            expected_state_event_id,
+            replacement_of_attempt_id,
+        } => {
+            if *expected_control_epoch <= 0
+                || *expected_decision_epoch < 0
+                || *expected_intent_revision < 0
+                || *expected_speech_revision < 0
+            {
+                return Err(DbError::InvalidData(
+                    "moderator DecisionAttempt expectations are out of range".to_string(),
+                ));
+            }
+            validate_id(expected_state_event_id, "expected Relay State event id")?;
+            if let Some(replacement_of_attempt_id) = replacement_of_attempt_id {
+                validate_id(
+                    replacement_of_attempt_id,
+                    "replaced moderator decision attempt id",
+                )?;
+            }
+        }
+        BatonCommand::ModeratorDecisionAttemptFinish {
+            attempt_id,
+            outcome,
+            reason_code,
+        } => {
+            validate_id(attempt_id, "moderator decision attempt id")?;
+            let supported = match outcome {
+                BatonDecisionAttemptFinishOutcome::Completed => {
+                    matches!(reason_code.as_str(), "no_action" | "idle_wait_fallback")
+                }
+                BatonDecisionAttemptFinishOutcome::Discarded => matches!(
+                    reason_code.as_str(),
+                    "human_priority"
+                        | "control_changed"
+                        | "speech_changed"
+                        | "meeting_ended"
+                        | "moderator_changed"
+                        | "cas_churn"
+                        | "source_changed"
+                        | "runtime_replaced"
+                ),
+            };
+            if !supported {
+                return Err(DbError::InvalidData(
+                    "unsupported moderator DecisionAttempt finish reason".to_string(),
+                ));
+            }
+        }
+        BatonCommand::ModeratorDecisionRetry {
+            attempt_id,
+            retry_ticket_id,
+            failed_action_event_id,
+            expected_control_epoch,
+            expected_decision_epoch,
+            expected_attempt_number,
+        } => {
+            validate_id(attempt_id, "moderator decision attempt id")?;
+            validate_id(retry_ticket_id, "moderator retry ticket id")?;
+            validate_id(failed_action_event_id, "failed moderator action event id")?;
+            if *expected_control_epoch <= 0
+                || *expected_decision_epoch <= 0
+                || *expected_attempt_number <= 0
+            {
+                return Err(DbError::InvalidData(
+                    "moderator DecisionRetry expectations must be positive".to_string(),
+                ));
+            }
+        }
+        BatonCommand::ModeratorCompleteCohort {
+            attempt_id,
+            expected_control_epoch,
+            expected_decision_epoch,
+        } => {
+            validate_id(attempt_id, "moderator decision attempt id")?;
+            if *expected_control_epoch <= 0 || *expected_decision_epoch <= 0 {
+                return Err(DbError::InvalidData(
+                    "Cohort completion epochs must be positive".to_string(),
+                ));
+            }
+        }
+        BatonCommand::ModeratorDecisionAttemptAbandon { attempt_id } => {
+            validate_id(attempt_id, "moderator decision attempt id")?;
         }
         BatonCommand::ModeratorRecall {
             control_epoch,
@@ -868,6 +1100,7 @@ struct IntentRow {
     current_event_id: Vec<u8>,
     state: String,
     deferred_by_offer_id: Option<Vec<u8>>,
+    eligible_decision_epoch: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -934,9 +1167,11 @@ struct HandoffRow {
     reason_type: String,
     reason_text: String,
     question_state: String,
+    blocked_by: Option<String>,
     last_offer_id: Option<Vec<u8>>,
     last_grant_id: Option<Vec<u8>>,
     attempt_count: i32,
+    eligible_decision_epoch: i64,
 }
 
 #[derive(Debug)]
@@ -947,6 +1182,37 @@ struct ReceiptRow {
     outcome_code: String,
     canonical_object_id: Option<Vec<u8>>,
     state_revision: Option<i64>,
+    retry_ticket_id: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct RetryTicketDraft {
+    retry_ticket_id: Vec<u8>,
+    attempt_id: Vec<u8>,
+    failed_action_event_id: Vec<u8>,
+    source_type: &'static str,
+    source_id: Vec<u8>,
+    snapshot_source_event_id: Option<Vec<u8>>,
+    snapshot_handoff_attempt_count: Option<i32>,
+    conflict_code: &'static str,
+    control_epoch: i64,
+    decision_epoch: i64,
+    deadline_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct RetryTicketRow {
+    retry_ticket_id: Vec<u8>,
+    attempt_id: Vec<u8>,
+    failed_action_event_id: Vec<u8>,
+    source_type: String,
+    source_id: Vec<u8>,
+    snapshot_source_event_id: Option<Vec<u8>>,
+    snapshot_handoff_attempt_count: Option<i32>,
+    control_epoch: i64,
+    decision_epoch: i64,
+    deadline_at: DateTime<Utc>,
+    consumed_at: Option<DateTime<Utc>>,
 }
 
 async fn database_now(tx: &mut Transaction<'_, Postgres>) -> Result<DateTime<Utc>> {
@@ -1060,6 +1326,11 @@ async fn preauthorize_command_tx(
             }
         }
         BatonCommand::IntentWithdraw { intent_id, .. } => {
+            if actor.is_moderator && actor.participant_type == ParticipantType::Agent {
+                return Err(DbError::AccessDenied(
+                    "an Agent moderator must use attempt-bound withdraw-self".to_string(),
+                ));
+            }
             if let Some(intent) = load_intent_tx(tx, community_id, session_id, intent_id).await? {
                 if intent.author_pubkey != actor.pubkey {
                     return Err(DbError::AccessDenied(
@@ -1097,11 +1368,31 @@ async fn preauthorize_command_tx(
                 }
             }
         }
-        BatonCommand::ModeratorDismissHandoff { .. } | BatonCommand::ModeratorRecall { .. } => {
+        BatonCommand::ModeratorDismissHandoff { .. }
+        | BatonCommand::ModeratorDecisionAttemptStart { .. }
+        | BatonCommand::ModeratorDecisionAttemptFinish { .. }
+        | BatonCommand::ModeratorDecisionRetry { .. }
+        | BatonCommand::ModeratorCompleteCohort { .. }
+        | BatonCommand::ModeratorDecisionAttemptAbandon { .. }
+        | BatonCommand::ModeratorRecall { .. } => {
             if !actor.is_moderator {
                 return Err(DbError::AccessDenied(
                     "only the frozen Meeting moderator can issue this command".to_string(),
                 ));
+            }
+        }
+        BatonCommand::ModeratorWithdrawSelf { intent_id, .. } => {
+            if !actor.is_moderator {
+                return Err(DbError::AccessDenied(
+                    "only the frozen Meeting moderator can issue this command".to_string(),
+                ));
+            }
+            if let Some(intent) = load_intent_tx(tx, community_id, session_id, intent_id).await? {
+                if intent.author_pubkey != actor.pubkey {
+                    return Err(DbError::AccessDenied(
+                        "the moderator can only withdraw its own Intent".to_string(),
+                    ));
+                }
             }
         }
         BatonCommand::ModeratorReject {
@@ -1220,7 +1511,7 @@ async fn load_receipt_tx(
 ) -> Result<Option<ReceiptRow>> {
     let row = sqlx::query(
         "SELECT author_pubkey, accepted, outcome_code, canonical_object_id, state_revision, \
-                response_json \
+                retry_ticket_id, response_json \
          FROM meeting_v1_command_receipts \
          WHERE community_id = $1 AND command_event_id = $2",
     )
@@ -1251,6 +1542,7 @@ async fn load_receipt_tx(
             outcome_code: row.try_get("outcome_code")?,
             canonical_object_id: row.try_get("canonical_object_id")?,
             state_revision: row.try_get("state_revision")?,
+            retry_ticket_id: row.try_get("retry_ticket_id")?,
         })
     })
     .transpose()
@@ -1268,6 +1560,7 @@ async fn insert_receipt_tx(
     outcome_code: &str,
     canonical_object_id: Option<&[u8]>,
     state_revision: Option<i64>,
+    retry_ticket_id: Option<&[u8]>,
 ) -> Result<()> {
     let response_json = json!({
         "version": 1,
@@ -1276,12 +1569,14 @@ async fn insert_receipt_tx(
         "outcome_code": outcome_code,
         "canonical_object_id": canonical_object_id.map(hex::encode),
         "state_revision": state_revision,
+        "retry_ticket_id": retry_ticket_id.map(hex::encode),
     });
     sqlx::query(
         "INSERT INTO meeting_v1_command_receipts \
              (community_id, session_id, command_event_id, author_pubkey, kind, action, \
-              accepted, outcome_code, canonical_object_id, state_revision, response_json) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              accepted, outcome_code, canonical_object_id, state_revision, retry_ticket_id, \
+              response_json) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
@@ -1293,10 +1588,82 @@ async fn insert_receipt_tx(
     .bind(outcome_code)
     .bind(canonical_object_id)
     .bind(state_revision)
+    .bind(retry_ticket_id)
     .bind(response_json)
     .execute(tx.as_mut())
     .await?;
     Ok(())
+}
+
+async fn insert_retry_ticket_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    ticket: &RetryTicketDraft,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO meeting_moderator_retry_tickets \
+             (community_id, session_id, retry_ticket_id, attempt_id, \
+              failed_action_event_id, source_type, source_id, \
+              snapshot_source_event_id, snapshot_handoff_attempt_count, conflict_code, \
+              control_epoch, decision_epoch, deadline_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(&ticket.retry_ticket_id)
+    .bind(&ticket.attempt_id)
+    .bind(&ticket.failed_action_event_id)
+    .bind(ticket.source_type)
+    .bind(&ticket.source_id)
+    .bind(&ticket.snapshot_source_event_id)
+    .bind(ticket.snapshot_handoff_attempt_count)
+    .bind(ticket.conflict_code)
+    .bind(ticket.control_epoch)
+    .bind(ticket.decision_epoch)
+    .bind(ticket.deadline_at)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+async fn load_retry_ticket_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    retry_ticket_id: &[u8],
+) -> Result<Option<RetryTicketRow>> {
+    let row = sqlx::query(
+        "SELECT retry_ticket_id, attempt_id, failed_action_event_id, source_type, source_id, \
+                snapshot_source_event_id, snapshot_handoff_attempt_count, \
+                control_epoch, decision_epoch, deadline_at, consumed_at \
+         FROM meeting_moderator_retry_tickets \
+         WHERE community_id = $1 AND session_id = $2 AND retry_ticket_id = $3 \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(retry_ticket_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    row.map(|row| {
+        Ok(RetryTicketRow {
+            retry_ticket_id: row.try_get("retry_ticket_id")?,
+            attempt_id: row.try_get("attempt_id")?,
+            failed_action_event_id: row.try_get("failed_action_event_id")?,
+            source_type: row.try_get("source_type")?,
+            source_id: row.try_get("source_id")?,
+            snapshot_source_event_id: row.try_get("snapshot_source_event_id")?,
+            snapshot_handoff_attempt_count: row.try_get("snapshot_handoff_attempt_count")?,
+            control_epoch: row.try_get("control_epoch")?,
+            decision_epoch: row.try_get("decision_epoch")?,
+            deadline_at: row.try_get("deadline_at")?,
+            consumed_at: row.try_get("consumed_at")?,
+        })
+    })
+    .transpose()
 }
 
 async fn persist_command_event_tx(
@@ -1351,9 +1718,8 @@ async fn load_intent_tx(
     intent_id: &[u8],
 ) -> Result<Option<IntentRow>> {
     let row = sqlx::query(
-        "SELECT intent_id, author_pubkey, current_event_id, basis_speech_revision, \
-                summary, addressed_to, state, selection_attempt_count, last_offer_id, \
-                last_attempt_outcome, deferred_by_offer_id, created_at \
+        "SELECT intent_id, author_pubkey, current_event_id, state, \
+                deferred_by_offer_id, eligible_decision_epoch \
          FROM meeting_speech_intents \
          WHERE community_id = $1 AND session_id = $2 AND intent_id = $3 \
          FOR UPDATE",
@@ -1373,6 +1739,7 @@ fn intent_from_row(row: sqlx::postgres::PgRow) -> Result<IntentRow> {
         current_event_id: row.try_get("current_event_id")?,
         state: row.try_get("state")?,
         deferred_by_offer_id: row.try_get("deferred_by_offer_id")?,
+        eligible_decision_epoch: row.try_get("eligible_decision_epoch")?,
     })
 }
 
@@ -1512,8 +1879,8 @@ async fn load_handoff_tx(
 ) -> Result<Option<HandoffRow>> {
     let row = sqlx::query(
         "SELECT handoff_id, source_speech_event_id, from_pubkey, to_pubkey, \
-                reason_type, reason_text, requested_depth, question_state, blocked_by, \
-                last_offer_id, last_grant_id, last_attempt_outcome, attempt_count, created_at \
+                reason_type, reason_text, question_state, blocked_by, \
+                last_offer_id, last_grant_id, attempt_count, eligible_decision_epoch \
          FROM meeting_directed_handoffs \
          WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3 \
          FOR UPDATE",
@@ -1535,10 +1902,342 @@ fn handoff_from_row(row: sqlx::postgres::PgRow) -> Result<HandoffRow> {
         reason_type: row.try_get("reason_type")?,
         reason_text: row.try_get("reason_text")?,
         question_state: row.try_get("question_state")?,
+        blocked_by: row.try_get("blocked_by")?,
         last_offer_id: row.try_get("last_offer_id")?,
         last_grant_id: row.try_get("last_grant_id")?,
         attempt_count: row.try_get("attempt_count")?,
+        eligible_decision_epoch: row.try_get("eligible_decision_epoch")?,
     })
+}
+
+#[derive(Debug, Clone)]
+struct ModeratorAttemptRow {
+    attempt_id: Vec<u8>,
+    moderator_pubkey: Vec<u8>,
+    control_epoch: i64,
+    decision_epoch: i64,
+    attempt_number: i32,
+    speech_revision: i64,
+    candidate_snapshot_json: Value,
+    state: String,
+    started_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+}
+
+fn moderator_attempt_from_row(row: sqlx::postgres::PgRow) -> Result<ModeratorAttemptRow> {
+    Ok(ModeratorAttemptRow {
+        attempt_id: row.try_get("attempt_id")?,
+        moderator_pubkey: row.try_get("moderator_pubkey")?,
+        control_epoch: row.try_get("control_epoch")?,
+        decision_epoch: row.try_get("decision_epoch")?,
+        attempt_number: row.try_get("attempt_number")?,
+        speech_revision: row.try_get("speech_revision")?,
+        candidate_snapshot_json: row.try_get("candidate_snapshot_json")?,
+        state: row.try_get("state")?,
+        started_at: row.try_get("started_at")?,
+        deadline_at: row.try_get("deadline_at")?,
+    })
+}
+
+async fn load_moderator_attempt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    attempt_id: &[u8],
+) -> Result<Option<ModeratorAttemptRow>> {
+    let row = sqlx::query(
+        "SELECT attempt_id, moderator_pubkey, control_epoch, decision_epoch, \
+                attempt_number, speech_revision, candidate_snapshot_json, state, \
+                started_at, deadline_at \
+         FROM meeting_moderator_decision_attempts \
+         WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(attempt_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    row.map(moderator_attempt_from_row).transpose()
+}
+
+async fn build_candidate_snapshot_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    state: &StateRow,
+    moderator_pubkey: &[u8],
+    eligible_through_epoch: i64,
+) -> Result<(Value, Vec<u8>, usize)> {
+    let intent_rows = sqlx::query(
+        "SELECT intent_id, current_event_id, author_pubkey, basis_speech_revision, \
+                summary, addressed_to, eligible_decision_epoch, created_at \
+         FROM meeting_speech_intents \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
+           AND deferred_by_offer_id IS NULL \
+           AND eligible_decision_epoch <= $3 \
+         ORDER BY created_at, intent_id \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(eligible_through_epoch)
+    .fetch_all(tx.as_mut())
+    .await?;
+    let mut candidate_refs = Vec::with_capacity(intent_rows.len());
+    for row in intent_rows {
+        let intent_id: Vec<u8> = row.try_get("intent_id")?;
+        let current_event_id: Vec<u8> = row.try_get("current_event_id")?;
+        let author_pubkey: Vec<u8> = row.try_get("author_pubkey")?;
+        let addressed_to: Option<Vec<u8>> = row.try_get("addressed_to")?;
+        let created_at: DateTime<Utc> = row.try_get("created_at")?;
+        candidate_refs.push(json!({
+            "source_type": "intent",
+            "source_id": hex::encode(intent_id),
+            "current_event_id": hex::encode(current_event_id),
+            "author_pubkey": hex::encode(&author_pubkey),
+            "moderator_self": author_pubkey == moderator_pubkey,
+            "basis_speech_revision": row.try_get::<i64, _>("basis_speech_revision")?,
+            "summary": row.try_get::<String, _>("summary")?,
+            "addressed_to": addressed_to.as_deref().map(hex::encode),
+            "eligible_decision_epoch": row.try_get::<i64, _>("eligible_decision_epoch")?,
+            "created_at_ms": created_at.timestamp_millis(),
+        }));
+    }
+
+    let handoff_rows = sqlx::query(
+        "SELECT handoff_id, source_speech_event_id, from_pubkey, to_pubkey, \
+                reason_type, reason_text, attempt_count, eligible_decision_epoch, created_at \
+         FROM meeting_directed_handoffs \
+         WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
+           AND blocked_by IS NULL AND moderator_retry_blocked_fingerprint IS NULL \
+           AND eligible_decision_epoch <= $3 \
+         ORDER BY created_at, handoff_id \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(eligible_through_epoch)
+    .fetch_all(tx.as_mut())
+    .await?;
+    candidate_refs.reserve(handoff_rows.len());
+    for row in handoff_rows {
+        let handoff_id: Vec<u8> = row.try_get("handoff_id")?;
+        let source_speech_event_id: Vec<u8> = row.try_get("source_speech_event_id")?;
+        let from_pubkey: Vec<u8> = row.try_get("from_pubkey")?;
+        let to_pubkey: Vec<u8> = row.try_get("to_pubkey")?;
+        let created_at: DateTime<Utc> = row.try_get("created_at")?;
+        candidate_refs.push(json!({
+            "source_type": "handoff",
+            "source_id": hex::encode(handoff_id),
+            "source_speech_event_id": hex::encode(source_speech_event_id),
+            "from_pubkey": hex::encode(from_pubkey),
+            "target_pubkey": hex::encode(to_pubkey),
+            "reason_type": row.try_get::<String, _>("reason_type")?,
+            "reason_text": row.try_get::<String, _>("reason_text")?,
+            "attempt_count": row.try_get::<i32, _>("attempt_count")?,
+            "eligible_decision_epoch": row.try_get::<i64, _>("eligible_decision_epoch")?,
+            "created_at_ms": created_at.timestamp_millis(),
+        }));
+    }
+    candidate_refs.sort_by(|left, right| {
+        left.get("created_at_ms")
+            .and_then(Value::as_i64)
+            .cmp(&right.get("created_at_ms").and_then(Value::as_i64))
+            .then_with(|| {
+                left.get("source_id")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("source_id").and_then(Value::as_str))
+            })
+    });
+    let candidate_count = candidate_refs.len();
+    let snapshot = json!({
+        "version": 1,
+        "control_epoch": state.control_epoch,
+        "decision_epoch": eligible_through_epoch,
+        "speech_revision": state.speech_revision,
+        "snapshot_intent_revision": state.intent_revision,
+        "candidate_refs": candidate_refs,
+    });
+    let encoded = serde_json::to_vec(&snapshot)?;
+    let snapshot_hash = Sha256::digest(encoded).to_vec();
+    Ok((snapshot, snapshot_hash, candidate_count))
+}
+
+fn attempt_candidate_ref<'a>(
+    attempt: &'a ModeratorAttemptRow,
+    source_type: &str,
+    source_id: &[u8],
+) -> Option<&'a Value> {
+    let source_id = hex::encode(source_id);
+    attempt
+        .candidate_snapshot_json
+        .get("candidate_refs")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|candidate| {
+            candidate.get("source_type").and_then(Value::as_str) == Some(source_type)
+                && candidate.get("source_id").and_then(Value::as_str) == Some(source_id.as_str())
+        })
+}
+
+enum ModeratorActionAuthority {
+    Manual,
+    Attempt(ModeratorAttemptRow),
+    Rejected {
+        code: &'static str,
+        canonical_object_id: Option<Vec<u8>>,
+    },
+}
+
+async fn moderator_action_authority_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    state: &StateRow,
+    actor: &Actor,
+    attempt_id: Option<&[u8]>,
+    now: DateTime<Utc>,
+) -> Result<ModeratorActionAuthority> {
+    if actor.participant_type == ParticipantType::Human {
+        return if attempt_id.is_none() {
+            Ok(ModeratorActionAuthority::Manual)
+        } else {
+            Ok(ModeratorActionAuthority::Rejected {
+                code: "human_moderator_does_not_use_attempt",
+                canonical_object_id: state.active_decision_attempt_id.clone(),
+            })
+        };
+    }
+    let Some(attempt_id) = attempt_id else {
+        return Ok(ModeratorActionAuthority::Rejected {
+            code: "moderator_attempt_required",
+            canonical_object_id: state.active_decision_attempt_id.clone(),
+        });
+    };
+    let Some(attempt) = load_moderator_attempt_tx(tx, community_id, session_id, attempt_id).await?
+    else {
+        return Ok(ModeratorActionAuthority::Rejected {
+            code: "moderator_attempt_not_found",
+            canonical_object_id: None,
+        });
+    };
+    if attempt.moderator_pubkey != actor.pubkey {
+        return Ok(ModeratorActionAuthority::Rejected {
+            code: "moderator_attempt_actor_mismatch",
+            canonical_object_id: Some(attempt.attempt_id),
+        });
+    }
+    if attempt.state != "running" || state.active_decision_attempt_id.as_deref() != Some(attempt_id)
+    {
+        return Ok(ModeratorActionAuthority::Rejected {
+            code: "moderator_attempt_not_active",
+            canonical_object_id: Some(attempt.attempt_id),
+        });
+    }
+    if attempt.control_epoch != state.control_epoch
+        || attempt.decision_epoch != state.decision_epoch
+        || attempt.speech_revision != state.speech_revision
+    {
+        return Ok(ModeratorActionAuthority::Rejected {
+            code: "moderator_attempt_prerequisite_changed",
+            canonical_object_id: Some(state.state_event_id.clone()),
+        });
+    }
+    if now >= attempt.deadline_at {
+        return Ok(ModeratorActionAuthority::Rejected {
+            code: "moderator_attempt_expired",
+            canonical_object_id: Some(attempt.attempt_id),
+        });
+    }
+    Ok(ModeratorActionAuthority::Attempt(attempt))
+}
+
+fn candidate_hex(candidate: &Value, field: &str) -> Result<Vec<u8>> {
+    let value = candidate
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DbError::InvalidData(format!(
+                "moderator DecisionAttempt candidate is missing {field}"
+            ))
+        })?;
+    let decoded = hex::decode(value).map_err(|_| {
+        DbError::InvalidData(format!(
+            "moderator DecisionAttempt candidate {field} is not hex"
+        ))
+    })?;
+    validate_id(&decoded, field)?;
+    Ok(decoded)
+}
+
+fn selected_source_retry_ticket(
+    attempt: &ModeratorAttemptRow,
+    failed_action_event_id: &[u8],
+    source_type: &'static str,
+    source_id: &[u8],
+    snapshot_source_event_id: Option<Vec<u8>>,
+    snapshot_handoff_attempt_count: Option<i32>,
+) -> RetryTicketDraft {
+    RetryTicketDraft {
+        retry_ticket_id: random_object_id(),
+        attempt_id: attempt.attempt_id.clone(),
+        failed_action_event_id: failed_action_event_id.to_vec(),
+        source_type,
+        source_id: source_id.to_vec(),
+        snapshot_source_event_id,
+        snapshot_handoff_attempt_count,
+        conflict_code: "selected_source_changed",
+        control_epoch: attempt.control_epoch,
+        decision_epoch: attempt.decision_epoch,
+        deadline_at: attempt.deadline_at,
+    }
+}
+
+async fn current_cohort_has_candidates_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    decision_epoch: i64,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM meeting_speech_intents \
+             WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
+               AND deferred_by_offer_id IS NULL AND eligible_decision_epoch <= $3 \
+             UNION ALL \
+             SELECT 1 FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
+               AND blocked_by IS NULL AND moderator_retry_blocked_fingerprint IS NULL \
+               AND eligible_decision_epoch <= $3 \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(decision_epoch)
+    .fetch_one(tx.as_mut())
+    .await?)
+}
+
+async fn current_cohort_has_handoffs_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    decision_epoch: i64,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
+               AND blocked_by IS NULL AND moderator_retry_blocked_fingerprint IS NULL \
+               AND eligible_decision_epoch <= $3 \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(decision_epoch)
+    .fetch_one(tx.as_mut())
+    .await?)
 }
 
 async fn pending_intents_json_tx(
@@ -1549,7 +2248,8 @@ async fn pending_intents_json_tx(
     let rows = sqlx::query(
         "SELECT intent_id, current_event_id, author_pubkey, basis_speech_revision, \
                 summary, addressed_to, created_at, deferred_by_offer_id IS NOT NULL AS deferred, \
-                selection_attempt_count, last_offer_id, last_attempt_outcome \
+                selection_attempt_count, last_offer_id, last_attempt_outcome, \
+                eligible_decision_epoch \
          FROM meeting_speech_intents \
          WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
          ORDER BY created_at, intent_id",
@@ -1578,6 +2278,7 @@ async fn pending_intents_json_tx(
                 "selection_attempt_count": row.try_get::<i32, _>("selection_attempt_count")?,
                 "last_offer_id": last_offer_id.as_deref().map(hex::encode),
                 "last_attempt_outcome": row.try_get::<Option<String>, _>("last_attempt_outcome")?,
+                "eligible_decision_epoch": row.try_get::<i64, _>("eligible_decision_epoch")?,
             }))
         })
         .collect()
@@ -1620,7 +2321,8 @@ async fn unresolved_handoffs_json_tx(
     let rows = sqlx::query(
         "SELECT handoff_id, source_speech_event_id, from_pubkey, to_pubkey, \
                 reason_type, reason_text, created_at, question_state, attempt_count, \
-                last_offer_id, last_grant_id, last_attempt_outcome, blocked_by \
+                last_offer_id, last_grant_id, last_attempt_outcome, blocked_by, \
+                eligible_decision_epoch \
          FROM meeting_directed_handoffs \
          WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
          ORDER BY created_at, handoff_id",
@@ -1652,6 +2354,7 @@ async fn unresolved_handoffs_json_tx(
                 "last_grant_id": last_grant_id.as_deref().map(hex::encode),
                 "last_attempt_outcome": row.try_get::<Option<String>, _>("last_attempt_outcome")?,
                 "blocked_by": row.try_get::<Option<String>, _>("blocked_by")?,
+                "eligible_decision_epoch": row.try_get::<i64, _>("eligible_decision_epoch")?,
             }))
         })
         .collect()
@@ -1764,6 +2467,60 @@ async fn grant_json_tx(
     })))
 }
 
+async fn active_decision_attempt_json_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    attempt_id: Option<&[u8]>,
+) -> Result<Option<Value>> {
+    let Some(attempt_id) = attempt_id else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT attempt_id, control_epoch, decision_epoch, attempt_number, \
+                speech_revision, snapshot_intent_revision, snapshot_state_event_id, \
+                candidate_snapshot_json, candidate_snapshot_hash, started_at, deadline_at \
+         FROM meeting_moderator_decision_attempts \
+         WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+           AND state = 'running'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(attempt_id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or_else(|| {
+        DbError::InvalidData("active moderator DecisionAttempt projection is missing".to_string())
+    })?;
+    let attempt_id: Vec<u8> = row.try_get("attempt_id")?;
+    let snapshot_state_event_id: Vec<u8> = row.try_get("snapshot_state_event_id")?;
+    let candidate_snapshot_hash: Vec<u8> = row.try_get("candidate_snapshot_hash")?;
+    let started_at: DateTime<Utc> = row.try_get("started_at")?;
+    let deadline_at: DateTime<Utc> = row.try_get("deadline_at")?;
+    let candidate_snapshot: Value = row.try_get("candidate_snapshot_json")?;
+    let candidate_refs = candidate_snapshot
+        .get("candidate_refs")
+        .cloned()
+        .ok_or_else(|| {
+            DbError::InvalidData(
+                "moderator DecisionAttempt snapshot has no candidate refs".to_string(),
+            )
+        })?;
+    Ok(Some(json!({
+        "attempt_id": hex::encode(attempt_id),
+        "control_epoch": row.try_get::<i64, _>("control_epoch")?,
+        "decision_epoch": row.try_get::<i64, _>("decision_epoch")?,
+        "attempt_number": row.try_get::<i32, _>("attempt_number")?,
+        "speech_revision": row.try_get::<i64, _>("speech_revision")?,
+        "snapshot_intent_revision": row.try_get::<i64, _>("snapshot_intent_revision")?,
+        "snapshot_state_event_id": hex::encode(snapshot_state_event_id),
+        "candidate_refs": candidate_refs,
+        "candidate_snapshot_hash": hex::encode(candidate_snapshot_hash),
+        "started_at_ms": started_at.timestamp_millis(),
+        "deadline_ms": deadline_at.timestamp_millis(),
+    })))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_dynamic_state_event_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -1801,6 +2558,13 @@ async fn build_dynamic_state_event_tx(
         target.active_grant_id.as_deref(),
     )
     .await?;
+    let active_decision_attempt = active_decision_attempt_json_tx(
+        tx,
+        community_id,
+        session_id,
+        target.active_decision_attempt_id.as_deref(),
+    )
+    .await?;
     let moderator = hex::encode(moderator_pubkey);
     let content = json!({
         "phase": target.phase,
@@ -1810,6 +2574,8 @@ async fn build_dynamic_state_event_tx(
         "speech_revision": speech_revision,
         "control_epoch": target.control_epoch,
         "decision_epoch": target.decision_epoch,
+        "decision_attempt": target.decision_attempt,
+        "active_decision_attempt": active_decision_attempt,
         "baton_config": config,
         "moderator_pubkey": moderator,
         "participants": participants,
@@ -1929,8 +2695,9 @@ async fn commit_transition_tx(
              consecutive_moderator_speeches = $14, \
              forced_return_to_moderator = $15, recall_event_id = $16, \
              moderator_decision_started_at = $17, moderator_decision_deadline = $18, \
-             next_action_at = $19, recovery_retry_at = '-infinity', \
-             recovery_attempts = 0, updated_at = $20 \
+             next_action_at = $19, decision_attempt = $20, \
+             active_decision_attempt_id = $21, recovery_retry_at = '-infinity', \
+             recovery_attempts = 0, updated_at = $22 \
          WHERE community_id = $1 AND session_id = $2",
     )
     .bind(community_id.as_uuid())
@@ -1952,6 +2719,8 @@ async fn commit_transition_tx(
     .bind(target.moderator_decision_started_at)
     .bind(target.moderator_decision_deadline)
     .bind(target.next_action_at)
+    .bind(target.decision_attempt)
+    .bind(&target.active_decision_attempt_id)
     .bind(now)
     .execute(tx.as_mut())
     .await?;
@@ -2081,7 +2850,9 @@ async fn insert_offer_tx(
         sqlx::query(
             "UPDATE meeting_directed_handoffs \
              SET attempt_count = attempt_count + 1, last_offer_id = $4, \
-                 last_attempt_outcome = 'offered', blocked_by = NULL \
+                 last_attempt_outcome = 'offered', blocked_by = NULL, \
+                 moderator_retry_blocked_fingerprint = NULL, \
+                 moderator_retry_not_before = NULL \
              WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3 \
                AND question_state = 'open'",
         )
@@ -2155,16 +2926,16 @@ async fn fallback_candidate_tx(
     community_id: CommunityId,
     session_id: Uuid,
     state: &StateRow,
+    eligible_through_epoch: i64,
 ) -> Result<Option<IntentRow>> {
     let moderator = load_moderator_tx(tx, community_id, session_id).await?;
     let rows = sqlx::query(
-        "SELECT i.intent_id, i.author_pubkey, i.current_event_id, \
-                i.basis_speech_revision, i.summary, i.addressed_to, i.state, \
-                i.selection_attempt_count, i.last_offer_id, i.last_attempt_outcome, \
-                i.deferred_by_offer_id, i.created_at \
+        "SELECT i.intent_id, i.author_pubkey, i.current_event_id, i.state, \
+                i.deferred_by_offer_id, i.eligible_decision_epoch \
          FROM meeting_speech_intents i \
          WHERE i.community_id = $1 AND i.session_id = $2 AND i.state = 'pending' \
            AND i.deferred_by_offer_id IS NULL \
+           AND i.eligible_decision_epoch <= $5 \
            AND NOT EXISTS ( \
                SELECT 1 FROM meeting_baton_fallback_attempts f \
                WHERE f.community_id = i.community_id AND f.session_id = i.session_id \
@@ -2180,6 +2951,7 @@ async fn fallback_candidate_tx(
     .bind(session_id)
     .bind(state.speech_revision)
     .bind(&moderator)
+    .bind(eligible_through_epoch)
     .fetch_all(tx.as_mut())
     .await?;
     let candidates: Vec<IntentRow> = rows
@@ -2191,11 +2963,13 @@ async fn fallback_candidate_tx(
              SELECT 1 FROM meeting_speech_intents \
              WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
                AND deferred_by_offer_id IS NULL AND author_pubkey <> $3 \
+               AND eligible_decision_epoch <= $4 \
          )",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(&moderator)
+    .bind(eligible_through_epoch)
     .fetch_one(tx.as_mut())
     .await?;
     Ok(candidates.into_iter().find(|candidate| {
@@ -2203,6 +2977,112 @@ async fn fallback_candidate_tx(
             || state.consecutive_moderator_speeches == 0
             || !has_other_valid
     }))
+}
+
+fn next_decision_epoch(current: i64) -> Result<i64> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| DbError::InvalidData("meeting decision epoch overflow".to_string()))
+}
+
+async fn release_human_request_handoff_blocks_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+) -> Result<Vec<Vec<u8>>> {
+    let rows = sqlx::query(
+        "UPDATE meeting_directed_handoffs \
+         SET blocked_by = NULL, moderator_retry_blocked_fingerprint = NULL, \
+             moderator_retry_not_before = NULL \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND question_state = 'open' AND blocked_by = 'human_request' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM meeting_human_floor_requests \
+               WHERE community_id = $1 AND session_id = $2 \
+                 AND state IN ('queued', 'offered') \
+           ) \
+         RETURNING handoff_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    let mut handoff_ids = rows
+        .into_iter()
+        .map(|row| row.try_get("handoff_id"))
+        .collect::<std::result::Result<Vec<Vec<u8>>, _>>()?;
+    handoff_ids.sort();
+    Ok(handoff_ids)
+}
+
+async fn clear_handoff_retry_suppression_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE meeting_directed_handoffs \
+         SET moderator_retry_blocked_fingerprint = NULL, moderator_retry_not_before = NULL \
+         WHERE community_id = $1 AND session_id = $2 AND question_state = 'open' \
+           AND moderator_retry_blocked_fingerprint IS NOT NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+async fn suppress_handoff_cohort_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    decision_epoch: i64,
+    fingerprint: &[u8],
+    retry_not_before: DateTime<Utc>,
+) -> Result<Vec<Vec<u8>>> {
+    let rows = sqlx::query(
+        "UPDATE meeting_directed_handoffs \
+         SET moderator_retry_blocked_fingerprint = $4, \
+             moderator_retry_not_before = $5 \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND question_state = 'open' AND blocked_by IS NULL \
+           AND eligible_decision_epoch <= $3 \
+         RETURNING handoff_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(decision_epoch)
+    .bind(fingerprint)
+    .bind(retry_not_before)
+    .fetch_all(tx.as_mut())
+    .await?;
+    let mut handoff_ids = rows
+        .into_iter()
+        .map(|row| row.try_get("handoff_id"))
+        .collect::<std::result::Result<Vec<Vec<u8>>, _>>()?;
+    handoff_ids.sort();
+    Ok(handoff_ids)
+}
+
+struct ModeratorControlReturn {
+    target: StateTarget,
+    unblocked_handoff_ids: Vec<Vec<u8>>,
+}
+
+impl ModeratorControlReturn {
+    fn into_target_with_effects(self, effects: &mut Vec<Value>) -> StateTarget {
+        for handoff_id in self.unblocked_handoff_ids {
+            effects.push(effect(
+                "handoff_unblocked",
+                "handoff",
+                &handoff_id,
+                Some("human_request"),
+                None,
+            ));
+        }
+        self.target
+    }
 }
 
 async fn return_control_to_moderator_tx(
@@ -2213,31 +3093,68 @@ async fn return_control_to_moderator_tx(
     config: &BatonConfig,
     now: DateTime<Utc>,
     increment_control_epoch: bool,
-) -> Result<StateTarget> {
-    let candidate = fallback_candidate_tx(tx, community_id, session_id, state).await?;
+) -> Result<ModeratorControlReturn> {
+    let unblocked_handoff_ids =
+        release_human_request_handoff_blocks_tx(tx, community_id, session_id).await?;
+    let next_epoch = next_decision_epoch(state.decision_epoch)?;
+    let next_has_intent = fallback_candidate_tx(tx, community_id, session_id, state, next_epoch)
+        .await?
+        .is_some();
+    let next_has_handoff =
+        current_cohort_has_handoffs_tx(tx, community_id, session_id, next_epoch).await?;
+    let next_exists = next_has_intent || next_has_handoff;
     let mut target = StateTarget::from_state(state);
     target.active_offer_id = None;
     target.active_grant_id = None;
     target.handoff_depth = 0;
     target.forced_return_to_moderator = false;
     target.recall_event_id = None;
+    target.decision_attempt = 0;
     if increment_control_epoch {
         target.control_epoch += 1;
     }
-    if candidate.is_some() {
+    if next_exists {
+        target.decision_epoch = next_epoch;
+    }
+    if next_has_intent {
+        clear_handoff_retry_suppression_tx(tx, community_id, session_id).await?;
         target.phase = BatonPhase::ModeratorControl;
-        target.decision_epoch += 1;
         target.moderator_decision_started_at = Some(now);
         let deadline = now + Duration::milliseconds(config.moderator_decision_ms);
         target.moderator_decision_deadline = Some(deadline);
         target.next_action_at = Some(deadline);
     } else {
         target.phase = BatonPhase::ModeratorIdle;
-        target.moderator_decision_started_at = None;
-        target.moderator_decision_deadline = None;
-        target.next_action_at = None;
+        if next_has_handoff && target.active_decision_attempt_id.is_some() {
+            // A still-running Attempt belongs to the pre-Human epoch. Bound
+            // the wait for its natural terminal with the new control
+            // window; never inherit its stale deadline into this Cohort.
+            target.moderator_decision_started_at = Some(now);
+            let deadline = now + Duration::milliseconds(config.moderator_decision_ms);
+            target.moderator_decision_deadline = Some(deadline);
+            target.next_action_at = Some(deadline);
+        } else if let Some(attempt_id) = target.active_decision_attempt_id.as_deref() {
+            let attempt = load_moderator_attempt_tx(tx, community_id, session_id, attempt_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::InvalidData(
+                        "active moderator DecisionAttempt is missing during control return"
+                            .to_string(),
+                    )
+                })?;
+            target.moderator_decision_started_at = Some(attempt.started_at);
+            target.moderator_decision_deadline = Some(attempt.deadline_at);
+            target.next_action_at = Some(attempt.deadline_at);
+        } else {
+            target.moderator_decision_started_at = None;
+            target.moderator_decision_deadline = None;
+            target.next_action_at = None;
+        }
     }
-    Ok(target)
+    Ok(ModeratorControlReturn {
+        target,
+        unblocked_handoff_ids,
+    })
 }
 
 async fn ensure_moderator_window_tx(
@@ -2251,15 +3168,25 @@ async fn ensure_moderator_window_tx(
     if !matches!(
         state.phase,
         BatonPhase::ModeratorIdle | BatonPhase::ModeratorControl
-    ) {
+    ) || state.active_decision_attempt_id.is_some()
+    {
         return Ok(StateTarget::from_state(state));
     }
-    let candidate = fallback_candidate_tx(tx, community_id, session_id, state).await?;
+    let eligible_through_epoch = if state.phase == BatonPhase::ModeratorIdle {
+        next_decision_epoch(state.decision_epoch)?
+    } else {
+        state.decision_epoch
+    };
+    let candidate =
+        fallback_candidate_tx(tx, community_id, session_id, state, eligible_through_epoch).await?;
     let mut target = StateTarget::from_state(state);
     match (state.phase, candidate.is_some()) {
         (BatonPhase::ModeratorIdle, true) => {
+            clear_handoff_retry_suppression_tx(tx, community_id, session_id).await?;
             target.phase = BatonPhase::ModeratorControl;
-            target.decision_epoch += 1;
+            target.decision_epoch = eligible_through_epoch;
+            target.decision_attempt = 0;
+            target.active_decision_attempt_id = None;
             target.moderator_decision_started_at = Some(now);
             let deadline = now + Duration::milliseconds(config.moderator_decision_ms);
             target.moderator_decision_deadline = Some(deadline);
@@ -2493,7 +3420,8 @@ async fn fail_active_offer_tx(
     } else {
         let target =
             return_control_to_moderator_tx(tx, community_id, session_id, state, config, now, true)
-                .await?;
+                .await?
+                .into_target_with_effects(&mut effects);
         append_control_return_effects(&mut effects, state, session_id);
         target
     };
@@ -2659,7 +3587,8 @@ async fn fail_active_grant_tx(
                 now,
                 true,
             )
-            .await?;
+            .await?
+            .into_target_with_effects(&mut effects);
             append_control_return_effects(&mut effects, &scheduling_state, session_id);
             target
         };
@@ -2786,14 +3715,75 @@ async fn advance_due_locked_tx(
             state = next;
             transitions.push(result);
         }
-    } else if state.phase == BatonPhase::ModeratorControl
-        && state
-            .moderator_decision_deadline
-            .is_some_and(|deadline| now >= deadline)
+    } else if matches!(
+        state.phase,
+        BatonPhase::ModeratorControl | BatonPhase::ModeratorIdle
+    ) && state
+        .moderator_decision_deadline
+        .is_some_and(|deadline| now >= deadline)
     {
-        let candidate = fallback_candidate_tx(tx, community_id, session_id, &state).await?;
         let mut effects = Vec::new();
-        let (target, object_id, delta) = if let Some(candidate) = candidate {
+        if let Some(attempt_id) = state.active_decision_attempt_id.as_deref() {
+            let updated = sqlx::query(
+                "UPDATE meeting_moderator_decision_attempts \
+                 SET state = 'timed_out', terminal_reason = 'deadline_expired', \
+                     terminal_at = $4 \
+                 WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+                   AND state = 'running'",
+            )
+            .bind(community_id.as_uuid())
+            .bind(session_id)
+            .bind(attempt_id)
+            .bind(now)
+            .execute(tx.as_mut())
+            .await?;
+            if updated.rows_affected() == 1 {
+                effects.push(effect(
+                    "moderator_decision_attempt_timed_out",
+                    "moderator_decision_attempt",
+                    attempt_id,
+                    Some("running"),
+                    Some("timed_out"),
+                ));
+            }
+            let (fingerprint, attempt_decision_epoch): (Vec<u8>, i64) = sqlx::query_as(
+                "SELECT candidate_snapshot_hash, decision_epoch \
+                 FROM meeting_moderator_decision_attempts \
+                 WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+            )
+            .bind(community_id.as_uuid())
+            .bind(session_id)
+            .bind(attempt_id)
+            .fetch_one(tx.as_mut())
+            .await?;
+            let suppressed =
+                if updated.rows_affected() == 1 && attempt_decision_epoch == state.decision_epoch {
+                    suppress_handoff_cohort_tx(
+                        tx,
+                        community_id,
+                        session_id,
+                        state.decision_epoch,
+                        &fingerprint,
+                        now + Duration::milliseconds(config.moderator_decision_ms),
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                };
+            for handoff_id in suppressed {
+                effects.push(effect(
+                    "handoff_moderator_retry_suppressed",
+                    "handoff",
+                    &handoff_id,
+                    None,
+                    Some("suppressed"),
+                ));
+            }
+        }
+        let candidate =
+            fallback_candidate_tx(tx, community_id, session_id, &state, state.decision_epoch)
+                .await?;
+        let (mut target, object_id, delta) = if let Some(candidate) = candidate {
             let moderator = load_moderator_tx(tx, community_id, session_id).await?;
             let offer_id = random_object_id();
             let turn_role = if candidate.author_pubkey == moderator {
@@ -2864,6 +3854,7 @@ async fn advance_due_locked_tx(
             target.next_action_at = None;
             (target, None, RevisionDelta::FLOOR)
         };
+        target.active_decision_attempt_id = None;
         effects.push(phase_effect(session_id, state.phase, target.phase));
         let transition = TransitionSpec::deadline(
             "moderator_fallback",
@@ -3004,6 +3995,11 @@ enum ApplyResult {
         code: &'static str,
         canonical_object_id: Option<Vec<u8>>,
     },
+    RejectedWithRetry {
+        code: &'static str,
+        canonical_object_id: Option<Vec<u8>>,
+        retry_ticket: RetryTicketDraft,
+    },
 }
 
 fn rejection_was_caused_by_recovery(
@@ -3142,6 +4138,7 @@ pub async fn execute_baton_command(
                         canonical_object_id: receipt.canonical_object_id,
                         state_revision: receipt.state_revision,
                         outcome_code: receipt.outcome_code,
+                        retry_ticket_id: receipt.retry_ticket_id,
                     },
                     snapshot,
                 });
@@ -3157,6 +4154,7 @@ pub async fn execute_baton_command(
                 "participant_revoked",
                 None,
                 Some(snapshot.state_revision),
+                None,
             )
             .await?;
             tx.commit().await?;
@@ -3165,6 +4163,7 @@ pub async fn execute_baton_command(
                 command_outcome: BatonCommandOutcome::RejectedAfterRecovery {
                     code: "participant_revoked".to_string(),
                     canonical_object_id: None,
+                    retry_ticket_id: None,
                 },
                 snapshot,
             });
@@ -3203,6 +4202,7 @@ pub async fn execute_baton_command(
                     command_outcome: BatonCommandOutcome::RejectedAfterRecovery {
                         code: "participant_revoked".to_string(),
                         canonical_object_id: None,
+                        retry_ticket_id: None,
                     },
                     snapshot,
                 });
@@ -3261,6 +4261,7 @@ pub async fn execute_baton_command(
                 canonical_object_id: receipt.canonical_object_id,
                 state_revision: receipt.state_revision,
                 outcome_code: receipt.outcome_code,
+                retry_ticket_id: receipt.retry_ticket_id,
             },
             snapshot,
         });
@@ -3277,6 +4278,7 @@ pub async fn execute_baton_command(
             "meeting_ended",
             None,
             Some(state.state_revision),
+            None,
         )
         .await?;
         let snapshot = load_snapshot_tx(&mut tx, params.community_id, params.session_id).await?;
@@ -3286,6 +4288,7 @@ pub async fn execute_baton_command(
             command_outcome: BatonCommandOutcome::RejectedTerminal {
                 code: "meeting_ended".to_string(),
                 canonical_object_id: None,
+                retry_ticket_id: None,
             },
             snapshot,
         });
@@ -3325,6 +4328,7 @@ pub async fn execute_baton_command(
                 "accepted",
                 canonical_object_id.as_deref(),
                 Some(state_revision),
+                None,
             )
             .await?;
             BatonCommandOutcome::Accepted {
@@ -3364,18 +4368,60 @@ pub async fn execute_baton_command(
                 code,
                 canonical_object_id.as_deref(),
                 Some(state.state_revision),
+                None,
             )
             .await?;
             if outcome_class == "rejected_terminal" {
                 BatonCommandOutcome::RejectedTerminal {
                     code: code.to_string(),
                     canonical_object_id,
+                    retry_ticket_id: None,
                 }
             } else {
                 BatonCommandOutcome::RejectedAfterRecovery {
                     code: code.to_string(),
                     canonical_object_id,
+                    retry_ticket_id: None,
                 }
+            }
+        }
+        ApplyResult::RejectedWithRetry {
+            code,
+            canonical_object_id,
+            retry_ticket,
+        } => {
+            sqlx::query("ROLLBACK TO SAVEPOINT meeting_v1_command")
+                .execute(tx.as_mut())
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT meeting_v1_command")
+                .execute(tx.as_mut())
+                .await?;
+            insert_retry_ticket_tx(
+                &mut tx,
+                params.community_id,
+                params.session_id,
+                &retry_ticket,
+                now,
+            )
+            .await?;
+            insert_receipt_tx(
+                &mut tx,
+                params.community_id,
+                params.session_id,
+                params.event,
+                action,
+                false,
+                "rejected_terminal",
+                code,
+                canonical_object_id.as_deref(),
+                Some(state.state_revision),
+                Some(&retry_ticket.retry_ticket_id),
+            )
+            .await?;
+            BatonCommandOutcome::RejectedTerminal {
+                code: code.to_string(),
+                canonical_object_id,
+                retry_ticket_id: Some(retry_ticket.retry_ticket_id),
             }
         }
     };
@@ -3473,6 +4519,114 @@ async fn apply_command_tx(
                 actor,
                 state,
                 command,
+                now,
+            )
+            .await
+        }
+        BatonCommand::ModeratorDecisionAttemptStart { .. } => {
+            apply_moderator_attempt_start_tx(
+                tx,
+                community_id,
+                session_id,
+                event,
+                relay_keys,
+                actor,
+                state,
+                command,
+                now,
+            )
+            .await
+        }
+        BatonCommand::ModeratorDecisionAttemptFinish { .. } => {
+            apply_moderator_attempt_finish_tx(
+                tx,
+                community_id,
+                session_id,
+                event,
+                relay_keys,
+                actor,
+                state,
+                command,
+                now,
+            )
+            .await
+        }
+        BatonCommand::ModeratorDecisionRetry {
+            attempt_id,
+            retry_ticket_id,
+            failed_action_event_id,
+            expected_control_epoch,
+            expected_decision_epoch,
+            expected_attempt_number,
+        } => {
+            apply_moderator_retry_tx(
+                tx,
+                community_id,
+                session_id,
+                event,
+                relay_keys,
+                actor,
+                state,
+                attempt_id,
+                retry_ticket_id,
+                failed_action_event_id,
+                *expected_control_epoch,
+                *expected_decision_epoch,
+                *expected_attempt_number,
+                now,
+            )
+            .await
+        }
+        BatonCommand::ModeratorCompleteCohort {
+            attempt_id,
+            expected_control_epoch,
+            expected_decision_epoch,
+        } => {
+            apply_moderator_complete_cohort_tx(
+                tx,
+                community_id,
+                session_id,
+                event,
+                relay_keys,
+                actor,
+                state,
+                attempt_id,
+                *expected_control_epoch,
+                *expected_decision_epoch,
+                now,
+            )
+            .await
+        }
+        BatonCommand::ModeratorDecisionAttemptAbandon { attempt_id } => {
+            apply_moderator_attempt_abandon_tx(
+                tx,
+                community_id,
+                session_id,
+                event,
+                relay_keys,
+                actor,
+                state,
+                attempt_id,
+                now,
+            )
+            .await
+        }
+        BatonCommand::ModeratorWithdrawSelf {
+            attempt_id,
+            intent_id,
+            previous_event_id,
+        } => {
+            apply_moderator_withdraw_self_tx(
+                tx,
+                community_id,
+                session_id,
+                event,
+                relay_keys,
+                actor,
+                state,
+                attempt_id,
+                intent_id,
+                previous_event_id,
                 now,
             )
             .await
@@ -3641,11 +4795,26 @@ async fn apply_intent_submit_tx(
     }
     persist_command_event_tx(tx, community_id, session_id, event, now).await?;
     let intent_id = event.id.as_bytes().to_vec();
+    let current_cohort_is_open = state.decision_attempt == 0
+        && match state.phase {
+            BatonPhase::ModeratorControl => true,
+            BatonPhase::ModeratorIdle => {
+                current_cohort_has_candidates_tx(tx, community_id, session_id, state.decision_epoch)
+                    .await?
+            }
+            BatonPhase::Offered | BatonPhase::Granted | BatonPhase::Ended => false,
+        };
+    let eligible_decision_epoch = if current_cohort_is_open {
+        state.decision_epoch
+    } else {
+        next_decision_epoch(state.decision_epoch)?
+    };
     sqlx::query(
         "INSERT INTO meeting_speech_intents \
              (community_id, session_id, intent_id, author_pubkey, current_event_id, \
-              basis_speech_revision, summary, addressed_to, state, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $3, $5, $6, $7, 'pending', $8, $8)",
+              basis_speech_revision, summary, addressed_to, state, \
+              eligible_decision_epoch, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $3, $5, $6, $7, 'pending', $8, $9, $9)",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
@@ -3654,6 +4823,7 @@ async fn apply_intent_submit_tx(
     .bind(basis_speech_revision)
     .bind(summary)
     .bind(addressed_to)
+    .bind(eligible_decision_epoch)
     .bind(now)
     .execute(tx.as_mut())
     .await?;
@@ -3805,6 +4975,7 @@ async fn apply_intent_refresh_tx(
     let target = if floor_changed && target.phase != BatonPhase::Offered {
         return_control_to_moderator_tx(tx, community_id, session_id, state, &config, now, true)
             .await?
+            .into_target_with_effects(&mut effects)
     } else if floor_changed {
         target
     } else {
@@ -3938,6 +5109,7 @@ async fn apply_intent_withdraw_tx(
     let target = if floor_changed && base_target.phase != BatonPhase::Offered {
         return_control_to_moderator_tx(tx, community_id, session_id, state, &config, now, true)
             .await?
+            .into_target_with_effects(&mut effects)
     } else if floor_changed {
         base_target
     } else {
@@ -4005,8 +5177,1173 @@ async fn pending_self_intent_tx(
     community_id: CommunityId,
     session_id: Uuid,
     moderator: &[u8],
+    decision_epoch: i64,
 ) -> Result<Option<Vec<u8>>> {
-    existing_pending_intent_tx(tx, community_id, session_id, moderator).await
+    Ok(sqlx::query_scalar(
+        "SELECT intent_id FROM meeting_speech_intents \
+         WHERE community_id = $1 AND session_id = $2 AND author_pubkey = $3 \
+           AND state = 'pending' AND deferred_by_offer_id IS NULL \
+           AND eligible_decision_epoch <= $4 \
+         ORDER BY created_at, intent_id \
+         LIMIT 1 \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(moderator)
+    .bind(decision_epoch)
+    .fetch_optional(tx.as_mut())
+    .await?)
+}
+
+async fn next_cohort_target_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    state: &StateRow,
+    config: &BatonConfig,
+    now: DateTime<Utc>,
+) -> Result<StateTarget> {
+    let next_epoch = next_decision_epoch(state.decision_epoch)?;
+    let next_exists =
+        current_cohort_has_candidates_tx(tx, community_id, session_id, next_epoch).await?;
+    let mut target = StateTarget::from_state(state);
+    target.active_decision_attempt_id = None;
+    target.decision_attempt = 0;
+    target.active_offer_id = None;
+    target.active_grant_id = None;
+    if !next_exists {
+        target.phase = BatonPhase::ModeratorIdle;
+        target.moderator_decision_started_at = None;
+        target.moderator_decision_deadline = None;
+        target.next_action_at = None;
+        return Ok(target);
+    }
+
+    target.decision_epoch = next_epoch;
+    let has_intent: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM meeting_speech_intents \
+             WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
+               AND deferred_by_offer_id IS NULL AND eligible_decision_epoch <= $3 \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(next_epoch)
+    .fetch_one(tx.as_mut())
+    .await?;
+    if has_intent {
+        target.phase = BatonPhase::ModeratorControl;
+        target.moderator_decision_started_at = Some(now);
+        let deadline = now + Duration::milliseconds(config.moderator_decision_ms);
+        target.moderator_decision_deadline = Some(deadline);
+        target.next_action_at = Some(deadline);
+    } else {
+        target.phase = BatonPhase::ModeratorIdle;
+        target.moderator_decision_started_at = None;
+        target.moderator_decision_deadline = None;
+        target.next_action_at = None;
+    }
+    Ok(target)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_moderator_attempt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    attempt_id: &[u8],
+    moderator_pubkey: &[u8],
+    control_epoch: i64,
+    decision_epoch: i64,
+    attempt_number: i32,
+    speech_revision: i64,
+    snapshot_intent_revision: i64,
+    snapshot_state_event_id: &[u8],
+    candidate_snapshot_json: &Value,
+    candidate_snapshot_hash: &[u8],
+    replacement_of_attempt_id: Option<&[u8]>,
+    started_by_event_id: &[u8],
+    started_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO meeting_moderator_decision_attempts \
+             (community_id, session_id, attempt_id, moderator_pubkey, control_epoch, \
+              decision_epoch, attempt_number, speech_revision, snapshot_intent_revision, \
+              snapshot_state_event_id, candidate_snapshot_json, candidate_snapshot_hash, \
+              state, replacement_of_attempt_id, started_by_event_id, started_at, deadline_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                 'running', $13, $14, $15, $16)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(attempt_id)
+    .bind(moderator_pubkey)
+    .bind(control_epoch)
+    .bind(decision_epoch)
+    .bind(attempt_number)
+    .bind(speech_revision)
+    .bind(snapshot_intent_revision)
+    .bind(snapshot_state_event_id)
+    .bind(candidate_snapshot_json)
+    .bind(candidate_snapshot_hash)
+    .bind(replacement_of_attempt_id)
+    .bind(started_by_event_id)
+    .bind(started_at)
+    .bind(deadline_at)
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_moderator_attempt_start_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event: &Event,
+    relay_keys: &Keys,
+    actor: &Actor,
+    state: &StateRow,
+    command: &BatonCommand,
+    now: DateTime<Utc>,
+) -> Result<ApplyResult> {
+    let BatonCommand::ModeratorDecisionAttemptStart {
+        expected_control_epoch,
+        expected_decision_epoch,
+        expected_intent_revision,
+        expected_speech_revision,
+        expected_state_event_id,
+        replacement_of_attempt_id,
+    } = command
+    else {
+        return Err(DbError::InvalidData(
+            "invalid moderator DecisionAttempt Start command".to_string(),
+        ));
+    };
+    if !actor.is_moderator || actor.participant_type != ParticipantType::Agent {
+        return Ok(ApplyResult::Rejected {
+            code: "agent_moderator_required",
+            canonical_object_id: None,
+        });
+    }
+    if !matches!(
+        state.phase,
+        BatonPhase::ModeratorControl | BatonPhase::ModeratorIdle
+    ) || state.active_offer_id.is_some()
+        || state.active_grant_id.is_some()
+    {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_does_not_hold_control",
+            canonical_object_id: state
+                .active_offer_id
+                .clone()
+                .or_else(|| state.active_grant_id.clone()),
+        });
+    }
+    if state.active_decision_attempt_id.is_some() {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_attempt_already_running",
+            canonical_object_id: state.active_decision_attempt_id.clone(),
+        });
+    }
+    if has_queued_human_tx(tx, community_id, session_id).await? {
+        return Ok(ApplyResult::Rejected {
+            code: "human_request_has_priority",
+            canonical_object_id: None,
+        });
+    }
+    if state.control_epoch != *expected_control_epoch
+        || state.decision_epoch != *expected_decision_epoch
+        || state.intent_revision != *expected_intent_revision
+        || state.speech_revision != *expected_speech_revision
+        || state.state_event_id != *expected_state_event_id
+    {
+        return Ok(ApplyResult::Rejected {
+            code: "stale_moderator_revision",
+            canonical_object_id: Some(state.state_event_id.clone()),
+        });
+    }
+
+    let config = load_config_tx(tx, community_id, session_id).await?;
+    let mut decision_epoch = state.decision_epoch;
+    if state.phase == BatonPhase::ModeratorIdle
+        && !current_cohort_has_candidates_tx(tx, community_id, session_id, state.decision_epoch)
+            .await?
+    {
+        decision_epoch = next_decision_epoch(state.decision_epoch)?;
+    }
+    let (candidate_snapshot, candidate_snapshot_hash, candidate_count) =
+        build_candidate_snapshot_tx(
+            tx,
+            community_id,
+            session_id,
+            state,
+            &actor.pubkey,
+            decision_epoch,
+        )
+        .await?;
+    if candidate_count == 0 {
+        return Ok(ApplyResult::Rejected {
+            code: "no_current_cohort_candidates",
+            canonical_object_id: None,
+        });
+    }
+
+    let (attempt_number, deadline_at) =
+        if let Some(replacement_id) = replacement_of_attempt_id.as_deref() {
+            let Some(replaced) =
+                load_moderator_attempt_tx(tx, community_id, session_id, replacement_id).await?
+            else {
+                return Ok(ApplyResult::Rejected {
+                    code: "replacement_attempt_not_found",
+                    canonical_object_id: None,
+                });
+            };
+            if replaced.state != "abandoned"
+                || replaced.moderator_pubkey != actor.pubkey
+                || replaced.control_epoch != state.control_epoch
+                || replaced.decision_epoch != decision_epoch
+            {
+                return Ok(ApplyResult::Rejected {
+                    code: "replacement_attempt_not_eligible",
+                    canonical_object_id: Some(replaced.attempt_id),
+                });
+            }
+            if now >= replaced.deadline_at {
+                return Ok(ApplyResult::Rejected {
+                    code: "moderator_attempt_expired",
+                    canonical_object_id: Some(replaced.attempt_id),
+                });
+            }
+            let attempt_number = replaced.attempt_number.checked_add(1).ok_or_else(|| {
+                DbError::InvalidData("moderator attempt number overflow".to_string())
+            })?;
+            (attempt_number, replaced.deadline_at)
+        } else {
+            let already_started: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM meeting_moderator_decision_attempts \
+                     WHERE community_id = $1 AND session_id = $2 \
+                       AND control_epoch = $3 AND decision_epoch = $4 \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(session_id)
+            .bind(state.control_epoch)
+            .bind(decision_epoch)
+            .fetch_one(tx.as_mut())
+            .await?;
+            if already_started {
+                return Ok(ApplyResult::Rejected {
+                    code: "moderator_attempt_already_started",
+                    canonical_object_id: None,
+                });
+            }
+            (
+                1,
+                now + Duration::milliseconds(config.moderator_decision_ms),
+            )
+        };
+    if attempt_number > config.moderator_max_rejudgments + 1 {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_attempt_limit_reached",
+            canonical_object_id: replacement_of_attempt_id.clone(),
+        });
+    }
+
+    persist_command_event_tx(tx, community_id, session_id, event, now).await?;
+    let attempt_id = random_object_id();
+    insert_moderator_attempt_tx(
+        tx,
+        community_id,
+        session_id,
+        &attempt_id,
+        &actor.pubkey,
+        state.control_epoch,
+        decision_epoch,
+        attempt_number,
+        state.speech_revision,
+        state.intent_revision,
+        &state.state_event_id,
+        &candidate_snapshot,
+        &candidate_snapshot_hash,
+        replacement_of_attempt_id.as_deref(),
+        event.id.as_bytes().as_slice(),
+        now,
+        deadline_at,
+    )
+    .await?;
+
+    let mut target = StateTarget::from_state(state);
+    target.decision_epoch = decision_epoch;
+    target.decision_attempt = attempt_number;
+    target.active_decision_attempt_id = Some(attempt_id.clone());
+    target.moderator_decision_started_at = Some(now);
+    target.moderator_decision_deadline = Some(deadline_at);
+    target.next_action_at = Some(deadline_at);
+    if target.phase == BatonPhase::ModeratorIdle {
+        let has_intent =
+            candidate_snapshot["candidate_refs"]
+                .as_array()
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        candidate.get("source_type").and_then(Value::as_str) == Some("intent")
+                    })
+                });
+        if has_intent {
+            target.phase = BatonPhase::ModeratorControl;
+        }
+    }
+    let mut started_effect = effect(
+        "moderator_decision_attempt_started",
+        "moderator_decision_attempt",
+        &attempt_id,
+        None,
+        Some("running"),
+    );
+    started_effect["candidate_snapshot_hash"] =
+        Value::String(hex::encode(&candidate_snapshot_hash));
+    let transition = TransitionSpec::command(
+        "moderator_decision_attempt_started",
+        Some(attempt_id.clone()),
+        event.id.as_bytes().as_slice(),
+        vec![
+            started_effect,
+            phase_effect(session_id, state.phase, target.phase),
+        ],
+    );
+    finish_accepted_tx(
+        tx,
+        community_id,
+        session_id,
+        event,
+        relay_keys,
+        state,
+        target,
+        RevisionDelta::FLOOR,
+        transition,
+        Some(attempt_id),
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_moderator_attempt_finish_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event: &Event,
+    relay_keys: &Keys,
+    actor: &Actor,
+    state: &StateRow,
+    command: &BatonCommand,
+    now: DateTime<Utc>,
+) -> Result<ApplyResult> {
+    let BatonCommand::ModeratorDecisionAttemptFinish {
+        attempt_id,
+        outcome,
+        reason_code,
+    } = command
+    else {
+        return Err(DbError::InvalidData(
+            "invalid moderator DecisionAttempt Finish command".to_string(),
+        ));
+    };
+    let Some(attempt) = load_moderator_attempt_tx(tx, community_id, session_id, attempt_id).await?
+    else {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_attempt_not_found",
+            canonical_object_id: None,
+        });
+    };
+    if attempt.moderator_pubkey != actor.pubkey {
+        return Err(DbError::AccessDenied(
+            "moderator attempt belongs to another actor".to_string(),
+        ));
+    }
+    if attempt.state != "running" {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_attempt_already_terminal",
+            canonical_object_id: Some(attempt.attempt_id),
+        });
+    }
+
+    persist_command_event_tx(tx, community_id, session_id, event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_moderator_decision_attempts \
+         SET state = $4, terminal_event_id = $5, terminal_reason = $6, terminal_at = $7 \
+         WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+           AND state = 'running'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(attempt_id)
+    .bind(outcome.as_str())
+    .bind(event.id.as_bytes().as_slice())
+    .bind(reason_code)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let mut target = StateTarget::from_state(state);
+    if target.active_decision_attempt_id.as_deref() == Some(attempt_id) {
+        target.active_decision_attempt_id = None;
+    }
+    let transition = TransitionSpec::command(
+        "moderator_decision_attempt_finished",
+        Some(attempt_id.clone()),
+        event.id.as_bytes().as_slice(),
+        vec![effect(
+            if *outcome == BatonDecisionAttemptFinishOutcome::Completed {
+                "moderator_decision_attempt_completed"
+            } else {
+                "moderator_decision_attempt_discarded"
+            },
+            "moderator_decision_attempt",
+            attempt_id,
+            Some("running"),
+            Some(outcome.as_str()),
+        )],
+    );
+    finish_accepted_tx(
+        tx,
+        community_id,
+        session_id,
+        event,
+        relay_keys,
+        state,
+        target,
+        RevisionDelta::FLOOR,
+        transition,
+        Some(attempt_id.clone()),
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_moderator_attempt_abandon_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event: &Event,
+    relay_keys: &Keys,
+    actor: &Actor,
+    state: &StateRow,
+    attempt_id: &[u8],
+    now: DateTime<Utc>,
+) -> Result<ApplyResult> {
+    let Some(attempt) = load_moderator_attempt_tx(tx, community_id, session_id, attempt_id).await?
+    else {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_attempt_not_found",
+            canonical_object_id: None,
+        });
+    };
+    if attempt.moderator_pubkey != actor.pubkey {
+        return Err(DbError::AccessDenied(
+            "moderator attempt belongs to another actor".to_string(),
+        ));
+    }
+    if attempt.state != "running" {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_attempt_already_terminal",
+            canonical_object_id: Some(attempt.attempt_id),
+        });
+    }
+    persist_command_event_tx(tx, community_id, session_id, event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_moderator_decision_attempts \
+         SET state = 'abandoned', terminal_event_id = $4, \
+             terminal_reason = 'runtime_lost', terminal_at = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+           AND state = 'running'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(attempt_id)
+    .bind(event.id.as_bytes().as_slice())
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let mut target = StateTarget::from_state(state);
+    if target.active_decision_attempt_id.as_deref() == Some(attempt_id) {
+        target.active_decision_attempt_id = None;
+    }
+    let transition = TransitionSpec::command(
+        "moderator_decision_attempt_abandoned",
+        Some(attempt_id.to_vec()),
+        event.id.as_bytes().as_slice(),
+        vec![effect(
+            "moderator_decision_attempt_abandoned",
+            "moderator_decision_attempt",
+            attempt_id,
+            Some("running"),
+            Some("abandoned"),
+        )],
+    );
+    finish_accepted_tx(
+        tx,
+        community_id,
+        session_id,
+        event,
+        relay_keys,
+        state,
+        target,
+        RevisionDelta::FLOOR,
+        transition,
+        Some(attempt_id.to_vec()),
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_moderator_complete_cohort_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event: &Event,
+    relay_keys: &Keys,
+    actor: &Actor,
+    state: &StateRow,
+    attempt_id: &[u8],
+    expected_control_epoch: i64,
+    expected_decision_epoch: i64,
+    now: DateTime<Utc>,
+) -> Result<ApplyResult> {
+    if state.control_epoch != expected_control_epoch
+        || state.decision_epoch != expected_decision_epoch
+    {
+        return Ok(ApplyResult::Rejected {
+            code: "stale_moderator_revision",
+            canonical_object_id: Some(state.state_event_id.clone()),
+        });
+    }
+    let authority = moderator_action_authority_tx(
+        tx,
+        community_id,
+        session_id,
+        state,
+        actor,
+        Some(attempt_id),
+        now,
+    )
+    .await?;
+    let attempt = match authority {
+        ModeratorActionAuthority::Attempt(attempt) => attempt,
+        ModeratorActionAuthority::Rejected {
+            code,
+            canonical_object_id,
+        } => {
+            return Ok(ApplyResult::Rejected {
+                code,
+                canonical_object_id,
+            });
+        }
+        ModeratorActionAuthority::Manual => {
+            return Ok(ApplyResult::Rejected {
+                code: "moderator_attempt_required",
+                canonical_object_id: None,
+            });
+        }
+    };
+    if current_cohort_has_candidates_tx(tx, community_id, session_id, state.decision_epoch).await? {
+        return Ok(ApplyResult::Rejected {
+            code: "current_cohort_not_empty",
+            canonical_object_id: None,
+        });
+    }
+    persist_command_event_tx(tx, community_id, session_id, event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_moderator_decision_attempts \
+         SET state = 'committed', terminal_event_id = $4, \
+             terminal_reason = 'cohort_complete', terminal_at = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+           AND state = 'running'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(&attempt.attempt_id)
+    .bind(event.id.as_bytes().as_slice())
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let config = load_config_tx(tx, community_id, session_id).await?;
+    let target = next_cohort_target_tx(tx, community_id, session_id, state, &config, now).await?;
+    let transition = TransitionSpec::command(
+        "moderator_cohort_completed",
+        Some(attempt.attempt_id.clone()),
+        event.id.as_bytes().as_slice(),
+        vec![
+            effect(
+                "moderator_decision_attempt_committed",
+                "moderator_decision_attempt",
+                &attempt.attempt_id,
+                Some("running"),
+                Some("committed"),
+            ),
+            control_effect(session_id, "moderator_cohort_completed"),
+            phase_effect(session_id, state.phase, target.phase),
+        ],
+    );
+    finish_accepted_tx(
+        tx,
+        community_id,
+        session_id,
+        event,
+        relay_keys,
+        state,
+        target,
+        RevisionDelta::FLOOR,
+        transition,
+        Some(attempt.attempt_id),
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_moderator_retry_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event: &Event,
+    relay_keys: &Keys,
+    actor: &Actor,
+    state: &StateRow,
+    attempt_id: &[u8],
+    retry_ticket_id: &[u8],
+    failed_action_event_id: &[u8],
+    expected_control_epoch: i64,
+    expected_decision_epoch: i64,
+    expected_attempt_number: i32,
+    now: DateTime<Utc>,
+) -> Result<ApplyResult> {
+    if state.control_epoch != expected_control_epoch
+        || state.decision_epoch != expected_decision_epoch
+    {
+        return Ok(ApplyResult::Rejected {
+            code: "stale_moderator_revision",
+            canonical_object_id: Some(state.state_event_id.clone()),
+        });
+    }
+    if has_queued_human_tx(tx, community_id, session_id).await? {
+        return Ok(ApplyResult::Rejected {
+            code: "human_request_has_priority",
+            canonical_object_id: None,
+        });
+    }
+    let authority = moderator_action_authority_tx(
+        tx,
+        community_id,
+        session_id,
+        state,
+        actor,
+        Some(attempt_id),
+        now,
+    )
+    .await?;
+    let attempt = match authority {
+        ModeratorActionAuthority::Attempt(attempt) => attempt,
+        ModeratorActionAuthority::Rejected {
+            code,
+            canonical_object_id,
+        } => {
+            return Ok(ApplyResult::Rejected {
+                code,
+                canonical_object_id,
+            });
+        }
+        ModeratorActionAuthority::Manual => {
+            return Ok(ApplyResult::Rejected {
+                code: "moderator_attempt_required",
+                canonical_object_id: None,
+            });
+        }
+    };
+    if attempt.attempt_number != expected_attempt_number {
+        return Ok(ApplyResult::Rejected {
+            code: "stale_moderator_attempt_number",
+            canonical_object_id: Some(attempt.attempt_id),
+        });
+    }
+    let Some(ticket) = load_retry_ticket_tx(tx, community_id, session_id, retry_ticket_id).await?
+    else {
+        return Ok(ApplyResult::Rejected {
+            code: "retry_ticket_not_found",
+            canonical_object_id: None,
+        });
+    };
+    if ticket.consumed_at.is_some() {
+        return Ok(ApplyResult::Rejected {
+            code: "retry_ticket_already_consumed",
+            canonical_object_id: Some(ticket.retry_ticket_id),
+        });
+    }
+    if ticket.attempt_id != attempt.attempt_id
+        || ticket.failed_action_event_id != failed_action_event_id
+        || ticket.control_epoch != state.control_epoch
+        || ticket.decision_epoch != state.decision_epoch
+    {
+        return Ok(ApplyResult::Rejected {
+            code: "retry_ticket_binding_mismatch",
+            canonical_object_id: Some(ticket.retry_ticket_id),
+        });
+    }
+    if now >= ticket.deadline_at || ticket.deadline_at != attempt.deadline_at {
+        return Ok(ApplyResult::Rejected {
+            code: "retry_ticket_expired",
+            canonical_object_id: Some(ticket.retry_ticket_id),
+        });
+    }
+    let Some(candidate) = attempt_candidate_ref(&attempt, &ticket.source_type, &ticket.source_id)
+    else {
+        return Ok(ApplyResult::Rejected {
+            code: "retry_source_not_in_attempt_snapshot",
+            canonical_object_id: Some(ticket.source_id),
+        });
+    };
+    let conflict_still_present = match ticket.source_type.as_str() {
+        "intent" => {
+            let snapshot_event_id = candidate_hex(candidate, "current_event_id")?;
+            if ticket.snapshot_source_event_id.as_deref() != Some(snapshot_event_id.as_slice()) {
+                return Ok(ApplyResult::Rejected {
+                    code: "retry_ticket_binding_mismatch",
+                    canonical_object_id: Some(ticket.retry_ticket_id),
+                });
+            }
+            match load_intent_tx(tx, community_id, session_id, &ticket.source_id).await? {
+                Some(intent) => {
+                    intent.state != "pending"
+                        || intent.current_event_id != snapshot_event_id
+                        || intent.eligible_decision_epoch > state.decision_epoch
+                }
+                None => true,
+            }
+        }
+        "handoff" => {
+            let snapshot_attempt = candidate
+                .get("attempt_count")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    DbError::InvalidData(
+                        "Handoff candidate snapshot has no valid attempt count".to_string(),
+                    )
+                })?;
+            if ticket.snapshot_handoff_attempt_count != Some(snapshot_attempt) {
+                return Ok(ApplyResult::Rejected {
+                    code: "retry_ticket_binding_mismatch",
+                    canonical_object_id: Some(ticket.retry_ticket_id),
+                });
+            }
+            match load_handoff_tx(tx, community_id, session_id, &ticket.source_id).await? {
+                Some(handoff) => {
+                    handoff.question_state != "open"
+                        || handoff.blocked_by.is_some()
+                        || handoff.attempt_count != snapshot_attempt
+                        || handoff.eligible_decision_epoch > state.decision_epoch
+                }
+                None => true,
+            }
+        }
+        _ => {
+            return Err(DbError::InvalidData(
+                "retry ticket has an unsupported source type".to_string(),
+            ));
+        }
+    };
+    if !conflict_still_present {
+        return Ok(ApplyResult::Rejected {
+            code: "retry_conflict_no_longer_present",
+            canonical_object_id: Some(ticket.source_id),
+        });
+    }
+
+    let config = load_config_tx(tx, community_id, session_id).await?;
+    let next_attempt_number = attempt
+        .attempt_number
+        .checked_add(1)
+        .ok_or_else(|| DbError::InvalidData("moderator attempt number overflow".to_string()))?;
+    let (candidate_snapshot, candidate_snapshot_hash, candidate_count) =
+        build_candidate_snapshot_tx(
+            tx,
+            community_id,
+            session_id,
+            state,
+            &actor.pubkey,
+            state.decision_epoch,
+        )
+        .await?;
+
+    persist_command_event_tx(tx, community_id, session_id, event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_moderator_retry_tickets \
+         SET consumed_at = $4, consumed_by_event_id = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND retry_ticket_id = $3 \
+           AND consumed_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(retry_ticket_id)
+    .bind(now)
+    .bind(event.id.as_bytes().as_slice())
+    .execute(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "UPDATE meeting_moderator_decision_attempts \
+         SET state = 'retry_required', terminal_event_id = $4, \
+             terminal_reason = 'selected_source_changed', terminal_at = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+           AND state = 'running'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(&attempt.attempt_id)
+    .bind(event.id.as_bytes().as_slice())
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+
+    let mut effects = vec![
+        effect(
+            "moderator_decision_attempt_retry_required",
+            "moderator_decision_attempt",
+            &attempt.attempt_id,
+            Some("running"),
+            Some("retry_required"),
+        ),
+        effect(
+            "moderator_retry_ticket_consumed",
+            "moderator_retry_ticket",
+            retry_ticket_id,
+            Some("available"),
+            Some("consumed"),
+        ),
+    ];
+
+    if candidate_count == 0 {
+        let target =
+            next_cohort_target_tx(tx, community_id, session_id, state, &config, now).await?;
+        effects.push(control_effect(session_id, "moderator_cohort_completed"));
+        effects.push(phase_effect(session_id, state.phase, target.phase));
+        let transition = TransitionSpec::command(
+            "moderator_cohort_completed_after_conflict",
+            Some(attempt.attempt_id.clone()),
+            event.id.as_bytes().as_slice(),
+            effects,
+        );
+        return finish_accepted_tx(
+            tx,
+            community_id,
+            session_id,
+            event,
+            relay_keys,
+            state,
+            target,
+            RevisionDelta::FLOOR,
+            transition,
+            Some(attempt.attempt_id),
+            now,
+        )
+        .await;
+    }
+
+    if next_attempt_number > config.moderator_max_rejudgments + 1 {
+        let fallback =
+            fallback_candidate_tx(tx, community_id, session_id, state, state.decision_epoch)
+                .await?;
+        let (mut target, object_id, delta) = if let Some(candidate) = fallback {
+            let moderator = load_moderator_tx(tx, community_id, session_id).await?;
+            let offer_id = random_object_id();
+            let draft = OfferDraft {
+                offer_id: offer_id.clone(),
+                target_pubkey: candidate.author_pubkey.clone(),
+                allocation_source: "fallback",
+                turn_role: if candidate.author_pubkey == moderator {
+                    "moderator_self"
+                } else {
+                    "participant"
+                },
+                allocation_event_id: None,
+                selection_reason: Some("moderator retry limit reached".to_string()),
+                source_intent_id: Some(candidate.intent_id.clone()),
+                source_request_id: None,
+                source_handoff_id: None,
+                source_speech_event_id: None,
+                reason_type: None,
+                reason_text: None,
+                basis_speech_revision: state.speech_revision,
+                depth_mode: "reset",
+                previous_handoff_depth: state.handoff_depth,
+                requested_handoff_depth: 0,
+            };
+            let deadline =
+                insert_offer_tx(tx, community_id, session_id, &draft, &config, now).await?;
+            sqlx::query(
+                "INSERT INTO meeting_baton_fallback_attempts \
+                     (community_id, session_id, intent_id, current_intent_event_id, \
+                      speech_revision, offer_id, attempted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(session_id)
+            .bind(&candidate.intent_id)
+            .bind(&candidate.current_event_id)
+            .bind(state.speech_revision)
+            .bind(&offer_id)
+            .bind(now)
+            .execute(tx.as_mut())
+            .await?;
+            effects.push(effect(
+                "intent_attempted",
+                "intent",
+                &candidate.intent_id,
+                Some("pending"),
+                Some("pending"),
+            ));
+            effects.push(effect(
+                "offer_created",
+                "offer",
+                &offer_id,
+                None,
+                Some("pending"),
+            ));
+            (
+                StateTarget::offered(state, offer_id.clone(), deadline),
+                Some(offer_id),
+                RevisionDelta::FLOOR_INTENT,
+            )
+        } else {
+            let mut target = StateTarget::from_state(state);
+            target.phase = BatonPhase::ModeratorIdle;
+            target.moderator_decision_started_at = None;
+            target.moderator_decision_deadline = None;
+            target.next_action_at = None;
+            let suppressed = suppress_handoff_cohort_tx(
+                tx,
+                community_id,
+                session_id,
+                state.decision_epoch,
+                &candidate_snapshot_hash,
+                now + Duration::milliseconds(config.moderator_decision_ms),
+            )
+            .await?;
+            for handoff_id in suppressed {
+                effects.push(effect(
+                    "handoff_moderator_retry_suppressed",
+                    "handoff",
+                    &handoff_id,
+                    None,
+                    Some("suppressed"),
+                ));
+            }
+            (target, None, RevisionDelta::FLOOR)
+        };
+        target.active_decision_attempt_id = None;
+        effects.push(control_effect(session_id, "moderator_retry_limit_fallback"));
+        effects.push(phase_effect(session_id, state.phase, target.phase));
+        let transition = TransitionSpec::command(
+            "moderator_retry_limit_fallback",
+            object_id.clone(),
+            event.id.as_bytes().as_slice(),
+            effects,
+        );
+        return finish_accepted_tx(
+            tx,
+            community_id,
+            session_id,
+            event,
+            relay_keys,
+            state,
+            target,
+            delta,
+            transition,
+            object_id,
+            now,
+        )
+        .await;
+    }
+
+    let new_attempt_id = random_object_id();
+    let deadline_at = now + Duration::milliseconds(config.moderator_decision_ms);
+    insert_moderator_attempt_tx(
+        tx,
+        community_id,
+        session_id,
+        &new_attempt_id,
+        &actor.pubkey,
+        state.control_epoch,
+        state.decision_epoch,
+        next_attempt_number,
+        state.speech_revision,
+        state.intent_revision,
+        &state.state_event_id,
+        &candidate_snapshot,
+        &candidate_snapshot_hash,
+        Some(&attempt.attempt_id),
+        event.id.as_bytes().as_slice(),
+        now,
+        deadline_at,
+    )
+    .await?;
+    let mut target = StateTarget::from_state(state);
+    target.decision_attempt = next_attempt_number;
+    target.active_decision_attempt_id = Some(new_attempt_id.clone());
+    target.moderator_decision_started_at = Some(now);
+    target.moderator_decision_deadline = Some(deadline_at);
+    target.next_action_at = Some(deadline_at);
+    let mut started_effect = effect(
+        "moderator_decision_attempt_started",
+        "moderator_decision_attempt",
+        &new_attempt_id,
+        None,
+        Some("running"),
+    );
+    started_effect["candidate_snapshot_hash"] =
+        Value::String(hex::encode(&candidate_snapshot_hash));
+    effects.push(started_effect);
+    let transition = TransitionSpec::command(
+        "moderator_decision_retried",
+        Some(new_attempt_id.clone()),
+        event.id.as_bytes().as_slice(),
+        effects,
+    );
+    finish_accepted_tx(
+        tx,
+        community_id,
+        session_id,
+        event,
+        relay_keys,
+        state,
+        target,
+        RevisionDelta::FLOOR,
+        transition,
+        Some(new_attempt_id),
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_moderator_withdraw_self_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    event: &Event,
+    relay_keys: &Keys,
+    actor: &Actor,
+    state: &StateRow,
+    attempt_id: &[u8],
+    intent_id: &[u8],
+    previous_event_id: &[u8],
+    now: DateTime<Utc>,
+) -> Result<ApplyResult> {
+    let authority = moderator_action_authority_tx(
+        tx,
+        community_id,
+        session_id,
+        state,
+        actor,
+        Some(attempt_id),
+        now,
+    )
+    .await?;
+    let attempt = match authority {
+        ModeratorActionAuthority::Attempt(attempt) => attempt,
+        ModeratorActionAuthority::Rejected {
+            code,
+            canonical_object_id,
+        } => {
+            return Ok(ApplyResult::Rejected {
+                code,
+                canonical_object_id,
+            });
+        }
+        ModeratorActionAuthority::Manual => {
+            return Ok(ApplyResult::Rejected {
+                code: "moderator_attempt_required",
+                canonical_object_id: None,
+            });
+        }
+    };
+    let Some(candidate) = attempt_candidate_ref(&attempt, "intent", intent_id) else {
+        return Ok(ApplyResult::Rejected {
+            code: "source_not_in_attempt_snapshot",
+            canonical_object_id: Some(intent_id.to_vec()),
+        });
+    };
+    let snapshot_event_id = candidate_hex(candidate, "current_event_id")?;
+    if snapshot_event_id != previous_event_id {
+        return Ok(ApplyResult::Rejected {
+            code: "source_version_not_bound_to_attempt",
+            canonical_object_id: Some(snapshot_event_id),
+        });
+    }
+    let Some(intent) = load_intent_tx(tx, community_id, session_id, intent_id).await? else {
+        return Ok(ApplyResult::Rejected {
+            code: "intent_not_found",
+            canonical_object_id: None,
+        });
+    };
+    if intent.author_pubkey != actor.pubkey {
+        return Err(DbError::AccessDenied(
+            "the moderator can only withdraw its own Intent".to_string(),
+        ));
+    }
+    if intent.state != "pending" || intent.current_event_id != previous_event_id {
+        return Ok(ApplyResult::Rejected {
+            code: "dependency_stale",
+            canonical_object_id: Some(intent.current_event_id),
+        });
+    }
+    persist_command_event_tx(tx, community_id, session_id, event, now).await?;
+    sqlx::query(
+        "UPDATE meeting_speech_intents \
+         SET state = 'withdrawn', terminal_event_id = $4, terminal_at = $5, \
+             updated_at = $5, deferred_by_offer_id = NULL, defer_event_id = NULL, \
+             defer_reason = NULL \
+         WHERE community_id = $1 AND session_id = $2 AND intent_id = $3 \
+           AND state = 'pending' AND current_event_id = $6",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(intent_id)
+    .bind(event.id.as_bytes().as_slice())
+    .bind(now)
+    .bind(previous_event_id)
+    .execute(tx.as_mut())
+    .await?;
+    let transition = TransitionSpec::command(
+        "moderator_self_intent_withdrawn",
+        Some(intent_id.to_vec()),
+        event.id.as_bytes().as_slice(),
+        vec![effect(
+            "intent_withdrawn",
+            "intent",
+            intent_id,
+            Some("pending"),
+            Some("withdrawn"),
+        )],
+    );
+    finish_accepted_tx(
+        tx,
+        community_id,
+        session_id,
+        event,
+        relay_keys,
+        state,
+        StateTarget::from_state(state),
+        RevisionDelta::FLOOR_INTENT,
+        transition,
+        Some(intent_id.to_vec()),
+        now,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4034,6 +6371,8 @@ async fn apply_moderator_select_tx(
         expected_speech_revision,
         selection_reason,
         deferrals,
+        attempt_id,
+        expected_source_event_id,
     } = command
     else {
         return Err(DbError::InvalidData(
@@ -4052,9 +6391,31 @@ async fn apply_moderator_select_tx(
                 .or_else(|| state.active_grant_id.clone()),
         });
     }
+    let authority = moderator_action_authority_tx(
+        tx,
+        community_id,
+        session_id,
+        state,
+        actor,
+        attempt_id.as_deref(),
+        now,
+    )
+    .await?;
+    let attempt = match authority {
+        ModeratorActionAuthority::Manual => None,
+        ModeratorActionAuthority::Attempt(attempt) => Some(attempt),
+        ModeratorActionAuthority::Rejected {
+            code,
+            canonical_object_id,
+        } => {
+            return Ok(ApplyResult::Rejected {
+                code,
+                canonical_object_id,
+            });
+        }
+    };
     if state.control_epoch != *expected_control_epoch
         || state.decision_epoch != *expected_decision_epoch
-        || state.intent_revision != *expected_intent_revision
         || state.speech_revision != *expected_speech_revision
     {
         return Ok(ApplyResult::Rejected {
@@ -4070,7 +6431,14 @@ async fn apply_moderator_select_tx(
     }
 
     let moderator = actor.pubkey.as_slice();
-    let self_intent = pending_self_intent_tx(tx, community_id, session_id, moderator).await?;
+    let self_intent = pending_self_intent_tx(
+        tx,
+        community_id,
+        session_id,
+        moderator,
+        state.decision_epoch,
+    )
+    .await?;
     let config = load_config_tx(tx, community_id, session_id).await?;
     let offer_id = random_object_id();
     let (draft, source_id, source_is_self) = match source {
@@ -4083,10 +6451,93 @@ async fn apply_moderator_select_tx(
                 });
             };
             if intent.state != "pending" || intent.deferred_by_offer_id.is_some() {
+                if let Some(attempt) = attempt.as_ref() {
+                    let Some(candidate) =
+                        attempt_candidate_ref(attempt, "intent", intent_id.as_slice())
+                    else {
+                        return Ok(ApplyResult::Rejected {
+                            code: "source_not_in_attempt_snapshot",
+                            canonical_object_id: Some(intent.intent_id),
+                        });
+                    };
+                    let snapshot_event_id = candidate_hex(candidate, "current_event_id")?;
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: Some(intent.current_event_id),
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "intent",
+                            intent_id,
+                            Some(snapshot_event_id),
+                            None,
+                        ),
+                    });
+                }
                 return Ok(ApplyResult::Rejected {
                     code: "intent_not_selectable",
                     canonical_object_id: Some(intent.intent_id),
                 });
+            }
+            if intent.eligible_decision_epoch > state.decision_epoch {
+                if let Some(attempt) = attempt.as_ref() {
+                    let Some(candidate) =
+                        attempt_candidate_ref(attempt, "intent", intent_id.as_slice())
+                    else {
+                        return Ok(ApplyResult::Rejected {
+                            code: "source_not_in_attempt_snapshot",
+                            canonical_object_id: Some(intent.intent_id),
+                        });
+                    };
+                    let snapshot_event_id = candidate_hex(candidate, "current_event_id")?;
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: Some(intent.intent_id),
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "intent",
+                            intent_id,
+                            Some(snapshot_event_id),
+                            None,
+                        ),
+                    });
+                }
+                return Ok(ApplyResult::Rejected {
+                    code: "source_not_in_current_cohort",
+                    canonical_object_id: Some(intent.intent_id),
+                });
+            }
+            if let Some(attempt) = attempt.as_ref() {
+                let Some(candidate) =
+                    attempt_candidate_ref(attempt, "intent", intent_id.as_slice())
+                else {
+                    return Ok(ApplyResult::Rejected {
+                        code: "source_not_in_attempt_snapshot",
+                        canonical_object_id: Some(intent.intent_id),
+                    });
+                };
+                let snapshot_event_id = candidate_hex(candidate, "current_event_id")?;
+                if expected_source_event_id.as_deref() != Some(snapshot_event_id.as_slice()) {
+                    return Ok(ApplyResult::Rejected {
+                        code: "source_version_not_bound_to_attempt",
+                        canonical_object_id: Some(snapshot_event_id),
+                    });
+                }
+                if intent.current_event_id != snapshot_event_id {
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: Some(intent.current_event_id),
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "intent",
+                            intent_id,
+                            Some(snapshot_event_id),
+                            None,
+                        ),
+                    });
+                }
             }
             let is_self = intent.author_pubkey == actor.pubkey;
             if !is_self && self_intent.is_some() {
@@ -4150,12 +6601,155 @@ async fn apply_moderator_select_tx(
                 });
             };
             if handoff.question_state != "open" {
+                if let Some(attempt) = attempt.as_ref() {
+                    let Some(candidate) =
+                        attempt_candidate_ref(attempt, "handoff", handoff_id.as_slice())
+                    else {
+                        return Ok(ApplyResult::Rejected {
+                            code: "source_not_in_attempt_snapshot",
+                            canonical_object_id: Some(handoff.handoff_id),
+                        });
+                    };
+                    let snapshot_attempt = candidate
+                        .get("attempt_count")
+                        .and_then(Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            DbError::InvalidData(
+                                "Handoff candidate snapshot has no valid attempt count".to_string(),
+                            )
+                        })?;
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: Some(handoff.handoff_id),
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "handoff",
+                            handoff_id,
+                            None,
+                            Some(snapshot_attempt),
+                        ),
+                    });
+                }
                 return Ok(ApplyResult::Rejected {
                     code: "handoff_not_open",
                     canonical_object_id: Some(handoff.handoff_id),
                 });
             }
-            if handoff.attempt_count != *expected_attempt_count {
+            if handoff.blocked_by.is_some() {
+                if let Some(attempt) = attempt.as_ref() {
+                    let Some(candidate) =
+                        attempt_candidate_ref(attempt, "handoff", handoff_id.as_slice())
+                    else {
+                        return Ok(ApplyResult::Rejected {
+                            code: "source_not_in_attempt_snapshot",
+                            canonical_object_id: Some(handoff.handoff_id),
+                        });
+                    };
+                    let snapshot_attempt = candidate
+                        .get("attempt_count")
+                        .and_then(Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            DbError::InvalidData(
+                                "Handoff candidate snapshot has no valid attempt count".to_string(),
+                            )
+                        })?;
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: Some(handoff.handoff_id),
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "handoff",
+                            handoff_id,
+                            None,
+                            Some(snapshot_attempt),
+                        ),
+                    });
+                }
+                return Ok(ApplyResult::Rejected {
+                    code: "handoff_blocked",
+                    canonical_object_id: Some(handoff.handoff_id),
+                });
+            }
+            if handoff.eligible_decision_epoch > state.decision_epoch {
+                if let Some(attempt) = attempt.as_ref() {
+                    let Some(candidate) =
+                        attempt_candidate_ref(attempt, "handoff", handoff_id.as_slice())
+                    else {
+                        return Ok(ApplyResult::Rejected {
+                            code: "source_not_in_attempt_snapshot",
+                            canonical_object_id: Some(handoff.handoff_id),
+                        });
+                    };
+                    let snapshot_attempt = candidate
+                        .get("attempt_count")
+                        .and_then(Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            DbError::InvalidData(
+                                "Handoff candidate snapshot has no valid attempt count".to_string(),
+                            )
+                        })?;
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: Some(handoff.handoff_id),
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "handoff",
+                            handoff_id,
+                            None,
+                            Some(snapshot_attempt),
+                        ),
+                    });
+                }
+                return Ok(ApplyResult::Rejected {
+                    code: "source_not_in_current_cohort",
+                    canonical_object_id: Some(handoff.handoff_id),
+                });
+            }
+            if let Some(attempt) = attempt.as_ref() {
+                let Some(candidate) =
+                    attempt_candidate_ref(attempt, "handoff", handoff_id.as_slice())
+                else {
+                    return Ok(ApplyResult::Rejected {
+                        code: "source_not_in_attempt_snapshot",
+                        canonical_object_id: Some(handoff.handoff_id),
+                    });
+                };
+                let snapshot_attempt = candidate
+                    .get("attempt_count")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        DbError::InvalidData(
+                            "Handoff candidate snapshot has no valid attempt count".to_string(),
+                        )
+                    })?;
+                if *expected_attempt_count != snapshot_attempt {
+                    return Ok(ApplyResult::Rejected {
+                        code: "source_version_not_bound_to_attempt",
+                        canonical_object_id: Some(handoff.handoff_id),
+                    });
+                }
+                if handoff.attempt_count != snapshot_attempt {
+                    return Ok(ApplyResult::RejectedWithRetry {
+                        code: "selected_source_changed",
+                        canonical_object_id: handoff.last_offer_id,
+                        retry_ticket: selected_source_retry_ticket(
+                            attempt,
+                            event.id.as_bytes().as_slice(),
+                            "handoff",
+                            handoff_id,
+                            None,
+                            Some(snapshot_attempt),
+                        ),
+                    });
+                }
+            } else if handoff.attempt_count != *expected_attempt_count {
                 return Ok(ApplyResult::Rejected {
                     code: "stale_handoff_attempt",
                     canonical_object_id: handoff.last_offer_id,
@@ -4186,18 +6780,27 @@ async fn apply_moderator_select_tx(
         }
     };
 
+    if state.intent_revision != *expected_intent_revision {
+        return Ok(ApplyResult::Rejected {
+            code: "stale_moderator_revision",
+            canonical_object_id: Some(state.state_event_id.clone()),
+        });
+    }
+
     if source_is_self {
         let rows = sqlx::query(
             "SELECT intent_id, current_event_id \
              FROM meeting_speech_intents \
              WHERE community_id = $1 AND session_id = $2 AND state = 'pending' \
                AND author_pubkey <> $3 AND deferred_by_offer_id IS NULL \
+               AND eligible_decision_epoch <= $4 \
              ORDER BY intent_id \
              FOR UPDATE",
         )
         .bind(community_id.as_uuid())
         .bind(session_id)
         .bind(&actor.pubkey)
+        .bind(state.decision_epoch)
         .fetch_all(tx.as_mut())
         .await?;
         let required: Vec<(Vec<u8>, Vec<u8>)> = rows
@@ -4259,8 +6862,38 @@ async fn apply_moderator_select_tx(
             });
         }
     }
-    let target = StateTarget::offered(state, offer_id.clone(), deadline);
+    let mut target = StateTarget::offered(state, offer_id.clone(), deadline);
     let mut effects = Vec::new();
+    if let Some(attempt) = attempt.as_ref() {
+        let updated = sqlx::query(
+            "UPDATE meeting_moderator_decision_attempts \
+             SET state = 'committed', terminal_event_id = $4, \
+                 terminal_reason = 'primary_action_committed', terminal_at = $5 \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+               AND state = 'running'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&attempt.attempt_id)
+        .bind(event.id.as_bytes().as_slice())
+        .bind(now)
+        .execute(tx.as_mut())
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Ok(ApplyResult::Rejected {
+                code: "moderator_attempt_not_active",
+                canonical_object_id: Some(attempt.attempt_id.clone()),
+            });
+        }
+        target.active_decision_attempt_id = None;
+        effects.push(effect(
+            "moderator_decision_attempt_committed",
+            "moderator_decision_attempt",
+            &attempt.attempt_id,
+            Some("running"),
+            Some("committed"),
+        ));
+    }
     if matches!(source, BatonSelectionSource::Intent { .. }) {
         effects.push(effect(
             "intent_attempted",
@@ -4348,7 +6981,45 @@ async fn apply_moderator_other_tx(
             author_pubkey,
             reason_code,
             reason_text,
+            attempt_id,
         } => {
+            let authority = moderator_action_authority_tx(
+                tx,
+                community_id,
+                session_id,
+                state,
+                actor,
+                attempt_id.as_deref(),
+                now,
+            )
+            .await?;
+            let attempt = match authority {
+                ModeratorActionAuthority::Manual => None,
+                ModeratorActionAuthority::Attempt(attempt) => Some(attempt),
+                ModeratorActionAuthority::Rejected {
+                    code,
+                    canonical_object_id,
+                } => {
+                    return Ok(ApplyResult::Rejected {
+                        code,
+                        canonical_object_id,
+                    });
+                }
+            };
+            if attempt.is_some()
+                && !matches!(
+                    state.phase,
+                    BatonPhase::ModeratorControl | BatonPhase::ModeratorIdle
+                )
+            {
+                return Ok(ApplyResult::Rejected {
+                    code: "moderator_does_not_hold_control",
+                    canonical_object_id: state
+                        .active_offer_id
+                        .clone()
+                        .or_else(|| state.active_grant_id.clone()),
+                });
+            }
             let Some(intent) = load_intent_tx(tx, community_id, session_id, intent_id).await?
             else {
                 return Ok(ApplyResult::Rejected {
@@ -4364,9 +7035,32 @@ async fn apply_moderator_other_tx(
             }
             if intent.current_event_id != *previous_event_id {
                 return Ok(ApplyResult::Rejected {
-                    code: "stale_intent_event",
+                    code: if attempt.is_some() {
+                        "dependency_stale"
+                    } else {
+                        "stale_intent_event"
+                    },
                     canonical_object_id: Some(intent.current_event_id),
                 });
+            }
+            if let Some(attempt) = attempt.as_ref() {
+                let Some(candidate) =
+                    attempt_candidate_ref(attempt, "intent", intent_id.as_slice())
+                else {
+                    return Ok(ApplyResult::Rejected {
+                        code: "source_not_in_attempt_snapshot",
+                        canonical_object_id: Some(intent.intent_id),
+                    });
+                };
+                let snapshot_event_id = candidate_hex(candidate, "current_event_id")?;
+                if snapshot_event_id != *previous_event_id
+                    || intent.eligible_decision_epoch > state.decision_epoch
+                {
+                    return Ok(ApplyResult::Rejected {
+                        code: "dependency_stale",
+                        canonical_object_id: Some(intent.current_event_id),
+                    });
+                }
             }
             if intent.author_pubkey != *author_pubkey {
                 return Err(DbError::InvalidData(
@@ -4435,6 +7129,7 @@ async fn apply_moderator_other_tx(
                     true,
                 )
                 .await?
+                .into_target_with_effects(&mut effects)
             } else if floor_changed {
                 base_target
             } else {
@@ -4486,7 +7181,45 @@ async fn apply_moderator_other_tx(
             expected_attempt_count,
             reason_code,
             reason_text,
+            attempt_id,
         } => {
+            let authority = moderator_action_authority_tx(
+                tx,
+                community_id,
+                session_id,
+                state,
+                actor,
+                attempt_id.as_deref(),
+                now,
+            )
+            .await?;
+            let attempt = match authority {
+                ModeratorActionAuthority::Manual => None,
+                ModeratorActionAuthority::Attempt(attempt) => Some(attempt),
+                ModeratorActionAuthority::Rejected {
+                    code,
+                    canonical_object_id,
+                } => {
+                    return Ok(ApplyResult::Rejected {
+                        code,
+                        canonical_object_id,
+                    });
+                }
+            };
+            if attempt.is_some()
+                && !matches!(
+                    state.phase,
+                    BatonPhase::ModeratorControl | BatonPhase::ModeratorIdle
+                )
+            {
+                return Ok(ApplyResult::Rejected {
+                    code: "moderator_does_not_hold_control",
+                    canonical_object_id: state
+                        .active_offer_id
+                        .clone()
+                        .or_else(|| state.active_grant_id.clone()),
+                });
+            }
             let Some(handoff) = load_handoff_tx(tx, community_id, session_id, handoff_id).await?
             else {
                 return Ok(ApplyResult::Rejected {
@@ -4504,9 +7237,41 @@ async fn apply_moderator_other_tx(
                 || handoff.attempt_count != *expected_attempt_count
             {
                 return Ok(ApplyResult::Rejected {
-                    code: "stale_handoff_revision",
+                    code: if attempt.is_some() {
+                        "dependency_stale"
+                    } else {
+                        "stale_handoff_revision"
+                    },
                     canonical_object_id: handoff.last_offer_id.or(handoff.last_grant_id),
                 });
+            }
+            if let Some(attempt) = attempt.as_ref() {
+                let Some(candidate) =
+                    attempt_candidate_ref(attempt, "handoff", handoff_id.as_slice())
+                else {
+                    return Ok(ApplyResult::Rejected {
+                        code: "source_not_in_attempt_snapshot",
+                        canonical_object_id: Some(handoff.handoff_id),
+                    });
+                };
+                let snapshot_attempt = candidate
+                    .get("attempt_count")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        DbError::InvalidData(
+                            "Handoff candidate snapshot has no valid attempt count".to_string(),
+                        )
+                    })?;
+                if snapshot_attempt != *expected_attempt_count
+                    || handoff.blocked_by.is_some()
+                    || handoff.eligible_decision_epoch > state.decision_epoch
+                {
+                    return Ok(ApplyResult::Rejected {
+                        code: "dependency_stale",
+                        canonical_object_id: Some(handoff.handoff_id),
+                    });
+                }
             }
             let active_reference = if let Some(offer_id) = state.active_offer_id.as_deref() {
                 load_offer_tx(tx, community_id, session_id, offer_id)
@@ -5652,12 +8417,14 @@ async fn apply_speech_tx(
                 handoff_can_offer = true;
                 ("open", "offered", None, None)
             };
+        let eligible_decision_epoch = next_decision_epoch(state.decision_epoch)?;
         sqlx::query(
             "INSERT INTO meeting_directed_handoffs \
                  (community_id, session_id, handoff_id, source_speech_event_id, \
                   from_pubkey, to_pubkey, reason_type, reason_text, requested_depth, \
-                  question_state, initial_disposition, blocked_by, created_at, terminal_at) \
-             VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  question_state, initial_disposition, blocked_by, \
+                  eligible_decision_epoch, created_at, terminal_at) \
+             VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(community_id.as_uuid())
         .bind(session_id)
@@ -5670,6 +8437,7 @@ async fn apply_speech_tx(
         .bind(question_state)
         .bind(initial_disposition)
         .bind(blocked_by)
+        .bind(eligible_decision_epoch)
         .bind(now)
         .bind(terminal_at)
         .execute(tx.as_mut())
@@ -5693,9 +8461,11 @@ async fn apply_speech_tx(
             reason_type: handoff.reason_type.clone(),
             reason_text: handoff.reason_text.clone(),
             question_state: question_state.to_string(),
+            blocked_by: blocked_by.map(str::to_string),
             last_offer_id: None,
             last_grant_id: None,
             attempt_count: 0,
+            eligible_decision_epoch,
         });
     }
 
@@ -5738,7 +8508,8 @@ async fn apply_speech_tx(
             now,
             true,
         )
-        .await?;
+        .await?
+        .into_target_with_effects(&mut effects);
         if state.forced_return_to_moderator {
             if let Some(recall_event_id) = state.recall_event_id.as_deref() {
                 effects.push(effect(
@@ -5814,7 +8585,8 @@ async fn apply_speech_tx(
             now,
             true,
         )
-        .await?;
+        .await?
+        .into_target_with_effects(&mut effects);
         effects.push(control_effect(session_id, "control_returned"));
         target
     };
@@ -6027,6 +8799,80 @@ mod tests {
         .await
         .expect("create test Meeting V1");
         tx.commit().await.expect("commit test Meeting V1");
+        TestMeeting {
+            db,
+            community_id,
+            session_id,
+            relay,
+            moderator,
+            agent,
+            human,
+            human_two,
+        }
+    }
+
+    async fn create_agent_moderated_test_meeting() -> TestMeeting {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool.clone());
+        let community_id = seed_community(&pool).await;
+        let relay = Keys::generate();
+        let human = Keys::generate();
+        let moderator = Keys::generate();
+        let agent = Keys::generate();
+        let human_two = Keys::generate();
+        let host_pubkey = human.public_key().to_bytes().to_vec();
+        let moderator_pubkey = moderator.public_key().to_bytes().to_vec();
+        seed_identity(&pool, community_id, &human, "owner", None).await;
+        seed_identity(
+            &pool,
+            community_id,
+            &moderator,
+            "member",
+            Some(&host_pubkey),
+        )
+        .await;
+        seed_identity(&pool, community_id, &agent, "member", Some(&host_pubkey)).await;
+        seed_identity(&pool, community_id, &human_two, "member", None).await;
+        let session_id = Uuid::new_v4();
+        let create_event = signed_event(
+            &human,
+            buzz_core::kind::KIND_MEETING_CREATE,
+            session_id,
+            "",
+            &[],
+        );
+        let roster = vec![
+            host_pubkey.clone(),
+            moderator_pubkey.clone(),
+            agent.public_key().to_bytes().to_vec(),
+            human_two.public_key().to_bytes().to_vec(),
+        ];
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin Agent-moderated Meeting create");
+        persist_existing_event_tx(&mut tx, community_id, session_id, &create_event).await;
+        create_meeting_v1_tx(
+            &mut tx,
+            CreateMeetingV1Params {
+                community_id,
+                session_id,
+                title: "Agent Moderator Retry",
+                description: None,
+                source_channel_id: None,
+                host_pubkey: &host_pubkey,
+                moderator_pubkey: &moderator_pubkey,
+                create_event_id: create_event.id.as_bytes().as_slice(),
+                participant_pubkeys: &roster,
+                relay_keys: &relay,
+                config: BatonConfig::default(),
+            },
+        )
+        .await
+        .expect("create Agent-moderated Meeting V1");
+        tx.commit()
+            .await
+            .expect("commit Agent-moderated Meeting V1");
         TestMeeting {
             db,
             community_id,
@@ -6278,11 +9124,86 @@ mod tests {
                     expected_speech_revision: snapshot.speech_revision,
                     selection_reason: Some("next relevant contribution".to_string()),
                     deferrals: Vec::new(),
+                    attempt_id: None,
+                    expected_source_event_id: None,
                 },
             },
         )
         .await
         .expect("moderator Select test Intent");
+        (event, result)
+    }
+
+    async fn start_agent_moderator_attempt(
+        meeting: &TestMeeting,
+        snapshot: &BatonSnapshot,
+        replacement_of_attempt_id: Option<Vec<u8>>,
+    ) -> (Event, BatonCommitResult) {
+        let event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let result = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorDecisionAttemptStart {
+                    expected_control_epoch: snapshot.control_epoch,
+                    expected_decision_epoch: snapshot.decision_epoch,
+                    expected_intent_revision: snapshot.intent_revision,
+                    expected_speech_revision: snapshot.speech_revision,
+                    expected_state_event_id: snapshot.state_event_id.clone(),
+                    replacement_of_attempt_id,
+                },
+            },
+        )
+        .await
+        .expect("start Agent moderator DecisionAttempt");
+        (event, result)
+    }
+
+    async fn agent_moderator_select_intent(
+        meeting: &TestMeeting,
+        snapshot: &BatonSnapshot,
+        intent_id: Vec<u8>,
+        attempt_id: Option<Vec<u8>>,
+        expected_source_event_id: Option<Vec<u8>>,
+    ) -> (Event, BatonCommitResult) {
+        let event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let result = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorSelect {
+                    source: BatonSelectionSource::Intent { intent_id },
+                    expected_control_epoch: snapshot.control_epoch,
+                    expected_decision_epoch: snapshot.decision_epoch,
+                    expected_intent_revision: snapshot.intent_revision,
+                    expected_speech_revision: snapshot.speech_revision,
+                    selection_reason: Some("attempt-bound selection".to_string()),
+                    deferrals: Vec::new(),
+                    attempt_id,
+                    expected_source_event_id,
+                },
+            },
+        )
+        .await
+        .expect("submit Agent moderator Select");
         (event, result)
     }
 
@@ -6477,6 +9398,1067 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn agent_moderator_attempt_freezes_cohort_without_retrying_for_late_intents() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let (source_event, submitted) =
+            submit_intent(&meeting, &meeting.agent, "Original candidate").await;
+        let intent_id = accepted_id(&submitted);
+
+        let (_, missing_attempt) = agent_moderator_select_intent(
+            &meeting,
+            &submitted.snapshot,
+            intent_id.clone(),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            missing_attempt.command_outcome,
+            BatonCommandOutcome::RejectedTerminal {
+                ref code,
+                retry_ticket_id: None,
+                ..
+            } if code == "moderator_attempt_required"
+        ));
+
+        let (_, started) = start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        let attempt_id = accepted_id(&started);
+        let state = latest_state_content(&meeting).await;
+        let active_attempt = &state["active_decision_attempt"];
+        assert_eq!(
+            active_attempt["attempt_id"],
+            hex::encode(attempt_id.as_slice())
+        );
+        let candidate_refs = active_attempt["candidate_refs"]
+            .as_array()
+            .expect("attempt candidate refs");
+        assert_eq!(candidate_refs.len(), 1);
+        assert_eq!(
+            candidate_refs[0]["current_event_id"],
+            hex::encode(source_event.id.as_bytes())
+        );
+        let persisted_hash: Vec<u8> = sqlx::query_scalar(
+            "SELECT candidate_snapshot_hash \
+             FROM meeting_moderator_decision_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&attempt_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load persisted Candidate Cohort hash");
+        assert_eq!(
+            active_attempt["candidate_snapshot_hash"],
+            hex::encode(&persisted_hash)
+        );
+        assert_eq!(
+            state["transition"]["effects"][0]["candidate_snapshot_hash"],
+            hex::encode(persisted_hash)
+        );
+
+        let (_, late) = submit_intent(
+            &meeting,
+            &meeting.moderator,
+            "Late moderator-self next-cohort candidate",
+        )
+        .await;
+        assert_eq!(
+            late.snapshot.decision_epoch,
+            started.snapshot.decision_epoch
+        );
+        let (source_epoch, late_epoch): (i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT eligible_decision_epoch FROM meeting_speech_intents \
+                  WHERE community_id = $1 AND session_id = $2 AND intent_id = $3), \
+                 (SELECT eligible_decision_epoch FROM meeting_speech_intents \
+                  WHERE community_id = $1 AND session_id = $2 AND intent_id = $4)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&intent_id)
+        .bind(accepted_id(&late))
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load frozen Cohort epochs");
+        assert_eq!(source_epoch, started.snapshot.decision_epoch);
+        assert_eq!(late_epoch, started.snapshot.decision_epoch + 1);
+
+        let (_, stale_cas) = agent_moderator_select_intent(
+            &meeting,
+            &started.snapshot,
+            intent_id.clone(),
+            Some(attempt_id.clone()),
+            Some(source_event.id.as_bytes().to_vec()),
+        )
+        .await;
+        assert!(matches!(
+            stale_cas.command_outcome,
+            BatonCommandOutcome::RejectedTerminal {
+                ref code,
+                retry_ticket_id: None,
+                ..
+            } if code == "stale_moderator_revision"
+        ));
+
+        let (_, selected) = agent_moderator_select_intent(
+            &meeting,
+            &late.snapshot,
+            intent_id,
+            Some(attempt_id),
+            Some(source_event.id.as_bytes().to_vec()),
+        )
+        .await;
+        assert!(matches!(
+            selected.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert_eq!(selected.snapshot.phase, BatonPhase::Offered);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn moderator_fallback_cannot_select_a_late_self_intent() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let (_, submitted) =
+            submit_intent(&meeting, &meeting.agent, "Current Cohort candidate").await;
+        let current_intent_id = accepted_id(&submitted);
+        let (_, started) = start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        let (_, late_self) = submit_intent(
+            &meeting,
+            &meeting.moderator,
+            "Late moderator-self candidate",
+        )
+        .await;
+        let late_self_id = accepted_id(&late_self);
+        assert_eq!(
+            late_self.snapshot.decision_epoch,
+            started.snapshot.decision_epoch
+        );
+
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET moderator_decision_deadline = due.deadline, next_action_at = due.deadline \
+             FROM (SELECT clock_timestamp() - interval '1 second' AS deadline) due \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force moderator DecisionAttempt deadline");
+        let transitions = recover_meeting_v1(
+            &meeting.db,
+            meeting.community_id,
+            meeting.session_id,
+            &meeting.relay,
+        )
+        .await
+        .expect("run deterministic moderator fallback");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].primary_type, "moderator_fallback");
+
+        let snapshot = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load fallback State");
+        let offer_id = snapshot
+            .active_offer_id
+            .expect("current Cohort candidate receives fallback Offer");
+        let source_intent_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT source_intent_id FROM meeting_baton_offers \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(offer_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load fallback Offer source");
+        assert_eq!(source_intent_id, current_intent_id);
+        let (late_state, late_attempts): (String, i32) = sqlx::query_as(
+            "SELECT state, selection_attempt_count \
+             FROM meeting_speech_intents \
+             WHERE community_id = $1 AND session_id = $2 AND intent_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(late_self_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load late moderator-self Intent");
+        assert_eq!(late_state, "pending");
+        assert_eq!(late_attempts, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn handoff_only_attempt_times_out_once_and_suppresses_the_same_snapshot() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let request_event = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let requested = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &request_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::HumanRequest,
+            },
+        )
+        .await
+        .expect("request setup Human floor");
+        let setup_offer = requested
+            .snapshot
+            .active_offer_id
+            .expect("Human Request creates setup Offer");
+        let setup_grant = ack_test_offer(&meeting, &meeting.human, setup_offer).await;
+        let (handoff_speech, handed_off) = submit_handoff_speech(
+            &meeting,
+            &meeting.human,
+            accepted_id(&setup_grant),
+            1,
+            &meeting.agent,
+            "Agent, please answer this Handoff-only question",
+        )
+        .await;
+        let handoff_id = handoff_speech.id.as_bytes().to_vec();
+        let handoff_offer = handed_off
+            .snapshot
+            .active_offer_id
+            .expect("Directed Handoff creates Agent Offer");
+        let decline_event = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_OFFER_RESPONSE,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let declined = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &decline_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::OfferDecline {
+                    offer_id: handoff_offer,
+                    reason: Some("needs moderator routing".to_string()),
+                },
+            },
+        )
+        .await
+        .expect("decline direct Handoff Offer");
+        assert_eq!(declined.snapshot.phase, BatonPhase::ModeratorIdle);
+        assert!(declined.snapshot.moderator_decision_deadline.is_none());
+
+        let (_, started) = start_agent_moderator_attempt(&meeting, &declined.snapshot, None).await;
+        assert_eq!(
+            started.snapshot.decision_epoch, declined.snapshot.decision_epoch,
+            "control return already exposed the Handoff-only Cohort"
+        );
+        assert_eq!(started.snapshot.phase, BatonPhase::ModeratorIdle);
+        let active_state = latest_state_content(&meeting).await;
+        assert_eq!(
+            active_state["active_decision_attempt"]["candidate_refs"][0]["source_id"],
+            hex::encode(&handoff_id)
+        );
+
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET moderator_decision_deadline = due.deadline, next_action_at = due.deadline \
+             FROM (SELECT clock_timestamp() - interval '1 second' AS deadline) due \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force Handoff-only moderator deadline");
+        let transitions = recover_meeting_v1(
+            &meeting.db,
+            meeting.community_id,
+            meeting.session_id,
+            &meeting.relay,
+        )
+        .await
+        .expect("recover Handoff-only timeout");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].primary_type, "moderator_fallback");
+        let (question_state, suppression): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT question_state, moderator_retry_blocked_fingerprint \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load timed-out Handoff suppression");
+        assert_eq!(question_state, "open");
+        assert!(suppression.is_some());
+
+        let recovered = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load recovered Handoff-only State");
+        assert_eq!(recovered.phase, BatonPhase::ModeratorIdle);
+        assert!(recovered.active_decision_attempt_id.is_none());
+        assert!(recovered.moderator_decision_deadline.is_none());
+        let (_, reopened) = start_agent_moderator_attempt(&meeting, &recovered, None).await;
+        assert!(matches!(
+            reopened.command_outcome,
+            BatonCommandOutcome::RejectedTerminal { ref code, .. }
+                if code == "no_current_cohort_candidates"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn human_preemption_does_not_suppress_a_handoff_in_the_next_cohort() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let setup_request = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let setup_requested = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &setup_request,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::HumanRequest,
+            },
+        )
+        .await
+        .expect("request setup Human floor");
+        let setup_offer = setup_requested
+            .snapshot
+            .active_offer_id
+            .expect("setup Human Request creates an Offer");
+        let setup_grant = ack_test_offer(&meeting, &meeting.human, setup_offer).await;
+        let (handoff_speech, handed_off) = submit_handoff_speech(
+            &meeting,
+            &meeting.human,
+            accepted_id(&setup_grant),
+            1,
+            &meeting.agent,
+            "Agent, please answer after moderator review",
+        )
+        .await;
+        let handoff_id = handoff_speech.id.as_bytes().to_vec();
+        let handoff_offer = handed_off
+            .snapshot
+            .active_offer_id
+            .expect("Directed Handoff creates an Offer");
+        let decline_event = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_OFFER_RESPONSE,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let declined = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &decline_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::OfferDecline {
+                    offer_id: handoff_offer,
+                    reason: Some("moderator should route this question".to_string()),
+                },
+            },
+        )
+        .await
+        .expect("decline direct Handoff Offer");
+        let (_, started) = start_agent_moderator_attempt(&meeting, &declined.snapshot, None).await;
+        let old_attempt_id = accepted_id(&started);
+        let old_decision_epoch = started.snapshot.decision_epoch;
+
+        let preempt_request = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let preempted = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &preempt_request,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::HumanRequest,
+            },
+        )
+        .await
+        .expect("Human preempts Handoff-only moderator attempt");
+        assert_eq!(
+            preempted.snapshot.active_decision_attempt_id,
+            Some(old_attempt_id.clone())
+        );
+        let human_offer = preempted
+            .snapshot
+            .active_offer_id
+            .expect("preempting Human receives an Offer");
+        let human_grant = ack_test_offer(&meeting, &meeting.human, human_offer).await;
+
+        sqlx::query(
+            "UPDATE meeting_moderator_decision_attempts \
+             SET deadline_at = clock_timestamp() + interval '5 seconds' \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&old_attempt_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("shorten pre-Human attempt deadline");
+
+        let human_speech = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+            meeting.session_id,
+            "Human contribution before returning control",
+            &[],
+        );
+        let returned = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &human_speech,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::Speech {
+                    grant_id: accepted_id(&human_grant),
+                    speech_revision: 2,
+                    handoff: None,
+                },
+            },
+        )
+        .await
+        .expect("complete preempting Human speech");
+        assert_eq!(returned.snapshot.phase, BatonPhase::ModeratorIdle);
+        assert_eq!(
+            returned.snapshot.decision_epoch,
+            old_decision_epoch + 1,
+            "Human speech opens a new Handoff Cohort"
+        );
+        assert_eq!(
+            returned.snapshot.active_decision_attempt_id,
+            Some(old_attempt_id.clone()),
+            "the old model Turn remains single-flight until its natural terminal"
+        );
+        let remaining_ms: i64 = sqlx::query_scalar(
+            "SELECT (EXTRACT(EPOCH FROM \
+                 (moderator_decision_deadline - clock_timestamp())) * 1000)::bigint \
+             FROM meeting_baton_state \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("measure new Handoff control window");
+        assert!(
+            remaining_ms > BatonConfig::default().moderator_decision_ms - 10_000,
+            "the next Cohort must not inherit the old Attempt's five-second deadline"
+        );
+
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET moderator_decision_deadline = due.deadline, next_action_at = due.deadline \
+             FROM (SELECT clock_timestamp() - interval '1 second' AS deadline) due \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force the new base control deadline");
+        let transitions = recover_meeting_v1(
+            &meeting.db,
+            meeting.community_id,
+            meeting.session_id,
+            &meeting.relay,
+        )
+        .await
+        .expect("recover expired Human-postponed control window");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].primary_type, "moderator_fallback");
+
+        let (attempt_state, suppression): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT \
+                 (SELECT state FROM meeting_moderator_decision_attempts \
+                  WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3), \
+                 (SELECT moderator_retry_blocked_fingerprint \
+                  FROM meeting_directed_handoffs \
+                  WHERE community_id = $1 AND session_id = $2 AND handoff_id = $4)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&old_attempt_id)
+        .bind(&handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load post-Human Attempt and Handoff state");
+        assert_eq!(attempt_state, "timed_out");
+        assert!(
+            suppression.is_none(),
+            "an old-epoch Attempt must not suppress a new-epoch Handoff"
+        );
+
+        let recovered = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("load recovered post-Human State");
+        assert!(recovered.active_decision_attempt_id.is_none());
+        let (_, restarted) = start_agent_moderator_attempt(&meeting, &recovered, None).await;
+        assert!(matches!(
+            restarted.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert_eq!(restarted.snapshot.decision_epoch, recovered.decision_epoch);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn complete_cohort_atomically_exposes_the_next_epoch() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let (current_event, submitted) =
+            submit_intent(&meeting, &meeting.agent, "Current Cohort management target").await;
+        let current_intent_id = accepted_id(&submitted);
+        let (_, started) = start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        let attempt_id = accepted_id(&started);
+        let (_, late) = submit_intent(&meeting, &meeting.human_two, "Next Cohort candidate").await;
+        let late_intent_id = accepted_id(&late);
+
+        let reject_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "already covered",
+            &[],
+        );
+        let rejected_current = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &reject_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorReject {
+                    intent_id: current_intent_id,
+                    previous_event_id: current_event.id.as_bytes().to_vec(),
+                    author_pubkey: meeting.agent.public_key().to_bytes().to_vec(),
+                    reason_code: "duplicate".to_string(),
+                    reason_text: "already covered".to_string(),
+                    attempt_id: Some(attempt_id.clone()),
+                },
+            },
+        )
+        .await
+        .expect("reject final current-Cohort Intent");
+        assert!(matches!(
+            rejected_current.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            rejected_current.snapshot.active_decision_attempt_id,
+            Some(attempt_id.clone())
+        );
+
+        let complete_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let completed = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &complete_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorCompleteCohort {
+                    attempt_id: attempt_id.clone(),
+                    expected_control_epoch: rejected_current.snapshot.control_epoch,
+                    expected_decision_epoch: rejected_current.snapshot.decision_epoch,
+                },
+            },
+        )
+        .await
+        .expect("complete exhausted current Cohort");
+        assert!(matches!(
+            completed.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            completed.snapshot.decision_epoch,
+            rejected_current.snapshot.decision_epoch + 1
+        );
+        assert_eq!(completed.snapshot.phase, BatonPhase::ModeratorControl);
+        assert!(completed.snapshot.active_decision_attempt_id.is_none());
+        assert!(completed.snapshot.moderator_decision_deadline.is_some());
+
+        let (late_epoch, attempt_state): (i64, String) = sqlx::query_as(
+            "SELECT \
+                 (SELECT eligible_decision_epoch FROM meeting_speech_intents \
+                  WHERE community_id = $1 AND session_id = $2 AND intent_id = $3), \
+                 (SELECT state FROM meeting_moderator_decision_attempts \
+                  WHERE community_id = $1 AND session_id = $2 AND attempt_id = $4)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(late_intent_id)
+        .bind(attempt_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load next Cohort and completed attempt");
+        assert_eq!(late_epoch, completed.snapshot.decision_epoch);
+        assert_eq!(attempt_state, "committed");
+
+        let (_, next_attempt) =
+            start_agent_moderator_attempt(&meeting, &completed.snapshot, None).await;
+        assert!(matches!(
+            next_attempt.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert_eq!(next_attempt.snapshot.decision_attempt, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn selected_source_change_issues_one_use_retry_with_a_fresh_deadline() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let (source_event, submitted) =
+            submit_intent(&meeting, &meeting.agent, "Candidate version one").await;
+        let intent_id = accepted_id(&submitted);
+        let (_, started) = start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        let attempt_id = accepted_id(&started);
+
+        let refresh_event = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_SPEECH_INTENT,
+            meeting.session_id,
+            "Candidate version two",
+            &[],
+        );
+        let refreshed = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &refresh_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::IntentRefresh {
+                    intent_id: intent_id.clone(),
+                    previous_event_id: source_event.id.as_bytes().to_vec(),
+                    basis_speech_revision: started.snapshot.speech_revision,
+                    summary: "Candidate version two".to_string(),
+                    addressed_to: None,
+                },
+            },
+        )
+        .await
+        .expect("refresh selected Intent during Agent moderator attempt");
+
+        let failed_select_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let failed_select_command = BatonCommand::ModeratorSelect {
+            source: BatonSelectionSource::Intent {
+                intent_id: intent_id.clone(),
+            },
+            expected_control_epoch: refreshed.snapshot.control_epoch,
+            expected_decision_epoch: refreshed.snapshot.decision_epoch,
+            expected_intent_revision: refreshed.snapshot.intent_revision,
+            expected_speech_revision: refreshed.snapshot.speech_revision,
+            selection_reason: Some("select frozen version".to_string()),
+            deferrals: Vec::new(),
+            attempt_id: Some(attempt_id.clone()),
+            expected_source_event_id: Some(source_event.id.as_bytes().to_vec()),
+        };
+        let rejected = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &failed_select_event,
+                relay_keys: &meeting.relay,
+                command: failed_select_command.clone(),
+            },
+        )
+        .await
+        .expect("reject Select whose chosen source changed");
+        let retry_ticket_id = match &rejected.command_outcome {
+            BatonCommandOutcome::RejectedTerminal {
+                code,
+                retry_ticket_id: Some(retry_ticket_id),
+                ..
+            } if code == "selected_source_changed" => retry_ticket_id.clone(),
+            other => panic!("expected selected-source retry ticket, got {other:?}"),
+        };
+
+        let duplicate = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &failed_select_event,
+                relay_keys: &meeting.relay,
+                command: failed_select_command,
+            },
+        )
+        .await
+        .expect("replay failed Select");
+        assert!(matches!(
+            duplicate.command_outcome,
+            BatonCommandOutcome::Duplicate {
+                accepted: false,
+                ref outcome_code,
+                retry_ticket_id: Some(ref duplicate_ticket_id),
+                ..
+            } if outcome_code == "selected_source_changed"
+                && duplicate_ticket_id == &retry_ticket_id
+        ));
+
+        let retry_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let retried = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &retry_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorDecisionRetry {
+                    attempt_id: attempt_id.clone(),
+                    retry_ticket_id: retry_ticket_id.clone(),
+                    failed_action_event_id: failed_select_event.id.as_bytes().to_vec(),
+                    expected_control_epoch: rejected.snapshot.control_epoch,
+                    expected_decision_epoch: rejected.snapshot.decision_epoch,
+                    expected_attempt_number: 1,
+                },
+            },
+        )
+        .await
+        .expect("consume selected-source retry ticket");
+        let replacement_id = accepted_id(&retried);
+        assert_eq!(retried.snapshot.decision_attempt, 2);
+        assert_eq!(
+            retried.snapshot.active_decision_attempt_id,
+            Some(replacement_id.clone())
+        );
+
+        let (started_at, deadline_at, replacement_of, candidate_snapshot): (
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<Vec<u8>>,
+            Value,
+        ) = sqlx::query_as(
+            "SELECT started_at, deadline_at, replacement_of_attempt_id, \
+                    candidate_snapshot_json \
+             FROM meeting_moderator_decision_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&replacement_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load replacement moderator attempt");
+        assert_eq!(
+            deadline_at - started_at,
+            Duration::milliseconds(BatonConfig::default().moderator_decision_ms)
+        );
+        assert_eq!(replacement_of, Some(attempt_id));
+        assert_eq!(
+            candidate_snapshot["candidate_refs"][0]["current_event_id"],
+            hex::encode(refresh_event.id.as_bytes())
+        );
+
+        let reused_ticket_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let reused = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &reused_ticket_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorDecisionRetry {
+                    attempt_id: replacement_id,
+                    retry_ticket_id,
+                    failed_action_event_id: failed_select_event.id.as_bytes().to_vec(),
+                    expected_control_epoch: retried.snapshot.control_epoch,
+                    expected_decision_epoch: retried.snapshot.decision_epoch,
+                    expected_attempt_number: 2,
+                },
+            },
+        )
+        .await
+        .expect("reject consumed retry ticket");
+        assert!(matches!(
+            reused.command_outcome,
+            BatonCommandOutcome::RejectedTerminal { ref code, .. }
+                if code == "retry_ticket_already_consumed"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn retry_limit_uses_current_cohort_fallback_without_starting_another_model_attempt() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        sqlx::query(
+            "UPDATE meeting_baton_config \
+             SET moderator_max_rejudgments = 0 \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("set zero-rejudgment test policy");
+
+        let (source_event, submitted) =
+            submit_intent(&meeting, &meeting.agent, "Bounded retry candidate").await;
+        let intent_id = accepted_id(&submitted);
+        let (_, started) = start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        let attempt_id = accepted_id(&started);
+        let refresh_event = signed_event(
+            &meeting.agent,
+            buzz_core::kind::KIND_MEETING_SPEECH_INTENT,
+            meeting.session_id,
+            "Bounded retry candidate refreshed",
+            &[],
+        );
+        let refreshed = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &refresh_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::IntentRefresh {
+                    intent_id: intent_id.clone(),
+                    previous_event_id: source_event.id.as_bytes().to_vec(),
+                    basis_speech_revision: started.snapshot.speech_revision,
+                    summary: "Bounded retry candidate refreshed".to_string(),
+                    addressed_to: None,
+                },
+            },
+        )
+        .await
+        .expect("refresh source for retry-limit test");
+        let failed_action = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let rejected = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &failed_action,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorSelect {
+                    source: BatonSelectionSource::Intent {
+                        intent_id: intent_id.clone(),
+                    },
+                    expected_control_epoch: refreshed.snapshot.control_epoch,
+                    expected_decision_epoch: refreshed.snapshot.decision_epoch,
+                    expected_intent_revision: refreshed.snapshot.intent_revision,
+                    expected_speech_revision: refreshed.snapshot.speech_revision,
+                    selection_reason: Some("exercise retry bound".to_string()),
+                    deferrals: Vec::new(),
+                    attempt_id: Some(attempt_id.clone()),
+                    expected_source_event_id: Some(source_event.id.as_bytes().to_vec()),
+                },
+            },
+        )
+        .await
+        .expect("obtain bounded retry ticket");
+        let ticket_id = match &rejected.command_outcome {
+            BatonCommandOutcome::RejectedTerminal {
+                code,
+                retry_ticket_id: Some(ticket_id),
+                ..
+            } if code == "selected_source_changed" => ticket_id.clone(),
+            other => panic!("expected selected-source retry ticket, got {other:?}"),
+        };
+        let retry_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let fallback = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &retry_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorDecisionRetry {
+                    attempt_id: attempt_id.clone(),
+                    retry_ticket_id: ticket_id,
+                    failed_action_event_id: failed_action.id.as_bytes().to_vec(),
+                    expected_control_epoch: rejected.snapshot.control_epoch,
+                    expected_decision_epoch: rejected.snapshot.decision_epoch,
+                    expected_attempt_number: 1,
+                },
+            },
+        )
+        .await
+        .expect("apply retry-limit fallback");
+        assert!(matches!(
+            fallback.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert_eq!(fallback.snapshot.phase, BatonPhase::Offered);
+        assert!(fallback.snapshot.active_decision_attempt_id.is_none());
+        assert_eq!(
+            latest_transition(&meeting).await["primary_type"],
+            "moderator_retry_limit_fallback"
+        );
+
+        let offer_id = fallback
+            .snapshot
+            .active_offer_id
+            .expect("retry limit creates deterministic fallback Offer");
+        let (allocation_source, source_intent_id): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT allocation_source, source_intent_id \
+             FROM meeting_baton_offers \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(offer_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load retry-limit fallback Offer");
+        assert_eq!(allocation_source, "fallback");
+        assert_eq!(source_intent_id, Some(intent_id));
+        let (attempt_state, attempt_count): (String, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT state FROM meeting_moderator_decision_attempts \
+                  WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3), \
+                 (SELECT count(*) FROM meeting_moderator_decision_attempts \
+                  WHERE community_id = $1 AND session_id = $2)",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(attempt_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load bounded moderator attempts");
+        assert_eq!(attempt_state, "retry_required");
+        assert_eq!(attempt_count, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn abandoned_attempt_replacement_inherits_the_original_deadline() {
+        let meeting = create_agent_moderated_test_meeting().await;
+        let (_, submitted) = submit_intent(&meeting, &meeting.agent, "Recoverable candidate").await;
+        let (_, started) = start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        let attempt_id = accepted_id(&started);
+        let original_deadline: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT deadline_at FROM meeting_moderator_decision_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&attempt_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load original moderator attempt deadline");
+
+        let abandon_event = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let abandoned = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &abandon_event,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorDecisionAttemptAbandon {
+                    attempt_id: attempt_id.clone(),
+                },
+            },
+        )
+        .await
+        .expect("abandon lost Runtime attempt");
+        assert!(matches!(
+            abandoned.command_outcome,
+            BatonCommandOutcome::Accepted { .. }
+        ));
+        assert!(abandoned.snapshot.active_decision_attempt_id.is_none());
+
+        let (_, replacement) =
+            start_agent_moderator_attempt(&meeting, &abandoned.snapshot, Some(attempt_id.clone()))
+                .await;
+        let replacement_id = accepted_id(&replacement);
+        let (replacement_deadline, replacement_of, attempt_number): (
+            DateTime<Utc>,
+            Option<Vec<u8>>,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT deadline_at, replacement_of_attempt_id, attempt_number \
+             FROM meeting_moderator_decision_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(replacement_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load replacement attempt deadline");
+        assert_eq!(replacement_deadline, original_deadline);
+        assert_eq!(replacement_of, Some(attempt_id));
+        assert_eq!(attempt_number, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn baton_happy_path_receipt_and_deadline_recovery_are_atomic() {
         let meeting = create_test_meeting().await;
         let (_, submitted) = submit_intent(&meeting, &meeting.agent, "Agent contribution").await;
@@ -6662,6 +10644,7 @@ mod tests {
             BatonCommandOutcome::RejectedTerminal {
                 ref code,
                 canonical_object_id: Some(ref canonical),
+                ..
             } if code == "offer_not_active" && canonical == &offer_id
         ));
         sqlx::query(
@@ -6994,6 +10977,8 @@ mod tests {
                     expected_speech_revision: before.speech_revision,
                     selection_reason: None,
                     deferrals: Vec::new(),
+                    attempt_id: None,
+                    expected_source_event_id: None,
                 },
             },
         )
@@ -7114,6 +11099,8 @@ mod tests {
                             previous_event_id: intent_event.id.as_bytes().to_vec(),
                             reason: "invalid for this selected source".to_string(),
                         }],
+                        attempt_id: None,
+                        expected_source_event_id: None,
                     },
                 },
             )
@@ -7545,6 +11532,189 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn human_priority_release_unblocks_directed_handoff_for_moderator_selection() {
+        let meeting = create_test_meeting().await;
+        let (_, agent_grant_id) = create_agent_grant(&meeting, "Speak while a Human waits").await;
+
+        let request = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let requested = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &request,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::HumanRequest,
+            },
+        )
+        .await
+        .expect("queue Human Request during Agent Grant");
+        assert_eq!(requested.snapshot.phase, BatonPhase::Granted);
+        let request_id = accepted_id(&requested);
+
+        let target_pubkey = meeting.human_two.public_key().to_bytes().to_vec();
+        let speech = signed_event(
+            &meeting.agent,
+            9,
+            meeting.session_id,
+            "Human priority should delay, not strand, this question",
+            std::slice::from_ref(&target_pubkey),
+        );
+        let spoken = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &speech,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::Speech {
+                    grant_id: agent_grant_id,
+                    speech_revision: 1,
+                    handoff: Some(BatonHandoffInput {
+                        to_pubkey: target_pubkey.clone(),
+                        reason_type: "question".to_string(),
+                        reason_text: "Answer after Human priority completes".to_string(),
+                    }),
+                },
+            },
+        )
+        .await
+        .expect("Agent speech creates Human-blocked Directed Handoff");
+        assert_eq!(spoken.snapshot.phase, BatonPhase::Offered);
+        let handoff_id = speech.id.as_bytes().to_vec();
+        let (initial_disposition, blocked_by): (String, Option<String>) = sqlx::query_as(
+            "SELECT initial_disposition, blocked_by \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&handoff_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("load Human-blocked Directed Handoff");
+        assert_eq!(initial_disposition, "blocked");
+        assert_eq!(blocked_by.as_deref(), Some("human_request"));
+
+        let withdraw = signed_event(
+            &meeting.human,
+            buzz_core::kind::KIND_MEETING_HUMAN_FLOOR_REQUEST,
+            meeting.session_id,
+            "",
+            &[],
+        );
+        let withdrawn = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &withdraw,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::HumanWithdraw { request_id },
+            },
+        )
+        .await
+        .expect("withdraw Human priority Offer");
+        assert!(matches!(
+            withdrawn.snapshot.phase,
+            BatonPhase::ModeratorIdle | BatonPhase::ModeratorControl
+        ));
+
+        let (question_state, initial_disposition, blocked_by): (String, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT question_state, initial_disposition, blocked_by \
+             FROM meeting_directed_handoffs \
+             WHERE community_id = $1 AND session_id = $2 AND handoff_id = $3",
+            )
+            .bind(meeting.community_id.as_uuid())
+            .bind(meeting.session_id)
+            .bind(&handoff_id)
+            .fetch_one(&meeting.db.pool)
+            .await
+            .expect("load released Directed Handoff");
+        assert_eq!(question_state, "open");
+        assert_eq!(initial_disposition, "blocked");
+        assert!(blocked_by.is_none());
+
+        let released_state = latest_state_content(&meeting).await;
+        let released_handoff = released_state["unresolved_handoffs"]
+            .as_array()
+            .expect("released State unresolved Handoffs")
+            .iter()
+            .find(|handoff| handoff["handoff_id"] == hex::encode(&handoff_id))
+            .expect("released Handoff remains canonical");
+        assert!(released_handoff["blocked_by"].is_null());
+        let released_effects = released_state["transition"]["effects"]
+            .as_array()
+            .expect("Human release effects");
+        assert!(released_effects.iter().any(|value| {
+            value["type"] == "handoff_unblocked"
+                && value["object_id"] == hex::encode(&handoff_id)
+                && value["from"] == "human_request"
+                && value["to"].is_null()
+        }));
+
+        let select = signed_event(
+            &meeting.moderator,
+            buzz_core::kind::KIND_MEETING_MODERATOR_COMMAND,
+            meeting.session_id,
+            "resume the delayed question",
+            &[],
+        );
+        let selected = execute_baton_command(
+            &meeting.db,
+            BatonCommandTxParams {
+                community_id: meeting.community_id,
+                session_id: meeting.session_id,
+                event: &select,
+                relay_keys: &meeting.relay,
+                command: BatonCommand::ModeratorSelect {
+                    source: BatonSelectionSource::Handoff {
+                        handoff_id: handoff_id.clone(),
+                        expected_attempt_count: 0,
+                    },
+                    expected_control_epoch: withdrawn.snapshot.control_epoch,
+                    expected_decision_epoch: withdrawn.snapshot.decision_epoch,
+                    expected_intent_revision: withdrawn.snapshot.intent_revision,
+                    expected_speech_revision: withdrawn.snapshot.speech_revision,
+                    selection_reason: Some(
+                        "Human priority completed; resume the directed question".to_string(),
+                    ),
+                    deferrals: Vec::new(),
+                    attempt_id: None,
+                    expected_source_event_id: None,
+                },
+            },
+        )
+        .await
+        .expect("moderator selects released Directed Handoff");
+        assert_eq!(selected.snapshot.phase, BatonPhase::Offered);
+        let offer_id = accepted_id(&selected);
+        let (allocation_source, target, source_handoff_id): (String, Vec<u8>, Option<Vec<u8>>) =
+            sqlx::query_as(
+                "SELECT allocation_source, target_pubkey, source_handoff_id \
+             FROM meeting_baton_offers \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+            )
+            .bind(meeting.community_id.as_uuid())
+            .bind(meeting.session_id)
+            .bind(offer_id)
+            .fetch_one(&meeting.db.pool)
+            .await
+            .expect("load selected Handoff Offer");
+        assert_eq!(allocation_source, "moderator_select");
+        assert_eq!(target, target_pubkey);
+        assert_eq!(source_handoff_id.as_deref(), Some(handoff_id.as_slice()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn directed_handoff_decline_reselect_and_max_depth_chain_are_canonical() {
         let meeting = create_test_meeting().await;
         let (_, setup_grant_id) =
@@ -7704,6 +11874,8 @@ mod tests {
                     expected_speech_revision: declined.snapshot.speech_revision,
                     selection_reason: Some("retry the still-open question".to_string()),
                     deferrals: Vec::new(),
+                    attempt_id: None,
+                    expected_source_event_id: None,
                 },
             },
         )
@@ -8238,6 +12410,8 @@ mod tests {
                             previous_event_id: deferred_event.id.as_bytes().to_vec(),
                             reason: "moderator needs to frame the discussion".to_string(),
                         }],
+                        attempt_id: None,
+                        expected_source_event_id: None,
                     },
                 },
             )
@@ -9310,6 +13484,8 @@ mod tests {
             expected_speech_revision: before.speech_revision,
             selection_reason: Some("concurrent selection".to_string()),
             deferrals: Vec::new(),
+            attempt_id: None,
+            expected_source_event_id: None,
         };
 
         let (first, second) = tokio::join!(
@@ -9826,6 +14002,8 @@ mod tests {
             state_revision: 2,
             control_epoch: 1,
             decision_epoch: 1,
+            decision_attempt: 0,
+            active_decision_attempt_id: None,
             state_event_id: state_event.clone(),
             active_offer_id: Some(offer.clone()),
             active_grant_id: None,
@@ -9902,6 +14080,7 @@ mod tests {
                 expected_attempt_count: 0,
                 reason_code: "superseded".to_string(),
                 reason_text: "stale cleanup".to_string(),
+                attempt_id: None,
             },
             &before,
             &after,

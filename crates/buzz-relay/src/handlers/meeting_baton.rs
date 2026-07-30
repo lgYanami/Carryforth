@@ -15,8 +15,8 @@ use buzz_core::kind::{
 use buzz_core::tenant::TenantContext;
 use buzz_db::meeting::MAX_MEETING_PARTICIPANTS;
 use buzz_db::meeting_baton::{
-    BatonCommand, BatonCommandOutcome, BatonCommandTxParams, BatonHandoffInput,
-    BatonIntentDeferral, BatonProgressStage, BatonSelectionSource,
+    BatonCommand, BatonCommandOutcome, BatonCommandTxParams, BatonDecisionAttemptFinishOutcome,
+    BatonHandoffInput, BatonIntentDeferral, BatonProgressStage, BatonSelectionSource,
 };
 use buzz_db::DbError;
 use nostr::Event;
@@ -64,6 +64,17 @@ const HANDOFF_TYPES: &[&str] = &[
     "clarification",
     "review",
     "response_requested",
+];
+const ATTEMPT_COMPLETED_REASON_CODES: &[&str] = &["no_action", "idle_wait_fallback"];
+const ATTEMPT_DISCARDED_REASON_CODES: &[&str] = &[
+    "human_priority",
+    "control_changed",
+    "speech_changed",
+    "meeting_ended",
+    "moderator_changed",
+    "cas_churn",
+    "source_changed",
+    "runtime_replaced",
 ];
 
 /// Parse and execute one participant-authored Meeting V1 control command.
@@ -237,6 +248,7 @@ async fn execute(
             outcome_class,
             canonical_object_id,
             outcome_code,
+            retry_ticket_id,
             ..
         } => Err(command_rejection(
             if outcome_class == "rejected_after_recovery" {
@@ -246,24 +258,29 @@ async fn execute(
             },
             &outcome_code,
             canonical_object_id.as_deref(),
+            retry_ticket_id.as_deref(),
             recovery_count,
         )),
         BatonCommandOutcome::RejectedTerminal {
             code,
             canonical_object_id,
+            retry_ticket_id,
         } => Err(command_rejection(
             "conflict",
             &code,
             canonical_object_id.as_deref(),
+            retry_ticket_id.as_deref(),
             recovery_count,
         )),
         BatonCommandOutcome::RejectedAfterRecovery {
             code,
             canonical_object_id,
+            retry_ticket_id,
         } => Err(command_rejection(
             "expired",
             &code,
             canonical_object_id.as_deref(),
+            retry_ticket_id.as_deref(),
             recovery_count,
         )),
     }
@@ -283,6 +300,12 @@ fn command_metric_action(command: &BatonCommand) -> &'static str {
         BatonCommand::ModeratorSelect { .. } => "moderator_select",
         BatonCommand::ModeratorReject { .. } => "moderator_reject",
         BatonCommand::ModeratorDismissHandoff { .. } => "moderator_dismiss_handoff",
+        BatonCommand::ModeratorWithdrawSelf { .. } => "moderator_withdraw_self",
+        BatonCommand::ModeratorDecisionAttemptStart { .. } => "decision_attempt_start",
+        BatonCommand::ModeratorDecisionAttemptFinish { .. } => "decision_attempt_finish",
+        BatonCommand::ModeratorDecisionRetry { .. } => "decision_retry",
+        BatonCommand::ModeratorCompleteCohort { .. } => "complete_cohort",
+        BatonCommand::ModeratorDecisionAttemptAbandon { .. } => "decision_attempt_abandon",
         BatonCommand::ModeratorRecall { .. } => "moderator_recall",
         BatonCommand::HumanRequest => "human_request",
         BatonCommand::HumanWithdraw { .. } => "human_withdraw",
@@ -388,11 +411,13 @@ fn command_rejection(
     prefix: &str,
     code: &str,
     canonical_object_id: Option<&[u8]>,
+    retry_ticket_id: Option<&[u8]>,
     recovery_count: usize,
 ) -> IngestError {
     let details = serde_json::json!({
         "code": code,
         "canonical_object_id": canonical_object_id.map(hex::encode),
+        "retry_ticket_id": retry_ticket_id.map(hex::encode),
         "recovery_transitions": recovery_count,
     });
     IngestError::Rejected(format!("{prefix}: {details}"))
@@ -474,7 +499,7 @@ fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), Ingest
             validate_meeting_tag_schema(
                 event,
                 &["h", "v", "action", "intent", "prev", "reason-code", "p"],
-                &[],
+                &["decision-attempt"],
                 &[],
             )?;
             BatonCommand::ModeratorReject {
@@ -492,6 +517,7 @@ fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), Ingest
                     MAX_CONTROL_REASON_BYTES,
                     "Intent rejection reason",
                 )?,
+                attempt_id: optional_event_id_tag(event, "decision-attempt")?,
             }
         }
         "dismiss-handoff" => {
@@ -506,7 +532,7 @@ fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), Ingest
                     "expected-handoff-attempt-count",
                     "reason-code",
                 ],
-                &[],
+                &["decision-attempt"],
                 &[],
             )?;
             BatonCommand::ModeratorDismissHandoff {
@@ -530,6 +556,159 @@ fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), Ingest
                     MAX_CONTROL_REASON_BYTES,
                     "Handoff dismissal reason",
                 )?,
+                attempt_id: optional_event_id_tag(event, "decision-attempt")?,
+            }
+        }
+        "withdraw-self" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "v", "action", "decision-attempt", "intent", "prev"],
+                &[],
+                &[],
+            )?;
+            require_empty_content(event, "moderator self-Intent withdrawal")?;
+            BatonCommand::ModeratorWithdrawSelf {
+                attempt_id: event_id_tag(event, "decision-attempt")?,
+                intent_id: event_id_tag(event, "intent")?,
+                previous_event_id: event_id_tag(event, "prev")?,
+            }
+        }
+        "decision-attempt-start" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "action",
+                    "expected-control-epoch",
+                    "expected-decision-epoch",
+                    "expected-intent-revision",
+                    "expected-speech-revision",
+                    "expected-state",
+                ],
+                &["replacement-attempt"],
+                &[],
+            )?;
+            require_empty_content(event, "DecisionAttempt Start")?;
+            BatonCommand::ModeratorDecisionAttemptStart {
+                expected_control_epoch: parse_positive_i64_tag(event, "expected-control-epoch")?,
+                expected_decision_epoch: parse_nonnegative_i64_tag(
+                    event,
+                    "expected-decision-epoch",
+                )?,
+                expected_intent_revision: parse_nonnegative_i64_tag(
+                    event,
+                    "expected-intent-revision",
+                )?,
+                expected_speech_revision: parse_nonnegative_i64_tag(
+                    event,
+                    "expected-speech-revision",
+                )?,
+                expected_state_event_id: event_id_tag(event, "expected-state")?,
+                replacement_of_attempt_id: optional_event_id_tag(event, "replacement-attempt")?,
+            }
+        }
+        "decision-attempt-finish" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "action",
+                    "decision-attempt",
+                    "outcome",
+                    "reason-code",
+                ],
+                &[],
+                &[],
+            )?;
+            require_empty_content(event, "DecisionAttempt Finish")?;
+            let outcome = closed_value_tag(
+                event,
+                "outcome",
+                &["completed", "discarded"],
+                "DecisionAttempt finish outcome",
+            )?;
+            let (outcome, reasons) = if outcome == "completed" {
+                (
+                    BatonDecisionAttemptFinishOutcome::Completed,
+                    ATTEMPT_COMPLETED_REASON_CODES,
+                )
+            } else {
+                (
+                    BatonDecisionAttemptFinishOutcome::Discarded,
+                    ATTEMPT_DISCARDED_REASON_CODES,
+                )
+            };
+            BatonCommand::ModeratorDecisionAttemptFinish {
+                attempt_id: event_id_tag(event, "decision-attempt")?,
+                outcome,
+                reason_code: closed_value_tag(
+                    event,
+                    "reason-code",
+                    reasons,
+                    "DecisionAttempt finish reason",
+                )?,
+            }
+        }
+        "decision-retry" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "action",
+                    "decision-attempt",
+                    "retry-ticket",
+                    "failed-action",
+                    "expected-control-epoch",
+                    "expected-decision-epoch",
+                    "expected-attempt-number",
+                ],
+                &[],
+                &[],
+            )?;
+            require_empty_content(event, "DecisionRetry")?;
+            BatonCommand::ModeratorDecisionRetry {
+                attempt_id: event_id_tag(event, "decision-attempt")?,
+                retry_ticket_id: event_id_tag(event, "retry-ticket")?,
+                failed_action_event_id: event_id_tag(event, "failed-action")?,
+                expected_control_epoch: parse_positive_i64_tag(event, "expected-control-epoch")?,
+                expected_decision_epoch: parse_positive_i64_tag(event, "expected-decision-epoch")?,
+                expected_attempt_number: parse_positive_i32_tag(event, "expected-attempt-number")?,
+            }
+        }
+        "complete-cohort" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "action",
+                    "decision-attempt",
+                    "expected-control-epoch",
+                    "expected-decision-epoch",
+                ],
+                &[],
+                &[],
+            )?;
+            require_empty_content(event, "CompleteCohort")?;
+            BatonCommand::ModeratorCompleteCohort {
+                attempt_id: event_id_tag(event, "decision-attempt")?,
+                expected_control_epoch: parse_positive_i64_tag(event, "expected-control-epoch")?,
+                expected_decision_epoch: parse_positive_i64_tag(event, "expected-decision-epoch")?,
+            }
+        }
+        "decision-attempt-abandon" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "v", "action", "decision-attempt"],
+                &[],
+                &[],
+            )?;
+            require_empty_content(event, "DecisionAttempt Abandon")?;
+            BatonCommand::ModeratorDecisionAttemptAbandon {
+                attempt_id: event_id_tag(event, "decision-attempt")?,
             }
         }
         "recall" => {
@@ -541,8 +720,7 @@ fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), Ingest
         }
         _ => {
             return Err(IngestError::Rejected(
-                "invalid: moderator action must be select, reject, dismiss-handoff, or recall"
-                    .into(),
+                "invalid: unsupported Meeting V1 moderator action".into(),
             ));
         }
     };
@@ -561,7 +739,13 @@ fn parse_moderator_select(event: &Event) -> Result<BatonCommand, IngestError> {
             "expected-intent-revision",
             "expected-speech-revision",
         ],
-        &["intent", "handoff", "expected-handoff-attempt-count"],
+        &[
+            "intent",
+            "handoff",
+            "expected-handoff-attempt-count",
+            "decision-attempt",
+            "expected-source-event",
+        ],
         &[],
     )?;
     let intent_id = optional_event_id_tag(event, "intent")?;
@@ -634,6 +818,8 @@ fn parse_moderator_select(event: &Event) -> Result<BatonCommand, IngestError> {
         expected_speech_revision: parse_nonnegative_i64_tag(event, "expected-speech-revision")?,
         selection_reason,
         deferrals,
+        attempt_id: optional_event_id_tag(event, "decision-attempt")?,
+        expected_source_event_id: optional_event_id_tag(event, "expected-source-event")?,
     })
 }
 
@@ -906,6 +1092,16 @@ fn parse_nonnegative_i32_tag(event: &Event, tag_name: &str) -> Result<i32, Inges
         })
 }
 
+fn parse_positive_i32_tag(event: &Event, tag_name: &str) -> Result<i32, IngestError> {
+    let value = parse_nonnegative_i32_tag(event, tag_name)?;
+    if value == 0 {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {tag_name} must be a positive integer"
+        )));
+    }
+    Ok(value)
+}
+
 fn optional_nonnegative_i32_tag(event: &Event, tag_name: &str) -> Result<Option<i32>, IngestError> {
     optional_single_tag(event, tag_name)?
         .map(|value| {
@@ -1088,6 +1284,10 @@ mod tests {
         let handoff = "ac".repeat(32);
         let offer = "ad".repeat(32);
         let grant = "ae".repeat(32);
+        let attempt = "af".repeat(32);
+        let retry_ticket = "b0".repeat(32);
+        let failed_action = "b1".repeat(32);
+        let state_event = "b2".repeat(32);
         let participant = "bb".repeat(32);
         let commands = vec![
             buzz_sdk::build_meeting_v1_intent_submit(buzz_sdk::MeetingV1IntentSubmitParams {
@@ -1118,6 +1318,8 @@ mod tests {
                 expected_speech_revision: 0,
                 selection_reason: Some("Relevant."),
                 deferrals: &[],
+                attempt_id: Some(&attempt),
+                expected_source_event_id: Some(&previous),
             }),
             buzz_sdk::build_meeting_v1_moderator_select(buzz_sdk::MeetingV1ModeratorSelectParams {
                 session_id,
@@ -1131,6 +1333,8 @@ mod tests {
                 expected_speech_revision: 0,
                 selection_reason: None,
                 deferrals: &[],
+                attempt_id: None,
+                expected_source_event_id: None,
             }),
             buzz_sdk::build_meeting_v1_moderator_reject(buzz_sdk::MeetingV1ModeratorRejectParams {
                 session_id,
@@ -1139,6 +1343,7 @@ mod tests {
                 intent_author_pubkey: &participant,
                 reason_code: buzz_sdk::MeetingV1IntentRejectionReason::Duplicate,
                 reason_text: "Already covered.",
+                attempt_id: None,
             }),
             buzz_sdk::build_meeting_v1_moderator_dismiss_handoff(
                 buzz_sdk::MeetingV1ModeratorDismissHandoffParams {
@@ -1148,6 +1353,55 @@ mod tests {
                     expected_attempt_count: 0,
                     reason_code: buzz_sdk::MeetingV1HandoffDismissReason::AnsweredElsewhere,
                     reason_text: "Already answered.",
+                    attempt_id: None,
+                },
+            ),
+            buzz_sdk::build_meeting_v1_decision_attempt_start(
+                buzz_sdk::MeetingV1DecisionAttemptStartParams {
+                    session_id,
+                    expected_control_epoch: 1,
+                    expected_decision_epoch: 1,
+                    expected_intent_revision: 2,
+                    expected_speech_revision: 0,
+                    expected_state_event_id: &state_event,
+                    replacement_of_attempt_id: None,
+                },
+            ),
+            buzz_sdk::build_meeting_v1_decision_attempt_finish(
+                buzz_sdk::MeetingV1DecisionAttemptFinishParams {
+                    session_id,
+                    attempt_id: &attempt,
+                    outcome: buzz_sdk::MeetingV1DecisionAttemptFinishOutcome::Completed,
+                    reason_code: "no_action",
+                },
+            ),
+            buzz_sdk::build_meeting_v1_decision_retry(buzz_sdk::MeetingV1DecisionRetryParams {
+                session_id,
+                attempt_id: &attempt,
+                retry_ticket_id: &retry_ticket,
+                failed_action_event_id: &failed_action,
+                expected_control_epoch: 1,
+                expected_decision_epoch: 1,
+                expected_attempt_number: 1,
+            }),
+            buzz_sdk::build_meeting_v1_complete_cohort(buzz_sdk::MeetingV1CompleteCohortParams {
+                session_id,
+                attempt_id: &attempt,
+                expected_control_epoch: 1,
+                expected_decision_epoch: 1,
+            }),
+            buzz_sdk::build_meeting_v1_decision_attempt_abandon(
+                buzz_sdk::MeetingV1DecisionAttemptAbandonParams {
+                    session_id,
+                    attempt_id: &attempt,
+                },
+            ),
+            buzz_sdk::build_meeting_v1_moderator_withdraw_self(
+                buzz_sdk::MeetingV1ModeratorWithdrawSelfParams {
+                    session_id,
+                    attempt_id: &attempt,
+                    intent_id: &intent,
+                    previous_event_id: &previous,
                 },
             ),
             buzz_sdk::build_meeting_v1_moderator_recall(buzz_sdk::MeetingV1ModeratorRecallParams {
@@ -1194,6 +1448,12 @@ mod tests {
             "moderator_select",
             "moderator_reject",
             "moderator_dismiss_handoff",
+            "decision_attempt_start",
+            "decision_attempt_finish",
+            "decision_retry",
+            "complete_cohort",
+            "decision_attempt_abandon",
+            "moderator_withdraw_self",
             "moderator_recall",
             "human_request",
             "human_withdraw",
@@ -1252,6 +1512,7 @@ mod tests {
                     canonical_object_id: None,
                     state_revision: Some(1),
                     outcome_code: "accepted".to_string(),
+                    retry_ticket_id: None,
                 },
                 CommandMetricOutcome {
                     outcome: "accepted",
@@ -1265,6 +1526,7 @@ mod tests {
                     canonical_object_id: None,
                     state_revision: None,
                     outcome_code: "conflict".to_string(),
+                    retry_ticket_id: None,
                 },
                 CommandMetricOutcome {
                     outcome: "rejected_terminal",
@@ -1278,6 +1540,7 @@ mod tests {
                     canonical_object_id: None,
                     state_revision: Some(2),
                     outcome_code: "offer_expired".to_string(),
+                    retry_ticket_id: None,
                 },
                 CommandMetricOutcome {
                     outcome: "rejected_after_recovery",
@@ -1288,6 +1551,7 @@ mod tests {
                 BatonCommandOutcome::RejectedTerminal {
                     code: "conflict".to_string(),
                     canonical_object_id: None,
+                    retry_ticket_id: None,
                 },
                 CommandMetricOutcome {
                     outcome: "rejected_terminal",
@@ -1298,6 +1562,7 @@ mod tests {
                 BatonCommandOutcome::RejectedAfterRecovery {
                     code: "expired".to_string(),
                     canonical_object_id: None,
+                    retry_ticket_id: None,
                 },
                 CommandMetricOutcome {
                     outcome: "rejected_after_recovery",
@@ -1315,6 +1580,7 @@ mod tests {
             canonical_object_id: None,
             state_revision: None,
             outcome_code: "reason body".to_string(),
+            retry_ticket_id: None,
         };
         assert_eq!(
             classify_command_outcome(&private_text),

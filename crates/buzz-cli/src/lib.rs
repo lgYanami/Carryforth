@@ -216,6 +216,15 @@ pub enum MeetingHandoffDismissReason {
     NoLongerNeeded,
 }
 
+/// Meeting V1 moderator DecisionAttempt terminal class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MeetingDecisionAttemptFinishOutcome {
+    /// Model execution completed and needs no primary action.
+    Completed,
+    /// Shared protocol state made the model result irrelevant.
+    Discarded,
+}
+
 /// Observable stage reported by a Meeting V1 Grant holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum MeetingGrantProgressStage {
@@ -953,6 +962,9 @@ pub enum MeetingModeratorCmd {
         /// Deferral in INTENT_ID:REASON form; repeatable
         #[arg(long = "defer")]
         deferrals: Vec<String>,
+        /// Registered DecisionAttempt ID; required for an Agent moderator
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Reject one pending intent
     Reject {
@@ -968,6 +980,9 @@ pub enum MeetingModeratorCmd {
         /// Required human-readable explanation
         #[arg(long)]
         reason: String,
+        /// Registered DecisionAttempt ID; required for an Agent moderator
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Close one unresolved directed handoff
     #[command(name = "dismiss-handoff")]
@@ -984,6 +999,86 @@ pub enum MeetingModeratorCmd {
         /// Required human-readable explanation
         #[arg(long)]
         reason: String,
+        /// Registered DecisionAttempt ID; required for an Agent moderator
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    /// Register a Relay-authoritative Candidate Cohort before model dispatch
+    #[command(name = "attempt-start")]
+    AttemptStart {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Abandoned attempt replaced without refreshing its deadline
+        #[arg(long)]
+        replacement: Option<String>,
+    },
+    /// Terminalize a registered DecisionAttempt without a primary action
+    #[command(name = "attempt-finish")]
+    AttemptFinish {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Registered DecisionAttempt ID
+        #[arg(long)]
+        attempt: String,
+        /// Completed or discarded terminal class
+        #[arg(long)]
+        outcome: MeetingDecisionAttemptFinishOutcome,
+        /// Closed machine-readable terminal reason
+        #[arg(long)]
+        reason_code: String,
+    },
+    /// Consume one Relay-issued selected-source retry ticket
+    Retry {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Failed DecisionAttempt ID
+        #[arg(long)]
+        attempt: String,
+        /// One-use retry ticket ID
+        #[arg(long)]
+        ticket: String,
+        /// Failed signed moderator action event ID
+        #[arg(long)]
+        failed_action: String,
+        /// Failed attempt number
+        #[arg(long)]
+        attempt_number: u64,
+    },
+    /// Close an empty current Candidate Cohort
+    #[command(name = "complete-cohort")]
+    CompleteCohort {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Registered DecisionAttempt ID
+        #[arg(long)]
+        attempt: String,
+    },
+    /// Mark a running DecisionAttempt abandoned after Runtime loss
+    #[command(name = "attempt-abandon")]
+    AttemptAbandon {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Registered DecisionAttempt ID
+        #[arg(long)]
+        attempt: String,
+    },
+    /// Withdraw the Agent moderator's own Intent through its DecisionAttempt
+    #[command(name = "withdraw-self")]
+    WithdrawSelf {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Registered DecisionAttempt ID
+        #[arg(long)]
+        attempt: String,
+        /// Stable moderator self-Intent ID
+        #[arg(long)]
+        intent: String,
     },
     /// Recall control after the current allocation chain
     Recall {

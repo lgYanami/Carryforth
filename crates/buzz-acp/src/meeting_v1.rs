@@ -38,7 +38,7 @@ use crate::meeting::{
     MeetingTurnRequest,
 };
 use crate::observer::{self, ObserverHandle};
-use crate::relay::{BuzzEvent, RestClient};
+use crate::relay::{BuzzEvent, ProtocolSubmitOutcome, ProtocolSubmitRejected, RestClient};
 
 const LEDGER_VERSION: u32 = 3;
 const PREVIOUS_LEDGER_VERSION: u32 = 2;
@@ -607,14 +607,18 @@ struct GrantedHandoffOutput {
 
 #[derive(Debug)]
 enum ProtocolSubmitFailure {
-    Rejected(String),
+    Rejected(ProtocolSubmitRejected),
     Uncertain(String),
 }
 
 impl std::fmt::Display for ProtocolSubmitFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rejected(message) => write!(formatter, "Relay rejected the event: {message}"),
+            Self::Rejected(rejection) => write!(
+                formatter,
+                "Relay rejected the event ({}): {}",
+                rejection.code, rejection.message
+            ),
             Self::Uncertain(message) => write!(formatter, "submission is uncertain: {message}"),
         }
     }
@@ -5092,23 +5096,20 @@ async fn submit_protocol_event(
     rest: &RestClient,
     event: &Event,
 ) -> std::result::Result<Value, ProtocolSubmitFailure> {
-    let response = tokio::time::timeout(PROTOCOL_SUBMIT_TIMEOUT, rest.submit_event(event)).await;
+    let response =
+        tokio::time::timeout(PROTOCOL_SUBMIT_TIMEOUT, rest.submit_event_outcome(event)).await;
     match response {
         Err(_) => Err(ProtocolSubmitFailure::Uncertain(format!(
             "submission exceeded {}ms",
             PROTOCOL_SUBMIT_TIMEOUT.as_millis()
         ))),
-        Ok(Ok(response)) if response.get("accepted").and_then(Value::as_bool) == Some(false) => {
-            Err(ProtocolSubmitFailure::Rejected(
-                response
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Relay rejected Meeting command")
-                    .to_string(),
-            ))
+        Ok(ProtocolSubmitOutcome::Accepted(accepted)) => Ok(accepted.response),
+        Ok(ProtocolSubmitOutcome::Rejected(rejected)) => {
+            Err(ProtocolSubmitFailure::Rejected(rejected))
         }
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err(ProtocolSubmitFailure::Uncertain(error.to_string())),
+        Ok(ProtocolSubmitOutcome::Uncertain(uncertain)) => {
+            Err(ProtocolSubmitFailure::Uncertain(uncertain.reason))
+        }
     }
 }
 
@@ -5877,6 +5878,7 @@ fn build_moderator_action_event(
                     intent_author_pubkey: &intent.author_pubkey,
                     reason_code: parse_rejection_reason(&proposal.reason_code)?,
                     reason_text: &proposal.reason_text,
+                    attempt_id: None,
                 }),
             )
         }
@@ -5891,6 +5893,7 @@ fn build_moderator_action_event(
                     expected_attempt_count: handoff.attempt_count,
                     reason_code: parse_handoff_dismiss_reason(&proposal.reason_code)?,
                     reason_text: &proposal.reason_text,
+                    attempt_id: None,
                 },
             ),
         ),
@@ -5958,6 +5961,8 @@ fn build_moderator_action_event(
                     expected_speech_revision: view.baton.speech_revision,
                     selection_reason: Some(reason),
                     deferrals: &deferrals,
+                    attempt_id: None,
+                    expected_source_event_id: None,
                 }),
             )
         }
@@ -5980,6 +5985,8 @@ fn build_moderator_action_event(
                 expected_speech_revision: view.baton.speech_revision,
                 selection_reason: Some(reason),
                 deferrals: &[],
+                attempt_id: None,
+                expected_source_event_id: None,
             }),
         ),
         ModeratorActionSpec::WithdrawSelf { intent } => (
@@ -9697,8 +9704,20 @@ mod tests {
         let rejected_error = rejected.as_ref().expect_err("Relay rejection");
         assert!(!rejected_error.is_uncertain());
 
+        let (bad_request_rest, bad_request_server) =
+            rest_responding_once("400 Bad Request", r#"{"error":"private protocol body"}"#).await;
+        let bad_request = submit_protocol_event(&bad_request_rest, &event).await;
+        bad_request_server
+            .await
+            .expect("join bad-request HTTP server");
+        assert_eq!(protocol_submission_label(&bad_request), "rejected");
+        assert!(!bad_request
+            .as_ref()
+            .expect_err("deterministic HTTP rejection")
+            .is_uncertain());
+
         let (uncertain_rest, uncertain_server) =
-            rest_responding_once("400 Bad Request", r#"{"error":"private transport body"}"#).await;
+            rest_responding_once("200 OK", r#"{"error":"private transport body"}"#).await;
         let uncertain = submit_protocol_event(&uncertain_rest, &event).await;
         uncertain_server.await.expect("join uncertain HTTP server");
         assert_eq!(protocol_submission_label(&uncertain), "uncertain");
@@ -9714,6 +9733,7 @@ mod tests {
         })
         .to_string();
         assert!(!telemetry.contains(PRIVATE_REJECTION));
+        assert!(!telemetry.contains("private protocol body"));
         assert!(!telemetry.contains("private transport body"));
     }
 

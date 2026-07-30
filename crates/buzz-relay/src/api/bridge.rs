@@ -617,6 +617,49 @@ fn ingest_rejection_status(message: &str) -> StatusCode {
     }
 }
 
+fn protocol_rejection_response(
+    status: StatusCode,
+    event_id: &str,
+    message: &str,
+) -> (StatusCode, Json<Value>) {
+    let details = message
+        .strip_prefix("conflict:")
+        .or_else(|| message.strip_prefix("expired:"))
+        .map(str::trim)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+    let Some(details) = details else {
+        return api_error(status, message);
+    };
+    let code = details
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("meeting_command_rejected");
+    (
+        status,
+        Json(serde_json::json!({
+            "event_id": event_id,
+            "accepted": false,
+            "code": code,
+            "canonical_object_id": details.get("canonical_object_id").cloned().unwrap_or(Value::Null),
+            "retry_ticket_id": details.get("retry_ticket_id").cloned().unwrap_or(Value::Null),
+            "recovery_transitions": details
+                .get("recovery_transitions")
+                .cloned()
+                .unwrap_or_else(|| Value::from(0)),
+            "message": message,
+        })),
+    )
+}
+
+fn merge_submit_response_details(response: &mut Value, details: serde_json::Map<String, Value>) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    for (key, value) in details {
+        object.entry(key).or_insert(value);
+    }
+}
+
 /// Submit a signed Nostr event via HTTP bridge (NIP-98 auth).
 pub async fn submit_event(
     State(state): State<Arc<AppState>>,
@@ -838,6 +881,7 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
+    let submitted_event_id = event.id.to_hex();
     let auth = IngestAuth::Http {
         pubkey,
         scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
@@ -846,11 +890,20 @@ async fn submit_event_authed(
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
         Ok(result) => {
-            let response = Json(serde_json::json!({
+            let details = result
+                .message
+                .strip_prefix("response:")
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .and_then(|value| value.as_object().cloned());
+            let mut response = serde_json::json!({
                 "event_id": result.event_id,
                 "accepted": result.accepted,
                 "message": result.message,
-            }));
+            });
+            if let Some(details) = details {
+                merge_submit_response_details(&mut response, details);
+            }
+            let response = Json(response);
             SubmitOutcome::Ok {
                 accepted: result.accepted,
                 response,
@@ -868,7 +921,7 @@ async fn submit_event_authed(
                 kind: kind_u32,
                 reason,
                 status,
-                response: api_error(status, &msg),
+                response: protocol_rejection_response(status, &submitted_event_id, &msg),
             }
         }
         Err(IngestError::AuthFailed(msg)) => {
@@ -3322,6 +3375,55 @@ mod tests {
             ingest_rejection_status("invalid: malformed tag"),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn meeting_conflict_response_preserves_typed_retry_evidence() {
+        let event_id = "11".repeat(32);
+        let canonical = "22".repeat(32);
+        let ticket = "33".repeat(32);
+        let message = format!(
+            "conflict: {}",
+            serde_json::json!({
+                "code": "selected_source_changed",
+                "canonical_object_id": canonical,
+                "retry_ticket_id": ticket,
+                "recovery_transitions": 0,
+            })
+        );
+        let (status, Json(body)) =
+            protocol_rejection_response(StatusCode::CONFLICT, &event_id, &message);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["event_id"], event_id);
+        assert_eq!(body["accepted"], false);
+        assert_eq!(body["code"], "selected_source_changed");
+        assert_eq!(body["canonical_object_id"], canonical);
+        assert_eq!(body["retry_ticket_id"], ticket);
+    }
+
+    #[test]
+    fn submit_response_details_cannot_override_authoritative_outcome() {
+        let mut response = serde_json::json!({
+            "event_id": "canonical-event",
+            "accepted": false,
+            "message": "canonical-message",
+        });
+        let details = serde_json::json!({
+            "event_id": "forged-event",
+            "accepted": true,
+            "message": "forged-message",
+            "attempt_id": "attempt-1",
+        })
+        .as_object()
+        .cloned()
+        .expect("test details object");
+
+        merge_submit_response_details(&mut response, details);
+
+        assert_eq!(response["event_id"], "canonical-event");
+        assert_eq!(response["accepted"], false);
+        assert_eq!(response["message"], "canonical-message");
+        assert_eq!(response["attempt_id"], "attempt-1");
     }
 
     // ──────────────────────────────────────────────────────────────────────────

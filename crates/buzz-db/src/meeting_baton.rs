@@ -54,6 +54,10 @@ pub struct BatonConfig {
     pub max_handoff_depth: i32,
     /// Maximum unresolved directed handoffs.
     pub max_open_handoffs: i32,
+    /// Maximum semantic rejudgments after the initial moderator attempt.
+    pub moderator_max_rejudgments: i32,
+    /// Maximum compare-and-swap rebases within one moderator attempt.
+    pub moderator_max_cas_rebases_per_attempt: i32,
     /// Versioned deterministic fallback algorithm.
     pub fallback_policy_version: String,
 }
@@ -71,6 +75,8 @@ impl Default for BatonConfig {
             agent_safety_margin_ms: 30_000,
             max_handoff_depth: 5,
             max_open_handoffs: 32,
+            moderator_max_rejudgments: 2,
+            moderator_max_cas_rebases_per_attempt: 8,
             fallback_policy_version: DEFAULT_FALLBACK_POLICY_VERSION.to_string(),
         }
     }
@@ -179,6 +185,10 @@ pub struct BatonSnapshot {
     pub control_epoch: i64,
     /// Epoch of the current moderator decision window.
     pub decision_epoch: i64,
+    /// Monotonic attempt number within the current decision window.
+    pub decision_attempt: i32,
+    /// Currently running authoritative moderator attempt.
+    pub active_decision_attempt_id: Option<Vec<u8>>,
     /// Relay-signed State event ID.
     pub state_event_id: Vec<u8>,
     /// Active Offer object ID.
@@ -498,6 +508,8 @@ pub async fn create_meeting_v1_tx(
         state_revision: 1,
         control_epoch: 1,
         decision_epoch: 0,
+        decision_attempt: 0,
+        active_decision_attempt_id: None,
         state_event_id: state_event.id.as_bytes().to_vec(),
         active_offer_id: None,
         active_grant_id: None,
@@ -1050,6 +1062,23 @@ async fn close_baton_locked_tx(
     .bind(now)
     .execute(tx.as_mut())
     .await?;
+    let ended_attempt_ids: Vec<Vec<u8>> = sqlx::query(
+        "UPDATE meeting_moderator_decision_attempts \
+         SET state = 'discarded', terminal_event_id = $3, \
+             terminal_reason = $4, terminal_at = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'running' \
+         RETURNING attempt_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(caused_by_event_id)
+    .bind(primary_type)
+    .bind(now)
+    .fetch_all(tx.as_mut())
+    .await?
+    .into_iter()
+    .map(|row| row.try_get("attempt_id"))
+    .collect::<std::result::Result<_, sqlx::Error>>()?;
 
     for (label, actual, expected) in [
         (
@@ -1145,6 +1174,15 @@ async fn close_baton_locked_tx(
             "to": "ended",
         })
     }));
+    effects.extend(ended_attempt_ids.iter().map(|attempt_id| {
+        serde_json::json!({
+            "type": "moderator_decision_attempt_discarded",
+            "object_type": "moderator_decision_attempt",
+            "object_id": hex::encode(attempt_id),
+            "from": "running",
+            "to": "discarded",
+        })
+    }));
     if let Some(recall_event_id) = state.recall_event_id.as_deref() {
         effects.push(serde_json::json!({
             "type": "recall_cleared",
@@ -1212,6 +1250,7 @@ async fn close_baton_locked_tx(
          SET phase = 'ended', floor_revision = $3, intent_revision = $4, \
              state_revision = $5, state_event_id = $6, \
              active_offer_id = NULL, active_grant_id = NULL, handoff_depth = 0, \
+             active_decision_attempt_id = NULL, \
              consecutive_moderator_speeches = 0, forced_return_to_moderator = FALSE, \
              recall_event_id = NULL, \
              moderator_decision_started_at = NULL, moderator_decision_deadline = NULL, \
@@ -1239,6 +1278,8 @@ async fn close_baton_locked_tx(
         state_revision: next_state_revision,
         control_epoch: state.control_epoch,
         decision_epoch: state.decision_epoch,
+        decision_attempt: state.decision_attempt,
+        active_decision_attempt_id: None,
         state_event_id: state_event.id.as_bytes().to_vec(),
         active_offer_id: None,
         active_grant_id: None,
@@ -1288,6 +1329,8 @@ struct StateRow {
     state_revision: i64,
     control_epoch: i64,
     decision_epoch: i64,
+    decision_attempt: i32,
+    active_decision_attempt_id: Option<Vec<u8>>,
     state_event_id: Vec<u8>,
     active_offer_id: Option<Vec<u8>>,
     active_grant_id: Option<Vec<u8>>,
@@ -1311,7 +1354,8 @@ async fn load_state_tx(
     let row = if for_update {
         sqlx::query(
             "SELECT phase, floor_revision, intent_revision, speech_revision, \
-                    state_revision, control_epoch, decision_epoch, state_event_id, \
+                    state_revision, control_epoch, decision_epoch, decision_attempt, \
+                    active_decision_attempt_id, state_event_id, \
                     active_offer_id, active_grant_id, handoff_depth, \
                     consecutive_moderator_speeches, forced_return_to_moderator, \
                     recall_event_id, moderator_decision_started_at, \
@@ -1327,7 +1371,8 @@ async fn load_state_tx(
     } else {
         sqlx::query(
             "SELECT phase, floor_revision, intent_revision, speech_revision, \
-                    state_revision, control_epoch, decision_epoch, state_event_id, \
+                    state_revision, control_epoch, decision_epoch, decision_attempt, \
+                    active_decision_attempt_id, state_event_id, \
                     active_offer_id, active_grant_id, handoff_depth, \
                     consecutive_moderator_speeches, forced_return_to_moderator, \
                     recall_event_id, moderator_decision_started_at, \
@@ -1354,6 +1399,8 @@ fn state_row_from_pg(row: sqlx::postgres::PgRow) -> Result<StateRow> {
         state_revision: row.try_get("state_revision")?,
         control_epoch: row.try_get("control_epoch")?,
         decision_epoch: row.try_get("decision_epoch")?,
+        decision_attempt: row.try_get("decision_attempt")?,
+        active_decision_attempt_id: row.try_get("active_decision_attempt_id")?,
         state_event_id: row.try_get("state_event_id")?,
         active_offer_id: row.try_get("active_offer_id")?,
         active_grant_id: row.try_get("active_grant_id")?,
@@ -1377,7 +1424,8 @@ async fn load_snapshot_pool(
     assert_v1_session_pool(pool, community_id, session_id).await?;
     let row = sqlx::query(
         "SELECT phase, floor_revision, intent_revision, speech_revision, \
-                state_revision, control_epoch, decision_epoch, state_event_id, \
+                state_revision, control_epoch, decision_epoch, decision_attempt, \
+                active_decision_attempt_id, state_event_id, \
                 active_offer_id, active_grant_id, handoff_depth, \
                 consecutive_moderator_speeches, forced_return_to_moderator, \
                 recall_event_id, moderator_decision_started_at, \
@@ -1438,6 +1486,8 @@ fn snapshot_from_parts(
         state_revision: state.state_revision,
         control_epoch: state.control_epoch,
         decision_epoch: state.decision_epoch,
+        decision_attempt: state.decision_attempt,
+        active_decision_attempt_id: state.active_decision_attempt_id,
         state_event_id: state.state_event_id,
         active_offer_id: state.active_offer_id,
         active_grant_id: state.active_grant_id,
@@ -1578,7 +1628,8 @@ async fn load_config_pool(
         "SELECT timing_profile_version, agent_offer_ack_ms, human_offer_ack_ms, \
                 moderator_decision_ms, grant_soft_lease_ms, progress_interval_ms, \
                 grant_hard_deadline_ms, agent_safety_margin_ms, max_handoff_depth, \
-                max_open_handoffs, fallback_policy_version \
+                max_open_handoffs, moderator_max_rejudgments, \
+                moderator_max_cas_rebases_per_attempt, fallback_policy_version \
          FROM meeting_baton_config \
          WHERE community_id = $1 AND session_id = $2",
     )
@@ -1599,7 +1650,8 @@ async fn load_config_tx(
         "SELECT timing_profile_version, agent_offer_ack_ms, human_offer_ack_ms, \
                 moderator_decision_ms, grant_soft_lease_ms, progress_interval_ms, \
                 grant_hard_deadline_ms, agent_safety_margin_ms, max_handoff_depth, \
-                max_open_handoffs, fallback_policy_version \
+                max_open_handoffs, moderator_max_rejudgments, \
+                moderator_max_cas_rebases_per_attempt, fallback_policy_version \
          FROM meeting_baton_config \
          WHERE community_id = $1 AND session_id = $2",
     )
@@ -1623,6 +1675,9 @@ fn config_from_row(row: sqlx::postgres::PgRow) -> Result<BatonConfig> {
         agent_safety_margin_ms: row.try_get("agent_safety_margin_ms")?,
         max_handoff_depth: row.try_get("max_handoff_depth")?,
         max_open_handoffs: row.try_get("max_open_handoffs")?,
+        moderator_max_rejudgments: row.try_get("moderator_max_rejudgments")?,
+        moderator_max_cas_rebases_per_attempt: row
+            .try_get("moderator_max_cas_rebases_per_attempt")?,
         fallback_policy_version: row.try_get("fallback_policy_version")?,
     })
 }
@@ -1638,8 +1693,9 @@ async fn insert_config_tx(
              (community_id, session_id, timing_profile_version, agent_offer_ack_ms, \
               human_offer_ack_ms, moderator_decision_ms, grant_soft_lease_ms, \
               progress_interval_ms, grant_hard_deadline_ms, agent_safety_margin_ms, \
-              max_handoff_depth, max_open_handoffs, fallback_policy_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+              max_handoff_depth, max_open_handoffs, moderator_max_rejudgments, \
+              moderator_max_cas_rebases_per_attempt, fallback_policy_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
@@ -1653,6 +1709,8 @@ async fn insert_config_tx(
     .bind(config.agent_safety_margin_ms)
     .bind(config.max_handoff_depth)
     .bind(config.max_open_handoffs)
+    .bind(config.moderator_max_rejudgments)
+    .bind(config.moderator_max_cas_rebases_per_attempt)
     .bind(&config.fallback_policy_version)
     .execute(tx.as_mut())
     .await?;
@@ -2062,6 +2120,8 @@ fn build_state_event(
         "speech_revision": speech_revision,
         "control_epoch": control_epoch,
         "decision_epoch": decision_epoch,
+        "decision_attempt": 0,
+        "active_decision_attempt": null,
         "baton_config": config,
         "moderator_pubkey": moderator,
         "participants": participants,
@@ -2226,9 +2286,11 @@ fn validate_config(config: &BatonConfig) -> Result<()> {
     }
     if !(0..=255).contains(&config.max_handoff_depth)
         || !(1..=32).contains(&config.max_open_handoffs)
+        || !(0..=8).contains(&config.moderator_max_rejudgments)
+        || !(1..=64).contains(&config.moderator_max_cas_rebases_per_attempt)
     {
         return Err(DbError::InvalidData(
-            "invalid Meeting V1 handoff limits".to_string(),
+            "invalid Meeting V1 handoff or moderator attempt limits".to_string(),
         ));
     }
     Ok(())

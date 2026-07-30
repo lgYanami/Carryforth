@@ -147,6 +147,10 @@ pub struct MeetingV1ModeratorSelectParams<'a> {
     pub selection_reason: Option<&'a str>,
     /// Atomic deferrals; only valid when Relay confirms a moderator-self intent.
     pub deferrals: &'a [MeetingV1IntentDeferral<'a>],
+    /// Registered decision attempt; required for an Agent moderator.
+    pub attempt_id: Option<&'a str>,
+    /// Intent event version from the registered snapshot.
+    pub expected_source_event_id: Option<&'a str>,
 }
 
 /// Closed reason codes for rejecting a Meeting V1 intent.
@@ -190,6 +194,8 @@ pub struct MeetingV1ModeratorRejectParams<'a> {
     pub reason_code: MeetingV1IntentRejectionReason,
     /// Required human-readable explanation.
     pub reason_text: &'a str,
+    /// Registered decision attempt; required for an Agent moderator.
+    pub attempt_id: Option<&'a str>,
 }
 
 /// Closed reason codes for dismissing a Meeting V1 handoff.
@@ -230,6 +236,106 @@ pub struct MeetingV1ModeratorDismissHandoffParams<'a> {
     pub reason_code: MeetingV1HandoffDismissReason,
     /// Required human-readable explanation.
     pub reason_text: &'a str,
+    /// Registered decision attempt; required for an Agent moderator.
+    pub attempt_id: Option<&'a str>,
+}
+
+/// Inputs for registering an authoritative Meeting V1 moderator attempt.
+pub struct MeetingV1DecisionAttemptStartParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Expected current control epoch.
+    pub expected_control_epoch: u64,
+    /// Expected current decision epoch.
+    pub expected_decision_epoch: u64,
+    /// Expected current Intent revision.
+    pub expected_intent_revision: u64,
+    /// Expected current speech revision.
+    pub expected_speech_revision: u64,
+    /// Relay State event observed immediately before registration.
+    pub expected_state_event_id: &'a str,
+    /// Abandoned attempt replaced without refreshing its deadline.
+    pub replacement_of_attempt_id: Option<&'a str>,
+}
+
+/// Terminal class for a Meeting V1 moderator attempt without a primary action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV1DecisionAttemptFinishOutcome {
+    /// Model execution completed and requires no primary action.
+    Completed,
+    /// Shared protocol state made the model result irrelevant.
+    Discarded,
+}
+
+impl MeetingV1DecisionAttemptFinishOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Discarded => "discarded",
+        }
+    }
+}
+
+/// Inputs for terminalizing a Meeting V1 moderator attempt.
+pub struct MeetingV1DecisionAttemptFinishParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Registered decision attempt.
+    pub attempt_id: &'a str,
+    /// Completed or discarded terminal class.
+    pub outcome: MeetingV1DecisionAttemptFinishOutcome,
+    /// Closed machine-readable terminal reason.
+    pub reason_code: &'a str,
+}
+
+/// Inputs for consuming a Relay-issued Meeting V1 retry ticket.
+pub struct MeetingV1DecisionRetryParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Failed decision attempt.
+    pub attempt_id: &'a str,
+    /// One-use Relay retry ticket.
+    pub retry_ticket_id: &'a str,
+    /// Signed action event whose rejection issued the ticket.
+    pub failed_action_event_id: &'a str,
+    /// Expected current control epoch.
+    pub expected_control_epoch: u64,
+    /// Expected current decision epoch.
+    pub expected_decision_epoch: u64,
+    /// Expected failed attempt number.
+    pub expected_attempt_number: u64,
+}
+
+/// Inputs for closing an exhausted Meeting V1 Candidate Cohort.
+pub struct MeetingV1CompleteCohortParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Registered decision attempt.
+    pub attempt_id: &'a str,
+    /// Expected current control epoch.
+    pub expected_control_epoch: u64,
+    /// Expected current decision epoch.
+    pub expected_decision_epoch: u64,
+}
+
+/// Inputs for abandoning a Meeting V1 moderator attempt after Runtime loss.
+pub struct MeetingV1DecisionAttemptAbandonParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Registered decision attempt.
+    pub attempt_id: &'a str,
+}
+
+/// Inputs for an attempt-bound Agent moderator self-Intent withdrawal.
+pub struct MeetingV1ModeratorWithdrawSelfParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Registered decision attempt.
+    pub attempt_id: &'a str,
+    /// Stable moderator self-Intent ID.
+    pub intent_id: &'a str,
+    /// Intent event version seen by the model.
+    pub previous_event_id: &'a str,
 }
 
 /// Inputs for a Meeting V1 moderator Recall command.
@@ -2307,6 +2413,36 @@ pub fn build_meeting_v1_moderator_select(
         "expected-speech-revision",
         &params.expected_speech_revision.to_string(),
     ])?);
+    match (params.attempt_id, params.expected_source_event_id) {
+        (Some(attempt_id), expected_source_event_id) => {
+            let attempt_id = check_hex_exact(attempt_id, 64, "moderator decision attempt id")?;
+            tags.push(tag(&["decision-attempt", &attempt_id])?);
+            match (selected_intent_id.is_some(), expected_source_event_id) {
+                (true, Some(source_event_id)) => {
+                    let source_event_id =
+                        check_hex_exact(source_event_id, 64, "selected Intent snapshot event id")?;
+                    tags.push(tag(&["expected-source-event", &source_event_id])?);
+                }
+                (true, None) => {
+                    return Err(SdkError::InvalidInput(
+                        "attempt-bound Intent selection requires its snapshot event id".into(),
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(SdkError::InvalidInput(
+                        "Handoff selection cannot carry an Intent source event id".into(),
+                    ));
+                }
+                (false, None) => {}
+            }
+        }
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(SdkError::InvalidInput(
+                "source event binding requires a moderator decision attempt".into(),
+            ));
+        }
+    }
 
     let mut seen = std::collections::HashSet::with_capacity(params.deferrals.len());
     let mut deferrals = Vec::with_capacity(params.deferrals.len());
@@ -2356,6 +2492,10 @@ pub fn build_meeting_v1_moderator_reject(
     tags.push(tag(&["prev", &previous_event_id])?);
     tags.push(tag(&["reason-code", params.reason_code.as_str()])?);
     tags.push(tag(&["p", &author])?);
+    if let Some(attempt_id) = params.attempt_id {
+        let attempt_id = check_hex_exact(attempt_id, 64, "moderator decision attempt id")?;
+        tags.push(tag(&["decision-attempt", &attempt_id])?);
+    }
     Ok(EventBuilder::new(
         Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16),
         reason_text,
@@ -2385,11 +2525,188 @@ pub fn build_meeting_v1_moderator_dismiss_handoff(
         &params.expected_attempt_count.to_string(),
     ])?);
     tags.push(tag(&["reason-code", params.reason_code.as_str()])?);
+    if let Some(attempt_id) = params.attempt_id {
+        let attempt_id = check_hex_exact(attempt_id, 64, "moderator decision attempt id")?;
+        tags.push(tag(&["decision-attempt", &attempt_id])?);
+    }
     Ok(EventBuilder::new(
         Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16),
         reason_text,
     )
     .tags(tags))
+}
+
+/// Build a Meeting V1 moderator DecisionAttempt Start command (kind 42106).
+pub fn build_meeting_v1_decision_attempt_start(
+    params: MeetingV1DecisionAttemptStartParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.expected_control_epoch == 0 {
+        return Err(SdkError::InvalidInput(
+            "expected control epoch must be positive".into(),
+        ));
+    }
+    for (value, field) in [
+        (params.expected_control_epoch, "expected control epoch"),
+        (params.expected_decision_epoch, "expected decision epoch"),
+        (params.expected_intent_revision, "expected intent revision"),
+        (params.expected_speech_revision, "expected speech revision"),
+    ] {
+        check_meeting_v1_i64(value, field)?;
+    }
+    let state_event_id = check_hex_exact(
+        params.expected_state_event_id,
+        64,
+        "expected Relay State event id",
+    )?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "decision-attempt-start")?;
+    tags.push(tag(&[
+        "expected-control-epoch",
+        &params.expected_control_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-decision-epoch",
+        &params.expected_decision_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-intent-revision",
+        &params.expected_intent_revision.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-speech-revision",
+        &params.expected_speech_revision.to_string(),
+    ])?);
+    tags.push(tag(&["expected-state", &state_event_id])?);
+    if let Some(replacement_id) = params.replacement_of_attempt_id {
+        let replacement_id =
+            check_hex_exact(replacement_id, 64, "replaced moderator decision attempt id")?;
+        tags.push(tag(&["replacement-attempt", &replacement_id])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 moderator DecisionAttempt Finish command (kind 42106).
+pub fn build_meeting_v1_decision_attempt_finish(
+    params: MeetingV1DecisionAttemptFinishParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
+    let reason_code = check_meeting_v1_text(params.reason_code, "attempt finish reason code", 128)?;
+    let supported = match params.outcome {
+        MeetingV1DecisionAttemptFinishOutcome::Completed => {
+            matches!(reason_code, "no_action" | "idle_wait_fallback")
+        }
+        MeetingV1DecisionAttemptFinishOutcome::Discarded => matches!(
+            reason_code,
+            "human_priority"
+                | "control_changed"
+                | "speech_changed"
+                | "meeting_ended"
+                | "moderator_changed"
+                | "cas_churn"
+                | "source_changed"
+                | "runtime_replaced"
+        ),
+    };
+    if !supported {
+        return Err(SdkError::InvalidInput(
+            "unsupported moderator DecisionAttempt finish reason".into(),
+        ));
+    }
+    let mut tags = meeting_v1_command_tags(params.session_id, "decision-attempt-finish")?;
+    tags.push(tag(&["decision-attempt", &attempt_id])?);
+    tags.push(tag(&["outcome", params.outcome.as_str()])?);
+    tags.push(tag(&["reason-code", reason_code])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 moderator DecisionRetry command (kind 42106).
+pub fn build_meeting_v1_decision_retry(
+    params: MeetingV1DecisionRetryParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.expected_control_epoch == 0
+        || params.expected_decision_epoch == 0
+        || params.expected_attempt_number == 0
+    {
+        return Err(SdkError::InvalidInput(
+            "DecisionRetry expectations must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.expected_control_epoch, "expected control epoch")?;
+    check_meeting_v1_i64(params.expected_decision_epoch, "expected decision epoch")?;
+    check_meeting_v1_i32(params.expected_attempt_number, "expected attempt number")?;
+    let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
+    let retry_ticket_id = check_hex_exact(params.retry_ticket_id, 64, "moderator retry ticket id")?;
+    let failed_action_event_id = check_hex_exact(
+        params.failed_action_event_id,
+        64,
+        "failed moderator action event id",
+    )?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "decision-retry")?;
+    tags.push(tag(&["decision-attempt", &attempt_id])?);
+    tags.push(tag(&["retry-ticket", &retry_ticket_id])?);
+    tags.push(tag(&["failed-action", &failed_action_event_id])?);
+    tags.push(tag(&[
+        "expected-control-epoch",
+        &params.expected_control_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-decision-epoch",
+        &params.expected_decision_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-attempt-number",
+        &params.expected_attempt_number.to_string(),
+    ])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 moderator CompleteCohort command (kind 42106).
+pub fn build_meeting_v1_complete_cohort(
+    params: MeetingV1CompleteCohortParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.expected_control_epoch == 0 || params.expected_decision_epoch == 0 {
+        return Err(SdkError::InvalidInput(
+            "CompleteCohort epochs must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.expected_control_epoch, "expected control epoch")?;
+    check_meeting_v1_i64(params.expected_decision_epoch, "expected decision epoch")?;
+    let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "complete-cohort")?;
+    tags.push(tag(&["decision-attempt", &attempt_id])?);
+    tags.push(tag(&[
+        "expected-control-epoch",
+        &params.expected_control_epoch.to_string(),
+    ])?);
+    tags.push(tag(&[
+        "expected-decision-epoch",
+        &params.expected_decision_epoch.to_string(),
+    ])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
+}
+
+/// Build a Meeting V1 moderator DecisionAttempt Abandon command (kind 42106).
+pub fn build_meeting_v1_decision_attempt_abandon(
+    params: MeetingV1DecisionAttemptAbandonParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "decision-attempt-abandon")?;
+    tags.push(tag(&["decision-attempt", &attempt_id])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
+}
+
+/// Build an attempt-bound Meeting V1 moderator self-Intent withdrawal (kind 42106).
+pub fn build_meeting_v1_moderator_withdraw_self(
+    params: MeetingV1ModeratorWithdrawSelfParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
+    let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
+    let previous_event_id =
+        check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
+    let mut tags = meeting_v1_command_tags(params.session_id, "withdraw-self")?;
+    tags.push(tag(&["decision-attempt", &attempt_id])?);
+    tags.push(tag(&["intent", &intent_id])?);
+    tags.push(tag(&["prev", &previous_event_id])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
 }
 
 /// Build a Meeting V1 moderator Recall command (kind 42106).
@@ -5046,5 +5363,33 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(String::as_str) == Some("replaced-by")));
+    }
+
+    #[test]
+    fn meeting_v1_attempt_finish_rejects_reason_from_the_wrong_terminal_class() {
+        let attempt_id = event_id().to_hex();
+        let error =
+            build_meeting_v1_decision_attempt_finish(MeetingV1DecisionAttemptFinishParams {
+                session_id: uuid(),
+                attempt_id: &attempt_id,
+                outcome: MeetingV1DecisionAttemptFinishOutcome::Completed,
+                reason_code: "human_priority",
+            })
+            .unwrap_err();
+        assert!(matches!(error, SdkError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn meeting_v1_attempt_finish_cannot_replace_complete_cohort() {
+        let attempt_id = event_id().to_hex();
+        let error =
+            build_meeting_v1_decision_attempt_finish(MeetingV1DecisionAttemptFinishParams {
+                session_id: uuid(),
+                attempt_id: &attempt_id,
+                outcome: MeetingV1DecisionAttemptFinishOutcome::Completed,
+                reason_code: "cohort_complete",
+            })
+            .unwrap_err();
+        assert!(matches!(error, SdkError::InvalidInput(_)));
     }
 }

@@ -135,7 +135,10 @@ just test
 ## 6. 已知可靠性边界
 
 - 这些测试使用确定性 Agent 输出验证协议与 Runtime，不验证具体 LLM provider 的可用性、
-  延迟或发言质量。
+  延迟或发言质量。真实 Codex ACP、模型配置证明和 6/10/12 Agent 压测见
+  [`meeting-v1-live-acceptance-plan.md`](meeting-v1-live-acceptance-plan.md)；首次
+  qualification 结果见
+  [`meeting-v1-live-acceptance-report-2026-07-29.md`](meeting-v1-live-acceptance-report-2026-07-29.md)。
 - Meeting outbox 是至少一次投递。客户端和 canonical State 以 event ID 去重；但在
   Redis publish 已成功、outbox delivery ACK 随后失败或丢失 claim 的故障窗口，
   `audit_log` 可能为同一个 event ID 追加两条 `event_created`。这不会改变会议状态或

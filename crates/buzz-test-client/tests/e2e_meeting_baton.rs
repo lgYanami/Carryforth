@@ -239,6 +239,8 @@ async fn select_intent(
         expected_speech_revision: state_u64(state, "speech_revision"),
         selection_reason: Some("next relevant contribution"),
         deferrals: &[],
+        attempt_id: None,
+        expected_source_event_id: None,
     })
     .expect("build Meeting V1 Select")
     .sign_with_keys(moderator)
@@ -267,6 +269,8 @@ async fn select_handoff(
         expected_speech_revision: state_u64(state, "speech_revision"),
         selection_reason: Some("restore the interrupted directed question"),
         deferrals: &[],
+        attempt_id: None,
+        expected_source_event_id: None,
     })
     .expect("build Meeting V1 Handoff Select")
     .sign_with_keys(moderator)

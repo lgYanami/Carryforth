@@ -103,10 +103,7 @@ async fn run_subscribe(url: &str, keys: &Keys, channel: &str, kind: u16) {
     };
 
     let sub_id = format!("cli-sub-{}", uuid::Uuid::new_v4());
-    let filter = Filter::new().kind(nostr::Kind::Custom(kind)).custom_tags(
-        nostr::SingleLetterTag::lowercase(nostr::Alphabet::E),
-        [channel],
-    );
+    let filter = channel_filter(channel, kind);
 
     println!("Subscribing to channel {channel} (kind {kind})...");
     if let Err(e) = client.subscribe(&sub_id, vec![filter]).await {
@@ -151,6 +148,13 @@ async fn run_subscribe(url: &str, keys: &Keys, channel: &str, kind: u16) {
     }
 
     let _ = client.disconnect().await;
+}
+
+fn channel_filter(channel: &str, kind: u16) -> Filter {
+    Filter::new().kind(nostr::Kind::Custom(kind)).custom_tags(
+        nostr::SingleLetterTag::lowercase(nostr::Alphabet::H),
+        [channel],
+    )
 }
 
 struct CliOpts {
@@ -233,4 +237,19 @@ EXAMPLES:
     buzz-test-cli --url ws://relay.example.com --channel test --subscribe
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_subscription_uses_nip29_h_tag() {
+        let filter = channel_filter("meeting-id", 42103);
+        let value = serde_json::to_value(filter).expect("serialize filter");
+
+        assert_eq!(value["#h"], serde_json::json!(["meeting-id"]));
+        assert!(value.get("#e").is_none());
+        assert_eq!(value["kinds"], serde_json::json!([42103]));
+    }
 }

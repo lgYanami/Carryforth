@@ -1060,6 +1060,54 @@ fn sdk_dismiss_reason(
     }
 }
 
+fn active_attempt_candidate<'a>(
+    state: &'a BatonState,
+    attempt_id: &str,
+    source_type: &str,
+    source_id: &str,
+) -> Result<&'a serde_json::Value, CliError> {
+    validate_hex64(attempt_id)?;
+    let attempt = state
+        .content
+        .get("active_decision_attempt")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "Meeting V1 State {} has no active DecisionAttempt",
+                state.state_event_id
+            ))
+        })?;
+    let canonical_attempt = attempt
+        .get("attempt_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Other("active DecisionAttempt has no attempt_id".into()))?;
+    if !canonical_attempt.eq_ignore_ascii_case(attempt_id) {
+        return Err(CliError::Other(format!(
+            "DecisionAttempt {attempt_id} is not active; Relay State has {canonical_attempt}"
+        )));
+    }
+    attempt
+        .get("candidate_refs")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|candidates| {
+            candidates.iter().find(|candidate| {
+                candidate
+                    .get("source_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_type)
+                    && candidate
+                        .get("source_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| value.eq_ignore_ascii_case(source_id))
+            })
+        })
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "{source_type} {source_id} is not in DecisionAttempt {attempt_id}"
+            ))
+        })
+}
+
 async fn cmd_moderator_select(
     client: &BuzzClient,
     meeting_id: &str,
@@ -1067,6 +1115,7 @@ async fn cmd_moderator_select(
     handoff_id: Option<&str>,
     reason: Option<&str>,
     deferrals: &[String],
+    attempt_id: Option<&str>,
 ) -> Result<(), CliError> {
     let source_count = usize::from(intent_id.is_some()) + usize::from(handoff_id.is_some());
     if source_count != 1 {
@@ -1076,6 +1125,7 @@ async fn cmd_moderator_select(
     }
     let meeting_id = parse_uuid(meeting_id)?;
     let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let mut expected_source_event_id = None;
     let selection = if let Some(intent_id) = intent_id {
         validate_hex64(intent_id)?;
         baton_object(
@@ -1084,6 +1134,17 @@ async fn cmd_moderator_select(
             "intent_id",
             &intent_id.to_ascii_lowercase(),
         )?;
+        if let Some(attempt_id) = attempt_id {
+            let candidate = active_attempt_candidate(&state, attempt_id, "intent", intent_id)?;
+            expected_source_event_id = Some(
+                object_string(
+                    candidate,
+                    "current_event_id",
+                    "DecisionAttempt Intent candidate",
+                )?
+                .to_string(),
+            );
+        }
         buzz_sdk::MeetingV1Selection::Intent { intent_id }
     } else {
         let handoff_id = handoff_id.unwrap_or_default();
@@ -1098,6 +1159,9 @@ async fn cmd_moderator_select(
             .get("attempt_count")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| CliError::Other("canonical Handoff has no attempt_count".into()))?;
+        if let Some(attempt_id) = attempt_id {
+            active_attempt_candidate(&state, attempt_id, "handoff", handoff_id)?;
+        }
         buzz_sdk::MeetingV1Selection::Handoff {
             handoff_id,
             expected_attempt_count,
@@ -1144,6 +1208,8 @@ async fn cmd_moderator_select(
             expected_speech_revision: state.speech_revision,
             selection_reason: reason,
             deferrals: &sdk_deferrals,
+            attempt_id,
+            expected_source_event_id: expected_source_event_id.as_deref(),
         })
         .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
@@ -1159,6 +1225,7 @@ async fn cmd_moderator_reject(
     intent_id: &str,
     reason_code: crate::MeetingIntentRejectionReason,
     reason: &str,
+    attempt_id: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(intent_id)?;
     let meeting_id = parse_uuid(meeting_id)?;
@@ -1179,6 +1246,7 @@ async fn cmd_moderator_reject(
             intent_author_pubkey: author_pubkey,
             reason_code: sdk_rejection_reason(reason_code),
             reason_text: reason,
+            attempt_id,
         })
         .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
@@ -1193,6 +1261,7 @@ async fn cmd_moderator_dismiss_handoff(
     handoff_id: &str,
     reason_code: crate::MeetingHandoffDismissReason,
     reason: &str,
+    attempt_id: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(handoff_id)?;
     let meeting_id = parse_uuid(meeting_id)?;
@@ -1215,12 +1284,179 @@ async fn cmd_moderator_dismiss_handoff(
             expected_attempt_count,
             reason_code: sdk_dismiss_reason(reason_code),
             reason_text: reason,
+            attempt_id,
         },
     )
     .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
     let response = submit_v1_event(client, meeting_id, event).await?;
     print_v1_write_response(&response, "handoff_id", handoff_id);
+    Ok(())
+}
+
+async fn cmd_moderator_attempt_start(
+    client: &BuzzClient,
+    meeting_id: &str,
+    replacement: Option<&str>,
+) -> Result<(), CliError> {
+    if let Some(replacement) = replacement {
+        validate_hex64(replacement)?;
+    }
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let builder = buzz_sdk::build_meeting_v1_decision_attempt_start(
+        buzz_sdk::MeetingV1DecisionAttemptStartParams {
+            session_id: meeting_id,
+            expected_control_epoch: baton_u64(&state, "control_epoch")?,
+            expected_decision_epoch: baton_u64(&state, "decision_epoch")?,
+            expected_intent_revision: state.intent_revision,
+            expected_speech_revision: state.speech_revision,
+            expected_state_event_id: &state.state_event_id,
+            replacement_of_attempt_id: replacement,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+async fn cmd_moderator_attempt_finish(
+    client: &BuzzClient,
+    meeting_id: &str,
+    attempt_id: &str,
+    outcome: crate::MeetingDecisionAttemptFinishOutcome,
+    reason_code: &str,
+) -> Result<(), CliError> {
+    validate_hex64(attempt_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    fetch_required_v1_baton(client, meeting_id).await?;
+    let outcome = match outcome {
+        crate::MeetingDecisionAttemptFinishOutcome::Completed => {
+            buzz_sdk::MeetingV1DecisionAttemptFinishOutcome::Completed
+        }
+        crate::MeetingDecisionAttemptFinishOutcome::Discarded => {
+            buzz_sdk::MeetingV1DecisionAttemptFinishOutcome::Discarded
+        }
+    };
+    let builder = buzz_sdk::build_meeting_v1_decision_attempt_finish(
+        buzz_sdk::MeetingV1DecisionAttemptFinishParams {
+            session_id: meeting_id,
+            attempt_id,
+            outcome,
+            reason_code,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+async fn cmd_moderator_retry(
+    client: &BuzzClient,
+    meeting_id: &str,
+    attempt_id: &str,
+    retry_ticket_id: &str,
+    failed_action_event_id: &str,
+    attempt_number: u64,
+) -> Result<(), CliError> {
+    for id in [attempt_id, retry_ticket_id, failed_action_event_id] {
+        validate_hex64(id)?;
+    }
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let builder =
+        buzz_sdk::build_meeting_v1_decision_retry(buzz_sdk::MeetingV1DecisionRetryParams {
+            session_id: meeting_id,
+            attempt_id,
+            retry_ticket_id,
+            failed_action_event_id,
+            expected_control_epoch: baton_u64(&state, "control_epoch")?,
+            expected_decision_epoch: baton_u64(&state, "decision_epoch")?,
+            expected_attempt_number: attempt_number,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+async fn cmd_moderator_complete_cohort(
+    client: &BuzzClient,
+    meeting_id: &str,
+    attempt_id: &str,
+) -> Result<(), CliError> {
+    validate_hex64(attempt_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let builder =
+        buzz_sdk::build_meeting_v1_complete_cohort(buzz_sdk::MeetingV1CompleteCohortParams {
+            session_id: meeting_id,
+            attempt_id,
+            expected_control_epoch: baton_u64(&state, "control_epoch")?,
+            expected_decision_epoch: baton_u64(&state, "decision_epoch")?,
+        })
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+async fn cmd_moderator_attempt_abandon(
+    client: &BuzzClient,
+    meeting_id: &str,
+    attempt_id: &str,
+) -> Result<(), CliError> {
+    validate_hex64(attempt_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    fetch_required_v1_baton(client, meeting_id).await?;
+    let builder = buzz_sdk::build_meeting_v1_decision_attempt_abandon(
+        buzz_sdk::MeetingV1DecisionAttemptAbandonParams {
+            session_id: meeting_id,
+            attempt_id,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+async fn cmd_moderator_withdraw_self(
+    client: &BuzzClient,
+    meeting_id: &str,
+    attempt_id: &str,
+    intent_id: &str,
+) -> Result<(), CliError> {
+    validate_hex64(attempt_id)?;
+    validate_hex64(intent_id)?;
+    let meeting_id = parse_uuid(meeting_id)?;
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let intent = baton_object(
+        &state,
+        "pending_intents",
+        "intent_id",
+        &intent_id.to_ascii_lowercase(),
+    )?;
+    let previous_event_id = object_string(intent, "current_event_id", "canonical pending Intent")?;
+    let builder = buzz_sdk::build_meeting_v1_moderator_withdraw_self(
+        buzz_sdk::MeetingV1ModeratorWithdrawSelfParams {
+            session_id: meeting_id,
+            attempt_id,
+            intent_id,
+            previous_event_id,
+        },
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let response = submit_v1_event(client, meeting_id, event).await?;
+    println!("{}", normalize_write_response(&response));
     Ok(())
 }
 
@@ -1954,6 +2190,7 @@ pub async fn dispatch(
                     handoff,
                     reason,
                     deferrals,
+                    attempt,
                 } => {
                     cmd_moderator_select(
                         client,
@@ -1962,6 +2199,7 @@ pub async fn dispatch(
                         handoff.as_deref(),
                         reason.as_deref(),
                         &deferrals,
+                        attempt.as_deref(),
                     )
                     .await
                 }
@@ -1970,16 +2208,76 @@ pub async fn dispatch(
                     intent,
                     reason_code,
                     reason,
-                } => cmd_moderator_reject(client, &meeting, &intent, reason_code, &reason).await,
+                    attempt,
+                } => {
+                    cmd_moderator_reject(
+                        client,
+                        &meeting,
+                        &intent,
+                        reason_code,
+                        &reason,
+                        attempt.as_deref(),
+                    )
+                    .await
+                }
                 MeetingModeratorCmd::DismissHandoff {
                     meeting,
                     handoff,
                     reason_code,
                     reason,
+                    attempt,
                 } => {
-                    cmd_moderator_dismiss_handoff(client, &meeting, &handoff, reason_code, &reason)
+                    cmd_moderator_dismiss_handoff(
+                        client,
+                        &meeting,
+                        &handoff,
+                        reason_code,
+                        &reason,
+                        attempt.as_deref(),
+                    )
+                    .await
+                }
+                MeetingModeratorCmd::AttemptStart {
+                    meeting,
+                    replacement,
+                } => cmd_moderator_attempt_start(client, &meeting, replacement.as_deref()).await,
+                MeetingModeratorCmd::AttemptFinish {
+                    meeting,
+                    attempt,
+                    outcome,
+                    reason_code,
+                } => {
+                    cmd_moderator_attempt_finish(client, &meeting, &attempt, outcome, &reason_code)
                         .await
                 }
+                MeetingModeratorCmd::Retry {
+                    meeting,
+                    attempt,
+                    ticket,
+                    failed_action,
+                    attempt_number,
+                } => {
+                    cmd_moderator_retry(
+                        client,
+                        &meeting,
+                        &attempt,
+                        &ticket,
+                        &failed_action,
+                        attempt_number,
+                    )
+                    .await
+                }
+                MeetingModeratorCmd::CompleteCohort { meeting, attempt } => {
+                    cmd_moderator_complete_cohort(client, &meeting, &attempt).await
+                }
+                MeetingModeratorCmd::AttemptAbandon { meeting, attempt } => {
+                    cmd_moderator_attempt_abandon(client, &meeting, &attempt).await
+                }
+                MeetingModeratorCmd::WithdrawSelf {
+                    meeting,
+                    attempt,
+                    intent,
+                } => cmd_moderator_withdraw_self(client, &meeting, &attempt, &intent).await,
                 MeetingModeratorCmd::Recall { meeting, reason } => {
                     cmd_moderator_recall(client, &meeting, reason.as_deref()).await
                 }

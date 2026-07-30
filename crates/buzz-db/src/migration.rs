@@ -560,9 +560,9 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        // Stage 2 adds migration 0030 after the 28 migrations present in the
-        // Stage 1 baseline; keep this guard aligned with the embedded set.
-        assert_eq!(migrations.len(), 29);
+        // Moderator optimistic-decision support adds migration 0031 after the
+        // 29 migrations present in the Meeting V1 Stage 2 baseline.
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -950,6 +950,19 @@ mod tests {
         assert!(meeting_baton_stage_two.contains("recovery_attempts"));
         assert!(meeting_baton_stage_two.contains("idx_meeting_baton_state_recovery_due"));
         assert!(meeting_baton_stage_two.contains("idx_meeting_revocation_jobs_reader_fence"));
+
+        // Moderator optimistic-decision state remains additive: candidate
+        // eligibility, signed Attempt snapshots, and one-use retry evidence
+        // upgrade existing V1 sessions without rewriting prior migrations.
+        assert_eq!(migrations[29].version, 31);
+        let meeting_moderator_attempts = migrations[29].sql.as_str();
+        assert!(meeting_moderator_attempts.contains("eligible_decision_epoch"));
+        assert!(
+            meeting_moderator_attempts.contains("CREATE TABLE meeting_moderator_decision_attempts")
+        );
+        assert!(meeting_moderator_attempts.contains("CREATE TABLE meeting_moderator_retry_tickets"));
+        assert!(meeting_moderator_attempts.contains("active_decision_attempt_id"));
+        assert!(meeting_moderator_attempts.contains("retry_ticket_id"));
     }
 
     #[test]

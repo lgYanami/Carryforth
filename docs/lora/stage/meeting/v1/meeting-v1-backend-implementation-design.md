@@ -909,7 +909,7 @@ offer_preempted | offer_recalled | offer_source_changed
 grant_created | grant_progressed | grant_yielded |
 grant_soft_expired | grant_hard_expired
 speech_accepted
-handoff_created | handoff_attempt_failed | handoff_answered | handoff_dismissed |
+handoff_created | handoff_unblocked | handoff_attempt_failed | handoff_answered | handoff_dismissed |
 handoff_open_limit_blocked
 recall_latched | forced_return_completed
 moderator_fallback
@@ -927,7 +927,7 @@ meeting_ended | participant_revoked
 | `offer` | `offer_created`、`offer_acked`、`offer_declined`、`offer_timed_out`、`offer_preempted`、`offer_recalled`、`offer_source_changed`、`offer_source_withdrawn`、`offer_ended` |
 | `grant` | `grant_created`、`grant_progressed`、`grant_spoken`、`grant_yielded`、`grant_soft_expired`、`grant_hard_expired`、`grant_ended` |
 | `speech` | `speech_accepted` |
-| `handoff` | `handoff_created`、`handoff_attempted`、`handoff_attempt_failed`、`handoff_answered`、`handoff_dismissed`、`handoff_open_limit_blocked`、`handoff_ended` |
+| `handoff` | `handoff_created`、`handoff_unblocked`、`handoff_attempted`、`handoff_attempt_failed`、`handoff_answered`、`handoff_dismissed`、`handoff_open_limit_blocked`、`handoff_ended` |
 | `recall` | `recall_latched`、`recall_cleared` |
 | `control` | `forced_return_latched`、`forced_return_completed`、`control_returned`、`fallback_attempt_recorded` |
 
@@ -953,6 +953,10 @@ spoken | yielded | soft_expired | hard_expired | ended
 创建 Offer 时写 `offered`，ACK 后写 `granted`，后续终态映射到同名 outcome。尚无 Offer
 attempt 的 open Handoff 为 null；`blocked_by` 单独使用
 `human_request | recall | max_depth | open_question_limit`，不能塞入 attempt outcome。
+`blocked_by=human_request` 是当前 Human priority 阻塞，不是永久处置：最后一个 queued 或
+offered Human Request 终结、控制权原子归还 moderator 时，Relay 必须把相关 open
+Handoff 的 `blocked_by` 清空，并在同一 State 中写入 `handoff_unblocked`
+effect（`from=human_request, to=null`）。`initial_disposition=blocked` 保留首次调度历史。
 
 `primary_type` 的确定规则固定：ACK 使用 `offer_acked`，SAY 使用 `speech_accepted`，
 Human 抢占使用 `human_requested`，End/撤权使用 `meeting_ended/participant_revoked`，
@@ -1322,6 +1326,12 @@ Decline/timeout，以及目标 Grant Yield/Expiry，都只结束本次 attempt�
 只有来源引用该 Handoff 的 Grant 接受 canonical speech 后才进入 `answered`；moderator
 可以把没有活动 attempt 的 open Handoff 显式变为 `dismissed`；Meeting End 把剩余 open
 行变为 `ended`。因此一次失败不会抹掉问题，也不会消费目标无关 Intent。
+
+Human priority 只是瞬时调度屏障。最后一个 queued/offered Human Request 结束并把 Control
+Token 归还 moderator 时，同一事务清除所有
+`question_state=open + blocked_by=human_request` 的阻塞标记，State 通过
+`handoff_unblocked` effect 公布恢复；主持人随后可以立即 Select 或 Dismiss。首次为何没有
+直传仍由 `initial_disposition=blocked` 保存。
 
 同一 Session 的 open 行在 Session 锁内计数，并由事务检查限制在冻结的
 `max_open_handoffs`（首版 32）。若一条合法 speech 在已满时携带新 Handoff，Relay 仍
@@ -1795,6 +1805,11 @@ End 高于所有其他状态，但仍与并发 SAY/ACK 通过同一会议行锁�
 
 ### 10.2 Agent moderator 的异步 ModeratorPlan
 
+> 2026-07-30 变更：本节的 `AgendaRanking + ControlDecision` 双层 LLM、完整
+> fingerprint stale 和 State-driven Cancel 语义已由
+> [主持人乐观决策设计](./meeting-v1-moderator-optimistic-decision-design.md)
+> 替代。下文保留为已交付旧实现的背景，不再作为下一阶段实现规范。
+
 ModeratorPlan 只保存在 ACP 私有账本，不发布到共享会议，并拆成两层：
 
 ```text
@@ -2161,6 +2176,12 @@ V1 首版不增加公开 RSVP/Join 状态。Agent 不想表达内容时保持没
 不能为每类事件各自启动独立历史流，否则会在 Grant 和 Intent revision 之间产生观察竞态。
 
 ### 14.3 三类 LLM Controller 与即时 Offer Controller
+
+> 2026-07-30 变更：`Granted Speech > Moderator Decision > Participant Intent` 仍是
+> 排队和容量调度优先级，但不再表示 Meeting State 变化必须物理 Cancel 正在运行的
+> Moderator Decision。异步 ModeratorPlan 和主持人 State-driven Cancel 已由
+> [主持人乐观决策设计](./meeting-v1-moderator-optimistic-decision-design.md)
+> 替代；下文相关内容保留为已交付旧实现的背景。
 
 Offer Controller 是不经过模型队列的即时控制路径。三类 LLM 工作的优先级为：
 

@@ -3,6 +3,140 @@
 本文记录在概念设计和后端实现设计冻结后，经讨论确认的语义调整。新决策优先于旧文档中
 与其冲突的描述；实现文档应同步更新为当前语义。
 
+## 2026-07-30：主持人判断改为候选批次上的乐观并发
+
+### 状态
+
+已确认。阶段一“权威 retry 与提交语义”已实现并通过确定性验收；ACP 单飞接入、
+可观测性 Runner 和针对性真实 Codex 验收仍按设计文档后续阶段推进。
+
+### 问题
+
+原设计把主持 Agent 的工作拆成发言权不在主持人时运行的 `ModeratorAgenda`，以及发言权
+回到主持人后运行的 `ControlDecision`。同时，ACP 使用完整 Intent/Handoff fingerprint
+判断结果是否过时，并可能在会议 State 变化时向正在运行的 ACP Turn 发送 Cancel。
+
+这带来三个问题：
+
+1. 当前 speaker 的最终发言尚未出现时，提前完成的完整主持判断天然容易过时；
+2. 晚到的普通 Agent Intent 会改变 `intent_revision` 或完整 fingerprint，但它完全可以
+   留到下一轮，不应该迫使本轮重新调用 LLM；
+3. 真实 C10/C12 验收已经证明，快速的 State 变化、Cancel、重新建 Session 和再次 Cancel
+   会在真实 `codex-acp` 下产生 `cancel_drain_timeout`、子进程 respawn 和不确定提交。
+
+### 新决策
+
+1. 只有 Control Token 已经回到主持人，且 canonical phase 为
+   `moderator_control | moderator_idle` 时，才启动完整的主持人 LLM 判断；
+2. 取消投机性的 `ModeratorAgenda` LLM Turn。发言权不在主持人时只同步会议消息、Intent、
+   Human Request 和 Handoff，不提前形成可执行的传递判断；
+3. 每次判断开始时冻结一个本轮候选批次。判断期间新增的普通 Agent Intent 不进入本轮，
+   不使本轮结果失效，也不触发重判；它在下一候选批次中处理；
+4. 主持人自己的晚到 SpeechIntent 同样按普通 Agent Intent 处理。主持人 self Intent 的
+   优先级只在同一候选批次内生效；
+5. Human Floor Request 不属于普通 Intent 批次。它仍具有协议优先级，可以使旧判断失去
+   提交资格，但不会物理取消正在运行的 LLM；
+6. 普通 Human SpeechIntent 若被保留，采用和普通 Agent Intent 相同的批次规则。Human
+   需要直接取得下一轮发言权时必须使用 Human Floor Request；
+7. LLM 判断期间不因 Meeting State 变化发送 `session/cancel`。模型自然完成后，ACP 先
+   Full Sync，再按该输出实际依赖的对象进行乐观校验；
+8. 被选中的 Intent/Handoff 已撤回、刷新、失效或失去资格时才需要重新调用 LLM。未选中
+   Intent 的新增、刷新或撤回，以及 Progress、ACK、outbox 等无关变化，都不触发重判；
+9. `intent_revision` 继续作为 Relay 提交时的低层 CAS token。CAS 冲突后，若 Full Sync
+   证明被选 source 仍有效，ACP 只用最新 revision 重建并重提命令，不重新调用 LLM；
+10. 若 source 冲突确实要求重判，且主持人仍持有控制权，Relay 为新 attempt 刷新完整的
+    3 分钟判断期限；若 Human 已接管、控制权已转移或会议已结束，则丢弃旧结果，等待新的
+    canonical 控制窗口，不立即重判；
+11. 物理 Cancel 只保留给进程关闭、操作者终止或 Runtime 故障处理，不再用它维持主持
+    判断的协议正确性。正确性由 Relay CAS、source 校验和迟到结果 fencing 保证。
+12. Candidate Cohort 的 eligibility 必须由 Relay/数据库持久化；moderator self priority、
+    Deferral、Select 和 deterministic fallback 都要遵守同一 Cohort，不能只依赖 ACP
+    私有快照；
+13. 每次真实 Moderator LLM 调用前先注册权威 DecisionAttempt。初次判断、selected-source
+    重判和 Human 抢占后的新判断通过有界 AttemptStart/Retry 取得完整 3 分钟窗口；若基础
+    deadline 已被 fallback 消费，则不得事后续期。
+14. selected-source 重判必须引用 Relay 对 attempt-bound 失败主 action 签发的一次性
+    retry ticket；普通 `intent_revision` CAS 冲突不签发 ticket，只允许有界 rebase。
+15. AttemptSnapshot 必须通过 Relay 签名 State 可回读；HTTP bridge/RestClient 必须把
+    Relay 确定性拒绝解析为 typed rejection，不能统一降级为 `outcome=uncertain`。
+
+### 保证边界
+
+- “状态变化不打断”只表示 Moderator Decision Turn 不因会议语义变化被物理 Cancel；
+  deadline 到期后 Relay 仍可执行确定性 fallback，迟到的模型结果必须被丢弃；
+- 晚到 Agent Intent 不影响当前判断，但不会丢失。当前 speaker 完成、当前批次结束或新的
+  主持控制窗口建立后，它必须进入下一候选批次；
+- 低层 CAS 仍保护 Full Sync 与协议命令提交之间的竞态。CAS 冲突不等于语义冲突；
+- 重判期限刷新必须由 Relay 在 Session 锁和数据库事务内完成，不能只延长 ACP 的本地
+  timer；刷新次数必须有上限，避免恶意 refresh/withdraw 无限延长会议。
+
+详细设计和针对性真实验收见
+[`meeting-v1-moderator-optimistic-decision-design.md`](meeting-v1-moderator-optimistic-decision-design.md)。
+
+## 2026-07-29：真实 Codex 验收采用 qualification 与正式签收两级口径
+
+### 状态
+
+已确认并执行。真实 Codex 和 canonical 协议闭环得到证明；C10/C12 的 ACP runtime
+stability gate 未通过。
+
+### 决策
+
+1. 真实调用链固定为 `buzz-acp -> @agentclientprotocol/codex-acp -> Codex`；
+2. Moderator 请求 `gpt-5.6-sol[max]`，其他 Agent 请求
+   `gpt-5.6-sol[high]`，每个 Meeting Session 都必须在发言前记录成功应用；
+3. model catalog、adapter 应用日志和真实 prompt 共同证明本轮确实使用 Codex；证据口径
+   记为 `requested_catalog_supported_and_adapter_session_log`，不冒充 provider
+   attestation；
+4. C6/C10/C12 指当前协议下的跨 Meeting 总 Agent 数，不代表单场 6/10/12 Agent；
+5. 单个 qualification 样本通过只允许继续验收，不能签收发布。正式签收仍需每 Tier 三次
+   独立重复、故障矩阵、C12 60 分钟 soak 和人工质量评分；
+6. 真实 Agent 使用 prompt 约定只读。worktree 零变化是本轮副作用审计结果，不是工具层
+   安全隔离证明；
+7. `agent_returned — respawning` 和 Meeting action `outcome=uncertain` 属于
+   qualification 硬失败，不能只因 Meeting 最终恢复并 End 就忽略。
+
+详细数据见
+[`meeting-v1-live-acceptance-report-2026-07-29.md`](meeting-v1-live-acceptance-report-2026-07-29.md)。
+
+## 2026-07-29：Human priority 结束时恢复被延迟的 Directed Handoff
+
+### 状态
+
+已确认并交付；由真实 Codex C4 验收发现。
+
+### 问题
+
+Agent 持有 Grant 发言时，Human Request 可以异步排队。若该次 Agent speech 同时创建
+Directed Handoff，Relay 会正确保存 open Handoff，并以
+`blocked_by=human_request` 阻止它抢在 Human 之前自动获得 Offer。
+
+原实现没有在 Human priority 结束后清除这个瞬时阻塞。Handoff 虽仍为 open，但主持
+Agent 会合理地把 `blocked_by=human_request` 理解为当前仍不可调度，从而可能保持 idle
+直到 3 分钟 moderator fallback；fallback 又只处理 Intent，不处理 Handoff，会议会失去
+连贯性。
+
+### 新决策
+
+1. `blocked_by=human_request` 表示当前 Human priority 屏障，不是永久处置；
+2. 当最后一个 queued/offered Human Request 终结并把控制权归还 moderator 时，Relay 在
+   同一个 Session 锁和数据库事务中清除相关 open Handoff 的 `blocked_by`；
+3. 首次被 Human 延迟的事实继续由 `initial_disposition=blocked` 保存；
+4. 同一 canonical State 写入 `handoff_unblocked` effect，使用
+   `from=human_request, to=null`；
+5. 主持人随后可以立即 Select 或 Dismiss 该 Handoff；Relay 不自动替主持人重放旧
+   Handoff Offer。
+
+### 验证
+
+Postgres 回归测试覆盖：
+
+- Agent Grant 期间 Human Request 入队；
+- Agent speech 创建被 Human priority 延迟的 Directed Handoff；
+- Human 撤回当前 Offer；
+- Relay 原子归还主持人控制权并发布 `handoff_unblocked`；
+- 主持人随后成功 Select 该 Handoff。
+
 ## 2026-07-29：Meeting Turn 工具策略改为 advisory
 
 ### 状态

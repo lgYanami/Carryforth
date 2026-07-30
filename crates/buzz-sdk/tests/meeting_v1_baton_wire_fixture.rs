@@ -125,6 +125,8 @@ fn meeting_v1_baton_builders_match_wire_fixture() {
             expected_speech_revision: 4,
             selection_reason: Some("Highest-impact risk."),
             deferrals: &[],
+            attempt_id: None,
+            expected_source_event_id: None,
         })
         .expect("Select Intent"),
         &fixture,
@@ -144,6 +146,8 @@ fn meeting_v1_baton_builders_match_wire_fixture() {
             expected_speech_revision: 4,
             selection_reason: None,
             deferrals: &[],
+            attempt_id: None,
+            expected_source_event_id: None,
         })
         .expect("Select Handoff"),
         &fixture,
@@ -160,6 +164,7 @@ fn meeting_v1_baton_builders_match_wire_fixture() {
             reason_text: fixture["moderator_reject"]["content"]
                 .as_str()
                 .expect("reject content"),
+            attempt_id: None,
         })
         .expect("Reject"),
         &fixture,
@@ -176,6 +181,7 @@ fn meeting_v1_baton_builders_match_wire_fixture() {
             reason_text: fixture["moderator_dismiss_handoff"]["content"]
                 .as_str()
                 .expect("dismiss content"),
+            attempt_id: None,
         })
         .expect("Dismiss"),
         &fixture,
@@ -324,6 +330,8 @@ fn meeting_v1_baton_builders_reject_invalid_wire_values() {
             expected_speech_revision: 0,
             selection_reason: None,
             deferrals: &[deferral],
+            attempt_id: None,
+            expected_source_event_id: None,
         })
         .is_err()
     );

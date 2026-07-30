@@ -78,6 +78,18 @@ pub(crate) fn baton_config_from_env() -> BatonConfig {
             1,
             32,
         ),
+        moderator_max_rejudgments: env_bounded_i32(
+            "BUZZ_MEETING_V1_MODERATOR_MAX_REJUDGMENTS",
+            defaults.moderator_max_rejudgments,
+            0,
+            8,
+        ),
+        moderator_max_cas_rebases_per_attempt: env_bounded_i32(
+            "BUZZ_MEETING_V1_MODERATOR_MAX_CAS_REBASES_PER_ATTEMPT",
+            defaults.moderator_max_cas_rebases_per_attempt,
+            1,
+            64,
+        ),
         fallback_policy_version: defaults.fallback_policy_version.clone(),
     };
     if valid_baton_config(&configured) {
