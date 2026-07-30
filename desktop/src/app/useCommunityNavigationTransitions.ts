@@ -7,7 +7,10 @@ import {
   replaceCommunityOverviewRoute,
   runCommunityViewTransition,
 } from "@/app/communityViewTransition";
-import { saveCommunityDestination } from "@/features/communities/communityNavigationStorage";
+import {
+  communityDestinationFromRoute,
+  saveCommunityDestination,
+} from "@/features/communities/communityNavigationStorage";
 import type { useCommunities } from "@/features/communities/useCommunities";
 
 type Communities = ReturnType<typeof useCommunities>;
@@ -32,13 +35,19 @@ export function useCommunityNavigationTransitions({
   const saveActiveDestination = React.useCallback(() => {
     const activeCommunityId = communities.activeCommunity?.id;
     if (!activeCommunityId) return;
-    saveCommunityDestination(
-      activeCommunityId,
-      selectedView === "channel" && selectedChannelId
-        ? { kind: "channel", channelId: selectedChannelId }
-        : { kind: "home" },
+    const destination = communityDestinationFromRoute(
+      selectedView,
+      selectedChannelId,
     );
+    if (destination) {
+      saveCommunityDestination(activeCommunityId, destination);
+    }
   }, [communities.activeCommunity?.id, selectedChannelId, selectedView]);
+
+  const openCommunityOverview = React.useCallback(async () => {
+    saveActiveDestination();
+    await goCommunity();
+  }, [goCommunity, saveActiveDestination]);
 
   // Home is a teardown barrier: the outgoing channel must unmount before the
   // relay changes, or its read effect can advance markers on the wrong relay.
@@ -46,7 +55,7 @@ export function useCommunityNavigationTransitions({
     async (id: string) => {
       const activeCommunityId = communities.activeCommunity?.id;
       if (id === activeCommunityId) {
-        await goCommunity();
+        await openCommunityOverview();
         return;
       }
       if (!activeCommunityId) {
@@ -62,7 +71,13 @@ export function useCommunityNavigationTransitions({
         communities.switchCommunity(id);
       });
     },
-    [communities, goCommunity, goHome, router.history, saveActiveDestination],
+    [
+      communities,
+      goHome,
+      openCommunityOverview,
+      router.history,
+      saveActiveDestination,
+    ],
   );
 
   const removeCommunity = React.useCallback(
@@ -86,5 +101,5 @@ export function useCommunityNavigationTransitions({
     [communities, goHome, router.history, saveActiveDestination],
   );
 
-  return { removeCommunity, switchCommunity };
+  return { openCommunityOverview, removeCommunity, switchCommunity };
 }

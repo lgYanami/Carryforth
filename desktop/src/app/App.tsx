@@ -43,6 +43,7 @@ import { useCommunityInit } from "@/features/communities/useCommunityInit";
 import { useNestNotifications } from "@/features/communities/useNestNotifications";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
+  communityDestinationFromRoute,
   loadCommunityDestination,
   markPendingCommunityRestore,
   saveCommunityDestination,
@@ -339,18 +340,19 @@ function CommunityApp({
       if (targetCommunityId === activeCommunityId) return;
       if (activeCommunityId) {
         const route = deriveShellRoute(router.state.location.pathname);
-        saveCommunityDestination(
-          activeCommunityId,
-          route.selectedView === "channel" && route.selectedChannelId
-            ? { kind: "channel", channelId: route.selectedChannelId }
-            : { kind: "home" },
+        const activeDestination = communityDestinationFromRoute(
+          route.selectedView,
+          route.selectedChannelId,
         );
+        if (activeDestination) {
+          saveCommunityDestination(activeCommunityId, activeDestination);
+        }
         await router.navigate({ to: "/", replace: true });
         markPendingCommunityRestore(targetCommunityId);
-        const destination = loadCommunityDestination(targetCommunityId);
-        if (destination?.kind === "channel") {
+        const targetDestination = loadCommunityDestination(targetCommunityId);
+        if (targetDestination?.kind === "channel") {
           replaceCommunityDestinationRoute(
-            destination.channelId,
+            targetDestination.channelId,
             router.history,
           );
         }

@@ -38,7 +38,7 @@
 - destination 保存、目标 Channel 验证、不可用回退和同 Community 恢复不改路由的既有
   测试语义必须保留，或按 Overview + Continue 的新交互改写，不能直接删除。
 
-### Desktop 初版实现（待按复核修正）
+### Desktop 初版实现（历史记录）
 
 - 新增 `/community` Community 展示页；侧栏固定区以当前 Community 名称提供
   Overview 入口，独立 `View` 菜单项移除。即使只有一个 Community，Human 也可以从
@@ -63,6 +63,26 @@
 - Desktop typecheck、Biome/文件大小/可缩放文本/公钥守卫、3508 项 unit test 和
   Project View + Community Rail 的 46 项 Playwright 场景完成验证；其中一次切换等待
   的测试时序缺陷修正后定向复验通过。
+
+### Desktop 复核修正交付
+
+- Community Overview 增加稳定空间页头，始终展示 Community 身份、当前成员权限、
+  Project 同步状态和明确的工作入口；Project View preview 关闭或读取失败都不再移除
+  Community 导航能力。
+- Community Rail 的普通切换统一先进入目标空间 Overview。Inbox 或有效 Channel
+  才会更新该 Community 的工作位置；Overview、完整 View、Settings 与其他临时页面
+  不再覆盖记录，Human 可通过 `Continue in #channel` 或 `Open Inbox` 显式继续工作。
+- 记忆中的 Channel 必须经过目标 Relay 的实时 joined、unarchived Channel 列表验证
+  后才会成为 Continue 目标；本地缓存只用于等待态，不作为权限依据。确认失效时持久化
+  回退 Inbox，暂时查询失败则保留记录以便恢复后重试。
+- 首屏收紧 Project identity、Current Focus、Role、Needs Attention 与 Resources 的
+  信息密度，可信状态只保留一个主要 `Verified` 标识；1280×720 下显式注意事项进入
+  首屏。preview 关闭提示改为紧凑的项目区域说明，且不发起 Project View 读取或实时
+  订阅。
+- 新增 destination 分类、Continue 目标解析和路由分类单元测试，并扩展 Community
+  Rail / Project View Playwright 验收，覆盖不同 Community 的独立工作位置、缓存等待、
+  失效回退、瞬时校验失败恢复、删除当前 Community 后的回退，以及 preview-disabled
+  稳定外壳。
 
 ## 2026-07-28 — Client Slice 4：验收与体验收口
 

@@ -142,6 +142,7 @@ export function AppShell() {
     [location.pathname],
   );
   const {
+    openCommunityOverview,
     removeCommunity: handleRemoveCommunity,
     switchCommunity: handleSwitchCommunity,
   } = useCommunityNavigationTransitions({
@@ -272,9 +273,9 @@ export function AppShell() {
       return;
     }
 
-    // The normal switch path writes the remembered channel into the hash before
-    // the target community mounts, so no intermediate Inbox frame is painted.
-    // Older transition callers may still arrive at neutral Home; repair those.
+    // Onboarding and deep-link transitions may request destination restoration
+    // after the target community mounts. Normal rail navigation now enters the
+    // Overview explicitly and exposes the destination through Continue.
     if (selectedView === "home") {
       void goChannel(destination.channelId, { replace: true });
     }
@@ -874,7 +875,7 @@ export function AppShell() {
                             await goChannel(directMessage.id);
                           }}
                           onSelectAgents={() => void goAgents()}
-                          onSelectCommunity={() => void goCommunity()}
+                          onSelectCommunity={() => void openCommunityOverview()}
                           onSelectChannel={(channelId) =>
                             void goChannel(channelId)
                           }

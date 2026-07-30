@@ -28,7 +28,8 @@ type SidebarSelectedView =
   | "pulse"
   | "community"
   | "view"
-  | "projects";
+  | "projects"
+  | "settings";
 
 type AppSidebarPinnedHeaderProps = {
   activeCommunityName: string;

@@ -16,13 +16,15 @@ export const Route = createFileRoute("/community")({
 });
 
 function CommunityRouteComponent() {
-  const { goSettings, goView } = useAppNavigation();
+  const { goChannel, goHome, goSettings, goView } = useAppNavigation();
 
   return (
     <React.Suspense fallback={<ViewLoadingFallback kind="view" />}>
       <CommunityProjectOverviewScreen
+        onOpenChannel={(channelId) => void goChannel(channelId)}
         onOpenExperiments={() => void goSettings("experimental")}
         onOpenFullView={() => void goView()}
+        onOpenInbox={() => void goHome()}
         onOpenObject={(objectId) => void goView({ objectId })}
       />
     </React.Suspense>

@@ -107,7 +107,8 @@ type AppSidebarProps = {
     | "pulse"
     | "community"
     | "view"
-    | "projects";
+    | "projects"
+    | "settings";
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
   communities: Community[];

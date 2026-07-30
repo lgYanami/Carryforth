@@ -686,9 +686,15 @@ test("Community overview presents Project View and Role context before the full 
   await expect(page.getByTestId("community-needs-attention")).toContainText(
     "Projects naming overlap",
   );
+  await expect(page.getByTestId("community-needs-attention")).toBeInViewport();
   await expect(page.getByTestId("community-resources")).toContainText(
     "Buzz repository",
   );
+  await expect(
+    page
+      .getByTestId("community-project-overview")
+      .getByText("Verified", { exact: true }),
+  ).toHaveCount(1);
 
   await page
     .getByTestId("community-current-focus")
@@ -710,6 +716,40 @@ test("Community overview presents Project View and Role context before the full 
   await expect(page.getByTestId("return-community-overview")).toContainText(
     "E2E Test",
   );
+});
+
+test("Community overview keeps its stable shell when Project View preview is disabled", async ({
+  page,
+}) => {
+  await installMockBridge(
+    page,
+    { projectView: V2_READY_VIEW },
+    { seedPreviewFeatures: false },
+  );
+  await page.goto("/#/community");
+
+  await expect(page.getByTestId("community-space-header")).toContainText(
+    "E2E Test",
+  );
+  await expect(page.getByTestId("community-continue-work")).toContainText(
+    "Open Inbox",
+  );
+  const disabledState = page.getByTestId("community-project-view-disabled");
+  await expect(disabledState).toBeVisible();
+  await expect(disabledState).toContainText(
+    "Community navigation and your last work position remain available.",
+  );
+  const disabledBox = await disabledState.boundingBox();
+  expect(disabledBox).not.toBeNull();
+  expect(disabledBox?.height ?? Number.POSITIVE_INFINITY).toBeLessThan(180);
+
+  const projectViewReads = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter(
+        (entry) => entry.command === "get_project_view",
+      ).length,
+  );
+  expect(projectViewReads).toBe(0);
 });
 
 test("View renders the verified canonical map and object inspector", async ({

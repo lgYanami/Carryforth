@@ -14,6 +14,9 @@ import {
   WifiOff,
 } from "lucide-react";
 
+import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
+import { useActiveCommunityIcon } from "@/features/communities/useCommunityIcons";
+import { useCommunityContinueTarget } from "@/features/communities/useCommunityContinueTarget";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
   useProjectViewLiveSync,
@@ -26,6 +29,11 @@ import {
   projectViewObjectStatus,
   projectViewObjectTitle,
 } from "@/features/project-view/model";
+import {
+  CommunityOverviewHeader,
+  CommunityOverviewLoading,
+  CommunityOverviewState,
+} from "@/features/project-view/ui/CommunityProjectOverviewChrome";
 import { ProjectRoleCard } from "@/features/project-view/ui/ProjectRoleCard";
 import { useProjectViewActors } from "@/features/project-view/useProjectViewActors";
 import type {
@@ -43,24 +51,15 @@ import {
   useRelayConnection,
 } from "@/shared/api/useRelayConnection";
 import { useFeatureEnabled } from "@/shared/features";
-import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
-import { Skeleton } from "@/shared/ui/skeleton";
 
 type CommunityProjectOverviewScreenProps = {
+  onOpenChannel: (channelId: string) => void;
   onOpenExperiments: () => void;
   onOpenFullView: () => void;
+  onOpenInbox: () => void;
   onOpenObject: (objectId: string) => void;
-};
-
-type OverviewStateProps = {
-  description: string;
-  title: string;
-  action?: React.ReactNode;
-  diagnostic?: string;
-  icon: React.ReactNode;
-  testId: string;
 };
 
 type AttentionItem = {
@@ -69,76 +68,6 @@ type AttentionItem = {
   objectId: string;
   tone: "warning" | "danger";
 };
-
-function OverviewState({
-  action,
-  description,
-  diagnostic,
-  icon,
-  testId,
-  title,
-}: OverviewStateProps) {
-  return (
-    <section
-      className="rounded-2xl border border-border/70 bg-card/60 p-6 text-center shadow-xs"
-      data-testid={testId}
-    >
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl border border-border/70 bg-muted/30 text-muted-foreground">
-        {icon}
-      </div>
-      <h1 className="mt-4 text-lg font-semibold">{title}</h1>
-      <p className="mx-auto mt-2 max-w-lg text-sm leading-relaxed text-muted-foreground">
-        {description}
-      </p>
-      {diagnostic ? (
-        <details className="mx-auto mt-4 max-w-lg rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-left">
-          <summary className="cursor-pointer text-xs font-medium">
-            Diagnostic detail
-          </summary>
-          <code className="mt-2 block whitespace-pre-wrap break-words text-xs text-muted-foreground">
-            {diagnostic}
-          </code>
-        </details>
-      ) : null}
-      {action ? <div className="mt-4">{action}</div> : null}
-    </section>
-  );
-}
-
-function OverviewLoading() {
-  return (
-    <div
-      aria-busy="true"
-      className="grid gap-5"
-      data-testid="community-project-loading"
-      role="status"
-    >
-      <span className="sr-only">
-        Reading and verifying the Community project snapshot.
-      </span>
-      <section className="rounded-2xl border border-border/70 bg-card/60 p-5">
-        <Skeleton className="h-5 w-28 rounded-full" />
-        <Skeleton className="mt-4 h-8 w-64 max-w-full" />
-        <Skeleton className="mt-3 h-4 w-full max-w-3xl" />
-        <Skeleton className="mt-2 h-4 w-4/5 max-w-2xl" />
-      </section>
-      <div className="grid gap-5 xl:grid-cols-2">
-        {["focus", "roles"].map((item) => (
-          <section
-            className="rounded-2xl border border-border/70 bg-card/60 p-4"
-            key={item}
-          >
-            <Skeleton className="h-5 w-32" />
-            <div className="mt-4 grid grid-cols-2 gap-2">
-              <Skeleton className="h-24 rounded-xl" />
-              <Skeleton className="h-24 rounded-xl" />
-            </div>
-          </section>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 function FocusMetric({
   icon,
@@ -150,14 +79,14 @@ function FocusMetric({
   value: number;
 }) {
   return (
-    <div className="rounded-xl border border-border/70 bg-background/50 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground">
+    <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-background/50 px-2.5 py-2">
+      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-muted-foreground">
         {icon}
-        <span className="text-2xs font-semibold uppercase tracking-wider">
+        <span className="truncate text-2xs font-semibold uppercase tracking-wider">
           {label}
         </span>
       </div>
-      <div className="mt-1 text-xl font-semibold tabular-nums">{value}</div>
+      <div className="text-lg font-semibold tabular-nums">{value}</div>
     </div>
   );
 }
@@ -225,7 +154,7 @@ function ProjectIdentitySummary({
       className="overflow-hidden rounded-2xl border border-border/70 bg-card/60 shadow-xs"
       data-testid="community-project-summary"
     >
-      <div className="p-5">
+      <div className="p-4">
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="outline">Project space</Badge>
           <Badge variant="success">
@@ -236,7 +165,7 @@ function ProjectIdentitySummary({
             Revision {result.projectRevision}
           </span>
         </div>
-        <div className="mt-3 flex flex-col gap-4 sm:flex-row sm:items-start">
+        <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-start">
           <button
             aria-label={`Inspect Project Profile ${profile.data.name}`}
             className="min-w-0 flex-1 text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
@@ -247,13 +176,13 @@ function ProjectIdentitySummary({
             <div className="text-xs font-medium text-muted-foreground">
               {communityName}
             </div>
-            <h1 className="mt-1 text-2xl font-semibold tracking-tight">
+            <h1 className="mt-0.5 text-xl font-semibold tracking-tight">
               {profile.data.name}
             </h1>
-            <p className="mt-2 max-w-4xl text-sm leading-relaxed text-muted-foreground">
+            <p className="mt-1 max-w-4xl text-sm leading-relaxed text-muted-foreground">
               {profile.data.positioning}
             </p>
-            <p className="mt-3 max-w-4xl text-sm leading-relaxed">
+            <p className="mt-1.5 max-w-4xl text-sm leading-relaxed">
               {profile.data.purpose}
             </p>
           </button>
@@ -269,21 +198,21 @@ function ProjectIdentitySummary({
         </div>
       </div>
       {result.view.goals.length > 0 ? (
-        <div className="border-t border-border/70 px-5 py-4">
+        <div className="border-t border-border/70 px-4 py-3">
           <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
             Current direction
           </div>
           <div className="mt-2 grid gap-2 lg:grid-cols-3">
             {result.view.goals.slice(0, 3).map(({ goal }) => (
               <button
-                className="rounded-xl border border-border/60 bg-background/40 p-3 text-left transition-colors hover:border-primary/40 hover:bg-background/70 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                className="rounded-xl border border-border/60 bg-background/40 px-3 py-2 text-left transition-colors hover:border-primary/40 hover:bg-background/70 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                 data-object-id={goal.id}
                 key={goal.id}
                 onClick={() => onOpenObject(goal.id)}
                 type="button"
               >
                 <div className="text-sm font-semibold">{goal.data.title}</div>
-                <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+                <p className="mt-0.5 line-clamp-1 text-xs leading-relaxed text-muted-foreground">
                   {goal.data.desiredOutcome}
                 </p>
               </button>
@@ -364,7 +293,7 @@ function ProjectRolesSummary({
           }
           return left.data.name.localeCompare(right.data.name);
         })
-        .slice(0, 4),
+        .slice(0, 2),
     [currentAssignments, currentPubkey, definitions, roles],
   );
 
@@ -508,7 +437,7 @@ function buildAttentionItems(
     }
   }
 
-  return items.slice(0, 6);
+  return items.slice(0, 4);
 }
 
 function ReadyCommunityOverview({
@@ -559,7 +488,7 @@ function ReadyCommunityOverview({
             )
           );
         })
-        .slice(0, 6),
+        .slice(0, 4),
     [objectsById],
   );
   const attentionItems = React.useMemo(
@@ -575,7 +504,7 @@ function ReadyCommunityOverview({
   );
 
   return (
-    <div className="grid gap-5" data-testid="community-project-overview">
+    <div className="grid gap-3" data-testid="community-project-overview">
       <ProjectIdentitySummary
         communityName={communityName}
         onOpenFullView={onOpenFullView}
@@ -583,9 +512,9 @@ function ReadyCommunityOverview({
         result={result}
       />
 
-      <div className="grid gap-5 xl:grid-cols-2">
+      <div className="grid gap-3 xl:grid-cols-2">
         <section
-          className="rounded-2xl border border-border/70 bg-card/60 p-4 shadow-xs"
+          className="rounded-2xl border border-border/70 bg-card/60 p-3.5 shadow-xs"
           data-testid="community-current-focus"
         >
           <div className="flex items-center gap-2">
@@ -595,7 +524,7 @@ function ReadyCommunityOverview({
               Explicit Project states
             </span>
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-2 lg:grid-cols-4">
+          <div className="mt-2.5 grid grid-cols-2 gap-2 lg:grid-cols-4">
             <FocusMetric
               icon={<GitBranch className="h-3.5 w-3.5" />}
               label="Plans"
@@ -618,10 +547,10 @@ function ReadyCommunityOverview({
             />
           </div>
           {focusObjects.length > 0 ? (
-            <div className="mt-3 space-y-1">
+            <div className="mt-2 space-y-0.5">
               {focusObjects.map((object) => (
                 <button
-                  className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-muted/50 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                  className="flex w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-muted/50 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                   data-object-id={object.id}
                   key={object.id}
                   onClick={() => onOpenObject(object.id)}
@@ -656,7 +585,7 @@ function ReadyCommunityOverview({
         />
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-2">
+      <div className="grid gap-3 xl:grid-cols-2">
         {attentionItems.length > 0 ? (
           <section
             className="rounded-2xl border border-amber-500/30 bg-amber-500/5 p-4"
@@ -765,11 +694,16 @@ function ReadyCommunityOverview({
 }
 
 export function CommunityProjectOverviewScreen({
+  onOpenChannel,
   onOpenExperiments,
   onOpenFullView,
+  onOpenInbox,
   onOpenObject,
 }: CommunityProjectOverviewScreenProps) {
   const { activeCommunity } = useCommunities();
+  const communityIconQuery = useActiveCommunityIcon(activeCommunity?.relayUrl);
+  const membershipQuery = useMyRelayMembershipLookupQuery();
+  const continueResolution = useCommunityContinueTarget();
   const projectViewEnabled = useFeatureEnabled("projectView");
   const query = useProjectViewQuery({ enabled: projectViewEnabled });
   const relayConnection = useRelayConnection();
@@ -815,53 +749,50 @@ export function CommunityProjectOverviewScreen({
           : liveStatus === "retrying"
             ? `Showing verified project revision ${verifiedRevision} while the live update subscription reconnects.`
             : `Keeping verified project revision ${verifiedRevision} visible while a new complete snapshot is verified.`;
+  const handleContinue = React.useCallback(() => {
+    if (continueResolution.target.kind === "channel") {
+      onOpenChannel(continueResolution.target.channelId);
+      return;
+    }
+    onOpenInbox();
+  }, [continueResolution.target, onOpenChannel, onOpenInbox]);
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <TopChromeInsetHeader flush>
-        <header
-          className="flex h-12 items-center gap-2 px-3 sm:gap-3 sm:px-5"
-          data-tauri-drag-region
-        >
-          <LayoutDashboard className="h-4 w-4 text-muted-foreground" />
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-semibold">
-              {communityName}
-            </div>
-            <div className="hidden text-2xs text-muted-foreground sm:block">
-              Community · Project space
-            </div>
-          </div>
-          {query.data?.status === "ready" ? (
-            <Badge variant="success">
-              <ShieldCheck className="mr-1 h-3 w-3" />
-              Verified
-            </Badge>
-          ) : null}
-          {degraded && relayPubkey ? (
-            <Badge variant="warning">
-              <WifiOff className="mr-1 h-3 w-3" />
-              Offline · may be stale
-            </Badge>
-          ) : null}
-          {!degraded &&
-          relayPubkey &&
-          (query.isFetching || liveStatus === "connecting") ? (
-            <Badge variant="secondary">
-              <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
-              Syncing
-            </Badge>
-          ) : null}
-          {!degraded && liveStatus === "retrying" ? (
-            <Badge variant="warning">Live sync retrying</Badge>
-          ) : null}
-        </header>
-      </TopChromeInsetHeader>
+      <CommunityOverviewHeader
+        communityIconUrl={communityIconQuery.data}
+        communityName={communityName}
+        communityRole={membershipQuery.data?.membership?.role}
+        continueStatus={continueResolution.status}
+        continueTarget={continueResolution.target}
+        onContinue={handleContinue}
+        projectStatus={
+          <>
+            {degraded && relayPubkey ? (
+              <Badge variant="warning">
+                <WifiOff className="mr-1 h-3 w-3" />
+                Offline · may be stale
+              </Badge>
+            ) : null}
+            {!degraded &&
+            relayPubkey &&
+            (query.isFetching || liveStatus === "connecting") ? (
+              <Badge variant="secondary">
+                <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                Syncing
+              </Badge>
+            ) : null}
+            {!degraded && liveStatus === "retrying" ? (
+              <Badge variant="warning">Live sync retrying</Badge>
+            ) : null}
+          </>
+        }
+      />
 
       <main className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-7xl space-y-3 p-3 pb-12 sm:p-5">
           {!projectViewEnabled ? (
-            <OverviewState
+            <CommunityOverviewState
               action={
                 <Button
                   data-testid="enable-project-view"
@@ -872,17 +803,19 @@ export function CommunityProjectOverviewScreen({
                   <ArrowRight />
                 </Button>
               }
-              description="This Community is a Project Space. Enable the Project View preview to show its verified Project Profile, current focus, Roles, and shared resources here."
+              description="Project Profile, current focus, Roles, and resources are hidden while this preview is off. Community navigation and your last work position remain available."
               icon={<LayoutDashboard className="h-5 w-5" />}
               testId="community-project-view-disabled"
               title="Project View preview is disabled"
             />
           ) : null}
-          {projectViewEnabled && query.isPending ? <OverviewLoading /> : null}
+          {projectViewEnabled && query.isPending ? (
+            <CommunityOverviewLoading />
+          ) : null}
           {projectViewEnabled &&
           fatalError &&
           isProjectViewIntegrityError(fatalError) ? (
-            <OverviewState
+            <CommunityOverviewState
               action={
                 <Button
                   disabled={query.isFetching}
@@ -905,7 +838,7 @@ export function CommunityProjectOverviewScreen({
           {projectViewEnabled &&
           fatalError &&
           !isProjectViewIntegrityError(fatalError) ? (
-            <OverviewState
+            <CommunityOverviewState
               action={
                 <Button
                   disabled={query.isFetching}
@@ -925,7 +858,7 @@ export function CommunityProjectOverviewScreen({
             />
           ) : null}
           {projectViewEnabled && query.data?.status === "unsupported" ? (
-            <OverviewState
+            <CommunityOverviewState
               description="This Relay does not advertise the Project View protocol. Inbox, Channels, Projects, and the rest of this Community remain available."
               icon={<MapIcon className="h-5 w-5" />}
               testId="community-project-unsupported"
@@ -933,7 +866,7 @@ export function CommunityProjectOverviewScreen({
             />
           ) : null}
           {projectViewEnabled && query.data?.status === "forbidden" ? (
-            <OverviewState
+            <CommunityOverviewState
               description="Your current identity cannot read this Community's Project View. Other Community capabilities keep their own access rules."
               icon={<UserRoundX className="h-5 w-5" />}
               testId="community-project-forbidden"
@@ -941,7 +874,7 @@ export function CommunityProjectOverviewScreen({
             />
           ) : null}
           {projectViewEnabled && query.data?.status === "uninitialized" ? (
-            <OverviewState
+            <CommunityOverviewState
               action={
                 <Button
                   data-testid="initialize-project-view"

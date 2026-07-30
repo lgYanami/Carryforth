@@ -44,4 +44,8 @@ test("deriveShellRoute distinguishes View from existing Projects", () => {
     selectedChannelId: null,
     selectedView: "projects",
   });
+  assert.deepEqual(deriveShellRoute("/settings"), {
+    selectedChannelId: null,
+    selectedView: "settings",
+  });
 });
