@@ -141,6 +141,14 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Stable OS process identifier captured at spawn time.
+    process_id: Option<u32>,
+    /// RFC3339 timestamp at which the adapter subprocess was spawned.
+    spawned_at: String,
+    /// Prevent duplicate lifecycle frames when a fatal outcome is followed by
+    /// the normal shutdown/reap path.
+    process_started_observed: bool,
+    process_terminal_observed: bool,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -381,6 +389,7 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
+        self.observe_process_terminal("shutdown_requested");
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -478,6 +487,8 @@ impl AcpClient {
         configure_no_window(&mut cmd);
 
         let mut child = cmd.spawn()?;
+        let process_id = child.id();
+        let spawned_at = chrono::Utc::now().to_rfc3339();
 
         let stdin = child
             .stdin
@@ -490,6 +501,10 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            process_id,
+            spawned_at,
+            process_started_observed: false,
+            process_terminal_observed: false,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -511,6 +526,17 @@ impl AcpClient {
     pub fn set_observer(&mut self, observer: Option<ObserverHandle>, agent_index: usize) {
         self.observer = observer;
         self.observer_agent_index = Some(agent_index);
+        if !self.process_started_observed {
+            self.process_started_observed = true;
+            self.observe(
+                "agent_process_started",
+                serde_json::json!({
+                    "pid": self.process_id,
+                    "spawned_at": self.spawned_at,
+                    "harness_pid": std::process::id(),
+                }),
+            );
+        }
     }
 
     /// Update metadata that will be attached to subsequent raw wire events.
@@ -538,6 +564,22 @@ impl AcpClient {
                 payload,
             );
         }
+    }
+
+    /// Emit one privacy-safe terminal frame for this adapter process.
+    pub(crate) fn observe_process_terminal(&mut self, reason: &str) {
+        if self.process_terminal_observed {
+            return;
+        }
+        self.process_terminal_observed = true;
+        self.observe(
+            "agent_process_terminal",
+            serde_json::json!({
+                "pid": self.process_id,
+                "spawned_at": self.spawned_at,
+                "reason": reason,
+            }),
+        );
     }
 
     /// Send the `initialize` request and return the agent's response result value.
@@ -772,7 +814,12 @@ impl AcpClient {
         let params = serde_json::json!({
             "sessionId": session_id,
         });
-        self.send_notification("session/cancel", params).await
+        self.send_notification("session/cancel", params).await?;
+        self.observe(
+            "acp_session_cancel_sent",
+            serde_json::json!({ "method": "session/cancel" }),
+        );
+        Ok(())
     }
 
     /// Returns `true` if a `session/prompt` request is currently in flight.

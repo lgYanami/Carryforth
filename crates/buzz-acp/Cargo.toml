@@ -11,9 +11,20 @@ description = "ACP harness that bridges Buzz events to AI agents"
 name = "buzz_acp"
 path = "src/lib.rs"
 
+[features]
+# Test-only timing and evidence hooks for the Meeting V1 real-Codex acceptance
+# runner. Production builds do not include the Unix-socket barrier or local
+# acceptance NDJSON sink.
+meeting-v1-acceptance = []
+
 [[bin]]
 name = "buzz-acp"
 path = "src/main.rs"
+
+[[bin]]
+name = "buzz-meeting-v1-acceptance-barrier"
+path = "src/bin/meeting_v1_acceptance_barrier.rs"
+required-features = ["meeting-v1-acceptance"]
 
 [dependencies]
 # Internal

@@ -40,6 +40,10 @@ use crate::meeting::{
     fetch_meeting_history, now_ms, sign_builder, tag_value, validate_bounded_text, MeetingTurnKind,
     MeetingTurnRequest,
 };
+#[cfg(feature = "meeting-v1-acceptance")]
+use crate::meeting_acceptance::{
+    self, AcceptanceCandidateRef, PreSubmitAcceptanceBarrier, PreSubmitBarrierFrame,
+};
 use crate::observer::{self, ObserverHandle};
 use crate::relay::{BuzzEvent, ProtocolSubmitOutcome, ProtocolSubmitRejected, RestClient};
 
@@ -482,6 +486,8 @@ struct ModeratorDecisionRecord {
     #[serde(default)]
     turn_id: Option<String>,
     #[serde(default)]
+    turn_started_at_ms: Option<i64>,
+    #[serde(default)]
     cas_rebases: u8,
     #[serde(default)]
     fast_rebases: u8,
@@ -763,8 +769,11 @@ enum ProtocolSubmissionContext {
     Moderator {
         action_kind: String,
         object_id: String,
+        attempt_id: Option<String>,
         turn_id: Option<String>,
         queued_at_ms: Option<i64>,
+        #[cfg(feature = "meeting-v1-acceptance")]
+        barrier: Option<Box<(PathBuf, PreSubmitBarrierFrame)>>,
     },
 }
 
@@ -816,6 +825,8 @@ pub(super) struct MeetingV1Coordinator {
     progress_waiting_for_state: HashMap<(Uuid, String), u64>,
     progress_result_tx: tokio::sync::mpsc::UnboundedSender<ProgressTaskResult>,
     progress_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProgressTaskResult>,
+    #[cfg(feature = "meeting-v1-acceptance")]
+    acceptance_barrier: PreSubmitAcceptanceBarrier,
 }
 
 impl MeetingV1Coordinator {
@@ -881,6 +892,8 @@ impl MeetingV1Coordinator {
             progress_waiting_for_state: HashMap::new(),
             progress_result_tx,
             progress_result_rx,
+            #[cfg(feature = "meeting-v1-acceptance")]
+            acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
         }
     }
 
@@ -922,6 +935,8 @@ impl MeetingV1Coordinator {
     }
 
     pub(super) fn mark_dispatched(&mut self, turn_id: String, request: MeetingTurnRequest) {
+        let turn_started_at_ms = now_ms();
+        let moderator_turn = request.kind == MeetingTurnKind::V1ModeratorControl;
         let session_epoch = self
             .meetings
             .get(&request.session_id)
@@ -957,11 +972,25 @@ impl MeetingV1Coordinator {
                 {
                     decision.state = "running".to_string();
                     decision.turn_id = Some(turn_id.clone());
+                    decision.turn_started_at_ms = Some(turn_started_at_ms);
                 }
             }
             MeetingTurnKind::V0Intent | MeetingTurnKind::V0Granted => {}
         }
         self.persist_ledger_best_effort();
+        if moderator_turn {
+            self.emit_moderator_decision_event(
+                "meeting_v1_moderator_decision_started",
+                request.session_id,
+                Some(turn_id.clone()),
+                ("dispatched", "control_token_held"),
+                None,
+                json!({
+                    "queued_latency_ms": turn_started_at_ms
+                        .saturating_sub(request.queued_at_unix_ms),
+                }),
+            );
+        }
         self.emit(
             "meeting_v1_turn_started",
             request.session_id,
@@ -1209,6 +1238,32 @@ impl MeetingV1Coordinator {
             }
         }
         let session_id = request.session_id;
+        if request.kind == MeetingTurnKind::V1ModeratorControl {
+            let model_latency_ms = self
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_decision.as_ref())
+                .and_then(|decision| decision.turn_started_at_ms)
+                .map(|started| now_ms().saturating_sub(started));
+            self.emit_moderator_decision_event(
+                "meeting_v1_moderator_decision_completed",
+                session_id,
+                Some(turn_id.to_string()),
+                (
+                    if succeeded {
+                        "natural_terminal"
+                    } else {
+                        "provider_failure"
+                    },
+                    if succeeded {
+                        "prompt_terminal"
+                    } else {
+                        "prompt_failed"
+                    },
+                ),
+                model_latency_ms,
+                json!({}),
+            );
+        }
         let Some(request_id) = self.request_full_sync(session_id) else {
             self.discard_deferred_turn_result(DeferredTurnResult {
                 request_id: 0,
@@ -1326,7 +1381,11 @@ impl MeetingV1Coordinator {
             None,
             json!({
                 "state_revision": updated.baton.state_revision,
+                "state_event_id": updated.baton.state_event_id,
+                "intent_revision": updated.baton.intent_revision,
                 "speech_revision": updated.baton.speech_revision,
+                "control_epoch": updated.baton.control_epoch,
+                "decision_epoch": updated.baton.decision_epoch,
                 "phase": updated.baton.phase,
                 "source": "live_fast_path",
             }),
@@ -1370,9 +1429,26 @@ impl MeetingV1Coordinator {
         let rest = self.rest.clone();
         let result_tx = self.protocol_result_tx.clone();
         let _task = tokio::spawn(async move {
-            let attempt = AssertUnwindSafe(submit_protocol_event(&rest, &event))
-                .catch_unwind()
-                .await;
+            let attempt = AssertUnwindSafe(async {
+                #[cfg(feature = "meeting-v1-acceptance")]
+                if let ProtocolSubmissionContext::Moderator {
+                    barrier: Some(barrier),
+                    ..
+                } = &context
+                {
+                    let (socket_path, frame) = barrier.as_ref();
+                    meeting_acceptance::await_pre_submit_release(socket_path, frame)
+                        .await
+                        .map_err(|error| {
+                            ProtocolSubmitFailure::Uncertain(format!(
+                                "acceptance barrier failed before protocol submit: {error}"
+                            ))
+                        })?;
+                }
+                submit_protocol_event(&rest, &event).await
+            })
+            .catch_unwind()
+            .await;
             let result = match attempt {
                 Ok(result) => result,
                 Err(_) => Err(ProtocolSubmitFailure::Uncertain(
@@ -1671,8 +1747,10 @@ impl MeetingV1Coordinator {
             ProtocolSubmissionContext::Moderator {
                 action_kind,
                 object_id,
+                attempt_id,
                 turn_id,
                 queued_at_ms,
+                ..
             } => {
                 let session_id = completed.key.session_id();
                 let event_matches = self
@@ -1689,6 +1767,27 @@ impl MeetingV1Coordinator {
                     );
                 }
                 self.persist_ledger_best_effort();
+                if event_matches
+                    && completed.result.is_ok()
+                    && matches!(
+                        action_kind.as_str(),
+                        "select_intent" | "select_handoff" | "moderator_speak" | "withdraw_self"
+                    )
+                {
+                    self.emit_moderator_decision_event(
+                        "meeting_v1_moderator_decision_committed",
+                        session_id,
+                        turn_id.clone(),
+                        ("accepted", "relay_committed"),
+                        None,
+                        json!({
+                            "action": action_kind,
+                            "object_id": object_id,
+                            "attempt_id": attempt_id,
+                            "event_id": completed.event_id,
+                        }),
+                    );
+                }
                 self.emit(
                     "meeting_v1_moderator_action_submitted",
                     session_id,
@@ -1696,6 +1795,7 @@ impl MeetingV1Coordinator {
                     json!({
                         "action": action_kind,
                         "object_id": object_id,
+                        "attempt_id": attempt_id,
                         "event_id": completed.event_id,
                         "outcome": protocol_submission_label(&completed.result),
                         "latency_ms": queued_at_ms
@@ -1808,9 +1908,11 @@ impl MeetingV1Coordinator {
                                 });
                                 decision.state = "retry_pending".to_string();
                             }
-                            self.emit(
+                            self.emit_moderator_decision_event(
                                 "meeting_v1_moderator_decision_retry_requested",
                                 session_id,
+                                None,
+                                ("retry_required", "selected_source_changed"),
                                 None,
                                 json!({
                                     "attempt_id": self
@@ -1819,7 +1921,7 @@ impl MeetingV1Coordinator {
                                         .map(|decision| decision.attempt.attempt_id.clone()),
                                     "retry_ticket_id": ticket,
                                     "failed_action_event_id": event_id,
-                                    "reason": rejection.code,
+                                    "rejection_code": rejection.code,
                                 }),
                             );
                         } else {
@@ -1953,9 +2055,20 @@ impl MeetingV1Coordinator {
                 runtime.moderator_rebase_at = None;
             }
         }
-        self.emit(
+        self.emit_moderator_decision_event(
             "meeting_v1_moderator_decision_rebased",
             session_id,
+            None,
+            (
+                if exhausted { "discarded" } else { "rebasing" },
+                if exhausted {
+                    "cas_churn"
+                } else if delayed {
+                    "cas_quiescence"
+                } else {
+                    "stale_moderator_revision"
+                },
+            ),
             None,
             json!({
                 "attempt_id": attempt_id,
@@ -2244,7 +2357,11 @@ impl MeetingV1Coordinator {
             None,
             json!({
                 "state_revision": view.baton.state_revision,
+                "state_event_id": view.baton.state_event_id,
+                "intent_revision": view.baton.intent_revision,
                 "speech_revision": view.baton.speech_revision,
+                "control_epoch": view.baton.control_epoch,
+                "decision_epoch": view.baton.decision_epoch,
                 "phase": view.baton.phase,
                 "source": "background",
             }),
@@ -2375,6 +2492,23 @@ impl MeetingV1Coordinator {
             .iter()
             .find(|intent| intent.author_pubkey == agent_pubkey)
             .cloned();
+        let previous_attempt_id = self
+            .ledger
+            .meetings
+            .get(&key)
+            .and_then(|ledger| ledger.moderator_decision.as_ref())
+            .map(|decision| decision.attempt.attempt_id.clone());
+        let prepared_attempt_transition = self
+            .ledger
+            .meetings
+            .get(&key)
+            .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
+            .map(|prepared| prepared.action_kind.clone());
+        let registered_attempt = view
+            .baton
+            .active_decision_attempt
+            .clone()
+            .filter(|attempt| previous_attempt_id.as_deref() != Some(attempt.attempt_id.as_str()));
         let Some(ledger) = self.ledger.meetings.get_mut(&key) else {
             return;
         };
@@ -2609,6 +2743,7 @@ impl MeetingV1Coordinator {
                         }
                         .to_string(),
                         turn_id: None,
+                        turn_started_at_ms: None,
                         cas_rebases: 0,
                         fast_rebases: 0,
                         pending_retry: None,
@@ -2654,6 +2789,39 @@ impl MeetingV1Coordinator {
         }
 
         self.persist_ledger_best_effort();
+        if let Some(attempt) = registered_attempt {
+            self.emit_moderator_decision_event(
+                "meeting_v1_moderator_attempt_registered",
+                view.session_id,
+                None,
+                (
+                    "registered",
+                    if prepared_attempt_transition.as_deref() == Some("decision_retry") {
+                        "relay_retry_registered"
+                    } else {
+                        "relay_attempt_registered"
+                    },
+                ),
+                None,
+                json!({
+                    "attempt_id": attempt.attempt_id,
+                    "deadline_ms": attempt.deadline_ms,
+                }),
+            );
+            if prepared_attempt_transition.as_deref() == Some("decision_retry") {
+                self.emit_moderator_decision_event(
+                    "meeting_v1_moderator_decision_retry_started",
+                    view.session_id,
+                    None,
+                    ("registered", "retry_ticket_consumed"),
+                    None,
+                    json!({
+                        "attempt_id": attempt.attempt_id,
+                        "deadline_ms": attempt.deadline_ms,
+                    }),
+                );
+            }
+        }
     }
 
     async fn reconcile(&mut self, session_id: Uuid) {
@@ -2906,6 +3074,14 @@ impl MeetingV1Coordinator {
         let guard_failure =
             moderator_attempt_guard_failure(&view, &decision.attempt, &self.agent_pubkey, now_ms());
         if let Some(reason) = guard_failure {
+            self.emit_moderator_decision_event(
+                "meeting_v1_moderator_decision_validated",
+                request.session_id,
+                Some(turn_id.to_string()),
+                ("invalid", reason),
+                None,
+                json!({}),
+            );
             self.mark_moderator_result_stale(request.session_id, reason);
             self.emit(
                 "meeting_v1_moderator_plan_stale",
@@ -2924,6 +3100,14 @@ impl MeetingV1Coordinator {
             None
         };
         let Some(output) = output else {
+            self.emit_moderator_decision_event(
+                "meeting_v1_moderator_decision_validated",
+                request.session_id,
+                Some(turn_id.to_string()),
+                ("invalid", "no_action"),
+                None,
+                json!({}),
+            );
             self.mark_moderator_result_stale(request.session_id, "no_action");
             return;
         };
@@ -2940,6 +3124,14 @@ impl MeetingV1Coordinator {
             current.turn_id = Some(turn_id.to_string());
         }
         self.persist_ledger_best_effort();
+        self.emit_moderator_decision_event(
+            "meeting_v1_moderator_decision_validated",
+            request.session_id,
+            Some(turn_id.to_string()),
+            ("valid", "semantic_guard_passed"),
+            None,
+            json!({}),
+        );
         self.emit(
             "meeting_v1_moderator_control_ready",
             request.session_id,
@@ -3198,8 +3390,11 @@ impl MeetingV1Coordinator {
             ProtocolSubmissionContext::Moderator {
                 action_kind: prepared.action_kind,
                 object_id: prepared.object_id,
+                attempt_id: prepared.attempt_id,
                 turn_id: None,
                 queued_at_ms: Some(prepared.created_at_ms),
+                #[cfg(feature = "meeting-v1-acceptance")]
+                barrier: None,
             },
             event,
         );
@@ -3550,11 +3745,20 @@ impl MeetingV1Coordinator {
             .ledger_for(session_id)
             .and_then(|ledger| ledger.moderator_decision.as_ref())
             .map(|decision| decision.attempt.started_at_ms);
+        #[cfg(feature = "meeting-v1-acceptance")]
+        let barrier = self.acceptance_barrier_for_moderator_action(
+            session_id,
+            &action_kind,
+            &object_id,
+            &event_id,
+            hard_deadline_unix_ms,
+            turn_id.clone(),
+        );
         if let Some(ledger) = self.ledger_for_mut(session_id) {
             ledger.prepared_moderator_action = Some(PreparedModeratorAction {
                 action_kind: action_kind.clone(),
                 object_id: object_id.clone(),
-                attempt_id,
+                attempt_id: attempt_id.clone(),
                 event: event_value,
                 event_id: event_id.clone(),
                 state: "prepared".to_string(),
@@ -3573,12 +3777,79 @@ impl MeetingV1Coordinator {
             ProtocolSubmissionContext::Moderator {
                 action_kind,
                 object_id,
+                attempt_id,
                 turn_id,
                 queued_at_ms,
+                #[cfg(feature = "meeting-v1-acceptance")]
+                barrier,
             },
             event,
         );
         true
+    }
+
+    #[cfg(feature = "meeting-v1-acceptance")]
+    fn acceptance_barrier_for_moderator_action(
+        &mut self,
+        session_id: Uuid,
+        action_kind: &str,
+        object_id: &str,
+        signed_event_id: &str,
+        hard_deadline_unix_ms: i64,
+        turn_id: Option<String>,
+    ) -> Option<Box<(PathBuf, PreSubmitBarrierFrame)>> {
+        let selected_source_type = match action_kind {
+            "select_intent" | "moderator_speak" => "intent",
+            "select_handoff" => "handoff",
+            _ => return None,
+        };
+        let decision = self
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_ref())
+            .cloned()?;
+        let view = self
+            .meetings
+            .get(&session_id)
+            .and_then(|runtime| runtime.view.as_ref())
+            .cloned()?;
+        let selected = decision.attempt.candidate_refs.iter().find(|candidate| {
+            candidate.source_type == selected_source_type && candidate.source_id == object_id
+        })?;
+        let socket_path = self.acceptance_barrier.claim()?;
+        let frame = PreSubmitBarrierFrame {
+            frame_type: "meeting_v1_pre_submit",
+            token: Uuid::new_v4().to_string(),
+            harness_pid: std::process::id(),
+            session_id: session_id.to_string(),
+            turn_id,
+            attempt_id: decision.attempt.attempt_id.clone(),
+            control_epoch: decision.attempt.control_epoch,
+            decision_epoch: decision.attempt.decision_epoch,
+            attempt_number: decision.attempt.attempt_number,
+            speech_revision: decision.attempt.speech_revision,
+            snapshot_intent_revision: decision.attempt.snapshot_intent_revision,
+            current_intent_revision: view.baton.intent_revision,
+            candidate_snapshot_hash: decision.attempt.candidate_snapshot_hash.clone(),
+            candidate_cohort: decision
+                .attempt
+                .candidate_refs
+                .iter()
+                .map(|candidate| AcceptanceCandidateRef {
+                    source_type: candidate.source_type.clone(),
+                    source_id: candidate.source_id.clone(),
+                    current_event_id: candidate.current_event_id.clone(),
+                    author_pubkey: candidate.author_pubkey.clone(),
+                    eligible_decision_epoch: candidate.eligible_decision_epoch,
+                })
+                .collect(),
+            selected_source_type: selected_source_type.to_string(),
+            selected_source_id: object_id.to_string(),
+            selected_source_event_id: selected.current_event_id.clone(),
+            action_kind: action_kind.to_string(),
+            signed_event_id: signed_event_id.to_string(),
+            hard_deadline_unix_ms,
+        };
+        Some(Box::new((socket_path, frame)))
     }
 
     fn set_moderator_finish_reason(&mut self, session_id: Uuid, reason: &str) {
@@ -3604,9 +3875,11 @@ impl MeetingV1Coordinator {
             _ => "control_changed",
         };
         self.set_moderator_finish_reason(session_id, reason);
-        self.emit(
+        self.emit_moderator_decision_event(
             "meeting_v1_moderator_decision_discarded",
             session_id,
+            None,
+            ("discarded", reason),
             None,
             json!({ "reason": reason }),
         );
@@ -5377,6 +5650,88 @@ impl MeetingV1Coordinator {
                 false
             }
         }
+    }
+
+    fn emit_moderator_decision_event(
+        &self,
+        kind: &str,
+        session_id: Uuid,
+        turn_id: Option<String>,
+        disposition: (&str, &str),
+        model_latency_ms: Option<i64>,
+        extra: Value,
+    ) {
+        let (outcome, reason) = disposition;
+        let Some(decision) = self
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_ref())
+        else {
+            return;
+        };
+        let current_intent_revision = self
+            .meetings
+            .get(&session_id)
+            .and_then(|runtime| runtime.view.as_ref())
+            .map_or(decision.attempt.snapshot_intent_revision, |view| {
+                view.baton.intent_revision
+            });
+        let phase = self
+            .meetings
+            .get(&session_id)
+            .and_then(|runtime| runtime.view.as_ref())
+            .map(|view| view.baton.phase.clone());
+        let (selected_source_type, selected_source_id) = match decision.next_action.action.as_str()
+        {
+            "select_intent" | "moderator_speak" | "withdraw_self" => {
+                (Some("intent"), decision.next_action.id.clone())
+            }
+            "select_handoff" => (Some("handoff"), decision.next_action.id.clone()),
+            _ => (None, None),
+        };
+        let candidate_sources: Vec<_> = decision
+            .attempt
+            .candidate_refs
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "source_type": candidate.source_type,
+                    "source_id": candidate.source_id,
+                    "current_event_id": candidate.current_event_id,
+                    "author_pubkey": candidate.author_pubkey,
+                    "eligible_decision_epoch": candidate.eligible_decision_epoch,
+                })
+            })
+            .collect();
+        let mut payload = json!({
+            "attempt_id": decision.attempt.attempt_id,
+            "control_epoch": decision.attempt.control_epoch,
+            "decision_epoch": decision.attempt.decision_epoch,
+            "attempt_number": decision.attempt.attempt_number,
+            "speech_revision": decision.attempt.speech_revision,
+            "snapshot_intent_revision": decision.attempt.snapshot_intent_revision,
+            "current_intent_revision": current_intent_revision,
+            "candidate_count": decision.attempt.candidate_refs.len(),
+            "candidate_snapshot_hash": decision.attempt.candidate_snapshot_hash,
+            "candidate_sources": candidate_sources,
+            "attempt_deadline_ms": decision.attempt.deadline_ms,
+            "selected_source_type": selected_source_type,
+            "selected_source_id": selected_source_id,
+            "phase": phase,
+            "outcome": outcome,
+            "reason": reason,
+            "model_latency_ms": model_latency_ms,
+        });
+        if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+        self.emit(
+            kind,
+            session_id,
+            turn_id.or_else(|| decision.turn_id.clone()),
+            payload,
+        );
     }
 
     fn emit(&self, kind: &str, session_id: Uuid, turn_id: Option<String>, payload: Value) {
@@ -7319,6 +7674,7 @@ fn recover_interrupted_meeting_turns(meeting: &mut MeetingLedger) -> (usize, usi
             // attempt before a bounded replacement is started.
             decision.state = "runtime_lost".to_string();
             decision.turn_id = None;
+            decision.turn_started_at_ms = None;
             changed = true;
         }
     }
@@ -7525,6 +7881,8 @@ mod tests {
             progress_waiting_for_state: HashMap::new(),
             progress_result_tx,
             progress_result_rx,
+            #[cfg(feature = "meeting-v1-acceptance")]
+            acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
         }
     }
 
@@ -7685,6 +8043,7 @@ mod tests {
             next_action,
             state: state.to_string(),
             turn_id: None,
+            turn_started_at_ms: None,
             cas_rebases: 0,
             fast_rebases: 0,
             pending_retry: None,
@@ -10748,9 +11107,13 @@ mod tests {
         view.baton.intent_revision = 1;
         let candidate = intent_candidate(&pubkey(110), &pubkey(111), &other_pubkey, false, 1);
         let attempt = decision_attempt(&view, vec![candidate]);
+        let observer = ObserverHandle::in_process();
 
-        let mut coordinator =
-            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
         install_decision(
             &mut coordinator,
             &mut view,
@@ -10774,6 +11137,31 @@ mod tests {
         assert_eq!(request.basis_id, attempt.attempt_id);
         assert!(request.prompt.contains(&attempt.candidate_snapshot_hash));
         assert!(coordinator.pending.is_empty());
+
+        coordinator.mark_dispatched("moderator-turn-1".to_string(), request);
+        let started = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "meeting_v1_moderator_decision_started")
+            .expect("structured Moderator Decision start evidence");
+        assert_eq!(started.turn_id.as_deref(), Some("moderator-turn-1"));
+        assert_eq!(started.payload["attempt_id"], attempt.attempt_id);
+        assert_eq!(
+            started.payload["candidate_snapshot_hash"],
+            attempt.candidate_snapshot_hash
+        );
+        assert_eq!(started.payload["candidate_count"], 1);
+        assert_eq!(started.payload["phase"], "moderator_control");
+        let registered = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "meeting_v1_moderator_attempt_registered")
+            .expect("structured Relay-registered attempt evidence");
+        assert_eq!(registered.payload["attempt_id"], attempt.attempt_id);
+        assert_eq!(
+            registered.payload["candidate_snapshot_hash"],
+            attempt.candidate_snapshot_hash
+        );
     }
 
     #[tokio::test]
@@ -11826,6 +12214,7 @@ mod tests {
                 },
                 state: "running".to_string(),
                 turn_id: Some("lost-provider-turn".to_string()),
+                turn_started_at_ms: Some(now_ms()),
                 cas_rebases: 0,
                 fast_rebases: 0,
                 pending_retry: None,
@@ -11891,6 +12280,7 @@ mod tests {
                         },
                         state: "queued".to_string(),
                         turn_id: Some("lost-provider-turn".to_string()),
+                        turn_started_at_ms: None,
                         cas_rebases: 0,
                         fast_rebases: 0,
                         pending_retry: None,

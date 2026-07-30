@@ -5,6 +5,8 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod meeting;
+#[cfg(feature = "meeting-v1-acceptance")]
+mod meeting_acceptance;
 mod meeting_v1;
 mod observer;
 mod pool;
@@ -1298,6 +1300,23 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
+    #[cfg(feature = "meeting-v1-acceptance")]
+    let acceptance_events_path = meeting_acceptance::acceptance_events_path();
+    #[cfg(feature = "meeting-v1-acceptance")]
+    let observer = match acceptance_events_path.as_deref() {
+        Some(path) => Some(
+            observer::ObserverHandle::in_process_with_acceptance_sink(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "create Meeting V1 acceptance evidence {}: {error}",
+                    path.display()
+                )
+            })?,
+        ),
+        None => config
+            .relay_observer
+            .then(observer::ObserverHandle::in_process),
+    };
+    #[cfg(not(feature = "meeting-v1-acceptance"))]
     let observer = config
         .relay_observer
         .then(observer::ObserverHandle::in_process);
@@ -1312,6 +1331,7 @@ async fn tokio_main() -> Result<()> {
                 "agentArgs": config.agent_args,
                 "parallelism": config.agents,
                 "relayObserver": config.relay_observer,
+                "meetingV1Acceptance": cfg!(feature = "meeting-v1-acceptance"),
             }),
         );
     }
@@ -1861,6 +1881,17 @@ async fn tokio_main() -> Result<()> {
                 }
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
+                if let Some(ref observer) = observer {
+                    observer.emit(
+                        "respawn_scheduled",
+                        Some(idx),
+                        &observer::ObserverContext::default(),
+                        serde_json::json!({
+                            "delay_ms": 0,
+                            "reason": "empty_slot_refill",
+                        }),
+                    );
+                }
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
@@ -1903,11 +1934,30 @@ async fn tokio_main() -> Result<()> {
                     };
                     pool.return_agent(agent);
                     tracing::info!(agent = rr.index, "respawn complete");
+                    if let Some(ref observer) = observer {
+                        observer.emit(
+                            "respawn_completed",
+                            Some(rr.index),
+                            &observer::ObserverContext::default(),
+                            serde_json::json!({ "outcome": "ready" }),
+                        );
+                    }
                     respawn_collected = true;
                 }
                 Err(e) => {
                     crash_history[rr.index].mark_spawn_failed();
                     tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
+                    if let Some(ref observer) = observer {
+                        observer.emit(
+                            "respawn_failed",
+                            Some(rr.index),
+                            &observer::ObserverContext::default(),
+                            serde_json::json!({
+                                "outcome": "failed",
+                                "error_class": "spawn_or_initialize",
+                            }),
+                        );
+                    }
                 }
             }
         }
@@ -2893,6 +2943,15 @@ async fn tokio_main() -> Result<()> {
         handle.abort();
     }
 
+    if let Some(observer) = &observer {
+        observer.emit(
+            "harness_stopped",
+            None,
+            &observer::ObserverContext::default(),
+            serde_json::json!({ "reason": "normal_shutdown" }),
+        );
+    }
+
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
     // for the background task to finish, rather than aborting immediately (#40).
     relay.shutdown().await;
@@ -3494,6 +3553,16 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
+    if let Some(ref observer) = observer {
+        observer.emit(
+            "prompt_terminal",
+            Some(agent_index),
+            &observer::context_for(channel_id, None, Some(turn_id.clone())),
+            serde_json::json!({
+                "outcome": outcome_label,
+            }),
+        );
+    }
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
             let mut payload = serde_json::json!({
@@ -3524,6 +3593,7 @@ fn handle_prompt_result(
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
+            result.agent.acp.observe_process_terminal(outcome_label);
             tracing::warn!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -3574,6 +3644,10 @@ fn handle_prompt_result(
         // removed channel) is decided above — the message stays fate-neutral
         // since it must be true in every case.
         PromptOutcome::CancelDrainTimeout(grace) => {
+            result
+                .agent
+                .acp
+                .observe_process_terminal("cancel_drain_timeout");
             tracing::warn!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -3642,6 +3716,10 @@ fn handle_prompt_result(
                 _ => None,
             };
             if is_transport_error {
+                result
+                    .agent
+                    .acp
+                    .observe_process_terminal("transport_protocol_error");
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
@@ -3769,6 +3847,17 @@ fn recover_panicked_agent(
 
     // Spawn respawn work off the main loop.
     slot.respawn_in_flight = true;
+    if let Some(ref observer) = observer {
+        observer.emit(
+            "respawn_scheduled",
+            Some(i),
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "delay_ms": delay.as_millis(),
+                "reason": "agent_task_panic",
+            }),
+        );
+    }
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
@@ -3958,6 +4047,17 @@ fn spawn_respawn_task(
     };
 
     slot.respawn_in_flight = true;
+    if let Some(ref observer) = observer {
+        observer.emit(
+            "respawn_scheduled",
+            Some(index),
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "delay_ms": delay.as_millis(),
+                "reason": "process_unusable",
+            }),
+        );
+    }
 
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();

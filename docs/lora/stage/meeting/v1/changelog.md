@@ -7,9 +7,9 @@
 
 ### 状态
 
-已确认。阶段一“权威 retry 与提交语义”和阶段二“ACP 单飞与 Candidate Cohort”
-均已实现并通过确定性验收；可观测性 Runner 和针对性真实 Codex 验收仍按设计文档
-后续阶段推进。
+已确认。阶段一“权威 retry 与提交语义”、阶段二“ACP 单飞与 Candidate Cohort”和
+阶段三“可观测性与验收 Runner”均已实现并通过本地确定性验收；针对性真实 Codex
+qualification 与正式签收仍按设计文档阶段四推进。
 
 ### 问题
 

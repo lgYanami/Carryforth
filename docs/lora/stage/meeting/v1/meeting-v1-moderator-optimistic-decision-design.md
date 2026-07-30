@@ -1,7 +1,7 @@
 # Meeting V1 主持人乐观决策设计
 
-> 状态：补充设计已确认；阶段一、二已实现并通过确定性验收；待阶段三可观测性与
-> 阶段四针对性真实 Codex 验收
+> 状态：补充设计已确认；阶段一至三已实现并通过本地确定性验收；待阶段四针对性
+> 真实 Codex qualification 与正式签收
 >
 > 日期：2026-07-30
 >
@@ -1112,13 +1112,30 @@ attempt；late self、fallback 和无关 Intent 变化都不能绕过 Cohort 或
 
 交付标准：确定性 Controller 测试完整覆盖第 12 节。
 
-### 阶段三：可观测性与验收 Runner
+### 阶段三：可观测性与验收 Runner（已交付）
 
 - 增加 Decision/Cohort/attempt 结构化事件；
 - 捕获 ACP wire Cancel、Prompt terminal、子进程身份和 rebase/retry；
 - 实现 submit timeout 之前的一次性 PreSubmitAcceptanceBarrier 和场景编排。
 
 交付标准：每项专项硬门槛都能由 artifact 自动判定，不依赖人工读日志猜测。
+
+实现边界：
+
+- `meeting-v1-acceptance` Cargo feature 才编译本地脱敏 NDJSON sink 和 Unix socket
+  Barrier；普通 production build 不含暂停分支；
+- Barrier 只暂停已经签名的 primary Moderator action，且发生在正常
+  `PROTOCOL_SUBMIT_TIMEOUT` 启动之前；等待上限仍是 Relay 权威 attempt deadline；
+- `scripts/meeting-v1-moderator-gates.jq` 根据结构化事件判断 model/Prompt 顺序、
+  Attempt/Cohort 对齐、自然 terminal、Cancel/respawn/uncertain 和结果归宿；
+- `scripts/meeting-v1-moderator-gates-test.sh` 用 PASS、Cancel 和缺失 attempt binding
+  fixture 验证硬门禁自身不会静默放过反例；
+- `scripts/meeting-v1-live-acceptance.sh` 编排单个 R-MOD 场景，
+  `scripts/meeting-v1-moderator-acceptance.sh` 对场景获取实施最多三个全新 Meeting 的
+  上限并可顺序执行 qualification 矩阵。
+
+这里的“已交付”只表示验收能力已经可执行且通过本地测试，不表示 R-MOD 真实 Codex
+结果已经通过；真实运行和签收仍属于阶段四。
 
 ### 阶段四：真实 Codex qualification 与正式签收
 

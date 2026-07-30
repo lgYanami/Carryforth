@@ -533,6 +533,25 @@ scripts/meeting-v1-live-acceptance.sh C10
 scripts/meeting-v1-live-acceptance.sh C12
 ```
 
+主持人乐观决策专项使用显式 acceptance build：
+
+```bash
+cargo build --release -p buzz-acp --features meeting-v1-acceptance
+
+# 单个场景；R-MOD-03/04 也可显式选择 refresh/withdraw 变体
+scripts/meeting-v1-moderator-acceptance.sh R-MOD-01
+scripts/meeting-v1-moderator-acceptance.sh R-MOD-04-refresh
+scripts/meeting-v1-moderator-acceptance.sh R-MOD-04-withdraw
+
+# 顺序执行 R-MOD qualification 矩阵
+scripts/meeting-v1-moderator-acceptance.sh qualification
+```
+
+单场 Driver 的退出码 `3` 表示真实模型没有在该次权威窗口内产出场景要求的 primary
+Select，属于 `INCONCLUSIVE`，不属于 PASS。外层 Runner 最多建立三个全新 Meeting 获取
+目标路径；三次都未命中则该场景 FAIL。每个 artifact 同时包含安全结构化事件、
+Barrier 证据、进程树、数据库不变量以及逐项 JQ 硬门禁结果。
+
 它不是三次重复或 soak 的缩写；每次命令只产生一个 cold-start qualification sample。
 成功 run 默认删除其隔离数据库，只保留脱敏 artifact；需要现场调查时显式设置
 `MEETING_LIVE_KEEP_DATABASE=true`。失败 run 保留数据库以便取证。

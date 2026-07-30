@@ -1013,6 +1013,16 @@ async fn apply_model_switch(
                 target: "pool::model",
                 "applied model {desired} via {method_label} on session {session_id}"
             );
+            acp.observe(
+                "model_applied",
+                serde_json::json!({
+                    "model_id": desired,
+                    "method": match method {
+                        ModelSwitchMethod::ConfigOption { .. } => "config_option",
+                        ModelSwitchMethod::SetModel { .. } => "set_model",
+                    },
+                }),
+            );
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent instead of reusing a poisoned one.
@@ -1893,6 +1903,13 @@ pub async fn run_prompt_task(
     // (control_rx=None) take the simple await path — they are not controllable.
     //
     let prompt_max_duration = bounded_turn_duration(ctx.max_turn_duration, absolute_hard_deadline);
+    agent.acp.observe(
+        "prompt_request_started",
+        serde_json::json!({
+            "block_count": prompt_blocks.len(),
+            "max_duration_ms": prompt_max_duration.as_millis(),
+        }),
+    );
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -1928,6 +1945,18 @@ pub async fn run_prompt_task(
                     // Control signal received. Guard against Race 1: the turn may
                     // have completed naturally just as cancel fired.
                     if agent.acp.has_in_flight_prompt() {
+                        agent.acp.observe(
+                            "acp_cancel_requested",
+                            serde_json::json!({
+                                "reason": match &control_signal {
+                                    ControlSignal::Steer => "steer",
+                                    ControlSignal::Interrupt => "interrupt",
+                                    ControlSignal::Cancel => "explicit_cancel",
+                                    ControlSignal::Rotate => "rotate",
+                                    ControlSignal::SwitchModel(_) => "switch_model",
+                                },
+                            }),
+                        );
                         // Prompt is genuinely in-flight — cancel it.
                         match agent
                             .acp
