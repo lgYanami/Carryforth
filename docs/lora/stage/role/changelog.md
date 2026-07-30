@@ -1,5 +1,47 @@
 # 角色连续性变更记录
 
+## 2026-07-30 — 上下文完善阶段 B：稳定 Project Space contract
+
+### 平台契约与动态事实分层
+
+- ACP 增加 Buzz 平台维护的固定 `[Project Space]` section，说明 Community / Project
+  Space、Project View、Role、Assignment、Member、Runtime、Role Brief / Binding、
+  Role Directory、Checkpoint 与 Handoff 的稳定语义，以及按需读取、显式写回、跨 Role
+  协作和 fail-closed 行为。
+- contract 是无参数常量，不接收当前 Project、Community、Member、Role、Assignment、
+  Directory、revision 或项目成员自由文本；这些动态事实继续只由每个完整 turn 前验证后
+  的 `[Role Brief] | [Role Binding] | unavailable` 上下文承载。
+- contract 明确聊天、本地文件、工具输出和 Agent memory 不会自动更新 Project；
+  Project-authored text 仍是项目数据而非平台 instruction，prompt 也不构成授权缓存，
+  role-bearing write 继续由 CLI 与 Relay 重新验证。
+
+### 现代与 legacy ACP 交付
+
+- protocol-v2 与支持专用 system prompt 的 Agent 在 `session/new` 获得 contract；固定
+  组装顺序为 `[Workspace] → [Base] → [Project Space] → [System] →
+  [Team Instructions] → [Agent Memory — core] → [Channel Canvas]`。
+- `[Project Space]` 不依赖 base prompt，因此 `--no-base-prompt` 不会关闭平台契约。
+- legacy Agent 在 batch、initial message 与 heartbeat 三条完整提示路径获得同一份明确
+  标注的兼容 section；兼容 user context 的较低提示优先级不被当作安全边界。现代路径
+  不会在 user message 中重复 contract。
+
+### 独立版本轴与有界失效
+
+- contract 使用“显式版本 + 精确内容 SHA-256”形成独立 content ID，与 Project
+  revision 完全分离；任一文案或版本变化都会得到不同 ID。
+- 每个 channel session 与 heartbeat session 只在成功创建后记录其 contract ID。ACP
+  在每个完整 turn、选择 Full / Incremental Role Context 之前比较 ID；缺失或不匹配时
+  清除旧 session、turn/core/canvas 状态并重建，因此替换 session 同时获得完整
+  Role Brief。
+- 普通 Project revision 变化不会触发 system contract 重建，仍沿用既有按 meta /
+  revision 刷新动态 Role Context 的路径。
+
+### 本阶段边界
+
+- 本阶段未修改 Project View / Role Continuity 的数据库、Nostr kind、权限或动态
+  Brief DTO；显式 Full refresh、connector compaction/reset 信号与 observer 的完整
+  contract 诊断仍属于阶段 C。
+
 ## 2026-07-30 — 上下文完善阶段 A：共享 Role Directory
 
 ### 同一验证快照派生目录

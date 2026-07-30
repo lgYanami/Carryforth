@@ -87,6 +87,13 @@ pub struct SessionState {
     /// channel_id → session_id
     pub sessions: HashMap<Uuid, String>,
     pub heartbeat_session: Option<String>,
+    /// Contract content ID installed in each active channel session.
+    ///
+    /// This version axis is intentionally independent of Project revision.
+    /// A missing or mismatched ID makes an otherwise-active session stale.
+    project_space_contract_ids: HashMap<Uuid, [u8; 32]>,
+    /// Contract content ID installed in the active heartbeat session.
+    heartbeat_project_space_contract_id: Option<[u8; 32]>,
     /// Per-channel turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<Uuid, u32>,
@@ -114,6 +121,7 @@ impl SessionState {
             PromptSource::Heartbeat => {
                 self.heartbeat_session = None;
                 self.heartbeat_turn_count = 0;
+                self.heartbeat_project_space_contract_id = None;
             }
         }
     }
@@ -124,6 +132,7 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        self.project_space_contract_ids.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -133,8 +142,64 @@ impl SessionState {
         self.turn_counts.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
+        self.project_space_contract_ids.clear();
+        self.heartbeat_project_space_contract_id = None;
         self.core_sections.clear();
         self.canvas_sections.clear();
+    }
+
+    /// Invalidate an active session whose stable Project Space contract is
+    /// missing or differs from `current_id`.
+    ///
+    /// This is checked at every complete turn, before Role Context chooses
+    /// Full versus Incremental. Consequently a stale contract rebuild also
+    /// forces a fresh full Role Brief on the replacement session.
+    fn invalidate_stale_project_space_contract(
+        &mut self,
+        source: &PromptSource,
+        current_id: [u8; 32],
+    ) -> bool {
+        match source {
+            PromptSource::Channel(channel_id) => {
+                if !self.sessions.contains_key(channel_id) {
+                    self.project_space_contract_ids.remove(channel_id);
+                    return false;
+                }
+                if self.project_space_contract_ids.get(channel_id) == Some(&current_id) {
+                    false
+                } else {
+                    self.invalidate_channel(channel_id)
+                }
+            }
+            PromptSource::Heartbeat => {
+                if self.heartbeat_session.is_none() {
+                    self.heartbeat_project_space_contract_id = None;
+                    return false;
+                }
+                if self.heartbeat_project_space_contract_id == Some(current_id) {
+                    false
+                } else {
+                    self.invalidate(&PromptSource::Heartbeat);
+                    true
+                }
+            }
+        }
+    }
+
+    /// Record the contract only after `session/new` (and any compatibility
+    /// system-prompt setup) succeeds.
+    fn record_project_space_contract(&mut self, source: &PromptSource, current_id: [u8; 32]) {
+        match source {
+            PromptSource::Channel(channel_id) => {
+                debug_assert!(self.sessions.contains_key(channel_id));
+                self.project_space_contract_ids
+                    .insert(*channel_id, current_id);
+            }
+            PromptSource::Heartbeat => {
+                debug_assert!(self.heartbeat_session.is_some());
+                self.heartbeat_project_space_contract_id = Some(current_id);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -143,6 +208,7 @@ impl SessionState {
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
+            || self.project_space_contract_ids.contains_key(channel_id)
     }
 }
 
@@ -825,12 +891,12 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
 ) -> Result<String, AcpError> {
-    // Build base_prompt + system_prompt + agent core + canvas metadata into a
-    // single prompt. Standard protocol-v2 agents receive it in `session/new`;
-    // Goose receives it through the custom request below. Legacy agents receive
-    // the same content as user-message sections via `format_prompt`. Core carries
-    // its own `[Agent Memory — core]` header, and canvas carries its own
-    // `[Channel Canvas]` header; both are appended with a blank-line separator.
+    // Build workspace/base + the platform-owned Project Space contract +
+    // persona/team + agent core + canvas metadata into a single prompt.
+    // Standard protocol-v2 agents receive it in `session/new`; Goose receives
+    // it through the custom request below. Legacy agents receive equivalent
+    // labeled user-message sections via `format_prompt`. Dynamic Project and
+    // Role facts never enter this prompt — they remain per-turn Role Context.
     let is_goose = agent.agent_name == "goose";
     let combined_system_prompt = with_canvas(
         with_core(
@@ -1118,6 +1184,19 @@ pub(crate) fn prepend_base_for_legacy(
     }
 }
 
+/// Prepend the stable `[Project Space]` contract for a legacy user-message path.
+///
+/// Modern agents already receive this platform-owned section in
+/// `session/new`. Unlike `[Base]`, the contract cannot be disabled by
+/// `--no-base-prompt`.
+pub(crate) fn prepend_project_space_for_legacy(protocol_version: u32, body: &str) -> String {
+    if protocol_version < 2 {
+        format!("{}\n\n{body}", crate::project_space::PROJECT_SPACE_SECTION)
+    } else {
+        body.to_string()
+    }
+}
+
 /// Prepend the `[Channel Canvas]` section to the legacy initial-message body.
 ///
 /// Protocol-v2 agents already receive the canvas in `systemPrompt`; only
@@ -1146,14 +1225,13 @@ pub(crate) fn prepend_role_brief(role_brief: &str, body: &str) -> String {
     format!("{role_brief}\n{body}")
 }
 
-/// Frame the `session/new` `systemPrompt` so each present prompt carries its own
-/// header, keeping the base/persona boundary recoverable downstream.
+/// Frame the `session/new` `systemPrompt` so each section carries its own
+/// header and ownership boundary remains recoverable downstream.
 ///
-/// The header framing matches the legacy per-turn path (`queue::base_section`
-/// for `[Base]`, `[System]\n{...}` for the persona) so the desktop observer can
-/// split the combined value into labeled sub-sections. Each prompt is wrapped
-/// only when present, so a persona-only agent yields `[System]\n{persona}`
-/// rather than an unlabeled blob that would be mislabeled as `[Base]`.
+/// The stable `[Project Space]` contract is always present, independently of
+/// `--no-base-prompt` and persona configuration. The header framing matches
+/// the legacy per-turn path so the desktop observer can split the combined
+/// value into labeled sub-sections.
 ///
 /// Prepends a `[Workspace]` section naming the agent's absolute working
 /// directory. The base prompt describes the workspace layout but never its
@@ -1167,22 +1245,24 @@ fn framed_system_prompt(
     base_prompt: Option<&str>,
     system_prompt: Option<&str>,
 ) -> Option<String> {
-    let body = match (base_prompt, system_prompt) {
-        (Some(bp), Some(sp)) => Some(format!(
-            "{}\n\n[System]\n{sp}",
-            crate::queue::base_section(bp)
-        )),
-        (Some(bp), None) => Some(crate::queue::base_section(bp)),
-        (None, Some(sp)) => Some(format!("[System]\n{sp}")),
-        (None, None) => None,
-    }?;
+    let mut sections = Vec::with_capacity(4);
+
     // Anchor the workspace only when a base prompt is present — the workspace
-    // section grounds the base prompt's layout description, so it is meaningless
-    // for a persona-only (`[System]`-only) agent that never received that layout.
-    match (base_prompt, workspace_section(cwd)) {
-        (Some(_), Some(workspace)) => Some(format!("{workspace}\n\n{body}")),
-        _ => Some(body),
+    // section grounds the base prompt's layout description.
+    if base_prompt.is_some() {
+        if let Some(workspace) = workspace_section(cwd) {
+            sections.push(workspace);
+        }
     }
+    if let Some(base_prompt) = base_prompt {
+        sections.push(crate::queue::base_section(base_prompt));
+    }
+    sections.push(crate::project_space::PROJECT_SPACE_SECTION.to_string());
+    if let Some(system_prompt) = system_prompt {
+        sections.push(format!("[System]\n{system_prompt}"));
+    }
+
+    Some(sections.join("\n\n"))
 }
 
 /// Render the `[Workspace]` grounding section, or `None` when `cwd` is unusable.
@@ -1378,6 +1458,22 @@ pub async fn run_prompt_task(
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
 
+    // The stable Project Space contract has its own version axis. Check it
+    // before choosing Full versus Incremental Role Context: a stale session
+    // must be rebuilt and receive a fresh full Brief, while ordinary Project
+    // revision changes leave the system contract/session intact.
+    let project_space_contract_id = crate::project_space::contract_id();
+    if agent
+        .state
+        .invalidate_stale_project_space_contract(&source, project_space_contract_id)
+    {
+        tracing::info!(
+            target: "pool::session",
+            contract_version = crate::project_space::PROJECT_SPACE_CONTRACT_VERSION,
+            "invalidated session with stale Project Space contract"
+        );
+    }
+
     // Role identity is dynamic authorization context, not session
     // configuration. Every complete channel prompt and heartbeat verifies the
     // current Relay/meta head before session creation. Existing sessions may
@@ -1553,6 +1649,9 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
+                        agent
+                            .state
+                            .record_project_space_contract(&source, project_space_contract_id);
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
@@ -1599,6 +1698,9 @@ pub async fn run_prompt_task(
                             agent.index
                         );
                         agent.state.heartbeat_session = Some(sid.clone());
+                        agent
+                            .state
+                            .record_project_space_contract(&source, project_space_contract_id);
                         (sid, true)
                     }
                     Err(AcpError::AgentExited) => {
@@ -1652,30 +1754,23 @@ pub async fn run_prompt_task(
                 target: "pool::session",
                 "sending initial_message to session {session_id} for channel {cid}"
             );
-            // For agents with systemPrompt support (protocol_version >= 2),
-            // base_prompt is delivered via the system role in session/new.
-            // Legacy agents receive it via [Base] in the user message instead.
-            // Canvas is also injected here for legacy agents: protocol-v2 agents
-            // already have it in systemPrompt; legacy agents need it before the
-            // first prompt, matching the "every turn" per-turn delivery semantics.
-            let init_msg = prepend_base_for_legacy(
-                if agent.has_system_prompt_support() {
-                    2
-                } else {
-                    1
-                },
-                ctx.base_prompt,
+            // Modern agents already received all stable sections through the
+            // system role. Legacy agents need labeled compatibility context on
+            // this first user message. Compose in reverse-prepend order so the
+            // final stable order is [Base] → [Project Space] → [Channel Canvas].
+            let prompt_protocol_version = if agent.has_system_prompt_support() {
+                2
+            } else {
+                1
+            };
+            let init_msg = prepend_canvas_for_legacy(
+                prompt_protocol_version,
+                agent_canvas.as_deref(),
                 initial_msg,
             );
-            let init_msg = prepend_canvas_for_legacy(
-                if agent.has_system_prompt_support() {
-                    2
-                } else {
-                    1
-                },
-                agent_canvas.as_deref(),
-                &init_msg,
-            );
+            let init_msg = prepend_project_space_for_legacy(prompt_protocol_version, &init_msg);
+            let init_msg =
+                prepend_base_for_legacy(prompt_protocol_version, ctx.base_prompt, &init_msg);
             let init_msg = prepend_role_brief(&role_context.markdown, &init_msg);
             let init_result = agent
                 .acp
@@ -1797,15 +1892,13 @@ pub async fn run_prompt_task(
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
-        let text = prepend_base_for_legacy(
-            if agent.has_system_prompt_support() {
-                2
-            } else {
-                1
-            },
-            ctx.base_prompt,
-            &text,
-        );
+        let prompt_protocol_version = if agent.has_system_prompt_support() {
+            2
+        } else {
+            1
+        };
+        let text = prepend_project_space_for_legacy(prompt_protocol_version, &text);
+        let text = prepend_base_for_legacy(prompt_protocol_version, ctx.base_prompt, &text);
         vec![text]
     } else if let Some(ref b) = batch {
         // Build prompt from batch with context enrichment.
@@ -1846,6 +1939,7 @@ pub async fn run_prompt_task(
                 profile_lookup: profile_lookup.as_ref(),
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: ctx.base_prompt,
+                project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
                 system_prompt: ctx.system_prompt.as_deref(),
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
@@ -3774,6 +3868,21 @@ mod tests {
         assert_eq!(composed, "hello channel");
     }
 
+    // ── prepend_project_space_for_legacy ────────────────────────────────────
+
+    #[test]
+    fn legacy_agent_gets_project_space_contract_without_base_prompt() {
+        let composed = prepend_project_space_for_legacy(1, "hello channel");
+        assert!(composed.starts_with("[Project Space]\n"));
+        assert!(composed.ends_with("\n\nhello channel"));
+    }
+
+    #[test]
+    fn modern_agent_omits_project_space_contract_from_user_message() {
+        let composed = prepend_project_space_for_legacy(2, "hello channel");
+        assert_eq!(composed, "hello channel");
+    }
+
     // ── prepend_canvas_for_legacy ─────────────────────────────────────────────
 
     #[test]
@@ -3821,30 +3930,31 @@ mod tests {
 
     #[test]
     fn test_initial_message_legacy_canvas_and_base_compose_correctly() {
-        // Verify the full composition order when both base and canvas are present:
-        // [Base] → canvas section → initial-message body.
+        // Match the production reverse-prepend composition. Stable ownership
+        // order is [Base] → [Project Space] → canvas → initial-message body.
         let canvas = "[Channel Canvas]\ncanvas content";
-        let base_composed = prepend_base_for_legacy(1, Some("be helpful"), "do the thing");
-        let full = prepend_canvas_for_legacy(1, Some(canvas), &base_composed);
+        let canvas_composed = prepend_canvas_for_legacy(1, Some(canvas), "do the thing");
+        let project_composed = prepend_project_space_for_legacy(1, &canvas_composed);
+        let full = prepend_base_for_legacy(1, Some("be helpful"), &project_composed);
         assert!(
-            full.starts_with("[Channel Canvas]"),
-            "canvas must be first in composed message"
+            full.starts_with("[Base]"),
+            "base must be first in composed compatibility context"
         );
         assert!(
-            full.contains("[Base]"),
-            "base must be present in composed message"
+            full.contains("[Project Space]"),
+            "Project Space contract must be present"
         );
         assert!(
             full.ends_with("do the thing"),
             "body must be last in composed message"
         );
-        // Order: canvas → base → body
-        let canvas_pos = full.find("[Channel Canvas]").unwrap();
         let base_pos = full.find("[Base]").unwrap();
+        let project_pos = full.find("[Project Space]").unwrap();
+        let canvas_pos = full.find("[Channel Canvas]").unwrap();
         let body_pos = full.find("do the thing").unwrap();
         assert!(
-            canvas_pos < base_pos && base_pos < body_pos,
-            "order must be: canvas → base → body"
+            base_pos < project_pos && project_pos < canvas_pos && canvas_pos < body_pos,
+            "order must be: base → Project Space → canvas → body"
         );
     }
 
@@ -3867,13 +3977,25 @@ mod tests {
     fn test_framed_system_prompt_both_present_carries_both_headers() {
         let framed = framed_system_prompt("/", Some("base text"), Some("persona text"))
             .expect("both present yields Some");
-        assert_eq!(framed, "[Base]\nbase text\n\n[System]\npersona text");
+        assert_eq!(
+            framed,
+            format!(
+                "[Base]\nbase text\n\n{}\n\n[System]\npersona text",
+                crate::project_space::PROJECT_SPACE_SECTION
+            )
+        );
     }
 
     #[test]
     fn test_framed_system_prompt_base_only_labels_base() {
         let framed = framed_system_prompt("/", Some("base text"), None).expect("base yields Some");
-        assert_eq!(framed, "[Base]\nbase text");
+        assert_eq!(
+            framed,
+            format!(
+                "[Base]\nbase text\n\n{}",
+                crate::project_space::PROJECT_SPACE_SECTION
+            )
+        );
     }
 
     #[test]
@@ -3882,12 +4004,21 @@ mod tests {
         // its own [System] header even when no base prompt exists.
         let framed =
             framed_system_prompt("/", None, Some("persona text")).expect("persona yields Some");
-        assert_eq!(framed, "[System]\npersona text");
+        assert_eq!(
+            framed,
+            format!(
+                "{}\n\n[System]\npersona text",
+                crate::project_space::PROJECT_SPACE_SECTION
+            )
+        );
     }
 
     #[test]
-    fn test_framed_system_prompt_neither_is_none() {
-        assert!(framed_system_prompt("/", None, None).is_none());
+    fn test_framed_system_prompt_contract_survives_no_base_and_no_persona() {
+        assert_eq!(
+            framed_system_prompt("/", None, None).as_deref(),
+            Some(crate::project_space::PROJECT_SPACE_SECTION)
+        );
     }
 
     #[test]
@@ -3903,6 +4034,11 @@ mod tests {
             framed.contains("\n\n[Base]\nbase text"),
             "base must follow the workspace section: {framed}"
         );
+        let base_pos = framed.find("[Base]").expect("base section");
+        let project_space_pos = framed
+            .find("[Project Space]")
+            .expect("Project Space section");
+        assert!(base_pos < project_space_pos);
     }
 
     #[test]
@@ -3911,14 +4047,63 @@ mod tests {
         // agent never received that layout, so no [Workspace] anchor is emitted.
         let framed = framed_system_prompt("/Users/me/.buzz", None, Some("persona text"))
             .expect("persona yields Some");
-        assert_eq!(framed, "[System]\npersona text");
+        assert_eq!(
+            framed,
+            format!(
+                "{}\n\n[System]\npersona text",
+                crate::project_space::PROJECT_SPACE_SECTION
+            )
+        );
     }
 
     #[test]
     fn test_framed_system_prompt_root_cwd_omits_workspace() {
         // The "/" fallback must never be named — it would invite a $HOME scan.
         let framed = framed_system_prompt("/", Some("base text"), None).expect("base yields Some");
-        assert_eq!(framed, "[Base]\nbase text");
+        assert_eq!(
+            framed,
+            format!(
+                "[Base]\nbase text\n\n{}",
+                crate::project_space::PROJECT_SPACE_SECTION
+            )
+        );
+    }
+
+    #[test]
+    fn modern_system_context_preserves_complete_section_order() {
+        let prompt = with_canvas(
+            with_core(
+                with_team(
+                    framed_system_prompt("/workspace", Some("base text"), Some("persona text")),
+                    Some("team text"),
+                ),
+                Some("[Agent Memory — core]\ncore text"),
+            ),
+            Some("[Channel Canvas]\ncanvas text"),
+        )
+        .expect("Project Space contract always yields a system prompt");
+
+        let headers = [
+            "[Workspace]",
+            "[Base]",
+            "[Project Space]",
+            "[System]",
+            "[Team Instructions]",
+            "[Agent Memory — core]",
+            "[Channel Canvas]",
+        ];
+        let positions: Vec<usize> = headers
+            .iter()
+            .map(|header| {
+                prompt
+                    .find(header)
+                    .unwrap_or_else(|| panic!("missing {header}: {prompt}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "unexpected system context order: {prompt}"
+        );
     }
 
     #[test]
@@ -4340,6 +4525,10 @@ mod tests {
         s.core_sections.insert(ch_b, "core-b".into());
         s.heartbeat_session = Some("sess-hb".into());
         s.heartbeat_turn_count = 7;
+        let contract_id = crate::project_space::contract_id();
+        s.project_space_contract_ids.insert(ch_a, contract_id);
+        s.project_space_contract_ids.insert(ch_b, contract_id);
+        s.heartbeat_project_space_contract_id = Some(contract_id);
         (s, ch_a, ch_b)
     }
 
@@ -4381,6 +4570,88 @@ mod tests {
             role_context_refresh_for(&state, &PromptSource::Heartbeat),
             RoleContextRefresh::Full
         );
+    }
+
+    #[test]
+    fn current_project_space_contract_preserves_active_sessions() {
+        let (mut state, channel_id, _) = make_state();
+        let current_id = crate::project_space::contract_id();
+
+        assert!(!state.invalidate_stale_project_space_contract(
+            &PromptSource::Channel(channel_id),
+            current_id
+        ));
+        assert!(
+            !state.invalidate_stale_project_space_contract(&PromptSource::Heartbeat, current_id)
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Channel(channel_id)),
+            crate::role_brief::RoleContextRefresh::Incremental
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Heartbeat),
+            crate::role_brief::RoleContextRefresh::Incremental
+        );
+    }
+
+    #[test]
+    fn changed_project_space_contract_invalidates_session_before_role_refresh() {
+        let (mut state, channel_id, other_channel_id) = make_state();
+        let changed_id = [0x5a; 32];
+
+        assert!(state.invalidate_stale_project_space_contract(
+            &PromptSource::Channel(channel_id),
+            changed_id
+        ));
+        assert!(!state.has_channel_state(&channel_id));
+        assert!(state.has_channel_state(&other_channel_id));
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Channel(channel_id)),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+
+        assert!(state.invalidate_stale_project_space_contract(&PromptSource::Heartbeat, changed_id));
+        assert!(state.heartbeat_session.is_none());
+        assert!(state.heartbeat_project_space_contract_id.is_none());
+        assert_eq!(
+            role_context_refresh_for(&state, &PromptSource::Heartbeat),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+    }
+
+    #[test]
+    fn active_session_without_contract_id_is_migrated_by_rebuild() {
+        let channel_id = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(channel_id, "pre-contract-session".to_owned());
+
+        assert!(state.invalidate_stale_project_space_contract(
+            &PromptSource::Channel(channel_id),
+            crate::project_space::contract_id()
+        ));
+        assert!(!state.has_channel_state(&channel_id));
+    }
+
+    #[test]
+    fn contract_id_is_recorded_only_for_created_session_source() {
+        let channel_id = Uuid::new_v4();
+        let other_channel_id = Uuid::new_v4();
+        let current_id = crate::project_space::contract_id();
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "new-session".to_owned());
+
+        state.record_project_space_contract(&PromptSource::Channel(channel_id), current_id);
+
+        assert_eq!(
+            state.project_space_contract_ids.get(&channel_id),
+            Some(&current_id)
+        );
+        assert!(!state
+            .project_space_contract_ids
+            .contains_key(&other_channel_id));
+        assert!(state.heartbeat_project_space_contract_id.is_none());
     }
 
     #[test]
@@ -4445,6 +4716,7 @@ mod tests {
 
         assert!(s.heartbeat_session.is_none());
         assert_eq!(s.heartbeat_turn_count, 0);
+        assert!(s.heartbeat_project_space_contract_id.is_none());
         // channels untouched
         assert_eq!(s.sessions.len(), 2);
         assert_eq!(*s.turn_counts.get(&ch_a).unwrap(), 5);
@@ -4461,8 +4733,10 @@ mod tests {
         assert!(s.sessions.is_empty());
         assert!(s.turn_counts.is_empty());
         assert!(s.core_sections.is_empty());
+        assert!(s.project_space_contract_ids.is_empty());
         assert!(s.heartbeat_session.is_none());
         assert_eq!(s.heartbeat_turn_count, 0);
+        assert!(s.heartbeat_project_space_contract_id.is_none());
     }
 
     #[test]
@@ -4487,6 +4761,7 @@ mod tests {
         assert!(s.sessions.is_empty());
         assert!(s.turn_counts.is_empty());
         assert!(s.core_sections.is_empty());
+        assert!(s.project_space_contract_ids.is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod filter;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project_space;
 mod queue;
 mod relay;
 mod role_brief;
