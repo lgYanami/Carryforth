@@ -5351,6 +5351,12 @@ mod tests {
         );
         verified_v2_snapshot_from_events(&cutover.events, &relay, community_id);
         assert_eq!(
+            db.backfill_from_allowlist(community_id)
+                .await
+                .expect("legacy allowlist backfill must be a safe v2 startup no-op"),
+            0
+        );
+        assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM project_view_objects \
                  WHERE community_id = $1 AND schema_version <> 2",

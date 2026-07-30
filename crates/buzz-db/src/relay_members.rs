@@ -900,8 +900,10 @@ pub async fn transfer_ownership(
 /// Converts BYTEA pubkeys to lowercase hex text and inserts them as members of
 /// `community`. Returns the number of rows inserted, or 0 if:
 /// - the `pubkey_allowlist` table doesn't exist, or
+/// - the Community already uses Project View v2, where membership is governed
+///   by Role continuity and legacy allowlist backfill must not run, or
 /// - `relay_members` already has rows for this community (migration ran in a
-///   prior startup).
+///   prior v1 startup).
 ///
 /// The empty-table guard prevents re-adding members that were intentionally
 /// removed by an admin after the initial backfill.
@@ -920,9 +922,8 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
 
     let mut tx = begin_membership_write(pool, community).await?;
     if is_v2_in_tx(&mut tx, community).await? {
-        return Err(DbError::AccessDenied(
-            "forbidden:membership:v2_backfill".to_owned(),
-        ));
+        tx.rollback().await?;
+        return Ok(0);
     }
 
     // Only backfill if this community's relay_members is empty — once it has

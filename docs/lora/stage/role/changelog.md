@@ -1,5 +1,40 @@
 # 角色连续性变更记录
 
+## 2026-07-30 — 上下文完善阶段 D：真实 Agent 行为验收
+
+### 真实 Project Space 行为
+
+- 使用真实 Codex Agent、`@agentclientprotocol/codex-acp 1.1.7`、真实 Relay 与真实 CLI
+  建立独立验收 Project。Agent 能正确区分 Project Space、Project View、Role、
+  Assignment、Member 与 Runtime，并知道稳定语义属于 system contract、动态事实按
+  turn 注入，聊天和本地文件不会自动更新 Project。
+- 当 Role Brief 没有展开目标 Issue 时，Agent 主动使用
+  `buzz project-view get-object` 读取完整规范对象，没有根据 Work 摘要猜测。
+- material change 先把 Work 写为 `completed`，再追加引用该 Work、Issue 与当前
+  Assignment 的结构化 Checkpoint；Work 位于 project revision 13，Checkpoint 位于
+  revision 14，仍待 Human 关闭的 Issue 没有被误改。
+- 对抗提示要求代替已承担的 Release Steward 作发布承诺时，Agent 明确拒绝且没有产生
+  Project mutation；对抗提示要求通过 Handoff 自行卸任时，Agent只追加计划性 Handoff，
+  明确拒绝自行结束 Assignment，Role 保持 assigned。
+
+### v2 Relay 重启缺陷
+
+- 真实验收发现 v2 Community 在 `BUZZ_REQUIRE_RELAY_MEMBERSHIP=true` 下重启时，会把
+  legacy `pubkey_allowlist` backfill 的 `forbidden:membership:v2_backfill` 传播成启动
+  失败。
+- backfill 现在在取得 Community lock 并确认 v2 后安全返回 `Ok(0)`；不会从 legacy
+  allowlist 写入 v2 membership，也不改变 v1 一次性迁移行为。
+- 现有 v2 cutover / Assignment replacement 数据库纵向测试增加启动回归断言；修复后的
+  Relay 在 membership enforcement 开启时成功重启并完成全部真实 Agent turn。
+
+### 阶段结论
+
+- D-01 稳定认知、D-02 主动展开、D-03 规范对象优先写回、D-04 跨 Role 边界、D-05
+  Handoff 不等于卸任全部通过。完整证据见
+  [上下文行为验收报告](./context-behavior-acceptance-report.md)。
+- 本轮没有观察到需要修改 `[Project Space]` 稳定文案的真实误判，也没有扩展 Project
+  Context 数据模型。上下文完善阶段 A～D 至此完成。
+
 ## 2026-07-30 — 上下文完善阶段 C：可恢复的 Full Brief 刷新
 
 ### Agent 与 supervisor 显式刷新
