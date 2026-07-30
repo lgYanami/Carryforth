@@ -103,6 +103,24 @@ impl RunCtx<'_> {
             *self.handoff_count,
             self.history.len()
         );
+        // The compaction happens inside the current ACP turn, so it must not
+        // trigger another prompt injection immediately. Report the context
+        // loss to the harness; it will force a Full Role Brief at the next
+        // complete turn boundary.
+        crate::wire::send(
+            self.wire,
+            crate::wire::session_update_with_buzz_meta(
+                self.session_id,
+                serde_json::json!({"sessionUpdate": "session_info_update"}),
+                serde_json::json!({
+                    "contextReset": {
+                        "reason": "compaction",
+                        "handoff": *self.handoff_count,
+                    }
+                }),
+            ),
+        )
+        .await;
         HandoffOutcome::Performed
     }
 

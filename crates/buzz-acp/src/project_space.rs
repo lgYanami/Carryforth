@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 ///
 /// The content hash is also part of [`contract_id`], so changing the wording
 /// invalidates old sessions even if this version is accidentally left alone.
-pub(crate) const PROJECT_SPACE_CONTRACT_VERSION: &str = "1";
+pub(crate) const PROJECT_SPACE_CONTRACT_VERSION: &str = "2";
 
 /// Stable Project Space operating contract.
 ///
@@ -22,7 +22,7 @@ You operate inside one persistent Buzz Project Space. One Buzz Community is one 
 
 Project View is the shared canonical view of the Project's current direct state. A Role is a stable responsibility position. An Assignment is one Member's bounded tenure in a Role and the fence for role-bearing writes. A Member is a Human or Agent identified by a stable community identity; a Runtime is only a short-lived executor. Persona, model, session, and Runtime are not the Role.
 
-At the start of each complete turn you receive a full [Role Brief], a compact [Role Binding], or an unavailable state. These are verified, revision-bound projections, not separate facts or cached authorization. A Role Brief summarizes the current project and role situation; a Role Binding confirms that the same verified assignment and revision still apply. Use the Role Directory to find active responsibility boundaries and vacancies. Use `buzz project-view` and `buzz roles` to inspect details, full Role definitions, current assignments, checkpoints, and handoffs when the injected slice is insufficient.
+At the start of each complete turn you receive a full [Role Brief], a compact [Role Binding], or an unavailable state. These are verified, revision-bound projections, not separate facts or cached authorization. A Role Brief summarizes the current project and role situation; a Role Binding confirms that the same verified assignment and revision still apply. Use the Role Directory to find active responsibility boundaries and vacancies. Use `buzz project-view` and `buzz roles` to inspect details, full Role definitions, current assignments, checkpoints, and handoffs when the injected slice is insufficient. To immediately rebuild and read your own complete Role Brief, run `buzz roles brief --markdown`.
 
 Chat, local files, tool output, and Agent memory do not update the Project automatically. Write direct current-state changes to their owning Project View objects. After a material change in progress, blockers, risks, open questions, or next steps, append a Role Checkpoint that references the underlying facts instead of duplicating them. Use Handoff for transition context; a Handoff does not end an Assignment, and an Agent cannot use it to resign itself.
 
@@ -69,6 +69,7 @@ mod tests {
             "Handoff",
             "`buzz project-view`",
             "`buzz roles`",
+            "`buzz roles brief --markdown`",
             "do not update the Project automatically",
             "never grants authority",
         ] {
@@ -93,7 +94,7 @@ mod tests {
     #[test]
     fn contract_id_changes_with_version_or_content() {
         let current = contract_id();
-        assert_ne!(current, content_id("2", PROJECT_SPACE_SECTION.as_bytes()));
+        assert_ne!(current, content_id("3", PROJECT_SPACE_SECTION.as_bytes()));
         assert_ne!(
             current,
             content_id(PROJECT_SPACE_CONTRACT_VERSION, b"[Project Space]\nchanged")

@@ -41,7 +41,7 @@ use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    PromptResult, PromptSource, RoleContextRefreshRequestResult, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -888,9 +888,54 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("refresh_role_context") => {
+            handle_refresh_role_context_control(&payload, pool, observer);
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
+    }
+}
+
+/// Handle a `refresh_role_context` control frame without interrupting work.
+///
+/// The request applies at the next complete turn. An active native steer or
+/// tool call remains part of its current turn and does not become a synthetic
+/// Role Context or authorization boundary.
+fn handle_refresh_role_context_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(channel_id) = payload
+        .get("channelId")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<Uuid>().ok())
+    else {
+        tracing::warn!("observer refresh_role_context control frame missing valid channelId");
+        return;
+    };
+
+    let status = match pool.request_role_context_refresh(channel_id) {
+        RoleContextRefreshRequestResult::Scheduled => "scheduled",
+        RoleContextRefreshRequestResult::NextSessionFull => "next_session_full",
+    };
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: None,
+                turn_id: None,
+                started_at: None,
+            },
+            serde_json::json!({
+                "type": "refresh_role_context",
+                "status": status,
+                "appliesAt": "next_complete_turn",
+            }),
+        );
     }
 }
 
@@ -3294,6 +3339,13 @@ fn handle_prompt_result(
     // only touches idle agents.
     for ch in removed_channels {
         result.agent.state.invalidate_channel(ch);
+    }
+    if let PromptSource::Channel(channel_id) = &result.source {
+        if removed_channels.contains(channel_id) {
+            pool.discard_pending_role_context_refresh(*channel_id);
+        } else {
+            pool.apply_pending_role_context_refresh(&mut result.agent.state, &result.source);
+        }
     }
 
     let outcome_label = match &result.outcome {

@@ -94,6 +94,11 @@ pub struct SessionState {
     project_space_contract_ids: HashMap<Uuid, [u8; 32]>,
     /// Contract content ID installed in the active heartbeat session.
     heartbeat_project_space_contract_id: Option<[u8; 32]>,
+    /// Explicit Full Role Context refreshes waiting for a complete channel
+    /// turn. Kept outside the ACP session map so a failed delivery can retry.
+    forced_role_context_refreshes: HashMap<Uuid, RoleContextRefreshReason>,
+    /// Explicit Full Role Context refresh waiting for a heartbeat turn.
+    heartbeat_forced_role_context_refresh: Option<RoleContextRefreshReason>,
     /// Per-channel turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<Uuid, u32>,
@@ -112,6 +117,57 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    fn session_id(&self, source: &PromptSource) -> Option<&str> {
+        match source {
+            PromptSource::Channel(channel_id) => self.sessions.get(channel_id).map(String::as_str),
+            PromptSource::Heartbeat => self.heartbeat_session.as_deref(),
+        }
+    }
+
+    fn force_role_context_refresh(
+        &mut self,
+        source: &PromptSource,
+        reason: RoleContextRefreshReason,
+    ) {
+        match source {
+            PromptSource::Channel(channel_id) => {
+                self.forced_role_context_refreshes
+                    .insert(*channel_id, reason);
+            }
+            PromptSource::Heartbeat => {
+                self.heartbeat_forced_role_context_refresh = Some(reason);
+            }
+        }
+    }
+
+    fn forced_role_context_refresh(
+        &self,
+        source: &PromptSource,
+    ) -> Option<RoleContextRefreshReason> {
+        match source {
+            PromptSource::Channel(channel_id) => {
+                self.forced_role_context_refreshes.get(channel_id).copied()
+            }
+            PromptSource::Heartbeat => self.heartbeat_forced_role_context_refresh,
+        }
+    }
+
+    /// Consume an explicit request only after a Full Brief reached a successful
+    /// complete turn. Unavailable or failed deliveries remain Full on retry.
+    fn acknowledge_role_context_refresh(&mut self, source: &PromptSource, delivered_full: bool) {
+        if !delivered_full {
+            return;
+        }
+        match source {
+            PromptSource::Channel(channel_id) => {
+                self.forced_role_context_refreshes.remove(channel_id);
+            }
+            PromptSource::Heartbeat => {
+                self.heartbeat_forced_role_context_refresh = None;
+            }
+        }
+    }
+
     /// Invalidate the session (and turn counter) for a specific prompt source.
     pub fn invalidate(&mut self, source: &PromptSource) {
         match source {
@@ -281,6 +337,9 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    /// Supervisor refreshes received while an Agent is checked out. Applied to
+    /// its SessionState when the in-flight turn returns.
+    pending_role_context_refreshes: HashSet<Uuid>,
 }
 
 /// Result returned by a completed prompt task.
@@ -301,10 +360,28 @@ pub enum PromptSource {
     Heartbeat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleContextRefreshReason {
+    Supervisor,
+    ConnectorContextReset,
+}
+
+impl RoleContextRefreshReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supervisor => "supervisor",
+            Self::ConnectorContextReset => "connector_context_reset",
+        }
+    }
+}
+
 fn role_context_refresh_for(
     state: &SessionState,
     source: &PromptSource,
 ) -> crate::role_brief::RoleContextRefresh {
+    if state.forced_role_context_refresh(source).is_some() {
+        return crate::role_brief::RoleContextRefresh::Full;
+    }
     let session_exists = match source {
         PromptSource::Channel(channel_id) => state.sessions.contains_key(channel_id),
         PromptSource::Heartbeat => state.heartbeat_session.is_some(),
@@ -313,6 +390,17 @@ fn role_context_refresh_for(
         crate::role_brief::RoleContextRefresh::Incremental
     } else {
         crate::role_brief::RoleContextRefresh::Full
+    }
+}
+
+fn role_context_refresh_reason_for(state: &SessionState, source: &PromptSource) -> &'static str {
+    if let Some(reason) = state.forced_role_context_refresh(source) {
+        return reason.as_str();
+    }
+    if state.session_id(source).is_some() {
+        "normal_turn"
+    } else {
+        "new_session"
     }
 }
 
@@ -630,6 +718,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            pending_role_context_refreshes: HashSet::new(),
         }
     }
 
@@ -703,6 +792,66 @@ impl AgentPool {
 
     pub fn task_map_mut(&mut self) -> &mut HashMap<tokio::task::Id, TaskMeta> {
         &mut self.task_map
+    }
+
+    /// Schedule a Full Role Brief for the channel's next complete turn.
+    ///
+    /// Idle sessions are marked immediately. When the Agent is checked out,
+    /// the request is held by the pool and attached when that turn returns.
+    /// A channel without any session needs no marker because session creation
+    /// already selects Full.
+    pub fn request_role_context_refresh(
+        &mut self,
+        channel_id: Uuid,
+    ) -> RoleContextRefreshRequestResult {
+        let turn_in_flight = self
+            .task_map
+            .values()
+            .any(|meta| meta.channel_id == Some(channel_id));
+        if turn_in_flight {
+            self.pending_role_context_refreshes.insert(channel_id);
+        }
+
+        // More than one pool slot may retain affinity for the same channel
+        // after earlier concurrent work. Mark every idle copy as well as the
+        // checked-out copy so slot ordering cannot bypass the refresh.
+        let mut marked = turn_in_flight;
+        for agent in self.agents.iter_mut().flatten() {
+            if agent.state.sessions.contains_key(&channel_id) {
+                agent.state.force_role_context_refresh(
+                    &PromptSource::Channel(channel_id),
+                    RoleContextRefreshReason::Supervisor,
+                );
+                marked = true;
+            }
+        }
+
+        if marked {
+            RoleContextRefreshRequestResult::Scheduled
+        } else {
+            RoleContextRefreshRequestResult::NextSessionFull
+        }
+    }
+
+    /// Apply and consume a supervisor refresh queued while a turn was active.
+    pub fn apply_pending_role_context_refresh(
+        &mut self,
+        state: &mut SessionState,
+        source: &PromptSource,
+    ) -> bool {
+        let PromptSource::Channel(channel_id) = source else {
+            return false;
+        };
+        if !self.pending_role_context_refreshes.remove(channel_id) {
+            return false;
+        }
+        state.force_role_context_refresh(source, RoleContextRefreshReason::Supervisor);
+        true
+    }
+
+    /// Drop a queued refresh when its channel is no longer in scope.
+    pub fn discard_pending_role_context_refresh(&mut self, channel_id: Uuid) -> bool {
+        self.pending_role_context_refreshes.remove(&channel_id)
     }
 
     /// Try to send a goose-native steer request to the in-flight task for
@@ -856,6 +1005,15 @@ pub enum IdleSwitchResult {
     UnsupportedModel,
     /// No idle agent available (all checked out / none spawned).
     NoIdleAgent,
+}
+
+/// Outcome of scheduling a supervisor-requested Full Role Brief.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RoleContextRefreshRequestResult {
+    /// An existing or in-flight session was marked for its next complete turn.
+    Scheduled,
+    /// No active session exists; ordinary session creation already guarantees Full.
+    NextSessionFull,
 }
 
 /// Timeout for a single pre-prompt context fetch attempt (thread/DM history).
@@ -1462,6 +1620,17 @@ pub async fn run_prompt_task(
     // before choosing Full versus Incremental Role Context: a stale session
     // must be rebuilt and receive a fresh full Brief, while ordinary Project
     // revision changes leave the system contract/session intact.
+    let connector_context_reset =
+        agent
+            .state
+            .session_id(&source)
+            .map(str::to_owned)
+            .and_then(|session_id| {
+                agent
+                    .acp
+                    .take_context_reset(&session_id)
+                    .map(|reason| (session_id, reason))
+            });
     let project_space_contract_id = crate::project_space::contract_id();
     if agent
         .state
@@ -1473,6 +1642,17 @@ pub async fn run_prompt_task(
             "invalidated session with stale Project Space contract"
         );
     }
+    if let Some((session_id, reason)) = connector_context_reset {
+        agent
+            .state
+            .force_role_context_refresh(&source, RoleContextRefreshReason::ConnectorContextReset);
+        tracing::info!(
+            target: "pool::role_brief",
+            session_id,
+            reason,
+            "connector context reset forces Full Role Brief on this complete turn"
+        );
+    }
 
     // Role identity is dynamic authorization context, not session
     // configuration. Every complete channel prompt and heartbeat verifies the
@@ -1481,13 +1661,31 @@ pub async fn run_prompt_task(
     // rebuilt session always receives a newly assembled full Brief. Any current
     // read failure remains fail closed and never injects the cached binding.
     let role_context_refresh = role_context_refresh_for(&agent.state, &source);
+    let role_context_refresh_reason = role_context_refresh_reason_for(&agent.state, &source);
     let role_context = ctx
         .role_brief_resolver
         .resolve_bounded(role_context_refresh)
         .await;
+    let role_directory = role_context.role_directory_total.map(|total| {
+        let shown = role_context.role_directory_shown.unwrap_or_default();
+        let omitted = role_context.role_directory_omitted.unwrap_or_default();
+        serde_json::json!({
+            "shown": shown,
+            "total": total,
+            "omitted": omitted,
+            "truncated": omitted > 0,
+        })
+    });
     agent.acp.observe(
         "role_context_resolved",
         serde_json::json!({
+            "contractVersion": crate::project_space::PROJECT_SPACE_CONTRACT_VERSION,
+            "contractId": hex::encode(project_space_contract_id),
+            "requestedRefresh": match role_context_refresh {
+                crate::role_brief::RoleContextRefresh::Incremental => "incremental",
+                crate::role_brief::RoleContextRefresh::Full => "full",
+            },
+            "refreshReason": role_context_refresh_reason,
             "status": role_context.status,
             "mode": role_context.mode,
             "assignmentId": role_context.assignment_id,
@@ -1495,6 +1693,7 @@ pub async fn run_prompt_task(
             "projectionGeneration": role_context.projection_generation,
             "metaEventId": role_context.meta_event_id,
             "errorCode": role_context.error_code,
+            "roleDirectory": role_directory,
         }),
     );
     if let Some(code) = role_context.error_code {
@@ -1513,6 +1712,7 @@ pub async fn run_prompt_task(
             "current Role context verified"
         );
     }
+    let delivered_full_role_context = role_context.mode == "full";
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2128,6 +2328,10 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        agent.state.acknowledge_role_context_refresh(
+                            &source,
+                            delivered_full_role_context,
+                        );
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -2156,6 +2360,9 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+            agent
+                .state
+                .acknowledge_role_context_refresh(&source, delivered_full_role_context);
 
             let should_rotate = matches!(
                 stop_reason,
@@ -4569,6 +4776,156 @@ mod tests {
         assert_eq!(
             role_context_refresh_for(&state, &PromptSource::Heartbeat),
             RoleContextRefresh::Full
+        );
+    }
+
+    #[test]
+    fn explicit_role_context_refresh_retries_until_a_full_brief_is_delivered() {
+        use crate::role_brief::RoleContextRefresh;
+
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "session-a".to_owned());
+        state.force_role_context_refresh(&source, RoleContextRefreshReason::Supervisor);
+
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_reason_for(&state, &source),
+            "supervisor"
+        );
+
+        state.acknowledge_role_context_refresh(&source, false);
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            RoleContextRefresh::Full,
+            "an unavailable or failed delivery must retain the explicit request"
+        );
+
+        state.acknowledge_role_context_refresh(&source, true);
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            RoleContextRefresh::Incremental
+        );
+        assert_eq!(
+            role_context_refresh_reason_for(&state, &source),
+            "normal_turn"
+        );
+    }
+
+    #[test]
+    fn connector_context_reset_forces_the_next_complete_heartbeat() {
+        let source = PromptSource::Heartbeat;
+        let mut state = SessionState {
+            heartbeat_session: Some("heartbeat-a".to_owned()),
+            ..SessionState::default()
+        };
+        state.force_role_context_refresh(&source, RoleContextRefreshReason::ConnectorContextReset);
+
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_reason_for(&state, &source),
+            "connector_context_reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_supervisor_refresh_is_attached_when_the_turn_returns() {
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let mut pool = AgentPool::from_slots(vec![]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "turn-a".to_owned(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+
+        assert_eq!(
+            pool.request_role_context_refresh(channel_id),
+            RoleContextRefreshRequestResult::Scheduled
+        );
+
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "session-a".to_owned());
+        assert!(pool.apply_pending_role_context_refresh(&mut state, &source));
+        assert!(!pool.apply_pending_role_context_refresh(&mut state, &source));
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_reason_for(&state, &source),
+            "supervisor"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_supervisor_refresh_marks_every_session_with_channel_affinity() {
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let mut slots = Vec::new();
+        for index in 0..2 {
+            let acp = AcpClient::spawn(
+                "bash",
+                &["-c".to_owned(), "sleep 10".to_owned()],
+                &[],
+                false,
+            )
+            .await
+            .expect("spawn inert test agent");
+            let mut state = SessionState::default();
+            state
+                .sessions
+                .insert(channel_id, format!("session-{index}"));
+            slots.push(Some(OwnedAgent {
+                index,
+                acp,
+                state,
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                agent_name: "unknown".to_owned(),
+                goose_system_prompt_supported: None,
+                protocol_version: 2,
+            }));
+        }
+        let mut pool = AgentPool::from_slots(slots);
+
+        assert_eq!(
+            pool.request_role_context_refresh(channel_id),
+            RoleContextRefreshRequestResult::Scheduled
+        );
+        for agent in pool.agents.iter().flatten() {
+            assert_eq!(
+                role_context_refresh_for(&agent.state, &source),
+                crate::role_brief::RoleContextRefresh::Full
+            );
+            assert_eq!(
+                role_context_refresh_reason_for(&agent.state, &source),
+                "supervisor"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_refresh_without_a_session_uses_normal_new_session_full() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        assert_eq!(
+            pool.request_role_context_refresh(Uuid::new_v4()),
+            RoleContextRefreshRequestResult::NextSessionFull
         );
     }
 

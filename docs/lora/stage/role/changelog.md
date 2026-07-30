@@ -1,5 +1,50 @@
 # 角色连续性变更记录
 
+## 2026-07-30 — 上下文完善阶段 C：可恢复的 Full Brief 刷新
+
+### Agent 与 supervisor 显式刷新
+
+- `[Project Space]` contract 升级到 version 2，明确
+  `buzz roles brief --markdown` 会立即从 Relay 重建并读取 Agent 自己的完整 Role
+  Brief；Agent 不需要销毁 session，也不必把旧 Binding 当作完整局势。
+- Desktop / owner observer control 增加 `refresh_role_context`。supervisor 可以为指定
+  channel 安排下一完整 turn 强制 Full Brief；如果 Agent 正在执行，刷新请求由 pool
+  暂存到该 turn 返回，如果当前没有 session，则下一次 session 创建本来就会使用 Full。
+- refresh control 不取消正在执行的 turn，不制造 requeue，也不改变 Assignment 或
+  Runtime fence。请求只在 Full Brief 成功进入一个完整 turn 后消费；unavailable 或
+  交付失败会在后续完整 turn 继续请求 Full。
+
+### connector compaction / reset 协议
+
+- Buzz ACP 定义窄扩展
+  `session/update.params.update._meta.buzz.contextReset`，按 `sessionId` 有界保存
+  connector 报告的上下文丢失；下一完整 turn 消费该信号并强制重建 Full Brief。
+- Buzz Agent 在内部 handoff 完成、模型可见 history 已经 compaction 后发送
+  `{reason: "compaction", handoff: N}`。当前 turn 继续运行；不会在 compaction 点插入
+  第二份 Role Context。
+- 未携带该精确信号的 native steer、tool call、keepalive 或普通 session update 不会
+  触发刷新，因此仍保持“每个完整 channel turn / heartbeat 一个动态 Role Context”
+  的边界。
+
+### observer 诊断
+
+- `role_context_resolved` 现在同时记录 Project Space contract version / content ID、
+  请求类型 `full | incremental`、刷新原因、实际结果
+  `full | compact | unavailable`，以及 Full Brief 的 Role Directory
+  `shown / total / omitted / truncated`。
+- connector reset 被识别时额外产生 `context_reset_detected`，说明 session、原因和
+  `next_complete_turn` 生效点；supervisor control 通过 `control_result` 返回
+  `scheduled | next_session_full`。
+- Directory 信息只随 Full observer 结果出现；compact 与 unavailable 不伪造目录，
+  observer 也不成为授权来源。
+
+### 本阶段边界
+
+- 本阶段没有新增 Project View / Role 数据表、Nostr kind、Assignment 权限或自动写回
+  行为，也没有增加前端刷新按钮；Desktop 已提供可调用的 supervisor API。
+- 下一阶段 D 是行为验收：使用真实 Agent 验证主动展开、规范对象与 Checkpoint 写回、
+  跨 Role 边界以及 Handoff 不等于主动卸任。
+
 ## 2026-07-30 — 上下文完善阶段 B：稳定 Project Space contract
 
 ### 平台契约与动态事实分层

@@ -8,6 +8,8 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+use std::collections::HashMap;
+
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -19,6 +21,10 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+/// Bound connector reset hints retained between complete turns.
+const MAX_PENDING_CONTEXT_RESETS: usize = 128;
+/// Bound connector-supplied diagnostic text retained per reset hint.
+const MAX_CONTEXT_RESET_REASON_CHARS: usize = 64;
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -200,6 +206,10 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Session-scoped connector hints that the model-visible context was
+    /// compacted or reset during an in-flight turn. The next complete turn
+    /// consumes the hint and requests a Full Role Brief.
+    pending_context_resets: HashMap<String, String>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -224,6 +234,22 @@ fn deep_merge(
                 base.insert(k, overlay_val);
             }
         }
+    }
+}
+
+fn buzz_context_reset_reason(update: &serde_json::Value) -> Option<&str> {
+    let signal = update
+        .get("_meta")
+        .and_then(|meta| meta.get("buzz"))
+        .and_then(|buzz| buzz.get("contextReset"))?;
+    match signal {
+        serde_json::Value::Bool(true) => Some("connector_reset"),
+        serde_json::Value::String(reason) if !reason.trim().is_empty() => Some(reason),
+        serde_json::Value::Object(details) => details
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty()),
+        _ => None,
     }
 }
 
@@ -522,6 +548,7 @@ impl AcpClient {
             active_run_id: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            pending_context_resets: HashMap::new(),
         })
     }
 
@@ -556,6 +583,40 @@ impl AcpClient {
                 payload,
             );
         }
+    }
+
+    /// Consume a connector-reported context reset for one ACP session.
+    ///
+    /// This is intentionally one-shot: once the next complete turn has
+    /// promoted its Role Context request to Full, [`SessionState`](crate::pool::SessionState)
+    /// owns retrying that request until a Full Brief is successfully delivered.
+    pub(crate) fn take_context_reset(&mut self, session_id: &str) -> Option<String> {
+        self.pending_context_resets.remove(session_id)
+    }
+
+    fn record_context_reset(&mut self, session_id: &str, reason: &str) {
+        let reason: String = reason
+            .trim()
+            .chars()
+            .take(MAX_CONTEXT_RESET_REASON_CHARS)
+            .collect();
+        if !self.pending_context_resets.contains_key(session_id)
+            && self.pending_context_resets.len() >= MAX_PENDING_CONTEXT_RESETS
+        {
+            if let Some(eviction_candidate) = self.pending_context_resets.keys().next().cloned() {
+                self.pending_context_resets.remove(&eviction_candidate);
+            }
+        }
+        self.pending_context_resets
+            .insert(session_id.to_owned(), reason.clone());
+        self.observe(
+            "context_reset_detected",
+            serde_json::json!({
+                "sessionId": session_id,
+                "reason": reason,
+                "appliesAt": "next_complete_turn",
+            }),
+        );
     }
 
     /// Send the `initialize` request and return the agent's response result value.
@@ -1556,6 +1617,13 @@ impl AcpClient {
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+
+        if let (Some(session_id), Some(reason)) = (
+            msg["params"]["sessionId"].as_str(),
+            buzz_context_reset_reason(update),
+        ) {
+            self.record_context_reset(session_id, reason);
+        }
 
         match update_type {
             "agent_message_chunk" => {
@@ -3178,6 +3246,64 @@ mod tests {
             Some("run-stable"),
             "non-string/non-null activeRunId must leave state untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn buzz_context_reset_is_session_scoped_and_one_shot() {
+        let mut client = spawn_inert_client().await;
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-a",
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "buzz": {
+                            "contextReset": {
+                                "reason": "compaction",
+                                "handoff": 1
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let _ = client.handle_session_update(&msg);
+
+        assert!(client.take_context_reset("session-b").is_none());
+        assert_eq!(
+            client.take_context_reset("session-a").as_deref(),
+            Some("compaction")
+        );
+        assert!(client.take_context_reset("session-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn buzz_context_reset_ignores_false_or_malformed_hints() {
+        let mut client = spawn_inert_client().await;
+        for signal in [
+            serde_json::json!(false),
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!({"reason": ""}),
+        ] {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-a",
+                    "update": {
+                        "sessionUpdate": "session_info_update",
+                        "_meta": {"buzz": {"contextReset": signal}}
+                    }
+                }
+            });
+            let _ = client.handle_session_update(&msg);
+        }
+
+        assert!(client.take_context_reset("session-a").is_none());
     }
 
     // ── Goose-native steer arm tests ──────────────────────────────────────

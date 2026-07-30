@@ -167,6 +167,26 @@ pub fn session_update_with_goose_meta(sid: &str, update: Value, goose_meta: Valu
     })
 }
 
+/// A `session/update` notification carrying a
+/// `update._meta.buzz.contextReset` extension.
+///
+/// Buzz Agent emits this after it compacts its model-visible history. A Buzz
+/// ACP harness consumes the hint on the next complete turn and forces a Full
+/// Role Brief; the current turn continues without creating a false turn or
+/// authorization boundary.
+pub fn session_update_with_buzz_meta(sid: &str, update: Value, buzz_meta: Value) -> Value {
+    let mut update = update;
+    update["_meta"] = json!({ "buzz": buzz_meta });
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": sid,
+            "update": update,
+        },
+    })
+}
+
 pub async fn send(wire: &WireSender, msg: Value) {
     let _ = wire.send(WireMsg::Notify(msg)).await;
 }
@@ -289,5 +309,29 @@ mod tests {
         });
         let params: SessionNewParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.system_prompt, Some(String::new()));
+    }
+
+    #[test]
+    fn buzz_context_reset_meta_uses_the_session_update_extension_shape() {
+        let update = session_update_with_buzz_meta(
+            "session-a",
+            json!({"sessionUpdate": "session_info_update"}),
+            json!({"contextReset": {"reason": "compaction", "handoff": 2}}),
+        );
+
+        assert_eq!(update["method"], "session/update");
+        assert_eq!(update["params"]["sessionId"], "session-a");
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "session_info_update"
+        );
+        assert_eq!(
+            update["params"]["update"]["_meta"]["buzz"]["contextReset"]["reason"],
+            "compaction"
+        );
+        assert_eq!(
+            update["params"]["update"]["_meta"]["buzz"]["contextReset"]["handoff"],
+            2
+        );
     }
 }

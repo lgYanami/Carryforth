@@ -29,3 +29,17 @@ export async function switchManagedAgentModel(
     modelId,
   });
 }
+
+/**
+ * Ask the harness to inject a newly rebuilt Full Role Brief at the Agent's
+ * next complete turn. This does not cancel or split an in-flight turn.
+ */
+export async function refreshManagedAgentRoleContext(
+  pubkey: string,
+  channelId: string,
+): Promise<void> {
+  await sendAgentObserverControl(pubkey, {
+    type: "refresh_role_context",
+    channelId,
+  });
+}

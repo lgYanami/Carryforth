@@ -59,6 +59,12 @@ pub struct RoleContextResolution {
     pub meta_event_id: Option<EventId>,
     /// Stable failure category when unavailable.
     pub error_code: Option<&'static str>,
+    /// Total active Roles in the verified directory, only for a Full Brief.
+    pub role_directory_total: Option<u32>,
+    /// Active Roles included in the bounded directory, only for a Full Brief.
+    pub role_directory_shown: Option<u32>,
+    /// Active Roles omitted by the prompt budget, only for a Full Brief.
+    pub role_directory_omitted: Option<u32>,
 }
 
 impl RoleContextResolution {
@@ -72,10 +78,14 @@ impl RoleContextResolution {
             projection_generation: None,
             meta_event_id: None,
             error_code: Some(code),
+            role_directory_total: None,
+            role_directory_shown: None,
+            role_directory_omitted: None,
         }
     }
 
     fn full(brief: &RoleBrief) -> Self {
+        let directory = &brief.role_directory;
         Self {
             markdown: render_role_brief_markdown(brief),
             status: brief.state.status(),
@@ -85,6 +95,13 @@ impl RoleContextResolution {
             projection_generation: Some(brief.projection_generation),
             meta_event_id: Some(brief.source_revisions.meta_event_id),
             error_code: None,
+            role_directory_total: Some(directory.total_active_roles),
+            role_directory_shown: Some(
+                directory
+                    .total_active_roles
+                    .saturating_sub(directory.omitted_active_roles),
+            ),
+            role_directory_omitted: Some(directory.omitted_active_roles),
         }
     }
 }
@@ -141,6 +158,9 @@ impl CachedRoleBinding {
             projection_generation: Some(self.projection_generation),
             meta_event_id: Some(self.meta_event_id),
             error_code: None,
+            role_directory_total: None,
+            role_directory_shown: None,
+            role_directory_omitted: None,
         }
     }
 }
@@ -575,6 +595,9 @@ mod tests {
         assert_eq!(full.mode, "full");
         assert!(full.markdown.starts_with("[Role Brief]"));
         assert!(full.markdown.contains("Project: Lora v1"));
+        assert_eq!(full.role_directory_total, Some(0));
+        assert_eq!(full.role_directory_shown, Some(0));
+        assert_eq!(full.role_directory_omitted, Some(0));
         assert_eq!(
             state.lock().expect("mock state").counts,
             MockQueryCounts {
@@ -592,6 +615,9 @@ mod tests {
         assert_eq!(compact.mode, "compact");
         assert!(compact.markdown.starts_with("[Role Binding]"));
         assert!(!compact.markdown.contains("Purpose:"));
+        assert!(compact.role_directory_total.is_none());
+        assert!(compact.role_directory_shown.is_none());
+        assert!(compact.role_directory_omitted.is_none());
         assert_eq!(
             state.lock().expect("mock state").counts,
             MockQueryCounts {
@@ -626,6 +652,9 @@ mod tests {
         assert_eq!(unavailable.mode, "unavailable");
         assert!(unavailable.markdown.starts_with("[Role Brief]"));
         assert!(!unavailable.markdown.starts_with("[Role Binding]"));
+        assert!(unavailable.role_directory_total.is_none());
+        assert!(unavailable.role_directory_shown.is_none());
+        assert!(unavailable.role_directory_omitted.is_none());
         assert_eq!(
             state.lock().expect("mock state").counts,
             MockQueryCounts {
