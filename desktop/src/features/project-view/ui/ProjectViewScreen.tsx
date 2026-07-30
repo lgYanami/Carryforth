@@ -2,9 +2,11 @@ import * as React from "react";
 import {
   AlertCircle,
   Boxes,
+  ChevronRight,
   CircleDot,
   Flag,
   GitBranch,
+  LayoutDashboard,
   Map as MapIcon,
   Plus,
   RefreshCw,
@@ -12,21 +14,17 @@ import {
   WifiOff,
 } from "lucide-react";
 
-import {
-  useManagedAgentsQuery,
-  useRelayAgentsQuery,
-} from "@/features/agents/hooks";
-import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import {
   countProjectViewFocus,
-  indexProjectViewObjects,
   type ProjectViewCreateContext,
 } from "@/features/project-view/model";
+import { useCommunities } from "@/features/communities/useCommunities";
 import {
   useProjectViewLiveSync,
   useProjectViewQuery,
 } from "@/features/project-view/hooks";
+import { useProjectViewActors } from "@/features/project-view/useProjectViewActors";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
 import { ProjectViewDeleteDialog } from "@/features/project-view/ui/ProjectViewDeleteDialog";
 import { ProjectViewInspector } from "@/features/project-view/ui/ProjectViewInspector";
@@ -56,7 +54,6 @@ import type {
   ProjectViewObjectType,
   ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
-import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   isRelayConnectionDegraded,
   useRelayConnection,
@@ -66,6 +63,7 @@ import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 
 type ProjectViewScreenProps = {
+  onOpenOverview?: () => void;
   onSelectObject: (objectId: string | undefined) => void;
   selectedObjectId?: string;
 };
@@ -419,67 +417,10 @@ function ReadyProjectView({
 
   const [editor, setEditor] = React.useState<EditorRequest>();
   const [deleteTarget, setDeleteTarget] = React.useState<ProjectViewObject>();
-  const objectsById = React.useMemo(
-    () => indexProjectViewObjects(view),
-    [view],
+  const { actorProfiles, currentPubkey, objectsById } = useProjectViewActors(
+    view,
+    roleContinuity,
   );
-  const actorPubkeys = React.useMemo(() => {
-    const pubkeys = new Set<string>();
-    for (const object of objectsById.values()) {
-      pubkeys.add(object.createdBy);
-      pubkeys.add(object.updatedBy);
-    }
-    if (roleContinuity) {
-      for (const member of roleContinuity.members) pubkeys.add(member.pubkey);
-      for (const assignment of roleContinuity.assignments) {
-        pubkeys.add(assignment.memberPubkey);
-        pubkeys.add(assignment.startedBy);
-        if (assignment.endedBy) pubkeys.add(assignment.endedBy);
-      }
-      for (const proposal of roleContinuity.proposals) {
-        pubkeys.add(proposal.candidatePubkey);
-        pubkeys.add(proposal.createdBy);
-        if (proposal.authorizedBy) pubkeys.add(proposal.authorizedBy);
-      }
-    }
-    return [...pubkeys];
-  }, [objectsById, roleContinuity]);
-  const actorProfilesQuery = useUsersBatchQuery(actorPubkeys);
-  const managedAgentsQuery = useManagedAgentsQuery();
-  const relayAgentsQuery = useRelayAgentsQuery();
-  const identityQuery = useIdentityQuery();
-  const actorProfiles = React.useMemo<UserProfileLookup>(() => {
-    const profiles = { ...(actorProfilesQuery.data?.profiles ?? {}) };
-    const actorSet = new Set(
-      actorPubkeys.map((pubkey) => pubkey.toLowerCase()),
-    );
-    const knownAgents = [
-      ...(relayAgentsQuery.data ?? []),
-      ...(managedAgentsQuery.data ?? []),
-    ];
-    for (const agent of knownAgents) {
-      const pubkey = agent.pubkey.toLowerCase();
-      if (!actorSet.has(pubkey)) continue;
-      const existing = profiles[pubkey];
-      profiles[pubkey] = {
-        avatarUrl:
-          existing?.avatarUrl ??
-          ("avatarUrl" in agent ? agent.avatarUrl : null),
-        displayName: existing?.displayName ?? agent.name,
-        isAgent: true,
-        name: existing?.name ?? agent.name,
-        nip05Handle: existing?.nip05Handle ?? null,
-        ownerPubkey: existing?.ownerPubkey ?? null,
-      };
-    }
-    return profiles;
-  }, [
-    actorProfilesQuery.data?.profiles,
-    actorPubkeys,
-    managedAgentsQuery.data,
-    relayAgentsQuery.data,
-  ]);
-  const currentPubkey = identityQuery.data?.pubkey;
   const selectedObject = selectedObjectId
     ? objectsById.get(selectedObjectId)
     : undefined;
@@ -694,9 +635,11 @@ function ReadyProjectView({
 }
 
 export function ProjectViewScreen({
+  onOpenOverview,
   onSelectObject,
   selectedObjectId,
 }: ProjectViewScreenProps) {
+  const { activeCommunity } = useCommunities();
   const [initializationDraft, setInitializationDraft] = React.useState(
     createProjectViewInitializationDraft,
   );
@@ -746,6 +689,17 @@ export function ProjectViewScreen({
     fatalError instanceof Error
       ? fatalError.message
       : "The Relay returned an unexpected Project View response.";
+  const openOverview = React.useCallback(() => {
+    if (
+      isProjectViewInitializationDraftDirty(initializationDraft) &&
+      !window.confirm(
+        "Leave the full Project View and discard this unsubmitted initialization draft?",
+      )
+    ) {
+      return;
+    }
+    onOpenOverview?.();
+  }, [initializationDraft, onOpenOverview]);
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -754,11 +708,27 @@ export function ProjectViewScreen({
           className="flex h-12 items-center gap-2 px-3 sm:gap-3 sm:px-5"
           data-tauri-drag-region
         >
-          <MapIcon className="h-4 w-4 text-muted-foreground" />
+          <Button
+            className="-ml-2 min-w-0 max-w-48 shrink justify-start px-2"
+            data-testid="return-community-overview"
+            disabled={!onOpenOverview}
+            onClick={openOverview}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            <LayoutDashboard />
+            <span className="truncate">
+              {activeCommunity?.name ?? "Community"}
+            </span>
+          </Button>
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-semibold">View</div>
+            <div className="truncate text-sm font-semibold">
+              Full Project View
+            </div>
             <div className="hidden text-2xs text-muted-foreground sm:block">
-              Community project context
+              Verified project map and maintenance
             </div>
           </div>
           {!degraded &&

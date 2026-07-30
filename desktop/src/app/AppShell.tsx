@@ -125,13 +125,13 @@ export function AppShell() {
   const {
     goAgents,
     goChannel,
+    goCommunity,
     goHome,
     goNewMessage,
     goProjects,
     goPulse,
     goSettings,
     goWorkflows,
-    goView,
     closeSettings,
     openSearchHit,
   } = useAppNavigation();
@@ -146,6 +146,7 @@ export function AppShell() {
     switchCommunity: handleSwitchCommunity,
   } = useCommunityNavigationTransitions({
     communities: communitiesHook,
+    goCommunity,
     goHome,
     selectedChannelId,
     selectedView,
@@ -873,6 +874,7 @@ export function AppShell() {
                             await goChannel(directMessage.id);
                           }}
                           onSelectAgents={() => void goAgents()}
+                          onSelectCommunity={() => void goCommunity()}
                           onSelectChannel={(channelId) =>
                             void goChannel(channelId)
                           }
@@ -882,7 +884,6 @@ export function AppShell() {
                           onSelectHome={() => void goHome()}
                           onSelectProjects={() => void goProjects()}
                           onSelectPulse={() => void goPulse()}
-                          onSelectView={() => void goView()}
                           onSelectSettings={handleOpenSettings}
                           onSelectWorkflows={() => void goWorkflows()}
                           onSetPresenceStatus={(status) =>

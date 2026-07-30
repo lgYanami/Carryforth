@@ -1,6 +1,7 @@
 import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { usePreviewFeatureWarning } from "@/shared/features";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
@@ -29,12 +30,14 @@ export const Route = createFileRoute("/view")({
 
 function ViewRouteComponent() {
   usePreviewFeatureWarning("projectView");
+  const { goCommunity } = useAppNavigation();
   const search = Route.useSearch();
   const navigate = Route.useNavigate();
 
   return (
     <React.Suspense fallback={<ViewLoadingFallback kind="view" />}>
       <ProjectViewScreen
+        onOpenOverview={() => void goCommunity()}
         onSelectObject={(object) =>
           void navigate({
             search: (previous) => ({

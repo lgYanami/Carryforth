@@ -25,12 +25,12 @@ import {
 export const projectViewQueryKey = (communityId: string | undefined) =>
   ["project-view", communityId ?? "no-community"] as const;
 
-export function useProjectViewQuery() {
+export function useProjectViewQuery(options: { enabled?: boolean } = {}) {
   const { activeCommunity } = useCommunities();
   return useQuery({
     queryKey: projectViewQueryKey(activeCommunity?.id),
     queryFn: getProjectView,
-    enabled: Boolean(activeCommunity),
+    enabled: Boolean(activeCommunity) && (options.enabled ?? true),
     staleTime: 15_000,
     refetchOnWindowFocus: true,
   });

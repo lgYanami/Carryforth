@@ -1,5 +1,69 @@
 # Project View 变更记录
 
+## 2026-07-30 — Community 展示页承载 Project View
+
+- 新增
+  [Community 展示页中的 Project View 前端设计](./community-project-view-frontend-design.md)，
+  修正客户端 v0 将 `View` 与 Inbox、Pulse、Projects 等入口并列所造成的信息架构偏差。
+- 前端产品层级调整为“Community / Project Space 持有 Project View”：Human 主动选择
+  Community 后直接进入其展示页，默认看到 Project Profile、Current Focus、Role 与明确
+  注意事项的可信摘要，再按需展开完整 Project Map、未规划对象、Resources 和 Inspector。
+- Role 从完整 View 底部的 Supporting Object 提升为 Community 展示页的一等协作摘要；
+  owner、Leader Role、普通 Role、Assignment 与 Runtime 继续保持不同语义，完整 Role
+  Brief、Checkpoint、Handoff 和治理操作仍在 Inspector 中按需展开。
+- 独立 `View` 主侧栏入口不再是最终信息架构的一部分。现有 `/view` 与
+  `/view?object=<id>` 保留为完整展开状态和深链接兼容入口，现有 `Projects` 名称、路由
+  与 Git/NIP-34 语义保持不变。
+- 默认摘要与完整 View 必须来自同一份 native 验证后的 Project View + Role Continuity
+  snapshot，不增加第二份 Profile、Role Directory、Markdown 摘要或未验证缓存；既有
+  revision、live refresh、conflict、Community 隔离和 integrity fail-closed 边界继续
+  有效。
+- 本次只形成一份完整设计，不拆分新的开发阶段；具体组件、路由组合和迁移接缝在实现时
+  根据现有 Desktop 架构决定。
+
+### 实际页面复核后的设计修正
+
+- 复核确认改造前没有独立 Community 展示页；原 Community Rail 保存、验证并恢复每个
+  Community 的 Inbox/Channel destination。新增 Overview 不得删除这项客户端工作位置
+  连续性。
+- Human 主动选择 Community 后仍可先进入 Overview，但目标 Community 已保存的
+  destination 必须保留，并通过 `Continue in #channel` 或 `Open Inbox` 等入口继续；
+  Overview、完整 View、Inspector 和 Settings 均不覆盖该记录，失效 Channel 安全回退
+  到 Inbox。
+- Community 展示页被明确拆成稳定空间外壳与 Project View 项目区域。`projectView`
+  preview 默认关闭时，Community 身份、成员身份、继续上次工作及既有导航仍然可用；
+  启用提示只能是紧凑的次要区域，不能用大面积空状态接管整页。
+- 宽屏首屏优先 Project identity、当前方向、Current Focus、关键 Role 和显式注意事项；
+  verified/stale 等可信状态只保留一个主要标识，不以重复 badge 挤占内容。
+- destination 保存、目标 Channel 验证、不可用回退和同 Community 恢复不改路由的既有
+  测试语义必须保留，或按 Overview + Continue 的新交互改写，不能直接删除。
+
+### Desktop 初版实现（待按复核修正）
+
+- 新增 `/community` Community 展示页；侧栏固定区以当前 Community 名称提供
+  Overview 入口，独立 `View` 菜单项移除。即使只有一个 Community，Human 也可以从
+  当前空间名称返回 Overview。
+- 默认摘要直接展示 Project Profile、Goal 方向、显式状态派生的 Current Focus、Role
+  Assignment、Needs Attention、Resources，以及 project revision、projection
+  generation 和更新时间；Role 排序只用于导航便利，不写入新的领域优先级。
+- 摘要继续复用 `get_project_view` 可信读取、Community-scoped React Query key 与
+  projection live invalidation。新增共享 actor resolver，使 Overview 与完整 View
+  使用同一 snapshot 和相同 Human/Agent 身份解析，没有新增摘要表、Markdown 或
+  module-level Community cache。
+- 摘要对象通过 `/view?object=<id>` 进入现有完整 View 和 Inspector；`/view` 的
+  初始化、Add/Edit/Delete、Role Continuity、冲突恢复和深链接能力完整保留。完整 View
+  页头显示当前 Community，并提供返回 Overview 的可访问入口。
+- Human 从 Community Rail 选择另一个 Community 时，初版实现会进入 `/community`，
+  但同时删除了目标空间的 Channel 恢复路径；实际页面复核后，这一实现不再视为最终
+  设计。后续需要保留 Home teardown barrier 和 destination 校验，并在 Overview 提供
+  “继续上次工作”。
+- Unsupported、Uninitialized、Forbidden、完整性失败、普通读取失败、Loading、
+  syncing 与 offline-stale 均在 Community 项目区域内显式表达；但初版在 Project View
+  preview 关闭时形成了大面积空状态，尚未满足修订后的稳定 Community 外壳要求。
+- Desktop typecheck、Biome/文件大小/可缩放文本/公钥守卫、3508 项 unit test 和
+  Project View + Community Rail 的 46 项 Playwright 场景完成验证；其中一次切换等待
+  的测试时序缺陷修正后定向复验通过。
+
 ## 2026-07-28 — Client Slice 4：验收与体验收口
 
 ### 完整状态与失败收口

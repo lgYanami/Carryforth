@@ -4,27 +4,26 @@ import * as React from "react";
 import type { deriveShellRoute } from "@/app/AppShell.helpers";
 import type { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
-  replaceCommunityDestinationRoute,
+  replaceCommunityOverviewRoute,
   runCommunityViewTransition,
 } from "@/app/communityViewTransition";
-import {
-  loadCommunityDestination,
-  markPendingCommunityRestore,
-  saveCommunityDestination,
-} from "@/features/communities/communityNavigationStorage";
+import { saveCommunityDestination } from "@/features/communities/communityNavigationStorage";
 import type { useCommunities } from "@/features/communities/useCommunities";
 
 type Communities = ReturnType<typeof useCommunities>;
 type ShellRoute = ReturnType<typeof deriveShellRoute>;
 type GoHome = ReturnType<typeof useAppNavigation>["goHome"];
+type GoCommunity = ReturnType<typeof useAppNavigation>["goCommunity"];
 
 export function useCommunityNavigationTransitions({
   communities,
+  goCommunity,
   goHome,
   selectedChannelId,
   selectedView,
 }: {
   communities: Communities;
+  goCommunity: GoCommunity;
   goHome: GoHome;
   selectedChannelId: ShellRoute["selectedChannelId"];
   selectedView: ShellRoute["selectedView"];
@@ -46,8 +45,12 @@ export function useCommunityNavigationTransitions({
   const switchCommunity = React.useCallback(
     async (id: string) => {
       const activeCommunityId = communities.activeCommunity?.id;
-      if (id === activeCommunityId) return;
+      if (id === activeCommunityId) {
+        await goCommunity();
+        return;
+      }
       if (!activeCommunityId) {
+        replaceCommunityOverviewRoute(router.history);
         communities.switchCommunity(id);
         return;
       }
@@ -55,18 +58,11 @@ export function useCommunityNavigationTransitions({
       await runCommunityViewTransition(async () => {
         saveActiveDestination();
         await goHome({ replace: true });
-        markPendingCommunityRestore(id);
-        const destination = loadCommunityDestination(id);
-        if (destination?.kind === "channel") {
-          replaceCommunityDestinationRoute(
-            destination.channelId,
-            router.history,
-          );
-        }
+        replaceCommunityOverviewRoute(router.history);
         communities.switchCommunity(id);
       });
     },
-    [communities, goHome, router.history, saveActiveDestination],
+    [communities, goCommunity, goHome, router.history, saveActiveDestination],
   );
 
   const removeCommunity = React.useCallback(
@@ -83,14 +79,7 @@ export function useCommunityNavigationTransitions({
       await runCommunityViewTransition(async () => {
         saveActiveDestination();
         await goHome({ replace: true });
-        markPendingCommunityRestore(fallback.id);
-        const destination = loadCommunityDestination(fallback.id);
-        if (destination?.kind === "channel") {
-          replaceCommunityDestinationRoute(
-            destination.channelId,
-            router.history,
-          );
-        }
+        replaceCommunityOverviewRoute(router.history);
         communities.removeCommunity(id);
       });
     },

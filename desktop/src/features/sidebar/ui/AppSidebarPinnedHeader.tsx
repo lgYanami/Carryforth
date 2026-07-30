@@ -3,7 +3,7 @@ import {
   Bot,
   FolderGit2,
   Inbox,
-  Map as MapIcon,
+  LayoutDashboard,
   Zap,
 } from "lucide-react";
 
@@ -26,10 +26,12 @@ type SidebarSelectedView =
   | "agents"
   | "workflows"
   | "pulse"
+  | "community"
   | "view"
   | "projects";
 
 type AppSidebarPinnedHeaderProps = {
+  activeCommunityName: string;
   channelLabels: Record<string, string>;
   currentPubkey?: string;
   onBrowseChannels?: () => void;
@@ -37,9 +39,11 @@ type AppSidebarPinnedHeaderProps = {
   onCreateChannel: () => void;
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
   onOpenSearchResult: (hit: SearchHit) => void;
+  onSelectCommunity: () => void;
   onSelectChannel: (channelId: string) => void;
   searchChannels: Channel[];
   searchFocusRequest: number;
+  selectedView: SidebarSelectedView;
   suggestionChannels: Channel[];
 };
 
@@ -49,12 +53,12 @@ type AppSidebarPrimaryMenuProps = {
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
-  onSelectView: () => void;
   onSelectWorkflows: () => void;
   selectedView: SidebarSelectedView;
 };
 
 export function AppSidebarPinnedHeader({
+  activeCommunityName,
   channelLabels,
   currentPubkey,
   onBrowseChannels,
@@ -62,9 +66,11 @@ export function AppSidebarPinnedHeader({
   onCreateChannel,
   onOpenDm,
   onOpenSearchResult,
+  onSelectCommunity,
   onSelectChannel,
   searchChannels,
   searchFocusRequest,
+  selectedView,
   suggestionChannels,
 }: AppSidebarPinnedHeaderProps) {
   return (
@@ -72,6 +78,29 @@ export function AppSidebarPinnedHeader({
       className="mx-[3px] shrink-0 px-2 pb-2 pt-3"
       data-testid="sidebar-pinned-header"
     >
+      <SidebarMenu className="mb-2">
+        <SidebarMenuItem>
+          <SidebarMenuButton
+            data-testid="open-community-overview"
+            isActive={selectedView === "community" || selectedView === "view"}
+            onClick={onSelectCommunity}
+            tooltip={`${activeCommunityName} overview`}
+            type="button"
+          >
+            <LayoutDashboard className="h-4 w-4" />
+            <SidebarMenuLabel>{activeCommunityName}</SidebarMenuLabel>
+            <span
+              className={
+                selectedView === "community" || selectedView === "view"
+                  ? "ml-auto text-2xs text-sidebar-active-foreground/75"
+                  : "ml-auto text-2xs text-muted-foreground"
+              }
+            >
+              Overview
+            </span>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      </SidebarMenu>
       <TopbarSearch
         channelLabels={channelLabels}
         channels={searchChannels}
@@ -95,7 +124,6 @@ export function AppSidebarPrimaryMenu({
   onSelectHome,
   onSelectProjects,
   onSelectPulse,
-  onSelectView,
   onSelectWorkflows,
   selectedView,
 }: AppSidebarPrimaryMenuProps) {
@@ -136,20 +164,6 @@ export function AppSidebarPrimaryMenu({
             >
               <Activity className="h-4 w-4" />
               <SidebarMenuLabel>Pulse</SidebarMenuLabel>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </FeatureGate>
-        <FeatureGate feature="projectView">
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              data-testid="open-view"
-              isActive={selectedView === "view"}
-              onClick={onSelectView}
-              tooltip="View"
-              type="button"
-            >
-              <MapIcon className="h-4 w-4" />
-              <SidebarMenuLabel>View</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </FeatureGate>

@@ -9,6 +9,7 @@ export type AppView =
   | "agents"
   | "workflows"
   | "pulse"
+  | "community"
   | "view"
   | "projects";
 
@@ -144,6 +145,13 @@ export function deriveShellRoute(pathname: string): {
     return {
       selectedChannelId: null,
       selectedView: "projects",
+    };
+  }
+
+  if (pathname === "/community") {
+    return {
+      selectedChannelId: null,
+      selectedView: "community",
     };
   }
 
