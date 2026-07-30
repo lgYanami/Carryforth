@@ -30,6 +30,9 @@ use crate::project_view_v2::{
 };
 use crate::SdkError;
 
+const ROLE_DIRECTORY_MAX_ENTRIES: usize = 32;
+const ROLE_DIRECTORY_PURPOSE_MAX_CHARS: usize = 160;
+
 /// Stable source reference for one object or Role-continuity entity in a Brief.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,6 +155,55 @@ pub struct RoleBriefProjectSummary {
     pub goals: Vec<RoleBriefObject>,
 }
 
+/// Current staffing state for one Role Directory entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleBriefRoleDirectoryAssignment {
+    /// One active Assignment currently occupies the Role.
+    Assigned {
+        /// Immutable active Assignment tenure.
+        assignment_id: Uuid,
+        /// Stable public key of the assigned Member.
+        member_pubkey: PublicKey,
+        /// Exact signed Assignment source revision.
+        source: RoleBriefSourceReference,
+    },
+    /// No active Assignment currently occupies the Role.
+    Vacant,
+}
+
+/// One bounded navigation entry for an active Project Role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleBriefRoleDirectoryEntry {
+    /// Stable Project Role identifier.
+    pub role_id: Uuid,
+    /// Human-readable Role name.
+    pub name: String,
+    /// Community permission level granted by the Role.
+    pub level: RoleLevel,
+    /// Deterministic one-line, length-bounded purpose summary.
+    pub purpose_summary: String,
+    /// Current active Assignment or an explicit vacancy.
+    pub assignment: RoleBriefRoleDirectoryAssignment,
+    /// Whether this is the Role occupied by the Brief's target Member.
+    pub is_current_member_role: bool,
+    /// Exact signed Role source revision.
+    pub role_source: RoleBriefSourceReference,
+}
+
+/// Bounded active-Role directory derived from the same verified Brief snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleBriefRoleDirectory {
+    /// Total active Roles in the verified Project snapshot.
+    pub total_active_roles: u32,
+    /// Deterministically selected Role entries carried by this Brief.
+    pub entries: Vec<RoleBriefRoleDirectoryEntry>,
+    /// Active Roles omitted because the prompt-safe directory bound was reached.
+    pub omitted_active_roles: u32,
+}
+
 /// Member entry state derived from the verified active Assignment set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -223,6 +275,8 @@ pub struct RoleBrief {
     pub community_role: Option<CommunityMemberRole>,
     /// Profile and Goal summary shared by candidate and assigned states.
     pub project: RoleBriefProjectSummary,
+    /// Bounded active-Role directory from the same verified snapshot.
+    pub role_directory: RoleBriefRoleDirectory,
     /// Candidate or assigned entry state.
     pub state: RoleBriefMemberState,
     /// Non-terminal Work owned by the assigned Role, with current Commitment
@@ -654,6 +708,7 @@ impl VerifiedRoleBriefSnapshot {
             .filter(|head| head.object.object_type == ProjectViewObjectType::Goal)
             .collect::<Vec<_>>();
         goals.sort_by(|left, right| object_order(&left.object, &right.object));
+        let role_directory = self.role_directory(member_pubkey)?;
 
         let active_assignment = self
             .assignments
@@ -740,6 +795,7 @@ impl VerifiedRoleBriefSnapshot {
                 profile: role_brief_object(profile),
                 goals: goals.into_iter().map(role_brief_object).collect(),
             },
+            role_directory,
             state,
             responsible_work,
             related_objects,
@@ -751,6 +807,60 @@ impl VerifiedRoleBriefSnapshot {
                 membership_event_id: self.membership.event_id,
                 project_updated_at: self.meta.updated_at,
             },
+        })
+    }
+
+    fn role_directory(&self, member_pubkey: PublicKey) -> Result<RoleBriefRoleDirectory, SdkError> {
+        let active_assignments = self
+            .assignments
+            .values()
+            .filter(|head| head.entity.is_active())
+            .map(|head| (head.entity.role_id, head))
+            .collect::<BTreeMap<_, _>>();
+        let mut entries = self
+            .roles
+            .values()
+            .filter(|head| head.entity.active)
+            .map(|head| {
+                let assignment = active_assignments.get(&head.entity.role_id);
+                RoleBriefRoleDirectoryEntry {
+                    role_id: head.entity.role_id,
+                    name: head.entity.name.clone(),
+                    level: head.entity.level,
+                    purpose_summary: role_directory_purpose_summary(&head.entity.purpose),
+                    assignment: assignment.map_or(
+                        RoleBriefRoleDirectoryAssignment::Vacant,
+                        |assignment| RoleBriefRoleDirectoryAssignment::Assigned {
+                            assignment_id: assignment.entity.assignment_id,
+                            member_pubkey: assignment.entity.member_pubkey,
+                            source: assignment.source.clone(),
+                        },
+                    ),
+                    is_current_member_role: assignment
+                        .is_some_and(|assignment| assignment.entity.member_pubkey == member_pubkey),
+                    role_source: head.source.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_cached_key(|entry| {
+            (
+                !entry.is_current_member_role,
+                role_level_order(entry.level),
+                entry.name.to_lowercase(),
+                entry.role_id,
+            )
+        });
+
+        let total_active_roles = u32::try_from(entries.len())
+            .map_err(|_| invalid("active Role count exceeds Role Directory range"))?;
+        entries.truncate(ROLE_DIRECTORY_MAX_ENTRIES);
+        let shown_roles = u32::try_from(entries.len())
+            .map_err(|_| invalid("shown Role count exceeds Role Directory range"))?;
+
+        Ok(RoleBriefRoleDirectory {
+            total_active_roles,
+            entries,
+            omitted_active_roles: total_active_roles - shown_roles,
         })
     }
 
@@ -925,6 +1035,7 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
             );
         }
     }
+    render_role_directory(&mut output, &brief.role_directory);
 
     match &brief.state {
         RoleBriefMemberState::Candidate { open_proposals } => {
@@ -1105,6 +1216,57 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
             .to_rfc3339_opts(SecondsFormat::Secs, true)
     );
     output
+}
+
+fn render_role_directory(output: &mut String, directory: &RoleBriefRoleDirectory) {
+    if directory.total_active_roles == 0 {
+        output.push_str("Role Directory: none (0 active)\n");
+        return;
+    }
+
+    let _ = writeln!(
+        output,
+        "Role Directory: {}/{} active shown",
+        directory.entries.len(),
+        directory.total_active_roles
+    );
+    for entry in &directory.entries {
+        let current = if entry.is_current_member_role {
+            ", current"
+        } else {
+            ""
+        };
+        let staffing = match &entry.assignment {
+            RoleBriefRoleDirectoryAssignment::Assigned {
+                assignment_id,
+                member_pubkey,
+                ..
+            } => format!(
+                "assigned to {} via Assignment {}",
+                member_pubkey.to_hex(),
+                assignment_id
+            ),
+            RoleBriefRoleDirectoryAssignment::Vacant => "vacant".to_owned(),
+        };
+        let _ = writeln!(
+            output,
+            "- {} [{}{}] — Role {}; {} — {}",
+            one_line(&entry.name),
+            entry.level.as_str(),
+            current,
+            entry.role_id,
+            staffing,
+            entry.purpose_summary
+        );
+    }
+    if directory.omitted_active_roles > 0 {
+        let _ = writeln!(
+            output,
+            "Role Directory omitted: {} active Role(s). Run `buzz roles list` for the complete \
+             directory; omitted Roles still exist.",
+            directory.omitted_active_roles
+        );
+    }
 }
 
 fn render_named_items(output: &mut String, heading: &str, items: &[String]) {
@@ -1677,6 +1839,27 @@ fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn role_directory_purpose_summary(value: &str) -> String {
+    let line = one_line(value);
+    if line.chars().count() <= ROLE_DIRECTORY_PURPOSE_MAX_CHARS {
+        return line;
+    }
+
+    let mut summary = line
+        .chars()
+        .take(ROLE_DIRECTORY_PURPOSE_MAX_CHARS - 1)
+        .collect::<String>();
+    summary.push('…');
+    summary
+}
+
+const fn role_level_order(level: RoleLevel) -> u8 {
+    match level {
+        RoleLevel::Admin => 0,
+        RoleLevel::Member => 1,
+    }
+}
+
 fn unavailable_markdown(detail: &str) -> String {
     format!(
         "[Role Brief]\nState: unavailable\n\
@@ -1745,10 +1928,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(related_types.contains(&ProjectViewObjectType::Issue));
         assert!(related_types.contains(&ProjectViewObjectType::Work));
+        assert_eq!(brief.role_directory.total_active_roles, 1);
+        assert_eq!(brief.role_directory.omitted_active_roles, 0);
+        let [directory_entry] = brief.role_directory.entries.as_slice() else {
+            panic!("assigned Brief should contain its active Role");
+        };
+        assert_eq!(directory_entry.role_id, fixture.role_id);
+        assert!(directory_entry.is_current_member_role);
+        assert!(matches!(
+            directory_entry.assignment,
+            RoleBriefRoleDirectoryAssignment::Assigned {
+                assignment_id,
+                member_pubkey,
+                ..
+            } if assignment_id == fixture.assignment_id && member_pubkey == fixture.agent
+        ));
 
         let markdown = render_role_brief_markdown(&brief);
         assert!(markdown.starts_with("[Role Brief]\nState: assigned"));
         assert!(markdown.contains("Community role: member"));
+        assert!(markdown.contains("Role Directory: 1/1 active shown"));
+        assert!(markdown.contains("[member, current]"));
         assert!(markdown.contains(&fixture.assignment_id.to_string()));
         assert!(markdown.contains("Responsible Work:"));
         assert!(markdown.contains("committed via"));
@@ -1777,6 +1977,7 @@ mod tests {
         assert!(binding.contains("Source revisions: project=7 generation=1"));
         assert!(!binding.contains("Responsible Work:"));
         assert!(!binding.contains("Latest Role Checkpoint:"));
+        assert!(!binding.contains("Role Directory:"));
     }
 
     #[test]
@@ -1834,15 +2035,203 @@ mod tests {
             brief.state,
             RoleBriefMemberState::Candidate { .. }
         ));
+        assert_eq!(brief.role_directory.total_active_roles, 1);
+        assert!(brief
+            .role_directory
+            .entries
+            .iter()
+            .all(|entry| !entry.is_current_member_role));
+        assert!(matches!(
+            brief.role_directory.entries[0].assignment,
+            RoleBriefRoleDirectoryAssignment::Assigned {
+                member_pubkey,
+                ..
+            } if member_pubkey == fixture.agent
+        ));
         let markdown = render_role_brief_markdown(&brief);
         assert!(markdown.contains("State: candidate"));
         assert!(markdown.contains("no active Assignment is verified"));
+        assert!(markdown.contains("Role Directory: 1/1 active shown"));
 
         let binding = render_role_binding_markdown(&brief);
         assert!(binding.starts_with("[Role Binding]\nState: candidate"));
         assert!(binding.contains("Role ID: none"));
         assert!(binding.contains("Assignment: none"));
         assert!(binding.contains("no active Assignment is verified for this meta head"));
+        assert!(!binding.contains("Role Directory:"));
+    }
+
+    #[test]
+    fn role_directory_is_bounded_sorted_and_explicit_about_omissions() {
+        let fixture = fixture();
+        let leader_id = Uuid::new_v4();
+        let inactive_id = Uuid::new_v4();
+        let mut roles = vec![
+            role_definition(
+                leader_id,
+                "Architecture leader",
+                &"Coordinate cross-role decisions ".repeat(12),
+                RoleLevel::Admin,
+                true,
+                fixture.agent,
+            ),
+            role_definition(
+                inactive_id,
+                "Retired responsibility",
+                "No longer assignable",
+                RoleLevel::Member,
+                false,
+                fixture.agent,
+            ),
+        ];
+        roles.extend((0..32).map(|index| {
+            role_definition(
+                Uuid::new_v4(),
+                &format!("Module {index:02}"),
+                "Maintain one stable module boundary",
+                RoleLevel::Member,
+                true,
+                fixture.agent,
+            )
+        }));
+        let snapshot = snapshot_with_additional_roles(&fixture.snapshot, roles);
+
+        let assigned = snapshot
+            .brief_for(fixture.agent, instant())
+            .expect("assigned Brief with bounded directory");
+        assert_eq!(assigned.role_directory.total_active_roles, 34);
+        assert_eq!(
+            assigned.role_directory.entries.len(),
+            ROLE_DIRECTORY_MAX_ENTRIES
+        );
+        assert_eq!(assigned.role_directory.omitted_active_roles, 2);
+        assert_eq!(
+            assigned.role_directory.entries[0].role_id, fixture.role_id,
+            "the target Member's Role sorts first"
+        );
+        assert_eq!(
+            assigned.role_directory.entries[1].role_id, leader_id,
+            "Leader Roles sort before remaining member Roles"
+        );
+        assert!(assigned
+            .role_directory
+            .entries
+            .iter()
+            .all(|entry| entry.role_id != inactive_id));
+        let leader = assigned
+            .role_directory
+            .entries
+            .iter()
+            .find(|entry| entry.role_id == leader_id)
+            .expect("Leader remains inside the bounded directory");
+        assert!(matches!(
+            leader.assignment,
+            RoleBriefRoleDirectoryAssignment::Vacant
+        ));
+        assert_eq!(
+            leader.purpose_summary.chars().count(),
+            ROLE_DIRECTORY_PURPOSE_MAX_CHARS
+        );
+        assert!(leader.purpose_summary.ends_with('…'));
+        let markdown = render_role_brief_markdown(&assigned);
+        assert!(markdown.contains("Role Directory omitted: 2 active Role(s)"));
+        assert!(markdown.contains("`buzz roles list`"));
+        assert!(markdown.contains("omitted Roles still exist"));
+
+        let candidate = snapshot
+            .brief_for(Keys::generate().public_key(), instant())
+            .expect("candidate Brief with bounded directory");
+        assert_eq!(candidate.role_directory.entries[0].role_id, leader_id);
+        assert!(candidate
+            .role_directory
+            .entries
+            .iter()
+            .all(|entry| !entry.is_current_member_role));
+    }
+
+    #[test]
+    fn ended_assignment_history_never_staffs_a_role_directory_entry() {
+        let fixture = fixture();
+        let old_member = Keys::generate().public_key();
+        let old_proposal_id = Uuid::new_v4();
+        let old_assignment_id = Uuid::new_v4();
+        let mut proposal = fixture
+            .snapshot
+            .proposals
+            .values()
+            .next()
+            .expect("fixture Proposal")
+            .entity
+            .clone();
+        proposal.proposal_id = old_proposal_id;
+        proposal.candidate_pubkey = old_member;
+        let mut assignment = fixture
+            .snapshot
+            .assignments
+            .values()
+            .next()
+            .expect("fixture Assignment")
+            .entity
+            .clone();
+        assignment.assignment_id = old_assignment_id;
+        assignment.member_pubkey = old_member;
+        assignment.proposal_id = old_proposal_id;
+        assignment.ended_at = Some(instant());
+        assignment.ended_by = Some(
+            fixture
+                .snapshot
+                .membership
+                .members
+                .iter()
+                .find(|member| member.role == CommunityMemberRole::Owner)
+                .expect("fixture owner")
+                .pubkey,
+        );
+        assignment.ended_reason = Some(buzz_project_view::v2::AssignmentEndReason::Replaced);
+        assignment.replaced_by_assignment_id = Some(fixture.assignment_id);
+        assignment.entity_revision = 2;
+        assignment.project_revision = 6;
+
+        let mut entities = entity_projections(&fixture.snapshot);
+        entities.push(projected_entity(
+            180,
+            fixture.snapshot.meta.project_id,
+            proposal.project_revision,
+            proposal.entity_revision,
+            RoleContinuityChange::Proposal(proposal),
+            source(200),
+            instant(),
+        ));
+        entities.push(projected_entity(
+            181,
+            fixture.snapshot.meta.project_id,
+            assignment.project_revision,
+            assignment.entity_revision,
+            RoleContinuityChange::Assignment(assignment),
+            source(201),
+            instant(),
+        ));
+        let snapshot = VerifiedRoleBriefSnapshot::new(
+            fixture.snapshot.meta.clone(),
+            fixture.snapshot.membership.clone(),
+            object_projections(&fixture.snapshot),
+            entities,
+        )
+        .expect("snapshot with ended Assignment history");
+        let brief = snapshot
+            .brief_for(fixture.agent, instant())
+            .expect("Brief after replacement history");
+        let [entry] = brief.role_directory.entries.as_slice() else {
+            panic!("fixture should expose one active Role");
+        };
+        assert!(matches!(
+            entry.assignment,
+            RoleBriefRoleDirectoryAssignment::Assigned {
+                assignment_id,
+                member_pubkey,
+                ..
+            } if assignment_id == fixture.assignment_id && member_pubkey == fixture.agent
+        ));
     }
 
     #[test]
@@ -2424,5 +2813,58 @@ mod tests {
             ));
         }
         entities
+    }
+
+    fn role_definition(
+        role_id: Uuid,
+        name: &str,
+        purpose: &str,
+        level: RoleLevel,
+        active: bool,
+        actor: PublicKey,
+    ) -> RoleDefinition {
+        RoleDefinition {
+            role_id,
+            name: name.to_owned(),
+            purpose: purpose.to_owned(),
+            responsibilities: Vec::new(),
+            boundaries: Vec::new(),
+            level,
+            active,
+            object_revision: 1,
+            project_revision: 7,
+            created_at: instant(),
+            updated_at: instant(),
+            created_by: actor,
+            updated_by: actor,
+        }
+    }
+
+    fn snapshot_with_additional_roles(
+        snapshot: &VerifiedRoleBriefSnapshot,
+        roles: Vec<RoleDefinition>,
+    ) -> VerifiedRoleBriefSnapshot {
+        let mut meta = snapshot.meta.clone();
+        meta.entity_counts.active_objects +=
+            u32::try_from(roles.len()).expect("test Role count fits u32");
+        let mut entities = entity_projections(snapshot);
+        entities.extend(roles.into_iter().enumerate().map(|(index, role)| {
+            projected_entity(
+                u8::try_from(180 + index).expect("test projection ID fits u8"),
+                snapshot.meta.project_id,
+                role.project_revision,
+                role.object_revision,
+                RoleContinuityChange::Role(role),
+                source(220),
+                instant(),
+            )
+        }));
+        VerifiedRoleBriefSnapshot::new(
+            meta,
+            snapshot.membership.clone(),
+            object_projections(snapshot),
+            entities,
+        )
+        .expect("snapshot with additional Roles")
     }
 }

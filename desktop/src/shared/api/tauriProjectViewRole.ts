@@ -1,6 +1,12 @@
 import type { ProjectView } from "@/shared/api/tauriProjectView";
 import { ProjectViewIntegrityError } from "@/shared/api/tauriProjectViewIntegrity";
 import {
+  normalizeRoleBriefRoleDirectory,
+  type ProjectRoleDirectory,
+  type RawRoleBriefRoleDirectory,
+  validateRoleBriefRoleDirectoryContinuity,
+} from "@/shared/api/tauriProjectViewRoleDirectory";
+import {
   normalizeCheckpoint,
   normalizeHandoff,
   type ProjectRoleCheckpoint,
@@ -10,6 +16,10 @@ import {
   type RawProjectRoleHandoff,
 } from "@/shared/api/tauriProjectViewRoleHistory";
 
+export type {
+  ProjectRoleDirectory,
+  ProjectRoleDirectoryEntry,
+} from "@/shared/api/tauriProjectViewRoleDirectory";
 export type {
   ProjectRoleCheckpoint,
   ProjectRoleCheckpointContent,
@@ -150,6 +160,7 @@ type RawProjectRoleBrief = {
     profile: RawRoleBriefObject;
     goals: RawRoleBriefObject[];
   };
+  role_directory: RawRoleBriefRoleDirectory;
   state:
     | {
         status: "candidate";
@@ -293,6 +304,7 @@ export type ProjectRoleBrief = {
     scope: string;
     goals: Array<{ title: string; desiredOutcome: string }>;
   };
+  roleDirectory: ProjectRoleDirectory;
   state:
     | {
         status: "candidate";
@@ -486,6 +498,10 @@ function normalizeRoleBrief(
             (proposal) => proposal.proposal.proposal_id,
           ),
         };
+  const roleDirectory = normalizeRoleBriefRoleDirectory(
+    raw.role_directory,
+    state,
+  );
   const responsibleWork = raw.responsible_work.map((item) => {
     const object = item.work.object;
     const data = object.data.data;
@@ -531,6 +547,7 @@ function normalizeRoleBrief(
       scope: stringField("scope"),
       goals,
     },
+    roleDirectory,
     state,
     responsibleWork,
     relatedObjects: raw.related_objects.map((related) => ({
@@ -641,6 +658,12 @@ export function normalizeRoleContinuity(
   );
   const commitmentsById = new Map(
     commitments.map((commitment) => [commitment.commitmentId, commitment]),
+  );
+  const rolesById = new Map(roles.map((role) => [role.roleId, role]));
+  const activeAssignmentsByRoleId = new Map(
+    assignments
+      .filter((assignment) => !assignment.endedAt)
+      .map((assignment) => [assignment.roleId, assignment]),
   );
   const objectIds = new Set([
     view.profile.id,
@@ -813,6 +836,13 @@ export function normalizeRoleContinuity(
         );
       }
     }
+    validateRoleBriefRoleDirectoryContinuity(
+      brief.roleDirectory,
+      brief.state,
+      roles.filter((role) => role.active).length,
+      rolesById,
+      activeAssignmentsByRoleId,
+    );
     if (
       brief.latestCheckpoint &&
       !checkpointIds.has(brief.latestCheckpoint.checkpointId)

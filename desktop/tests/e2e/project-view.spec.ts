@@ -355,6 +355,26 @@ const V2_READY_VIEW = {
             },
           ],
         },
+        role_directory: {
+          total_active_roles: 1,
+          entries: [
+            {
+              role_id: IDS.role,
+              name: "Context steward",
+              level: "admin",
+              purpose_summary: "Keep project intent coherent.",
+              assignment: {
+                status: "assigned",
+                assignment_id: ROLE_STATE_IDS.currentAssignment,
+                member_pubkey: ACTOR,
+                source: ROLE_BRIEF_SOURCE,
+              },
+              is_current_member_role: true,
+              role_source: ROLE_BRIEF_SOURCE,
+            },
+          ],
+          omitted_active_roles: 0,
+        },
         state: {
           status: "assigned",
           role: {
@@ -600,6 +620,10 @@ function humanAssignedV2View() {
   brief.member_pubkey = HUMAN;
   brief.community_role = "owner";
   brief.state.assignment.assignment.member_pubkey = HUMAN;
+  const directoryAssignment = brief.role_directory.entries[0]?.assignment;
+  if (directoryAssignment?.status === "assigned") {
+    directoryAssignment.member_pubkey = HUMAN;
+  }
   const briefCommitment =
     brief.responsible_work[0]?.state.status === "committed"
       ? brief.responsible_work[0].state.commitment.commitment
@@ -701,6 +725,15 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
   );
   await expect(page.getByTestId("project-role-brief")).toContainText(
     "Make project context legible",
+  );
+  await expect(page.getByTestId("project-role-directory")).toContainText(
+    "Collaboration roles",
+  );
+  await expect(page.getByTestId("project-role-directory")).toContainText(
+    "Context steward",
+  );
+  await expect(page.getByTestId("project-role-directory")).toContainText(
+    "Current",
   );
   await expect(page.getByTestId("project-role-brief")).toContainText(
     "Add the View entry",
@@ -1091,6 +1124,34 @@ test("View rejects a self-contradictory snapshot without rendering partial data"
   await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
   await page.getByText("Diagnostic detail").click();
   await expect(page.getByText(/active object count 11/)).toBeVisible();
+});
+
+test("View rejects a Role Directory that disagrees with verified continuity", async ({
+  page,
+}) => {
+  const invalid = structuredClone(V2_READY_VIEW) as Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >;
+  const directoryAssignment =
+    invalid.role_continuity?.briefs[0]?.role_directory.entries[0]?.assignment;
+  if (directoryAssignment?.status !== "assigned") {
+    throw new Error("v2 fixture must include an assigned Role Directory entry");
+  }
+  directoryAssignment.member_pubkey = FORMER_ASSIGNEE;
+
+  await installMockBridge(page, { projectView: invalid });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await expect(
+    page.getByRole("heading", { name: "View integrity check failed" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+  await page.getByText("Diagnostic detail").click();
+  await expect(
+    page.getByText(/Role Brief Role Directory disagrees with Role continuity/),
+  ).toBeVisible();
 });
 
 test("View explains a trusted-read failure without rendering project data", async ({

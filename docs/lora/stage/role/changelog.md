@@ -1,5 +1,131 @@
 # 角色连续性变更记录
 
+## 2026-07-30 — 上下文完善阶段 A：共享 Role Directory
+
+### 同一验证快照派生目录
+
+- `RoleBrief` 增加必需的 `role_directory`，由组装 Brief 的同一份
+  `VerifiedRoleBriefSnapshot` 直接派生，不执行第二次 roster 查询，也不引入新的数据库
+  表、Nostr kind、Project View object 或 Markdown 事实源。
+- 目录只包含 active Role；每项携带稳定 `role_id`、name、level、有界单行 purpose、
+  当前 `assigned | vacant` 状态、承担者稳定公钥、Assignment/source 引用以及当前
+  Member 自身 Role 标记。
+- 历史已结束 Assignment 不参与当前 staffing；replacement 后目录只保留当前 active
+  Assignment。display name 仍只在 Desktop 展示层 best-effort 解析，不参与目录组装、
+  排序、验证或权限判断。
+
+### 有界、稳定且不静默截断
+
+- 首版目录最多携带 32 个 active Role，单项 purpose summary 最多 160 个 Unicode
+  字符；顺序固定为当前 Member 的 Role、Leader / admin Role、其余 Role 的规范化名称
+  与 Role ID。
+- DTO 同时携带 `total_active_roles` 与 `omitted_active_roles`。超过预算时 Full Brief
+  明确报告 shown / total / omitted，并提示使用 `buzz roles list` 展开；被省略的 Role
+  不会被表达为不存在。
+- candidate 与 assigned Brief 使用同一目录规则；compact `[Role Binding]` 不重复目录，
+  unavailable 路径继续只返回 fail-closed 状态，不复用旧目录。
+
+### CLI、ACP 与 Desktop 同源
+
+- 共享 JSON DTO 与 Full Markdown renderer 同步扩展，因此 `buzz roles brief` 和 ACP
+  的 Full Role Brief 自动使用同一份目录；没有在 ACP 中拼接第二套协作清单。
+- Desktop 的 v2 normalizer 对目录计数、唯一 Role、当前 Role 标记、active Role 定义
+  以及 active Assignment 一致性执行 fail-closed 检查；Inspector 增加
+  `Collaboration roles` 区域，展示 Leader / Role、Current、承担者或 Vacant 和显式
+  omitted 数量。
+- Rust 覆盖 assigned、candidate、vacant、replacement history、稳定排序、purpose
+  截断与目录预算；Desktop E2E 覆盖正常展示及目录与验证后 Role Continuity 不一致时
+  拒绝整份 View。
+
+### 本阶段边界
+
+- 本阶段只交付设计中的阶段 A。稳定 `[Project Space]` system contract、contract
+  version/session 失效、显式 Full Brief refresh 与 compaction/reset 信号仍属于后续
+  阶段。
+
+## 2026-07-30 — 设计决策：完善 Project View + Role Continuity Agent 上下文
+
+> 本条记录设计决策，尚不表示对应代码已经交付。完整设计见
+> [Project View + Role Continuity Agent 上下文完善设计](./project-view-role-continuity-context-design.md)。
+
+### 稳定 Project Space 运行契约进入 system context
+
+- ACP 应增加由 Buzz 平台维护的稳定 `[Project Space]` section，使 Agent 从 session
+  开始就知道一个 Community 是一个持久 Project Space，并理解 Project View、Role、
+  Assignment、Role Brief、Role Binding、Checkpoint 与 Handoff 的语义、状态归属及
+  基本读写规则。
+- `[Project Space]` 属于共享平台 contract，不属于单个 Agent 可配置的 Persona。它只
+  解释如何使用和维护 Project Space，不包含当前 Project 名称、Goal、Role、
+  Assignment、Role Directory、Work、revision、成员身份或任何项目成员编写的动态文本。
+- 现代 ACP Agent 在 `session/new` 的 system prompt 中获得 contract；legacy Agent
+  只能通过既有 `[Base]` user-context 路径获得兼容说明。提示优先级差异不能成为安全
+  边界，最终授权继续由 CLI 与 Relay 验证。
+- Project Space contract 与 Project revision 使用独立版本轴。contract 内容变化后，
+  已有 session 需要在有界时间内失效或重建；Project revision 变化只刷新动态 Role
+  Context，不重建 system contract。
+
+### 动态 Project 与 Role 内容继续按 turn 注入
+
+- 本次决策不把当前 Role、Assignment 或 Project View 内容迁入长期 system prompt。
+  Stage 10 已有的 `full | compact | unavailable` 模型保持不变：新建/重建 session、
+  cache miss、Relay/Community/Member/meta/revision/generation 变化时注入完整
+  `[Role Brief]`；同一 session 且 meta 精确不变时注入 `[Role Binding]`；验证失败时
+  fail closed。
+- native steer 与单次 tool call 仍不形成新的 Role Context 注入。Project mutation
+  后的下一完整 turn 根据新 meta 刷新；当前逻辑立即依赖写入结果时，Agent 应使用回执
+  或主动查询。
+- unavailable turn 不重新发送旧 Role、Assignment、Binding 或 Directory，也不把
+  verified cache 当作授权。下一完整 turn 恢复后，如果 Relay 与 meta head 和既有
+  verified cache 精确一致，可以恢复为 compact Binding；cache 缺失、身份改变或 meta
+  变化时才重新生成 Full Brief。
+- Agent / supervisor 显式 full refresh，以及 ACP connector 报告
+  compaction/reset 后强制 full refresh，被确认为后续体验完善点。原生信号完成前，
+  `buzz roles brief --markdown` 提供即时完整重读。
+
+### Full Role Brief 增加最小 Role Directory
+
+- Full Brief 应从组装自身的同一份 meta-bounded verified Project View v2 snapshot
+  派生最小 Role Directory；不新增 roster 查询、数据库表、event kind、Project View
+  object 或独立 Markdown 事实源。
+- 目录只表达 active Role 的稳定 ID、name、level、单行 purpose、`assigned | vacant`
+  状态、承担者稳定公钥以及当前 Member 自身 Role 标记。它不展开其他 Role 的完整职责、
+  历史任期、Checkpoint、Handoff、presence 或 Runtime 状态。
+- stable public key 是规范成员身份；display name 只能作为 best-effort 展示，不能参与
+  验证、排序、权限或 Assignment 判断。
+- candidate 与 assigned Member 可以看到当前权限范围内的目录；unavailable 不复用旧
+  目录；compact Binding 不重复目录。目录超过 prompt 预算时必须稳定排序、显式报告
+  total/shown/omitted，并引导使用 `buzz roles list`，不能静默把截断解释为不存在。
+- Role Directory 必须进入共享 Role Brief assembler/DTO/renderer，使 CLI、ACP 与
+  Desktop 保持同源。当前 closed DTO 的兼容方式需要在实现阶段明确，不能由 ACP 私自
+  拼接另一套目录。
+
+### Agent 读取、写回与协作规则
+
+- system contract 应指导 Agent 在 Brief 不足、跨 Role、revision conflict、
+  candidate、unavailable、Community/Relay/Member 切换或 context compaction 后主动
+  使用 `buzz project-view` 与 `buzz roles` 展开当前状态。
+- Project 对象的直接事实变化写回对应 Project View 对象；Role 的 material progress、
+  blocker、risk、open question 与 next step 形成结构化 Checkpoint；计划性接续使用
+  Handoff。属于 Work 或 Issue 的事实应先更新原对象，再由 Checkpoint 引用，不能建立
+  第二份真相。
+- 对话、工作区文件、工具输出和 Agent memory 不自动更新 Project。一般探索与未验证
+  判断默认不写入规范状态；本次设计不引入自动 context extraction 或 Project Context
+  数据模型。
+- Role Directory 用于识别责任边界与 vacancy，不授予权限，也不允许 Agent 静默承担
+  第二个 Role。跨 Role 行动前应读取完整 Role 定义，并通过现有消息、Issue、Work 与
+  有权治理主体协作：普通 Role 可交给 Community owner 或 active Leader，admin /
+  Leader Role 只能交给 Community owner。verified human owner 只保留针对自己所拥有
+  managed Agent 的既有 owner-control 特例，不获得通用 Role Assignment 治理权；
+  普通 Human Member 也不因其是 Human 而天然获得治理权。
+
+### 范围边界
+
+- 本次设计不改变 Project View v2 协议、数据库规范状态、Nostr kind、Relay capability、
+  Community 权限、Assignment 控制规则或 Runtime fencing。
+- Relay-signed 动态内容证明来源和 revision 一致性，不表示其中判断绝对正确，也不能
+  覆盖平台安全规则、Team Instructions 或 Human 治理。动态项目文本继续留在
+  user-context 层，prompt 本身不承担授权。
+
 ## 2026-07-29 — 集成验收缺陷修复：可验证 cutover 快照与完整 Role 历史
 
 ### v2 generation reset 保留每个 head 的最后变更坐标

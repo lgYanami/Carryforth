@@ -22,9 +22,12 @@ import {
   ProjectRoleCheckpointDialog,
   ProjectRoleHandoffDialog,
 } from "@/features/project-view/ui/ProjectRoleContinuityDialogs";
-import { formatProjectRoleDateTime } from "@/features/project-view/ui/projectRoleFormatting";
+import { ProjectRoleDirectory } from "@/features/project-view/ui/ProjectRoleDirectory";
+import {
+  findActiveProjectRoleAssignment,
+  formatProjectRoleDateTime,
+} from "@/features/project-view/ui/projectRoleFormatting";
 import type {
-  ProjectRoleAssignment,
   ProjectRoleDefinition,
   ProjectRoleProposal,
   ProjectViewRoleContinuity,
@@ -43,15 +46,6 @@ import {
 } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
-
-function activeAssignmentForRole(
-  assignments: ProjectRoleAssignment[],
-  roleId: string,
-) {
-  return assignments.find(
-    (assignment) => assignment.roleId === roleId && !assignment.endedAt,
-  );
-}
 
 function effectiveProposalStatus(proposal: ProjectRoleProposal, now: number) {
   return proposal.status === "open" &&
@@ -115,7 +109,7 @@ export function ProjectRoleInspector({
     item.entityType === "handoff" ? [item.entity] : [],
   );
   const normalizedCurrentPubkey = currentPubkey?.toLowerCase();
-  const currentAssignment = activeAssignmentForRole(
+  const currentAssignment = findActiveProjectRoleAssignment(
     continuity.assignments,
     definition.roleId,
   );
@@ -426,6 +420,11 @@ export function ProjectRoleInspector({
               </li>
             ))}
           </ul>
+          <ProjectRoleDirectory
+            actorProfiles={actorProfiles}
+            currentPubkey={currentPubkey}
+            directory={currentBrief.roleDirectory}
+          />
           <div className="mt-3 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
             Responsible Work
           </div>
