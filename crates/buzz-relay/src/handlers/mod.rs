@@ -4,6 +4,8 @@ pub mod auth;
 pub mod close;
 /// Command executor — transactional processing for command kinds.
 pub mod command_executor;
+/// Shared Community-private protocol read/fan-out gates.
+pub mod community_private;
 /// Relay-operator community provisioning HTTP support.
 pub mod community_provisioning;
 /// NIP-45 COUNT handler.

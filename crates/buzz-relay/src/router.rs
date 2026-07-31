@@ -378,7 +378,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 
     let check = async {
-        let (pg_ok, redis_ok, project_view_ok) = tokio::join!(
+        let (pg_ok, redis_ok, project_view_ok, project_document_ok) = tokio::join!(
             state.db.ping(),
             async { state.redis_pool.get().await.is_ok() },
             async {
@@ -388,15 +388,23 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .await
                     .unwrap_or(false)
             },
+            async {
+                state
+                    .db
+                    .project_document_deployment_ready(state.config.relay_private_key.is_some())
+                    .await
+                    .unwrap_or(false)
+            },
         );
-        (pg_ok, redis_ok, project_view_ok)
+        (pg_ok, redis_ok, project_view_ok, project_document_ok)
     };
 
-    let (pg_ok, redis_ok, project_view_ok) = tokio::time::timeout(Duration::from_secs(2), check)
-        .await
-        .unwrap_or((false, false, false));
+    let (pg_ok, redis_ok, project_view_ok, project_document_ok) =
+        tokio::time::timeout(Duration::from_secs(2), check)
+            .await
+            .unwrap_or((false, false, false, false));
 
-    if pg_ok && redis_ok && project_view_ok {
+    if pg_ok && redis_ok && project_view_ok && project_document_ok {
         (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
     } else {
         (
@@ -405,7 +413,8 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                 "status": "not_ready",
                 "postgres": pg_ok,
                 "redis": redis_ok,
-                "project_view": project_view_ok
+                "project_view": project_view_ok,
+                "project_document": project_document_ok
             })),
         )
             .into_response()

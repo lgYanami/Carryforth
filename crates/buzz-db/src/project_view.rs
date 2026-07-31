@@ -6505,6 +6505,7 @@ mod tests {
                 runtime_id: runtime_one,
                 runtime_epoch: 1,
             }),
+            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
         )
         .await
         .expect("current leased runtime fence");
@@ -6517,6 +6518,7 @@ mod tests {
                     runtime_id: runtime_one,
                     runtime_epoch: 2,
                 }),
+                crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
             )
             .await,
             Err(crate::project_runtime::RuntimeSupervisionError::CommandFence)

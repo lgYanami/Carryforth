@@ -1074,6 +1074,7 @@ fn exclude_project_view_if_unauthorized(
             buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
         ]);
     }
+    crate::handlers::community_private::exclude_project_document_kinds(query, filter);
 }
 
 /// Hard cap on the `reason` field logged for a rejected `/events` request.
@@ -1497,6 +1498,13 @@ async fn query_events_authed(
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    if crate::handlers::community_private::filters_are_exclusively_project_document(&filters) {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:project_document:disabled",
+        ));
+    }
 
     let project_view_can_match = filters
         .iter()
@@ -1962,6 +1970,11 @@ async fn query_events_authed(
                     {
                         continue;
                     }
+                    if !crate::handlers::community_private::event_is_visible(
+                        se.event.kind.as_u16() as u32
+                    ) {
+                        continue;
+                    }
                     if let Ok(v) = serde_json::to_value(&se.event) {
                         events.push(v);
                     }
@@ -2077,6 +2090,13 @@ async fn count_events_authed(
 
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    if crate::handlers::community_private::filters_are_exclusively_project_document(&filters) {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:project_document:disabled",
+        ));
+    }
 
     let project_view_can_match = filters
         .iter()
@@ -2226,6 +2246,11 @@ async fn count_events_authed(
                             {
                                 continue;
                             }
+                            if !crate::handlers::community_private::event_is_visible(
+                                se.event.kind.as_u16() as u32,
+                            ) {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -2298,6 +2323,11 @@ async fn count_events_authed(
                                     se.event.kind.as_u16() as u32,
                                 )
                             {
+                                continue;
+                            }
+                            if !crate::handlers::community_private::event_is_visible(
+                                se.event.kind.as_u16() as u32,
+                            ) {
                                 continue;
                             }
                             total += 1;
@@ -2494,6 +2524,11 @@ async fn handle_bridge_search(
             if !reader.project_view_read_allowed
                 && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
             {
+                continue;
+            }
+            if !crate::handlers::community_private::event_is_visible(
+                stored.event.kind.as_u16() as u32
+            ) {
                 continue;
             }
             // Dedup across filters.

@@ -5,23 +5,27 @@
 //! This crate owns the closed Project Document v1 command and projection
 //! contracts. It deliberately performs no SQL, networking, signing,
 //! authorization lookup, async work, Markdown execution, or external Resource
-//! resolution. Later implementation stages add the pure reducer without
-//! changing the wire shapes frozen here.
+//! resolution.
 
 mod command;
 mod error;
 mod model;
 mod projection;
+mod reducer;
 mod validation;
 
 pub use command::{DocumentCommandRequest, ProjectDocumentCommand};
 pub use error::{DocumentError, DocumentResult};
-pub use model::{DocumentOperation, DocumentRevision, DocumentSnapshot, DocumentState};
+pub use model::{
+    CurrentDocument, DocumentAttribution, DocumentCatalog, DocumentOperation, DocumentRevision,
+    DocumentSnapshot, DocumentState, ProjectDocument,
+};
 pub use projection::{
     document_head_coordinate, document_meta_coordinate, document_revision_coordinate,
-    ChangedDocumentHead, DocumentHeadProjection, DocumentMetaProjection, DocumentProjectionType,
-    DocumentRevisionProjection, ProjectDocumentReceipt,
+    ChangedDocumentHead, DocumentHeadProjection, DocumentMetaProjection, DocumentProjectionPlan,
+    DocumentProjectionType, DocumentRevisionProjection, ProjectDocumentReceipt,
 };
+pub use reducer::{reduce_document, DocumentChangeContext, DocumentTransition};
 pub use validation::{
     MAX_COMMAND_CONTENT_BYTES, MAX_COMMAND_JSON_DEPTH, MAX_CONTENT_MARKDOWN_BYTES,
     MAX_SAFE_REVISION, MAX_SUMMARY_BYTES, MAX_TITLE_BYTES,

@@ -20,6 +20,7 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod project_document;
 mod project_view;
 
 use std::sync::Arc;
@@ -87,6 +88,11 @@ enum Command {
     ProjectView {
         #[command(subcommand)]
         command: project_view::ProjectViewCommand,
+    },
+    /// Inspect Project Document schema and signer readiness (read-only in Stage 1).
+    ProjectDocument {
+        #[command(subcommand)]
+        command: project_document::ProjectDocumentCommand,
     },
     /// Emit kind:39000/39002 events for channels missing them.
     ///
@@ -156,6 +162,7 @@ async fn run(cli: Cli) -> Result<i32> {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
         Command::ProjectView { command } => project_view::run(command).await,
+        Command::ProjectDocument { command } => project_document::run(command).await,
         Command::ReconcileChannels { relay_key } => {
             reconcile_channels(relay_key).await?;
             Ok(0)

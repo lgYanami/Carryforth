@@ -1858,6 +1858,7 @@ impl ProjectViewV2WriteTx {
             self.community_id,
             command.acting_assignment_id,
             command.runtime_fence,
+            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
         )
         .await?;
         if let Some(receipt) =
@@ -3078,6 +3079,7 @@ async fn validate_project_object_actor_fence(
         community_id,
         Some(assignment_id),
         runtime_fence,
+        crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
     )
     .await?;
     Ok(())

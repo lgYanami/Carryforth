@@ -964,6 +964,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-audit",
  "buzz-core",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "chrono",
@@ -1093,6 +1094,7 @@ dependencies = [
  "hex",
  "nostr",
  "postcard",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1265,6 +1267,7 @@ name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-project-document",
  "buzz-project-view",
  "chrono",
  "hex",
@@ -1293,6 +1296,8 @@ dependencies = [
  "anyhow",
  "base64",
  "buzz-core",
+ "buzz-db",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",

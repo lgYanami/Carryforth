@@ -91,6 +91,14 @@ pub async fn handle_req(
         }
     };
 
+    if super::community_private::filters_are_exclusively_project_document(&filters) {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unavailable:project_document:disabled",
+        ));
+        return;
+    }
+
     let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
     let project_view_exclusive = !filters.is_empty()
         && filters
@@ -351,6 +359,7 @@ pub async fn handle_req(
                     buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
                 ]);
             }
+            super::community_private::exclude_project_document_kinds(&mut params, filter);
             (idx, per_filter_channel, params)
         })
         .collect();
@@ -446,6 +455,9 @@ pub async fn handle_req(
             if !project_view_read_allowed
                 && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
             {
+                continue;
+            }
+            if !super::community_private::event_is_visible(stored.event.kind.as_u16() as u32) {
                 continue;
             }
 
@@ -770,6 +782,10 @@ async fn handle_search_req(
                         && buzz_core::kind::is_project_view_protocol_kind(
                             stored.event.kind.as_u16() as u32,
                         )
+                    {
+                        continue;
+                    }
+                    if !super::community_private::event_is_visible(stored.event.kind.as_u16() as u32)
                     {
                         continue;
                     }

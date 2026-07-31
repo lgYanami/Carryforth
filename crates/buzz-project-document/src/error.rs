@@ -72,6 +72,50 @@ pub enum DocumentError {
         /// Safe projection diagnostic.
         reason: String,
     },
+    /// The caller's expected revision differs from current canonical state.
+    #[error("Project Document revision conflict: expected {expected}, current {actual:?}")]
+    RevisionConflict {
+        /// Revision carried by the signed command.
+        expected: u64,
+        /// Current revision, or `None` when the identity has never existed.
+        actual: Option<u64>,
+    },
+    /// A create attempted to reuse an active or tombstoned identity.
+    #[error("Project Document id {document_id} has already been used")]
+    DocumentIdAlreadyExists {
+        /// Permanently occupied Document identity.
+        document_id: Uuid,
+    },
+    /// An update or delete targeted an identity that has never existed.
+    #[error("Project Document {document_id} was not found")]
+    DocumentNotFound {
+        /// Missing Document identity.
+        document_id: Uuid,
+    },
+    /// An operation targeted a tombstoned identity.
+    #[error("Project Document {document_id} has been deleted")]
+    DocumentDeleted {
+        /// Permanently tombstoned Document identity.
+        document_id: Uuid,
+    },
+    /// An update supplied the exact current full snapshot.
+    #[error("Project Document update does not change the current snapshot")]
+    NoChange,
+    /// A delete was blocked by an active Guide or Live Document reference.
+    #[error("Project Document {document_id} is still referenced")]
+    StillReferenced {
+        /// Referenced Document identity.
+        document_id: Uuid,
+    },
+    /// No next JavaScript-safe Document or catalog revision can be allocated.
+    #[error("Project Document revision space is exhausted")]
+    RevisionExhausted,
+    /// Trusted canonical inputs violate the pure state invariants.
+    #[error("invalid canonical Project Document state: {reason}")]
+    InvalidCanonicalState {
+        /// Safe state diagnostic that never includes body content.
+        reason: String,
+    },
 }
 
 impl DocumentError {
@@ -88,6 +132,13 @@ impl DocumentError {
             Self::InvalidRuntimeFence { .. } => "runtime_fence",
             Self::InvalidSnapshot { .. } => "invalid_snapshot",
             Self::InvalidProjection { .. } => "invalid_snapshot",
+            Self::RevisionConflict { .. } => "revision",
+            Self::DocumentIdAlreadyExists { .. } => "id_exists",
+            Self::DocumentNotFound { .. } | Self::DocumentDeleted { .. } => "revision_target",
+            Self::NoChange => "no_change",
+            Self::StillReferenced { .. } => "still_referenced",
+            Self::RevisionExhausted => "revision_target",
+            Self::InvalidCanonicalState { .. } => "invalid_snapshot",
         }
     }
 }

@@ -726,14 +726,25 @@ impl Db {
     }
 }
 
+/// Runtime supervision requirement chosen by the calling protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCommandFencePolicy {
+    /// Preserve Project View v2 behavior: only registered supervision is fenced.
+    LegacyOptionalSupervision,
+    /// Managed commands require a binding and an exact current leased Runtime.
+    RequireSupervisedRuntime,
+}
+
 /// Reject a supervised managed command unless its signed runtime fence is
-/// current and leased. Called from the Project View transaction after the
-/// Community lock and canonical Assignment checks are held.
+/// current and leased. Called after the Community lock and canonical Assignment
+/// checks are held; the policy keeps legacy v2 and strict newer protocols
+/// explicit at every call site.
 pub(crate) async fn validate_runtime_command_fence_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     assignment_id: Option<Uuid>,
     runtime_fence: Option<RuntimeFence>,
+    policy: RuntimeCommandFencePolicy,
 ) -> RuntimeSupervisionResult<()> {
     let Some(assignment_id) = assignment_id else {
         return Ok(());
@@ -748,7 +759,12 @@ pub(crate) async fn validate_runtime_command_fence_in_tx(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(binding_id) = binding_id else {
-        return Ok(());
+        return match policy {
+            RuntimeCommandFencePolicy::LegacyOptionalSupervision => Ok(()),
+            RuntimeCommandFencePolicy::RequireSupervisedRuntime => {
+                Err(RuntimeSupervisionError::CommandFence)
+            }
+        };
     };
     let Some(runtime_fence) = runtime_fence else {
         return Err(RuntimeSupervisionError::CommandFence);

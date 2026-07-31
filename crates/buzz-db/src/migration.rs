@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -977,6 +977,20 @@ mod tests {
         let graceful_stop = migrations[30].sql.as_str();
         assert!(graceful_stop.contains("project_runtime_evidence_type_check"));
         assert!(graceful_stop.contains("'graceful_stop'"));
+
+        // Project Document lands as one additive, flag-off canonical kernel.
+        assert_eq!(migrations[31].version, 32);
+        let project_document = migrations[31].sql.as_str();
+        assert!(project_document.contains("ADD COLUMN project_document_enabled"));
+        assert!(project_document.contains("DEFAULT FALSE"));
+        assert!(project_document.contains("CREATE TABLE project_document_state"));
+        assert!(project_document.contains("CREATE TABLE project_documents"));
+        assert!(project_document.contains("CREATE TABLE project_document_revisions"));
+        assert!(project_document.contains("CREATE TABLE project_document_changes"));
+        assert!(project_document.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(project_document.contains("project_document_revisions_append_only"));
+        assert!(project_document.contains("project_document_reject_hard_delete"));
+        assert!(project_document.contains("project_document_validate_community"));
     }
 
     #[test]
@@ -1016,6 +1030,15 @@ mod tests {
             "project_runtime_supervision_validate_community",
             "Runtime lease is not backed by its exact latest evidence",
             "Runtime evidence does not match its trusted binding",
+            "project_document_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE TABLE project_document_state",
+            "CREATE TABLE project_documents",
+            "CREATE TABLE project_document_revisions",
+            "CREATE TABLE project_document_changes",
+            "idx_project_document_revisions_history",
+            "project_document_revisions_append_only",
+            "project_document_reject_hard_delete",
+            "project_document_validate_community",
         ] {
             assert!(
                 schema.contains(fragment),
@@ -1054,9 +1077,9 @@ mod tests {
                 .await
                 .expect("inspect migration ledger");
         assert!(!has_ledger);
-        let project_view_enabled: bool = sqlx::query_scalar(
+        let (project_view_enabled, project_document_enabled): (bool, bool) = sqlx::query_as(
             "INSERT INTO communities (id, host) VALUES ($1, $2) \
-             RETURNING project_view_enabled",
+             RETURNING project_view_enabled, project_document_enabled",
         )
         .bind(uuid::Uuid::new_v4())
         .bind(format!("schema-{}.test", uuid::Uuid::new_v4().simple()))
@@ -1064,10 +1087,15 @@ mod tests {
         .await
         .expect("read schema-created Project View default");
         assert!(!project_view_enabled);
+        assert!(!project_document_enabled);
         for relation in [
             "project_view_state",
             "project_view_objects",
             "project_view_mutations",
+            "project_document_state",
+            "project_documents",
+            "project_document_revisions",
+            "project_document_changes",
         ] {
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                 .bind(format!("public.{relation}"))
@@ -1306,8 +1334,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0031");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
+            .expect("upgrade scratch database through 0032");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1411,6 +1439,88 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn project_document_upgrade_from_0031_is_additive_and_disabled() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!("buzz_pd_upgrade_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create migration scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect migration scratch database");
+
+        MIGRATOR
+            .run_to(31, &pool)
+            .await
+            .expect("apply migrations through 0031");
+        let existing_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(existing_id)
+            .bind(format!("document-upgrade-{}.test", existing_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("seed pre-0032 Community");
+
+        run_migrations(&pool)
+            .await
+            .expect("upgrade scratch database through 0032");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
+        let existing_enabled: bool =
+            sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
+                .bind(existing_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read upgraded Community flag");
+        assert!(!existing_enabled);
+        let new_enabled: bool = sqlx::query_scalar(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) \
+             RETURNING project_document_enabled",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(format!(
+            "document-new-{}.test",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("read new Community default");
+        assert!(!new_enabled);
+        for relation in [
+            "project_document_state",
+            "project_documents",
+            "project_document_revisions",
+            "project_document_changes",
+            "idx_project_documents_active",
+            "idx_project_document_revisions_history",
+        ] {
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(format!("public.{relation}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("inspect {relation}: {error}"));
+            assert!(exists, "{relation} must exist after migration 0032");
+        }
+
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop migration scratch database");
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn concurrent_migrators_reach_project_view_schema_once() {
         let admin_url = test_database_url();
         let admin = PgPool::connect(&admin_url)
@@ -1439,15 +1549,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(31));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(32));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version IN (25, 26, 27, 28, 29, 30, 31) AND success",
+             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32) AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 7);
+        assert_eq!(project_view_migration_count, 8);
 
         first.close().await;
         second.close().await;
@@ -1527,7 +1637,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
     }
 
     #[tokio::test]

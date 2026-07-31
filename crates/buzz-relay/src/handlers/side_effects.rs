@@ -216,9 +216,11 @@ pub async fn validate_standard_deletion_event(
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
 
-        if buzz_core::kind::is_project_view_protocol_kind(target_event.event.kind.as_u16() as u32) {
+        if buzz_core::kind::is_community_private_protocol_kind(
+            target_event.event.kind.as_u16() as u32
+        ) {
             return Err(anyhow::anyhow!(
-                "Project View commands and projections cannot be deleted via NIP-09"
+                "Community-private commands and projections cannot be deleted via NIP-09"
             ));
         }
 

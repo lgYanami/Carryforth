@@ -10,8 +10,8 @@ use crate::validation::{
     validate_positive_revision, validate_snapshot,
 };
 use crate::{
-    DocumentError, DocumentOperation, DocumentResult, DocumentState,
-    PROJECT_DOCUMENT_SCHEMA_VERSION,
+    CurrentDocument, DocumentCatalog, DocumentError, DocumentOperation, DocumentResult,
+    DocumentState, PROJECT_DOCUMENT_SCHEMA_VERSION,
 };
 
 /// Exact subtype discriminator carried in every Document projection body.
@@ -458,6 +458,87 @@ impl DocumentMetaProjection {
             }
         }
         Ok(())
+    }
+}
+
+/// Wire-neutral inputs for one Relay-signed Document projection bundle.
+///
+/// A bootstrap plan contains only reset metadata. A mutation plan contains one
+/// immutable revision, its current head, and one incremental metadata change.
+/// Signing and Nostr event construction remain in `buzz-sdk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentProjectionPlan {
+    catalog: DocumentCatalog,
+    current: Option<CurrentDocument>,
+    source_event_id: Option<EventId>,
+    reset: bool,
+}
+
+impl DocumentProjectionPlan {
+    /// Build the only valid empty-catalog bootstrap plan.
+    pub fn for_bootstrap(catalog: &DocumentCatalog) -> DocumentResult<Self> {
+        catalog.validate()?;
+        if catalog.catalog_revision() != 0 || catalog.active_document_count() != 0 {
+            return invalid_projection(
+                "bootstrap projection requires revision zero and an empty catalog",
+            );
+        }
+        Ok(Self {
+            catalog: catalog.clone(),
+            current: None,
+            source_event_id: None,
+            reset: true,
+        })
+    }
+
+    /// Build one deterministic mutation projection plan from canonical output.
+    pub fn for_transition(
+        catalog: &DocumentCatalog,
+        current: &CurrentDocument,
+        source_event_id: EventId,
+    ) -> DocumentResult<Self> {
+        catalog.validate()?;
+        current.validate()?;
+        if catalog.catalog_revision() == 0 {
+            return invalid_projection(
+                "a mutation projection requires a positive catalog revision",
+            );
+        }
+        if catalog.updated_at() != current.document().updated().at {
+            return invalid_projection(
+                "catalog and current Document must share one canonical transition time",
+            );
+        }
+        Ok(Self {
+            catalog: catalog.clone(),
+            current: Some(current.clone()),
+            source_event_id: Some(source_event_id),
+            reset: false,
+        })
+    }
+
+    /// Canonical catalog after the transition.
+    #[must_use]
+    pub const fn catalog(&self) -> &DocumentCatalog {
+        &self.catalog
+    }
+
+    /// Changed current Document, absent for bootstrap reset metadata.
+    #[must_use]
+    pub const fn current(&self) -> Option<&CurrentDocument> {
+        self.current.as_ref()
+    }
+
+    /// Accepted member command, absent for bootstrap/reset.
+    #[must_use]
+    pub const fn source_event_id(&self) -> Option<EventId> {
+        self.source_event_id
+    }
+
+    /// Whether readers must reset their catalog observation cache.
+    #[must_use]
+    pub const fn reset(&self) -> bool {
+        self.reset
     }
 }
 

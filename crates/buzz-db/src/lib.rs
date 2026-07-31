@@ -36,6 +36,8 @@ pub mod moderation;
 pub mod partition;
 /// Buzz product-feedback sidecar persistence.
 pub mod product_feedback;
+/// Project Document canonical state, immutable history, and restricted writes.
+pub mod project_document;
 /// Trusted managed-runtime leases, epochs, and supervisor evidence.
 pub mod project_runtime;
 /// Project View canonical state and atomic mutation persistence.

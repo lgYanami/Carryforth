@@ -52,6 +52,14 @@ pub async fn handle_count(
         }
     };
 
+    if super::community_private::filters_are_exclusively_project_document(&filters) {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unavailable:project_document:disabled",
+        ));
+        return;
+    }
+
     let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
     let project_view_exclusive = !filters.is_empty()
         && filters
@@ -254,6 +262,11 @@ pub async fn handle_count(
                             {
                                 continue;
                             }
+                            if !super::community_private::event_is_visible(
+                                se.event.kind.as_u16() as u32
+                            ) {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -331,6 +344,11 @@ pub async fn handle_count(
                             {
                                 continue;
                             }
+                            if !super::community_private::event_is_visible(
+                                se.event.kind.as_u16() as u32
+                            ) {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -357,4 +375,5 @@ fn exclude_project_view_if_unauthorized(
             buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
         ]);
     }
+    super::community_private::exclude_project_document_kinds(query, filter);
 }

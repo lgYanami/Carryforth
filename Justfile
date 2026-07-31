@@ -293,6 +293,10 @@ test-unit:
         # and agent CLI. Keep that complete no-infra slice in the ordinary unit
         # gate so adding a new package cannot silently drop coverage.
         just project-view-test-unit
+        # Project Document Stage 1 is deliberately flag-off, but its pure
+        # kernel, protocol adapters, deny skeleton, and read-only admin surface
+        # are still part of the ordinary no-infrastructure gate.
+        just project-document-test-unit
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
@@ -312,14 +316,19 @@ project-view-test-unit:
           -p buzz-sdk \
           -p buzz-relay \
           -p buzz-cli \
+          -p buzz-acp \
           --lib \
           -E 'test(project_view)'
+        # buzz-admin has only a binary target; do not pass --lib here.
+        cargo nextest run -p buzz-admin -E 'test(project_view)'
     else
         cargo test -p buzz-project-view
         cargo test -p buzz-core --lib project_view
         cargo test -p buzz-sdk --lib project_view
         cargo test -p buzz-relay --lib project_view
         cargo test -p buzz-cli --lib project_view
+        cargo test -p buzz-acp --lib project_view
+        cargo test -p buzz-admin project_view
     fi
 
 # Run isolated Postgres-backed Project View transaction tests.
@@ -336,6 +345,48 @@ project-view-test-e2e:
 
 # Run every Project View quality gate, including infrastructure-backed tests.
 project-view-test: project-view-test-unit project-view-test-db test-migrations project-view-test-e2e
+
+# Run the complete no-infrastructure Project Document Stage 1 contract.
+project-document-test-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        # The domain crate includes Stage 0 wire fixtures plus the Stage 1
+        # reducer/property tests; SDK golden coverage is an integration target.
+        cargo nextest run -p buzz-project-document
+        cargo nextest run -p buzz-sdk --test project_document
+        cargo nextest run \
+          -p buzz-core \
+          -p buzz-relay \
+          -p buzz-cli \
+          -p buzz-acp \
+          --lib \
+          -E 'test(project_document) or test(community_private)'
+        cargo nextest run -p buzz-db --lib -E 'test(project_document)'
+        # buzz-admin has only a binary target; do not pass --lib here.
+        cargo nextest run -p buzz-admin -E 'test(project_document)'
+    else
+        cargo test -p buzz-project-document
+        cargo test -p buzz-sdk --test project_document
+        cargo test -p buzz-core --lib project_document
+        cargo test -p buzz-relay --lib project_document
+        cargo test -p buzz-relay --lib community_private
+        cargo test -p buzz-cli --lib project_document
+        cargo test -p buzz-acp --lib project_document
+        cargo test -p buzz-db --lib project_document
+        cargo test -p buzz-admin project_document
+    fi
+
+# Run isolated PostgreSQL-backed Project Document transaction and race tests.
+project-document-test-db:
+    ./scripts/test-project-document-db.sh
+
+# Run the real Relay + ordinary CLI/client flag-off security E2E.
+project-document-test-e2e:
+    ./scripts/test-project-document-e2e.sh
+
+# Run every Project Document Stage 1 quality gate.
+project-document-test: project-document-test-unit project-document-test-db test-migrations project-document-test-e2e
 
 # Run integration tests only (starts services if needed)
 test-integration:

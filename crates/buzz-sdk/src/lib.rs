@@ -15,6 +15,8 @@
 pub mod builders;
 pub mod mentions;
 pub mod nip_oa;
+/// Project Document v1 command and verified Relay projection wire format.
+pub mod project_document;
 pub mod project_view;
 /// Project View v2 Role continuity command and projection wire format.
 pub mod project_view_v2;
@@ -114,7 +116,7 @@ pub enum SdkError {
     /// Input failed validation (e.g. malformed pubkey).
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// A Relay-authored Project View projection failed strict verification.
-    #[error("invalid Project View projection: {0}")]
+    /// A Relay-authored protocol projection failed strict verification.
+    #[error("invalid Relay projection: {0}")]
     InvalidProjection(String),
 }

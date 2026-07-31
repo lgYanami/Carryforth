@@ -20,3 +20,4 @@ buzz-project-view = { workspace = true }
 hex = { workspace = true }
 nostr = { workspace = true }
 postcard = { workspace = true }
+proptest = { workspace = true }

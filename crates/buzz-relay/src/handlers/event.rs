@@ -44,11 +44,11 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         20000..=29999 => kind.to_string(),
         30023 | 30315 | 39000..=39003 => kind.to_string(),
         40002..=40100 => kind.to_string(),
-        40903..=40904 => kind.to_string(),
+        40903..=40907 => kind.to_string(),
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
-        44200 | 44300 => kind.to_string(),
+        44200 | 44300..=44301 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
@@ -130,6 +130,10 @@ pub async fn filter_fanout_by_access(
     matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
+    if !super::community_private::event_is_visible(event_kind_u32(&stored_event.event)) {
+        return Vec::new();
+    }
+
     // First enforce the receiver-side tenant label. Subscription indexes are
     // community-scoped, but stale/injected matches and future fan-out helpers
     // must still fail closed at the send chokepoint: a connection bound to

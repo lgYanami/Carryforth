@@ -4889,6 +4889,12 @@ Documents         │
 
 目标：建立 flag-off 的可信内核，不暴露半成品 capability。
 
+> 交付状态（2026-07-31）：已完成。新增 pure reducer、SDK strict protocol adapter、
+> additive migration `0032`、restricted canonical DB transaction、只读 admin status /
+> preflight，以及 Relay private deny skeleton。`project_document_enabled` 没有 enable 写入口，
+> 真实 Community 不执行 bootstrap，NIP-11 不广告 capability，Document public handler与 CLI
+> 仍留在阶段 2。具体交付和验证记录见 [`changelog.md`](changelog.md)。
+
 开发内容：
 
 - 新建 `buzz-project-document` pure crate；
