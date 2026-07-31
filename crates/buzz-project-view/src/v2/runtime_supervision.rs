@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use crate::MAX_SAFE_REVISION;
 
+pub use buzz_core::RuntimeFence;
+
 /// Current runtime-supervision wire schema.
 pub const RUNTIME_SUPERVISION_SCHEMA_VERSION: u16 = 1;
 
@@ -37,29 +39,6 @@ pub enum RuntimeAvailability {
     Recovering,
     /// Recovery policy has been exhausted for this runtime.
     Unavailable,
-}
-
-/// Signed runtime fence carried by a supervised managed Agent command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeFence {
-    /// Logical runtime identity.
-    pub runtime_id: Uuid,
-    /// Current server-allocated epoch for that runtime.
-    pub runtime_epoch: u64,
-}
-
-impl RuntimeFence {
-    /// Validate a non-nil identity and JavaScript-safe positive epoch.
-    pub fn validate(self) -> Result<(), String> {
-        if self.runtime_id.is_nil() {
-            return Err("runtime_id cannot be nil".to_owned());
-        }
-        if !(1..=MAX_SAFE_REVISION).contains(&self.runtime_epoch) {
-            return Err("runtime_epoch must be in the JavaScript-safe positive range".to_owned());
-        }
-        Ok(())
-    }
 }
 
 impl RuntimeAvailability {

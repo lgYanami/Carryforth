@@ -4849,6 +4849,13 @@ Documents         │
 
 目标：在实现前固定跨 crate 合同。
 
+> 交付状态（2026-07-31）：已完成。规范入口为
+> [`docs/nips/NIP-PD.md`](../../../nips/NIP-PD.md) 与
+> [`docs/nips/NIP-PV3.md`](../../../nips/NIP-PV3.md)，共享 fixture 位于
+> [`docs/nips/fixtures/project-document-v1/`](../../../nips/fixtures/project-document-v1/)，
+> 具体冻结决策和阶段边界记录在 [`changelog.md`](changelog.md)。阶段 0 只注册 kind 和
+> pure contract；未创建 migration、未增加 Relay route、未广告 capability，也未开放读取。
+
 开发内容：
 
 - 新建 Project Document protocol / NIP 文档；

@@ -1,0 +1,17 @@
+{
+  "content": "{\"schema_version\":1,\"expected_document_revision\":7,\"acting_assignment_id\":\"151f2347-7d24-41a0-ab0d-f272e84fcf88\",\"runtime_fence\":{\"runtime_id\":\"74ad5e95-903b-4488-ac19-d95a73fa62d4\",\"runtime_epoch\":4},\"request\":{\"type\":\"update\",\"document_id\":\"9c23f672-a397-42d1-b933-104ba2674f26\",\"title\":\"Buzz repository guide\",\"summary\":\"Clone, initialize, and verify this repository.\",\"content_markdown\":\"# Repository\\n\\nRun `just ci` before review.\"}}",
+  "created_at": 1785146700,
+  "id": "c9c2a166554b139afe8d782425fc900b6d7af45faa1cbfe613445326d2d1178d",
+  "kind": 44301,
+  "pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+  "sig": "750996d411244950aaec591b991b4828bbbfdbf1fd9bf09d071cc3b6ef36ce6f0d7f77ef53e843b426576ae6172600aefe9528ca7457ee76746d1287cfead530",
+  "tags": [
+    [
+      "-"
+    ],
+    [
+      "t",
+      "buzz-project-document-command"
+    ]
+  ]
+}

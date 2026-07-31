@@ -1,0 +1,33 @@
+{
+  "content": "{\"schema_version\":1,\"projection_type\":\"document_meta\",\"project_id\":\"3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77\",\"initialized\":true,\"projection_generation\":1,\"catalog_revision\":0,\"active_document_count\":0,\"reset\":true,\"changed_heads\":[],\"updated_at\":\"2026-07-27T09:55:00Z\"}",
+  "created_at": 1785146100,
+  "id": "3cd4f2f8d097d8a21814dee9c2eeba412381aa34bbe180bb4cbf2eb8a2bdcf6c",
+  "kind": 40907,
+  "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "sig": "839fb7457040188e667fa3a2e107ae4b57f5f2797c2132ed8acb589dee0d7b4fd68b28f6900b731bb9cb60095c9c170d30d897f72fe13ebef85c7d569fdd3fc7",
+  "tags": [
+    [
+      "-"
+    ],
+    [
+      "d",
+      "project-document:3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77:meta"
+    ],
+    [
+      "t",
+      "buzz-project-document"
+    ],
+    [
+      "t",
+      "buzz-project-document-meta"
+    ],
+    [
+      "projection_generation",
+      "1"
+    ],
+    [
+      "catalog_revision",
+      "0"
+    ]
+  ]
+}

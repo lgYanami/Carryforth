@@ -1084,11 +1084,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-document"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "buzz-project-view",
+ "chrono",
+ "hex",
+ "nostr",
+ "postcard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-project-view"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
  "chrono",
+ "postcard",
  "proptest",
  "serde",
  "serde_json",

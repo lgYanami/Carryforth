@@ -451,6 +451,21 @@ pub const KIND_PROJECT_VIEW_OBJECT: u32 = 40903;
 /// This kind carries an indexed `d` tag, but it is not a NIP-33 addressable
 /// event. Project View owns replacement through its domain revision protocol.
 pub const KIND_PROJECT_VIEW_META: u32 = 40904;
+/// NIP-PD: relay-signed current metadata head for one Project Document.
+///
+/// This kind carries an indexed `d` tag, but it is not a NIP-33 addressable
+/// event. Project Document owns replacement through its revision protocol.
+pub const KIND_PROJECT_DOCUMENT_HEAD: u32 = 40905;
+/// NIP-PD: relay-signed immutable Project Document revision.
+///
+/// Every active revision is a complete Markdown snapshot. Revisions remain
+/// queryable after the current head advances or is tombstoned.
+pub const KIND_PROJECT_DOCUMENT_REVISION: u32 = 40906;
+/// NIP-PD: relay-signed current Project Document catalog metadata head.
+///
+/// This kind carries an indexed `d` tag but uses the Document catalog revision
+/// and projection generation rather than NIP-33 last-write-wins semantics.
+pub const KIND_PROJECT_DOCUMENT_META: u32 = 40907;
 
 // Direct messages (41000–41999)
 /// Open/create DM (p-tags = participants).
@@ -496,6 +511,8 @@ pub const KIND_AGENT_TURN_METRIC: u32 = 44200;
 
 /// NIP-PV: member-signed, append-only Project View mutation command.
 pub const KIND_PROJECT_VIEW_MUTATION: u32 = 44300;
+/// NIP-PD: member-signed, append-only Project Document command.
+pub const KIND_PROJECT_DOCUMENT_COMMAND: u32 = 44301;
 
 // Forum / social (45000–45999)
 // V1 used addressable range (30001–30003) — wrong.
@@ -655,6 +672,9 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PRESENCE_SNAPSHOT,
     KIND_PROJECT_VIEW_OBJECT,
     KIND_PROJECT_VIEW_META,
+    KIND_PROJECT_DOCUMENT_HEAD,
+    KIND_PROJECT_DOCUMENT_REVISION,
+    KIND_PROJECT_DOCUMENT_META,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -670,6 +690,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_AGENT_TURN_METRIC,
     KIND_PROJECT_VIEW_MUTATION,
+    KIND_PROJECT_DOCUMENT_COMMAND,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
     KIND_USER_STATUS,
@@ -731,12 +752,19 @@ pub const fn is_parameterized_replaceable(kind: u32) -> bool {
 /// Returns `true` when the event store materializes this kind's `d` tag.
 ///
 /// NIP-33 addressable events use `d` as part of their replacement key.
-/// Project View object and metadata projections use `d` only as a
+/// Project View and Project Document projections use `d` only as a
 /// relay-managed query coordinate; they deliberately retain separate domain
 /// revision and replacement semantics.
 pub const fn has_indexed_d_tag(kind: u32) -> bool {
     is_parameterized_replaceable(kind)
-        || matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META)
+        || matches!(
+            kind,
+            KIND_PROJECT_VIEW_OBJECT
+                | KIND_PROJECT_VIEW_META
+                | KIND_PROJECT_DOCUMENT_HEAD
+                | KIND_PROJECT_DOCUMENT_REVISION
+                | KIND_PROJECT_DOCUMENT_META
+        )
 }
 
 /// Returns `true` for relay-signed Project View current-state projections.
@@ -755,6 +783,37 @@ pub const fn is_project_view_mutation_kind(kind: u32) -> bool {
 /// read gate instead of the ordinary `channel_id IS NULL` visibility rule.
 pub const fn is_project_view_protocol_kind(kind: u32) -> bool {
     is_project_view_projection_kind(kind) || is_project_view_mutation_kind(kind)
+}
+
+/// Returns `true` for relay-signed Project Document projections.
+pub const fn is_project_document_projection_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_PROJECT_DOCUMENT_HEAD | KIND_PROJECT_DOCUMENT_REVISION | KIND_PROJECT_DOCUMENT_META
+    )
+}
+
+/// Returns `true` for the member-signed Project Document command.
+pub const fn is_project_document_command_kind(kind: u32) -> bool {
+    kind == KIND_PROJECT_DOCUMENT_COMMAND
+}
+
+/// Returns `true` for every event kind in the Project Document wire protocol.
+///
+/// Commands contain full Markdown snapshots, so they are as private as the
+/// relay-authored projections and must eventually pass every Community-private
+/// read chokepoint before the capability can be enabled.
+pub const fn is_project_document_protocol_kind(kind: u32) -> bool {
+    is_project_document_projection_kind(kind) || is_project_document_command_kind(kind)
+}
+
+/// Returns `true` for Community-global protocols with member-only reads.
+///
+/// This classifier is the protocol registry boundary. Relay read paths still
+/// keep their capability-specific readiness checks and must not infer that a
+/// newly registered protocol is enabled merely because it appears here.
+pub const fn is_community_private_protocol_kind(kind: u32) -> bool {
+    is_project_view_protocol_kind(kind) || is_project_document_protocol_kind(kind)
 }
 
 /// Returns `true` if `kind` is a workflow execution event (46001–46012).
@@ -796,6 +855,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
             | KIND_PROJECT_VIEW_MUTATION
+            | KIND_PROJECT_DOCUMENT_COMMAND
     )
 }
 
@@ -809,6 +869,9 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_PRESENCE_SNAPSHOT
             | KIND_PROJECT_VIEW_OBJECT
             | KIND_PROJECT_VIEW_META
+            | KIND_PROJECT_DOCUMENT_HEAD
+            | KIND_PROJECT_DOCUMENT_REVISION
+            | KIND_PROJECT_DOCUMENT_META
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -848,6 +911,39 @@ const _: () = assert!(is_project_view_mutation_kind(KIND_PROJECT_VIEW_MUTATION))
 const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_OBJECT));
 const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_META));
 const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_MUTATION));
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_HEAD));
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_REVISION));
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_META));
+const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_DOCUMENT_HEAD));
+const _: () = assert!(!is_parameterized_replaceable(
+    KIND_PROJECT_DOCUMENT_REVISION
+));
+const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_DOCUMENT_META));
+const _: () = assert!(!has_indexed_d_tag(KIND_PROJECT_DOCUMENT_COMMAND));
+const _: () = assert!(is_project_document_projection_kind(
+    KIND_PROJECT_DOCUMENT_HEAD
+));
+const _: () = assert!(is_project_document_projection_kind(
+    KIND_PROJECT_DOCUMENT_REVISION
+));
+const _: () = assert!(is_project_document_projection_kind(
+    KIND_PROJECT_DOCUMENT_META
+));
+const _: () = assert!(is_project_document_command_kind(
+    KIND_PROJECT_DOCUMENT_COMMAND
+));
+const _: () = assert!(is_project_document_protocol_kind(
+    KIND_PROJECT_DOCUMENT_HEAD
+));
+const _: () = assert!(is_project_document_protocol_kind(
+    KIND_PROJECT_DOCUMENT_REVISION
+));
+const _: () = assert!(is_project_document_protocol_kind(
+    KIND_PROJECT_DOCUMENT_META
+));
+const _: () = assert!(is_project_document_protocol_kind(
+    KIND_PROJECT_DOCUMENT_COMMAND
+));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -915,11 +1011,20 @@ mod tests {
         assert!(!has_indexed_d_tag(40000));
         assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_OBJECT));
         assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_META));
+        assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_HEAD));
+        assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_REVISION));
+        assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_META));
         assert!(!has_indexed_d_tag(KIND_PROJECT_VIEW_MUTATION));
+        assert!(!has_indexed_d_tag(KIND_PROJECT_DOCUMENT_COMMAND));
         assert!(!has_indexed_d_tag(KIND_TEXT_NOTE));
 
         assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_OBJECT));
         assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_META));
+        assert!(!is_parameterized_replaceable(KIND_PROJECT_DOCUMENT_HEAD));
+        assert!(!is_parameterized_replaceable(
+            KIND_PROJECT_DOCUMENT_REVISION
+        ));
+        assert!(!is_parameterized_replaceable(KIND_PROJECT_DOCUMENT_META));
     }
 
     #[test]
@@ -940,6 +1045,45 @@ mod tests {
         assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_META));
         assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_MUTATION));
         assert!(!is_project_view_protocol_kind(KIND_TEXT_NOTE));
+    }
+
+    #[test]
+    fn project_document_projection_kinds_are_relay_only() {
+        assert!(is_relay_only_kind(KIND_PROJECT_DOCUMENT_HEAD));
+        assert!(is_relay_only_kind(KIND_PROJECT_DOCUMENT_REVISION));
+        assert!(is_relay_only_kind(KIND_PROJECT_DOCUMENT_META));
+        assert!(!is_relay_only_kind(KIND_PROJECT_DOCUMENT_COMMAND));
+    }
+
+    #[test]
+    fn project_document_protocol_classifiers_cover_commands_and_projections() {
+        for kind in [
+            KIND_PROJECT_DOCUMENT_HEAD,
+            KIND_PROJECT_DOCUMENT_REVISION,
+            KIND_PROJECT_DOCUMENT_META,
+        ] {
+            assert!(is_project_document_projection_kind(kind));
+            assert!(is_project_document_protocol_kind(kind));
+            assert!(is_community_private_protocol_kind(kind));
+        }
+        assert!(!is_project_document_projection_kind(
+            KIND_PROJECT_DOCUMENT_COMMAND
+        ));
+        assert!(is_project_document_command_kind(
+            KIND_PROJECT_DOCUMENT_COMMAND
+        ));
+        assert!(is_command_kind(KIND_PROJECT_DOCUMENT_COMMAND));
+        assert!(is_project_document_protocol_kind(
+            KIND_PROJECT_DOCUMENT_COMMAND
+        ));
+        assert!(is_community_private_protocol_kind(
+            KIND_PROJECT_DOCUMENT_COMMAND
+        ));
+        assert!(is_community_private_protocol_kind(
+            KIND_PROJECT_VIEW_MUTATION
+        ));
+        assert!(!is_project_document_protocol_kind(KIND_TEXT_NOTE));
+        assert!(!is_community_private_protocol_kind(KIND_TEXT_NOTE));
     }
 
     #[test]

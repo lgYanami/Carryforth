@@ -32,6 +32,8 @@ pub mod pairing;
 pub mod presence;
 /// Canonical relay runtime identities.
 pub mod relay;
+/// Wire-neutral managed-runtime fencing shared by command protocols.
+pub mod runtime;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
 /// Schnorr signature and event ID verification.
@@ -41,6 +43,7 @@ pub use error::VerificationError;
 pub use event::StoredEvent;
 pub use nostr::{Event, EventId, Filter, Keys, Kind, PublicKey};
 pub use presence::PresenceStatus;
+pub use runtime::RuntimeFence;
 pub use tenant::{normalize_host, CommunityId, TenantContext};
 pub use verification::verify_event;
 
