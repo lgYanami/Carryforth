@@ -257,6 +257,25 @@ fn apply_completed_before_control_signal(
     }
 }
 
+/// Consume a control signal that arrived while session creation or prompt
+/// context assembly was still in progress.
+///
+/// Starting `session/prompt` after an explicit stop is already queued creates
+/// a needless prompt-then-cancel race. In particular, a newly created adapter
+/// session may not yet be ready to acknowledge that immediate cancellation.
+/// A closed sender has the same stop semantics as the ordinary awaited path.
+fn take_ready_pre_prompt_control_signal(
+    control_rx: &mut Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
+) -> Option<ControlSignal> {
+    let signal = match control_rx.as_mut()?.try_recv() {
+        Ok(signal) => signal,
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => ControlSignal::Cancel,
+    };
+    *control_rx = None;
+    Some(signal)
+}
+
 /// Control signal for an in-flight channel turn.
 ///
 /// Not `Copy`: `SwitchModel` carries an owned `String`. Callers must clone when
@@ -1343,7 +1362,7 @@ pub async fn run_prompt_task(
     execution: PromptExecution,
 ) {
     let PromptExecution {
-        control_rx,
+        mut control_rx,
         absolute_hard_deadline,
         turn_id,
     } = execution;
@@ -1874,6 +1893,54 @@ pub async fn run_prompt_task(
         );
         return;
     };
+
+    // Session creation and context assembly can take seconds. A Meeting End,
+    // Stop, or superseding event may have queued a control signal during that
+    // pre-prompt window. Consume it before writing `session/prompt`; otherwise
+    // the harness starts work known to be obsolete and immediately races a
+    // `session/cancel` against a newly initialized adapter session.
+    if let Some(control_signal) = take_ready_pre_prompt_control_signal(&mut control_rx) {
+        if let ControlSignal::SwitchModel(ref model_id) = control_signal {
+            agent.desired_model = Some(model_id.clone());
+            agent.model_overridden = true;
+        }
+        agent.state.invalidate(&source);
+        agent.acp.observe(
+            "prompt_cancelled_before_request",
+            serde_json::json!({
+                "reason": match &control_signal {
+                    ControlSignal::Steer => "steer",
+                    ControlSignal::Interrupt => "interrupt",
+                    ControlSignal::Cancel => "explicit_cancel",
+                    ControlSignal::Rotate => "rotate",
+                    ControlSignal::SwitchModel(_) => "switch_model",
+                },
+            }),
+        );
+        tracing::info!(
+            target: "pool::prompt",
+            "control signal arrived before prompt request — skipping model call"
+        );
+        let retry_batch = requeue_cancelled_batch(&ctx, control_signal, batch);
+        publish_agent_turn_metric(
+            &ctx,
+            None,
+            observer_channel_id,
+            &session_id,
+            &turn_id,
+            Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+        )
+        .await;
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Cancelled,
+            retry_batch,
+        );
+        return;
+    }
 
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
@@ -3838,6 +3905,48 @@ mod tests {
         }
     }
 
+    async fn pre_prompt_cancel_fake_agent(observer: observer::ObserverHandle) -> OwnedAgent {
+        // If the harness regresses and writes a prompt after the already-ready
+        // Cancel, acknowledge the old prompt/cancel sequence so the test fails
+        // on observer evidence instead of waiting for a timeout.
+        let script = r#"
+            set -eu
+
+            IFS= read -r INIT
+            printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":2,"agentCapabilities":{},"agentInfo":{"name":"pre-prompt-cancel-fake","version":"test"}}}'
+
+            IFS= read -r SESSION_NEW
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"pre-prompt-cancel-session"}}'
+
+            if IFS= read -r PROMPT; then
+                if [[ "$PROMPT" == *'"method":"session/prompt"'* ]]; then
+                    IFS= read -r CANCEL
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"cancelled"}}'
+                fi
+            fi
+        "#;
+
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script.to_string()], &[], false)
+            .await
+            .expect("failed to spawn pre-prompt cancellation fake agent");
+        acp.initialize()
+            .await
+            .expect("pre-prompt cancellation fake agent must initialize");
+        acp.set_observer(Some(observer), 0);
+
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "pre-prompt-cancel-fake".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
     #[tokio::test]
     async fn meeting_v1_granted_turn_inherits_context_mcp_without_forced_plan_mode() {
         const EXPECTED_SAY: &str = r#"{"action":"SAY","content":"The Meeting state is coherent.","mention_pubkeys":[],"handoff":null,"reason":null}"#;
@@ -3927,6 +4036,70 @@ mod tests {
             EXPECTED_SAY,
             "the harness must assemble the complete strict SAY JSON across ACP chunks"
         );
+        result.agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_during_session_setup_skips_the_prompt_request() {
+        let observer = observer::ObserverHandle::in_process();
+        let channel_id = Uuid::new_v4();
+        let mut agent = pre_prompt_cancel_fake_agent(observer.clone()).await;
+        // Avoid unrelated canvas discovery while preserving the new-session
+        // path that exposed the real Codex cancellation race.
+        agent.state.canvas_sections.insert(
+            channel_id,
+            "[Channel Canvas]\nPre-prompt cancellation test.".into(),
+        );
+
+        let agent_keys = Keys::generate();
+        let mut ctx = make_prompt_context_impl(&agent_keys, None);
+        ctx.require_permission_mode = false;
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(ControlSignal::Cancel)
+            .expect("queue explicit cancellation before the prompt request");
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_prompt_task(
+                agent,
+                Some(batch),
+                Some("This prompt must never reach the adapter.".into()),
+                Arc::new(ctx),
+                result_tx,
+                PromptExecution {
+                    control_rx: Some(control_rx),
+                    absolute_hard_deadline: None,
+                    turn_id: "pre-prompt-cancel-test".into(),
+                },
+            ),
+        )
+        .await
+        .expect("pre-prompt cancellation must complete without a drain timeout");
+
+        let mut result = result_rx
+            .recv()
+            .await
+            .expect("run_prompt_task must return its agent");
+        assert!(matches!(result.outcome, PromptOutcome::Cancelled));
+        assert!(result.batch.is_none(), "explicit Cancel drops the batch");
+        let events = observer.snapshot();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "prompt_cancelled_before_request"));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.kind.as_str(),
+                "prompt_request_started" | "acp_cancel_requested" | "acp_session_cancel_sent"
+            )
+        }));
         result.agent.acp.shutdown().await;
     }
 

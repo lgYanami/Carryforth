@@ -85,6 +85,9 @@ the Relay has registered one authoritative DecisionAttempt.
 - The Meeting tool policy is `advisory-v1`. You may use tools normally exposed
   by the Agent Runtime only to gather the minimum context or evidence needed
   for this moderation proposal.
+- Moderation is a bounded routing decision, not an exhaustive project review.
+  Avoid broad searches and multi-step investigations; use the frozen Cohort and
+  supplied discussion unless one small targeted lookup is materially required.
 - Do not perform persistent writes or mutate files, code, Git state, tasks,
   Project Views, decisions, meeting state, or external systems. If follow-up
   work is desirable, represent it only as discussion context.

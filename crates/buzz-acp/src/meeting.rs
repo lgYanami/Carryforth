@@ -84,6 +84,10 @@ pub(crate) struct MeetingTurnRequest {
     pub(super) floor_revision: u64,
     pub(super) grant_event_id: Option<String>,
     pub(super) queued_at_unix_ms: i64,
+    /// Privacy-safe Moderator Attempt evidence retained with an in-flight
+    /// Turn so a terminal Meeting can still emit its natural completion and
+    /// final disposition after the durable Meeting ledger is erased.
+    pub(super) moderator_observer_snapshot: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1560,6 +1564,7 @@ impl V0MeetingCoordinator {
                 floor_revision: view.floor.floor_revision,
                 grant_event_id: Some(grant_id.clone()),
                 queued_at_unix_ms: now_ms(),
+                moderator_observer_snapshot: None,
             });
             self.emit(
                 "grant_received",
@@ -1647,6 +1652,7 @@ impl V0MeetingCoordinator {
             floor_revision: updated_view.floor.floor_revision,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         });
         self.emit(
             "intent_started",
@@ -3398,6 +3404,7 @@ mod tests {
             floor_revision: 1,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         }
     }
 
@@ -3418,6 +3425,7 @@ mod tests {
             )
             .then(|| "a".repeat(64)),
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         }
     }
 

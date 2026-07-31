@@ -966,6 +966,27 @@ mod tests {
     }
 
     #[test]
+    fn desired_schema_contains_moderator_optimistic_decision_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "moderator_max_rejudgments",
+            "moderator_max_cas_rebases_per_attempt",
+            "eligible_decision_epoch",
+            "active_decision_attempt_id",
+            "CREATE TABLE meeting_moderator_decision_attempts",
+            "CREATE TABLE meeting_moderator_retry_tickets",
+            "fk_meeting_baton_active_decision_attempt",
+            "fk_meeting_v1_receipt_retry_ticket",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0031 object {required}"
+            );
+        }
+    }
+
+    #[test]
     fn migration_lint_detects_tables_missing_community_id_by_default() {
         let sql = r#"
             CREATE TABLE communities (id UUID PRIMARY KEY);

@@ -67,6 +67,7 @@ const MODERATOR_DEADLINE_SAFETY_MARGIN: Duration = Duration::from_secs(15);
 const DEFAULT_MODERATOR_DECISION_DURATION: Duration = Duration::from_secs(3 * 60);
 const MAX_MODERATOR_FAST_REBASES: u8 = 3;
 const MODERATOR_REBASE_QUIESCENCE: Duration = Duration::from_millis(250);
+const MAX_MODERATOR_TERMINAL_TURNS: usize = 4_096;
 
 const PARTICIPANT_INTENT_PROMPT: &str = include_str!("meeting_participant_intent_prompt.md");
 const GRANTED_SPEECH_PROMPT: &str = include_str!("meeting_granted_speech_prompt.md");
@@ -495,6 +496,8 @@ struct ModeratorDecisionRecord {
     pending_retry: Option<PendingModeratorRetry>,
     #[serde(default)]
     pending_finish_reason: Option<String>,
+    #[serde(default)]
+    terminal_disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +512,10 @@ struct PreparedModeratorAction {
     object_id: String,
     #[serde(default)]
     attempt_id: Option<String>,
+    #[serde(default)]
+    observer_snapshot: Option<Value>,
+    #[serde(default)]
+    turn_id: Option<String>,
     event: Value,
     event_id: String,
     state: String,
@@ -770,6 +777,7 @@ enum ProtocolSubmissionContext {
         action_kind: String,
         object_id: String,
         attempt_id: Option<String>,
+        observer_snapshot: Option<Value>,
         turn_id: Option<String>,
         queued_at_ms: Option<i64>,
         #[cfg(feature = "meeting-v1-acceptance")]
@@ -811,6 +819,8 @@ pub(super) struct MeetingV1Coordinator {
     in_flight_epochs: HashMap<String, u64>,
     external_reclaimable_turns: BTreeSet<Uuid>,
     preemptions: BTreeSet<Uuid>,
+    moderator_terminal_turns: BTreeSet<String>,
+    moderator_terminal_turn_order: VecDeque<String>,
     next_session_epoch: u64,
     next_sync_request_id: u64,
     sync_result_tx: tokio::sync::mpsc::UnboundedSender<SyncTaskResult>,
@@ -878,6 +888,8 @@ impl MeetingV1Coordinator {
             in_flight_epochs: HashMap::new(),
             external_reclaimable_turns: BTreeSet::new(),
             preemptions: BTreeSet::new(),
+            moderator_terminal_turns: BTreeSet::new(),
+            moderator_terminal_turn_order: VecDeque::new(),
             next_session_epoch: 0,
             next_sync_request_id: 0,
             sync_result_tx,
@@ -1096,14 +1108,22 @@ impl MeetingV1Coordinator {
         } else {
             self.preemptions.remove(&session_id);
         }
-        self.deferred_turn_results.remove(&session_id);
-        self.protocol_in_flight
-            .retain(|key, _| key.session_id() != session_id);
+        let deferred_turn_result = self.deferred_turn_results.remove(&session_id);
+        // A primary Moderator action may already be committed at the Relay
+        // even when the terminal State wins the local delivery race. Keep its
+        // submission identity until the HTTP result arrives so the observer
+        // can record either the commit or a typed terminal discard.
+        self.protocol_in_flight.retain(|key, _| {
+            key.session_id() != session_id || matches!(key, ProtocolSubmissionKey::Moderator { .. })
+        });
         self.progress_in_flight
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
         self.progress_waiting_for_state
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
         self.external_reclaimable_turns.remove(&session_id);
+        if let Some(pending) = deferred_turn_result {
+            self.discard_deferred_turn_result(pending, Some("meeting_ended"));
+        }
         self.meetings.remove(&session_id);
         self.ledger.meetings.remove(&session_id.to_string());
         self.persist_terminal_ledger_cleanup();
@@ -1223,10 +1243,71 @@ impl MeetingV1Coordinator {
             .meetings
             .get(&request.session_id)
             .map(|runtime| runtime.epoch);
+        let session_id = request.session_id;
+        if request.kind == MeetingTurnKind::V1ModeratorControl {
+            let model_latency_ms = self
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_decision.as_ref())
+                .and_then(|decision| decision.turn_started_at_ms)
+                .map(|started| now_ms().saturating_sub(started))
+                .or_else(|| Some(now_ms().saturating_sub(request.queued_at_unix_ms)));
+            let disposition = (
+                if succeeded {
+                    "natural_terminal"
+                } else {
+                    "provider_failure"
+                },
+                if succeeded {
+                    "prompt_terminal"
+                } else {
+                    "prompt_failed"
+                },
+            );
+            if self
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_decision.as_ref())
+                .is_some()
+            {
+                self.emit_moderator_decision_event(
+                    "meeting_v1_moderator_decision_completed",
+                    session_id,
+                    Some(turn_id.to_string()),
+                    disposition,
+                    model_latency_ms,
+                    json!({}),
+                );
+            } else {
+                self.emit_moderator_decision_snapshot_event(
+                    "meeting_v1_moderator_decision_completed",
+                    session_id,
+                    Some(turn_id.to_string()),
+                    request.moderator_observer_snapshot.as_ref(),
+                    disposition,
+                    model_latency_ms,
+                );
+            }
+        }
         let Some(turn_epoch) = turn_epoch.filter(|epoch| Some(*epoch) == current_epoch) else {
+            if request.kind == MeetingTurnKind::V1ModeratorControl {
+                let reason = if self.ledger_for(session_id).is_none() {
+                    "meeting_ended"
+                } else {
+                    "control_changed"
+                };
+                if self.claim_moderator_disposition(session_id, Some(turn_id), "discarded") {
+                    self.emit_moderator_decision_snapshot_event(
+                        "meeting_v1_moderator_decision_discarded",
+                        session_id,
+                        Some(turn_id.to_string()),
+                        request.moderator_observer_snapshot.as_ref(),
+                        ("discarded", reason),
+                        None,
+                    );
+                }
+            }
             self.emit(
                 "meeting_v1_turn_result_deferred",
-                request.session_id,
+                session_id,
                 Some(turn_id.to_string()),
                 json!({ "reason": "registration_epoch_changed" }),
             );
@@ -1237,42 +1318,18 @@ impl MeetingV1Coordinator {
                 runtime.in_flight_turn = None;
             }
         }
-        let session_id = request.session_id;
-        if request.kind == MeetingTurnKind::V1ModeratorControl {
-            let model_latency_ms = self
-                .ledger_for(session_id)
-                .and_then(|ledger| ledger.moderator_decision.as_ref())
-                .and_then(|decision| decision.turn_started_at_ms)
-                .map(|started| now_ms().saturating_sub(started));
-            self.emit_moderator_decision_event(
-                "meeting_v1_moderator_decision_completed",
-                session_id,
-                Some(turn_id.to_string()),
-                (
-                    if succeeded {
-                        "natural_terminal"
-                    } else {
-                        "provider_failure"
-                    },
-                    if succeeded {
-                        "prompt_terminal"
-                    } else {
-                        "prompt_failed"
-                    },
-                ),
-                model_latency_ms,
-                json!({}),
-            );
-        }
         let Some(request_id) = self.request_full_sync(session_id) else {
-            self.discard_deferred_turn_result(DeferredTurnResult {
-                request_id: 0,
-                session_epoch: turn_epoch,
-                turn_id: turn_id.to_string(),
-                request,
-                raw_output,
-                succeeded,
-            });
+            self.discard_deferred_turn_result(
+                DeferredTurnResult {
+                    request_id: 0,
+                    session_epoch: turn_epoch,
+                    turn_id: turn_id.to_string(),
+                    request,
+                    raw_output,
+                    succeeded,
+                },
+                None,
+            );
             return;
         };
         let deferred = DeferredTurnResult {
@@ -1284,7 +1341,7 @@ impl MeetingV1Coordinator {
             succeeded,
         };
         if let Some(replaced) = self.deferred_turn_results.insert(session_id, deferred) {
-            self.discard_deferred_turn_result(replaced);
+            self.discard_deferred_turn_result(replaced, None);
         }
     }
 
@@ -1486,6 +1543,11 @@ impl MeetingV1Coordinator {
     }
 
     async fn handle_protocol_result(&mut self, completed: ProtocolTaskResult) {
+        let terminal_moderator_submission =
+            matches!(
+                &completed.context,
+                ProtocolSubmissionContext::Moderator { .. }
+            ) && !self.meetings.contains_key(&completed.key.session_id());
         let current_epoch = self
             .meetings
             .get(&completed.key.session_id())
@@ -1494,7 +1556,7 @@ impl MeetingV1Coordinator {
             .protocol_in_flight
             .get(&completed.key)
             .is_none_or(|in_flight| {
-                current_epoch != completed.session_epoch
+                (!terminal_moderator_submission && current_epoch != completed.session_epoch)
                     || in_flight.session_epoch != completed.session_epoch
                     || in_flight.submission_id != completed.submission_id
                     || in_flight.event_id != completed.event_id
@@ -1548,6 +1610,7 @@ impl MeetingV1Coordinator {
                         "turn_role": turn_role,
                         "ack_latency_ms": now_ms().saturating_sub(created_at_ms),
                         "submission": protocol_submission_label(&completed.result),
+                        "rejection_code": protocol_rejection_code(&completed.result),
                     }),
                 );
                 if completed.result.is_err() {
@@ -1603,6 +1666,7 @@ impl MeetingV1Coordinator {
                         "decision": "SUBMIT",
                         "intent_event_id": completed.event_id,
                         "outcome": protocol_submission_label(&completed.result),
+                        "rejection_code": protocol_rejection_code(&completed.result),
                         "latency_ms": queued_at_ms
                             .map(|queued_at_ms| now_ms().saturating_sub(queued_at_ms)),
                     }),
@@ -1692,6 +1756,7 @@ impl MeetingV1Coordinator {
                     "grant_id": grant_id,
                     "action": action.as_str(),
                     "outcome": protocol_submission_label(&completed.result),
+                    "rejection_code": protocol_rejection_code(&completed.result),
                     "grant_duration_ms": grant_started_at_ms
                         .map(|started| now_ms().saturating_sub(started)),
                     "turn_latency_ms": queued_at_ms
@@ -1748,16 +1813,18 @@ impl MeetingV1Coordinator {
                 action_kind,
                 object_id,
                 attempt_id,
+                observer_snapshot,
                 turn_id,
                 queued_at_ms,
                 ..
             } => {
                 let session_id = completed.key.session_id();
+                let meeting_ended = !self.meetings.contains_key(&session_id);
                 let event_matches = self
                     .ledger_for(session_id)
                     .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
                     .is_some_and(|prepared| prepared.event_id == completed.event_id);
-                if event_matches {
+                if event_matches && !meeting_ended {
                     self.handle_moderator_protocol_outcome(
                         session_id,
                         &action_kind,
@@ -1765,27 +1832,64 @@ impl MeetingV1Coordinator {
                         &completed.event_id,
                         &completed.result,
                     );
+                } else if event_matches {
+                    // A terminal Meeting cannot continue or replay a prepared
+                    // moderator action. Keep its immutable observer snapshot
+                    // below, but release the durable replay slot.
+                    if let Some(ledger) = self.ledger_for_mut(session_id) {
+                        ledger.prepared_moderator_action = None;
+                    }
                 }
                 self.persist_ledger_best_effort();
-                if event_matches
-                    && completed.result.is_ok()
-                    && matches!(
-                        action_kind.as_str(),
-                        "select_intent" | "select_handoff" | "moderator_speak" | "withdraw_self"
-                    )
+                let committing_action = matches!(
+                    action_kind.as_str(),
+                    "select_intent"
+                        | "select_handoff"
+                        | "moderator_speak"
+                        | "withdraw_self"
+                        | "complete_cohort"
+                );
+                let terminal_disposition_action = committing_action
+                    || matches!(action_kind.as_str(), "reject" | "dismiss_handoff");
+                if completed.result.is_ok() && committing_action {
+                    if self.claim_moderator_disposition(session_id, turn_id.as_deref(), "committed")
+                    {
+                        if observer_snapshot.is_some() {
+                            self.emit_moderator_decision_snapshot_event(
+                                "meeting_v1_moderator_decision_committed",
+                                session_id,
+                                turn_id.clone(),
+                                observer_snapshot.as_ref(),
+                                ("accepted", "relay_committed"),
+                                None,
+                            );
+                        } else {
+                            self.emit_moderator_decision_event(
+                                "meeting_v1_moderator_decision_committed",
+                                session_id,
+                                turn_id.clone(),
+                                ("accepted", "relay_committed"),
+                                None,
+                                json!({
+                                    "action": action_kind,
+                                    "object_id": object_id,
+                                    "attempt_id": attempt_id,
+                                    "event_id": completed.event_id,
+                                }),
+                            );
+                        }
+                    }
+                } else if meeting_ended
+                    && terminal_disposition_action
+                    && self.claim_moderator_disposition(session_id, turn_id.as_deref(), "discarded")
                 {
-                    self.emit_moderator_decision_event(
-                        "meeting_v1_moderator_decision_committed",
+                    self.emit_moderator_decision_snapshot_event(
+                        "meeting_v1_moderator_decision_discarded",
                         session_id,
                         turn_id.clone(),
-                        ("accepted", "relay_committed"),
+                        observer_snapshot.as_ref(),
+                        ("discarded", "meeting_ended"),
                         None,
-                        json!({
-                            "action": action_kind,
-                            "object_id": object_id,
-                            "attempt_id": attempt_id,
-                            "event_id": completed.event_id,
-                        }),
                     );
                 }
                 self.emit(
@@ -1798,6 +1902,8 @@ impl MeetingV1Coordinator {
                         "attempt_id": attempt_id,
                         "event_id": completed.event_id,
                         "outcome": protocol_submission_label(&completed.result),
+                        "rejection_code": protocol_rejection_code(&completed.result),
+                        "retry_ticket_id": protocol_retry_ticket_id(&completed.result),
                         "latency_ms": queued_at_ms
                             .map(|queued| now_ms().saturating_sub(queued)),
                     }),
@@ -1908,22 +2014,25 @@ impl MeetingV1Coordinator {
                                 });
                                 decision.state = "retry_pending".to_string();
                             }
-                            self.emit_moderator_decision_event(
-                                "meeting_v1_moderator_decision_retry_requested",
-                                session_id,
-                                None,
-                                ("retry_required", "selected_source_changed"),
-                                None,
-                                json!({
-                                    "attempt_id": self
-                                        .ledger_for(session_id)
-                                        .and_then(|ledger| ledger.moderator_decision.as_ref())
-                                        .map(|decision| decision.attempt.attempt_id.clone()),
-                                    "retry_ticket_id": ticket,
-                                    "failed_action_event_id": event_id,
-                                    "rejection_code": rejection.code,
-                                }),
-                            );
+                            if self.claim_moderator_disposition(session_id, None, "retry_required")
+                            {
+                                self.emit_moderator_decision_event(
+                                    "meeting_v1_moderator_decision_retry_requested",
+                                    session_id,
+                                    None,
+                                    ("retry_required", "selected_source_changed"),
+                                    None,
+                                    json!({
+                                        "attempt_id": self
+                                            .ledger_for(session_id)
+                                            .and_then(|ledger| ledger.moderator_decision.as_ref())
+                                            .map(|decision| decision.attempt.attempt_id.clone()),
+                                        "retry_ticket_id": ticket,
+                                        "failed_action_event_id": event_id,
+                                        "rejection_code": rejection.code,
+                                    }),
+                                );
+                            }
                         } else {
                             self.mark_moderator_result_stale(session_id, "source_changed");
                         }
@@ -1961,7 +2070,7 @@ impl MeetingV1Coordinator {
                         }
                     }
                     "current_cohort_not_empty" if action_kind == "complete_cohort" => {
-                        self.set_moderator_finish_reason(session_id, "idle_wait_fallback");
+                        self.mark_moderator_result_stale(session_id, "idle_wait_fallback");
                     }
                     "stale_moderator_revision" if action_kind == "complete_cohort" => {
                         if let Some(decision) = self
@@ -2077,6 +2186,9 @@ impl MeetingV1Coordinator {
                 "exhausted": exhausted,
             }),
         );
+        if exhausted {
+            self.mark_moderator_result_stale(session_id, "cas_churn");
+        }
     }
 
     /// Request a fresh Relay snapshot without blocking the ACP event loop.
@@ -2384,7 +2496,7 @@ impl MeetingV1Coordinator {
             .get(&session_id)
             .is_none_or(|runtime| runtime.epoch != pending.session_epoch)
         {
-            self.discard_deferred_turn_result(pending);
+            self.discard_deferred_turn_result(pending, None);
             return;
         }
         match pending.request.kind {
@@ -2419,7 +2531,22 @@ impl MeetingV1Coordinator {
         self.reconcile(session_id).await;
     }
 
-    fn discard_deferred_turn_result(&mut self, pending: DeferredTurnResult) {
+    fn discard_deferred_turn_result(
+        &mut self,
+        pending: DeferredTurnResult,
+        reason_override: Option<&'static str>,
+    ) {
+        let moderator_discard_reason =
+            (pending.request.kind == MeetingTurnKind::V1ModeratorControl).then(|| {
+                if let Some(reason) = reason_override {
+                    return reason;
+                }
+                if self.ledger_for(pending.request.session_id).is_none() {
+                    "meeting_ended"
+                } else {
+                    "authoritative_state_unavailable"
+                }
+            });
         match pending.request.kind {
             MeetingTurnKind::V1Intent => {
                 self.mark_trigger_state(
@@ -2443,12 +2570,43 @@ impl MeetingV1Coordinator {
             }
             MeetingTurnKind::V0Intent | MeetingTurnKind::V0Granted => {}
         }
+        if let Some(reason) = moderator_discard_reason {
+            if self.claim_moderator_disposition(
+                pending.request.session_id,
+                Some(&pending.turn_id),
+                "discarded",
+            ) {
+                if self
+                    .ledger_for(pending.request.session_id)
+                    .and_then(|ledger| ledger.moderator_decision.as_ref())
+                    .is_some()
+                {
+                    self.emit_moderator_decision_event(
+                        "meeting_v1_moderator_decision_discarded",
+                        pending.request.session_id,
+                        Some(pending.turn_id.clone()),
+                        ("discarded", reason),
+                        None,
+                        json!({ "reason": reason }),
+                    );
+                } else {
+                    self.emit_moderator_decision_snapshot_event(
+                        "meeting_v1_moderator_decision_discarded",
+                        pending.request.session_id,
+                        Some(pending.turn_id.clone()),
+                        pending.request.moderator_observer_snapshot.as_ref(),
+                        ("discarded", reason),
+                        None,
+                    );
+                }
+            }
+        }
         self.emit(
             "meeting_v1_turn_result_deferred",
             pending.request.session_id,
             Some(pending.turn_id),
             json!({
-                "reason": "authoritative_state_unavailable",
+                "reason": reason_override.unwrap_or("authoritative_state_unavailable"),
                 "turn_type": match pending.request.kind {
                     MeetingTurnKind::V1Intent => "participant_intent",
                     MeetingTurnKind::V1ModeratorControl => "moderator_control",
@@ -2508,6 +2666,7 @@ impl MeetingV1Coordinator {
             .baton
             .active_decision_attempt
             .clone()
+            .filter(|_| view.baton.moderator_pubkey == agent_pubkey)
             .filter(|attempt| previous_attempt_id.as_deref() != Some(attempt.attempt_id.as_str()));
         let Some(ledger) = self.ledger.meetings.get_mut(&key) else {
             return;
@@ -2526,6 +2685,19 @@ impl MeetingV1Coordinator {
                 .or_insert_with(|| {
                     TriggerRecord::new(trigger_id, None, view.baton.speech_revision)
                 });
+            if let Some(intent) = &self_pending_intent {
+                if let Some(trigger) = ledger
+                    .triggers
+                    .get_mut(&format!("activation:{}", view.session_id))
+                {
+                    // A canonical pending Intent already satisfies the initial
+                    // participation trigger. Do not spend another model Turn
+                    // refreshing it merely because this ACP process started or
+                    // recovered while the Intent was still pending.
+                    trigger.state = "submitted".to_string();
+                    trigger.prepared_event_id = Some(intent.current_event_id.clone());
+                }
+            }
         } else {
             for speech in &view.speeches {
                 if speech.speech_revision > view.baton.speech_revision {
@@ -2705,19 +2877,19 @@ impl MeetingV1Coordinator {
         }
 
         let active_attempt = view.baton.active_decision_attempt.clone();
-        match active_attempt {
-            Some(active) => {
-                let same_attempt = ledger
-                    .moderator_decision
-                    .as_ref()
-                    .is_some_and(|decision| decision.attempt.attempt_id == active.attempt_id);
-                if same_attempt {
-                    if let Some(decision) = ledger.moderator_decision.as_mut() {
-                        decision.attempt = active;
-                    }
-                } else {
-                    let locally_started =
-                        ledger
+        if view.baton.moderator_pubkey == agent_pubkey {
+            match active_attempt {
+                Some(active) => {
+                    let same_attempt = ledger
+                        .moderator_decision
+                        .as_ref()
+                        .is_some_and(|decision| decision.attempt.attempt_id == active.attempt_id);
+                    if same_attempt {
+                        if let Some(decision) = ledger.moderator_decision.as_mut() {
+                            decision.attempt = active;
+                        }
+                    } else {
+                        let locally_started = ledger
                             .prepared_moderator_action
                             .as_ref()
                             .is_some_and(|prepared| {
@@ -2726,66 +2898,73 @@ impl MeetingV1Coordinator {
                                     "decision_attempt_start" | "decision_retry"
                                 )
                             });
-                    ledger.moderator_decision = Some(ModeratorDecisionRecord {
-                        attempt: active,
-                        rejections: Vec::new(),
-                        handoff_dismissals: Vec::new(),
-                        deferrals: Vec::new(),
-                        next_action: ModeratorNextAction {
-                            action: "idle".to_string(),
-                            id: None,
-                            reason: "decision has not run".to_string(),
-                        },
-                        state: if locally_started {
-                            "registered"
-                        } else {
-                            "runtime_lost"
+                        ledger.moderator_decision = Some(ModeratorDecisionRecord {
+                            attempt: active,
+                            rejections: Vec::new(),
+                            handoff_dismissals: Vec::new(),
+                            deferrals: Vec::new(),
+                            next_action: ModeratorNextAction {
+                                action: "idle".to_string(),
+                                id: None,
+                                reason: "decision has not run".to_string(),
+                            },
+                            state: if locally_started {
+                                "registered"
+                            } else {
+                                "runtime_lost"
+                            }
+                            .to_string(),
+                            turn_id: None,
+                            turn_started_at_ms: None,
+                            cas_rebases: 0,
+                            fast_rebases: 0,
+                            pending_retry: None,
+                            pending_finish_reason: None,
+                            terminal_disposition: None,
+                        });
+                        if locally_started {
+                            ledger.replacement_attempt_id = None;
                         }
-                        .to_string(),
-                        turn_id: None,
-                        turn_started_at_ms: None,
-                        cas_rebases: 0,
-                        fast_rebases: 0,
-                        pending_retry: None,
-                        pending_finish_reason: None,
-                    });
-                    if locally_started {
-                        ledger.replacement_attempt_id = None;
+                    }
+                    if ledger
+                        .prepared_moderator_action
+                        .as_ref()
+                        .is_some_and(|prepared| {
+                            matches!(
+                                prepared.action_kind.as_str(),
+                                "decision_attempt_start" | "decision_retry"
+                            )
+                        })
+                    {
+                        ledger.prepared_moderator_action = None;
                     }
                 }
-                if ledger
-                    .prepared_moderator_action
-                    .as_ref()
-                    .is_some_and(|prepared| {
-                        matches!(
-                            prepared.action_kind.as_str(),
-                            "decision_attempt_start" | "decision_retry"
-                        )
-                    })
-                {
-                    ledger.prepared_moderator_action = None;
-                }
-            }
-            None => {
-                if let Some(decision) = ledger.moderator_decision.as_mut() {
-                    if decision.state == "abandoning" {
-                        ledger.replacement_attempt_id = Some(decision.attempt.attempt_id.clone());
-                        decision.state = "terminal".to_string();
-                    } else if !matches!(
-                        decision.state.as_str(),
-                        "starting" | "retrying" | "terminal"
-                    ) {
-                        decision.state = "terminal".to_string();
+                None => {
+                    if let Some(decision) = ledger.moderator_decision.as_mut() {
+                        if decision.state == "abandoning" {
+                            ledger.replacement_attempt_id =
+                                Some(decision.attempt.attempt_id.clone());
+                            decision.state = "terminal".to_string();
+                        } else if !matches!(
+                            decision.state.as_str(),
+                            "starting" | "retrying" | "terminal"
+                        ) {
+                            decision.state = "terminal".to_string();
+                        }
+                    }
+                    if ledger
+                        .prepared_moderator_action
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.action_kind != "decision_attempt_start")
+                    {
+                        ledger.prepared_moderator_action = None;
                     }
                 }
-                if ledger
-                    .prepared_moderator_action
-                    .as_ref()
-                    .is_some_and(|prepared| prepared.action_kind != "decision_attempt_start")
-                {
-                    ledger.prepared_moderator_action = None;
-                }
             }
+        } else {
+            ledger.moderator_decision = None;
+            ledger.prepared_moderator_action = None;
+            ledger.replacement_attempt_id = None;
         }
 
         self.persist_ledger_best_effort();
@@ -3012,6 +3191,7 @@ impl MeetingV1Coordinator {
             return;
         }
         let prompt = build_moderator_control_prompt(view, &attempt, hard_deadline_unix_ms);
+        let moderator_observer_snapshot = moderator_observer_snapshot(&attempt, view);
         if let Some(ledger) = self.ledger_for_mut(session_id) {
             if let Some(decision) = ledger.moderator_decision.as_mut() {
                 decision.state = "queued".to_string();
@@ -3030,6 +3210,7 @@ impl MeetingV1Coordinator {
             floor_revision: view.baton.state_revision,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: Some(moderator_observer_snapshot),
         });
         self.emit(
             "meeting_v1_moderator_control_started",
@@ -3269,7 +3450,7 @@ impl MeetingV1Coordinator {
         };
         if matches!(action, ModeratorActionSpec::Idle) {
             if current_cohort_has_candidates(&view.baton, decision.attempt.decision_epoch) {
-                self.set_moderator_finish_reason(session_id, "idle_wait_fallback");
+                self.mark_moderator_result_stale(session_id, "idle_wait_fallback");
                 self.prepare_moderator_attempt_finish(session_id, view);
             } else {
                 self.prepare_moderator_complete_cohort(session_id, view);
@@ -3382,6 +3563,11 @@ impl MeetingV1Coordinator {
         if !self.persist_ledger_required(session_id, "moderator_action_retry") {
             return true;
         }
+        let turn_id = prepared.turn_id.clone().or_else(|| {
+            self.ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_decision.as_ref())
+                .and_then(|decision| decision.turn_id.clone())
+        });
         self.submit_protocol_in_background(
             ProtocolSubmissionKey::Moderator {
                 session_id,
@@ -3391,7 +3577,8 @@ impl MeetingV1Coordinator {
                 action_kind: prepared.action_kind,
                 object_id: prepared.object_id,
                 attempt_id: prepared.attempt_id,
-                turn_id: None,
+                observer_snapshot: prepared.observer_snapshot,
+                turn_id,
                 queued_at_ms: Some(prepared.created_at_ms),
                 #[cfg(feature = "meeting-v1-acceptance")]
                 barrier: None,
@@ -3741,6 +3928,12 @@ impl MeetingV1Coordinator {
             .ledger_for(session_id)
             .and_then(|ledger| ledger.moderator_decision.as_ref())
             .and_then(|decision| decision.turn_id.clone());
+        let observer_snapshot = self.moderator_action_observer_snapshot(
+            session_id,
+            &action_kind,
+            &object_id,
+            &event_id,
+        );
         let queued_at_ms = self
             .ledger_for(session_id)
             .and_then(|ledger| ledger.moderator_decision.as_ref())
@@ -3759,6 +3952,8 @@ impl MeetingV1Coordinator {
                 action_kind: action_kind.clone(),
                 object_id: object_id.clone(),
                 attempt_id: attempt_id.clone(),
+                observer_snapshot: observer_snapshot.clone(),
+                turn_id: turn_id.clone(),
                 event: event_value,
                 event_id: event_id.clone(),
                 state: "prepared".to_string(),
@@ -3778,6 +3973,7 @@ impl MeetingV1Coordinator {
                 action_kind,
                 object_id,
                 attempt_id,
+                observer_snapshot,
                 turn_id,
                 queued_at_ms,
                 #[cfg(feature = "meeting-v1-acceptance")]
@@ -3786,6 +3982,41 @@ impl MeetingV1Coordinator {
             event,
         );
         true
+    }
+
+    fn moderator_action_observer_snapshot(
+        &self,
+        session_id: Uuid,
+        action_kind: &str,
+        object_id: &str,
+        event_id: &str,
+    ) -> Option<Value> {
+        let decision = self
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_ref())?;
+        let view = self
+            .meetings
+            .get(&session_id)
+            .and_then(|runtime| runtime.view.as_ref())?;
+        let mut payload = moderator_observer_snapshot(&decision.attempt, view);
+        let payload_object = payload.as_object_mut()?;
+        let selected_source_type = match action_kind {
+            "select_intent" | "moderator_speak" | "withdraw_self" => Some("intent"),
+            "select_handoff" => Some("handoff"),
+            _ => None,
+        };
+        payload_object.insert(
+            "selected_source_type".to_string(),
+            json!(selected_source_type),
+        );
+        payload_object.insert(
+            "selected_source_id".to_string(),
+            selected_source_type.map_or(Value::Null, |_| json!(object_id)),
+        );
+        payload_object.insert("action".to_string(), json!(action_kind));
+        payload_object.insert("object_id".to_string(), json!(object_id));
+        payload_object.insert("event_id".to_string(), json!(event_id));
+        Some(payload)
     }
 
     #[cfg(feature = "meeting-v1-acceptance")]
@@ -3852,6 +4083,52 @@ impl MeetingV1Coordinator {
         Some(Box::new((socket_path, frame)))
     }
 
+    fn claim_moderator_disposition(
+        &mut self,
+        session_id: Uuid,
+        turn_id: Option<&str>,
+        disposition: &str,
+    ) -> bool {
+        let (already_claimed, resolved_turn_id) = self
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_ref())
+            .map_or_else(
+                || (false, turn_id.map(str::to_string)),
+                |decision| {
+                    (
+                        decision.terminal_disposition.is_some(),
+                        turn_id
+                            .map(str::to_string)
+                            .or_else(|| decision.turn_id.clone()),
+                    )
+                },
+            );
+        if already_claimed
+            || resolved_turn_id
+                .as_ref()
+                .is_some_and(|turn_id| self.moderator_terminal_turns.contains(turn_id))
+        {
+            return false;
+        }
+        if let Some(decision) = self
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_mut())
+        {
+            decision.terminal_disposition = Some(disposition.to_string());
+        }
+        if let Some(turn_id) = resolved_turn_id {
+            self.moderator_terminal_turns.insert(turn_id.clone());
+            self.moderator_terminal_turn_order.push_back(turn_id);
+            while self.moderator_terminal_turn_order.len() > MAX_MODERATOR_TERMINAL_TURNS {
+                if let Some(expired) = self.moderator_terminal_turn_order.pop_front() {
+                    self.moderator_terminal_turns.remove(&expired);
+                }
+            }
+        }
+        self.persist_ledger_best_effort();
+        true
+    }
+
     fn set_moderator_finish_reason(&mut self, session_id: Uuid, reason: &str) {
         if let Some(decision) = self
             .ledger_for_mut(session_id)
@@ -3874,6 +4151,9 @@ impl MeetingV1Coordinator {
             "no_action" | "idle_wait_fallback" => reason,
             _ => "control_changed",
         };
+        if !self.claim_moderator_disposition(session_id, None, "discarded") {
+            return;
+        }
         self.set_moderator_finish_reason(session_id, reason);
         self.emit_moderator_decision_event(
             "meeting_v1_moderator_decision_discarded",
@@ -4464,6 +4744,7 @@ impl MeetingV1Coordinator {
             floor_revision: view.baton.state_revision,
             grant_event_id: Some(grant.grant_id.clone()),
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         });
         self.emit(
             "meeting_v1_grant_received",
@@ -4523,6 +4804,7 @@ impl MeetingV1Coordinator {
             floor_revision: view.baton.state_revision,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         });
         self.emit(
             "meeting_v1_intent_started",
@@ -5530,6 +5812,7 @@ impl MeetingV1Coordinator {
                 "progress_seq": completed.progress_seq,
                 "stage": progress_stage_name(completed.stage),
                 "outcome": protocol_submission_label(&completed.result),
+                "rejection_code": protocol_rejection_code(&completed.result),
             }),
         );
         if let Err(error) = &completed.result {
@@ -5734,6 +6017,33 @@ impl MeetingV1Coordinator {
         );
     }
 
+    fn emit_moderator_decision_snapshot_event(
+        &self,
+        kind: &str,
+        session_id: Uuid,
+        turn_id: Option<String>,
+        snapshot: Option<&Value>,
+        disposition: (&str, &str),
+        model_latency_ms: Option<i64>,
+    ) {
+        let Some(mut payload) = snapshot.cloned() else {
+            return;
+        };
+        let Some(payload_object) = payload.as_object_mut() else {
+            return;
+        };
+        payload_object.insert(
+            "outcome".to_string(),
+            Value::String(disposition.0.to_string()),
+        );
+        payload_object.insert(
+            "reason".to_string(),
+            Value::String(disposition.1.to_string()),
+        );
+        payload_object.insert("model_latency_ms".to_string(), json!(model_latency_ms));
+        self.emit(kind, session_id, turn_id, payload);
+    }
+
     fn emit(&self, kind: &str, session_id: Uuid, turn_id: Option<String>, payload: Value) {
         if let Some(observer) = &self.observer {
             observer.emit(
@@ -5744,6 +6054,41 @@ impl MeetingV1Coordinator {
             );
         }
     }
+}
+
+fn moderator_observer_snapshot(attempt: &ActiveDecisionAttemptView, view: &MeetingView) -> Value {
+    let candidate_sources: Vec<_> = attempt
+        .candidate_refs
+        .iter()
+        .map(|candidate| {
+            json!({
+                "source_type": candidate.source_type,
+                "source_id": candidate.source_id,
+                "current_event_id": candidate.current_event_id,
+                "author_pubkey": candidate.author_pubkey,
+                "eligible_decision_epoch": candidate.eligible_decision_epoch,
+            })
+        })
+        .collect();
+    json!({
+        "attempt_id": attempt.attempt_id,
+        "control_epoch": attempt.control_epoch,
+        "decision_epoch": attempt.decision_epoch,
+        "attempt_number": attempt.attempt_number,
+        "speech_revision": attempt.speech_revision,
+        "snapshot_intent_revision": attempt.snapshot_intent_revision,
+        "current_intent_revision": view.baton.intent_revision,
+        "candidate_count": attempt.candidate_refs.len(),
+        "candidate_snapshot_hash": attempt.candidate_snapshot_hash,
+        "candidate_sources": candidate_sources,
+        "attempt_deadline_ms": attempt.deadline_ms,
+        "selected_source_type": Value::Null,
+        "selected_source_id": Value::Null,
+        "phase": view.baton.phase,
+        "outcome": Value::Null,
+        "reason": Value::Null,
+        "model_latency_ms": Value::Null,
+    })
 }
 
 async fn submit_protocol_event(
@@ -5774,6 +6119,24 @@ fn protocol_submission_label<T>(
         Ok(_) => "accepted",
         Err(ProtocolSubmitFailure::Rejected(_)) => "rejected",
         Err(ProtocolSubmitFailure::Uncertain(_)) => "uncertain",
+    }
+}
+
+fn protocol_rejection_code<T>(
+    result: &std::result::Result<T, ProtocolSubmitFailure>,
+) -> Option<&str> {
+    match result {
+        Err(ProtocolSubmitFailure::Rejected(rejection)) => Some(rejection.code.as_str()),
+        Ok(_) | Err(ProtocolSubmitFailure::Uncertain(_)) => None,
+    }
+}
+
+fn protocol_retry_ticket_id<T>(
+    result: &std::result::Result<T, ProtocolSubmitFailure>,
+) -> Option<&str> {
+    match result {
+        Err(ProtocolSubmitFailure::Rejected(rejection)) => rejection.retry_ticket_id.as_deref(),
+        Ok(_) | Err(ProtocolSubmitFailure::Uncertain(_)) => None,
     }
 }
 
@@ -6265,14 +6628,23 @@ fn validate_active_decision_attempt(
     state: &RawBatonState,
     attempt: &ActiveDecisionAttemptView,
 ) -> Result<()> {
+    let current_authority = attempt.control_epoch == state.control_epoch
+        && attempt.decision_epoch == state.decision_epoch
+        && attempt.attempt_number == state.decision_attempt
+        && attempt.speech_revision == state.speech_revision;
+    let retained_for_natural_terminal = retained_pre_human_attempt(
+        &state.phase,
+        state.control_epoch,
+        state.decision_epoch,
+        state.decision_attempt,
+        state.speech_revision,
+        attempt,
+    );
     if !is_hex_id(&attempt.attempt_id)
         || !is_hex_id(&attempt.snapshot_state_event_id)
         || !is_hex_id(&attempt.candidate_snapshot_hash)
-        || attempt.control_epoch != state.control_epoch
-        || attempt.decision_epoch != state.decision_epoch
         || attempt.attempt_number == 0
-        || attempt.attempt_number != state.decision_attempt
-        || attempt.speech_revision != state.speech_revision
+        || (!current_authority && !retained_for_natural_terminal)
         || attempt.deadline_ms <= attempt.started_at_ms
     {
         return Err(anyhow!(
@@ -6342,6 +6714,31 @@ fn validate_active_decision_attempt(
         ));
     }
     Ok(())
+}
+
+/// Human priority never physically cancels a provider Turn. After the Human
+/// speaks, the Relay keeps the old Attempt attached until its natural terminal
+/// can be recorded as discarded. A directed Handoff can temporarily preserve
+/// the original authority tuple (including `decision_attempt`) while advancing
+/// only the speech revision; returning control to the Moderator clears the
+/// attempt number and can advance the epochs as well.
+fn retained_pre_human_attempt(
+    phase: &str,
+    control_epoch: u64,
+    decision_epoch: u64,
+    decision_attempt: u64,
+    speech_revision: u64,
+    attempt: &ActiveDecisionAttemptView,
+) -> bool {
+    let original_authority_retained = attempt.control_epoch == control_epoch
+        && attempt.decision_epoch == decision_epoch
+        && attempt.attempt_number == decision_attempt;
+    let authority_released = decision_attempt == 0
+        && attempt.control_epoch <= control_epoch
+        && attempt.decision_epoch <= decision_epoch;
+    phase != "ended"
+        && attempt.speech_revision < speech_revision
+        && (original_authority_retained || authority_released)
 }
 
 fn validate_baton_state_event(
@@ -6534,6 +6931,22 @@ fn moderator_attempt_guard_failure(
             .is_none_or(|participant| participant.participant_type != "agent")
     {
         return Some("moderator_changed");
+    }
+    if view
+        .baton
+        .active_decision_attempt
+        .as_ref()
+        .is_some_and(|active| active.attempt_id == attempt.attempt_id)
+        && retained_pre_human_attempt(
+            &view.baton.phase,
+            view.baton.control_epoch,
+            view.baton.decision_epoch,
+            view.baton.decision_attempt,
+            view.baton.speech_revision,
+            attempt,
+        )
+    {
+        return Some("human_priority");
     }
     if human_priority_active(&view.baton) {
         return Some("human_priority");
@@ -7867,6 +8280,8 @@ mod tests {
             in_flight_epochs: HashMap::new(),
             external_reclaimable_turns: BTreeSet::new(),
             preemptions: BTreeSet::new(),
+            moderator_terminal_turns: BTreeSet::new(),
+            moderator_terminal_turn_order: VecDeque::new(),
             next_session_epoch: 0,
             next_sync_request_id: 0,
             sync_result_tx,
@@ -7936,6 +8351,7 @@ mod tests {
             floor_revision: 1,
             grant_event_id: Some(grant_id.to_string()),
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         }
     }
 
@@ -8048,6 +8464,7 @@ mod tests {
             fast_rebases: 0,
             pending_retry: None,
             pending_finish_reason: None,
+            terminal_disposition: None,
         });
     }
 
@@ -9306,11 +9723,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_teardown_discards_a_deferred_moderator_result() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let moderator_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let turn_id = "deferred-moderator-terminal".to_string();
+        let mut view = meeting_view(session_id, &moderator_pubkey, &other_pubkey);
+        view.baton.phase = "moderator_control".to_string();
+        view.baton.decision_epoch = 1;
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(
+                &pubkey(76),
+                &pubkey(77),
+                &other_pubkey,
+                false,
+                1,
+            )],
+        );
+        let observer = ObserverHandle::in_process();
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
+        install_decision(
+            &mut coordinator,
+            &mut view,
+            attempt.clone(),
+            "running",
+            ModeratorNextAction {
+                action: "idle".to_string(),
+                id: None,
+                reason: "awaiting authoritative sync".to_string(),
+            },
+        );
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view.clone()));
+        coordinator.deferred_turn_results.insert(
+            session_id,
+            DeferredTurnResult {
+                request_id: 1,
+                session_epoch: 1,
+                turn_id: turn_id.clone(),
+                request: MeetingTurnRequest {
+                    session_id,
+                    prompt: "moderate".to_string(),
+                    hard_deadline_unix_ms: attempt.deadline_ms,
+                    kind: MeetingTurnKind::V1ModeratorControl,
+                    format_retry: false,
+                    basis_id: attempt.attempt_id.clone(),
+                    round_number: 0,
+                    speech_cursor: None,
+                    floor_revision: 1,
+                    grant_event_id: None,
+                    queued_at_unix_ms: now_ms(),
+                    moderator_observer_snapshot: Some(moderator_observer_snapshot(
+                        &attempt, &view,
+                    )),
+                },
+                raw_output: r#"{"rejections":[],"handoff_dismissals":[],"deferrals":[],"next_action":{"action":"select_intent","id":"unused","reason":"unused"}}"#.to_string(),
+                succeeded: true,
+            },
+        );
+
+        coordinator.teardown_terminal_session(session_id);
+
+        assert!(!coordinator.deferred_turn_results.contains_key(&session_id));
+        assert!(coordinator.ledger_for(session_id).is_none());
+        let events = observer.snapshot();
+        let discarded: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.kind == "meeting_v1_moderator_decision_discarded"
+                    && event.turn_id.as_deref() == Some(turn_id.as_str())
+            })
+            .collect();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].payload["reason"], "meeting_ended");
+        let deferred = events
+            .iter()
+            .find(|event| {
+                event.kind == "meeting_v1_turn_result_deferred"
+                    && event.turn_id.as_deref() == Some(turn_id.as_str())
+            })
+            .expect("terminal deferred result evidence");
+        assert_eq!(deferred.payload["reason"], "meeting_ended");
+    }
+
+    #[tokio::test]
     async fn terminal_teardown_does_not_cancel_a_running_moderator_decision() {
         let dir = tempfile::tempdir().expect("temp ledger directory");
         let keys = Keys::generate();
-        let mut coordinator =
-            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        let observer = ObserverHandle::in_process();
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
         let kinds = [
             MeetingTurnKind::V1Intent,
             MeetingTurnKind::V1ModeratorControl,
@@ -9337,6 +9850,27 @@ mod tests {
             if kind != MeetingTurnKind::V1Granted {
                 request.grant_event_id = None;
             }
+            if kind == MeetingTurnKind::V1ModeratorControl {
+                request.moderator_observer_snapshot = Some(json!({
+                    "attempt_id": request.basis_id,
+                    "control_epoch": 1,
+                    "decision_epoch": 1,
+                    "attempt_number": 1,
+                    "speech_revision": 0,
+                    "snapshot_intent_revision": 0,
+                    "current_intent_revision": 0,
+                    "candidate_count": 1,
+                    "candidate_snapshot_hash": pubkey(79),
+                    "candidate_sources": [],
+                    "attempt_deadline_ms": now_ms() + 180_000,
+                    "selected_source_type": Value::Null,
+                    "selected_source_id": Value::Null,
+                    "phase": "moderator_control",
+                    "outcome": Value::Null,
+                    "reason": Value::Null,
+                    "model_latency_ms": Value::Null,
+                }));
+            }
             coordinator.in_flight.insert(turn_id.clone(), request);
             coordinator.in_flight_epochs.insert(turn_id, epoch);
 
@@ -9362,6 +9896,29 @@ mod tests {
         assert!(coordinator.in_flight_epochs.is_empty());
         assert!(coordinator.pending.is_empty());
         assert!(coordinator.ledger.meetings.is_empty());
+        let moderator_terminal: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.turn_id.as_deref() == Some("terminal-turn-1"))
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "meeting_v1_moderator_decision_completed"
+                        | "meeting_v1_moderator_decision_discarded"
+                )
+            })
+            .collect();
+        assert_eq!(moderator_terminal.len(), 2);
+        assert_eq!(
+            moderator_terminal[0].kind,
+            "meeting_v1_moderator_decision_completed"
+        );
+        assert_eq!(moderator_terminal[0].payload["outcome"], "natural_terminal");
+        assert_eq!(
+            moderator_terminal[1].kind,
+            "meeting_v1_moderator_decision_discarded"
+        );
+        assert_eq!(moderator_terminal[1].payload["reason"], "meeting_ended");
     }
 
     #[tokio::test]
@@ -10561,6 +11118,8 @@ mod tests {
         let rejected = submit_protocol_event(&rejected_rest, &event).await;
         rejected_server.await.expect("join rejected HTTP server");
         assert_eq!(protocol_submission_label(&rejected), "rejected");
+        assert_eq!(protocol_rejection_code(&rejected), Some("http_200"));
+        assert_eq!(protocol_retry_ticket_id(&rejected), None);
         let rejected_error = rejected.as_ref().expect_err("Relay rejection");
         assert!(!rejected_error.is_uncertain());
 
@@ -10571,6 +11130,7 @@ mod tests {
             .await
             .expect("join bad-request HTTP server");
         assert_eq!(protocol_submission_label(&bad_request), "rejected");
+        assert_eq!(protocol_rejection_code(&bad_request), Some("http_400"));
         assert!(!bad_request
             .as_ref()
             .expect_err("deterministic HTTP rejection")
@@ -10581,6 +11141,8 @@ mod tests {
         let uncertain = submit_protocol_event(&uncertain_rest, &event).await;
         uncertain_server.await.expect("join uncertain HTTP server");
         assert_eq!(protocol_submission_label(&uncertain), "uncertain");
+        assert_eq!(protocol_rejection_code(&uncertain), None);
+        assert_eq!(protocol_retry_ticket_id(&uncertain), None);
         assert!(uncertain
             .as_ref()
             .expect_err("uncertain submission")
@@ -10590,6 +11152,7 @@ mod tests {
         let telemetry = json!({
             "event_id": event.id.to_hex(),
             "outcome": protocol_submission_label(&rejected),
+            "rejection_code": protocol_rejection_code(&rejected),
         })
         .to_string();
         assert!(!telemetry.contains(PRIVATE_REJECTION));
@@ -10662,11 +11225,13 @@ mod tests {
         assert!(intent_prompt.contains("advisory-v1"));
         assert!(intent_prompt.contains("persistent write operations"));
         assert!(intent_prompt.contains("publish a Meeting event"));
+        assert!(intent_prompt.contains("not an investigation"));
         assert!(!intent_prompt.contains("read-only"));
         assert!(granted_prompt.contains("advisory-v1"));
         assert!(granted_prompt.contains("persistent write operations"));
         assert!(granted_prompt.contains("only as a recommendation"));
         assert!(granted_prompt.contains("publish a Meeting event"));
+        assert!(granted_prompt.contains("not a project task"));
         assert!(!granted_prompt.contains("read-only"));
         assert!(granted_prompt.contains("meeting_read"));
         assert!(granted_prompt.contains("SAY"));
@@ -10773,6 +11338,7 @@ mod tests {
         assert!(control_prompt.contains(r#""is_truncated": true"#));
         assert!(control_prompt.contains(r#""omitted_earlier_speech_count": 1"#));
         assert!(control_prompt.contains(r#""operation": "history""#));
+        assert!(control_prompt.contains("bounded routing decision"));
         assert!(!control_prompt.contains("agenda_ranking"));
         assert!(!control_prompt.contains("cached_agenda_ranking"));
         assert!(!control_prompt.contains("moderator_summary"));
@@ -10805,6 +11371,67 @@ mod tests {
         assert!(
             !encoded.contains(r#""attempt_count":null"#),
             "Intent candidates must not gain Handoff-only fields"
+        );
+    }
+
+    #[test]
+    fn retained_pre_human_attempt_accepts_new_authority_and_fences_as_human_priority() {
+        let moderator = pubkey(83);
+        let other = pubkey(84);
+        let mut view = meeting_view(Uuid::new_v4(), &moderator, &other);
+        view.baton.moderator_pubkey = moderator.clone();
+        view.baton.phase = "moderator_control".to_string();
+        view.baton.control_epoch = 2;
+        view.baton.decision_epoch = 1;
+        view.baton.decision_attempt = 1;
+        view.baton.speech_revision = 1;
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(&pubkey(85), &pubkey(86), &other, false, 1)],
+        );
+        let mut state = base_state();
+        state.phase = view.baton.phase.clone();
+        state.control_epoch = view.baton.control_epoch;
+        state.decision_epoch = view.baton.decision_epoch;
+        state.decision_attempt = view.baton.decision_attempt;
+        state.speech_revision = view.baton.speech_revision;
+        assert!(validate_active_decision_attempt(&state, &attempt).is_ok());
+
+        state.decision_attempt = 0;
+        state.speech_revision += 1;
+        assert!(
+            validate_active_decision_attempt(&state, &attempt).is_ok(),
+            "control return may clear the Attempt number while retaining the pre-Human Attempt"
+        );
+
+        state.decision_attempt = attempt.attempt_number;
+        assert!(
+            validate_active_decision_attempt(&state, &attempt).is_ok(),
+            "a directed Handoff may preserve the authority tuple while advancing speech"
+        );
+
+        view.baton.control_epoch = state.control_epoch;
+        view.baton.decision_epoch = state.decision_epoch;
+        view.baton.decision_attempt = state.decision_attempt;
+        view.baton.speech_revision = state.speech_revision;
+        view.baton.active_decision_attempt = Some(attempt.clone());
+        assert_eq!(
+            moderator_attempt_guard_failure(&view, &attempt, &moderator, now_ms()),
+            Some("human_priority")
+        );
+
+        state.control_epoch += 1;
+        state.decision_epoch += 1;
+        state.decision_attempt = 0;
+        assert!(
+            validate_active_decision_attempt(&state, &attempt).is_ok(),
+            "the retained Attempt also remains readable after control returns"
+        );
+
+        state.decision_attempt = 1;
+        assert!(
+            validate_active_decision_attempt(&state, &attempt).is_err(),
+            "an unrelated mixed authority tuple must remain invalid"
         );
     }
 
@@ -11165,6 +11792,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn participant_does_not_adopt_or_abandon_the_moderators_active_attempt() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let participant_pubkey = keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let mut view = meeting_view(session_id, &participant_pubkey, &moderator_pubkey);
+        view.baton.phase = "moderator_control".to_string();
+        view.baton.decision_epoch = 1;
+        view.baton.intent_revision = 1;
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(
+                &pubkey(112),
+                &pubkey(113),
+                &participant_pubkey,
+                false,
+                1,
+            )],
+        );
+        view.baton.decision_attempt = attempt.attempt_number;
+        view.baton.active_decision_attempt = Some(attempt);
+        let observer = ObserverHandle::in_process();
+
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
+        coordinator.apply_view_to_ledger(&view);
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view));
+
+        coordinator.reconcile(session_id).await;
+
+        let ledger = coordinator
+            .ledger_for(session_id)
+            .expect("participant Meeting ledger");
+        assert!(ledger.moderator_decision.is_none());
+        assert!(ledger.prepared_moderator_action.is_none());
+        assert!(ledger.replacement_attempt_id.is_none());
+        assert!(coordinator.protocol_in_flight.is_empty());
+        assert!(
+            observer
+                .snapshot()
+                .iter()
+                .all(|event| !event.kind.starts_with("meeting_v1_moderator_")),
+            "a participant must not emit Moderator attempt lifecycle events"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_pending_intent_satisfies_initial_activation_without_a_model_turn() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let participant_pubkey = keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let current_event_id = pubkey(114);
+        let mut view = meeting_view(session_id, &participant_pubkey, &moderator_pubkey);
+        view.baton.intent_revision = 1;
+        view.baton.pending_intents.push(PendingIntentView {
+            intent_id: pubkey(115),
+            current_event_id: current_event_id.clone(),
+            author_pubkey: participant_pubkey,
+            basis_speech_revision: 0,
+            summary: "An already-pending contribution.".to_string(),
+            addressed_to: None,
+            created_at_ms: now_ms(),
+            deferred: false,
+            selection_attempt_count: 0,
+            last_offer_id: None,
+            last_attempt_outcome: None,
+            eligible_decision_epoch: 1,
+        });
+
+        let mut coordinator =
+            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        coordinator.apply_view_to_ledger(&view);
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view));
+
+        coordinator.reconcile(session_id).await;
+
+        let activation_id = format!("activation:{session_id}");
+        let activation = coordinator
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.triggers.get(&activation_id))
+            .expect("initial activation trigger");
+        assert_eq!(activation.state, "submitted");
+        assert_eq!(
+            activation.prepared_event_id.as_deref(),
+            Some(current_event_id.as_str())
+        );
+        assert!(
+            coordinator.pending.is_empty(),
+            "an existing canonical Intent must not be regenerated on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_moderator_committing_actions_emit_after_terminal_state_clears_runtime() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let moderator_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        for (index, action_kind) in ["select_intent", "complete_cohort"].into_iter().enumerate() {
+            let session_id = Uuid::new_v4();
+            let turn_id = format!("moderator-turn-committed-{index}");
+            let event_id = pubkey(118 + index as u8);
+            let mut view = meeting_view(session_id, &moderator_pubkey, &other_pubkey);
+            view.baton.moderator_pubkey = moderator_pubkey.clone();
+            view.baton.phase = "moderator_control".to_string();
+            view.baton.decision_epoch = 1;
+            let candidate_id = pubkey(121 + index as u8);
+            let attempt = decision_attempt(
+                &view,
+                vec![intent_candidate(
+                    &candidate_id,
+                    &pubkey(123 + index as u8),
+                    &other_pubkey,
+                    false,
+                    1,
+                )],
+            );
+            let snapshot = moderator_observer_snapshot(&attempt, &view);
+            let observer = ObserverHandle::in_process();
+            let mut coordinator = test_coordinator(
+                keys.clone(),
+                dir.path().join(format!("meeting-v1-ledger-{index}.json")),
+                Some(observer.clone()),
+            );
+            coordinator
+                .meetings
+                .insert(session_id, runtime_with_view(1, view));
+            let key = ProtocolSubmissionKey::Moderator {
+                session_id,
+                event_id: event_id.clone(),
+            };
+            coordinator.protocol_in_flight.insert(
+                key.clone(),
+                ProtocolInFlight {
+                    session_epoch: 1,
+                    submission_id: 1,
+                    event_id: event_id.clone(),
+                },
+            );
+
+            coordinator.teardown_terminal_session(session_id);
+            assert!(!coordinator.meetings.contains_key(&session_id));
+            assert!(
+                coordinator.protocol_in_flight.contains_key(&key),
+                "terminal teardown must retain a Moderator submission until its HTTP result"
+            );
+
+            let object_id = if action_kind == "complete_cohort" {
+                attempt.attempt_id.clone()
+            } else {
+                candidate_id
+            };
+            coordinator
+                .handle_protocol_result(ProtocolTaskResult {
+                    key,
+                    session_epoch: 1,
+                    submission_id: 1,
+                    event_id: event_id.clone(),
+                    context: ProtocolSubmissionContext::Moderator {
+                        action_kind: action_kind.to_string(),
+                        object_id,
+                        attempt_id: Some(attempt.attempt_id.clone()),
+                        observer_snapshot: Some(snapshot),
+                        turn_id: Some(turn_id.clone()),
+                        queued_at_ms: Some(now_ms()),
+                        #[cfg(feature = "meeting-v1-acceptance")]
+                        barrier: None,
+                    },
+                    result: Ok(json!({ "accepted": true })),
+                })
+                .await;
+
+            assert!(coordinator.protocol_in_flight.is_empty());
+            let committed = observer
+                .snapshot()
+                .into_iter()
+                .find(|event| event.kind == "meeting_v1_moderator_decision_committed")
+                .expect("accepted committing action has one committed disposition");
+            assert_eq!(committed.turn_id.as_deref(), Some(turn_id.as_str()));
+            assert_eq!(committed.payload["attempt_id"], attempt.attempt_id);
+            assert_eq!(committed.payload["outcome"], "accepted");
+            assert_eq!(committed.payload["reason"], "relay_committed");
+        }
+    }
+
+    #[tokio::test]
     async fn human_priority_discards_a_queued_moderator_turn_before_dispatch_without_cancel() {
         let dir = tempfile::tempdir().expect("temp ledger directory");
         let keys = Keys::generate();
@@ -11287,6 +12110,7 @@ mod tests {
             floor_revision: view.baton.state_revision,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         };
         coordinator.handle_moderator_control_result("control-1", &request, "{malformed", true);
 
@@ -11301,6 +12125,94 @@ mod tests {
             Some(("result_stale", Some("no_action")))
         );
         assert!(coordinator.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_with_a_nonempty_cohort_emits_one_discard_before_finishing() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let moderator_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let turn_id = "idle-fallback-turn";
+        let intent_id = pubkey(113);
+        let intent_event_id = pubkey(114);
+        let mut view = meeting_view(session_id, &moderator_pubkey, &other_pubkey);
+        view.baton.moderator_pubkey = moderator_pubkey.clone();
+        view.baton.phase = "moderator_control".to_string();
+        view.baton.decision_epoch = 1;
+        view.baton.pending_intents.push(PendingIntentView {
+            intent_id: intent_id.clone(),
+            current_event_id: intent_event_id.clone(),
+            author_pubkey: other_pubkey.clone(),
+            basis_speech_revision: view.baton.speech_revision,
+            summary: "candidate remains current".to_string(),
+            addressed_to: None,
+            created_at_ms: now_ms(),
+            deferred: false,
+            selection_attempt_count: 0,
+            last_offer_id: None,
+            last_attempt_outcome: None,
+            eligible_decision_epoch: 1,
+        });
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(
+                &intent_id,
+                &intent_event_id,
+                &other_pubkey,
+                false,
+                1,
+            )],
+        );
+        let observer = ObserverHandle::in_process();
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
+        install_decision(
+            &mut coordinator,
+            &mut view,
+            attempt.clone(),
+            "ready",
+            ModeratorNextAction {
+                action: "idle".to_string(),
+                id: None,
+                reason: "wait".to_string(),
+            },
+        );
+        coordinator
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_mut())
+            .expect("moderator decision")
+            .turn_id = Some(turn_id.to_string());
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view.clone()));
+
+        assert!(
+            coordinator
+                .execute_ready_moderator_control(session_id, &view)
+                .await
+        );
+
+        let discarded: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "meeting_v1_moderator_decision_discarded")
+            .collect();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].turn_id.as_deref(), Some(turn_id));
+        assert_eq!(discarded[0].payload["attempt_id"], attempt.attempt_id);
+        assert_eq!(discarded[0].payload["reason"], "idle_wait_fallback");
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
+                .map(|prepared| prepared.action_kind.as_str()),
+            Some("decision_attempt_finish")
+        );
     }
 
     #[tokio::test]
@@ -11355,6 +12267,7 @@ mod tests {
                 floor_revision: 1,
                 grant_event_id: None,
                 queued_at_unix_ms: now_ms(),
+                moderator_observer_snapshot: None,
             },
         );
 
@@ -11444,6 +12357,7 @@ mod tests {
             floor_revision: 1,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         };
         let mut runtime = runtime_with_view(1, view.clone());
         runtime.in_flight_turn = Some("moderator-turn".to_string());
@@ -11718,8 +12632,12 @@ mod tests {
             )],
         );
 
-        let mut coordinator =
-            test_coordinator(keys, dir.path().join("meeting-v1-ledger.json"), None);
+        let observer = ObserverHandle::in_process();
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
         install_decision(
             &mut coordinator,
             &mut view,
@@ -11775,6 +12693,90 @@ mod tests {
             .and_then(|runtime| runtime.moderator_rebase_at)
             .is_none());
         assert!(coordinator.pending.is_empty());
+        let discarded: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "meeting_v1_moderator_decision_discarded")
+            .collect();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].payload["reason"], "cas_churn");
+    }
+
+    #[test]
+    fn repeated_stale_reconciliation_emits_one_moderator_disposition() {
+        let dir = tempfile::tempdir().expect("temp ledger directory");
+        let keys = Keys::generate();
+        let moderator_pubkey = keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let session_id = Uuid::new_v4();
+        let turn_id = "single-disposition-turn";
+        let mut view = meeting_view(session_id, &moderator_pubkey, &other_pubkey);
+        view.baton.moderator_pubkey = moderator_pubkey;
+        view.baton.phase = "moderator_control".to_string();
+        view.baton.decision_epoch = 1;
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(
+                &pubkey(139),
+                &pubkey(140),
+                &other_pubkey,
+                false,
+                1,
+            )],
+        );
+
+        let observer = ObserverHandle::in_process();
+        let mut coordinator = test_coordinator(
+            keys,
+            dir.path().join("meeting-v1-ledger.json"),
+            Some(observer.clone()),
+        );
+        install_decision(
+            &mut coordinator,
+            &mut view,
+            attempt,
+            "ready",
+            ModeratorNextAction {
+                action: "select_intent".to_string(),
+                id: Some(pubkey(139)),
+                reason: "select".to_string(),
+            },
+        );
+        coordinator
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_mut())
+            .expect("moderator decision")
+            .turn_id = Some(turn_id.to_string());
+        coordinator
+            .meetings
+            .insert(session_id, runtime_with_view(1, view));
+
+        coordinator.mark_moderator_result_stale(session_id, "control_changed");
+        coordinator
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.moderator_decision.as_mut())
+            .expect("moderator decision remains durable")
+            .state = "terminal".to_string();
+        coordinator.mark_moderator_result_stale(session_id, "human_priority");
+
+        let discarded: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "meeting_v1_moderator_decision_discarded")
+            .collect();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].turn_id.as_deref(), Some(turn_id));
+        assert_eq!(discarded[0].payload["reason"], "control_changed");
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.moderator_decision.as_ref())
+                .map(|decision| (
+                    decision.terminal_disposition.as_deref(),
+                    decision.pending_finish_reason.as_deref(),
+                )),
+            Some((Some("discarded"), Some("control_changed")))
+        );
     }
 
     #[test]
@@ -11859,6 +12861,7 @@ mod tests {
                 floor_revision: 1,
                 grant_event_id: None,
                 queued_at_unix_ms: now_ms(),
+                moderator_observer_snapshot: None,
             },
         );
 
@@ -11979,6 +12982,7 @@ mod tests {
             floor_revision: 1,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         };
         coordinator.in_flight.insert(
             "participant-turn".to_string(),
@@ -12042,6 +13046,7 @@ mod tests {
             floor_revision: 1,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
         };
         coordinator.queue_turn(request(participant_session, MeetingTurnKind::V1Intent));
         coordinator.queue_turn(request(
@@ -12219,11 +13224,14 @@ mod tests {
                 fast_rebases: 0,
                 pending_retry: None,
                 pending_finish_reason: None,
+                terminal_disposition: None,
             }),
             prepared_moderator_action: Some(PreparedModeratorAction {
                 action_kind: "select_intent".to_string(),
                 object_id: pubkey(102),
                 attempt_id: Some(attempt.attempt_id),
+                observer_snapshot: None,
+                turn_id: Some("lost-provider-turn".to_string()),
                 event: json!({ "id": event_id }),
                 event_id: event_id.clone(),
                 state: "sent".to_string(),
@@ -12248,6 +13256,11 @@ mod tests {
             .expect("prepared moderator action");
         assert_eq!(prepared.event_id, event_id);
         assert_eq!(prepared.state, "prepared");
+        assert_eq!(
+            prepared.turn_id.as_deref(),
+            Some("lost-provider-turn"),
+            "protocol replay keeps the original Moderator Turn identity"
+        );
     }
 
     #[test]
@@ -12285,11 +13298,14 @@ mod tests {
                         fast_rebases: 0,
                         pending_retry: None,
                         pending_finish_reason: None,
+                        terminal_disposition: None,
                     }),
                     prepared_moderator_action: Some(PreparedModeratorAction {
                         action_kind: "select_intent".to_string(),
                         object_id: pubkey(112),
                         attempt_id: Some(attempt.attempt_id),
+                        observer_snapshot: None,
+                        turn_id: Some("lost-provider-turn".to_string()),
                         event: json!({ "id": event_id }),
                         event_id,
                         state: "sent".to_string(),

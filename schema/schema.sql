@@ -484,6 +484,8 @@ CREATE TABLE meeting_baton_config (
     agent_safety_margin_ms    BIGINT NOT NULL,
     max_handoff_depth         INT NOT NULL,
     max_open_handoffs         INT NOT NULL,
+    moderator_max_rejudgments INT NOT NULL DEFAULT 2,
+    moderator_max_cas_rebases_per_attempt INT NOT NULL DEFAULT 8,
     fallback_policy_version   TEXT NOT NULL,
     created_at                TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (community_id, session_id),
@@ -510,7 +512,11 @@ CREATE TABLE meeting_baton_config (
     CONSTRAINT chk_meeting_baton_handoff_depth
         CHECK (max_handoff_depth BETWEEN 0 AND 255),
     CONSTRAINT chk_meeting_baton_open_handoffs
-        CHECK (max_open_handoffs BETWEEN 1 AND 32)
+        CHECK (max_open_handoffs BETWEEN 1 AND 32),
+    CONSTRAINT chk_meeting_baton_moderator_rejudgments
+        CHECK (moderator_max_rejudgments BETWEEN 0 AND 8),
+    CONSTRAINT chk_meeting_baton_moderator_cas_rebases
+        CHECK (moderator_max_cas_rebases_per_attempt BETWEEN 1 AND 64)
 );
 
 CREATE TABLE meeting_baton_state_history (
@@ -564,9 +570,11 @@ CREATE TABLE meeting_baton_state (
     state_revision                  BIGINT NOT NULL,
     control_epoch                   BIGINT NOT NULL,
     decision_epoch                  BIGINT NOT NULL DEFAULT 0,
+    decision_attempt                INT NOT NULL DEFAULT 0,
     state_event_id                  BYTEA NOT NULL,
     active_offer_id                 BYTEA,
     active_grant_id                 BYTEA,
+    active_decision_attempt_id      BYTEA,
     handoff_depth                   INT NOT NULL DEFAULT 0,
     consecutive_moderator_speeches  INT NOT NULL DEFAULT 0,
     forced_return_to_moderator      BOOLEAN NOT NULL DEFAULT FALSE,
@@ -595,6 +603,11 @@ CREATE TABLE meeting_baton_state (
         CHECK (active_offer_id IS NULL OR LENGTH(active_offer_id) = 32),
     CONSTRAINT chk_meeting_baton_active_grant_id_len
         CHECK (active_grant_id IS NULL OR LENGTH(active_grant_id) = 32),
+    CONSTRAINT chk_meeting_baton_active_decision_attempt_id_len
+        CHECK (
+            active_decision_attempt_id IS NULL
+            OR LENGTH(active_decision_attempt_id) = 32
+        ),
     CONSTRAINT chk_meeting_baton_recall_event_id_len
         CHECK (recall_event_id IS NULL OR LENGTH(recall_event_id) = 32),
     CONSTRAINT chk_meeting_baton_state_revisions CHECK (
@@ -609,15 +622,24 @@ CREATE TABLE meeting_baton_state (
         CHECK (handoff_depth BETWEEN 0 AND 255),
     CONSTRAINT chk_meeting_baton_moderator_speeches
         CHECK (consecutive_moderator_speeches >= 0),
+    CONSTRAINT chk_meeting_baton_decision_attempt
+        CHECK (decision_attempt >= 0),
     CONSTRAINT chk_meeting_baton_recovery_attempts
         CHECK (recovery_attempts >= 0),
     CONSTRAINT chk_meeting_baton_state_phase_shape CHECK (
         (phase = 'moderator_idle'
             AND active_offer_id IS NULL
             AND active_grant_id IS NULL
-            AND moderator_decision_started_at IS NULL
-            AND moderator_decision_deadline IS NULL
-            AND next_action_at IS NULL)
+            AND (
+                (active_decision_attempt_id IS NULL
+                    AND moderator_decision_started_at IS NULL
+                    AND moderator_decision_deadline IS NULL
+                    AND next_action_at IS NULL)
+                OR
+                (moderator_decision_started_at IS NOT NULL
+                    AND moderator_decision_deadline IS NOT NULL
+                    AND next_action_at = moderator_decision_deadline)
+            ))
         OR
         (phase = 'moderator_control'
             AND active_offer_id IS NULL
@@ -643,6 +665,7 @@ CREATE TABLE meeting_baton_state (
         (phase = 'ended'
             AND active_offer_id IS NULL
             AND active_grant_id IS NULL
+            AND active_decision_attempt_id IS NULL
             AND moderator_decision_started_at IS NULL
             AND moderator_decision_deadline IS NULL
             AND next_action_at IS NULL)
@@ -662,6 +685,188 @@ CREATE INDEX idx_meeting_baton_state_recovery_due
     )
     WHERE next_action_at IS NOT NULL;
 
+CREATE TABLE meeting_moderator_decision_attempts (
+    community_id                 UUID NOT NULL REFERENCES communities(id),
+    session_id                   UUID NOT NULL,
+    attempt_id                   BYTEA NOT NULL,
+    moderator_pubkey             BYTEA NOT NULL,
+    control_epoch                BIGINT NOT NULL,
+    decision_epoch               BIGINT NOT NULL,
+    attempt_number               INT NOT NULL,
+    speech_revision              BIGINT NOT NULL,
+    snapshot_intent_revision     BIGINT NOT NULL,
+    snapshot_state_event_id      BYTEA NOT NULL,
+    candidate_snapshot_json      JSONB NOT NULL,
+    candidate_snapshot_hash      BYTEA NOT NULL,
+    state                        TEXT NOT NULL
+        CHECK (state IN (
+            'running',
+            'completed',
+            'committed',
+            'retry_required',
+            'discarded',
+            'timed_out',
+            'abandoned'
+        )),
+    replacement_of_attempt_id    BYTEA,
+    started_by_event_id          BYTEA NOT NULL,
+    terminal_event_id            BYTEA,
+    terminal_reason              TEXT,
+    started_at                   TIMESTAMPTZ NOT NULL,
+    deadline_at                  TIMESTAMPTZ NOT NULL,
+    terminal_at                  TIMESTAMPTZ,
+    PRIMARY KEY (community_id, session_id, attempt_id),
+    UNIQUE (
+        community_id,
+        session_id,
+        control_epoch,
+        decision_epoch,
+        attempt_number
+    ),
+    FOREIGN KEY (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id),
+    FOREIGN KEY (community_id, session_id, replacement_of_attempt_id)
+        REFERENCES meeting_moderator_decision_attempts (
+            community_id,
+            session_id,
+            attempt_id
+        ),
+    CONSTRAINT chk_meeting_moderator_attempt_id_len
+        CHECK (LENGTH(attempt_id) = 32),
+    CONSTRAINT chk_meeting_moderator_attempt_pubkey_len
+        CHECK (LENGTH(moderator_pubkey) = 32),
+    CONSTRAINT chk_meeting_moderator_attempt_snapshot_state_len
+        CHECK (LENGTH(snapshot_state_event_id) = 32),
+    CONSTRAINT chk_meeting_moderator_attempt_snapshot_hash_len
+        CHECK (LENGTH(candidate_snapshot_hash) = 32),
+    CONSTRAINT chk_meeting_moderator_attempt_replacement_len
+        CHECK (
+            replacement_of_attempt_id IS NULL
+            OR LENGTH(replacement_of_attempt_id) = 32
+        ),
+    CONSTRAINT chk_meeting_moderator_attempt_start_event_len
+        CHECK (LENGTH(started_by_event_id) = 32),
+    CONSTRAINT chk_meeting_moderator_attempt_terminal_event_len
+        CHECK (
+            terminal_event_id IS NULL
+            OR LENGTH(terminal_event_id) = 32
+        ),
+    CONSTRAINT chk_meeting_moderator_attempt_epochs CHECK (
+        control_epoch > 0
+        AND decision_epoch > 0
+        AND attempt_number > 0
+        AND speech_revision >= 0
+        AND snapshot_intent_revision >= 0
+    ),
+    CONSTRAINT chk_meeting_moderator_attempt_snapshot
+        CHECK (jsonb_typeof(candidate_snapshot_json) = 'object'),
+    CONSTRAINT chk_meeting_moderator_attempt_reason
+        CHECK (
+            terminal_reason IS NULL
+            OR OCTET_LENGTH(terminal_reason) BETWEEN 1 AND 128
+        ),
+    CONSTRAINT chk_meeting_moderator_attempt_terminal_shape CHECK (
+        (state = 'running'
+            AND terminal_at IS NULL
+            AND terminal_event_id IS NULL
+            AND terminal_reason IS NULL)
+        OR
+        (state <> 'running' AND terminal_at IS NOT NULL)
+    ),
+    CONSTRAINT chk_meeting_moderator_attempt_time
+        CHECK (deadline_at > started_at)
+);
+
+CREATE UNIQUE INDEX uq_meeting_running_moderator_attempt
+    ON meeting_moderator_decision_attempts (community_id, session_id)
+    WHERE state = 'running';
+
+CREATE INDEX idx_meeting_moderator_attempt_epoch
+    ON meeting_moderator_decision_attempts (
+        community_id,
+        session_id,
+        decision_epoch,
+        attempt_number
+    );
+
+CREATE TABLE meeting_moderator_retry_tickets (
+    community_id                   UUID NOT NULL REFERENCES communities(id),
+    session_id                     UUID NOT NULL,
+    retry_ticket_id                BYTEA NOT NULL,
+    attempt_id                     BYTEA NOT NULL,
+    failed_action_event_id         BYTEA NOT NULL,
+    source_type                    TEXT NOT NULL
+        CHECK (source_type IN ('intent', 'handoff')),
+    source_id                      BYTEA NOT NULL,
+    snapshot_source_event_id       BYTEA,
+    snapshot_handoff_attempt_count INT,
+    conflict_code                  TEXT NOT NULL,
+    control_epoch                  BIGINT NOT NULL,
+    decision_epoch                 BIGINT NOT NULL,
+    deadline_at                    TIMESTAMPTZ NOT NULL,
+    created_at                     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    consumed_at                    TIMESTAMPTZ,
+    consumed_by_event_id           BYTEA,
+    PRIMARY KEY (community_id, session_id, retry_ticket_id),
+    UNIQUE (community_id, failed_action_event_id),
+    FOREIGN KEY (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id),
+    FOREIGN KEY (community_id, session_id, attempt_id)
+        REFERENCES meeting_moderator_decision_attempts (
+            community_id,
+            session_id,
+            attempt_id
+        ),
+    CONSTRAINT chk_meeting_retry_ticket_id_len
+        CHECK (LENGTH(retry_ticket_id) = 32),
+    CONSTRAINT chk_meeting_retry_ticket_attempt_id_len
+        CHECK (LENGTH(attempt_id) = 32),
+    CONSTRAINT chk_meeting_retry_ticket_failed_action_len
+        CHECK (LENGTH(failed_action_event_id) = 32),
+    CONSTRAINT chk_meeting_retry_ticket_source_id_len
+        CHECK (LENGTH(source_id) = 32),
+    CONSTRAINT chk_meeting_retry_ticket_source_event_len
+        CHECK (
+            snapshot_source_event_id IS NULL
+            OR LENGTH(snapshot_source_event_id) = 32
+        ),
+    CONSTRAINT chk_meeting_retry_ticket_consumed_event_len
+        CHECK (
+            consumed_by_event_id IS NULL
+            OR LENGTH(consumed_by_event_id) = 32
+        ),
+    CONSTRAINT chk_meeting_retry_ticket_source_version CHECK (
+        (source_type = 'intent'
+            AND snapshot_source_event_id IS NOT NULL
+            AND snapshot_handoff_attempt_count IS NULL)
+        OR
+        (source_type = 'handoff'
+            AND snapshot_source_event_id IS NULL
+            AND snapshot_handoff_attempt_count IS NOT NULL
+            AND snapshot_handoff_attempt_count >= 0)
+    ),
+    CONSTRAINT chk_meeting_retry_ticket_conflict_code
+        CHECK (OCTET_LENGTH(conflict_code) BETWEEN 1 AND 128),
+    CONSTRAINT chk_meeting_retry_ticket_epochs CHECK (
+        control_epoch > 0 AND decision_epoch > 0
+    ),
+    CONSTRAINT chk_meeting_retry_ticket_consumed_shape CHECK (
+        (consumed_at IS NULL AND consumed_by_event_id IS NULL)
+        OR
+        (consumed_at IS NOT NULL AND consumed_by_event_id IS NOT NULL)
+    ),
+    CONSTRAINT chk_meeting_retry_ticket_deadline
+        CHECK (deadline_at > created_at)
+);
+
+CREATE INDEX idx_meeting_retry_ticket_attempt
+    ON meeting_moderator_retry_tickets (
+        community_id,
+        session_id,
+        attempt_id,
+        created_at
+    );
+
 CREATE TABLE meeting_speech_intents (
     community_id             UUID NOT NULL REFERENCES communities(id),
     session_id               UUID NOT NULL,
@@ -669,6 +874,7 @@ CREATE TABLE meeting_speech_intents (
     author_pubkey            BYTEA NOT NULL,
     current_event_id         BYTEA NOT NULL,
     basis_speech_revision    BIGINT NOT NULL,
+    eligible_decision_epoch  BIGINT NOT NULL DEFAULT 0,
     summary                  TEXT NOT NULL,
     addressed_to             BYTEA,
     state                    TEXT NOT NULL
@@ -716,6 +922,8 @@ CREATE TABLE meeting_speech_intents (
         CHECK (defer_event_id IS NULL OR LENGTH(defer_event_id) = 32),
     CONSTRAINT chk_meeting_intent_basis_revision
         CHECK (basis_speech_revision >= 0),
+    CONSTRAINT chk_meeting_intent_eligible_decision_epoch
+        CHECK (eligible_decision_epoch >= 0),
     CONSTRAINT chk_meeting_intent_summary
         CHECK (OCTET_LENGTH(summary) BETWEEN 1 AND 512),
     CONSTRAINT chk_meeting_intent_reason_code
@@ -777,6 +985,16 @@ CREATE UNIQUE INDEX uq_meeting_pending_intent_per_author
 CREATE UNIQUE INDEX uq_meeting_selected_intent_grant
     ON meeting_speech_intents (community_id, session_id, selected_grant_id)
     WHERE selected_grant_id IS NOT NULL;
+
+CREATE INDEX idx_meeting_intent_decision_cohort
+    ON meeting_speech_intents (
+        community_id,
+        session_id,
+        eligible_decision_epoch,
+        created_at,
+        intent_id
+    )
+    WHERE state = 'pending';
 
 CREATE TABLE meeting_human_floor_requests (
     community_id       UUID NOT NULL REFERENCES communities(id),
@@ -1248,6 +1466,7 @@ CREATE TABLE meeting_directed_handoffs (
     reason_type                 TEXT NOT NULL,
     reason_text                 TEXT NOT NULL,
     requested_depth             INT NOT NULL,
+    eligible_decision_epoch     BIGINT NOT NULL DEFAULT 0,
     question_state              TEXT NOT NULL
         CHECK (question_state IN ('open', 'answered', 'dismissed', 'blocked', 'ended')),
     initial_disposition         TEXT NOT NULL
@@ -1263,6 +1482,8 @@ CREATE TABLE meeting_directed_handoffs (
     last_grant_id               BYTEA,
     last_attempt_outcome        TEXT,
     attempt_count               INT NOT NULL DEFAULT 0,
+    moderator_retry_blocked_fingerprint BYTEA,
+    moderator_retry_not_before  TIMESTAMPTZ,
     answered_by_speech_event_id BYTEA,
     dismiss_event_id            BYTEA,
     dismiss_reason_code         TEXT,
@@ -1327,6 +1548,21 @@ CREATE TABLE meeting_directed_handoffs (
     ),
     CONSTRAINT chk_meeting_handoff_requested_depth
         CHECK (requested_depth BETWEEN 0 AND 255),
+    CONSTRAINT chk_meeting_handoff_eligible_decision_epoch
+        CHECK (eligible_decision_epoch >= 0),
+    CONSTRAINT chk_meeting_handoff_retry_fingerprint_len
+        CHECK (
+            moderator_retry_blocked_fingerprint IS NULL
+            OR LENGTH(moderator_retry_blocked_fingerprint) = 32
+        ),
+    CONSTRAINT chk_meeting_handoff_retry_suppression_shape
+        CHECK (
+            (moderator_retry_blocked_fingerprint IS NULL
+                AND moderator_retry_not_before IS NULL)
+            OR
+            (moderator_retry_blocked_fingerprint IS NOT NULL
+                AND moderator_retry_not_before IS NOT NULL)
+        ),
     CONSTRAINT chk_meeting_handoff_attempt_count CHECK (attempt_count >= 0),
     CONSTRAINT chk_meeting_handoff_terminal_shape CHECK (
         (question_state = 'open'
@@ -1359,6 +1595,16 @@ CREATE TABLE meeting_directed_handoffs (
 
 CREATE INDEX idx_meeting_open_handoffs
     ON meeting_directed_handoffs (community_id, session_id, created_at)
+    WHERE question_state = 'open';
+
+CREATE INDEX idx_meeting_handoff_decision_cohort
+    ON meeting_directed_handoffs (
+        community_id,
+        session_id,
+        eligible_decision_epoch,
+        created_at,
+        handoff_id
+    )
     WHERE question_state = 'open';
 
 CREATE TABLE meeting_baton_fallback_attempts (
@@ -1396,6 +1642,7 @@ CREATE TABLE meeting_v1_command_receipts (
     outcome_code        TEXT NOT NULL,
     canonical_object_id BYTEA,
     state_revision      BIGINT,
+    retry_ticket_id     BYTEA,
     response_json       JSONB NOT NULL,
     recorded_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (community_id, command_event_id),
@@ -1409,6 +1656,8 @@ CREATE TABLE meeting_v1_command_receipts (
         CHECK (canonical_object_id IS NULL OR LENGTH(canonical_object_id) = 32),
     CONSTRAINT chk_meeting_receipt_state_revision
         CHECK (state_revision IS NULL OR state_revision > 0),
+    CONSTRAINT chk_meeting_v1_receipt_retry_ticket_len
+        CHECK (retry_ticket_id IS NULL OR LENGTH(retry_ticket_id) = 32),
     CONSTRAINT chk_meeting_receipt_action
         CHECK (LENGTH(action) BETWEEN 1 AND 128),
     CONSTRAINT chk_meeting_receipt_outcome
@@ -1471,7 +1720,14 @@ ALTER TABLE meeting_baton_state
         REFERENCES meeting_baton_offers (community_id, session_id, offer_id),
     ADD CONSTRAINT fk_meeting_baton_active_grant
         FOREIGN KEY (community_id, session_id, active_grant_id)
-        REFERENCES meeting_baton_grants (community_id, session_id, grant_id);
+        REFERENCES meeting_baton_grants (community_id, session_id, grant_id),
+    ADD CONSTRAINT fk_meeting_baton_active_decision_attempt
+        FOREIGN KEY (community_id, session_id, active_decision_attempt_id)
+        REFERENCES meeting_moderator_decision_attempts (
+            community_id,
+            session_id,
+            attempt_id
+        );
 
 ALTER TABLE meeting_speech_intents
     ADD CONSTRAINT fk_meeting_intent_selected_grant
@@ -1507,6 +1763,15 @@ ALTER TABLE meeting_baton_fallback_attempts
     ADD CONSTRAINT fk_meeting_fallback_offer
         FOREIGN KEY (community_id, session_id, offer_id)
         REFERENCES meeting_baton_offers (community_id, session_id, offer_id);
+
+ALTER TABLE meeting_v1_command_receipts
+    ADD CONSTRAINT fk_meeting_v1_receipt_retry_ticket
+        FOREIGN KEY (community_id, session_id, retry_ticket_id)
+        REFERENCES meeting_moderator_retry_tickets (
+            community_id,
+            session_id,
+            retry_ticket_id
+        );
 
 -- ── Users ─────────────────────────────────────────────────────────────────────
 -- Conformance: "Users, profiles, NIP-05, and user search". One profile per

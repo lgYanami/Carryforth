@@ -2606,6 +2606,11 @@ mod tests {
     use nostr::{EventBuilder, Kind, Tag};
     use sqlx::PgPool;
 
+    // Postgres-backed Meeting tests intentionally share one isolated database.
+    // Sweep every Session created by that test process so an earlier test's
+    // due floor cannot consume a small batch and starve the Session under test.
+    const TEST_SWEEP_LIMIT: i64 = 10_000;
+
     #[test]
     fn phase_parser_is_fail_closed() {
         assert_eq!(FloorPhase::parse("open").unwrap(), FloorPhase::Open);
@@ -2887,11 +2892,17 @@ mod tests {
         .await
         .expect("deactivate authoritative Agent owner");
 
-        assert_eq!(
-            recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10,)
-                .await
-                .expect("recover due V0 floor"),
-            1
+        assert!(
+            recover_due_floors(
+                &db,
+                &relay_keys,
+                config,
+                WinnerSelector::FixedIndex(0),
+                TEST_SWEEP_LIMIT,
+            )
+            .await
+            .expect("recover due V0 floor")
+                >= 1
         );
         let round = sqlx::query(
             "SELECT phase, outcome, grant_event_id \
@@ -3026,9 +3037,15 @@ mod tests {
         .await
         .expect("Agent B Pass");
         tokio::time::sleep(StdDuration::from_millis(40)).await;
-        recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10)
-            .await
-            .expect("settle complete cohort");
+        recover_due_floors(
+            &db,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+            TEST_SWEEP_LIMIT,
+        )
+        .await
+        .expect("settle complete cohort");
         let granted = get_floor_snapshot(&db, community_id, session_id)
             .await
             .expect("granted floor");
@@ -3321,9 +3338,15 @@ mod tests {
 
         tokio::time::sleep(StdDuration::from_millis(550)).await;
         assert!(
-            recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10,)
-                .await
-                .expect("settle Round 1")
+            recover_due_floors(
+                &db,
+                &relay_keys,
+                config,
+                WinnerSelector::FixedIndex(0),
+                TEST_SWEEP_LIMIT,
+            )
+            .await
+            .expect("settle Round 1")
                 >= 1
         );
         let granted = get_floor_snapshot(&db, community_id, session_id)
@@ -3525,13 +3548,25 @@ mod tests {
         .await
         .expect("Claim Round 2");
         tokio::time::sleep(StdDuration::from_millis(550)).await;
-        recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10)
-            .await
-            .expect("grant Round 2");
+        recover_due_floors(
+            &db,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+            TEST_SWEEP_LIMIT,
+        )
+        .await
+        .expect("grant Round 2");
         tokio::time::sleep(StdDuration::from_millis(2_050)).await;
-        recover_due_floors(&db, &relay_keys, config, WinnerSelector::FixedIndex(0), 10)
-            .await
-            .expect("expire Round 2");
+        recover_due_floors(
+            &db,
+            &relay_keys,
+            config,
+            WinnerSelector::FixedIndex(0),
+            TEST_SWEEP_LIMIT,
+        )
+        .await
+        .expect("expire Round 2");
         let round_three = get_floor_snapshot(&db, community_id, session_id)
             .await
             .expect("Round 3 snapshot");

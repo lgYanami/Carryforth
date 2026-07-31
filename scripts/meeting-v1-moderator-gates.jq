@@ -20,6 +20,8 @@ def all_true:
 | [events($all; "harness_started")[].acceptanceRole] | unique as $harness_roles
 | events($all; "turn_started") as $turns
 | events($all; "prompt_request_started") as $prompt_requests
+| events($all; "prompt_cancelled_before_request") as $pre_prompt_cancellations
+| ($prompt_requests + $pre_prompt_cancellations) as $prompt_dispositions
 | [$prompt_requests[].acceptanceRole] | unique as $turn_roles
 | events($all; "model_applied") as $models
 | [
@@ -74,24 +76,38 @@ def all_true:
       "every exercised ACP Session applies gpt-5.6-sol[max|high] before its Prompt"
     ),
     gate(
-      "one_prompt_request_per_started_turn";
-      ($turns
-        | [
-            .[] as $turn
-            | ([
-                $prompt_requests[]
-                | select(
-                    .acceptanceRole == $turn.acceptanceRole
-                    and .turnId == $turn.turnId
-                  )
-              ] | length) == 1
-          ]
-        | all_true);
+      "one_prompt_disposition_per_started_turn";
+      (
+        ($turns
+          | [
+              .[] as $turn
+              | ([
+                  $prompt_dispositions[]
+                  | select(
+                      .acceptanceRole == $turn.acceptanceRole
+                      and .turnId == $turn.turnId
+                    )
+                ] | length) == 1
+            ]
+          | all_true)
+        and
+        ($pre_prompt_cancellations
+          | [
+              .[].payload.reason
+              | . == "steer"
+                or . == "interrupt"
+                or . == "explicit_cancel"
+                or . == "rotate"
+                or . == "switch_model"
+            ]
+          | all_true)
+      );
       {
         turns: ($turns | length),
-        prompt_requests: ($prompt_requests | length)
+        prompt_requests: ($prompt_requests | length),
+        pre_prompt_cancellations: ($pre_prompt_cancellations | length)
       };
-      "exactly one session/prompt request for every started harness Turn"
+      "every started harness Turn has exactly one prompt request or typed pre-prompt cancellation"
     ),
     gate(
       "adapter_process_identity_complete";
@@ -267,21 +283,25 @@ def all_true:
       0
     ),
     gate(
-      "moderator_action_uncertain_absent";
+      "meeting_action_uncertain_absent";
       ([
         $all[]
         | select(
             (.kind | startswith("meeting_v1_"))
-            and (.kind | endswith("_submitted"))
-            and .payload.outcome == "uncertain"
+            and (
+              .payload.outcome == "uncertain"
+              or .payload.submission == "uncertain"
+            )
           )
       ] | length) == 0;
       ([
         $all[]
         | select(
             (.kind | startswith("meeting_v1_"))
-            and (.kind | endswith("_submitted"))
-            and .payload.outcome == "uncertain"
+            and (
+              .payload.outcome == "uncertain"
+              or .payload.submission == "uncertain"
+            )
           )
       ] | length);
       0

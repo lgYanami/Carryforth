@@ -212,6 +212,7 @@ fn acceptance_safe_kind(kind: &str) -> bool {
             | "turn_started"
             | "turn_completed"
             | "prompt_request_started"
+            | "prompt_cancelled_before_request"
             | "prompt_terminal"
             | "acp_cancel_requested"
             | "acp_session_cancel_sent"
@@ -301,11 +302,19 @@ mod acceptance_tests {
             &ObserverContext::default(),
             serde_json::json!({"error": "private failure detail"}),
         );
+        observer.emit(
+            "prompt_cancelled_before_request",
+            Some(0),
+            &ObserverContext::default(),
+            serde_json::json!({"reason": "explicit_cancel"}),
+        );
 
         let contents = std::fs::read_to_string(path).unwrap();
         assert!(!contents.contains("do-not-persist"));
         assert!(!contents.contains("private failure detail"));
         assert!(contents.contains("meeting_v1_moderator_decision_started"));
         assert!(contents.contains("attempt-1"));
+        assert!(contents.contains("prompt_cancelled_before_request"));
+        assert!(contents.contains("explicit_cancel"));
     }
 }

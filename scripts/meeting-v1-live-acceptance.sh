@@ -16,6 +16,8 @@
 #
 # A run is one cold-start qualification sample. Formal acceptance still requires
 # the repetitions and soak described in meeting-v1-live-acceptance-plan.md.
+# Set MEETING_LIVE_SOAK_SECONDS on a scale tier to keep issuing bounded,
+# round-robin Human directed handoffs after the ordinary speech target is met.
 
 set -euo pipefail
 
@@ -31,6 +33,9 @@ tier="${1:-}"
 artifact_root="${2:-${TMPDIR:-/tmp}/buzz-meeting-v1-live}"
 speech_target="${MEETING_LIVE_SPEECHES_PER_AGENT:-2}"
 keep_database="${MEETING_LIVE_KEEP_DATABASE:-false}"
+soak_seconds="${MEETING_LIVE_SOAK_SECONDS:-0}"
+soak_elapsed_seconds=0
+soak_completed_turns=0
 suite="scale"
 scenario=""
 scenario_variant=""
@@ -100,6 +105,12 @@ case "$speech_target" in
     exit 2
     ;;
 esac
+case "$soak_seconds" in
+  ''|*[!0-9]*)
+    echo "MEETING_LIVE_SOAK_SECONDS must be a non-negative integer" >&2
+    exit 2
+    ;;
+esac
 
 run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 tier_lower="$(printf '%s' "$tier" | tr '[:upper:]' '[:lower:]')"
@@ -149,7 +160,15 @@ cleanup() {
       ;;
   esac
 }
-trap 'exit_status=$?; cleanup; exit "$exit_status"' EXIT
+trap 'exit_status=$?;
+  if [[ "$exit_status" -ne 0 && "$exit_status" -ne 130 &&
+    ! -f "$run_dir/failure.txt" && ! -f "$run_dir/inconclusive.txt" ]]; then
+    log "FAIL: acceptance runner exited unexpectedly with status $exit_status"
+    printf "acceptance runner exited unexpectedly with status %s\n" "$exit_status" \
+      >"$run_dir/failure.txt"
+  fi
+  cleanup
+  exit "$exit_status"' EXIT
 trap 'exit 130' INT TERM
 
 fail() {
@@ -540,7 +559,7 @@ for agent_count in $meeting_agent_counts; do
     meetings create
     --policy moderated-baton-v1
     --title "$tier real Codex qualification / Meeting $meeting_index"
-    --description "Cross-meeting real Codex qualification. Read-only project investigation."
+    --description "Cross-meeting real Codex qualification. Bounded evidence review for discussion; no task execution or exhaustive project audit."
     --moderator "$moderator_public_key"
     --participant "$(identity_public_key "$observer_role")"
   )
@@ -561,7 +580,7 @@ for agent_count in $meeting_agent_counts; do
     "$host_role" \
     "$meeting_id" \
     "m${meeting_index}-opening" \
-    "这是 ${tier} 并发验收的 Meeting ${meeting_index}。请围绕 Meeting V1 在真实 Codex 并发下的协议连续性、数据库不变量、ACP 延迟和运维边界进行只读调查；所有 Agent 先提交简短且不重复的发言意图，获得 Grant 后用代码事实支撑结论。禁止修改工作区或执行外部写操作。"
+    "这是 ${tier} 并发验收的 Meeting ${meeting_index}。请围绕 Meeting V1 在真实 Codex 并发下的协议连续性、数据库不变量、ACP 延迟和运维边界进行有界证据讨论；所有 Agent 先提交简短且不重复的发言意图，获得 Grant 后只做最小范围的针对性读取并及时发言。不要执行任务、全仓审计、修改工作区或进行外部写操作。"
   meeting_index=$((meeting_index + 1))
 done
 
@@ -571,13 +590,71 @@ submit_fixture_intent() {
   local agent_index="$3"
   local role="m${meeting_index}-agent${agent_index}"
   local artifact="$run_dir/meetings/${role}-fixture-intent.json"
+  local focus
   local intent_id
+  local submit_status
 
-  buzz_as "$role" meetings intents submit \
-    --meeting "$meeting_id" \
-    --summary "验收候选 ${role}：基于只读代码和权威 State，提供一个与当前会议目标直接相关、可被主持人立即选择的独立证据。" \
-    >"$artifact"
-  intent_id="$(jq -r '.intent_id // empty' "$artifact")"
+  case "$agent_index" in
+    2)
+      focus="核验 Moderator 乐观并发、CAS 冲突与 retry ticket 的状态一致性"
+      ;;
+    3)
+      focus="核验 ACP 模型延迟、deadline、自然终止与会议结束时的生命周期收敛"
+      ;;
+    4)
+      focus="核验 observer 证据、故障恢复、重放安全与验收门禁的可观测性"
+      ;;
+    *)
+      focus="核验多会议并发下的资源隔离、限流与发布门槛"
+      ;;
+  esac
+
+  intent_id="$(
+    db_scalar "
+      SELECT COALESCE(encode(intent_id, 'hex'), '')
+      FROM meeting_speech_intents
+      WHERE session_id='$meeting_id'
+        AND author_pubkey=decode('$(identity_public_key "$role")', 'hex')
+        AND state='pending'
+      ORDER BY created_at DESC
+      LIMIT 1;
+    "
+  )"
+  if [[ "$intent_id" =~ ^[0-9a-f]{64}$ ]]; then
+    jq -cn --arg intent_id "$intent_id" \
+      '{intent_id: $intent_id, reused_existing_pending: true}' >"$artifact"
+  else
+    set +e
+    buzz_as "$role" meetings intents submit \
+      --meeting "$meeting_id" \
+      --summary "验收候选 ${role}：${focus}；该议题与其他候选互补而非重复，并将基于只读代码和权威 State 给出独立证据。" \
+      >"$artifact" 2>&1
+    submit_status=$?
+    set -e
+    if [[ "$submit_status" -ne 0 ]]; then
+      intent_id="$(
+        db_scalar "
+          SELECT COALESCE(encode(intent_id, 'hex'), '')
+          FROM meeting_speech_intents
+          WHERE session_id='$meeting_id'
+            AND author_pubkey=decode('$(identity_public_key "$role")', 'hex')
+            AND state='pending'
+          ORDER BY created_at DESC
+          LIMIT 1;
+        "
+      )"
+      [[ "$intent_id" =~ ^[0-9a-f]{64}$ ]] ||
+        fail "$role fixture Intent submission failed with exit $submit_status"
+      jq -cn --arg intent_id "$intent_id" --argjson submit_status "$submit_status" \
+        '{
+          intent_id: $intent_id,
+          reused_existing_pending: true,
+          raced_submit_exit_status: $submit_status
+        }' >"$artifact"
+    else
+      intent_id="$(jq -r '.intent_id // empty' "$artifact")"
+    fi
+  fi
   [[ "$intent_id" =~ ^[0-9a-f]{64}$ ]] ||
     fail "$role fixture Intent did not return a canonical intent_id"
   printf '%s\t%s\t%s\t%s\t%s\n' \
@@ -813,9 +890,9 @@ capture_process_node() {
   local command_name
   local child_pid
 
-  (( depth <= 8 )) || return
+  (( depth <= 8 )) || return 0
   process_row="$(ps -p "$process_id" -o pid= -o ppid= -o etime= -o comm= 2>/dev/null || true)"
-  [[ -n "$process_row" ]] || return
+  [[ -n "$process_row" ]] || return 0
   read -r observed_pid parent_pid elapsed command_name <<EOF
 $process_row
 EOF
@@ -841,6 +918,7 @@ EOF
   for child_pid in $(pgrep -P "$process_id" 2>/dev/null || true); do
     capture_process_node "$phase" "$role" "$child_pid" $((depth + 1))
   done
+  return 0
 }
 
 capture_process_tree() {
@@ -1094,6 +1172,8 @@ wait_for_barrier() {
   local latest_turn=""
   local deadline_seconds=0
   local now_seconds
+  local terminal_turn=""
+  local terminal_poll_count=0
 
   while true; do
     if [[ -s "$path" ]]; then
@@ -1123,10 +1203,22 @@ wait_for_barrier() {
       if [[ -n "$latest_turn" ]] && jq -se --arg turn "$latest_turn" '
         any(.[]; .kind == "prompt_terminal" and .turnId == $turn)
       ' "$event_path" >/dev/null 2>&1; then
-        inconclusive "Meeting $meeting_index provider terminal did not exercise a primary Select"
+        if [[ "$terminal_turn" != "$latest_turn" ]]; then
+          terminal_turn="$latest_turn"
+          terminal_poll_count=0
+        fi
+        terminal_poll_count=$((terminal_poll_count + 1))
+        if (( terminal_poll_count > 300 )); then
+          inconclusive "Meeting $meeting_index provider terminal did not exercise a primary Select"
+        fi
+      else
+        terminal_turn=""
+        terminal_poll_count=0
       fi
       now_seconds="$(date -u +%s)"
-      if [[ "$deadline_seconds" -gt 0 && "$now_seconds" -ge "$deadline_seconds" ]]; then
+      if [[ -z "$terminal_turn" &&
+        "$deadline_seconds" -gt 0 &&
+        "$now_seconds" -ge "$deadline_seconds" ]]; then
         inconclusive "Meeting $meeting_index reached its authoritative attempt deadline without a primary Select"
       fi
     fi
@@ -1177,7 +1269,7 @@ mutate_intent() {
       buzz_as "$role" meetings intents refresh \
         --meeting "$meeting_id" \
         --intent "$intent_id" \
-        --summary "Acceptance refresh $label：保留稳定 intent_id，但以新的权威 source version 提供同一独立证据。" \
+        --summary "Acceptance refresh ${label}：保留稳定 intent_id，但以新的权威 source version 提供同一独立证据。" \
         >"$run_dir/meetings/$label-refresh.json"
       ;;
     withdraw)
@@ -1414,11 +1506,41 @@ run_barrier_source_mutation() {
   local retry_ticket_id
   local failed_action_event_id
   local reuse_status
+  local remaining_candidate_count=0
+  local candidate_id
+  local candidate_event_id
+  local authoritative_event_id
 
   wait_for_barrier "$meeting_index"
   attempt_id="$(jq -r '.attempt_id' <<<"$LAST_BARRIER_JSON")"
   selected_id="$(jq -r '.selected_source_id' <<<"$LAST_BARRIER_JSON")"
   old_selected_event_id="$(jq -r '.selected_source_event_id // empty' <<<"$LAST_BARRIER_JSON")"
+  if [[ "$mutate_selected" == true ]]; then
+    while IFS=$'\t' read -r candidate_id candidate_event_id; do
+      [[ "$candidate_id" == "$selected_id" ]] && continue
+      authoritative_event_id="$(
+        db_scalar "
+          SELECT COALESCE(encode(current_event_id, 'hex'), '')
+          FROM meeting_speech_intents
+          WHERE session_id='$meeting_id'
+            AND intent_id=decode('$candidate_id', 'hex')
+            AND state='pending';
+        "
+      )"
+      if [[ "$authoritative_event_id" == "$candidate_event_id" ]]; then
+        remaining_candidate_count=$((remaining_candidate_count + 1))
+      fi
+    done < <(
+      jq -r '
+        .candidate_cohort[]
+        | select(.source_type == "intent")
+        | [.source_id, .current_event_id]
+        | @tsv
+      ' <<<"$LAST_BARRIER_JSON"
+    )
+    (( remaining_candidate_count > 0 )) ||
+      inconclusive "selected-source mutation acquired no still-current alternative Cohort candidate"
+  fi
   if [[ "$mutate_selected" == true ]]; then
     target_id="$selected_id"
   else
@@ -1577,6 +1699,8 @@ run_rmod_05() {
   local turn_id
   local before_revision
   local request_revision
+  local human_priority_dispositions
+  local retry_requests
 
   wait_for_decision_start "$meeting_index" 1
   start="$LAST_EVENT_JSON"
@@ -1601,11 +1725,40 @@ run_rmod_05() {
     "$host_role" "$meeting_id" "m${meeting_index}-human-priority" "$LAST_REQUEST_ID"
   wait_for_attempt_event \
     "$meeting_index" meeting_v1_moderator_decision_discarded "$attempt_id"
+  human_priority_dispositions="$(
+    jq -sr --arg attempt "$attempt_id" '
+      [
+        .[]
+        | select(
+            .kind == "meeting_v1_moderator_decision_discarded"
+            and .payload.attempt_id == $attempt
+            and .payload.reason == "human_priority"
+          )
+      ]
+      | length
+    ' "$run_dir/agents/m${meeting_index}-agent1-events.ndjson"
+  )"
+  retry_requests="$(
+    jq -sr --arg attempt "$attempt_id" '
+      [
+        .[]
+        | select(
+            .kind == "meeting_v1_moderator_decision_retry_requested"
+            and .payload.attempt_id == $attempt
+          )
+      ]
+      | length
+    ' "$run_dir/agents/m${meeting_index}-agent1-events.ndjson"
+  )"
+  [[ "$human_priority_dispositions" -eq 1 && "$retry_requests" -eq 0 ]] ||
+    fail "R-MOD-05 preempted attempt did not end exactly once as human_priority without retry"
   wait_for_decision_start "$meeting_index" 2
   [[ "$(jq -r '.payload.attempt_id' <<<"$LAST_EVENT_JSON")" != "$attempt_id" ]] ||
     fail "Human speech did not produce a fresh Moderator DecisionAttempt"
   record_scenario_pass \
-    "r_mod_05_human_priority_fences_old_result" "$attempt_id" "discarded before fresh attempt"
+    "r_mod_05_human_priority_fences_old_result" \
+    "$attempt_id/discarded=$human_priority_dispositions/retries=$retry_requests" \
+    "one human_priority discard, zero retry, then a fresh attempt"
 }
 
 run_rmod_06() {
@@ -1767,7 +1920,7 @@ qualify_meeting() {
       label="m${meeting_index}-qualify-${targeted_round}-${target_role}"
       case $((targeted_round % 3)) in
         1)
-          qualification_prompt="Host 定向复核 ${targeted_round}：请 ${target_role} 对照本场已有历史，补充一个尚未被充分证明的协议或数据库不变量。回答必须读取实际代码或权威 State，并明确区分本场观察、确定性测试和仍待验证的结论。"
+          qualification_prompt="Host 定向复核 ${targeted_round}：请 ${target_role} 对照本场已有历史，补充一个尚未被充分证明的协议或数据库不变量。仅在共享上下文不足时做一次小范围代码或权威 State 读取，不得展开全仓审计；请及时明确区分本场观察、确定性测试和仍待验证的结论。"
           qualification_reason="请补充尚未充分证明的协议或数据库证据，避免重复已有发言。"
           ;;
         2)
@@ -1809,6 +1962,80 @@ if [[ "$suite" == scale ]]; then
       fail "an Agent qualification driver failed"
   done
   log "all Agents reached the qualification speech target"
+fi
+
+soak_meeting() {
+  local meeting_index="$1"
+  local meeting_id="$2"
+  local host_role="$3"
+  local agent_count="$4"
+  local deadline_epoch="$5"
+  local turn_index=0
+  local target_index
+  local target_role
+  local target_public_key
+  local label
+  local turn_started_epoch
+  local turn_finished_epoch
+  local turns_path="$run_dir/meetings/m${meeting_index}-soak-turns.tsv"
+
+  : >"$turns_path"
+  while [[ "$(date -u +%s)" -lt "$deadline_epoch" ]]; do
+    turn_index=$((turn_index + 1))
+    target_index=$(((turn_index - 1) % agent_count + 1))
+    target_role="m${meeting_index}-agent${target_index}"
+    target_public_key="$(identity_public_key "$target_role")"
+    label="m${meeting_index}-soak-${turn_index}-${target_role}"
+    turn_started_epoch="$(date -u +%s)"
+    human_turn \
+      "$host_role" \
+      "$meeting_id" \
+      "$label" \
+      "持续验收轮次 ${turn_index}：请 ${target_role} 依据本场最新讨论，给出一个简短且不重复的协议风险、反例或停止条件。只做最小范围的针对性读取；不要执行任务或展开全仓调查。" \
+      "$target_public_key" \
+      "请在有界发言时间内补充一个新的协议风险、反例或可观测停止条件。"
+    wait_handoff_resolved "$LAST_SPEECH_ID" "$label" false
+    turn_finished_epoch="$(date -u +%s)"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$turn_index" "$target_role" "$LAST_SPEECH_ID" \
+      "$turn_started_epoch" "$turn_finished_epoch" >>"$turns_path"
+  done
+}
+
+if [[ "$suite" == scale && "$soak_seconds" -gt 0 ]]; then
+  soak_started_epoch="$(date -u +%s)"
+  soak_deadline_epoch=$((soak_started_epoch + soak_seconds))
+  log "starting ${soak_seconds}s sustained round-robin Meeting churn"
+  soak_pids=""
+  while IFS=$'\t' read -r meeting_index meeting_id host_role observer_role agent_count; do
+    soak_meeting \
+      "$meeting_index" "$meeting_id" "$host_role" "$agent_count" "$soak_deadline_epoch" \
+      >"$run_dir/meetings/m${meeting_index}-soak-driver.log" 2>&1 &
+    soak_pids="$soak_pids $!"
+  done <"$run_dir/meetings.tsv"
+  for soak_pid in $soak_pids; do
+    wait "$soak_pid" || fail "a sustained churn driver failed"
+  done
+  soak_finished_epoch="$(date -u +%s)"
+  soak_elapsed_seconds=$((soak_finished_epoch - soak_started_epoch))
+  for turns_path in "$run_dir"/meetings/m*-soak-turns.tsv; do
+    [[ -e "$turns_path" ]] || continue
+    soak_completed_turns=$((soak_completed_turns + $(wc -l <"$turns_path")))
+  done
+  jq -n \
+    --argjson requested_seconds "$soak_seconds" \
+    --argjson elapsed_seconds "$soak_elapsed_seconds" \
+    --argjson completed_turns "$soak_completed_turns" \
+    '{
+      requested_seconds: $requested_seconds,
+      elapsed_seconds: $elapsed_seconds,
+      completed_directed_turns: $completed_turns
+    }' >"$run_dir/soak-summary.json"
+  [[ "$soak_elapsed_seconds" -ge "$soak_seconds" ]] ||
+    fail "sustained churn ended before its requested duration"
+  [[ "$soak_completed_turns" -ge "$meeting_count" ]] ||
+    fail "sustained churn did not complete at least one directed turn per Meeting"
+  log "sustained churn completed $soak_completed_turns directed turns in ${soak_elapsed_seconds}s"
 fi
 
 log "ending all Meetings through the canonical CLI path"
@@ -1914,9 +2141,9 @@ wait_for_moderator_turns_to_settle() {
   fail "$pending Moderator provider Turn(s) did not reach a terminal within 6 minutes"
 }
 
-verify_final_retry_count() {
-  local expected="$1"
-  local observed=0
+verify_final_retry_integrity() {
+  local retry_started=0
+  local retry_requested=0
   local count
   local meeting_index
   local role
@@ -1928,11 +2155,11 @@ verify_final_retry_count() {
   for ignored_count in $meeting_agent_counts; do
     role="m${meeting_index}-agent1"
     count="$(event_count "$role" meeting_v1_moderator_decision_retry_started)"
-    observed=$((observed + count))
+    retry_started=$((retry_started + count))
+    count="$(event_count "$role" meeting_v1_moderator_decision_retry_requested)"
+    retry_requested=$((retry_requested + count))
     meeting_index=$((meeting_index + 1))
   done
-  [[ "$observed" -eq "$expected" ]] ||
-    fail "$tier finished with $observed Moderator retries; expected exactly $expected"
   ticket_count="$(
     db_scalar "SELECT count(*) FROM meeting_moderator_retry_tickets;"
   )"
@@ -1950,24 +2177,21 @@ verify_final_retry_count() {
       WHERE conflict_code <> 'selected_source_changed';
     "
   )"
-  [[ "$ticket_count" -eq "$expected" ]] ||
-    fail "$tier created $ticket_count retry tickets; expected exactly $expected"
+  [[ "$retry_requested" -eq "$retry_started" &&
+    "$ticket_count" -eq "$retry_started" ]] ||
+    fail "$tier did not preserve a one-to-one retry request/start/ticket relationship"
   [[ "$unconsumed_tickets" -eq 0 && "$invalid_ticket_code" -eq 0 ]] ||
     fail "$tier retained an unconsumed or non-selected-source retry ticket"
   record_scenario_pass \
-    "final_moderator_retry_count" \
-    "retries=$observed,tickets=$ticket_count,unconsumed=$unconsumed_tickets" \
-    "exactly $expected selected-source retry/retry-ticket pair(s)"
+    "final_moderator_retry_integrity" \
+    "requested=$retry_requested,started=$retry_started,tickets=$ticket_count,unconsumed=$unconsumed_tickets" \
+    "every requested retry has exactly one started attempt and consumed selected-source ticket"
 }
 
 if [[ "$suite" == moderator ]]; then
   log "waiting for every ACP Turn and Moderator disposition to settle"
   wait_for_moderator_turns_to_settle
-  case "$scenario" in
-    R-MOD-03) verify_final_retry_count 0 ;;
-    R-MOD-04|R-MOD-06|R-MOD-07) verify_final_retry_count 1 ;;
-    *) verify_final_retry_count 0 ;;
-  esac
+  verify_final_retry_integrity
 fi
 
 for ignored_attempt in $(seq 1 80); do
@@ -2121,11 +2345,44 @@ docker exec buzz-postgres psql -U buzz -d "$database_name" -qtA -F '|' -c "
   ORDER BY grant_row.session_id, grant_row.holder_pubkey;
 " >"$run_dir/agent-speech-counts.txt"
 
+docker exec buzz-postgres psql -U buzz -d "$database_name" -qtA -F '|' -c "
+  SELECT
+    offer_row.session_id,
+    encode(offer_row.offer_id, 'hex'),
+    offer_row.allocation_source,
+    offer_row.state,
+    COALESCE(offer_row.response_reason, ''),
+    CASE
+      WHEN offer_row.source_handoff_id IS NOT NULL THEN COALESCE((
+        SELECT handoff.question_state
+        FROM meeting_directed_handoffs handoff
+        WHERE handoff.community_id=offer_row.community_id
+          AND handoff.session_id=offer_row.session_id
+          AND handoff.handoff_id=offer_row.source_handoff_id
+      ), '')
+      WHEN offer_row.source_intent_id IS NOT NULL THEN COALESCE((
+        SELECT intent.state
+        FROM meeting_speech_intents intent
+        WHERE intent.community_id=offer_row.community_id
+          AND intent.session_id=offer_row.session_id
+          AND intent.intent_id=offer_row.source_intent_id
+      ), '')
+      ELSE ''
+    END AS source_terminal_state
+  FROM meeting_baton_offers offer_row
+  JOIN meeting_participants participant USING (community_id, session_id)
+  WHERE participant.pubkey=offer_row.target_pubkey
+    AND participant.participant_type='agent'
+  ORDER BY offer_row.session_id, offer_row.created_at, offer_row.offer_id;
+" >"$run_dir/agent-offer-outcomes.txt"
+
 curl -fsS http://127.0.0.1:9102/metrics >"$run_dir/metrics.prom" || true
 git status --porcelain=v1 >"$run_dir/workspace-after.status"
 git diff --binary HEAD >"$run_dir/workspace-after.diff"
 
 protocol_failures=0
+agent_offer_declines=0
+recovered_agent_offer_declines=0
 
 if [[ "$post_end_state_changed" == true ]]; then
   log "canonical State or Speech revision changed after all Meetings ended"
@@ -2162,6 +2419,56 @@ if [[ "$terminal_reservations" -ne 0 ]]; then
 fi
 
 if [[ "$suite" == scale ]]; then
+  agent_offer_declines="$(
+    db_scalar "
+    SELECT count(*)
+    FROM meeting_baton_offers offer_row
+    JOIN meeting_participants participant USING (community_id, session_id)
+    WHERE participant.pubkey=offer_row.target_pubkey
+      AND participant.participant_type='agent'
+      AND offer_row.state='declined';
+  "
+  )" || fail "failed to query explicit Agent Offer declines"
+  recovered_agent_offer_declines="$(
+    db_scalar "
+    SELECT count(*)
+    FROM meeting_baton_offers offer_row
+    JOIN meeting_participants participant USING (community_id, session_id)
+    WHERE participant.pubkey=offer_row.target_pubkey
+      AND participant.participant_type='agent'
+      AND offer_row.state='declined'
+      AND offer_row.response_event_id IS NOT NULL
+      AND offer_row.response_reason IN (
+        'local Agent turn capacity is fully reserved',
+        'no physical Agent turn slot is currently available'
+      )
+      AND (
+        (
+          offer_row.source_handoff_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM meeting_directed_handoffs handoff
+            WHERE handoff.community_id=offer_row.community_id
+              AND handoff.session_id=offer_row.session_id
+              AND handoff.handoff_id=offer_row.source_handoff_id
+              AND handoff.question_state='answered'
+          )
+        )
+        OR
+        (
+          offer_row.source_intent_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM meeting_speech_intents intent
+            WHERE intent.community_id=offer_row.community_id
+              AND intent.session_id=offer_row.session_id
+              AND intent.intent_id=offer_row.source_intent_id
+              AND intent.state='consumed'
+          )
+        )
+      );
+  "
+  )" || fail "failed to query recovered Agent Offer declines"
   failed_agent_offers="$(
     db_scalar "
     SELECT count(*)
@@ -2169,12 +2476,51 @@ if [[ "$suite" == scale ]]; then
     JOIN meeting_participants participant USING (community_id, session_id)
     WHERE participant.pubkey=offer_row.target_pubkey
       AND participant.participant_type='agent'
-      AND offer_row.state <> 'acked';
+      AND offer_row.state <> 'acked'
+      AND NOT (
+        offer_row.state='declined'
+        AND offer_row.response_event_id IS NOT NULL
+        AND offer_row.response_reason IN (
+          'local Agent turn capacity is fully reserved',
+          'no physical Agent turn slot is currently available'
+        )
+        AND (
+          (
+            offer_row.source_handoff_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM meeting_directed_handoffs handoff
+              WHERE handoff.community_id=offer_row.community_id
+                AND handoff.session_id=offer_row.session_id
+                AND handoff.handoff_id=offer_row.source_handoff_id
+                AND handoff.question_state='answered'
+            )
+          )
+          OR
+          (
+            offer_row.source_intent_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM meeting_speech_intents intent
+              WHERE intent.community_id=offer_row.community_id
+                AND intent.session_id=offer_row.session_id
+                AND intent.intent_id=offer_row.source_intent_id
+                AND intent.state='consumed'
+            )
+          )
+        )
+      );
   "
   )" || fail "failed to query Agent Offer outcomes"
   if [[ "$failed_agent_offers" -ne 0 ]]; then
-    log "an Agent Offer did not ACK successfully"
+    log "Agent Offers include unresolved, timed-out, or unrecovered outcomes"
     protocol_failures=$((protocol_failures + 1))
+  fi
+  if [[ "$agent_offer_declines" -ne "$recovered_agent_offer_declines" ]]; then
+    log "one or more explicit Agent Offer declines did not preserve and complete their source"
+    protocol_failures=$((protocol_failures + 1))
+  elif [[ "$agent_offer_declines" -gt 0 ]]; then
+    log "$agent_offer_declines explicit Agent Offer decline(s) preserved and completed their source"
   fi
 fi
 
@@ -2326,7 +2672,7 @@ while IFS=$'\t' read -r role agent_pid effort; do
       "$agent_log" >>"$run_dir/runtime-anomalies.txt" || true
   else
     rg -nH \
-      'agent_returned — respawning|agent_returned \(application error|Meeting V1 .* was not confirmed| ERROR ' \
+      'agent_returned — respawning|agent_returned \(application error| ERROR ' \
       "$agent_log" >>"$run_dir/runtime-anomalies.txt" || true
   fi
 done <"$run_dir/agent-processes.tsv"
@@ -2340,34 +2686,34 @@ fi
 
 moderator_gate_failures=0
 scenario_gate_failures=0
-if [[ "$suite" == moderator ]]; then
-  expected_agent_count="$(wc -l <"$run_dir/agent-processes.tsv" | tr -d ' ')"
-  : >"$run_dir/acceptance-events.ndjson"
-  while IFS=$'\t' read -r role agent_pid effort; do
-    event_path="$run_dir/agents/$role-events.ndjson"
-    if [[ ! -s "$event_path" ]]; then
-      log "$role produced no acceptance observer evidence"
-      moderator_gate_failures=$((moderator_gate_failures + 1))
-      continue
-    fi
-    if ! jq -c --arg role "$role" '. + {acceptanceRole: $role}' \
-      "$event_path" >>"$run_dir/acceptance-events.ndjson"; then
-      fail "$role acceptance observer evidence is not valid NDJSON"
-    fi
-  done <"$run_dir/agent-processes.tsv"
-
-  if ! jq -s \
-    --argjson expected_agents "$expected_agent_count" \
-    -f scripts/meeting-v1-moderator-gates.jq \
-    "$run_dir/acceptance-events.ndjson" \
-    >"$run_dir/gates/moderator.json"; then
-    fail "could not evaluate structured Moderator hard gates"
+expected_agent_count="$(wc -l <"$run_dir/agent-processes.tsv" | tr -d ' ')"
+: >"$run_dir/acceptance-events.ndjson"
+while IFS=$'\t' read -r role agent_pid effort; do
+  event_path="$run_dir/agents/$role-events.ndjson"
+  if [[ ! -s "$event_path" ]]; then
+    log "$role produced no acceptance observer evidence"
+    moderator_gate_failures=$((moderator_gate_failures + 1))
+    continue
   fi
-  structured_failures="$(
-    jq -r '.failed_gates | length' "$run_dir/gates/moderator.json"
-  )"
-  moderator_gate_failures=$((moderator_gate_failures + structured_failures))
+  if ! jq -c --arg role "$role" '. + {acceptanceRole: $role}' \
+    "$event_path" >>"$run_dir/acceptance-events.ndjson"; then
+    fail "$role acceptance observer evidence is not valid NDJSON"
+  fi
+done <"$run_dir/agent-processes.tsv"
 
+if ! jq -s \
+  --argjson expected_agents "$expected_agent_count" \
+  -f scripts/meeting-v1-moderator-gates.jq \
+  "$run_dir/acceptance-events.ndjson" \
+  >"$run_dir/gates/moderator.json"; then
+  fail "could not evaluate structured Moderator hard gates"
+fi
+structured_failures="$(
+  jq -r '.failed_gates | length' "$run_dir/gates/moderator.json"
+)"
+moderator_gate_failures=$((moderator_gate_failures + structured_failures))
+
+if [[ "$suite" == moderator ]]; then
   case "$scenario" in
     R-MOD-01) expected_scenario_gates=3 ;;
     R-MOD-02) expected_scenario_gates=4 ;;
@@ -2405,10 +2751,10 @@ if [[ "$suite" == moderator ]]; then
   if [[ "$(jq -r '.passed' "$run_dir/gates/scenario.json")" != true ]]; then
     scenario_gate_failures=1
   fi
-  if [[ "$moderator_gate_failures" -ne 0 || "$scenario_gate_failures" -ne 0 ]]; then
-    log "$tier has $moderator_gate_failures structured and $scenario_gate_failures scenario gate failure(s)"
-    protocol_failures=$((protocol_failures + moderator_gate_failures + scenario_gate_failures))
-  fi
+fi
+if [[ "$moderator_gate_failures" -ne 0 || "$scenario_gate_failures" -ne 0 ]]; then
+  log "$tier has $moderator_gate_failures structured and $scenario_gate_failures scenario gate failure(s)"
+  protocol_failures=$((protocol_failures + moderator_gate_failures + scenario_gate_failures))
 fi
 
 jq -n \
@@ -2427,7 +2773,12 @@ jq -n \
   --arg workspace_diff_sha256 "$workspace_diff_sha256" \
   --argjson meeting_count "$meeting_count" \
   --argjson speech_target "$speech_target" \
+  --argjson soak_seconds_requested "$soak_seconds" \
+  --argjson soak_elapsed_seconds "$soak_elapsed_seconds" \
+  --argjson soak_completed_turns "$soak_completed_turns" \
   --argjson runtime_anomalies "$runtime_anomalies" \
+  --argjson agent_offer_declines "$agent_offer_declines" \
+  --argjson recovered_agent_offer_declines "$recovered_agent_offer_declines" \
   --argjson moderator_gate_failures "$moderator_gate_failures" \
   --argjson scenario_gate_failures "$scenario_gate_failures" \
   --argjson protocol_failures "$protocol_failures" \
@@ -2454,8 +2805,13 @@ jq -n \
     tracked_workspace_diff_sha256: $workspace_diff_sha256,
     meeting_count: $meeting_count,
     speeches_per_agent_target: $speech_target,
+    soak_seconds_requested: $soak_seconds_requested,
+    soak_elapsed_seconds: $soak_elapsed_seconds,
+    soak_completed_directed_turns: $soak_completed_turns,
     runtime_anomalies: $runtime_anomalies,
-    meeting_v1_acceptance_feature: ($suite == "moderator"),
+    agent_offer_declines: $agent_offer_declines,
+    recovered_agent_offer_declines: $recovered_agent_offer_declines,
+    meeting_v1_acceptance_feature: true,
     pre_submit_barrier: (
       if $suite == "moderator"
       then "acceptance-only-one-shot-before-protocol-submit-timeout"

@@ -3,6 +3,119 @@
 本文记录在概念设计和后端实现设计冻结后，经讨论确认的语义调整。新决策优先于旧文档中
 与其冲突的描述；实现文档应同步更新为当前语义。
 
+## 2026-07-31：Moderator Turn 的 terminal disposition 必须一次性
+
+### 状态
+
+已修复并纳入真实 Codex C12 硬门禁；由最终规模验收发现。
+
+### 问题
+
+一次主持判断自然结束后，若主 action 与并发控制权变化冲突，ACP 会正确把结果标记为
+`discarded` 并继续提交 DecisionAttempt Finish。后续 Full Sync/准备下一 Attempt 的竞态
+可能再次走到同一 `mark_moderator_result_stale`，为同一个 `turn_id + attempt_id` 重复发出
+`meeting_v1_moderator_decision_discarded`。
+
+该样本的 Relay 协议投影仍然一致（Offer 全部 ACK、Grant 全部 spoken、outbox 无积压），
+但一个主持 Turn 出现两个终结 disposition，会破坏可观测性、统计和恢复判断，因此必须是
+qualification 硬失败，不能在 Runner 中去重掩盖。
+
+### 新决策
+
+1. 每个 Moderator Turn 只能 claim 一次 terminal disposition：
+   `committed`、`discarded` 或 `retry_required`；
+2. claim 状态写入 durable `ModeratorDecisionRecord`，重启恢复时保留；
+3. Meeting ledger 已终止清理后到达的晚结果由有界的 4096-turn 本地 fence 去重，避免为了
+   可观测性无限增长内存；
+4. 重复 reconcile 仍可完成 Attempt Finish、Full Sync 和其他协议清理，但不得再次发出
+   terminal disposition；
+5. Runner 的 `moderator_turn_has_exactly_one_disposition` 门禁保持不变。
+
+### 验证
+
+- 新回归测试复现第一次 `control_changed` discard、ledger 状态随后变化、再次 stale
+  reconcile 的顺序，并证明只产生一个 discard，且首次 reason 不被覆盖；
+- 全部 Meeting V1 controller 测试 59/59 通过；
+- 发现该问题的 C12 样本保留为失败证据，不计入后续三次连续通过。
+
+## 2026-07-31：Moderator Attempt schema 必须同时覆盖迁移与 fresh install
+
+### 状态
+
+已修复并纳入后端权威门禁；由阶段四最终复跑的空数据库 Relay E2E 发现。
+
+### 问题
+
+迁移 `0031_meeting_v1_moderator_attempts.sql` 已完整定义主持人乐观判断所需的配置列、
+Candidate eligibility、DecisionAttempt、RetryTicket 和外键，但仓库的 desired-state
+`schema/schema.sql` 没有同步。brownfield 数据库通过 migration 升级后可以工作，直接应用
+desired schema 的 fresh install 则会在 V1 Create 时因
+`meeting_baton_config.moderator_max_rejudgments` 不存在而返回 HTTP 500。
+
+### 新决策
+
+1. migration 与 `schema/schema.sql` 都是受支持的安装路径，任何新增持久化协议状态都必须
+   同步维护；
+2. desired schema 现已包含 migration 0031 的全部最终结构，而不是只补发生错误的单个列；
+3. `buzz-db` 增加静态回归测试，固定关键列、Attempt/RetryTicket 表和循环外键必须出现在
+   desired schema；
+4. `just test-meeting-backend` 继续从空数据库应用 `schema/schema.sql` 并运行 V0/V1
+   Relay E2E，作为实际可执行的 fresh-install 门禁；
+5. Postgres Meeting 单测共享隔离数据库时，测试 sweeper 必须扫完该测试进程创建的 due
+   Session，并按目标 Session 的终态断言，不能让前序测试占用小批次后误报失败。生产
+   sweeper 的 batch limit 与行为不变。
+
+### 验证
+
+- 全新数据库成功创建 68 张表，并包含
+  `meeting_moderator_decision_attempts`、`meeting_moderator_retry_tickets` 及新增列/外键；
+- 同一空库按顺序运行 V0、V1 lifecycle E2E，2/2 通过；
+- 完整 `just test-meeting-backend` 通过：ACP 685、Relay Meeting 27、Postgres Meeting
+  50，以及全部 Meeting lifecycle/floor/baton/rollout/revocation E2E 均无失败。
+
+## 2026-07-31：Agent Offer 验收区分可受理 ACK 与可恢复容量 Decline
+
+### 状态
+
+已确认并纳入真实 Codex 规模验收门禁；由 C10 qualification 的主持判断与 Human 定向
+Handoff 并发样本发现。
+
+### 问题
+
+Meeting V1 已明确规定 Moderator Decision 不因会议状态变化被物理取消。若 Human 在主持
+Agent 正进行不可中断判断时发言，并把下一轮定向交给同一个 Agent，新的 Offer 会与该
+Runtime 当前占用的物理 turn slot 发生短暂冲突。
+
+ACP 按既有容量策略确定性 Decline，Relay 接受签名 Decline，并把原 Handoff 保持为 open；
+主持判断自然结束后，主持人可以重新选择该 Handoff，目标随后 ACK、获得 Grant 并完成
+回答。这是非抢占语义的正常恢复路径，不是 ACK 提交失败。
+
+原规模 Runner 把所有 `state <> acked` 的 Agent Offer 都判为硬失败，因此会把上述完整恢复
+误报为协议故障。
+
+### 新决策
+
+1. 可受理的 Agent Offer 仍必须不调用 LLM，并在默认 5 秒窗口内 ACK；
+2. 当 Agent Runtime 正被不可中断主持判断或已经保留的 Agent turn 占用时，可以确定性
+   Decline，不能为了 ACK 抢占或取消正在运行的主持判断；
+3. 可恢复 Decline 必须同时满足：
+   - Decline 事件已被 Relay 接受，并持久化 `response_event_id`；
+   - `response_reason` 只能是 Harness 定义的受控容量原因；
+   - 原 SpeechIntent 最终进入 `consumed`，或原 Directed Handoff 最终进入 `answered`；
+4. Offer timeout、未确认提交、任意其他 Decline 原因，以及源对象未完成，仍是
+   qualification 硬失败；
+5. Runner 必须单独记录 `agent_offer_declines` 和
+   `recovered_agent_offer_declines`，并保存逐 Offer 的状态、原因与源对象终态证据；
+6. 该规则不改变 Relay 的唯一 Offer/Grant、deadline 或 holder 校验，也不允许自动重放
+   Decline 的旧 Offer。后续机会仍由新的 canonical 主持选择形成。
+
+### 验证
+
+C10 真实 Codex 样本观察到一次上述竞态：第一次 Offer 被目标主持 Agent 显式 Decline，
+原 Handoff 保持有效；主持判断自然结束后，该 Handoff 被重新选择并回答。修正后的门禁
+得到 `decline=1 / recovered=1 / failed=0`，同时 C10 的 10 个 Agent 全部完成两次
+canonical speech，协议、运行时与结构化门禁均为 0。
+
 ## 2026-07-30：主持人判断改为候选批次上的乐观并发
 
 ### 状态

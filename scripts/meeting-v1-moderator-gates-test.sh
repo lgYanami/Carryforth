@@ -141,4 +141,47 @@ fixture |
     )
   ' >/dev/null
 
+{
+  fixture
+  jq -nc '{
+    seq: 12,
+    kind: "meeting_v1_progress",
+    acceptanceRole: "m1-agent1",
+    payload: {outcome: "uncertain"}
+  }'
+} | evaluate |
+  jq -e '
+    .passed == false
+    and (.failed_gates | index("meeting_action_uncertain_absent") != null)
+  ' >/dev/null
+
+{
+  fixture
+  jq -nc '{
+    seq: 12,
+    kind: "meeting_v1_offer_decision",
+    acceptanceRole: "m1-agent1",
+    payload: {submission: "uncertain"}
+  }'
+} | evaluate |
+  jq -e '
+    .passed == false
+    and (.failed_gates | index("meeting_action_uncertain_absent") != null)
+  ' >/dev/null
+
+fixture |
+  jq -c '
+    if .kind == "meeting_v1_moderator_action_submitted"
+    then
+      .payload.outcome = "rejected"
+      | .payload.rejection_code = "stale_moderator_revision"
+    else .
+    end
+  ' |
+  evaluate |
+  jq -e '
+    .passed == true
+    and (.failed_gates | index("meeting_action_uncertain_absent") == null)
+  ' >/dev/null
+
 printf 'Meeting V1 Moderator hard-gate fixtures passed\n'

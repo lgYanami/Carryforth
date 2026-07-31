@@ -282,7 +282,9 @@ Host 创建 Meeting，并把另一个 Agent 设为 moderator，以同时验证 c
 3. 多个 Participant Agent 异步形成 Intent，且同一 Agent 没有重复 pending Intent；
 4. Moderator Agent 在真实 `max` 延迟下选择一个 Intent，并合理 defer 或 reject 其他
    Intent；
-5. Agent Offer 不调用 LLM 即 ACK，且在默认 profile 的 5 秒内进入 Grant；
+5. 可受理的 Agent Offer 不调用 LLM 即 ACK，且在默认 profile 的 5 秒内进入 Grant；若
+   Offer 与同一 Runtime 中不可中断的主持判断发生资源冲突，Agent 必须确定性 Decline，
+   Relay 必须接受该签名响应，并保留原 Intent/Handoff 供后续重新选择；
 6. 获 Grant 的 Agent 调用工具读取证据，持续发送 Progress，并在默认 profile 的本地
    270 秒预算内 SAY 或 YIELD；
 7. 发言携带明确目标和原因的 directed Handoff，目标 Agent 连贯回应；
@@ -438,7 +440,9 @@ Moderator 额外评估：
 - 指定 model/effort 证据完整，配置不匹配为 0；
 - State 中冻结的 BatonConfig 与 run manifest 的 timing profile 完全一致；
 - 双 Offer、双 Grant、非 holder speech、revision 缺口和历史分叉均为 0；
-- 默认 profile 的健康场景中 Agent Offer 100% 在 5 秒内 ACK；
+- 默认 profile 的健康场景中，可受理 Agent Offer 100% 在 5 秒内 ACK；因不可中断主持
+  判断或已保留 Agent turn 导致的显式容量 Decline，必须由 Relay 接受、携带受控原因，
+  且原 Intent/Handoff 随后完成；Offer timeout、静默丢失和未恢复 Decline 均为 0；
 - 默认 profile 的健康场景中 Moderator 100% 在 Harness 本地约 165 秒预算内形成合法决策；
 - 默认 profile 的健康场景中 Grant 100% 在 Harness 本地约 270 秒预算内 SAY/YIELD；
 - 迟到模型结果形成 canonical event 的数量为 0；

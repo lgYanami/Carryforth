@@ -45,6 +45,7 @@ run_scenario() {
   local status
   local log_path
   local scenario_slug
+  local sample_dir
 
   normalized="$(normalize_scenario "$requested")"
   scenario_slug="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
@@ -67,6 +68,32 @@ run_scenario() {
       2>&1 | tee "$log_path"
     status="${PIPESTATUS[0]}"
     set -e
+    if [[ "$status" -eq 0 ]]; then
+      sample_dir="$(
+        LC_ALL=C sed -n 's/^\[[^]]*\] artifacts: //p' "$log_path" | tail -1
+      )"
+      case "$sample_dir" in
+        "$artifact_root"/*)
+          ;;
+        *)
+          echo "$normalized returned success without an in-scope artifact path" >&2
+          status=1
+          ;;
+      esac
+      if [[ "$status" -eq 0 ]] &&
+        { ! rg -q '^\[[^]]+\] PASS: .* qualification sample completed$' "$log_path" ||
+          [[ ! -f "$sample_dir/manifest.json" ]] ||
+          ! jq -e '
+            .result == "pass"
+            and .protocol_failures == 0
+            and .runtime_anomalies == 0
+            and .moderator_gate_failures == 0
+            and .scenario_gate_failures == 0
+          ' "$sample_dir/manifest.json" >/dev/null; }; then
+        echo "$normalized returned success without a complete passing sample manifest" >&2
+        status=1
+      fi
+    fi
     printf '%s\t%s\t%s\t%s\n' \
       "$normalized" "$acquisition" "$status" "$log_path" \
       >>"$orchestration_dir/attempts.tsv"
@@ -119,12 +146,20 @@ jq -Rn '
     exit_status: (.[2] | tonumber),
     log: .[3]
   }] as $attempts
+  | ([ $attempts[].scenario ] | unique) as $scenarios
   | {
-      passed: all($attempts[]; .exit_status == 0 or .exit_status == 3)
-        and ([ $attempts[].scenario ] | unique
-          | all(.[] as $scenario;
-              any($attempts[];
-                  .scenario == $scenario and .exit_status == 0))),
+      passed: (
+        all($attempts[]; .exit_status == 0 or .exit_status == 3)
+        and
+        all(
+          $scenarios[];
+          . as $scenario
+          | any(
+              $attempts[];
+              .scenario == $scenario and .exit_status == 0
+            )
+        )
+      ),
       attempts: $attempts
     }
 ' <"$orchestration_dir/attempts.tsv" >"$orchestration_dir/manifest.json"
