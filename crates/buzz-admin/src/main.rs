@@ -89,7 +89,7 @@ enum Command {
         #[command(subcommand)]
         command: project_view::ProjectViewCommand,
     },
-    /// Inspect Project Document schema and signer readiness (read-only in Stage 1).
+    /// Bootstrap, inspect, verify, enable, or disable Project Document.
     ProjectDocument {
         #[command(subcommand)]
         command: project_document::ProjectDocumentCommand,

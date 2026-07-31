@@ -197,6 +197,54 @@ pub fn read_file_or_stdin(value: &str) -> Result<String, CliError> {
     }
 }
 
+/// Read a UTF-8 file or stdin without ever buffering more than `limit + 1`
+/// bytes. File metadata is checked first for a fast rejection, then the same
+/// bounded read is still used so a concurrent file growth cannot bypass the
+/// limit.
+pub fn read_bounded_file_or_stdin(value: &str, limit: usize) -> Result<String, CliError> {
+    use std::io::Read as _;
+
+    let read_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| CliError::Other("bounded input limit overflow".to_owned()))?;
+    let read_limit_u64 = u64::try_from(read_limit)
+        .map_err(|_| CliError::Other("bounded input limit does not fit u64".to_owned()))?;
+    let limit_u64 = u64::try_from(limit)
+        .map_err(|_| CliError::Other("bounded input limit does not fit u64".to_owned()))?;
+    let mut bytes = Vec::with_capacity(read_limit.min(64 * 1024));
+    if value == "-" {
+        std::io::stdin()
+            .lock()
+            .take(read_limit_u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| CliError::Other(format!("failed to read stdin: {error}")))?;
+    } else {
+        let file = std::fs::File::open(value)
+            .map_err(|error| CliError::Usage(format!("failed to read {value:?}: {error}")))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| CliError::Usage(format!("failed to inspect {value:?}: {error}")))?;
+        if !metadata.is_file() {
+            return Err(CliError::Usage(format!("{value:?} is not a regular file")));
+        }
+        if metadata.len() > limit_u64 {
+            return Err(CliError::Usage(format!(
+                "input {value:?} exceeds the {limit}-byte limit"
+            )));
+        }
+        file.take(read_limit_u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| CliError::Usage(format!("failed to read {value:?}: {error}")))?;
+    }
+    if bytes.len() > limit {
+        return Err(CliError::Usage(format!(
+            "input exceeds the {limit}-byte limit"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| CliError::Usage("bounded input must contain valid UTF-8".to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +550,22 @@ mod tests {
         // verbatim as if it were the patch content.
         let err = super::read_file_or_stdin("0001-does-not-exist.patch").unwrap_err();
         assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn bounded_file_reader_rejects_oversize_and_invalid_utf8() {
+        use std::io::Write as _;
+
+        let mut oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized.write_all(b"12345").unwrap();
+        let error =
+            super::read_bounded_file_or_stdin(oversized.path().to_str().unwrap(), 4).unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)));
+
+        let mut invalid = tempfile::NamedTempFile::new().unwrap();
+        invalid.write_all(&[0xff, 0xfe]).unwrap();
+        let error =
+            super::read_bounded_file_or_stdin(invalid.path().to_str().unwrap(), 4).unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)));
     }
 }

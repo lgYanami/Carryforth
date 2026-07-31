@@ -1,10 +1,9 @@
-//! Stage 1 Project Document flag-off security E2E.
+//! Project Document disabled-state security E2E.
 //!
-//! This deliberately does not exercise a public Document handler: Stage 1 has
-//! none. It proves that a normal member cannot submit either protocol side,
-//! that NIP-11 does not advertise the capability, and that even a projection
-//! row inserted behind the Relay cannot escape through exclusive, mixed,
-//! kindless, by-ID, COUNT, HTTP, or WebSocket reads.
+//! It proves that the Stage 2 kill switch rejects commands, removes NIP-11
+//! advertisement, and prevents even a projection row inserted behind the Relay
+//! from escaping through exclusive, mixed, kindless, by-ID, COUNT, HTTP, or
+//! WebSocket reads.
 
 use std::time::Duration;
 
@@ -197,7 +196,7 @@ fn create_command_event(keys: &Keys) -> Event {
         0,
         DocumentCommandRequest::Create {
             document_id: Uuid::new_v4(),
-            title: "Stage 1 remains private".to_owned(),
+            title: "Disabled remains private".to_owned(),
             summary: None,
             content_markdown: "# Not publicly routable".to_owned(),
         },
@@ -210,7 +209,7 @@ fn create_command_event(keys: &Keys) -> Event {
 
 #[tokio::test]
 #[ignore = "requires isolated Relay, PostgreSQL, Redis, and stable Relay signer"]
-async fn project_document_stage_one_is_unadvertised_unwritable_and_unreadable() {
+async fn project_document_disabled_is_unadvertised_unwritable_and_unreadable() {
     let context = setup().await;
     let http = Client::new();
 
@@ -228,7 +227,7 @@ async fn project_document_stage_one_is_unadvertised_unwritable_and_unreadable() 
             .is_none_or(|extensions| extensions
                 .iter()
                 .all(|value| value != "buzz-project-document-v1")),
-        "Stage 1 must not advertise Project Document: {info}"
+        "disabled state must not advertise Project Document: {info}"
     );
 
     let enabled: bool =
@@ -237,7 +236,7 @@ async fn project_document_stage_one_is_unadvertised_unwritable_and_unreadable() 
             .fetch_one(&context.pool)
             .await
             .expect("read Document feature flag");
-    assert!(!enabled, "Stage 1 Community flag must stay false");
+    assert!(!enabled, "disabled Community flag must stay false");
     let canonical_rows: i64 = sqlx::query_scalar(
         "SELECT \
            (SELECT count(*) FROM project_document_state WHERE community_id = $1) + \

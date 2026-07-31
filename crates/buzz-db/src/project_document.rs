@@ -1,15 +1,16 @@
 //! Project Document canonical state, immutable history, and restricted writes.
 //!
-//! Stage 1 deliberately exposes no Relay routing. The only mutation seam is a
-//! caller-owned transaction that holds the shared Community advisory lock,
-//! re-derives the pure transition, verifies the complete signed projection
-//! bundle, and commits command/event/history/pointers atomically.
+//! Relay and operator adapters enter through restricted coordinators that hold
+//! the shared Community advisory lock, re-derive pure transitions, verify full
+//! signed projection bundles, and commit command/event/history/pointers
+//! atomically.
 
+use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{
     KIND_PROJECT_DOCUMENT_COMMAND, KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
     KIND_PROJECT_DOCUMENT_REVISION,
 };
-use buzz_core::{CommunityId, EventId, PublicKey};
+use buzz_core::{CommunityId, EventId, PublicKey, StoredEvent};
 use buzz_project_document::{
     reduce_document, CurrentDocument, DocumentAttribution, DocumentCatalog, DocumentChangeContext,
     DocumentCommandRequest, DocumentError, DocumentRevision, DocumentState, DocumentTransition,
@@ -36,6 +37,9 @@ pub enum ProjectDocumentWriteError {
     /// SQL execution failed.
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    /// Tamper-evident control audit append failed.
+    #[error(transparent)]
+    Audit(#[from] buzz_audit::AuditError),
     /// The pure Project Document kernel rejected the transition.
     #[error(transparent)]
     Domain(#[from] DocumentError),
@@ -119,6 +123,94 @@ pub struct ProjectDocumentCommitOutcome {
     pub replayed: bool,
 }
 
+/// Result of the security-first receipt lookup for one signed command.
+///
+/// A replay is returned before the caller loads the current Markdown body or
+/// attempts to reduce the command against a later canonical revision. This is
+/// particularly important for an accepted Create: reducing that old command
+/// against current state would incorrectly report `id_exists` instead of the
+/// durable receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectDocumentPrepareOutcome {
+    /// The exact signed command was already accepted.
+    Replayed(ProjectDocumentReceipt),
+    /// No receipt exists; the caller may load the target and prepare a commit.
+    New,
+}
+
+/// One bounded page of trusted Relay-signed Document projections.
+#[derive(Debug, Clone)]
+pub struct ProjectDocumentProjectionPage {
+    /// Events in canonical keyset order.
+    pub events: Vec<StoredEvent>,
+}
+
+/// Closed snapshot request for one page of active Document heads.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectDocumentActiveHeadsPageRequest<'a> {
+    /// Host-derived Community identity.
+    pub community_id: CommunityId,
+    /// Stable Relay signer advertised for this Community.
+    pub expected_pubkey: &'a PublicKey,
+    /// Authenticated principal re-authorized under the shared lock.
+    pub reader_pubkey: &'a [u8],
+    /// Fixed positive projection generation.
+    pub projection_generation: u64,
+    /// Fixed catalog observation revision.
+    pub catalog_revision: u64,
+    /// Exclusive Document UUID cursor.
+    pub after_document_id: Option<Uuid>,
+    /// Page size in the closed `1..=500` range.
+    pub limit: u16,
+}
+
+/// Closed snapshot request for one page of immutable Document history.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectDocumentHistoryPageRequest<'a> {
+    /// Host-derived Community identity.
+    pub community_id: CommunityId,
+    /// Stable Relay signer advertised for this Community.
+    pub expected_pubkey: &'a PublicKey,
+    /// Authenticated principal re-authorized under the shared lock.
+    pub reader_pubkey: &'a [u8],
+    /// Fixed positive projection generation.
+    pub projection_generation: u64,
+    /// Document whose immutable revisions are requested.
+    pub document_id: Uuid,
+    /// Inclusive revision ceiling pinned by the caller's trusted head.
+    pub max_document_revision: u64,
+    /// Exclusive descending revision cursor.
+    pub before_revision: Option<u64>,
+    /// Page size in the closed `1..=50` range.
+    pub limit: u16,
+}
+
+/// Failures from generation- and catalog-bound Document reads.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectDocumentReadError {
+    /// The supplied snapshot observation is no longer current.
+    #[error("Project Document snapshot changed")]
+    Conflict,
+    /// The capability, signer, schema, or projection state is unavailable.
+    #[error("Project Document is unavailable")]
+    Unavailable,
+    /// The principal is no longer a current eligible Community reader.
+    #[error("Project Document reader is no longer authorized")]
+    Restricted,
+    /// A cursor or page limit is outside the closed v1 contract.
+    #[error("invalid Project Document page request: {0}")]
+    InvalidRequest(String),
+    /// Database abstraction failed.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// SQL execution failed.
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    /// Canonical pointers did not reconstruct the expected event page.
+    #[error("inconsistent Project Document projection page: {0}")]
+    Inconsistent(String),
+}
+
 /// Signed, revision-zero empty catalog prepared for disabled-only bootstrap.
 #[derive(Debug, Clone)]
 pub struct PreparedProjectDocumentBootstrap {
@@ -137,7 +229,7 @@ pub struct ProjectDocumentFeatureStatus {
     pub host: String,
     /// Whether the Community is archived.
     pub archived: bool,
-    /// Capability flag. Stage 1 has no API that can turn this on.
+    /// Per-Community capability flag.
     pub enabled: bool,
     /// Current Project View schema version.
     pub project_view_schema_version: i16,
@@ -251,6 +343,59 @@ impl Db {
         Ok(stable_signer_configured && self.project_document_schema_ready().await?)
     }
 
+    /// Return a PostgreSQL-derived timestamp for a signed empty-catalog
+    /// bootstrap. The caller may sign outside the transaction, but it never
+    /// substitutes a client clock for canonical catalog time.
+    pub async fn project_document_canonical_now(&self) -> crate::Result<DateTime<Utc>> {
+        Ok(sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// Return whether the capability is enabled and every signer/projection
+    /// readiness condition currently passes.
+    pub async fn project_document_capability_ready(
+        &self,
+        community_id: CommunityId,
+        expected_pubkey: &PublicKey,
+    ) -> crate::Result<bool> {
+        let Some(status) = self.project_document_status(community_id).await? else {
+            return Ok(false);
+        };
+        if status.archived
+            || !status.enabled
+            || !matches!(status.project_view_schema_version, 2 | 3)
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .project_document_preflight(community_id, expected_pubkey)
+            .await?
+            .ready)
+    }
+
+    /// Document readers use the same current Human / managed-owner and active
+    /// ban policy as Project View. Timeouts intentionally remain write-only
+    /// restrictions.
+    pub async fn project_document_authorized_pubkey(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) -> crate::Result<bool> {
+        self.project_view_authorized_pubkey(community_id, pubkey)
+            .await
+    }
+
+    /// Set-based form used by local and Redis fan-out recipient filtering.
+    pub async fn project_document_authorized_pubkeys(
+        &self,
+        community_id: CommunityId,
+        pubkeys: &[Vec<u8>],
+    ) -> crate::Result<std::collections::HashSet<Vec<u8>>> {
+        self.project_view_authorized_pubkeys(community_id, pubkeys)
+            .await
+    }
+
     /// List status for every Community in stable UUID order.
     pub async fn list_project_document_statuses(
         &self,
@@ -356,8 +501,9 @@ impl Db {
             .as_deref()
             .is_some_and(|bytes| bytes == expected_pubkey.as_bytes());
         let projection_parity = if signer_matches {
+            let mut connection = self.pool.acquire().await?;
             document_projection_parity(
-                &self.pool,
+                &mut connection,
                 community_id,
                 expected_pubkey,
                 meta_event_id.as_deref(),
@@ -383,10 +529,258 @@ impl Db {
         })
     }
 
+    /// Enable or disable one Community under the shared Community/Project
+    /// writer lock. Disable is always fail-closed and preserves every canonical
+    /// row and event. Enable requires schema 2/3, a stable signer, bootstrap,
+    /// and full pointer/projection parity.
+    pub async fn set_project_document_enabled_checked(
+        &self,
+        community_id: CommunityId,
+        enabled: bool,
+        expected_pubkey: Option<&PublicKey>,
+    ) -> ProjectDocumentWriteResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        let row = sqlx::query(
+            "SELECT archived_at IS NULL AS active, project_view_schema_version \
+             FROM communities WHERE id = $1 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let active: bool = row.try_get("active")?;
+        let schema_version: i16 = row.try_get("project_view_schema_version")?;
+        if !active {
+            return Ok(false);
+        }
+        if enabled {
+            let expected_pubkey = expected_pubkey.ok_or_else(|| {
+                DbError::InvalidData(
+                    "a stable Relay signer is required to enable Project Document".to_owned(),
+                )
+            })?;
+            if !matches!(schema_version, 2 | 3) {
+                return Err(DbError::InvalidData(
+                    "Project Document requires Project View schema 2 or 3".to_owned(),
+                )
+                .into());
+            }
+            let state = sqlx::query(
+                "SELECT projection_pubkey, meta_projection_event_id, active_document_count \
+                 FROM project_document_state WHERE community_id = $1 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(state) = state else {
+                return Err(DbError::InvalidData(
+                    "Project Document catalog must be bootstrapped before enable".to_owned(),
+                )
+                .into());
+            };
+            let projection_pubkey: Vec<u8> = state.try_get("projection_pubkey")?;
+            if projection_pubkey.as_slice() != expected_pubkey.as_bytes() {
+                return Err(DbError::InvalidData(
+                    "Project Document stable signer does not match bootstrap state".to_owned(),
+                )
+                .into());
+            }
+            sqlx::query("SELECT project_document_validate_community($1)")
+                .bind(community_id.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+            let meta_event_id: Vec<u8> = state.try_get("meta_projection_event_id")?;
+            let active_count: i64 = state.try_get("active_document_count")?;
+            // The exclusive advisory lock prevents canonical writers while the
+            // full cryptographic parser walks committed event rows.
+            if !document_projection_parity(
+                &mut tx,
+                community_id,
+                expected_pubkey,
+                Some(&meta_event_id),
+                Some(active_count),
+            )
+            .await?
+            {
+                return Err(DbError::InvalidData(
+                    "Project Document canonical/projection parity is not ready".to_owned(),
+                )
+                .into());
+            }
+        }
+        let result =
+            sqlx::query("UPDATE communities SET project_document_enabled = $2 WHERE id = $1")
+                .bind(community_id.as_uuid())
+                .bind(enabled)
+                .execute(&mut *tx)
+                .await?;
+        if result.rows_affected() == 1 {
+            append_document_control_audit(
+                &mut tx,
+                community_id,
+                if enabled { "enable" } else { "disable" },
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Read one stable active-head page under the Community shared lock.
+    pub async fn project_document_active_heads_page(
+        &self,
+        request: ProjectDocumentActiveHeadsPageRequest<'_>,
+    ) -> Result<ProjectDocumentProjectionPage, ProjectDocumentReadError> {
+        let ProjectDocumentActiveHeadsPageRequest {
+            community_id,
+            expected_pubkey,
+            reader_pubkey,
+            projection_generation,
+            catalog_revision,
+            after_document_id,
+            limit,
+        } = request;
+        if !(1..=500).contains(&limit) {
+            return Err(ProjectDocumentReadError::InvalidRequest(
+                "active-head limit must be in 1..=500".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
+        require_document_reader_in_tx(&mut tx, community_id, reader_pubkey).await?;
+        require_document_read_state_in_tx(
+            &mut tx,
+            community_id,
+            expected_pubkey,
+            projection_generation,
+            Some(catalog_revision),
+        )
+        .await?;
+        let rows = sqlx::query(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, \
+                    e.received_at, e.channel_id \
+             FROM project_documents d \
+             JOIN events e ON e.community_id = d.community_id \
+                          AND e.id = d.current_head_event_id \
+             WHERE d.community_id = $1 AND d.state = 'active' \
+               AND ($2::uuid IS NULL OR d.document_id > $2) \
+               AND e.deleted_at IS NULL AND e.kind = $3 AND e.pubkey = $4 \
+             ORDER BY d.document_id ASC LIMIT $5",
+        )
+        .bind(community_id.as_uuid())
+        .bind(after_document_id)
+        .bind(KIND_PROJECT_DOCUMENT_HEAD as i32)
+        .bind(expected_pubkey.as_bytes())
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        let events = rows
+            .into_iter()
+            .map(crate::event::row_to_stored_event)
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ProjectDocumentReadError::Inconsistent(
+                    "an active head event could not be reconstructed".to_owned(),
+                )
+            })?;
+        tx.commit().await?;
+        Ok(ProjectDocumentProjectionPage { events })
+    }
+
+    /// Read one immutable revision-history page under the Community shared
+    /// lock. Newer concurrent revisions are excluded by the caller-fixed max.
+    pub async fn project_document_history_page(
+        &self,
+        request: ProjectDocumentHistoryPageRequest<'_>,
+    ) -> Result<ProjectDocumentProjectionPage, ProjectDocumentReadError> {
+        let ProjectDocumentHistoryPageRequest {
+            community_id,
+            expected_pubkey,
+            reader_pubkey,
+            projection_generation,
+            document_id,
+            max_document_revision,
+            before_revision,
+            limit,
+        } = request;
+        if !(1..=50).contains(&limit)
+            || max_document_revision == 0
+            || max_document_revision > MAX_SAFE_REVISION
+            || before_revision.is_some_and(|value| value == 0 || value > MAX_SAFE_REVISION)
+        {
+            return Err(ProjectDocumentReadError::InvalidRequest(
+                "history revision or limit is outside the v1 range".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
+        require_document_reader_in_tx(&mut tx, community_id, reader_pubkey).await?;
+        require_document_read_state_in_tx(
+            &mut tx,
+            community_id,
+            expected_pubkey,
+            projection_generation,
+            None,
+        )
+        .await?;
+        let rows = sqlx::query(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, \
+                    e.received_at, e.channel_id \
+             FROM project_document_revisions r \
+             JOIN events e ON e.community_id = r.community_id \
+                          AND e.id = r.projection_event_id \
+             WHERE r.community_id = $1 AND r.document_id = $2 \
+               AND r.document_revision <= $3 \
+               AND ($4::bigint IS NULL OR r.document_revision < $4) \
+               AND r.projection_generation = $5 \
+               AND e.deleted_at IS NULL AND e.kind = $6 AND e.pubkey = $7 \
+             ORDER BY r.document_revision DESC LIMIT $8",
+        )
+        .bind(community_id.as_uuid())
+        .bind(document_id)
+        .bind(
+            revision_to_i64(max_document_revision, "max_document_revision")
+                .map_err(|error| ProjectDocumentReadError::InvalidRequest(error.to_string()))?,
+        )
+        .bind(
+            before_revision
+                .map(|value| revision_to_i64(value, "before_revision"))
+                .transpose()
+                .map_err(|error| ProjectDocumentReadError::InvalidRequest(error.to_string()))?,
+        )
+        .bind(
+            revision_to_i64(projection_generation, "projection_generation")
+                .map_err(|error| ProjectDocumentReadError::InvalidRequest(error.to_string()))?,
+        )
+        .bind(KIND_PROJECT_DOCUMENT_REVISION as i32)
+        .bind(expected_pubkey.as_bytes())
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        let events = rows
+            .into_iter()
+            .map(crate::event::row_to_stored_event)
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ProjectDocumentReadError::Inconsistent(
+                    "a revision event could not be reconstructed".to_owned(),
+                )
+            })?;
+        tx.commit().await?;
+        Ok(ProjectDocumentProjectionPage { events })
+    }
+
     /// Commit a signed revision-zero reset catalog while the capability is off.
     ///
-    /// No admin command invokes this in stage 1; it exists for isolated DB
-    /// builders/tests and the later controlled enable workflow.
+    /// The controlled admin workflow invokes this only while the capability is
+    /// disabled; isolated DB tests also use it directly.
     pub async fn bootstrap_empty_project_document_catalog(
         &self,
         prepared: PreparedProjectDocumentBootstrap,
@@ -454,6 +848,7 @@ impl Db {
         .bind(prepared.catalog.initialized_at())
         .execute(&mut *tx)
         .await?;
+        append_document_control_audit(&mut tx, community_id, "bootstrap").await?;
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
             .execute(&mut *tx)
             .await?;
@@ -494,11 +889,86 @@ impl Db {
     }
 }
 
+async fn append_document_control_audit(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    operation: &'static str,
+) -> ProjectDocumentWriteResult<()> {
+    buzz_audit::append_in_transaction(
+        tx,
+        NewAuditEntry {
+            community_id,
+            action: AuditAction::ProjectDocumentControl,
+            actor_pubkey: None,
+            object_id: Some(community_id.to_string()),
+            detail: serde_json::json!({ "operation": operation }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 impl ProjectDocumentWriteTx {
     /// Explicitly roll back and release the Community lock.
     pub async fn rollback(self) -> ProjectDocumentWriteResult<()> {
         self.tx.rollback().await?;
         Ok(())
+    }
+
+    /// Revalidate signer and actor authority, then look up a durable receipt
+    /// before any current Markdown body is loaded.
+    pub async fn prepare_command(
+        &mut self,
+        command_event: &Event,
+        command: &ProjectDocumentCommand,
+    ) -> ProjectDocumentWriteResult<ProjectDocumentPrepareOutcome> {
+        let parsed = parse_document_command(command_event)
+            .map_err(|error| ProjectDocumentWriteError::InvalidCommit(error.to_string()))?;
+        if &parsed != command {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "command event does not carry the supplied strict command".to_owned(),
+            ));
+        }
+        let signer: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT projection_pubkey FROM project_document_state \
+             WHERE community_id = $1 FOR UPDATE",
+        )
+        .bind(self.community_id.as_uuid())
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        if signer.as_deref() != Some(self.expected_projection_pubkey.as_bytes()) {
+            return Err(ProjectDocumentWriteError::Unavailable {
+                community_id: self.community_id,
+            });
+        }
+        sqlx::query("SELECT project_document_validate_community($1)")
+            .bind(self.community_id.as_uuid())
+            .execute(&mut *self.tx)
+            .await?;
+        validate_actor_in_tx(
+            &mut self.tx,
+            self.community_id,
+            command_event.pubkey,
+            command.acting_assignment_id,
+            command.runtime_fence,
+        )
+        .await?;
+        if let Some(receipt) =
+            find_receipt(&mut self.tx, self.community_id, command_event.id.as_bytes()).await?
+        {
+            if receipt.actor != command_event.pubkey
+                || receipt.operation != command.operation()
+                || receipt.document_id != command.document_id()
+                || receipt.expected_document_revision != command.expected_document_revision
+                || receipt.acting_assignment_id != command.acting_assignment_id
+            {
+                return Err(ProjectDocumentWriteError::InvalidCommit(
+                    "stored receipt does not match the replayed signed command".to_owned(),
+                ));
+            }
+            return Ok(ProjectDocumentPrepareOutcome::Replayed(receipt));
+        }
+        Ok(ProjectDocumentPrepareOutcome::New)
     }
 
     /// Lock and reconstruct the catalog plus one exact current Document target.
@@ -830,6 +1300,118 @@ impl ProjectDocumentWriteTx {
             replayed: false,
         })
     }
+}
+
+async fn require_document_reader_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    reader_pubkey: &[u8],
+) -> Result<(), ProjectDocumentReadError> {
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 \
+             FROM (SELECT $2::bytea AS pubkey) requested \
+             LEFT JOIN users actor \
+               ON actor.community_id = $1 AND actor.pubkey = requested.pubkey \
+             WHERE ( \
+                 ( \
+                     actor.agent_owner_pubkey IS NULL \
+                     AND EXISTS ( \
+                         SELECT 1 FROM relay_members direct_member \
+                         WHERE direct_member.community_id = $1 \
+                           AND direct_member.pubkey = encode(requested.pubkey, 'hex') \
+                     ) \
+                 ) \
+                 OR ( \
+                     actor.agent_owner_pubkey IS NOT NULL \
+                     AND EXISTS ( \
+                         SELECT 1 FROM relay_members owner_member \
+                         WHERE owner_member.community_id = $1 \
+                           AND owner_member.pubkey = encode(actor.agent_owner_pubkey, 'hex') \
+                     ) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM community_bans owner_ban \
+                         WHERE owner_ban.community_id = $1 \
+                           AND owner_ban.pubkey = actor.agent_owner_pubkey \
+                           AND owner_ban.banned \
+                           AND (owner_ban.ban_expires_at IS NULL \
+                                OR owner_ban.ban_expires_at > clock_timestamp()) \
+                     ) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM users owner_actor \
+                         WHERE owner_actor.community_id = $1 \
+                           AND owner_actor.pubkey = actor.agent_owner_pubkey \
+                           AND owner_actor.agent_owner_pubkey IS NOT NULL \
+                     ) \
+                 ) \
+             ) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM community_bans actor_ban \
+                 WHERE actor_ban.community_id = $1 \
+                   AND actor_ban.pubkey = requested.pubkey \
+                   AND actor_ban.banned \
+                   AND (actor_ban.ban_expires_at IS NULL \
+                        OR actor_ban.ban_expires_at > clock_timestamp()) \
+             ) \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(reader_pubkey)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !authorized {
+        return Err(ProjectDocumentReadError::Restricted);
+    }
+    Ok(())
+}
+
+async fn require_document_read_state_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    expected_pubkey: &PublicKey,
+    projection_generation: u64,
+    catalog_revision: Option<u64>,
+) -> Result<(), ProjectDocumentReadError> {
+    let row = sqlx::query(
+        "SELECT c.project_document_enabled, c.project_view_schema_version, \
+                s.projection_pubkey, s.projection_generation, s.catalog_revision \
+         FROM communities c \
+         LEFT JOIN project_document_state s ON s.community_id = c.id \
+         WHERE c.id = $1 AND c.archived_at IS NULL FOR SHARE OF c",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(ProjectDocumentReadError::Unavailable);
+    };
+    let enabled: bool = row.try_get("project_document_enabled")?;
+    let schema: i16 = row.try_get("project_view_schema_version")?;
+    let signer: Option<Vec<u8>> = row.try_get("projection_pubkey")?;
+    let generation: Option<i64> = row.try_get("projection_generation")?;
+    let revision: Option<i64> = row.try_get("catalog_revision")?;
+    if !enabled
+        || !matches!(schema, 2 | 3)
+        || signer.as_deref() != Some(expected_pubkey.as_bytes())
+        || generation.and_then(|value| u64::try_from(value).ok()) != Some(projection_generation)
+    {
+        return Err(ProjectDocumentReadError::Unavailable);
+    }
+    if catalog_revision.is_some()
+        && revision.and_then(|value| u64::try_from(value).ok()) != catalog_revision
+    {
+        return Err(ProjectDocumentReadError::Conflict);
+    }
+    sqlx::query("SELECT project_document_validate_community($1)")
+        .bind(community_id.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            ProjectDocumentReadError::Inconsistent(format!(
+                "canonical pointer validation failed: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 async fn validate_actor_in_tx(
@@ -1438,7 +2020,7 @@ fn db_positive_revision_db(value: i64, field: &str) -> crate::Result<u64> {
 }
 
 async fn document_projection_parity(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     community_id: CommunityId,
     expected_pubkey: &PublicKey,
     meta_event_id: Option<&[u8]>,
@@ -1455,7 +2037,7 @@ async fn document_projection_parity(
          FROM project_document_state WHERE community_id = $1",
     )
     .bind(community_id.as_uuid())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
     let Some(state) = state else {
         return Ok(false);
@@ -1463,7 +2045,7 @@ async fn document_projection_parity(
     let catalog_revision: i64 = state.try_get("catalog_revision")?;
     let generation: i64 = state.try_get("projection_generation")?;
     let updated_at: DateTime<Utc> = state.try_get("updated_at")?;
-    let meta = crate::event::get_event_by_id(pool, community_id, meta_event_id).await?;
+    let meta = project_document_event_by_id(connection, community_id, meta_event_id).await?;
     let Some(meta) = meta else {
         return Ok(false);
     };
@@ -1484,7 +2066,7 @@ async fn document_projection_parity(
          WHERE community_id = $1 AND state = 'active'",
     )
     .bind(community_id.as_uuid())
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
     if actual_active != active_count {
         return Ok(false);
@@ -1495,7 +2077,7 @@ async fn document_projection_parity(
          FROM project_documents WHERE community_id = $1 ORDER BY document_id",
     )
     .bind(community_id.as_uuid())
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     for row in rows {
         let document_id: Uuid = row.try_get("document_id")?;
@@ -1504,8 +2086,8 @@ async fn document_projection_parity(
         let source: Vec<u8> = row.try_get("current_source_change_id")?;
         let head_id: Vec<u8> = row.try_get("current_head_event_id")?;
         let revision_id: Vec<u8> = row.try_get("current_revision_event_id")?;
-        let head = crate::event::get_event_by_id(pool, community_id, &head_id).await?;
-        let revision = crate::event::get_event_by_id(pool, community_id, &revision_id).await?;
+        let head = project_document_event_by_id(connection, community_id, &head_id).await?;
+        let revision = project_document_event_by_id(connection, community_id, &revision_id).await?;
         let (Some(head), Some(revision)) = (head, revision) else {
             return Ok(false);
         };
@@ -1530,6 +2112,25 @@ async fn document_projection_parity(
         }
     }
     Ok(true)
+}
+
+async fn project_document_event_by_id(
+    connection: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    event_id: &[u8],
+) -> crate::Result<Option<StoredEvent>> {
+    let row = sqlx::query(
+        "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id \
+         FROM events WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    row.map(crate::event::row_to_stored_event)
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn verified_current_identity(

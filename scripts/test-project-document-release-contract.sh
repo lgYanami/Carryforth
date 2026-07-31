@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Static Stage 1 packaging/CI contract. Runtime behavior is covered by the
-# dedicated unit, DB/migration, and real Relay flag-off E2E gates.
+# Static Stage 2 packaging/CI contract. Runtime behavior is covered by the
+# dedicated unit, DB/migration, and disabled/enabled real Relay E2E gates.
 
 set -euo pipefail
 
@@ -46,19 +46,24 @@ require_literal "crates/buzz-acp/**" .github/workflows/ci.yml
 require_literal "crates/buzz-admin/**" .github/workflows/ci.yml
 require_literal "scripts/test-project-document-*.sh" .github/workflows/ci.yml
 require_literal "--test e2e_project_document_disabled" .github/workflows/ci.yml
+require_literal "--test e2e_project_document_enabled" .github/workflows/ci.yml
 require_literal "project-document-integration:" .github/workflows/ci.yml
 require_literal "just project-document-test-db" .github/workflows/ci.yml
 require_literal "just project-document-test-e2e" .github/workflows/ci.yml
 
-# Stage 1 is additive and flag-off. No operator enable/bootstrap command or
-# public CLI surface is allowed until the Stage 2 vertical slice.
+# The database default remains fail-closed while Stage 2 exposes only the
+# controlled operator lifecycle and the closed Agent-first CLI surface.
 require_literal "project_document_enabled BOOLEAN NOT NULL DEFAULT FALSE" schema/schema.sql
 require_literal "DEFAULT FALSE" migrations/0032_project_document.sql
-require_literal "unavailable:project_document:disabled" crates/buzz-relay/src/handlers/ingest.rs
-if rg -n "ProjectDocumentCommand::(Enable|Bootstrap)|enum DocumentsCmd|Cmd::Documents" \
-  crates/buzz-admin/src crates/buzz-cli/src; then
-  echo "Project Document release contract: Stage 1 must not expose enable/bootstrap or Document CLI" >&2
-  exit 1
-fi
+require_literal "unavailable:project_document:disabled" crates/buzz-relay/src/handlers/project_document.rs
+require_literal "e2e_project_document_enabled" scripts/test-project-document-e2e.sh
+require_literal "ProjectDocumentCommand::Bootstrap" crates/buzz-admin/src/project_document.rs
+require_literal "ProjectDocumentCommand::Enable" crates/buzz-admin/src/project_document.rs
+require_literal "ProjectDocumentCommand::Disable" crates/buzz-admin/src/project_document.rs
+require_literal "enum DocumentsCmd" crates/buzz-cli/src/lib.rs
+require_literal "Cmd::Documents" crates/buzz-cli/src/lib.rs
+require_literal "Project Documents are not a Secret Store" crates/buzz-cli/src/commands/documents.rs
+require_literal "buzz-project-document-v1" crates/buzz-relay/src/nip11.rs
+require_literal "synthetic Secret incident drill" scripts/test-project-document-e2e.sh
 
-echo "Project Document Stage 1 release contract passed."
+echo "Project Document Stage 2 release contract passed."

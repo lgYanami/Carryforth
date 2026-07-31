@@ -92,7 +92,7 @@ jobs:
               - 'crates/buzz-cli/**'
               - 'crates/buzz-acp/**'
               - 'crates/buzz-admin/**'
-              - 'crates/buzz-test-client/tests/e2e_project_document_disabled.rs'
+              - 'crates/buzz-test-client/tests/e2e_project_document_*.rs'
               - 'migrations/**'
               - 'schema/**'
               - 'scripts/test-project-document-*.sh'
@@ -405,6 +405,7 @@ jobs:
             --lib \
             --test e2e_event_reminder \
             --test e2e_project_document_disabled \
+            --test e2e_project_document_enabled \
             --test e2e_project_view \
             --archive-file target/ci/backend-integration-tests.tar.zst
       - name: Save relay artifacts cache
@@ -803,7 +804,7 @@ jobs:
         run: just project-view-test-e2e
 
   project-document-integration:
-    name: Project Document Stage 1 Integration
+    name: Project Document Stage 2 Integration
     runs-on: ubuntu-latest
     timeout-minutes: 35
     needs: [changes, desktop-e2e-relay]
@@ -832,7 +833,7 @@ jobs:
         env:
           PROJECT_DOCUMENT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
         run: just test-migrations
-      - name: Project Document real Relay flag-off security e2e
+      - name: Project Document disabled/enabled Relay and CLI e2e
         env:
           PROJECT_DOCUMENT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
           PROJECT_DOCUMENT_E2E_PROFILE: ci

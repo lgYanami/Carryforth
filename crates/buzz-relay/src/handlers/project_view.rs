@@ -43,7 +43,7 @@ const MUTATION_TAG: &str = "buzz-project-view-mutation";
 /// events, before the current member/ban lookup.
 #[must_use]
 pub(crate) fn credential_can_read(scopes: &[Scope], channel_ids: Option<&[uuid::Uuid]>) -> bool {
-    channel_ids.is_none() && (scopes.is_empty() || scopes.contains(&Scope::MessagesRead))
+    super::community_private::credential_can_read_community_private(scopes, channel_ids)
 }
 
 /// Return whether a Nostr filter can match at least one Project View kind.

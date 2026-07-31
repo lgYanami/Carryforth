@@ -15,6 +15,9 @@ use serde_json::Value;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
+use buzz_db::project_document::{
+    ProjectDocumentActiveHeadsPageRequest, ProjectDocumentHistoryPageRequest,
+};
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
 use crate::state::AppState;
@@ -271,6 +274,246 @@ enum ProjectViewPageRequest {
         after: Option<buzz_db::project_view::ProjectViewRoleHistoryCursor>,
         limit: u16,
     },
+}
+
+enum ProjectDocumentPageRequest {
+    ActiveHeads {
+        projection_generation: u64,
+        catalog_revision: u64,
+        after_document_id: Option<uuid::Uuid>,
+        limit: u16,
+    },
+    History {
+        projection_generation: u64,
+        document_id: uuid::Uuid,
+        max_document_revision: u64,
+        before_revision: Option<u64>,
+        limit: u16,
+    },
+}
+
+fn parse_project_document_page_request(
+    raw_filters: &[Value],
+    relay_pubkey: &nostr::PublicKey,
+) -> Result<Option<ProjectDocumentPageRequest>, (StatusCode, Json<Value>)> {
+    let extension_count = raw_filters
+        .iter()
+        .filter(|filter| filter.get("buzz_project_document").is_some())
+        .count();
+    if extension_count == 0 {
+        return Ok(None);
+    }
+    if extension_count != 1 || raw_filters.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_document pagination requires exactly one filter",
+        ));
+    }
+
+    let raw = raw_filters[0].as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_document filter must be a JSON object",
+        )
+    })?;
+    const ALLOWED_OUTER: &[&str] = &["kinds", "authors", "#t", "limit", "buzz_project_document"];
+    if raw.keys().any(|key| !ALLOWED_OUTER.contains(&key.as_str())) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_document pagination contains an unsupported outer field",
+        ));
+    }
+    let extension = raw
+        .get("buzz_project_document")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_document must be an object",
+            )
+        })?;
+    let scope = extension
+        .get("scope")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "buzz_project_document scope must be a string",
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or("active_heads");
+    let projection_generation =
+        project_document_safe_revision(extension, "projection_generation", false)?;
+
+    match scope {
+        "active_heads" => {
+            require_project_document_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_DOCUMENT_HEAD,
+                "buzz-project-document-head",
+            )?;
+            const ALLOWED: &[&str] = &[
+                "scope",
+                "projection_generation",
+                "catalog_revision",
+                "after_document_id",
+            ];
+            reject_project_document_extension_fields(extension, ALLOWED)?;
+            Ok(Some(ProjectDocumentPageRequest::ActiveHeads {
+                projection_generation,
+                catalog_revision: project_document_safe_revision(
+                    extension,
+                    "catalog_revision",
+                    true,
+                )?,
+                after_document_id: extension
+                    .get("after_document_id")
+                    .map(|value| project_document_uuid(value, "after_document_id"))
+                    .transpose()?,
+                limit: project_document_limit(raw, 100, 500)?,
+            }))
+        }
+        "history" => {
+            require_project_document_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_DOCUMENT_REVISION,
+                "buzz-project-document-revision",
+            )?;
+            const ALLOWED: &[&str] = &[
+                "scope",
+                "projection_generation",
+                "document_id",
+                "max_document_revision",
+                "before_revision",
+            ];
+            reject_project_document_extension_fields(extension, ALLOWED)?;
+            Ok(Some(ProjectDocumentPageRequest::History {
+                projection_generation,
+                document_id: extension
+                    .get("document_id")
+                    .ok_or_else(|| {
+                        api_error(
+                            StatusCode::BAD_REQUEST,
+                            "buzz_project_document document_id is required",
+                        )
+                    })
+                    .and_then(|value| project_document_uuid(value, "document_id"))?,
+                max_document_revision: project_document_safe_revision(
+                    extension,
+                    "max_document_revision",
+                    false,
+                )?,
+                before_revision: extension
+                    .get("before_revision")
+                    .map(|_| project_document_safe_revision(extension, "before_revision", false))
+                    .transpose()?,
+                limit: project_document_limit(raw, 20, 50)?,
+            }))
+        }
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_document scope is unsupported",
+        )),
+    }
+}
+
+fn require_project_document_outer_filter(
+    raw: &serde_json::Map<String, Value>,
+    relay_pubkey: &nostr::PublicKey,
+    kind: u32,
+    subtype: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if raw.get("kinds") != Some(&serde_json::json!([kind]))
+        || raw.get("#t") != Some(&serde_json::json!([subtype]))
+        || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_document pagination requires exact kinds, authors, and #t filters",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_project_document_extension_fields(
+    extension: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if extension.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_document contains an unsupported field",
+        ));
+    }
+    Ok(())
+}
+
+fn project_document_safe_revision(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    allow_zero: bool,
+) -> Result<u64, (StatusCode, Json<Value>)> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|value| {
+            (allow_zero || *value > 0) && *value <= buzz_project_document::MAX_SAFE_REVISION
+        })
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("buzz_project_document {field} is outside the supported range"),
+            )
+        })
+}
+
+fn project_document_limit(
+    raw: &serde_json::Map<String, Value>,
+    default: u16,
+    max: u16,
+) -> Result<u16, (StatusCode, Json<Value>)> {
+    match raw.get("limit") {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| (1..=max).contains(value))
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("buzz_project_document limit must be in 1..={max}"),
+                )
+            }),
+    }
+}
+
+fn project_document_uuid(
+    value: &Value,
+    field: &str,
+) -> Result<uuid::Uuid, (StatusCode, Json<Value>)> {
+    let raw = value.as_str().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_document {field} must be a canonical lowercase UUID"),
+        )
+    })?;
+    let parsed = raw.parse::<uuid::Uuid>().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_document {field} must be a canonical lowercase UUID"),
+        )
+    })?;
+    if parsed.to_string() != raw {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_document {field} must be a canonical lowercase UUID"),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_project_view_page_request(
@@ -1062,10 +1305,11 @@ fn event_in_accessible_channel(se: &buzz_core::StoredEvent, accessible: &[uuid::
     }
 }
 
-fn exclude_project_view_if_unauthorized(
+fn exclude_private_protocols_if_unauthorized(
     query: &mut buzz_db::EventQuery,
     filter: &nostr::Filter,
     project_view_read_allowed: bool,
+    project_document_read_allowed: bool,
 ) {
     if !project_view_read_allowed && crate::handlers::project_view::filter_can_match(filter) {
         query.excluded_kinds = Some(vec![
@@ -1074,7 +1318,11 @@ fn exclude_project_view_if_unauthorized(
             buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
         ]);
     }
-    crate::handlers::community_private::exclude_project_document_kinds(query, filter);
+    crate::handlers::community_private::exclude_project_document_kinds(
+        query,
+        filter,
+        project_document_read_allowed,
+    );
 }
 
 /// Hard cap on the `reason` field logged for a rejected `/events` request.
@@ -1499,10 +1747,52 @@ async fn query_events_authed(
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
-    if crate::handlers::community_private::filters_are_exclusively_project_document(&filters) {
+    let project_document_can_match = filters
+        .iter()
+        .any(crate::handlers::community_private::filter_can_match_project_document);
+    let project_document_exclusive =
+        crate::handlers::community_private::filters_are_exclusively_project_document(&filters);
+    let project_document_decision = if project_document_can_match {
+        crate::handlers::community_private::project_document_read_decision(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            &[],
+            None,
+        )
+        .await
+        .map_err(|_| internal_error("Project Document authorization lookup failed"))?
+    } else {
+        crate::handlers::community_private::ProjectDocumentReadDecision::Restricted
+    };
+    if project_document_exclusive {
+        match project_document_decision {
+            crate::handlers::community_private::ProjectDocumentReadDecision::Allowed => {}
+            crate::handlers::community_private::ProjectDocumentReadDecision::Restricted => {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted:project_document:membership_required",
+                ));
+            }
+            crate::handlers::community_private::ProjectDocumentReadDecision::Unavailable(
+                reason,
+            ) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("unavailable:project_document:{reason}"),
+                ));
+            }
+        }
+    }
+    let project_document_read_allowed = project_document_decision.allowed();
+    if project_document_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::community_private::filter_is_project_document_search)
+    {
         return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable:project_document:disabled",
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_document:search",
         ));
     }
 
@@ -1539,6 +1829,106 @@ async fn query_events_authed(
             StatusCode::BAD_REQUEST,
             "unsupported:project_view:search",
         ));
+    }
+
+    if let Some(page) =
+        parse_project_document_page_request(&raw_filters, &state.relay_keypair.public_key())?
+    {
+        if !project_document_read_allowed {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "restricted:project_document:membership_required",
+            ));
+        }
+        let query_type = match &page {
+            ProjectDocumentPageRequest::ActiveHeads { .. } => "active_heads",
+            ProjectDocumentPageRequest::History { .. } => "history",
+        };
+        let query_started = std::time::Instant::now();
+        let page_result = match page {
+            ProjectDocumentPageRequest::ActiveHeads {
+                projection_generation,
+                catalog_revision,
+                after_document_id,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_document_active_heads_page(ProjectDocumentActiveHeadsPageRequest {
+                        community_id: tenant.community(),
+                        expected_pubkey: &state.relay_keypair.public_key(),
+                        reader_pubkey: &pubkey_bytes,
+                        projection_generation,
+                        catalog_revision,
+                        after_document_id,
+                        limit,
+                    })
+                    .await
+            }
+            ProjectDocumentPageRequest::History {
+                projection_generation,
+                document_id,
+                max_document_revision,
+                before_revision,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_document_history_page(ProjectDocumentHistoryPageRequest {
+                        community_id: tenant.community(),
+                        expected_pubkey: &state.relay_keypair.public_key(),
+                        reader_pubkey: &pubkey_bytes,
+                        projection_generation,
+                        document_id,
+                        max_document_revision,
+                        before_revision,
+                        limit,
+                    })
+                    .await
+            }
+        };
+        metrics::histogram!(
+            "buzz_project_document_query_duration_seconds",
+            "query_type" => query_type,
+        )
+        .record(query_started.elapsed().as_secs_f64());
+        let page = page_result.map_err(|error| match error {
+            buzz_db::project_document::ProjectDocumentReadError::Conflict => {
+                metrics::counter!(
+                    "buzz_project_document_snapshot_restarts_total",
+                    "surface" => query_type,
+                )
+                .increment(1);
+                api_error(
+                    StatusCode::CONFLICT,
+                    "conflict:project_document:snapshot_changed",
+                )
+            }
+            buzz_db::project_document::ProjectDocumentReadError::Unavailable => api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:project_document:not_ready",
+            ),
+            buzz_db::project_document::ProjectDocumentReadError::Restricted => api_error(
+                StatusCode::FORBIDDEN,
+                "restricted:project_document:membership_required",
+            ),
+            buzz_db::project_document::ProjectDocumentReadError::InvalidRequest(_) => api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid:project_document:page_request",
+            ),
+            buzz_db::project_document::ProjectDocumentReadError::Database(_)
+            | buzz_db::project_document::ProjectDocumentReadError::Sqlx(_)
+            | buzz_db::project_document::ProjectDocumentReadError::Inconsistent(_) => {
+                internal_error("Project Document snapshot is unavailable")
+            }
+        })?;
+        let events = page
+            .events
+            .into_iter()
+            .map(|stored| serde_json::to_value(stored.event))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| internal_error("Project Document snapshot serialization failed"))?;
+        return Ok(Json(Value::Array(events)));
     }
 
     if let Some(page) =
@@ -1896,7 +2286,12 @@ async fn query_events_authed(
         if crate::handlers::req::filter_can_match_persona_shared_kinds(filter) {
             query.persona_reader = Some(pubkey_bytes.clone());
         }
-        exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
+        exclude_private_protocols_if_unauthorized(
+            &mut query,
+            filter,
+            project_view_read_allowed,
+            project_document_read_allowed,
+        );
 
         match extract_before_id(raw) {
             BeforeId::Malformed => {
@@ -1971,7 +2366,8 @@ async fn query_events_authed(
                         continue;
                     }
                     if !crate::handlers::community_private::event_is_visible(
-                        se.event.kind.as_u16() as u32
+                        se.event.kind.as_u16() as u32,
+                        project_document_read_allowed,
                     ) {
                         continue;
                     }
@@ -2091,10 +2487,52 @@ async fn count_events_authed(
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
-    if crate::handlers::community_private::filters_are_exclusively_project_document(&filters) {
+    let project_document_can_match = filters
+        .iter()
+        .any(crate::handlers::community_private::filter_can_match_project_document);
+    let project_document_exclusive =
+        crate::handlers::community_private::filters_are_exclusively_project_document(&filters);
+    let project_document_decision = if project_document_can_match {
+        crate::handlers::community_private::project_document_read_decision(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            &[],
+            None,
+        )
+        .await
+        .map_err(|_| internal_error("Project Document authorization lookup failed"))?
+    } else {
+        crate::handlers::community_private::ProjectDocumentReadDecision::Restricted
+    };
+    if project_document_exclusive {
+        match project_document_decision {
+            crate::handlers::community_private::ProjectDocumentReadDecision::Allowed => {}
+            crate::handlers::community_private::ProjectDocumentReadDecision::Restricted => {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted:project_document:membership_required",
+                ));
+            }
+            crate::handlers::community_private::ProjectDocumentReadDecision::Unavailable(
+                reason,
+            ) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("unavailable:project_document:{reason}"),
+                ));
+            }
+        }
+    }
+    let project_document_read_allowed = project_document_decision.allowed();
+    if project_document_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::community_private::filter_is_project_document_search)
+    {
         return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable:project_document:disabled",
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_document:search",
         ));
     }
 
@@ -2162,6 +2600,7 @@ async fn count_events_authed(
 
     let mut total: u64 = 0;
     for filter in &filters {
+        let document_visible_for_filter = project_document_read_allowed && filter.search.is_none();
         let needs_author_only_filtering =
             crate::handlers::req::filter_can_match_author_only_kinds(filter);
         // Same result-gated guard as the WS COUNT handler: force the per-event
@@ -2192,7 +2631,12 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
-            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
+            exclude_private_protocols_if_unauthorized(
+                &mut query,
+                filter,
+                project_view_read_allowed,
+                document_visible_for_filter,
+            );
             // Persona visibility pushdown: same as REQ and /query paths, so the
             // fallback's query_events call doesn't over-fetch private persona rows.
             if needs_persona_filtering {
@@ -2248,6 +2692,7 @@ async fn count_events_authed(
                             }
                             if !crate::handlers::community_private::event_is_visible(
                                 se.event.kind.as_u16() as u32,
+                                document_visible_for_filter,
                             ) {
                                 continue;
                             }
@@ -2269,7 +2714,12 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
-            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
+            exclude_private_protocols_if_unauthorized(
+                &mut query,
+                filter,
+                project_view_read_allowed,
+                document_visible_for_filter,
+            );
             query.channel_ids = Some(accessible_channels.to_vec());
             // Persona visibility pushdown: pre-filter before ORDER/LIMIT on the
             // fallback query_events path.
@@ -2327,6 +2777,7 @@ async fn count_events_authed(
                             }
                             if !crate::handlers::community_private::event_is_visible(
                                 se.event.kind.as_u16() as u32,
+                                document_visible_for_filter,
                             ) {
                                 continue;
                             }
@@ -2527,7 +2978,8 @@ async fn handle_bridge_search(
                 continue;
             }
             if !crate::handlers::community_private::event_is_visible(
-                stored.event.kind.as_u16() as u32
+                stored.event.kind.as_u16() as u32,
+                false,
             ) {
                 continue;
             }
@@ -3057,6 +3509,91 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn project_document_extension_parses_only_closed_snapshot_scopes() {
+        let relay = Keys::generate().public_key();
+        let after_document_id = uuid::Uuid::new_v4();
+        let active = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_DOCUMENT_HEAD],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-document-head"],
+            "limit": 500,
+            "buzz_project_document": {
+                "scope": "active_heads",
+                "projection_generation": 3,
+                "catalog_revision": 9,
+                "after_document_id": after_document_id,
+            },
+        });
+        assert!(matches!(
+            parse_project_document_page_request(&[active], &relay),
+            Ok(Some(ProjectDocumentPageRequest::ActiveHeads {
+                projection_generation: 3,
+                catalog_revision: 9,
+                after_document_id: Some(actual),
+                limit: 500,
+            })) if actual == after_document_id
+        ));
+
+        let document_id = uuid::Uuid::new_v4();
+        let history = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_DOCUMENT_REVISION],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-document-revision"],
+            "buzz_project_document": {
+                "scope": "history",
+                "projection_generation": 3,
+                "document_id": document_id,
+                "max_document_revision": 41,
+                "before_revision": 21,
+            },
+        });
+        assert!(matches!(
+            parse_project_document_page_request(&[history], &relay),
+            Ok(Some(ProjectDocumentPageRequest::History {
+                projection_generation: 3,
+                document_id: actual,
+                max_document_revision: 41,
+                before_revision: Some(21),
+                limit: 20,
+            })) if actual == document_id
+        ));
+    }
+
+    #[test]
+    fn project_document_extension_rejects_open_or_malleable_filters() {
+        let relay = Keys::generate().public_key();
+        let base = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_DOCUMENT_HEAD],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-document-head"],
+            "buzz_project_document": {
+                "scope": "active_heads",
+                "projection_generation": 1,
+                "catalog_revision": 0,
+            },
+        });
+
+        let mut extra_outer = base.clone();
+        extra_outer["since"] = serde_json::json!(1);
+        assert!(parse_project_document_page_request(&[extra_outer], &relay).is_err());
+
+        let mut wrong_signer = base.clone();
+        wrong_signer["authors"] = serde_json::json!([Keys::generate().public_key().to_hex()]);
+        assert!(parse_project_document_page_request(&[wrong_signer], &relay).is_err());
+
+        let mut too_large = base.clone();
+        too_large["limit"] = serde_json::json!(501);
+        assert!(parse_project_document_page_request(&[too_large], &relay).is_err());
+
+        let mut noncanonical_cursor = base.clone();
+        noncanonical_cursor["buzz_project_document"]["after_document_id"] =
+            serde_json::json!(uuid::Uuid::new_v4().to_string().to_uppercase());
+        assert!(parse_project_document_page_request(&[noncanonical_cursor], &relay).is_err());
+
+        assert!(parse_project_document_page_request(&[base.clone(), base], &relay).is_err());
     }
 
     #[test]

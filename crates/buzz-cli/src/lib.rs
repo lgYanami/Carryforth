@@ -233,6 +233,9 @@ enum Cmd {
     /// Read and mutate the Community's canonical Project View
     #[command(subcommand, name = "project-view")]
     ProjectView(ProjectViewCmd),
+    /// Read and maintain independent versioned Project Documents
+    #[command(subcommand)]
+    Documents(DocumentsCmd),
     /// Read and govern Project View v2 Roles and Assignments
     #[command(subcommand)]
     Roles(RolesCmd),
@@ -345,6 +348,101 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
+    },
+}
+
+/// Commands for the Community-global Project Document catalog.
+#[derive(Subcommand)]
+pub enum DocumentsCmd {
+    /// List active Document metadata without fetching Markdown bodies
+    List,
+    /// Read the current or one pinned immutable Document revision
+    Get {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact immutable revision; omit for current.
+        #[arg(long)]
+        revision: Option<u64>,
+        /// Print only raw Markdown to stdout.
+        #[arg(long)]
+        content_only: bool,
+    },
+    /// List immutable revision metadata without printing Markdown bodies
+    History {
+        /// Stable Document UUID.
+        document_id: Uuid,
+    },
+    /// Create a complete revision-one Document snapshot
+    Create {
+        /// Canonical non-empty title.
+        #[arg(long)]
+        title: String,
+        /// Optional non-empty summary.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Literal Markdown, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content_file")]
+        content: Option<String>,
+        /// Markdown file path, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
+        /// Client-selected UUID v4; generated when omitted.
+        #[arg(long)]
+        document_id: Option<Uuid>,
+    },
+    /// Replace the complete active Document snapshot
+    Update {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact current revision observed by the caller.
+        #[arg(long)]
+        expected_revision: u64,
+        /// Complete next title.
+        #[arg(long)]
+        title: String,
+        /// Complete next non-empty summary.
+        #[arg(long, conflicts_with = "clear_summary")]
+        summary: Option<String>,
+        /// Explicitly omit the summary in the next snapshot.
+        #[arg(long, conflicts_with = "summary")]
+        clear_summary: bool,
+        /// Literal Markdown, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content_file")]
+        content: Option<String>,
+        /// Markdown file path, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
+    },
+    /// Apply one exact-position unified diff and submit a full update
+    Patch {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact base revision to fetch and patch.
+        #[arg(long)]
+        expected_revision: u64,
+        /// Unified diff file, or `-` for bounded stdin.
+        #[arg(long)]
+        patch_file: String,
+        /// Optional file in which to save the exact merged Markdown.
+        #[arg(long)]
+        output: Option<String>,
+        /// Replace the title; omitted preserves the base title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Replace the summary; omitted preserves the base summary.
+        #[arg(long, conflicts_with = "clear_summary")]
+        summary: Option<String>,
+        /// Explicitly clear the base summary.
+        #[arg(long, conflicts_with = "summary")]
+        clear_summary: bool,
+    },
+    /// Append a bodyless tombstone revision
+    Delete {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact current revision observed by the caller.
+        #[arg(long)]
+        expected_revision: u64,
     },
 }
 
@@ -2371,6 +2469,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
+        Cmd::Documents(sub) => commands::documents::dispatch(sub, &client, &cli.format).await,
         Cmd::Roles(sub) => commands::roles::dispatch(sub, &client, &cli.format).await,
         Cmd::Runtime(sub) => commands::runtime::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
@@ -2396,6 +2495,7 @@ mod tests {
             "canvas",
             "channels",
             "dms",
+            "documents",
             "emoji",
             "feed",
             "issues",

@@ -462,7 +462,7 @@ fn load_relay_keys_from_env() -> Result<Keys> {
     load_relay_keys(None)
 }
 
-fn load_relay_keys(relay_key_file: Option<&Path>) -> Result<Keys> {
+pub(crate) fn load_relay_keys(relay_key_file: Option<&Path>) -> Result<Keys> {
     let secret = if let Some(path) = relay_key_file {
         let metadata = std::fs::metadata(path)
             .map_err(|error| anyhow::anyhow!("read relay key metadata: {error}"))?;

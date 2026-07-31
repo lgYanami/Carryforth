@@ -122,8 +122,8 @@ run_unit_tests() {
     cargo test -p buzz-admin project_view -- --nocapture
 
   # Keep the fallback path equivalent to `just project-document-test-unit`.
-  # Project Document remains flag-off in Stage 1, but the kernel and every
-  # deny/readiness adapter still run in the ordinary unit gate.
+  # Keep the Stage 2 domain, private Relay adapter, CLI, and operator surface in
+  # the ordinary no-infrastructure unit gate.
   run_test_step "Project Document domain tests" \
     cargo test -p buzz-project-document -- --nocapture
 
@@ -141,6 +141,12 @@ run_unit_tests() {
 
   run_test_step "Project Document CLI boundary tests" \
     cargo test -p buzz-cli --lib project_document -- --nocapture
+
+  run_test_step "Project Document CLI vertical tests" \
+    cargo test -p buzz-cli --lib documents -- --nocapture
+
+  run_test_step "Project Document delivery policy tests" \
+    cargo test -p buzz-cli --lib project_command -- --nocapture
 
   run_test_step "Project Document ACP boundary tests" \
     cargo test -p buzz-acp --lib project_document -- --nocapture

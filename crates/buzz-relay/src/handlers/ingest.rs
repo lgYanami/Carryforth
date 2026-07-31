@@ -459,9 +459,9 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // Project View commands are Community-global and intentionally
             // forbid any client-selected `h` scope.
             | KIND_PROJECT_VIEW_MUTATION
-            // Project Document commands are also Community-global. Stage 1
-            // rejects them at the private sibling route after global-token
-            // validation, and a stray client-selected h tag cannot alter scope.
+            // Project Document commands are also Community-global. Their
+            // private handler runs only after global-token validation, and a
+            // stray client-selected h tag cannot alter scope.
             | KIND_PROJECT_DOCUMENT_COMMAND
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
@@ -1575,7 +1575,7 @@ async fn ingest_event_inner(
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before. Project Document
     // deliberately continues through the ordinary global-token and moderation
-    // gates before reaching its flag-off seam below.
+    // gates before reaching its dedicated adapter below.
     if buzz_core::kind::is_command_kind(kind_u32)
         && !is_project_view_mutation_kind(kind_u32)
         && !is_project_document_command_kind(kind_u32)
@@ -1776,13 +1776,22 @@ async fn ingest_event_inner(
         ));
     }
 
-    // Stage 1 has no public Document handler. Keep this beside the Project View
-    // special route so the command cannot enter generic command persistence,
-    // while still preserving every credential/global/restriction gate above.
+    // Project Document commands use their own Community-locked transaction and
+    // private projection fan-out. Keep this beside Project View so commands can
+    // never enter generic command persistence while retaining every ordinary
+    // credential/global/restriction gate above.
     if is_project_document_command_kind(kind_u32) {
-        return Err(IngestError::Unavailable(
-            "unavailable:project_document:disabled".to_owned(),
-        ));
+        let project_document_event_id = event.id.to_bytes();
+        let result = super::project_document::handle_command(tenant, state, event, &auth).await?;
+        emit(
+            tracer,
+            TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(&project_document_event_id),
+                claimed_community: None,
+            },
+            state_for_request(tenant, auth.pubkey()),
+        );
+        return Ok(result);
     }
 
     if is_project_view_mutation_kind(kind_u32) {
@@ -2939,7 +2948,7 @@ mod tests {
     }
 
     #[test]
-    fn project_document_command_reaches_only_the_stage_one_deny_seam() {
+    fn project_document_command_uses_the_closed_global_write_seam() {
         let event = make_dummy_event();
         assert_eq!(
             required_scope_for_kind(KIND_PROJECT_DOCUMENT_COMMAND, &event),

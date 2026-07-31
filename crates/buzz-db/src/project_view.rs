@@ -3147,6 +3147,10 @@ fn projection_map(projections: Vec<PreparedObjectProjection>) -> BTreeMap<Uuid, 
 mod tests {
     use super::*;
 
+    use buzz_project_document::{
+        reduce_document, DocumentCatalog, DocumentChangeContext, DocumentCommandRequest,
+        DocumentProjectionPlan, ProjectDocumentCommand,
+    };
     use buzz_project_view::v2::{
         CommunityMemberRole, HandoffCause, ProjectObjectCommand, RoleCheckpointContent,
         RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityError,
@@ -3158,6 +3162,10 @@ mod tests {
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
         NewProjectViewObject, ObjectRef, Patch, Priority, ProjectProfile, ProjectViewObjectType,
         RequirementStatus, RolePatch, UpdateMutation, WorkStatus,
+    };
+    use buzz_sdk::project_document::{
+        build_document_command, build_document_head_projection, build_document_meta_projection,
+        build_document_revision_projection, changed_head_for as document_changed_head_for,
     };
     use buzz_sdk::project_view_v2::{
         build_entity_projection as build_v2_entity_projection,
@@ -3171,6 +3179,10 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
+    use crate::project_document::{
+        PreparedProjectDocumentBootstrap, PreparedProjectDocumentCommit,
+        ProjectDocumentPrepareOutcome, ProjectDocumentWriteError,
+    };
     use crate::project_view_v2::{
         PreparedV2EntityProjection, PreparedV2ProjectObjectCommit, PreparedV2ProjectObjectHead,
         PreparedV2RoleCommit, ProjectViewV2AdminAssignment, ProjectViewV2CommitOutcome,
@@ -6376,7 +6388,7 @@ mod tests {
         .expect("valid Assignment UUID");
 
         let policy = RuntimeRecoveryPolicy {
-            lease_seconds: 10,
+            lease_seconds: 60,
             recovery_window_seconds: 30,
             max_recovery_attempts: 1,
             recovery_backoff_seconds: 1,
@@ -6524,6 +6536,157 @@ mod tests {
             Err(crate::project_runtime::RuntimeSupervisionError::CommandFence)
         ));
         fence_tx.rollback().await.expect("release fence check");
+
+        // Project Document deliberately strengthens the shared v2 policy:
+        // every managed write requires an exact active Assignment + leased
+        // Runtime fence. Prove one valid write and reject the same Runtime at a
+        // stale epoch before any receipt lookup.
+        let document_time = db
+            .project_document_canonical_now()
+            .await
+            .expect("read Document bootstrap time");
+        let document_catalog = DocumentCatalog::empty(community_id, 1, document_time)
+            .expect("build empty Document catalog");
+        let bootstrap_plan = DocumentProjectionPlan::for_bootstrap(&document_catalog)
+            .expect("build Document bootstrap plan");
+        let document_meta = build_document_meta_projection(&bootstrap_plan, &[])
+            .expect("build Document bootstrap metadata")
+            .sign_with_keys(&relay)
+            .expect("sign Document bootstrap metadata");
+        db.bootstrap_empty_project_document_catalog(PreparedProjectDocumentBootstrap {
+            catalog: document_catalog,
+            meta_projection: document_meta,
+        })
+        .await
+        .expect("bootstrap managed Document fixture");
+        assert!(db
+            .set_project_document_enabled_checked(community_id, true, Some(&relay.public_key()),)
+            .await
+            .expect("enable managed Document fixture"));
+        let audit_seq_after_document_enable: i64 =
+            sqlx::query_scalar("SELECT max(seq) FROM audit_log WHERE community_id = $1")
+                .bind(community_id.as_uuid())
+                .fetch_one(&scratch.pool)
+                .await
+                .expect("read audit head after Document enable");
+
+        let document_id = Uuid::new_v4();
+        let managed_create = ProjectDocumentCommand::new(
+            0,
+            DocumentCommandRequest::Create {
+                document_id,
+                title: "Managed runtime canary".to_owned(),
+                summary: None,
+                content_markdown: "# Managed runtime canary".to_owned(),
+            },
+        )
+        .with_runtime_fence(
+            assignment_id,
+            RuntimeFence {
+                runtime_id: runtime_one,
+                runtime_epoch: 1,
+            },
+        );
+        let managed_event = build_document_command(managed_create.clone())
+            .expect("build managed Document command")
+            .sign_with_keys(&agent)
+            .expect("sign managed Document command");
+        let mut document_write = db
+            .begin_project_document_write(community_id, relay.public_key())
+            .await
+            .expect("begin managed Document write");
+        assert!(matches!(
+            document_write
+                .prepare_command(&managed_event, &managed_create)
+                .await
+                .expect("authorize current managed Runtime"),
+            ProjectDocumentPrepareOutcome::New
+        ));
+        let document_context = document_write
+            .load_current(document_id)
+            .await
+            .expect("load managed Document basis");
+        let document_transition = reduce_document(
+            &document_context.catalog,
+            document_context.current.as_ref(),
+            &managed_create,
+            DocumentChangeContext::new(
+                managed_event.pubkey,
+                managed_event.id,
+                document_context.canonical_time,
+            )
+            .with_deletion_blocked(document_context.deletion_blocked),
+        )
+        .expect("reduce managed Document create");
+        let revision_projection =
+            build_document_revision_projection(document_transition.projection_plan())
+                .expect("build managed revision")
+                .sign_with_keys(&relay)
+                .expect("sign managed revision");
+        let head_projection = build_document_head_projection(
+            document_transition.projection_plan(),
+            &revision_projection,
+        )
+        .expect("build managed head")
+        .sign_with_keys(&relay)
+        .expect("sign managed head");
+        let changed_head = document_changed_head_for(
+            document_transition.projection_plan(),
+            &head_projection,
+            &revision_projection,
+        )
+        .expect("bind managed head");
+        let meta_projection =
+            build_document_meta_projection(document_transition.projection_plan(), &[changed_head])
+                .expect("build managed metadata")
+                .sign_with_keys(&relay)
+                .expect("sign managed metadata");
+        document_write
+            .commit(PreparedProjectDocumentCommit {
+                command_event: managed_event,
+                command: managed_create,
+                transition: document_transition,
+                revision_projection,
+                head_projection,
+                meta_projection,
+            })
+            .await
+            .expect("commit current managed Runtime Document write");
+
+        let stale_update = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id,
+                title: "Stale managed runtime".to_owned(),
+                summary: None,
+                content_markdown: "must not commit".to_owned(),
+            },
+        )
+        .with_runtime_fence(
+            assignment_id,
+            RuntimeFence {
+                runtime_id: runtime_one,
+                runtime_epoch: 2,
+            },
+        );
+        let stale_event = build_document_command(stale_update.clone())
+            .expect("build stale managed Document command")
+            .sign_with_keys(&agent)
+            .expect("sign stale managed Document command");
+        let mut stale_write = db
+            .begin_project_document_write(community_id, relay.public_key())
+            .await
+            .expect("begin stale managed Document write");
+        assert!(matches!(
+            stale_write
+                .prepare_command(&stale_event, &stale_update)
+                .await,
+            Err(ProjectDocumentWriteError::Unauthorized)
+        ));
+        stale_write
+            .rollback()
+            .await
+            .expect("release stale managed Document write");
 
         for (marker, evidence, epoch) in [
             (
@@ -6810,7 +6973,7 @@ mod tests {
                 .fetch_one(&scratch.pool)
                 .await
                 .expect("read runtime audit head");
-        assert_eq!(latest_audit_seq, 3);
+        assert_eq!(latest_audit_seq, audit_seq_after_document_enable + 1);
         assert!(audit
             .verify_chain(community_id, 1, latest_audit_seq)
             .await

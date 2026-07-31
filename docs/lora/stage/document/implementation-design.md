@@ -4935,6 +4935,14 @@ Documents         │
 
 目标：Human / managed Agent 可以可靠维护和读取独立 Project Document。
 
+> 交付状态（2026-07-31）：已完成。Relay 已接入 atomic command、全部 private read surface、
+> closed catalog/history pagination、current-membership final fan-out 和 host-scoped NIP-11；admin
+> 提供 bootstrap / verify / enable / disable；Agent-first CLI 提供完整 CRUD、exact patch、verified
+> current / pinned / history、typed ambiguous delivery read-back。Secret incident runbook、隔离 canary
+> 与验证记录见 [`secret-incident-runbook.md`](secret-incident-runbook.md)、
+> [`stage2-canary.md`](stage2-canary.md) 和 [`changelog.md`](changelog.md)。Desktop、Project View v3
+> Resource / Context 与正文 prompt 注入仍不属于本阶段。
+
 开发内容：
 
 - Relay command handler；

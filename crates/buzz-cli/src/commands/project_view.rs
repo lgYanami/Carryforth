@@ -644,7 +644,7 @@ fn v2_object_output(entry: &ProjectViewEntry, meta: &V2MetaProjection) -> Value 
     }
 }
 
-async fn v2_acting_assignment(
+pub(crate) async fn v2_acting_assignment(
     client: &BuzzClient,
     identity: ProjectViewIdentity,
 ) -> Result<Option<Uuid>, CliError> {

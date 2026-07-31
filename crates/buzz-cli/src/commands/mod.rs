@@ -2,6 +2,7 @@ pub mod agents;
 pub mod channel_templates;
 pub mod channels;
 pub mod dms;
+pub mod documents;
 pub mod emoji;
 pub mod feed;
 pub mod issues;

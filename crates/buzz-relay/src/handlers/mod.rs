@@ -26,6 +26,8 @@ pub mod moderation_commands;
 pub mod moderation_notices;
 /// Product-feedback validation + deployment sidecar persistence.
 pub mod product_feedback;
+/// Project Document v1 command adapter.
+pub mod project_document;
 /// Project View mutation, authorization, and projection protocol helpers.
 pub mod project_view;
 #[allow(dead_code, missing_docs)]
