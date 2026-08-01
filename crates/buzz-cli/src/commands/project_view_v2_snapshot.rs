@@ -5,6 +5,7 @@ use std::io::Read as _;
 use std::path::Path;
 use std::time::Duration;
 
+use buzz_core::agent_process_env::MANAGED_RUNTIME_MODE_ENV;
 use buzz_core::kind::{
     KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
@@ -464,7 +465,11 @@ pub(crate) async fn read_current_v2_snapshot(
 }
 
 pub(crate) fn is_managed_runtime() -> bool {
-    std::env::var("BUZZ_MANAGED_AGENT").as_deref() == Ok("1")
+    is_managed_runtime_value(std::env::var(MANAGED_RUNTIME_MODE_ENV).ok().as_deref())
+}
+
+fn is_managed_runtime_value(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 pub(crate) fn runtime_fence_from_env() -> Result<Option<RuntimeFence>, CliError> {
@@ -607,8 +612,9 @@ pub(crate) fn integrity_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_history_cursor, history_cursor_precedes, parse_history_cursor,
-        runtime_fence_from_file, runtime_fence_from_legacy_env, RoleHistoryCursor,
+        format_history_cursor, history_cursor_precedes, is_managed_runtime_value,
+        parse_history_cursor, runtime_fence_from_file, runtime_fence_from_legacy_env,
+        RoleHistoryCursor,
     };
     use buzz_project_view::v2::{RoleContinuityEntity, RuntimeFence};
     use uuid::Uuid;
@@ -691,5 +697,15 @@ mod tests {
         );
         assert!(runtime_fence_from_legacy_env(Some(&runtime_id_text), None).is_err());
         assert!(runtime_fence_from_legacy_env(Some("not-a-uuid"), Some("3")).is_err());
+    }
+
+    #[test]
+    fn managed_runtime_requires_exact_new_mode_marker() {
+        assert!(is_managed_runtime_value(Some("1")));
+        assert!(!is_managed_runtime_value(None));
+        assert!(!is_managed_runtime_value(Some("")));
+        assert!(!is_managed_runtime_value(Some("0")));
+        assert!(!is_managed_runtime_value(Some("true")));
+        assert!(!is_managed_runtime_value(Some("xyz.block.buzz.app.dev")));
     }
 }

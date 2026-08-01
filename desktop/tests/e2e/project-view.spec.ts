@@ -12,6 +12,7 @@ import { openSettings } from "../helpers/settings";
 const ACTOR = "a".repeat(64);
 const HUMAN = "deadbeef".repeat(8);
 const FORMER_ASSIGNEE = "e".repeat(64);
+const ROLE_CANDIDATE = "9".repeat(64);
 const ALICE =
   "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f";
 const NOW = "2026-07-27T08:00:00Z";
@@ -1016,14 +1017,41 @@ test("owner creates a revision-fenced Role offer from the Inspector", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    managedAgents: [
+      {
+        pubkey: ROLE_CANDIDATE,
+        name: "test-2",
+        relayUrl: "",
+        status: "stopped",
+      },
+    ],
+    managedAgentRuntimes: [
+      {
+        pubkey: ROLE_CANDIDATE,
+        relayUrl: "ws://127.0.0.1:3000",
+        lifecycle: "ready",
+      },
+    ],
     projectView: V2_READY_VIEW,
   });
   await page.goto("/");
   await openFullProjectView(page);
   await page.getByTestId(`project-role-card-${IDS.role}`).click();
   await page.getByTestId("project-role-offer").click();
-  await page.getByTestId("project-role-candidate").fill(FORMER_ASSIGNEE);
+  await page.getByTestId("project-role-candidate-picker").click();
+  await page.getByTestId("project-role-candidate-search").fill("test-2");
+  await expect(
+    page.getByTestId(`project-role-candidate-option-${ROLE_CANDIDATE}`),
+  ).toContainText("managed by you");
+  await expect(
+    page.getByTestId(`project-role-candidate-option-${ROLE_CANDIDATE}`),
+  ).toContainText("Running");
+  await page
+    .getByTestId(`project-role-candidate-option-${ROLE_CANDIDATE}`)
+    .click();
+  await expect(page.getByTestId("project-role-candidate-picker")).toContainText(
+    "test-2",
+  );
   await page.getByTestId("project-role-offer-submit").click();
 
   await expect
@@ -1040,7 +1068,7 @@ test("owner creates a revision-fenced Role offer from the Inspector", async ({
     operation: "offer_role",
     expected_project_revision: 7,
     role_id: IDS.role,
-    candidate_pubkey: FORMER_ASSIGNEE,
+    candidate_pubkey: ROLE_CANDIDATE,
     expires_in_hours: 72,
   });
 });
@@ -1140,6 +1168,8 @@ test("a concurrent Role replacement refreshes state without replaying intent", a
   await openFullProjectView(page);
   await page.getByTestId(`project-role-card-${IDS.role}`).click();
   await page.getByTestId("project-role-offer").click();
+  await page.getByTestId("project-role-candidate-picker").click();
+  await page.getByTestId("project-role-candidate-manual-toggle").click();
   await page.getByTestId("project-role-candidate").fill(FORMER_ASSIGNEE);
   await page.getByTestId("project-role-offer-submit").click();
 

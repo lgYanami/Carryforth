@@ -1,5 +1,14 @@
 use crate::managed_agents::known_acp_runtime;
 
+#[test]
+fn relay_target_canonicalizes_only_the_process_key() {
+    let (key, connection_url) =
+        super::managed_agent_relay_target("aa".repeat(32), " ws://localhost:3000 ").unwrap();
+
+    assert_eq!(key.relay_url, "ws://127.0.0.1:3000");
+    assert_eq!(connection_url, "ws://localhost:3000");
+}
+
 // ── buffer_contains_identifier tests ────────────────────────────────────
 
 #[test]

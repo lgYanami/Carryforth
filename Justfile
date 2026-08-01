@@ -48,6 +48,18 @@ bootstrap:
 setup: bootstrap
     ./scripts/dev-setup.sh
 
+# Start Docker services, relay, and desktop in the background
+start:
+    ./scripts/dev-start.sh
+
+# Force-rebuild Buzz executables, then start the local stack
+rebuild-start:
+    ./scripts/dev-rebuild-start.sh
+
+# Stop the app and Docker containers without deleting containers or data
+stop:
+    ./scripts/dev-stop.sh
+
 # Install git hooks via lefthook (dispatches from the shared .git/hooks dir so all
 # linked worktrees inherit the same hooks without a worktree-relative .hooks path)
 hooks:
@@ -71,7 +83,7 @@ reset:
 
 # Stop all dev services (keep data)
 down:
-    docker compose down
+    ./scripts/dev-stop.sh
 
 # Show dev service status
 ps:
@@ -471,6 +483,16 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
         done
     fi
     cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr -p buzz-relay
+    TARGET=$(rustc -vV | sed -n 's|host: ||p')
+    TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
+    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+        src="${TARGET_DIR}/debug/${bin}"
+        dest="desktop/src-tauri/binaries/${bin}-${TARGET}"
+        if ! cmp -s "$src" "$dest"; then
+            cp "$src" "$dest"
+            chmod +x "$dest"
+        fi
+    done
     if [[ -n "{{mesh}}" ]]; then
         export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
     fi

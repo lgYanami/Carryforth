@@ -86,7 +86,7 @@ it is safe to re-run.
 
 `just setup` then starts Docker services (Postgres on `:5432`, Redis on `:6379`,
 Adminer on `:8082`, Keycloak on `:8180` for local OAuth/OIDC testing, MinIO on
-`:9000` for media storage, and Prometheus on `:9090` for metrics) and runs all
+`:9000` for media storage, and Prometheus on `:9091` for metrics) and runs all
 pending database migrations.
 
 ### Running the Relay and Desktop App
@@ -99,6 +99,18 @@ just dev   # starts the relay + desktop app in one command
 the background, and launches the Tauri desktop app. The relay process is
 automatically killed when you quit the app or press Ctrl+C.
 
+For a detached one-command workflow with lifecycle tracking:
+
+```bash
+./scripts/dev-start.sh          # start containers + relay + desktop
+./scripts/dev-rebuild-start.sh  # force-rebuild Buzz executables, then start
+./scripts/dev-stop.sh           # stop app + containers; preserve all data
+```
+
+The detached process log is written to `target/dev-lifecycle/buzz-dev.log`.
+The same commands are available as `just start`, `just rebuild-start`, and
+`just stop`.
+
 For a split-terminal workflow (relay logs visible separately from Vite output):
 
 ```bash
@@ -109,7 +121,7 @@ just desktop-dev  # terminal 2 — Vite dev server only (no Tauri shell)
 ### Stopping / Resetting
 
 ```bash
-just down    # Stop Docker services, keep data
+just down    # Stop app + Docker containers, keep containers and data
 just reset   # Wipe all dev state and recreate it; installed Buzz is preserved
 ```
 

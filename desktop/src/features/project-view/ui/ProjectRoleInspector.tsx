@@ -16,7 +16,10 @@ import {
   useProjectViewRoleHistory,
   useProjectViewRoleMutation,
 } from "@/features/project-view/hooks";
+import { normalizeRoleCandidateInput } from "@/features/project-view/projectRoleCandidates";
+import { useProjectRoleCandidates } from "@/features/project-view/useProjectRoleCandidates";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
+import { ProjectRoleCandidatePicker } from "@/features/project-view/ui/ProjectRoleCandidatePicker";
 import {
   EMPTY_ROLE_CONTINUITY_DRAFT,
   ProjectRoleCheckpointDialog,
@@ -33,7 +36,6 @@ import type {
   ProjectViewRoleContinuity,
   ProjectViewRoleMutationIntent,
 } from "@/shared/api/tauriProjectView";
-import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import {
@@ -44,7 +46,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/ui/dialog";
-import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 
 function effectiveProposalStatus(proposal: ProjectRoleProposal, now: number) {
@@ -52,11 +53,6 @@ function effectiveProposalStatus(proposal: ProjectRoleProposal, now: number) {
     new Date(proposal.expiresAt).getTime() <= now
     ? "expired"
     : proposal.status;
-}
-
-function memberLabel(pubkey: string, profiles?: UserProfileLookup) {
-  const profile = profiles?.[pubkey.toLowerCase()];
-  return profile?.displayName ?? profile?.name ?? truncatePubkey(pubkey);
 }
 
 function uniqueBy<T>(items: T[], key: (item: T) => string) {
@@ -93,6 +89,13 @@ export function ProjectRoleInspector({
   const [continuityDraft, setContinuityDraft] = React.useState(
     EMPTY_ROLE_CONTINUITY_DRAFT,
   );
+  const roleCandidates = useProjectRoleCandidates({
+    actorProfiles,
+    continuity,
+    currentPubkey,
+    enabled: offerOpen,
+    targetRoleId: definition.roleId,
+  });
   const [renderedAt] = React.useState(Date.now);
   const historyItems =
     roleHistory.data?.pages.flatMap((page) => page.items) ?? [];
@@ -242,13 +245,15 @@ export function ProjectRoleInspector({
   }
 
   async function submitOffer() {
-    if (!candidatePubkey.trim()) return;
+    const normalizedCandidatePubkey =
+      normalizeRoleCandidateInput(candidatePubkey);
+    if (!normalizedCandidatePubkey) return;
     const applied = await submit({
       operation: "offer_role",
       expectedProjectRevision: projectRevision,
       actingAssignmentId,
       roleId: definition.roleId,
-      candidatePubkey: candidatePubkey.trim(),
+      candidatePubkey: normalizedCandidatePubkey,
       expiresInHours: 72,
       reason: reason.trim() || undefined,
     });
@@ -880,27 +885,15 @@ export function ProjectRoleInspector({
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
-            <label
-              className="space-y-1.5 text-sm"
-              htmlFor={`project-role-candidate-${definition.roleId}`}
-            >
-              <span className="font-medium">Candidate</span>
-              <Input
-                data-testid="project-role-candidate"
-                id={`project-role-candidate-${definition.roleId}`}
-                list={`project-role-members-${definition.roleId}`}
-                onChange={(event) => setCandidatePubkey(event.target.value)}
-                placeholder="Public key or npub"
-                value={candidatePubkey}
-              />
-              <datalist id={`project-role-members-${definition.roleId}`}>
-                {continuity.members.map((member) => (
-                  <option key={member.pubkey} value={member.pubkey}>
-                    {memberLabel(member.pubkey, actorProfiles)}
-                  </option>
-                ))}
-              </datalist>
-            </label>
+            <ProjectRoleCandidatePicker
+              candidates={roleCandidates.candidates}
+              disabled={mutation.isPending}
+              id={`project-role-candidate-${definition.roleId}`}
+              isLoading={roleCandidates.isLoading}
+              isPartial={roleCandidates.isPartial}
+              onChange={setCandidatePubkey}
+              value={candidatePubkey}
+            />
             <label
               className="space-y-1.5 text-sm"
               htmlFor={`project-role-reason-${definition.roleId}`}
@@ -924,7 +917,10 @@ export function ProjectRoleInspector({
             </Button>
             <Button
               data-testid="project-role-offer-submit"
-              disabled={!candidatePubkey.trim() || mutation.isPending}
+              disabled={
+                !normalizeRoleCandidateInput(candidatePubkey) ||
+                mutation.isPending
+              }
               onClick={() => void submitOffer()}
               type="button"
             >

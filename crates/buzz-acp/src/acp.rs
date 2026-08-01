@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use buzz_core::agent_process_env::{MANAGED_AGENT_OWNER_ENV, MANAGED_RUNTIME_MODE_ENV};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -496,7 +497,9 @@ impl AcpClient {
             }
             if matches!(
                 key.as_str(),
-                "BUZZ_MANAGED_AGENT" | crate::runtime_supervisor::RUNTIME_FENCE_PATH_ENV
+                MANAGED_AGENT_OWNER_ENV
+                    | MANAGED_RUNTIME_MODE_ENV
+                    | crate::runtime_supervisor::RUNTIME_FENCE_PATH_ENV
             ) {
                 // These are harness-owned security and fencing values. A
                 // parent-shell value must neither downgrade managed mode nor

@@ -99,6 +99,57 @@ pub(super) fn procargs2_buffer(pid: u32) -> Option<Vec<u8>> {
 
 // ── Ancestor walk ────────────────────────────────────────────────────────
 
+/// Whether a process can be classified relative to the tracked harness set.
+/// Cleanup callers must treat [`TrackedAncestry::Unknown`] conservatively.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrackedAncestry {
+    /// The process is a live descendant of a tracked harness.
+    Tracked,
+    /// The process chain was resolved and has no tracked harness ancestor.
+    Untracked,
+    /// The process chain could not be resolved safely during this scan.
+    Unknown,
+}
+
+/// Only proven-untracked processes owned by another Desktop are candidates.
+#[cfg(unix)]
+pub(super) fn should_collect_foreign_agent(
+    agent_instance_id: &str,
+    our_instance_id: &str,
+    ancestry: TrackedAncestry,
+) -> bool {
+    agent_instance_id != our_instance_id && ancestry == TrackedAncestry::Untracked
+}
+
+/// Classify whether walking `start`'s parent chain reaches `skip_pids`.
+#[cfg(unix)]
+fn walk_tracked_ancestor_status(
+    start: u32,
+    skip_pids: &[u32],
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> TrackedAncestry {
+    if skip_pids.is_empty() {
+        return TrackedAncestry::Untracked;
+    }
+
+    const MAX_DEPTH: usize = 32;
+    let mut cur = start;
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = parent_of(cur) else {
+            return TrackedAncestry::Unknown;
+        };
+        if parent <= 1 || parent == cur {
+            return TrackedAncestry::Untracked;
+        }
+        if skip_pids.contains(&parent) {
+            return TrackedAncestry::Tracked;
+        }
+        cur = parent;
+    }
+    TrackedAncestry::Unknown
+}
+
 /// True if walking `start`'s parent chain reaches any PID in `skip_pids`.
 /// Bounded to 32 hops to guard against PPID cycles from PID reuse; a lookup
 /// failure or reaching PID ≤ 1 ends the walk (process is not a descendant of
@@ -106,27 +157,13 @@ pub(super) fn procargs2_buffer(pid: u32) -> Option<Vec<u8>> {
 ///
 /// The candidate itself being in `skip_pids` is handled at the call site —
 /// this function checks strict ancestors only.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(super) fn walk_has_tracked_ancestor(
     start: u32,
     skip_pids: &[u32],
     parent_of: impl Fn(u32) -> Option<u32>,
 ) -> bool {
-    const MAX_DEPTH: usize = 32;
-    let mut cur = start;
-    for _ in 0..MAX_DEPTH {
-        let Some(parent) = parent_of(cur) else {
-            return false;
-        };
-        if parent <= 1 || parent == cur {
-            return false;
-        }
-        if skip_pids.contains(&parent) {
-            return true;
-        }
-        cur = parent;
-    }
-    false
+    walk_tracked_ancestor_status(start, skip_pids, parent_of) == TrackedAncestry::Tracked
 }
 
 /// OS-resolved parent-PID lookup for `walk_has_tracked_ancestor`.
@@ -202,14 +239,23 @@ pub(super) fn ppid_of_linux(pid: u32) -> Option<u32> {
 ///    node shim -> codex-acp).
 #[cfg(target_os = "macos")]
 pub(super) fn is_live_descendant_macos(pid: u32, ppid: u32, skip_pids: &[u32]) -> bool {
+    tracked_ancestry_macos(pid, ppid, skip_pids) == TrackedAncestry::Tracked
+}
+
+/// Classify a macOS process relative to the tracked harness set.
+#[cfg(target_os = "macos")]
+pub(super) fn tracked_ancestry_macos(pid: u32, ppid: u32, skip_pids: &[u32]) -> TrackedAncestry {
+    if skip_pids.is_empty() {
+        return TrackedAncestry::Untracked;
+    }
     if skip_pids.contains(&ppid) {
-        return true;
+        return TrackedAncestry::Tracked;
     }
     let pgid = unsafe { libc::getpgid(pid as i32) };
     if pgid > 0 && skip_pids.contains(&(pgid as u32)) {
-        return true;
+        return TrackedAncestry::Tracked;
     }
-    walk_has_tracked_ancestor(ppid, skip_pids, ppid_of_macos)
+    walk_tracked_ancestor_status(ppid, skip_pids, ppid_of_macos)
 }
 
 /// Linux variant: reads PPID and PGID from `/proc/<pid>/stat` in a single
@@ -218,13 +264,22 @@ pub(super) fn is_live_descendant_macos(pid: u32, ppid: u32, skip_pids: &[u32]) -
 /// grace in the periodic sweep absorbs transient failures.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn is_live_descendant_linux(pid: u32, skip_pids: &[u32]) -> bool {
+    tracked_ancestry_linux(pid, skip_pids) == TrackedAncestry::Tracked
+}
+
+/// Classify a Linux process relative to the tracked harness set.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn tracked_ancestry_linux(pid: u32, skip_pids: &[u32]) -> TrackedAncestry {
+    if skip_pids.is_empty() {
+        return TrackedAncestry::Untracked;
+    }
     let Some((ppid, pgid)) = proc_stat_ppid_pgid_linux(pid) else {
-        return false;
+        return TrackedAncestry::Unknown;
     };
     if skip_pids.contains(&ppid) || skip_pids.contains(&pgid) {
-        return true;
+        return TrackedAncestry::Tracked;
     }
-    walk_has_tracked_ancestor(ppid, skip_pids, ppid_of_linux)
+    walk_tracked_ancestor_status(ppid, skip_pids, ppid_of_linux)
 }
 
 // ── ProcessSnapshot and pure decision function ────────────────────────────
@@ -668,6 +723,10 @@ mod tests {
         assert!(!walk_has_tracked_ancestor(201, &[100], |p| map_parent(
             &tree, p
         )));
+        assert_eq!(
+            walk_tracked_ancestor_status(201, &[100], |p| map_parent(&tree, p)),
+            TrackedAncestry::Untracked
+        );
     }
 
     #[cfg(unix)]
@@ -684,11 +743,46 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn walk_missing_parent_entry_returns_false() {
-        // proc_pidinfo / /proc stat failure (process exited) → not a descendant.
+        // The bool convenience API returns false, while cleanup-sensitive
+        // callers retain Unknown and fail safe for this sweep.
         let tree: std::collections::HashMap<u32, u32> = [].into_iter().collect();
         assert!(!walk_has_tracked_ancestor(400, &[100], |p| map_parent(
             &tree, p
         )));
+        assert_eq!(
+            walk_tracked_ancestor_status(400, &[100], |p| map_parent(&tree, p)),
+            TrackedAncestry::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_instance_sweep_spares_tracked_or_unknown_descendants() {
+        assert!(!should_collect_foreign_agent(
+            "1",
+            "xyz.block.buzz.app.dev",
+            TrackedAncestry::Tracked,
+        ));
+        assert!(!should_collect_foreign_agent(
+            "1",
+            "xyz.block.buzz.app.dev",
+            TrackedAncestry::Unknown,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_instance_sweep_collects_only_proven_untracked_foreign_agent() {
+        assert!(should_collect_foreign_agent(
+            "xyz.block.buzz.app.old",
+            "xyz.block.buzz.app.dev",
+            TrackedAncestry::Untracked,
+        ));
+        assert!(!should_collect_foreign_agent(
+            "xyz.block.buzz.app.dev",
+            "xyz.block.buzz.app.dev",
+            TrackedAncestry::Untracked,
+        ));
     }
 
     #[cfg(unix)]

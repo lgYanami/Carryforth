@@ -23,6 +23,9 @@ use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
+use buzz_core::agent_process_env::{
+    MANAGED_AGENT_OWNER_ENV, MANAGED_AGENT_START_NONCE_ENV, MANAGED_RUNTIME_MODE_ENV,
+};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -1613,7 +1616,7 @@ async fn tokio_main(
         ));
     }
 
-    let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    let runtime_start_nonce = std::env::var(MANAGED_AGENT_START_NONCE_ENV).unwrap_or_default();
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
@@ -3920,12 +3923,28 @@ fn managed_agent_env(
     persona_env: &[(String, String)],
     runtime_fence_path: Option<&std::path::Path>,
 ) -> Vec<(String, String)> {
+    let desktop_owner_marker = std::env::var(MANAGED_AGENT_OWNER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    managed_agent_env_for_owner(
+        persona_env,
+        runtime_fence_path,
+        desktop_owner_marker.as_deref(),
+    )
+}
+
+fn managed_agent_env_for_owner(
+    persona_env: &[(String, String)],
+    runtime_fence_path: Option<&std::path::Path>,
+    desktop_owner_marker: Option<&str>,
+) -> Vec<(String, String)> {
     let mut env = persona_env
         .iter()
         .filter(|(name, _)| {
             !matches!(
                 name.as_str(),
-                "BUZZ_MANAGED_AGENT"
+                MANAGED_AGENT_OWNER_ENV
+                    | MANAGED_RUNTIME_MODE_ENV
                     | "BUZZ_RUNTIME_ID"
                     | "BUZZ_RUNTIME_EPOCH"
                     | runtime_supervisor::RUNTIME_FENCE_PATH_ENV
@@ -3933,7 +3952,10 @@ fn managed_agent_env(
         })
         .cloned()
         .collect::<Vec<_>>();
-    env.push(("BUZZ_MANAGED_AGENT".to_owned(), "1".to_owned()));
+    env.push((MANAGED_RUNTIME_MODE_ENV.to_owned(), "1".to_owned()));
+    if let Some(owner) = desktop_owner_marker.filter(|value| !value.is_empty()) {
+        env.push((MANAGED_AGENT_OWNER_ENV.to_owned(), owner.to_owned()));
+    }
     if let Some(path) = runtime_fence_path {
         env.push((
             runtime_supervisor::RUNTIME_FENCE_PATH_ENV.to_owned(),
@@ -4344,6 +4366,16 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
+    let desktop_owner_marker = std::env::var(MANAGED_AGENT_OWNER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    build_mcp_servers_for_owner(config, desktop_owner_marker.as_deref())
+}
+
+fn build_mcp_servers_for_owner(
+    config: &Config,
+    desktop_owner_marker: Option<&str>,
+) -> Vec<McpServer> {
     if config.mcp_command.is_empty() {
         return vec![];
     }
@@ -4373,10 +4405,16 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         .expect("secret key bech32 encoding should never fail"),
                 },
                 EnvVar {
-                    name: "BUZZ_MANAGED_AGENT".into(),
+                    name: MANAGED_RUNTIME_MODE_ENV.into(),
                     value: "1".into(),
                 },
             ];
+            if let Some(owner) = desktop_owner_marker.filter(|value| !value.is_empty()) {
+                env.push(EnvVar {
+                    name: MANAGED_AGENT_OWNER_ENV.into(),
+                    value: owner.to_owned(),
+                });
+            }
             if let Some(path) = &config.runtime_fence_path {
                 env.push(EnvVar {
                     name: runtime_supervisor::RUNTIME_FENCE_PATH_ENV.into(),
@@ -5206,7 +5244,7 @@ mod build_mcp_servers_tests {
     #[test]
     fn session_new_mcp_server_has_required_fields() {
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
         assert_eq!(server.name, "test-mcp-server");
@@ -5221,16 +5259,31 @@ mod build_mcp_servers_tests {
             "missing BUZZ_PRIVATE_KEY; got {names:?}"
         );
         assert!(
-            names.contains(&"BUZZ_MANAGED_AGENT"),
-            "missing BUZZ_MANAGED_AGENT; got {names:?}"
+            names.contains(&MANAGED_RUNTIME_MODE_ENV),
+            "missing {MANAGED_RUNTIME_MODE_ENV}; got {names:?}"
         );
         assert_eq!(
             server
                 .env
                 .iter()
-                .find(|env| env.name == "BUZZ_MANAGED_AGENT")
+                .find(|env| env.name == MANAGED_RUNTIME_MODE_ENV)
                 .map(|env| env.value.as_str()),
             Some("1")
+        );
+        assert!(!names.contains(&MANAGED_AGENT_OWNER_ENV));
+    }
+
+    #[test]
+    fn session_new_mcp_server_preserves_desktop_owner_marker() {
+        let config = test_config();
+        let servers = build_mcp_servers_for_owner(&config, Some("xyz.block.buzz.app.dev"));
+        assert_eq!(
+            servers[0]
+                .env
+                .iter()
+                .find(|env| env.name == MANAGED_AGENT_OWNER_ENV)
+                .map(|env| env.value.as_str()),
+            Some("xyz.block.buzz.app.dev")
         );
     }
 
@@ -5238,7 +5291,7 @@ mod build_mcp_servers_tests {
     fn session_new_mcp_server_receives_dynamic_runtime_fence_path() {
         let mut config = test_config();
         config.runtime_fence_path = Some(std::path::PathBuf::from("/tmp/buzz-runtime.fence.json"));
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(
             servers[0]
                 .env
@@ -5250,29 +5303,49 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn managed_runtime_marker_overrides_persona_value() {
-        let env = managed_agent_env(
+    fn managed_runtime_mode_and_desktop_owner_override_persona_values() {
+        let env = managed_agent_env_for_owner(
             &[
                 ("PERSONA".to_owned(), "developer".to_owned()),
-                ("BUZZ_MANAGED_AGENT".to_owned(), "0".to_owned()),
+                (
+                    MANAGED_AGENT_OWNER_ENV.to_owned(),
+                    "forged-owner".to_owned(),
+                ),
+                (MANAGED_RUNTIME_MODE_ENV.to_owned(), "0".to_owned()),
             ],
             None,
+            Some("xyz.block.buzz.app.dev"),
         );
-        let marker_values = env
+        let mode_values = env
             .iter()
-            .filter(|(name, _)| name == "BUZZ_MANAGED_AGENT")
+            .filter(|(name, _)| name == MANAGED_RUNTIME_MODE_ENV)
             .map(|(_, value)| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(marker_values, vec!["1"]);
+        assert_eq!(mode_values, vec!["1"]);
+        let owner_values = env
+            .iter()
+            .filter(|(name, _)| name == MANAGED_AGENT_OWNER_ENV)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(owner_values, vec!["xyz.block.buzz.app.dev"]);
         assert!(env
             .iter()
             .any(|(name, value)| name == "PERSONA" && value == "developer"));
     }
 
     #[test]
+    fn standalone_managed_runtime_does_not_invent_desktop_owner() {
+        let env = managed_agent_env_for_owner(&[], None, None);
+        assert!(env
+            .iter()
+            .any(|(name, value)| name == MANAGED_RUNTIME_MODE_ENV && value == "1"));
+        assert!(!env.iter().any(|(name, _)| name == MANAGED_AGENT_OWNER_ENV));
+    }
+
+    #[test]
     fn runtime_fence_path_overrides_persona_and_removes_static_pair() {
         let expected_path = std::path::Path::new("/tmp/buzz-runtime.fence.json");
-        let env = managed_agent_env(
+        let env = managed_agent_env_for_owner(
             &[
                 ("BUZZ_RUNTIME_ID".to_owned(), Uuid::new_v4().to_string()),
                 ("BUZZ_RUNTIME_EPOCH".to_owned(), "999".to_owned()),
@@ -5282,6 +5355,7 @@ mod build_mcp_servers_tests {
                 ),
             ],
             Some(expected_path),
+            None,
         );
         assert_eq!(
             env.iter()
@@ -5299,7 +5373,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -5316,7 +5390,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -5328,7 +5402,7 @@ mod build_mcp_servers_tests {
     fn empty_mcp_command_returns_no_servers() {
         let mut config = test_config();
         config.mcp_command = "".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert!(
             servers.is_empty(),
             "empty mcp_command should produce no MCP servers"
@@ -5339,7 +5413,7 @@ mod build_mcp_servers_tests {
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
         config.mcp_command = "/opt/bin/my-mcp-server".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "my-mcp-server");
     }
@@ -5360,7 +5434,7 @@ mod build_mcp_servers_tests {
 
         // Confirm a non-empty command with no stem (e.g. just a dot) also falls back.
         config.mcp_command = ".".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(servers.len(), 1);
         assert_eq!(
             servers[0].name, "mcp",

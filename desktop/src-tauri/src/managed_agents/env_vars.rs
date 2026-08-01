@@ -13,6 +13,10 @@
 
 use std::collections::BTreeMap;
 
+use buzz_core_pkg::agent_process_env::{
+    MANAGED_AGENT_OWNER_ENV, MANAGED_AGENT_START_NONCE_ENV, MANAGED_RUNTIME_MODE_ENV,
+};
+
 /// Env var keys that are *derived* from the structured `AgentDefinition.provider`
 /// and `AgentDefinition.model` fields at spawn/deploy time. These must NOT be
 /// persisted in `AgentDefinition.env_vars` because they would shadow the
@@ -68,6 +72,9 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_RUNTIME_FENCE_PATH",
     "BUZZ_RUNTIME_ID",
     "BUZZ_RUNTIME_EPOCH",
+    MANAGED_AGENT_OWNER_ENV,
+    MANAGED_RUNTIME_MODE_ENV,
+    MANAGED_AGENT_START_NONCE_ENV,
     // Relay URL: overriding would let a malicious config redirect the
     // agent to an attacker-controlled relay.
     "BUZZ_RELAY_URL",

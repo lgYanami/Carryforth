@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use buzz_core_pkg::agent_process_env::{MANAGED_AGENT_OWNER_ENV, MANAGED_AGENT_START_NONCE_ENV};
 use tauri::AppHandle;
 
 use super::agent_env::build_buzz_agent_provider_defaults;
@@ -171,7 +172,7 @@ pub(crate) fn current_instance_id(app: &AppHandle) -> String {
 /// against when scanning processes. Kept here so the spawn stamp and the sweep
 /// matcher can never drift apart.
 fn buzz_marker_entry(instance_id: &str) -> Vec<u8> {
-    format!("BUZZ_MANAGED_AGENT={instance_id}").into_bytes()
+    format!("{MANAGED_AGENT_OWNER_ENV}={instance_id}").into_bytes()
 }
 
 /// Check if a running process is one of *our* managed agents: it must carry
@@ -894,7 +895,7 @@ fn buffer_contains_identifier(buf: &[u8], id: &[u8]) -> bool {
 /// Returns `None` if the process doesn't have the marker or can't be read.
 #[cfg(target_os = "macos")]
 fn extract_buzz_marker_value(pid: u32) -> Option<String> {
-    let prefix = b"BUZZ_MANAGED_AGENT=";
+    let prefix = format!("{MANAGED_AGENT_OWNER_ENV}=").into_bytes();
     let buf = sweep::procargs2_buffer(pid)?;
 
     if buf.len() < std::mem::size_of::<libc::c_int>() {
@@ -930,7 +931,7 @@ fn extract_buzz_marker_value(pid: u32) -> Option<String> {
     }
     // Search environment entries for our marker.
     for entry in buf[pos..].split(|&b| b == 0) {
-        if entry.starts_with(prefix) {
+        if entry.starts_with(&prefix) {
             return String::from_utf8(entry[prefix.len()..].to_vec()).ok();
         }
     }
@@ -939,10 +940,10 @@ fn extract_buzz_marker_value(pid: u32) -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn extract_buzz_marker_value(pid: u32) -> Option<String> {
-    let prefix = b"BUZZ_MANAGED_AGENT=";
+    let prefix = format!("{MANAGED_AGENT_OWNER_ENV}=").into_bytes();
     let data = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
     for entry in data.split(|&b| b == 0) {
-        if entry.starts_with(prefix) {
+        if entry.starts_with(&prefix) {
             return String::from_utf8(entry[prefix.len()..].to_vec()).ok();
         }
     }
@@ -1123,8 +1124,8 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
         let Some(agent_instance_id) = extract_buzz_marker_value(upid) else {
             continue;
         };
-        // Skip agents belonging to our own instance (handled by sweep_system_agent_processes).
-        if agent_instance_id == our_instance_id {
+        let ancestry = sweep::tracked_ancestry_macos(upid, info.pbi_ppid, skip_pids);
+        if !sweep::should_collect_foreign_agent(&agent_instance_id, our_instance_id, ancestry) {
             continue;
         }
         foreign_agents
@@ -1183,7 +1184,8 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
         let Some(agent_instance_id) = extract_buzz_marker_value(upid) else {
             continue;
         };
-        if agent_instance_id == our_instance_id {
+        let ancestry = sweep::tracked_ancestry_linux(upid, skip_pids);
+        if !sweep::should_collect_foreign_agent(&agent_instance_id, our_instance_id, ancestry) {
             continue;
         }
         foreign_agents
@@ -1457,10 +1459,14 @@ pub fn build_managed_agent_summary(
     // stamped at spawn.  This catches out-of-band adapter changes (manual
     // npm install/downgrade) that Phase-1 auto-restart doesn't cover.  The
     // cache is read-only here — no subprocess is spawned.
+    let workspace_relay_url = {
+        use tauri::Manager;
+        crate::relay::relay_ws_url_with_override(&app.state::<crate::app_state::AppState>())
+    };
     let needs_restart = pair_key
         .as_ref()
-        .and_then(|key| runtimes.get(key).map(|runtime| (key, runtime)))
-        .is_some_and(|(key, runtime)| {
+        .and_then(|key| runtimes.get(key))
+        .is_some_and(|runtime| {
             let global_for_hash =
                 crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
             let teams_for_hash = crate::managed_agents::load_teams(app).unwrap_or_default();
@@ -1469,7 +1475,7 @@ pub fn build_managed_agent_summary(
                     record,
                     personas,
                     &teams_for_hash,
-                    &key.relay_url,
+                    &workspace_relay_url,
                     &global_for_hash,
                 );
             let availability_drift = super::availability_drift(
@@ -1621,6 +1627,15 @@ pub(crate) fn configure_runtime_cli(
     }
 }
 
+pub(crate) fn managed_agent_relay_target(
+    pubkey: impl Into<String>,
+    configured_relay_url: &str,
+) -> Result<(ManagedAgentRuntimeKey, &str), String> {
+    let connection_relay_url = configured_relay_url.trim();
+    let runtime_key = ManagedAgentRuntimeKey::new(pubkey, connection_relay_url)?;
+    Ok((runtime_key, connection_relay_url))
+}
+
 /// Spawn an agent process without holding any locks on records or runtimes.
 /// Returns the child process and log path on success. The caller is responsible
 /// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
@@ -1630,14 +1645,15 @@ pub(crate) fn configure_runtime_cli(
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
-    relay_url: &str,
+    connection_relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
-    let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
+    let (runtime_key, connection_relay_url) =
+        managed_agent_relay_target(record.pubkey.clone(), connection_relay_url)?;
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
         &log_path,
@@ -1688,9 +1704,11 @@ pub fn spawn_agent_child(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| effective_command.clone());
 
-    // The caller supplies the explicit canonical pair relay. This is the only
-    // relay this child may connect to, regardless of the record/workspace default.
-    let effective_relay_url = runtime_key.relay_url.clone();
+    // Keep the configured authority for every real network operation. The
+    // canonical URL in `runtime_key` exists only for process identity and
+    // deduplication; replacing `localhost` with `127.0.0.1` here would select a
+    // different host-scoped community on the relay.
+    let effective_relay_url = connection_relay_url.to_string();
 
     // Augment PATH for DMG launches so child processes can find:
     //   - bundled CLI via ~/.local/bin symlink
@@ -2049,8 +2067,8 @@ pub fn spawn_agent_child(
     // Stamp desktop ownership and an unpredictable harness-generation identity.
     let start_nonce = uuid::Uuid::new_v4().simple().to_string();
     command
-        .env("BUZZ_MANAGED_AGENT", current_instance_id(app))
-        .env("BUZZ_MANAGED_AGENT_START_NONCE", &start_nonce);
+        .env(MANAGED_AGENT_OWNER_ENV, current_instance_id(app))
+        .env(MANAGED_AGENT_START_NONCE_ENV, &start_nonce);
 
     // Spawn the harness in its own process group so we can kill the entire
     // tree (harness + MCP servers + agent subprocesses) on shutdown.
@@ -2168,7 +2186,7 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
+    let mut process = spawn_agent_child(app, record, &relay_url, false, owner_hex)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),

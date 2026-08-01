@@ -146,6 +146,19 @@ fn reserved_keys_include_agent_owner_for_legacy_records() {
 }
 
 #[test]
+fn reserved_keys_include_managed_process_boundary() {
+    for key in [
+        buzz_core_pkg::agent_process_env::MANAGED_AGENT_OWNER_ENV,
+        buzz_core_pkg::agent_process_env::MANAGED_RUNTIME_MODE_ENV,
+        buzz_core_pkg::agent_process_env::MANAGED_AGENT_START_NONCE_ENV,
+    ] {
+        assert!(is_reserved_env_key(key), "{key} should be reserved");
+        let agent = map(&[(key, "forged")]);
+        assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
+    }
+}
+
+#[test]
 fn reserved_keys_include_respond_to_gate() {
     // Respond-to mode + allowlist control who the agent answers.
     // Overriding via env_vars would let the running agent answer

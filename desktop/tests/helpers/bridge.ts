@@ -52,6 +52,7 @@ type MockManagedAgentSeed = {
   pubkey: string;
   name: string;
   personaId?: string | null;
+  relayUrl?: string;
   status?: "running" | "stopped" | "deployed" | "not_deployed";
   channelNames?: string[];
   channelIds?: string[];
