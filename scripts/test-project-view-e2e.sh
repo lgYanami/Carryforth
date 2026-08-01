@@ -39,7 +39,10 @@ fi
 port="${PROJECT_VIEW_E2E_PORT:-$((22000 + ($$ % 10000)))}"
 health_port="$((port + 1))"
 metrics_port="$((port + 2))"
-test_host="project-view-${database_name}.localhost:${port}"
+# The disposable database and unique port already isolate this run. Use the
+# universally-resolvable localhost name instead of relying on libc/NSS to map
+# arbitrary `*.localhost` names to loopback (not every Linux environment does).
+test_host="localhost:${port}"
 relay_pid=""
 relay_log="$(mktemp)"
 

@@ -5162,6 +5162,11 @@ Documents         │
 
 ### 阶段 6：Context Reference 与 Role Brief / Agent 闭环
 
+> 交付状态（2026-08-01）：已完成。CLI、Desktop、SDK Role Brief closure、ACP body-free
+> enrichment/cache、Context control plane与跨域删除保护均已交付；只覆盖Desktop，不包含Mobile / Web。
+> 本地真实验收按[`stage6-context-canary.md`](stage6-context-canary.md)在独立scratch Community中完成，
+> 未扩大到broad rollout。
+
 目标：让 Resource / Document 成为真正可沿项目工作坐标发现的 Context。
 
 开发内容：

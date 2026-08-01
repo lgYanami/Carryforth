@@ -36,6 +36,8 @@ pub enum AuditAction {
     ProjectViewProvisioning,
     /// A security-critical Community change invalidated maintenance preflight.
     ProjectViewSecurityInvalidation,
+    /// The staged Project Context sub-capability was enabled or disabled.
+    ProjectContextControl,
     /// A controlled Project Document bootstrap or capability transition.
     ProjectDocumentControl,
     /// A trusted runtime supervisor was bound to an exact Assignment.
@@ -65,6 +67,7 @@ impl AuditAction {
             Self::ProjectViewMaintenance => "project_view_maintenance",
             Self::ProjectViewProvisioning => "project_view_provisioning",
             Self::ProjectViewSecurityInvalidation => "project_view_security_invalidation",
+            Self::ProjectContextControl => "project_context_control",
             Self::ProjectDocumentControl => "project_document_control",
             Self::RuntimeSupervisorRegistered => "runtime_supervisor_registered",
             Self::RuntimeSupervisorRevoked => "runtime_supervisor_revoked",
@@ -88,6 +91,7 @@ impl AuditAction {
         Self::ProjectViewMaintenance,
         Self::ProjectViewProvisioning,
         Self::ProjectViewSecurityInvalidation,
+        Self::ProjectContextControl,
         Self::ProjectDocumentControl,
         Self::RuntimeSupervisorRegistered,
         Self::RuntimeSupervisorRevoked,

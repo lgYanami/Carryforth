@@ -72,7 +72,7 @@ fi
 # gate.
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 -qtA \
-  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 33 AND success" \
+  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 34 AND success" \
   | grep -qx ok
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \

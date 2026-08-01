@@ -454,10 +454,17 @@ pub struct ContextResourceV3 {
     pub summary: Option<String>,
     /// Mandatory Guide Document identity.
     pub guide_document_id: Uuid,
-    /// Current verified Guide revision.
-    pub guide_document_revision: u64,
+    /// Current verified Guide revision, omitted when metadata is unavailable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub guide_document_revision: Option<u64>,
     /// Explicit CLI command for opt-in body retrieval.
     pub fetch: String,
+    /// Optional descriptive metadata did not fit the escaped prompt budget.
+    pub metadata_omitted_due_to_budget: bool,
 }
 
 /// Live Document metadata exposed in a Role Brief v3 Context slice.
@@ -466,10 +473,20 @@ pub struct ContextResourceV3 {
 pub struct ContextLiveDocumentV3 {
     /// Stable Document identity.
     pub document_id: Uuid,
-    /// Verified current active revision.
-    pub document_revision: u64,
-    /// Untrusted current title.
-    pub title: String,
+    /// Verified current active revision, omitted when metadata is unavailable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub document_revision: Option<u64>,
+    /// Untrusted current title, omitted when metadata is unavailable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub title: Option<String>,
     /// Untrusted current optional summary.
     #[serde(
         default,
@@ -479,6 +496,8 @@ pub struct ContextLiveDocumentV3 {
     pub summary: Option<String>,
     /// Explicit CLI command for opt-in body retrieval.
     pub fetch: String,
+    /// Optional descriptive metadata did not fit the escaped prompt budget.
+    pub metadata_omitted_due_to_budget: bool,
 }
 
 /// Pinned Document coordinate exposed without current metadata.

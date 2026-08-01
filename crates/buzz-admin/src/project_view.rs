@@ -92,10 +92,43 @@ pub(crate) enum ProjectViewCommand {
         #[command(subcommand)]
         command: ProjectViewMaintenanceCommand,
     },
+    /// Inspect or transition the staged Project Context sub-capability.
+    Context {
+        #[command(subcommand)]
+        command: ProjectViewContextCommand,
+    },
     /// Operate the capability-off Project View schema-v3 migration surface.
     V3 {
         #[command(subcommand)]
         command: ProjectViewV3Command,
+    },
+}
+
+/// Project Context capability control commands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProjectViewContextCommand {
+    /// Show flags, structural parity, Document readiness, and reference counts.
+    Status {
+        #[arg(long)]
+        community: String,
+    },
+    /// Enable only after all server, client, closure, and storage gates pass.
+    Enable {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+    },
+    /// Fail closed without deleting canonical Context coordinates.
+    Disable {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
     },
 }
 
@@ -348,11 +381,83 @@ pub(crate) async fn run(command: ProjectViewCommand) -> Result<i32> {
         ProjectViewCommand::Maintenance { command } => {
             run_maintenance(&db, command).await?;
         }
+        ProjectViewCommand::Context { command } => {
+            run_context(&db, command).await?;
+        }
         ProjectViewCommand::V3 { command } => {
             run_v3(&db, command).await?;
         }
     }
     Ok(0)
+}
+
+async fn run_context(db: &Db, command: ProjectViewContextCommand) -> Result<()> {
+    match command {
+        ProjectViewContextCommand::Status { community } => {
+            let status = required_status(db, &community).await?;
+            let context = db
+                .project_context_feature_status(status.community_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Community '{}' was not found", status.host))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "community_id": context.community_id.to_string(),
+                    "host": context.host,
+                    "archived": context.archived,
+                    "project_view_schema_version": context.project_view_schema_version,
+                    "project_view_enabled": context.project_view_enabled,
+                    "context_enabled": context.context_enabled,
+                    "document_enabled": context.document_enabled,
+                    "maintenance_state": context.maintenance_state,
+                    "project_revision": context.project_revision,
+                    "projection_generation": context.projection_generation,
+                    "projection_pubkey": context.projection_pubkey.map(|key| key.to_hex()),
+                    "document_catalog_revision": context.document_catalog_revision,
+                    "resource_reference_count": context.resource_reference_count,
+                    "document_reference_count": context.document_reference_count,
+                    "project_view_ready": context.project_view_ready,
+                    "document_ready": context.document_ready,
+                    "advertised_ready": context.advertised_ready,
+                }))?
+            );
+        }
+        ProjectViewContextCommand::Enable {
+            community,
+            idempotency_key,
+            operator_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let receipt = db
+                .set_project_context_enabled_checked(
+                    status.community_id,
+                    true,
+                    operator,
+                    &idempotency_key,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ProjectViewContextCommand::Disable {
+            community,
+            idempotency_key,
+            operator_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let receipt = db
+                .set_project_context_enabled_checked(
+                    status.community_id,
+                    false,
+                    operator,
+                    &idempotency_key,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+    }
+    Ok(())
 }
 
 async fn run_v3(db: &Db, command: ProjectViewV3Command) -> Result<()> {
@@ -1247,5 +1352,71 @@ mod tests {
             "relay.example"
         );
         assert!(normalize_required_host("   ").is_err());
+    }
+
+    #[test]
+    fn context_control_cli_has_closed_status_enable_and_disable_shapes() {
+        let status = <crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "project-view",
+            "context",
+            "status",
+            "--community",
+            "relay.example",
+        ])
+        .expect("parse context status");
+        assert!(matches!(
+            status.command,
+            crate::Command::ProjectView {
+                command: ProjectViewCommand::Context {
+                    command: ProjectViewContextCommand::Status { community }
+                }
+            } if community == "relay.example"
+        ));
+
+        for operation in ["enable", "disable"] {
+            let parsed = <crate::Cli as clap::Parser>::try_parse_from([
+                "buzz-admin",
+                "project-view",
+                "context",
+                operation,
+                "--community",
+                "relay.example",
+                "--idempotency-key",
+                "stage6-canary",
+                "--operator-pubkey",
+                "00",
+            ])
+            .unwrap_or_else(|error| panic!("parse context {operation}: {error}"));
+            assert!(matches!(
+                parsed.command,
+                crate::Command::ProjectView {
+                    command: ProjectViewCommand::Context { .. }
+                }
+            ));
+
+            let missing_key = <crate::Cli as clap::Parser>::try_parse_from([
+                "buzz-admin",
+                "project-view",
+                "context",
+                operation,
+                "--community",
+                "relay.example",
+            ]);
+            assert!(missing_key.is_err(), "{operation} must require idempotency");
+        }
+
+        assert!(<crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "project-view",
+            "context",
+            "enable",
+            "--community",
+            "relay.example",
+            "--idempotency-key",
+            "stage6-canary",
+            "--force",
+        ])
+        .is_err());
     }
 }

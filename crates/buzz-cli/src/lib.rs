@@ -326,6 +326,11 @@ pub enum ProjectViewCmd {
         #[command(subcommand)]
         command: ProjectViewV3ClientCmd,
     },
+    /// Discover and edit schema-v3 Context Reference coordinates
+    Context {
+        #[command(subcommand)]
+        command: ProjectViewContextCmd,
+    },
     /// Create one typed object with a CLI-generated UUID v4
     Create {
         /// Object type to create (the project profile is not creatable here).
@@ -362,6 +367,60 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
+    },
+}
+
+/// Context Reference operations for one active Project View object.
+#[derive(Subcommand)]
+pub enum ProjectViewContextCmd {
+    /// List the object's canonical Context Reference set
+    List {
+        /// Stable source object UUID.
+        object_id: Uuid,
+    },
+    /// Add one Resource, live Document, or pinned Document coordinate
+    Add {
+        /// Stable source object UUID.
+        object_id: Uuid,
+        /// Stable target Resource UUID.
+        #[arg(
+            long,
+            conflicts_with = "document",
+            required_unless_present = "document"
+        )]
+        resource: Option<Uuid>,
+        /// Stable target Document UUID.
+        #[arg(
+            long,
+            conflicts_with = "resource",
+            required_unless_present = "resource"
+        )]
+        document: Option<Uuid>,
+        /// Exact pinned Document revision; omission means a live reference.
+        #[arg(long, requires = "document")]
+        revision: Option<u64>,
+    },
+    /// Remove one exact Resource, live Document, or pinned Document coordinate
+    Remove {
+        /// Stable source object UUID.
+        object_id: Uuid,
+        /// Stable target Resource UUID.
+        #[arg(
+            long,
+            conflicts_with = "document",
+            required_unless_present = "document"
+        )]
+        resource: Option<Uuid>,
+        /// Stable target Document UUID.
+        #[arg(
+            long,
+            conflicts_with = "resource",
+            required_unless_present = "resource"
+        )]
+        document: Option<Uuid>,
+        /// Exact pinned Document revision; omission means a live reference.
+        #[arg(long, requires = "document")]
+        revision: Option<u64>,
     },
 }
 
@@ -2639,6 +2698,7 @@ mod tests {
         assert_eq!(
             names(&cmd, "project-view"),
             vec![
+                "context",
                 "create",
                 "delete",
                 "get",
@@ -2833,7 +2893,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
-            ("project-view", 8),
+            ("project-view", 9),
             ("reactions", 3),
             ("repos", 4),
             ("resources", 1),

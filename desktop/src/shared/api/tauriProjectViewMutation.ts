@@ -1,8 +1,10 @@
 import { invokeTauri } from "@/shared/api/tauri";
+import { canonicalizeProjectViewContextReferences } from "@/shared/api/tauriProjectViewContext";
 import {
   isProjectResourceDataV3,
   type ProjectViewMutationIntent,
   type ProjectViewMutationResult,
+  type ProjectViewContextReference,
   type ProjectViewObjectRef,
   type ProjectViewWritableObject,
   type RawProjectViewMutationResult,
@@ -13,6 +15,19 @@ function rawReference(reference: ProjectViewObjectRef) {
     object_type: reference.objectType,
     object_id: reference.objectId,
   };
+}
+
+function rawContextReference(reference: ProjectViewContextReference) {
+  return reference.referenceType === "resource"
+    ? { type: "resource", resource_id: reference.resourceId }
+    : {
+        type: "document",
+        document_id: reference.documentId,
+        mode: reference.mode,
+        ...(reference.mode === "pinned"
+          ? { document_revision: reference.documentRevision }
+          : {}),
+      };
 }
 
 function serializeWritableObject(
@@ -110,6 +125,16 @@ export function serializeProjectViewMutationIntent(
         expected_project_revision: intent.expectedProjectRevision,
         object_type: intent.objectType,
         object_id: intent.objectId,
+      };
+    case "context":
+      return {
+        operation: intent.operation,
+        expected_project_revision: intent.expectedProjectRevision,
+        object_type: intent.objectType,
+        object_id: intent.objectId,
+        context_references: canonicalizeProjectViewContextReferences(
+          intent.contextReferences,
+        ).map(rawContextReference),
       };
   }
 }

@@ -1042,10 +1042,29 @@ impl ProjectDocumentWriteTx {
         .fetch_one(&mut *self.tx)
         .await?;
 
-        // Resource/Context tables do not exist until later stages. Holding the
-        // Community exclusive lock now freezes the deletion-proof seam without
-        // pretending those future reference sources are implemented.
-        let deletion_blocked = false;
+        // The shared Community lock serializes Document deletion with Project
+        // View Resource/Context mutation. Guides and Live references protect
+        // the current Document; Pinned references deliberately preserve only
+        // an immutable historical revision and do not block ordinary delete.
+        let deletion_blocked: bool = sqlx::query_scalar(
+            "SELECT \
+                EXISTS ( \
+                    SELECT 1 FROM project_view_objects resource \
+                    WHERE resource.community_id = $1 \
+                      AND resource.schema_version = 3 \
+                      AND resource.deleted_at IS NULL \
+                      AND resource.guide_document_id = $2 \
+                ) OR EXISTS ( \
+                    SELECT 1 FROM project_view_document_context_references reference \
+                    WHERE reference.community_id = $1 \
+                      AND reference.target_document_id = $2 \
+                      AND reference.reference_mode = 'live' \
+                )",
+        )
+        .bind(self.community_id.as_uuid())
+        .bind(document_id)
+        .fetch_one(&mut *self.tx)
+        .await?;
         self.loaded = Some(LoadedBasis {
             target_id: document_id,
             catalog: catalog.clone(),
@@ -2019,7 +2038,7 @@ fn db_positive_revision_db(value: i64, field: &str) -> crate::Result<u64> {
     }
 }
 
-async fn document_projection_parity(
+pub(crate) async fn document_projection_parity(
     connection: &mut sqlx::PgConnection,
     community_id: CommunityId,
     expected_pubkey: &PublicKey,

@@ -1,4 +1,5 @@
 import { ProjectViewIntegrityError } from "@/shared/api/tauriProjectViewIntegrity";
+import { requireCanonicalProjectViewContextReferences } from "@/shared/api/tauriProjectViewContext";
 import type {
   ProjectView,
   ProjectViewContextReference,
@@ -67,7 +68,9 @@ function commonV3ObjectFields<T extends ProjectViewObjectType>(
     createdBy: raw.created_by,
     updatedBy: raw.updated_by,
     relations: normalizeRelations(raw.relations),
-    contextReferences: raw.context_references.map(normalizeContextReference),
+    contextReferences: requireCanonicalProjectViewContextReferences(
+      raw.context_references.map(normalizeContextReference),
+    ),
   };
 }
 

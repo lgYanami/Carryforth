@@ -24,6 +24,7 @@ use crate::commands::project_view_v2_snapshot::{
     read_verified_v2_snapshot, read_verified_v3_snapshot, require_v2_identity,
     runtime_fence_from_env, ProjectViewIdentity, ProjectViewSchema, RoleHistoryRequest,
 };
+use crate::commands::project_view_v3_context::resolve_v3_role_brief;
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
 use crate::{
@@ -147,9 +148,8 @@ async fn show_brief(
         }
         ProjectViewSchema::V3 => {
             let snapshot = read_verified_v3_snapshot(client, identity).await?;
-            let brief = snapshot
-                .brief_for(member, Utc::now())
-                .map_err(|error| v3_integrity_error(error.to_string()))?;
+            let brief =
+                resolve_v3_role_brief(client, identity, &snapshot, member, Utc::now()).await?;
             if markdown {
                 print!("{}", render_role_brief_markdown_v3(&brief));
                 return Ok(());
@@ -1001,13 +1001,6 @@ fn print_json(value: &Value, format: &OutputFormat) -> Result<(), CliError> {
 fn integrity_error(message: impl Into<String>) -> CliError {
     CliError::Other(format!(
         "Project View v2 integrity error: {}",
-        message.into()
-    ))
-}
-
-fn v3_integrity_error(message: impl Into<String>) -> CliError {
-    CliError::Other(format!(
-        "Project View v3 integrity error: {}",
         message.into()
     ))
 }

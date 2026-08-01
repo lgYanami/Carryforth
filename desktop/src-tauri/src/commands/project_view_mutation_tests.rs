@@ -354,6 +354,47 @@ fn v3_resource_rejects_the_legacy_locator_shape() {
 }
 
 #[test]
+fn v3_context_replacement_round_trips_only_closed_coordinates() {
+    let object_id = Uuid::new_v4();
+    let resource_id = Uuid::new_v4();
+    let document_id = Uuid::new_v4();
+    let references = vec![
+        ProjectContextReference::Resource { resource_id },
+        ProjectContextReference::Document {
+            document_id,
+            mode: buzz_project_view_pkg::v3::DocumentReferenceMode::Live,
+            document_revision: None,
+        },
+        ProjectContextReference::Document {
+            document_id,
+            mode: buzz_project_view_pkg::v3::DocumentReferenceMode::Pinned,
+            document_revision: Some(7),
+        },
+    ];
+    let prepared = prepare_v3_mutation(ProjectViewMutationInput::Context {
+        expected_project_revision: 11,
+        object_type: ProjectViewObjectType::Role,
+        object_id,
+        context_references: references.clone(),
+    })
+    .expect("prepare v3 Context replacement");
+    let event = prepared
+        .builder
+        .sign_with_keys(&Keys::generate())
+        .expect("sign v3 Context replacement");
+    let command = buzz_project_view_pkg::v3::ProjectObjectCommandV3::from_json(&event.content)
+        .expect("parse closed v3 command");
+    assert_eq!(command.expected_project_revision, 11);
+    let buzz_project_view_pkg::v3::ProjectObjectRequestV3::Update(update) = command.request else {
+        panic!("expected v3 update");
+    };
+    assert_eq!(update.object_id(), object_id);
+    assert_eq!(update.context_references(), Some(references.as_slice()));
+    assert!(!event.content.contains("content_markdown"));
+    assert!(!event.content.contains("permission"));
+}
+
+#[test]
 fn receipt_requires_the_canonical_response_prefix() {
     let event = build_initialize(
         profile(),

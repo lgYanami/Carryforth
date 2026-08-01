@@ -13,6 +13,7 @@ cd "${REPO_ROOT}"
 . ./bin/activate-hermit
 
 umask 077
+export CARGO_INCREMENTAL=0
 
 fail() {
   echo "Project View Stage 5 canary: $*" >&2
@@ -37,7 +38,7 @@ for container in buzz-postgres buzz-redis buzz-minio; do
   fi
 done
 
-database_name="buzz_pv_stage5_canary_$$_${RANDOM}"
+database_name="${PROJECT_VIEW_STAGE5_DATABASE_NAME:-buzz_pv_stage5_canary_$$_${RANDOM}}"
 if [[ ! "${database_name}" =~ ^buzz_pv_stage5_canary_[0-9_]+$ ]]; then
   fail "refusing unsafe scratch database name: ${database_name}"
 fi
@@ -92,6 +93,13 @@ stop_relay() {
   relay_pid=""
 }
 
+clean_incremental_artifacts() {
+  for root in "${REPO_ROOT}/target" "${REPO_ROOT}/desktop/src-tauri/target"; do
+    [[ -d "${root}" ]] || continue
+    find "${root}" -type d -name incremental -prune -exec rm -rf -- {} +
+  done
+}
+
 cleanup() {
   stop_acp
   stop_relay
@@ -105,6 +113,7 @@ cleanup() {
   if [[ "${temporary_dir}" == /tmp/tmp.* ]]; then
     rm -rf -- "${temporary_dir}"
   fi
+  clean_incremental_artifacts
 }
 trap cleanup EXIT
 

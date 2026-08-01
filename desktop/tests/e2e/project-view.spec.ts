@@ -588,6 +588,25 @@ const V3_READY_VIEW = {
   role_continuity: roleContinuityFixtureV3(),
 } satisfies RawProjectViewLoadResult;
 
+function contextReadyV3View(): RawProjectViewLoadResult {
+  return {
+    ...structuredClone(V3_READY_VIEW),
+    project_context_supported: true,
+  };
+}
+
+function contextUnavailableWithPreservedIssueRef(): RawProjectViewLoadResult {
+  const view = structuredClone(V3_READY_VIEW);
+  const issueObject = view.objects_v3.find(
+    (candidate) => candidate.id === IDS.issue,
+  );
+  if (!issueObject) throw new Error("v3 Issue fixture is unavailable");
+  issueObject.context_references = [
+    { type: "resource", resource_id: IDS.resource },
+  ];
+  return view;
+}
+
 function guideDocumentState(): MockProjectDocumentState {
   const guide: ProjectDocument = {
     communityKey: "fixture",
@@ -889,6 +908,99 @@ test("v3 Resource creation uses an active Guide and never exposes a legacy locat
   await expect(page.getByTestId("document-markdown")).toContainText(
     "reviewed clone and contribution workflow",
   );
+});
+
+test("v3 Role Context picker submits canonical coordinates and Resource sources hide Resource targets", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectDocument: guideDocumentState(),
+    projectView: contextReadyV3View(),
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await page
+    .getByRole("button", { name: "Inspect Role Context steward" })
+    .click();
+  const context = page.getByTestId("project-view-context");
+  await expect(context).toContainText("Verified coordinates only");
+  await expect(context).toContainText("Ready");
+  await page
+    .getByLabel("Context target type", { exact: true })
+    .selectOption("resource");
+  await page
+    .getByLabel("Context target", { exact: true })
+    .selectOption(IDS.resource);
+  await page.getByRole("button", { name: "Add Context" }).click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const mutations = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations?.[0]).toEqual({
+    operation: "context",
+    expected_project_revision: 7,
+    object_type: "role",
+    object_id: IDS.role,
+    context_references: [{ type: "resource", resource_id: IDS.resource }],
+  });
+
+  await page.getByRole("button", { name: "Close inspector" }).click();
+  await page
+    .getByRole("button", { name: "Inspect Resource Buzz repository" })
+    .click();
+  const targetType = page.getByLabel("Context target type", { exact: true });
+  await expect(targetType.locator('option[value="resource"]')).toHaveCount(0);
+  await expect(targetType).toHaveValue("live_document");
+});
+
+test("disabled Context keeps preserved coordinates visible and permits only cleanup", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: contextUnavailableWithPreservedIssueRef(),
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page
+    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
+    .click();
+
+  const context = page.getByTestId("project-view-context");
+  await expect(context).toContainText("Unavailable");
+  await expect(context).toContainText("Buzz repository");
+  await expect(context).toContainText("Preserved coordinates remain visible");
+  await expect(page.getByRole("button", { name: "Add Context" })).toHaveCount(
+    0,
+  );
+  await page
+    .getByRole("button", { name: "Remove Context Buzz repository" })
+    .click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const mutations = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations?.[0]).toEqual({
+    operation: "context",
+    expected_project_revision: 7,
+    object_type: "issue",
+    object_id: IDS.issue,
+    context_references: [],
+  });
 });
 
 test("v3 Resource saga preserves a newly committed Guide when the Resource conflicts", async ({

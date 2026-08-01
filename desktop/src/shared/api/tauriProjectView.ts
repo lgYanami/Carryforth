@@ -19,6 +19,7 @@ export {
   mutateProjectView,
   serializeProjectViewMutationIntent,
 } from "@/shared/api/tauriProjectViewMutation";
+export { canonicalizeProjectViewContextReferences } from "@/shared/api/tauriProjectViewContext";
 export {
   assembleProjectViewV3,
   normalizeProjectViewObjectV3,
@@ -294,6 +295,7 @@ export type RawProjectViewLoadResult =
   | {
       status: "ready";
       relay_pubkey: string;
+      project_context_supported?: boolean;
       schema_version: 1 | 2;
       project_revision: number;
       projection_generation: number;
@@ -306,6 +308,7 @@ export type RawProjectViewLoadResult =
   | {
       status: "ready";
       relay_pubkey: string;
+      project_context_supported?: boolean;
       schema_version: 3;
       project_revision: number;
       projection_generation: number;
@@ -449,6 +452,7 @@ export type ProjectViewLoadResult =
   | {
       status: "ready";
       relayPubkey: string;
+      contextCapability: boolean;
       schemaVersion: 1 | 2 | 3;
       projectRevision: number;
       projectionGeneration: number;
@@ -515,6 +519,13 @@ export type ProjectViewMutationIntent =
       expectedProjectRevision: number;
       objectType: Exclude<ProjectViewObjectType, "project_profile">;
       objectId: string;
+    }
+  | {
+      operation: "context";
+      expectedProjectRevision: number;
+      objectType: ProjectViewObjectType;
+      objectId: string;
+      contextReferences: ProjectViewContextReference[];
     };
 
 export type RawProjectViewMutationResult =
@@ -901,6 +912,7 @@ export function normalizeProjectViewLoadResult(
       return {
         status: raw.status,
         relayPubkey: raw.relay_pubkey,
+        contextCapability: Boolean(raw.project_context_supported),
         schemaVersion: raw.schema_version,
         projectRevision: raw.project_revision,
         projectionGeneration: raw.projection_generation,

@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 34);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1006,6 +1006,16 @@ mod tests {
         assert!(project_view_v3
             .contains("CREATE OR REPLACE FUNCTION project_role_continuity_validate_community"));
         assert!(project_view_v3.contains("project_view_v3_validate_community"));
+
+        // Project Context gets a separate, append-only, replay-first control
+        // ledger. Merely applying the migration cannot enable the capability.
+        assert_eq!(migrations[33].version, 34);
+        let project_context_control = migrations[33].sql.as_str();
+        assert!(project_context_control.contains("CREATE TABLE project_view_context_operations"));
+        assert!(project_context_control.contains("UNIQUE (community_id, idempotency_key_hash)"));
+        assert!(project_context_control.contains("closure_protocol_version"));
+        assert!(project_context_control.contains("project_view_context_operations_immutable"));
+        assert!(!project_context_control.contains("SET project_context_enabled = TRUE"));
     }
 
     #[test]
@@ -1054,6 +1064,9 @@ mod tests {
             "project_document_revisions_append_only",
             "project_document_reject_hard_delete",
             "project_document_validate_community",
+            "CREATE TABLE project_view_context_operations",
+            "project_view_context_operations_idempotency_unique",
+            "project_view_context_operations_immutable",
         ] {
             assert!(
                 schema.contains(fragment),
@@ -1111,6 +1124,7 @@ mod tests {
             "project_documents",
             "project_document_revisions",
             "project_document_changes",
+            "project_view_context_operations",
         ] {
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                 .bind(format!("public.{relation}"))
@@ -1349,8 +1363,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0033");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
+            .expect("upgrade scratch database through 0034");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1486,8 +1500,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0033");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
+            .expect("upgrade scratch database through 0034");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -1564,15 +1578,15 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(33));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(34));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
-             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32) AND success",
+             WHERE version BETWEEN 25 AND 34 AND success",
         )
         .fetch_one(&first)
         .await
         .expect("count Project View migration ledger entries");
-        assert_eq!(project_view_migration_count, 8);
+        assert_eq!(project_view_migration_count, 10);
 
         first.close().await;
         second.close().await;
@@ -1652,7 +1666,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
     }
 
     #[tokio::test]

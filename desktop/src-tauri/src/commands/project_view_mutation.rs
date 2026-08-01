@@ -3,8 +3,8 @@
 use buzz_core_pkg::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
 use buzz_project_view_pkg::v2::{ProjectObjectCommand, RoleContinuityChange};
 use buzz_project_view_pkg::v3::{
-    CreateProjectObjectV3, DeleteProjectObjectV3, NewProjectViewObjectV3, ProjectObjectCommandV3,
-    ProjectObjectRequestV3, UpdateProjectObjectV3,
+    CreateProjectObjectV3, DeleteProjectObjectV3, NewProjectViewObjectV3, ProjectContextReference,
+    ProjectObjectCommandV3, ProjectObjectRequestV3, UpdateProjectObjectV3,
 };
 use buzz_project_view_pkg::{
     CreateMutation, DeleteMutation, InitializeGoal, InitializeMutation, MutationRequest,
@@ -93,6 +93,17 @@ pub enum ProjectViewMutationInput {
         object_type: ProjectViewObjectType,
         /// Stable object identifier.
         object_id: Uuid,
+    },
+    /// Replace the complete canonical Context Reference set on one v3 object.
+    Context {
+        /// Exact Project revision on which the replacement was based.
+        expected_project_revision: u64,
+        /// Immutable source object type.
+        object_type: ProjectViewObjectType,
+        /// Stable source object identifier.
+        object_id: Uuid,
+        /// Complete canonical replacement set.
+        context_references: Vec<ProjectContextReference>,
     },
 }
 
@@ -299,6 +310,9 @@ async fn execute_mutation(
 
 fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation, String> {
     match input {
+        ProjectViewMutationInput::Context { .. } => {
+            Err("unsupported: Context Reference mutations require Project View v3".to_owned())
+        }
         ProjectViewMutationInput::Initialize { profile, goals } => {
             let goals: Vec<InitializeGoal> = goals
                 .into_iter()
@@ -447,6 +461,24 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
                 object_type,
                 object_id,
             }),
+        ),
+        ProjectViewMutationInput::Context {
+            expected_project_revision,
+            object_type,
+            object_id,
+            context_references,
+        } => (
+            expected_project_revision,
+            MutationTarget {
+                object_type,
+                object_id,
+                deleted: false,
+            },
+            ProjectObjectRequestV3::Update(update_input_v3(
+                object_type,
+                object_id,
+                json!({ "context_references": context_references }),
+            )?),
         ),
     };
     let command = ProjectObjectCommandV3::new(expected_project_revision, None, request);

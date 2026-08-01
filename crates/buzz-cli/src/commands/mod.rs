@@ -16,6 +16,7 @@ pub mod pr;
 pub mod project_view;
 pub(crate) mod project_view_v2_snapshot;
 pub(crate) mod project_view_v3_approval;
+pub(crate) mod project_view_v3_context;
 pub mod reactions;
 pub mod repos;
 pub mod resources;

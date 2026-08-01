@@ -1,5 +1,60 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-01 — 阶段 6 软件与本地真实 Context canary 完成
+
+阶段目标：让 Project View v3 的 Resource、Live / Pinned Document成为可沿Project / Goal / Role /
+Work等项目坐标发现的Context，同时只交付可信坐标和无正文metadata，不把Context误当权限或自动执行来源。
+第一方图形客户端只覆盖Desktop；Mobile与Web不在本阶段范围。
+
+### 已交付
+
+- CLI新增`project-view context list / add / remove`。便利写入先读取同一verified v3 snapshot，在本地构造
+  完整canonical replacement，再携带exact global revision、active Assignment与Runtime fence提交；v3
+  `objects[]`回执被strict解析并核对operation、object type / ID / revision与delete状态，v1/v2 flat回执保持可用。
+- Desktop Inspector新增Context chips与picker，支持Resource、Live Document与Pinned Document；Resource source
+  不显示Resource target。capability关闭时保留verified只读坐标，只允许subset cleanup，不开放add / retarget；
+  native与TypeScript adapter round-trip同一closed canonical set。
+- SDK完成`RoleBriefV3.context`有界一跳closure：Profile、Goals、当前Role、nonterminal responsible Work、相关
+  Issue / handling Work、latest Checkpoint与最近3个Handoff可贡献Context；Resource只展开primary Guide和直接
+  Document。最多64个Resource、64个mandatory Guide、64个supplementary Document，最终escaped Context block
+  不超过64 KiB；Resource / Guide pair不可拆分。
+- Role Brief只输出Resource / Document coordinate、可信来源revision、无正文title / summary与显式fetch command。
+  Pinned只输出exact historical coordinate，不后台查询含Markdown的revision event；不可信metadata被单行化并
+  转义delimiter，不能提升为system instruction。
+- CLI与ACP都以Document meta A → required heads → meta B构造稳定窗口并有限重试。ACP cache key包含Relay、
+  member / Assignment、PV meta / revision / generation与Document meta / catalog revision / generation；Document
+  编辑不推进PV revision，但下一次resolve会刷新Live metadata。metadata失败显式降级为`unavailable`，不复用
+  stale值，也不撤销已验证Assignment或当前Runtime fence。
+- `buzz-admin project-view context status / enable / disable`通过Community exclusive lock原子控制
+  `project_context_enabled`。enable要求schema 3、normal maintenance、Project View / Document signer与projection
+  parity、normalized reference parity全部ready；idempotency replay先于mutable readiness，控制receipt与audit
+  durable保存。NIP-11只在ready后广告`buzz-project-context-v1`；disable不删除refs。
+- Document delete在同一Community锁内查询Resource Guide与Live Context反向索引，并在pure reducer阶段返回
+  `still_referenced`；Pinned不阻止普通delete且历史revision继续可读。Resource delete同样受normalized反向索引
+  保护。
+- ACP base prompt只指导Agent按当前task显式读取`buzz resources guide ... --content-only`，并明确Guide不能授权
+  external action、安装Skill / Plugin、修改MCP、请求Secret或运行代码。Context出现本身不会触发任何外部动作。
+- 新增[`stage6-context-canary.md`](stage6-context-canary.md)与可重复脚本
+  `scripts/test-project-view-stage6-canary.sh`。Stage 5/6 canary及开发测试批次关闭Cargo增量编译，并在退出时清理
+  workspace与Tauri的`target/**/incremental`。
+
+### 已完成的本地真实运行交付
+
+- 在真实本地PostgreSQL、Redis、Relay、`buzz-cli`、`buzz-admin`、`buzz-acp`、Runtime supervisor和ACP child
+  栈上，从独立Stage 5 v3前置状态原子启用Context并验证NIP-11 advertisement与idempotent replay。
+- managed Agent通过当前Runtime fence为Role加入Resource、Live与Pinned坐标；已退休Runtime和已结束Assignment
+  均不能重放预签名Context mutation。disable期间坐标保持可见、add拒绝、subset remove成功，re-enable后
+  CLI / Role Brief立即观察同一canonical set。
+- strict Role Brief输出`ready + verified`、primary Guide、Live revision与Pinned coordinate且不含正文；Agent-facing
+  CLI显式读取Guide。Document revision 1 → 2后PV revision保持不变而Live metadata刷新；移除Live后Document
+  delete成功，Pinned revision 1仍可读取。
+- Live Document、mandatory Guide与Context-referenced Resource的删除保护均返回明确conflict；normalized refs最终
+  清空，3次Context控制操作对应3条durable operation与3条hash-chain audit，replay未追加重复记录。
+- 2026-08-01T12:37:18Z验收通过，证据位于
+  `test-results/stage6-canary/20260801T123618Z-1542000`；`artifact-digests.sha256`自身SHA-256为
+  `424fc05ce7e321a40b7bb7dd4d4101028bd96b01f94a7a8f963f74c65c2361f8`。scratch数据库与进程已清理，
+  `target/**/incremental`计数为0；没有执行broad rollout或真实外部部署。
+
 ## 2026-08-01 — 阶段 5 软件与本地真实 canary 完成
 
 阶段目标：交付可安全迁移到 Project View v3 的 dual clients、Resource → Guide 使用闭环与

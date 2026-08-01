@@ -10,8 +10,8 @@ use crate::relay::{
 };
 
 use super::{
-    integrity_error, ProjectViewIdentity, ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
-    PROJECT_VIEW_V2_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
+    integrity_error, ProjectViewIdentity, ProjectViewSchema, PROJECT_CONTEXT_EXTENSION,
+    PROJECT_VIEW_V1_EXTENSION, PROJECT_VIEW_V2_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
 };
 
 #[derive(Debug, Deserialize)]
@@ -82,5 +82,9 @@ pub(crate) async fn read_identity_at(
             .supported_extensions
             .iter()
             .any(|extension| extension == "buzz-project-document-v1"),
+        project_context_supported: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_CONTEXT_EXTENSION),
     }))
 }

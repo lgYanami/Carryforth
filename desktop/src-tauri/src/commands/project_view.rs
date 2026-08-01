@@ -40,6 +40,7 @@ use crate::relay::query_relay;
 pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
 pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 pub(crate) const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
+pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 
@@ -55,6 +56,7 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
     pub(crate) schema: ProjectViewSchema,
     pub(crate) project_document_supported: bool,
+    pub(crate) project_context_supported: bool,
 }
 
 struct ProjectSnapshot {
@@ -134,6 +136,8 @@ pub enum ProjectViewLoadResult {
     Ready {
         /// Canonical Relay signing identity established by NIP-11.
         relay_pubkey: String,
+        /// Whether the independent Context sub-capability is currently ready.
+        project_context_supported: bool,
         /// Project View protocol schema selected by the Community.
         schema_version: u16,
         /// Current optimistic-concurrency revision.
@@ -193,6 +197,7 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
                 snapshot.map(
                     |ProjectSnapshot { meta, view }| ProjectViewLoadResult::Ready {
                         relay_pubkey: identity.relay_pubkey.to_hex(),
+                        project_context_supported: false,
                         schema_version: 1,
                         project_revision: meta.project_revision,
                         projection_generation: meta.projection_generation,
@@ -215,6 +220,7 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
                              role_continuity,
                          }| ProjectViewLoadResult::Ready {
                             relay_pubkey: identity.relay_pubkey.to_hex(),
+                            project_context_supported: false,
                             schema_version: 2,
                             project_revision: meta.project_revision,
                             projection_generation: meta.projection_generation,
@@ -240,6 +246,7 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
                              role_continuity,
                          }| ProjectViewLoadResult::Ready {
                             relay_pubkey: identity.relay_pubkey.to_hex(),
+                            project_context_supported: identity.project_context_supported,
                             schema_version: 3,
                             project_revision: meta.project_revision,
                             projection_generation: meta.projection_generation,

@@ -24,6 +24,8 @@ const BEGIN_REQUEST_DOMAIN: &[u8] = b"buzz-pv3-maintenance-begin-request-v1\0";
 const OPERATION_REQUEST_DOMAIN: &[u8] = b"buzz-pv3-maintenance-operation-request-v1\0";
 const ACK_REQUEST_DOMAIN: &[u8] = b"buzz-pv3-maintenance-ack-request-v1\0";
 const PREPARE_REQUEST_DOMAIN: &[u8] = b"buzz-pv3-prepare-request-v1\0";
+const CONTEXT_REQUEST_DOMAIN: &[u8] = b"buzz-project-context-control-request-v1\0";
+const PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION: u64 = 1;
 
 /// Stable failures from maintenance, acknowledgement, or provisioning.
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +184,24 @@ pub struct ProjectViewV3PreparationReceipt {
     /// Target schema version, always three.
     pub target_schema_version: u16,
     /// Whether the exact request was replayed.
+    pub replayed: bool,
+    /// Complete stored result body.
+    pub result: Value,
+}
+
+/// Durable receipt for one Project Context capability transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectContextCapabilityReceipt {
+    /// Community identity.
+    #[serde(serialize_with = "serialize_community_id")]
+    pub community_id: CommunityId,
+    /// Stable control operation identity.
+    pub operation_id: Uuid,
+    /// Desired capability state recorded by the request.
+    pub enabled: bool,
+    /// Deployed Role Brief closure protocol checked by enable.
+    pub closure_protocol_version: u64,
+    /// Whether the exact durable receipt was replayed.
     pub replayed: bool,
     /// Complete stored result body.
     pub result: Value,
@@ -1318,6 +1338,242 @@ impl Db {
         })
     }
 
+    /// Atomically enable or disable the staged Project Context capability.
+    ///
+    /// Exact idempotency receipts are replayed before evaluating mutable
+    /// readiness. Enable holds the exclusive Community lock while validating
+    /// Project View v3 structure, normalized Context parity, Project Document
+    /// signer/projection parity, and the deployed closure protocol. Disable is
+    /// fail-closed and preserves all canonical references.
+    #[allow(clippy::too_many_lines)]
+    pub async fn set_project_context_enabled_checked(
+        &self,
+        community_id: CommunityId,
+        enabled: bool,
+        requested_by: PublicKey,
+        idempotency_key: &str,
+    ) -> ProjectViewMaintenanceResult<ProjectContextCapabilityReceipt> {
+        let idempotency_key_hash = idempotency_hash(idempotency_key)?;
+        let request_hash = context_request_hash(community_id, enabled);
+        let operation = if enabled { "enable" } else { "disable" };
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        require_human_operator_in_tx(&mut tx, community_id, requested_by).await?;
+
+        if let Some(row) = sqlx::query(
+            "SELECT operation_id, canonical_request_hash, result_receipt \
+             FROM project_view_context_operations \
+             WHERE community_id = $1 AND idempotency_key_hash = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(idempotency_key_hash.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if bytes32(
+                row.try_get("canonical_request_hash")?,
+                "canonical_request_hash",
+            )? != request_hash
+            {
+                return Err(ProjectViewMaintenanceError::Conflict(
+                    "Context capability key was reused for another request".to_owned(),
+                ));
+            }
+            let operation_id: Uuid = row.try_get("operation_id")?;
+            let result: Value = row.try_get("result_receipt")?;
+            tx.rollback().await?;
+            return Ok(ProjectContextCapabilityReceipt {
+                community_id,
+                operation_id,
+                enabled,
+                closure_protocol_version: PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION,
+                replayed: true,
+                result,
+            });
+        }
+
+        let pointer = sqlx::query(
+            "SELECT community.archived_at IS NULL AS active, \
+                    community.project_view_schema_version, \
+                    community.project_view_enabled, community.project_context_enabled, \
+                    community.project_document_enabled, maintenance.state \
+             FROM communities community \
+             JOIN project_view_maintenance maintenance \
+               ON maintenance.community_id = community.id \
+             WHERE community.id = $1 FOR UPDATE OF community, maintenance",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ProjectViewMaintenanceError::Unavailable("Community does not exist".to_owned())
+        })?;
+        let current_enabled: bool = pointer.try_get("project_context_enabled")?;
+
+        if enabled {
+            let ready = pointer.try_get::<bool, _>("active")?
+                && pointer.try_get::<i16, _>("project_view_schema_version")? == 3
+                && pointer.try_get::<bool, _>("project_view_enabled")?
+                && pointer.try_get::<bool, _>("project_document_enabled")?
+                && pointer.try_get::<String, _>("state")? == "normal";
+            if !ready {
+                return Err(ProjectViewMaintenanceError::Unavailable(
+                    "Context enable requires an active, normal, Project View v3 Community with Project View and Document capabilities enabled"
+                        .to_owned(),
+                ));
+            }
+            let project_view_pubkey: Vec<u8> = sqlx::query_scalar(
+                "SELECT projection_pubkey FROM project_view_state \
+                 WHERE community_id = $1 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                ProjectViewMaintenanceError::Unavailable(
+                    "Project View v3 state is missing".to_owned(),
+                )
+            })?;
+            let relay_pubkey = PublicKey::from_slice(&project_view_pubkey).map_err(|error| {
+                ProjectViewMaintenanceError::Invalid(format!(
+                    "stored Project View projection_pubkey is invalid: {error}"
+                ))
+            })?;
+            if !Self::project_view_v3_structural_ready_in_tx(&mut tx, community_id, &relay_pubkey)
+                .await?
+            {
+                return Err(ProjectViewMaintenanceError::Unavailable(
+                    "Project View v3 canonical, normalized Context, or projection parity is not ready"
+                        .to_owned(),
+                ));
+            }
+
+            let document = sqlx::query(
+                "SELECT projection_pubkey, meta_projection_event_id, active_document_count \
+                 FROM project_document_state WHERE community_id = $1 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                ProjectViewMaintenanceError::Unavailable(
+                    "Project Document canonical state is missing".to_owned(),
+                )
+            })?;
+            let document_pubkey: Vec<u8> = document.try_get("projection_pubkey")?;
+            if document_pubkey != project_view_pubkey {
+                return Err(ProjectViewMaintenanceError::Unavailable(
+                    "Project View and Document stable projection signers differ".to_owned(),
+                ));
+            }
+            sqlx::query("SELECT project_document_validate_community($1)")
+                .bind(community_id.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+            let meta_event_id: Vec<u8> = document.try_get("meta_projection_event_id")?;
+            let active_count: i64 = document.try_get("active_document_count")?;
+            if !crate::project_document::document_projection_parity(
+                &mut tx,
+                community_id,
+                &relay_pubkey,
+                Some(&meta_event_id),
+                Some(active_count),
+            )
+            .await?
+            {
+                return Err(ProjectViewMaintenanceError::Unavailable(
+                    "Project Document canonical/projection parity is not ready".to_owned(),
+                ));
+            }
+        }
+
+        let operation_id = Uuid::new_v4();
+        let accepted_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let counts = sqlx::query(
+            "SELECT \
+                (SELECT count(*)::bigint FROM project_view_resource_context_references \
+                 WHERE community_id = $1) AS resource_references, \
+                (SELECT count(*)::bigint FROM project_view_document_context_references \
+                 WHERE community_id = $1) AS document_references",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        let changed = current_enabled != enabled;
+        sqlx::query("UPDATE communities SET project_context_enabled = $2 WHERE id = $1")
+            .bind(community_id.as_uuid())
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?;
+        let requester = requested_by.to_bytes();
+        let audit = buzz_audit::append_in_transaction(
+            &mut tx,
+            NewAuditEntry {
+                community_id,
+                action: AuditAction::ProjectContextControl,
+                actor_pubkey: Some(requester.to_vec()),
+                object_id: Some(operation_id.to_string()),
+                detail: json!({
+                    "operation": operation,
+                    "enabled": enabled,
+                    "changed": changed,
+                    "closure_protocol_version": PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION,
+                    "idempotency_key_hash": hex::encode(idempotency_key_hash),
+                }),
+            },
+        )
+        .await?;
+        let result = json!({
+            "community_id": community_id.to_string(),
+            "operation_id": operation_id,
+            "operation": operation,
+            "enabled": enabled,
+            "changed": changed,
+            "preserved_resource_reference_count": counts.try_get::<i64, _>("resource_references")?,
+            "preserved_document_reference_count": counts.try_get::<i64, _>("document_references")?,
+            "closure_protocol_version": PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION,
+        });
+        sqlx::query(
+            "INSERT INTO project_view_context_operations \
+                (community_id, operation_id, operation, idempotency_key_hash, \
+                 canonical_request_hash, requested_by, closure_protocol_version, \
+                 audit_seq, result_receipt, accepted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(operation_id)
+        .bind(operation)
+        .bind(idempotency_key_hash.as_slice())
+        .bind(request_hash.as_slice())
+        .bind(requester.as_slice())
+        .bind(
+            i64::try_from(PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION).map_err(|_| {
+                ProjectViewMaintenanceError::Invalid(
+                    "closure protocol version exceeds BIGINT".to_owned(),
+                )
+            })?,
+        )
+        .bind(audit.seq)
+        .bind(&result)
+        .bind(accepted_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(ProjectContextCapabilityReceipt {
+            community_id,
+            operation_id,
+            enabled,
+            closure_protocol_version: PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION,
+            replayed: false,
+            result,
+        })
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn project_view_maintenance_operation(
         &self,
@@ -2418,6 +2674,17 @@ fn prepare_request_hash(community_id: CommunityId) -> [u8; 32] {
     hash_parts(
         PREPARE_REQUEST_DOMAIN,
         &[community_id.as_uuid().as_bytes(), &3_u16.to_be_bytes()],
+    )
+}
+
+fn context_request_hash(community_id: CommunityId, enabled: bool) -> [u8; 32] {
+    hash_parts(
+        CONTEXT_REQUEST_DOMAIN,
+        &[
+            community_id.as_uuid().as_bytes(),
+            &[u8::from(enabled)],
+            &PROJECT_CONTEXT_CLOSURE_PROTOCOL_VERSION.to_be_bytes(),
+        ],
     )
 }
 

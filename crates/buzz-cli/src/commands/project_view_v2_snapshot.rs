@@ -32,6 +32,8 @@ use crate::error::CliError;
 pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
 pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 pub(crate) const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
+pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
+pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_ENTITY_PAGE_SIZE: usize = 500;
 const RUNTIME_FENCE_FILE_MAX_BYTES: u64 = 4 * 1024;
@@ -48,6 +50,8 @@ pub(crate) enum ProjectViewSchema {
 pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
     pub(crate) schema: ProjectViewSchema,
+    pub(crate) context_enabled: bool,
+    pub(crate) document_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -113,6 +117,14 @@ pub(crate) async fn read_identity(
     Ok(Some(ProjectViewIdentity {
         relay_pubkey,
         schema,
+        context_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_CONTEXT_EXTENSION),
+        document_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_DOCUMENT_EXTENSION),
     }))
 }
 

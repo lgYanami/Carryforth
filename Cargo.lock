@@ -779,6 +779,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "chrono",

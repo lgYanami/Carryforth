@@ -241,6 +241,84 @@ test("typed Human intents serialize optional relation clears without raw event f
   );
 });
 
+test("v3 Context coordinates round-trip and mutation replacement is canonical", () => {
+  const resourceId = "11111111-1111-4111-8111-111111111111";
+  const documentId = "22222222-2222-4222-8222-222222222222";
+  const profile = objectV3("project_profile", "profile", {
+    name: "Lora",
+    positioning: "Shared context",
+    purpose: "Coordinate",
+    problem: "Fragmentation",
+    scope: "Project context",
+  });
+  profile.context_references = [
+    { type: "resource", resource_id: resourceId },
+    {
+      type: "document",
+      document_id: documentId,
+      mode: "pinned",
+      document_revision: 10,
+    },
+  ];
+  const normalized = assembleProjectViewV3([profile]);
+  assert.deepEqual(normalized.profile.contextReferences, [
+    { referenceType: "resource", resourceId },
+    {
+      referenceType: "document",
+      documentId,
+      mode: "pinned",
+      documentRevision: 10,
+    },
+  ]);
+
+  assert.deepEqual(
+    serializeProjectViewMutationIntent({
+      operation: "context",
+      expectedProjectRevision: 9,
+      objectType: "project_profile",
+      objectId: "profile",
+      contextReferences: [
+        {
+          referenceType: "document",
+          documentId,
+          mode: "pinned",
+          documentRevision: 10,
+        },
+        {
+          referenceType: "document",
+          documentId,
+          mode: "pinned",
+          documentRevision: 2,
+        },
+        { referenceType: "resource", resourceId },
+        { referenceType: "document", documentId, mode: "live" },
+      ],
+    }),
+    {
+      operation: "context",
+      expected_project_revision: 9,
+      object_type: "project_profile",
+      object_id: "profile",
+      context_references: [
+        { type: "resource", resource_id: resourceId },
+        { type: "document", document_id: documentId, mode: "live" },
+        {
+          type: "document",
+          document_id: documentId,
+          mode: "pinned",
+          document_revision: 2,
+        },
+        {
+          type: "document",
+          document_id: documentId,
+          mode: "pinned",
+          document_revision: 10,
+        },
+      ],
+    },
+  );
+});
+
 test("v3 assembly preserves unknown Resource kinds and Guide-only writes", () => {
   const view = assembleProjectViewV3([
     objectV3("project_profile", "profile", {

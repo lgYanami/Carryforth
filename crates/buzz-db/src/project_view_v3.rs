@@ -77,6 +77,45 @@ pub enum ProjectViewV3WriteError {
 /// Convenient v3 write result.
 pub type ProjectViewV3WriteResult<T> = Result<T, ProjectViewV3WriteError>;
 
+/// Operator-facing readiness for the staged Project Context capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectContextFeatureStatus {
+    /// Community identity.
+    pub community_id: CommunityId,
+    /// Normalized Community host.
+    pub host: String,
+    /// Whether the Community is archived.
+    pub archived: bool,
+    /// Stored Project View schema major.
+    pub project_view_schema_version: i16,
+    /// Main Project View capability flag.
+    pub project_view_enabled: bool,
+    /// Project Context sub-capability flag.
+    pub context_enabled: bool,
+    /// Project Document capability flag.
+    pub document_enabled: bool,
+    /// Durable maintenance state.
+    pub maintenance_state: String,
+    /// Current Project revision when initialized.
+    pub project_revision: Option<u64>,
+    /// Current Project View projection generation.
+    pub projection_generation: Option<u64>,
+    /// Stable projection signer.
+    pub projection_pubkey: Option<PublicKey>,
+    /// Current Document catalog revision.
+    pub document_catalog_revision: Option<u64>,
+    /// Number of normalized Resource Context coordinates.
+    pub resource_reference_count: u64,
+    /// Number of normalized Document Context coordinates.
+    pub document_reference_count: u64,
+    /// Project View v3 structure, projections, and normalized parity are valid.
+    pub project_view_ready: bool,
+    /// Enabled Document catalog and projection parity are valid.
+    pub document_ready: bool,
+    /// Exact state currently eligible for NIP-11 advertisement.
+    pub advertised_ready: bool,
+}
+
 /// One canonical v3 head awaiting Relay signing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedV3ProjectObjectHead {
@@ -479,24 +518,125 @@ impl Db {
         Ok(operational == Some(true))
     }
 
+    /// Read the complete staged Context capability status and independently
+    /// recompute Project View and Document readiness.
+    pub async fn project_context_feature_status(
+        &self,
+        community_id: CommunityId,
+    ) -> crate::Result<Option<ProjectContextFeatureStatus>> {
+        let row = sqlx::query(
+            "SELECT community.host, community.archived_at IS NOT NULL AS archived, \
+                    community.project_view_schema_version, community.project_view_enabled, \
+                    community.project_context_enabled, community.project_document_enabled, \
+                    maintenance.state AS maintenance_state, view_state.project_revision, \
+                    view_state.projection_generation, view_state.projection_pubkey, \
+                    document_state.catalog_revision AS document_catalog_revision, \
+                    (SELECT count(*)::bigint FROM project_view_resource_context_references \
+                     WHERE community_id = community.id) AS resource_reference_count, \
+                    (SELECT count(*)::bigint FROM project_view_document_context_references \
+                     WHERE community_id = community.id) AS document_reference_count \
+             FROM communities community \
+             LEFT JOIN project_view_maintenance maintenance \
+               ON maintenance.community_id = community.id \
+             LEFT JOIN project_view_state view_state ON view_state.community_id = community.id \
+             LEFT JOIN project_document_state document_state \
+               ON document_state.community_id = community.id \
+             WHERE community.id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let projection_pubkey_bytes: Option<Vec<u8>> = row.try_get("projection_pubkey")?;
+        let projection_pubkey = projection_pubkey_bytes
+            .as_deref()
+            .map(|bytes| {
+                PublicKey::from_slice(bytes).map_err(|error| {
+                    DbError::InvalidData(format!(
+                        "stored Project View projection_pubkey is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let project_view_ready = if let Some(relay_pubkey) = projection_pubkey {
+            self.project_view_v3_structural_ready(community_id, &relay_pubkey)
+                .await?
+        } else {
+            false
+        };
+        let document_enabled: bool = row.try_get("project_document_enabled")?;
+        let document_ready = if document_enabled {
+            if let Some(relay_pubkey) = projection_pubkey {
+                self.project_document_preflight(community_id, &relay_pubkey)
+                    .await?
+                    .ready
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let archived: bool = row.try_get("archived")?;
+        let project_view_schema_version: i16 = row.try_get("project_view_schema_version")?;
+        let project_view_enabled: bool = row.try_get("project_view_enabled")?;
+        let context_enabled: bool = row.try_get("project_context_enabled")?;
+        let maintenance_state: Option<String> = row.try_get("maintenance_state")?;
+        let maintenance_state = maintenance_state.unwrap_or_else(|| "missing".to_owned());
+        let advertised_ready = !archived
+            && project_view_schema_version == 3
+            && project_view_enabled
+            && context_enabled
+            && maintenance_state == "normal"
+            && project_view_ready
+            && document_ready;
+        Ok(Some(ProjectContextFeatureStatus {
+            community_id,
+            host: row.try_get("host")?,
+            archived,
+            project_view_schema_version,
+            project_view_enabled,
+            context_enabled,
+            document_enabled,
+            maintenance_state,
+            project_revision: optional_db_u64(
+                row.try_get("project_revision")?,
+                "project_revision",
+            )?,
+            projection_generation: optional_db_u64(
+                row.try_get("projection_generation")?,
+                "projection_generation",
+            )?,
+            projection_pubkey,
+            document_catalog_revision: optional_db_u64(
+                row.try_get("document_catalog_revision")?,
+                "document_catalog_revision",
+            )?,
+            resource_reference_count: db_count_u64(
+                row.try_get("resource_reference_count")?,
+                "resource_reference_count",
+            )?,
+            document_reference_count: db_count_u64(
+                row.try_get("document_reference_count")?,
+                "document_reference_count",
+            )?,
+            project_view_ready,
+            document_ready,
+            advertised_ready,
+        }))
+    }
+
     /// Independently advertised non-empty Context write readiness.
     pub async fn project_context_v1_advertised_ready(
         &self,
         community_id: CommunityId,
         relay_pubkey: &PublicKey,
     ) -> crate::Result<bool> {
-        if !self
-            .project_view_v3_advertised_write_ready(community_id, relay_pubkey)
-            .await?
-        {
-            return Ok(false);
-        }
-        let enabled: Option<bool> =
-            sqlx::query_scalar("SELECT project_context_enabled FROM communities WHERE id = $1")
-                .bind(community_id.as_uuid())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(enabled == Some(true))
+        let status = self.project_context_feature_status(community_id).await?;
+        Ok(status.is_some_and(|status| {
+            status.projection_pubkey == Some(*relay_pubkey) && status.advertised_ready
+        }))
     }
 
     /// Atomically initialize one explicitly prepared, disabled schema-v3
@@ -3454,6 +3594,15 @@ fn revision_i64(value: u64, field: &str) -> ProjectViewV3WriteResult<i64> {
     i64::try_from(value).map_err(|_| {
         ProjectViewV3WriteError::InvalidCommit(format!("{field} exceeds PostgreSQL BIGINT"))
     })
+}
+
+fn optional_db_u64(value: Option<i64>, field: &str) -> crate::Result<Option<u64>> {
+    value.map(|value| db_count_u64(value, field)).transpose()
+}
+
+fn db_count_u64(value: i64, field: &str) -> crate::Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| DbError::InvalidData(format!("stored {field} must be non-negative")))
 }
 
 fn count_i32(value: u32, field: &str) -> ProjectViewV3WriteResult<i32> {
