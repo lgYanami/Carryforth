@@ -16,10 +16,16 @@ use buzz_project_view::v2::{
     AssignmentRuntimeStatus, RuntimeAvailability, RuntimeEvidence, RuntimeEvidenceReceipt,
     RuntimeEvidenceRequest, RuntimeFence, RUNTIME_SUPERVISION_SCHEMA_VERSION,
 };
+use buzz_project_view::v3::{
+    MaintenanceAckCommand, MaintenanceAckRequest, MaintenanceRuntimeAckStatus,
+    PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
+};
 use chrono::{DateTime, Utc};
 use nostr::{Keys, PublicKey};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -31,9 +37,108 @@ pub(crate) const RUNTIME_FENCE_PATH_ENV: &str = "BUZZ_RUNTIME_FENCE_PATH";
 
 const STATE_SCHEMA_VERSION: u16 = 1;
 const EVIDENCE_PATH: &str = "/api/project-runtime/evidence";
+const MAINTENANCE_PATH: &str = "/api/project-runtime/maintenance";
+const MAINTENANCE_ACK_PATH: &str = "/api/project-runtime/maintenance/ack";
+const MAINTENANCE_CLIENT_PROTOCOL_VERSION: u64 = 1;
+const MAINTENANCE_CLIENT_BUILD: &str = concat!("buzz-acp/", env!("CARGO_PKG_VERSION"));
+const MAINTENANCE_POLL_MIN: u64 = 1;
+const MAINTENANCE_POLL_MAX: u64 = 60;
+const MAINTENANCE_ACK_ID_DOMAIN: &[u8] = b"buzz-acp-maintenance-ack-id-v1\0";
 const LEASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RECOVERY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const SUPERVISOR_COMMAND_CAPACITY: usize = 16;
+
+/// Long-lived maintenance observation shared with the main-loop admission
+/// gate. `ResumeRequired` remains closed until the old pool and durable child
+/// registry have been discarded and a fresh Runtime generation is prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MaintenanceWatchState {
+    Normal,
+    Holding {
+        state: String,
+        maintenance_epoch: u64,
+        poll_after_seconds: u64,
+    },
+    ResumeRequired {
+        completed_epoch: Option<u64>,
+        poll_after_seconds: u64,
+    },
+    Unavailable {
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceAckView {
+    status: String,
+    acked_at: Option<DateTime<Utc>>,
+    ack_request_id: Option<Uuid>,
+    canonical_request_hash: Option<String>,
+    receipt: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceAssignmentBaseline {
+    assignment_id: Uuid,
+    member_pubkey: String,
+    binding_id: Uuid,
+    state_at_begin: String,
+    last_polled_at: Option<DateTime<Utc>>,
+    client_protocol_version: Option<u64>,
+    client_build: Option<String>,
+    ack: Option<MaintenanceAckView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceRuntimeBaseline {
+    binding_id: Uuid,
+    assignment_id: Uuid,
+    runtime_id: Uuid,
+    runtime_epoch: u64,
+    availability_at_begin: String,
+    ack: Option<MaintenanceAckView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceEpochView {
+    maintenance_epoch: u64,
+    required_client_protocol_version: u64,
+    outcome: String,
+    requested_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    assignments: Vec<MaintenanceAssignmentBaseline>,
+    runtimes: Vec<MaintenanceRuntimeBaseline>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceStatus {
+    community_id: Uuid,
+    host: String,
+    state: String,
+    current_epoch: Option<u64>,
+    latest_epoch: Option<u64>,
+    project_view_schema_version: u16,
+    project_view_enabled: bool,
+    archived: bool,
+    poll_after_seconds: u64,
+    epoch: Option<MaintenanceEpochView>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceAckReceiptView {
+    community_id: Uuid,
+    maintenance_epoch: u64,
+    ack_type: String,
+    ack_request_id: Uuid,
+    replayed: bool,
+    result: Value,
+}
 
 /// Secret supervisor identity and pair-scoped durable recovery state.
 pub(crate) struct RuntimeSupervisorConfig {
@@ -105,6 +210,14 @@ impl RuntimeSupervisorConfig {
     /// different Assignment or epoch.
     pub(crate) fn fence_path(&self) -> PathBuf {
         self.fence_path.clone()
+    }
+
+    /// Pair-scoped durable registry used to prove that no model-facing child
+    /// from an earlier harness generation survives maintenance.
+    pub(crate) fn child_registry_path(&self) -> PathBuf {
+        let mut path = self.state_path.as_os_str().to_os_string();
+        path.push(".children.json");
+        PathBuf::from(path)
     }
 }
 
@@ -594,10 +707,16 @@ impl Drop for RuntimeSupervisor {
 pub(crate) struct RuntimeSupervisorCoordinator {
     config: Option<RuntimeSupervisorConfig>,
     agent_client: RestClient,
+    maintenance_client: Option<RestClient>,
     member_pubkey: PublicKey,
     relay_url: String,
     current_assignment_id: Option<Uuid>,
     active: Option<RuntimeSupervisor>,
+    lifecycle_gate: crate::role_brief::TurnLifecycleGate,
+    maintenance_tx: watch::Sender<MaintenanceWatchState>,
+    maintenance_latch: Option<u64>,
+    maintenance_blocked: bool,
+    poll_after: Duration,
 }
 
 impl RuntimeSupervisorCoordinator {
@@ -606,14 +725,35 @@ impl RuntimeSupervisorCoordinator {
         agent_client: RestClient,
         member_pubkey: PublicKey,
         relay_url: String,
+        lifecycle_gate: crate::role_brief::TurnLifecycleGate,
     ) -> Self {
+        let maintenance_client = config.as_ref().map(|config| {
+            let mut client = agent_client.clone();
+            client.keys = config.keys.clone();
+            client.auth_tag_json = None;
+            client
+        });
+        let initial_state = if maintenance_client.is_some() {
+            MaintenanceWatchState::Unavailable {
+                detail: "maintenance status has not been checked".to_owned(),
+            }
+        } else {
+            MaintenanceWatchState::Normal
+        };
+        let (maintenance_tx, _) = watch::channel(initial_state);
         Self {
             config,
             agent_client,
+            maintenance_client,
             member_pubkey,
             relay_url,
             current_assignment_id: None,
             active: None,
+            lifecycle_gate,
+            maintenance_tx,
+            maintenance_latch: None,
+            maintenance_blocked: false,
+            poll_after: Duration::from_secs(MAINTENANCE_POLL_MIN),
         }
     }
 
@@ -624,11 +764,271 @@ impl RuntimeSupervisorCoordinator {
             .map(RuntimeSupervisorConfig::fence_path)
     }
 
+    /// Perform the synchronous maintenance observation required before Role
+    /// Brief resolution, Runtime Start/Recovery, or AgentPool creation. A
+    /// restarted harness stays in maintenance-only mode and can finish its
+    /// exact baseline acknowledgements without relying on the hidden Project
+    /// View capability.
+    pub(crate) async fn wait_for_maintenance_first_startup(&mut self) -> Result<(), String> {
+        if self.maintenance_client.is_none() {
+            let _ = self.maintenance_tx.send(MaintenanceWatchState::Normal);
+            return Ok(());
+        }
+        loop {
+            match self.poll_maintenance().await {
+                Ok(MaintenanceWatchState::Normal) => return Ok(()),
+                Ok(MaintenanceWatchState::ResumeRequired { .. }) => {
+                    self.finish_maintenance_generation()?;
+                    return Ok(());
+                }
+                Ok(MaintenanceWatchState::Holding {
+                    state,
+                    maintenance_epoch,
+                    poll_after_seconds,
+                }) => {
+                    tracing::info!(
+                        state,
+                        maintenance_epoch,
+                        "managed ACP startup is maintenance-only"
+                    );
+                    if state == "draining" {
+                        if let Err(error) = self.acknowledge_latched_maintenance().await {
+                            tracing::warn!(
+                                maintenance_epoch,
+                                "maintenance acknowledgement remains pending: {error}"
+                            );
+                        }
+                    } else {
+                        self.discard_retired_runtime_state()?;
+                    }
+                    tokio::time::sleep(Duration::from_secs(poll_after_seconds)).await;
+                }
+                Ok(MaintenanceWatchState::Unavailable { detail }) => {
+                    tracing::warn!("maintenance-first startup poll failed closed: {detail}");
+                    tokio::time::sleep(self.poll_after).await;
+                }
+                Err(error) => {
+                    self.fail_maintenance_poll(&error);
+                    tracing::warn!("maintenance-first startup poll failed closed: {error}");
+                    tokio::time::sleep(self.poll_after).await;
+                }
+            }
+        }
+    }
+
+    async fn poll_maintenance(&mut self) -> Result<MaintenanceWatchState, String> {
+        let Some(client) = self.maintenance_client.as_ref() else {
+            return Ok(MaintenanceWatchState::Normal);
+        };
+        let status = read_maintenance_status(client).await?;
+        self.poll_after = Duration::from_secs(status.poll_after_seconds);
+        match status.state.as_str() {
+            "normal" => {
+                if status.current_epoch.is_some() {
+                    return Err("normal maintenance state carried a current epoch".to_owned());
+                }
+                let state = if self.maintenance_blocked {
+                    MaintenanceWatchState::ResumeRequired {
+                        completed_epoch: self.maintenance_latch.or(status.latest_epoch),
+                        poll_after_seconds: status.poll_after_seconds,
+                    }
+                } else {
+                    MaintenanceWatchState::Normal
+                };
+                let _ = self.maintenance_tx.send(state.clone());
+                Ok(state)
+            }
+            "draining" | "frozen" => {
+                let epoch = status.current_epoch.ok_or_else(|| {
+                    format!("{} maintenance state has no current epoch", status.state)
+                })?;
+                let epoch_view = status.epoch.as_ref().ok_or_else(|| {
+                    format!("{} maintenance state has no epoch body", status.state)
+                })?;
+                if epoch_view.maintenance_epoch != epoch {
+                    return Err("maintenance pointer and epoch body disagree".to_owned());
+                }
+                if let Some(latched) = self.maintenance_latch {
+                    if latched != epoch {
+                        return Err(format!(
+                            "maintenance epoch changed from latched {latched} to {epoch}"
+                        ));
+                    }
+                } else {
+                    self.maintenance_latch = Some(epoch);
+                }
+                self.maintenance_blocked = true;
+                self.lifecycle_gate.cancel();
+                self.pause_active();
+                self.clear_fence()?;
+                let state = MaintenanceWatchState::Holding {
+                    state: status.state,
+                    maintenance_epoch: epoch,
+                    poll_after_seconds: status.poll_after_seconds,
+                };
+                let _ = self.maintenance_tx.send(state.clone());
+                Ok(state)
+            }
+            state => Err(format!("unsupported maintenance state {state:?}")),
+        }
+    }
+
+    fn fail_maintenance_poll(&mut self, detail: &str) {
+        self.maintenance_blocked = true;
+        self.lifecycle_gate.cancel();
+        self.pause_active();
+        let _ = self.clear_fence();
+        let _ = self
+            .maintenance_tx
+            .send(MaintenanceWatchState::Unavailable {
+                detail: detail.to_owned(),
+            });
+    }
+
+    async fn acknowledge_latched_maintenance(&mut self) -> Result<(), String> {
+        if !crate::child_registry::is_empty()? {
+            return Err(
+                "owned Agent child registry is not empty; refusing maintenance ACK".to_owned(),
+            );
+        }
+        self.pause_active();
+        self.clear_fence()?;
+        let client = self
+            .maintenance_client
+            .as_ref()
+            .ok_or_else(|| "maintenance supervisor identity is unavailable".to_owned())?;
+        let status = read_maintenance_status(client).await?;
+        let community_id = status.community_id;
+        let epoch = self
+            .maintenance_latch
+            .ok_or_else(|| "maintenance epoch was not latched".to_owned())?;
+        if status.state == "frozen" {
+            verify_owned_acks(&status, self.member_pubkey, epoch)?;
+            return self.discard_retired_runtime_state();
+        }
+        if status.state != "draining" || status.current_epoch != Some(epoch) {
+            return Err("maintenance ACK no longer names the active draining epoch".to_owned());
+        }
+        let epoch_view = status
+            .epoch
+            .as_ref()
+            .ok_or_else(|| "draining maintenance status omitted its epoch".to_owned())?;
+        if epoch_view.required_client_protocol_version > MAINTENANCE_CLIENT_PROTOCOL_VERSION {
+            return Err(format!(
+                "maintenance protocol {} is required, but this ACP implements {}",
+                epoch_view.required_client_protocol_version, MAINTENANCE_CLIENT_PROTOCOL_VERSION
+            ));
+        }
+        let assignments = owned_assignments(epoch_view, self.member_pubkey)?;
+        for assignment in &assignments {
+            for runtime in epoch_view
+                .runtimes
+                .iter()
+                .filter(|runtime| runtime.assignment_id == assignment.assignment_id)
+            {
+                if runtime.ack.is_some() {
+                    continue;
+                }
+                let status = match runtime.availability_at_begin.as_str() {
+                    "available" | "recovering" => MaintenanceRuntimeAckStatus::Suspended,
+                    "unavailable" => MaintenanceRuntimeAckStatus::Terminal,
+                    other => {
+                        return Err(format!(
+                            "unsupported baseline Runtime availability {other:?}"
+                        ));
+                    }
+                };
+                let command = MaintenanceAckCommand {
+                    schema_version: PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
+                    request: MaintenanceAckRequest::RuntimeSuspendedOrTerminal {
+                        maintenance_epoch: epoch,
+                        binding_id: runtime.binding_id,
+                        assignment_id: runtime.assignment_id,
+                        runtime_id: runtime.runtime_id,
+                        runtime_epoch: runtime.runtime_epoch,
+                        status,
+                        idempotency_key: maintenance_runtime_ack_id(epoch, runtime, status),
+                    },
+                };
+                submit_maintenance_ack(client, community_id, &command).await?;
+            }
+        }
+
+        // Re-read exact durable Runtime receipts before claiming the Assignment
+        // watcher is quiesced. This also resolves a lost POST response without
+        // inventing a second idempotency coordinate.
+        let status = read_maintenance_status(client).await?;
+        if status.community_id != community_id {
+            return Err("maintenance Community changed during Runtime ACK read-back".to_owned());
+        }
+        let epoch_view = status
+            .epoch
+            .as_ref()
+            .ok_or_else(|| "maintenance status omitted its epoch after Runtime ACK".to_owned())?;
+        let assignments = owned_assignments(epoch_view, self.member_pubkey)?;
+        for assignment in &assignments {
+            let runtime_pending = epoch_view.runtimes.iter().any(|runtime| {
+                runtime.assignment_id == assignment.assignment_id && runtime.ack.is_none()
+            });
+            if runtime_pending {
+                return Err(format!(
+                    "Runtime acknowledgements remain pending for Assignment {}",
+                    assignment.assignment_id
+                ));
+            }
+            if assignment.ack.is_none() {
+                let command = MaintenanceAckCommand {
+                    schema_version: PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
+                    request: MaintenanceAckRequest::AssignmentQuiesced {
+                        maintenance_epoch: epoch,
+                        binding_id: assignment.binding_id,
+                        assignment_id: assignment.assignment_id,
+                        client_protocol_version: MAINTENANCE_CLIENT_PROTOCOL_VERSION,
+                        client_build: MAINTENANCE_CLIENT_BUILD.to_owned(),
+                        idempotency_key: maintenance_assignment_ack_id(epoch, assignment),
+                    },
+                };
+                submit_maintenance_ack(client, community_id, &command).await?;
+            }
+        }
+
+        let verified = read_maintenance_status(client).await?;
+        if verified.community_id != community_id {
+            return Err("maintenance Community changed during Assignment ACK read-back".to_owned());
+        }
+        verify_owned_acks(&verified, self.member_pubkey, epoch)?;
+        self.discard_retired_runtime_state()
+    }
+
+    fn discard_retired_runtime_state(&mut self) -> Result<(), String> {
+        self.pause_active();
+        self.clear_fence()?;
+        if let Some(config) = &self.config {
+            remove_state_if_present(&config.state_path)?;
+        }
+        Ok(())
+    }
+
+    fn finish_maintenance_generation(&mut self) -> Result<(), String> {
+        if !crate::child_registry::is_empty()? {
+            return Err("cannot resume while an owned Agent child remains registered".to_owned());
+        }
+        self.discard_retired_runtime_state()?;
+        self.maintenance_latch = None;
+        self.maintenance_blocked = false;
+        self.lifecycle_gate.rotate_after_reap()?;
+        let _ = self.maintenance_tx.send(MaintenanceWatchState::Normal);
+        Ok(())
+    }
+
     /// Reconcile startup before any model-facing child can receive work.
     pub(crate) async fn prepare_startup(
         &mut self,
         assignment_id: Option<Uuid>,
     ) -> Result<(), String> {
+        if self.maintenance_blocked {
+            return Err("Runtime admission is blocked by Project View maintenance".to_owned());
+        }
         self.current_assignment_id = assignment_id;
         self.active = RuntimeSupervisor::prepare(
             self.config.as_ref(),
@@ -661,6 +1061,11 @@ impl RuntimeSupervisorCoordinator {
     }
 
     async fn reconcile(&mut self, assignment_id: Option<Uuid>) -> Result<(), String> {
+        if self.maintenance_blocked {
+            self.pause_active();
+            self.clear_fence()?;
+            return Err("Runtime admission is blocked by Project View maintenance".to_owned());
+        }
         if assignment_id != self.current_assignment_id {
             self.pause_active();
             self.clear_fence()?;
@@ -734,8 +1139,35 @@ impl RuntimeSupervisorCoordinator {
         self.publish_current_fence()
     }
 
-    fn suspend(&self) -> Result<(), String> {
+    fn suspend(&mut self) -> Result<(), String> {
+        self.pause_active();
         self.clear_fence()
+    }
+
+    async fn acknowledge_after_quiesce(&mut self) -> Result<(), String> {
+        self.acknowledge_latched_maintenance().await
+    }
+
+    async fn resume_after_maintenance(
+        &mut self,
+        assignment_id: Option<Uuid>,
+    ) -> Result<(), String> {
+        let client = self
+            .maintenance_client
+            .as_ref()
+            .ok_or_else(|| "maintenance supervisor identity is unavailable".to_owned())?;
+        let status = read_maintenance_status(client).await?;
+        if status.state != "normal" || status.current_epoch.is_some() {
+            return Err("maintenance has not been explicitly resumed or aborted".to_owned());
+        }
+        self.finish_maintenance_generation()?;
+        if let Err(error) = self.prepare_startup(assignment_id).await {
+            self.fail_maintenance_poll(&format!(
+                "fresh Runtime preparation after maintenance failed: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn stop(&mut self, exit: RuntimeSupervisorExit) -> Result<(), String> {
@@ -778,10 +1210,27 @@ impl RuntimeSupervisorCoordinator {
     pub(crate) fn spawn(mut self) -> (RuntimeSupervisorClient, tokio::task::JoinHandle<()>) {
         let (sender, mut receiver) =
             mpsc::channel::<RuntimeSupervisorCommand>(SUPERVISOR_COMMAND_CAPACITY);
-        let client = RuntimeSupervisorClient { sender };
+        let client = RuntimeSupervisorClient {
+            sender,
+            maintenance_rx: self.maintenance_tx.subscribe(),
+        };
         let task = tokio::spawn(async move {
-            while let Some(command) = receiver.recv().await {
-                match command {
+            let mut next_maintenance_poll = tokio::time::Instant::now() + self.poll_after;
+            'worker: loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(next_maintenance_poll), if self.maintenance_client.is_some() => {
+                        if let Err(error) = self.poll_maintenance().await {
+                            tracing::warn!("Runtime maintenance watcher failed closed: {error}");
+                            self.fail_maintenance_poll(&error);
+                        }
+                        next_maintenance_poll = tokio::time::Instant::now() + self.poll_after;
+                    }
+                    command = receiver.recv() => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        match command {
                     RuntimeSupervisorCommand::Reconcile {
                         assignment_id,
                         response,
@@ -796,10 +1245,31 @@ impl RuntimeSupervisorCoordinator {
                         let result = self.suspend();
                         let _ = response.send(result);
                     }
+                    RuntimeSupervisorCommand::AcknowledgeMaintenance { response } => {
+                        let result = self.acknowledge_after_quiesce().await;
+                        let _ = response.send(result);
+                    }
+                    RuntimeSupervisorCommand::ResumeAfterMaintenance {
+                        assignment_id,
+                        response,
+                    } => {
+                        let result = self.resume_after_maintenance(assignment_id).await;
+                        let _ = response.send(result);
+                    }
+                    RuntimeSupervisorCommand::MarkHealthy { response } => {
+                        let result = self.mark_healthy().await;
+                        let _ = response.send(result);
+                    }
+                    RuntimeSupervisorCommand::MarkStartFailed { summary, response } => {
+                        let result = self.mark_start_failed(summary).await;
+                        let _ = response.send(result);
+                    }
                     RuntimeSupervisorCommand::Stop { exit, response } => {
                         let result = self.stop(exit).await;
                         let _ = response.send(result);
-                        break;
+                        break 'worker;
+                    }
+                        }
                     }
                 }
             }
@@ -832,6 +1302,20 @@ enum RuntimeSupervisorCommand {
     Suspend {
         response: oneshot::Sender<Result<(), String>>,
     },
+    AcknowledgeMaintenance {
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    ResumeAfterMaintenance {
+        assignment_id: Option<Uuid>,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    MarkHealthy {
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    MarkStartFailed {
+        summary: String,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     Stop {
         exit: RuntimeSupervisorExit,
         response: oneshot::Sender<Result<(), String>>,
@@ -842,9 +1326,14 @@ enum RuntimeSupervisorCommand {
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeSupervisorClient {
     sender: mpsc::Sender<RuntimeSupervisorCommand>,
+    maintenance_rx: watch::Receiver<MaintenanceWatchState>,
 }
 
 impl RuntimeSupervisorClient {
+    pub(crate) fn maintenance_receiver(&self) -> watch::Receiver<MaintenanceWatchState> {
+        self.maintenance_rx.clone()
+    }
+
     pub(crate) async fn reconcile(&self, assignment_id: Option<Uuid>) -> Result<(), String> {
         self.request(|response| RuntimeSupervisorCommand::Reconcile {
             assignment_id,
@@ -855,6 +1344,34 @@ impl RuntimeSupervisorClient {
 
     pub(crate) async fn suspend(&self) -> Result<(), String> {
         self.request(|response| RuntimeSupervisorCommand::Suspend { response })
+            .await
+    }
+
+    pub(crate) async fn acknowledge_maintenance(&self) -> Result<(), String> {
+        self.request(|response| RuntimeSupervisorCommand::AcknowledgeMaintenance { response })
+            .await
+    }
+
+    pub(crate) async fn resume_after_maintenance(
+        &self,
+        assignment_id: Option<Uuid>,
+    ) -> Result<(), String> {
+        self.request(
+            |response| RuntimeSupervisorCommand::ResumeAfterMaintenance {
+                assignment_id,
+                response,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn mark_healthy(&self) -> Result<(), String> {
+        self.request(|response| RuntimeSupervisorCommand::MarkHealthy { response })
+            .await
+    }
+
+    pub(crate) async fn mark_start_failed(&self, summary: String) -> Result<(), String> {
+        self.request(|response| RuntimeSupervisorCommand::MarkStartFailed { summary, response })
             .await
     }
 
@@ -887,6 +1404,366 @@ impl RuntimeSupervisorClient {
             .await
             .map_err(|_| "Runtime supervisor worker stopped before acknowledging".to_owned())?
     }
+}
+
+async fn read_maintenance_status(client: &RestClient) -> Result<MaintenanceStatus, String> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "client_protocol_version",
+            &MAINTENANCE_CLIENT_PROTOCOL_VERSION.to_string(),
+        )
+        .append_pair("client_build", MAINTENANCE_CLIENT_BUILD)
+        .finish();
+    let value = client
+        .get_authed(&format!("{MAINTENANCE_PATH}?{query}"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let status: MaintenanceStatus = serde_json::from_value(value)
+        .map_err(|error| format!("invalid maintenance status response: {error}"))?;
+    validate_maintenance_status(&status)?;
+    Ok(status)
+}
+
+fn validate_maintenance_status(status: &MaintenanceStatus) -> Result<(), String> {
+    if status.community_id.is_nil()
+        || status.host.is_empty()
+        || status.host.contains('\0')
+        || !matches!(status.project_view_schema_version, 2 | 3)
+        || !(MAINTENANCE_POLL_MIN..=MAINTENANCE_POLL_MAX).contains(&status.poll_after_seconds)
+    {
+        return Err("maintenance status header is malformed".to_owned());
+    }
+    if status.archived && status.project_view_enabled {
+        return Err("archived Community advertised Project View enabled".to_owned());
+    }
+    match status.state.as_str() {
+        "normal" if status.current_epoch.is_none() => {}
+        "draining" | "frozen" if status.current_epoch.is_some() => {}
+        "normal" | "draining" | "frozen" => {
+            return Err("maintenance state and current_epoch disagree".to_owned());
+        }
+        _ => return Err("maintenance status contains an unknown state".to_owned()),
+    }
+    if let Some(epoch) = &status.epoch {
+        if epoch.maintenance_epoch == 0
+            || epoch.required_client_protocol_version == 0
+            || !matches!(
+                epoch.outcome.as_str(),
+                "active" | "aborted" | "cutover_committed" | "resumed"
+            )
+        {
+            return Err("maintenance epoch body is malformed".to_owned());
+        }
+        if status
+            .current_epoch
+            .is_some_and(|current| current != epoch.maintenance_epoch)
+        {
+            return Err("maintenance epoch body does not match current_epoch".to_owned());
+        }
+        if status
+            .latest_epoch
+            .is_some_and(|latest| latest < epoch.maintenance_epoch)
+        {
+            return Err("maintenance latest_epoch precedes the returned epoch".to_owned());
+        }
+        let _ = (&epoch.requested_at, &epoch.completed_at);
+        for assignment in &epoch.assignments {
+            if assignment.assignment_id.is_nil()
+                || assignment.binding_id.is_nil()
+                || !matches!(assignment.state_at_begin.as_str(), "idle" | "has_runtime")
+                || assignment
+                    .client_protocol_version
+                    .is_some_and(|version| version == 0)
+                || assignment.client_build.as_ref().is_some_and(|build| {
+                    build.is_empty() || build.len() > 256 || build.contains('\0')
+                })
+                || PublicKey::parse(&assignment.member_pubkey).is_err()
+            {
+                return Err("maintenance Assignment baseline is malformed".to_owned());
+            }
+            let _ = &assignment.last_polled_at;
+            if let Some(ack) = &assignment.ack {
+                validate_ack_view(ack, &["quiesced"])?;
+                validate_assignment_ack_receipt(
+                    ack,
+                    epoch.maintenance_epoch,
+                    assignment,
+                    epoch.required_client_protocol_version,
+                )?;
+            }
+        }
+        for runtime in &epoch.runtimes {
+            if runtime.binding_id.is_nil()
+                || runtime.assignment_id.is_nil()
+                || runtime.runtime_id.is_nil()
+                || runtime.runtime_epoch == 0
+                || !matches!(
+                    runtime.availability_at_begin.as_str(),
+                    "available" | "recovering" | "unavailable"
+                )
+            {
+                return Err("maintenance Runtime baseline is malformed".to_owned());
+            }
+            if let Some(ack) = &runtime.ack {
+                validate_ack_view(ack, &["suspended", "terminal"])?;
+                validate_runtime_ack_receipt(ack, epoch.maintenance_epoch, runtime)?;
+            }
+        }
+    } else if status.current_epoch.is_some() {
+        return Err("current maintenance epoch has no body".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_ack_view(ack: &MaintenanceAckView, allowed: &[&str]) -> Result<(), String> {
+    if !allowed.contains(&ack.status.as_str())
+        || ack.acked_at.is_none()
+        || ack.ack_request_id.is_none_or(|id| id.is_nil())
+        || ack.canonical_request_hash.as_ref().is_none_or(|hash| {
+            hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || ack.receipt.is_none()
+    {
+        return Err("maintenance acknowledgement view is malformed".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_assignment_ack_receipt(
+    ack: &MaintenanceAckView,
+    maintenance_epoch: u64,
+    assignment: &MaintenanceAssignmentBaseline,
+    required_client_protocol_version: u64,
+) -> Result<(), String> {
+    let result = ack
+        .receipt
+        .as_ref()
+        .ok_or_else(|| "maintenance Assignment acknowledgement omitted its receipt".to_owned())?;
+    let object = result.as_object().ok_or_else(|| {
+        "maintenance Assignment acknowledgement receipt is not an object".to_owned()
+    })?;
+    let protocol = result
+        .get("client_protocol_version")
+        .and_then(Value::as_u64);
+    let build = result.get("client_build").and_then(Value::as_str);
+    if object.len() != 7
+        || result.get("maintenance_epoch").and_then(Value::as_u64) != Some(maintenance_epoch)
+        || result.get("type").and_then(Value::as_str) != Some("assignment_quiesced")
+        || result_uuid(result, "binding_id") != Some(assignment.binding_id)
+        || result_uuid(result, "assignment_id") != Some(assignment.assignment_id)
+        || result.get("status").and_then(Value::as_str) != Some("quiesced")
+        || protocol.is_none_or(|version| version < required_client_protocol_version)
+        || build.is_none_or(|value| value.is_empty() || value.len() > 256 || value.contains('\0'))
+    {
+        return Err("maintenance Assignment acknowledgement receipt is malformed".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_runtime_ack_receipt(
+    ack: &MaintenanceAckView,
+    maintenance_epoch: u64,
+    runtime: &MaintenanceRuntimeBaseline,
+) -> Result<(), String> {
+    let result = ack
+        .receipt
+        .as_ref()
+        .ok_or_else(|| "maintenance Runtime acknowledgement omitted its receipt".to_owned())?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| "maintenance Runtime acknowledgement receipt is not an object".to_owned())?;
+    let expected_status = match runtime.availability_at_begin.as_str() {
+        "available" | "recovering" => "suspended",
+        "unavailable" => "terminal",
+        _ => return Err("maintenance Runtime baseline is malformed".to_owned()),
+    };
+    if object.len() != 7
+        || result.get("maintenance_epoch").and_then(Value::as_u64) != Some(maintenance_epoch)
+        || result.get("type").and_then(Value::as_str) != Some("runtime_suspended_or_terminal")
+        || result_uuid(result, "binding_id") != Some(runtime.binding_id)
+        || result_uuid(result, "assignment_id") != Some(runtime.assignment_id)
+        || result_uuid(result, "runtime_id") != Some(runtime.runtime_id)
+        || result.get("runtime_epoch").and_then(Value::as_u64) != Some(runtime.runtime_epoch)
+        || result.get("status").and_then(Value::as_str) != Some(expected_status)
+        || ack.status != expected_status
+    {
+        return Err("maintenance Runtime acknowledgement receipt is malformed".to_owned());
+    }
+    Ok(())
+}
+
+fn result_uuid(result: &Value, field: &str) -> Option<Uuid> {
+    result
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn owned_assignments(
+    epoch: &MaintenanceEpochView,
+    member_pubkey: PublicKey,
+) -> Result<Vec<&MaintenanceAssignmentBaseline>, String> {
+    let mut assignments = Vec::new();
+    for assignment in &epoch.assignments {
+        let member = PublicKey::parse(&assignment.member_pubkey)
+            .map_err(|error| format!("invalid baseline member pubkey: {error}"))?;
+        if member == member_pubkey {
+            assignments.push(assignment);
+        }
+    }
+    if assignments.len() > 1 {
+        return Err("member has more than one active maintenance Assignment baseline".to_owned());
+    }
+    Ok(assignments)
+}
+
+fn verify_owned_acks(
+    status: &MaintenanceStatus,
+    member_pubkey: PublicKey,
+    expected_epoch: u64,
+) -> Result<(), String> {
+    let epoch = status
+        .epoch
+        .as_ref()
+        .ok_or_else(|| "maintenance status omitted the exact epoch".to_owned())?;
+    if epoch.maintenance_epoch != expected_epoch {
+        return Err("maintenance status returned another epoch".to_owned());
+    }
+    for assignment in owned_assignments(epoch, member_pubkey)? {
+        if assignment.ack.as_ref().map(|ack| ack.status.as_str()) != Some("quiesced") {
+            return Err(format!(
+                "Assignment {} has no durable quiesced acknowledgement",
+                assignment.assignment_id
+            ));
+        }
+        if epoch.runtimes.iter().any(|runtime| {
+            runtime.assignment_id == assignment.assignment_id && runtime.ack.is_none()
+        }) {
+            return Err(format!(
+                "Assignment {} has an unacknowledged Runtime baseline",
+                assignment.assignment_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn submit_maintenance_ack(
+    client: &RestClient,
+    expected_community_id: Uuid,
+    command: &MaintenanceAckCommand,
+) -> Result<(), String> {
+    command
+        .validate()
+        .map_err(|error| format!("invalid maintenance acknowledgement: {error}"))?;
+    let body = serde_json::to_value(command)
+        .map_err(|error| format!("serialize maintenance acknowledgement: {error}"))?;
+    let value = client
+        .post_authed_json(MAINTENANCE_ACK_PATH, &body)
+        .await
+        .map_err(|error| error.to_string())?;
+    let receipt: MaintenanceAckReceiptView = serde_json::from_value(value)
+        .map_err(|error| format!("invalid maintenance acknowledgement receipt: {error}"))?;
+    if receipt.community_id != expected_community_id
+        || receipt.maintenance_epoch != command.maintenance_epoch()
+        || receipt.ack_type != command.ack_type()
+        || receipt.ack_request_id.is_nil()
+        || !maintenance_ack_result_matches(&receipt.result, command)
+    {
+        return Err("maintenance acknowledgement receipt does not match the request".to_owned());
+    }
+    let _ = receipt.replayed;
+    Ok(())
+}
+
+fn maintenance_ack_result_matches(result: &Value, command: &MaintenanceAckCommand) -> bool {
+    if result.get("maintenance_epoch").and_then(Value::as_u64) != Some(command.maintenance_epoch())
+    {
+        return false;
+    }
+    match &command.request {
+        MaintenanceAckRequest::AssignmentQuiesced {
+            binding_id,
+            assignment_id,
+            client_protocol_version,
+            client_build,
+            ..
+        } => {
+            result.as_object().is_some_and(|object| object.len() == 7)
+                && result.get("type").and_then(Value::as_str) == Some("assignment_quiesced")
+                && result_uuid(result, "binding_id") == Some(*binding_id)
+                && result_uuid(result, "assignment_id") == Some(*assignment_id)
+                && result.get("status").and_then(Value::as_str) == Some("quiesced")
+                && result
+                    .get("client_protocol_version")
+                    .and_then(Value::as_u64)
+                    == Some(*client_protocol_version)
+                && result.get("client_build").and_then(Value::as_str) == Some(client_build.as_str())
+        }
+        MaintenanceAckRequest::RuntimeSuspendedOrTerminal {
+            binding_id,
+            assignment_id,
+            runtime_id,
+            runtime_epoch,
+            status,
+            ..
+        } => {
+            result.as_object().is_some_and(|object| object.len() == 7)
+                && result.get("type").and_then(Value::as_str)
+                    == Some("runtime_suspended_or_terminal")
+                && result_uuid(result, "binding_id") == Some(*binding_id)
+                && result_uuid(result, "assignment_id") == Some(*assignment_id)
+                && result_uuid(result, "runtime_id") == Some(*runtime_id)
+                && result.get("runtime_epoch").and_then(Value::as_u64) == Some(*runtime_epoch)
+                && result.get("status").and_then(Value::as_str) == Some(status.as_str())
+        }
+    }
+}
+
+fn maintenance_assignment_ack_id(
+    maintenance_epoch: u64,
+    assignment: &MaintenanceAssignmentBaseline,
+) -> Uuid {
+    deterministic_ack_id(&[
+        b"assignment",
+        &maintenance_epoch.to_be_bytes(),
+        assignment.binding_id.as_bytes(),
+        assignment.assignment_id.as_bytes(),
+    ])
+}
+
+fn maintenance_runtime_ack_id(
+    maintenance_epoch: u64,
+    runtime: &MaintenanceRuntimeBaseline,
+    status: MaintenanceRuntimeAckStatus,
+) -> Uuid {
+    deterministic_ack_id(&[
+        b"runtime",
+        &maintenance_epoch.to_be_bytes(),
+        runtime.binding_id.as_bytes(),
+        runtime.assignment_id.as_bytes(),
+        runtime.runtime_id.as_bytes(),
+        &runtime.runtime_epoch.to_be_bytes(),
+        status.as_str().as_bytes(),
+    ])
+}
+
+fn deterministic_ack_id(parts: &[&[u8]]) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(MAINTENANCE_ACK_ID_DOMAIN);
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    let hash = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 async fn read_status(
@@ -1102,6 +1979,7 @@ fn remove_file_if_present(path: &Path, label: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1111,6 +1989,179 @@ mod tests {
         managed: bool,
         runtime: Option<buzz_project_view::v2::RuntimeLeaseStatus>,
         evidence: Vec<String>,
+        maintenance: Option<MockMaintenanceApi>,
+    }
+
+    struct MockMaintenanceApi {
+        community_id: Uuid,
+        member_pubkey: String,
+        binding_id: Uuid,
+        assignment_id: Uuid,
+        runtime_id: Uuid,
+        runtime_epoch: u64,
+        runtime_acked: bool,
+        assignment_acked: bool,
+        ack_order: Vec<String>,
+    }
+
+    fn mock_ack_view(status: &str, request_id: Uuid, receipt: Value) -> Value {
+        json!({
+            "status": status,
+            "acked_at": Utc::now(),
+            "ack_request_id": request_id,
+            "canonical_request_hash": "ab".repeat(32),
+            "receipt": receipt,
+        })
+    }
+
+    fn mock_maintenance_status(state: &MockRuntimeApi) -> Value {
+        let Some(maintenance) = state.maintenance.as_ref() else {
+            return json!({
+                "community_id": Uuid::from_u128(1),
+                "host": "buzz.example",
+                "state": "normal",
+                "current_epoch": null,
+                "latest_epoch": null,
+                "project_view_schema_version": 2,
+                "project_view_enabled": true,
+                "archived": false,
+                "poll_after_seconds": 5,
+                "epoch": null,
+            });
+        };
+        json!({
+            "community_id": maintenance.community_id,
+            "host": "buzz.example",
+            "state": "draining",
+            "current_epoch": 7,
+            "latest_epoch": 7,
+            "project_view_schema_version": 2,
+            "project_view_enabled": false,
+            "archived": false,
+            "poll_after_seconds": 5,
+            "epoch": {
+                "maintenance_epoch": 7,
+                "required_client_protocol_version": MAINTENANCE_CLIENT_PROTOCOL_VERSION,
+                "outcome": "active",
+                "requested_at": Utc::now(),
+                "completed_at": null,
+                "assignments": [{
+                    "assignment_id": maintenance.assignment_id,
+                    "member_pubkey": maintenance.member_pubkey,
+                    "binding_id": maintenance.binding_id,
+                    "state_at_begin": "has_runtime",
+                    "last_polled_at": Utc::now(),
+                    "client_protocol_version": MAINTENANCE_CLIENT_PROTOCOL_VERSION,
+                    "client_build": MAINTENANCE_CLIENT_BUILD,
+                    "ack": maintenance.assignment_acked.then(|| {
+                        mock_ack_view("quiesced", Uuid::from_u128(12), json!({
+                            "maintenance_epoch": 7,
+                            "type": "assignment_quiesced",
+                            "binding_id": maintenance.binding_id,
+                            "assignment_id": maintenance.assignment_id,
+                            "status": "quiesced",
+                            "client_protocol_version": MAINTENANCE_CLIENT_PROTOCOL_VERSION,
+                            "client_build": MAINTENANCE_CLIENT_BUILD,
+                        }))
+                    }),
+                }],
+                "runtimes": [{
+                    "binding_id": maintenance.binding_id,
+                    "assignment_id": maintenance.assignment_id,
+                    "runtime_id": maintenance.runtime_id,
+                    "runtime_epoch": maintenance.runtime_epoch,
+                    "availability_at_begin": "available",
+                    "ack": maintenance.runtime_acked.then(|| {
+                        mock_ack_view("suspended", Uuid::from_u128(11), json!({
+                            "maintenance_epoch": 7,
+                            "type": "runtime_suspended_or_terminal",
+                            "binding_id": maintenance.binding_id,
+                            "assignment_id": maintenance.assignment_id,
+                            "runtime_id": maintenance.runtime_id,
+                            "runtime_epoch": maintenance.runtime_epoch,
+                            "status": "suspended",
+                        }))
+                    }),
+                }],
+            },
+        })
+    }
+
+    fn apply_mock_maintenance_ack(
+        state: &mut MockRuntimeApi,
+        command: &MaintenanceAckCommand,
+    ) -> Value {
+        let maintenance = state
+            .maintenance
+            .as_mut()
+            .expect("maintenance ACK requires a fixture");
+        let (request_id, result) = match &command.request {
+            MaintenanceAckRequest::RuntimeSuspendedOrTerminal {
+                maintenance_epoch,
+                binding_id,
+                assignment_id,
+                runtime_id,
+                runtime_epoch,
+                status,
+                ..
+            } => {
+                assert_eq!(*maintenance_epoch, 7);
+                assert_eq!(*binding_id, maintenance.binding_id);
+                assert_eq!(*assignment_id, maintenance.assignment_id);
+                assert_eq!(*runtime_id, maintenance.runtime_id);
+                assert_eq!(*runtime_epoch, maintenance.runtime_epoch);
+                assert!(!maintenance.assignment_acked);
+                maintenance.runtime_acked = true;
+                maintenance.ack_order.push("runtime".to_owned());
+                (
+                    Uuid::from_u128(11),
+                    json!({
+                        "maintenance_epoch": maintenance_epoch,
+                        "type": "runtime_suspended_or_terminal",
+                        "binding_id": binding_id,
+                        "assignment_id": assignment_id,
+                        "runtime_id": runtime_id,
+                        "runtime_epoch": runtime_epoch,
+                        "status": status.as_str(),
+                    }),
+                )
+            }
+            MaintenanceAckRequest::AssignmentQuiesced {
+                maintenance_epoch,
+                binding_id,
+                assignment_id,
+                client_protocol_version,
+                client_build,
+                ..
+            } => {
+                assert_eq!(*maintenance_epoch, 7);
+                assert_eq!(*binding_id, maintenance.binding_id);
+                assert_eq!(*assignment_id, maintenance.assignment_id);
+                assert!(maintenance.runtime_acked);
+                maintenance.assignment_acked = true;
+                maintenance.ack_order.push("assignment".to_owned());
+                (
+                    Uuid::from_u128(12),
+                    json!({
+                        "maintenance_epoch": maintenance_epoch,
+                        "type": "assignment_quiesced",
+                        "binding_id": binding_id,
+                        "assignment_id": assignment_id,
+                        "status": "quiesced",
+                        "client_protocol_version": client_protocol_version,
+                        "client_build": client_build,
+                    }),
+                )
+            }
+        };
+        json!({
+            "community_id": maintenance.community_id,
+            "maintenance_epoch": command.maintenance_epoch(),
+            "ack_type": command.ack_type(),
+            "ack_request_id": request_id,
+            "replayed": false,
+            "result": result,
+        })
     }
 
     async fn mock_runtime_client(
@@ -1162,7 +2213,12 @@ mod tests {
                         .unwrap_or_default()
                         .to_owned();
                     let body = &request[header_end..header_end + content_length];
-                    let response = if request_line.starts_with("GET ") {
+                    let response = if request_line
+                        .starts_with("GET /api/project-runtime/maintenance?")
+                    {
+                        let state = state.lock().expect("lock mock Runtime API");
+                        mock_maintenance_status(&state)
+                    } else if request_line.starts_with("GET ") {
                         let state = state.lock().expect("lock mock Runtime API");
                         serde_json::to_value(AssignmentRuntimeStatus {
                             assignment_id: state.assignment_id,
@@ -1182,6 +2238,12 @@ mod tests {
                             runtimes: state.runtime.iter().cloned().collect(),
                         })
                         .expect("serialize Runtime status")
+                    } else if request_line.starts_with("POST /api/project-runtime/maintenance/ack ")
+                    {
+                        let command: MaintenanceAckCommand =
+                            serde_json::from_slice(body).expect("parse maintenance ACK");
+                        let mut state = state.lock().expect("lock mock Runtime API");
+                        apply_mock_maintenance_ack(&mut state, &command)
                     } else {
                         let request: RuntimeEvidenceRequest =
                             serde_json::from_slice(body).expect("parse Runtime evidence");
@@ -1429,6 +2491,188 @@ mod tests {
         std::fs::remove_dir(&directory).expect("remove Runtime fence directory");
     }
 
+    #[test]
+    fn project_view_maintenance_status_is_strict_and_ack_ids_are_coordinate_stable() {
+        let member = Keys::generate().public_key();
+        let assignment = MaintenanceAssignmentBaseline {
+            assignment_id: Uuid::new_v4(),
+            member_pubkey: member.to_hex(),
+            binding_id: Uuid::new_v4(),
+            state_at_begin: "has_runtime".to_owned(),
+            last_polled_at: Some(Utc::now()),
+            client_protocol_version: Some(MAINTENANCE_CLIENT_PROTOCOL_VERSION),
+            client_build: Some(MAINTENANCE_CLIENT_BUILD.to_owned()),
+            ack: None,
+        };
+        let runtime = MaintenanceRuntimeBaseline {
+            binding_id: assignment.binding_id,
+            assignment_id: assignment.assignment_id,
+            runtime_id: Uuid::new_v4(),
+            runtime_epoch: 9,
+            availability_at_begin: "available".to_owned(),
+            ack: None,
+        };
+        let status = MaintenanceStatus {
+            community_id: Uuid::new_v4(),
+            host: "buzz.example".to_owned(),
+            state: "draining".to_owned(),
+            current_epoch: Some(7),
+            latest_epoch: Some(7),
+            project_view_schema_version: 2,
+            project_view_enabled: false,
+            archived: false,
+            poll_after_seconds: 5,
+            epoch: Some(MaintenanceEpochView {
+                maintenance_epoch: 7,
+                required_client_protocol_version: 1,
+                outcome: "active".to_owned(),
+                requested_at: Utc::now(),
+                completed_at: None,
+                assignments: vec![assignment.clone()],
+                runtimes: vec![runtime.clone()],
+            }),
+        };
+        validate_maintenance_status(&status).expect("valid maintenance status");
+        assert_eq!(
+            maintenance_assignment_ack_id(7, &assignment),
+            maintenance_assignment_ack_id(7, &assignment)
+        );
+        assert_ne!(
+            maintenance_assignment_ack_id(7, &assignment),
+            maintenance_runtime_ack_id(7, &runtime, MaintenanceRuntimeAckStatus::Suspended,)
+        );
+        assert_ne!(
+            maintenance_runtime_ack_id(7, &runtime, MaintenanceRuntimeAckStatus::Suspended,),
+            maintenance_runtime_ack_id(7, &runtime, MaintenanceRuntimeAckStatus::Terminal,)
+        );
+
+        let mut acknowledged = status.clone();
+        let acknowledged_epoch = acknowledged.epoch.as_mut().expect("maintenance epoch");
+        acknowledged_epoch.assignments[0].ack = Some(MaintenanceAckView {
+            status: "quiesced".to_owned(),
+            acked_at: Some(Utc::now()),
+            ack_request_id: Some(Uuid::new_v4()),
+            canonical_request_hash: Some("ab".repeat(32)),
+            receipt: Some(json!({
+                "maintenance_epoch": 7,
+                "type": "assignment_quiesced",
+                "binding_id": assignment.binding_id,
+                "assignment_id": assignment.assignment_id,
+                "status": "quiesced",
+                "client_protocol_version": MAINTENANCE_CLIENT_PROTOCOL_VERSION,
+                "client_build": MAINTENANCE_CLIENT_BUILD,
+            })),
+        });
+        acknowledged_epoch.runtimes[0].ack = Some(MaintenanceAckView {
+            status: "suspended".to_owned(),
+            acked_at: Some(Utc::now()),
+            ack_request_id: Some(Uuid::new_v4()),
+            canonical_request_hash: Some("cd".repeat(32)),
+            receipt: Some(json!({
+                "maintenance_epoch": 7,
+                "type": "runtime_suspended_or_terminal",
+                "binding_id": runtime.binding_id,
+                "assignment_id": runtime.assignment_id,
+                "runtime_id": runtime.runtime_id,
+                "runtime_epoch": runtime.runtime_epoch,
+                "status": "suspended",
+            })),
+        });
+        validate_maintenance_status(&acknowledged).expect("exact ACK receipts");
+
+        let mut tampered_ack = acknowledged;
+        tampered_ack
+            .epoch
+            .as_mut()
+            .expect("maintenance epoch")
+            .runtimes[0]
+            .ack
+            .as_mut()
+            .expect("Runtime ACK")
+            .receipt = Some(json!({
+            "maintenance_epoch": 7,
+            "type": "runtime_suspended_or_terminal",
+            "binding_id": runtime.binding_id,
+            "assignment_id": runtime.assignment_id,
+            "runtime_id": Uuid::new_v4(),
+            "runtime_epoch": runtime.runtime_epoch,
+            "status": "suspended",
+        }));
+        assert!(validate_maintenance_status(&tampered_ack).is_err());
+
+        let mut malformed = status;
+        malformed.poll_after_seconds = 0;
+        assert!(validate_maintenance_status(&malformed).is_err());
+    }
+
+    #[tokio::test]
+    async fn project_view_maintenance_acknowledges_runtime_before_assignment_and_reads_back() {
+        let member_keys = Keys::generate();
+        let assignment_id = Uuid::new_v4();
+        let api_state = Arc::new(Mutex::new(MockRuntimeApi {
+            assignment_id,
+            managed: true,
+            maintenance: Some(MockMaintenanceApi {
+                community_id: Uuid::new_v4(),
+                member_pubkey: member_keys.public_key().to_hex(),
+                binding_id: Uuid::new_v4(),
+                assignment_id,
+                runtime_id: Uuid::new_v4(),
+                runtime_epoch: 9,
+                runtime_acked: false,
+                assignment_acked: false,
+                ack_order: Vec::new(),
+            }),
+            ..MockRuntimeApi::default()
+        }));
+        let (client, server) =
+            mock_runtime_client(Arc::clone(&api_state), member_keys.clone()).await;
+        let directory = std::env::temp_dir().join(format!(
+            "buzz-acp-project-view-maintenance-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("create maintenance test directory");
+        let lifecycle_gate = crate::role_brief::TurnLifecycleGate::new();
+        let mut coordinator = RuntimeSupervisorCoordinator::new(
+            Some(RuntimeSupervisorConfig {
+                keys: Keys::generate(),
+                state_path: directory.join("state.json"),
+                fence_path: directory.join("runtime.fence.json"),
+            }),
+            client,
+            member_keys.public_key(),
+            "ws://relay.example".to_owned(),
+            lifecycle_gate.clone(),
+        );
+
+        assert!(matches!(
+            coordinator
+                .poll_maintenance()
+                .await
+                .expect("latch maintenance"),
+            MaintenanceWatchState::Holding {
+                state,
+                maintenance_epoch: 7,
+                ..
+            } if state == "draining"
+        ));
+        assert!(!lifecycle_gate.admission_open());
+        coordinator
+            .acknowledge_latched_maintenance()
+            .await
+            .expect("acknowledge exact maintenance baseline");
+
+        let state = api_state.lock().expect("lock mock Runtime API");
+        let maintenance = state.maintenance.as_ref().expect("maintenance fixture");
+        assert!(maintenance.runtime_acked);
+        assert!(maintenance.assignment_acked);
+        assert_eq!(maintenance.ack_order, ["runtime", "assignment"]);
+        drop(state);
+
+        server.abort();
+        std::fs::remove_dir(&directory).expect("remove maintenance test directory");
+    }
+
     #[tokio::test]
     async fn running_harness_converges_across_binding_and_assignment_changes() {
         let assignment_id = Uuid::new_v4();
@@ -1455,6 +2699,7 @@ mod tests {
             client,
             member_keys.public_key(),
             "ws://relay.example".to_owned(),
+            crate::role_brief::TurnLifecycleGate::new(),
         );
         coordinator
             .prepare_startup(Some(assignment_id))

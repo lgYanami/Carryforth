@@ -304,6 +304,56 @@ fn create_rejects_unknown_fields_before_signing() {
 }
 
 #[test]
+fn v3_resource_mutation_is_guide_only_and_keeps_unknown_kinds() {
+    let guide_document_id = Uuid::new_v4();
+    let prepared = prepare_v3_mutation(ProjectViewMutationInput::Create {
+        expected_project_revision: 8,
+        object_type: ProjectViewObjectType::Resource,
+        data: json!({
+            "name": "Release console",
+            "resource_kind": "internal-release-console-v7",
+            "summary": "Coordinates releases",
+            "guide_document_id": guide_document_id,
+        }),
+    })
+    .expect("prepare v3 Resource");
+    let event = prepared
+        .builder
+        .sign_with_keys(&Keys::generate())
+        .expect("sign v3 Resource");
+    let command = buzz_project_view_pkg::v3::ProjectObjectCommandV3::from_json(&event.content)
+        .expect("parse closed v3 command");
+    let buzz_project_view_pkg::v3::ProjectObjectRequestV3::Create(create) = command.request else {
+        panic!("expected v3 create");
+    };
+    assert!(matches!(
+        create.object,
+        buzz_project_view_pkg::v3::NewProjectViewObjectV3::Resource {
+            resource_kind,
+            guide_document_id: actual_guide,
+            ..
+        } if resource_kind == "internal-release-console-v7" && actual_guide == guide_document_id
+    ));
+    assert!(!event.content.contains("locator"));
+}
+
+#[test]
+fn v3_resource_rejects_the_legacy_locator_shape() {
+    let error = prepare_v3_mutation(ProjectViewMutationInput::Create {
+        expected_project_revision: 8,
+        object_type: ProjectViewObjectType::Resource,
+        data: json!({
+            "name": "Legacy",
+            "resource_type": "repository",
+            "locator": {"locator_type": "url", "value": "https://example.test"},
+            "description": "must not cross the v3 boundary",
+        }),
+    })
+    .expect_err("legacy Resource must fail closed");
+    assert!(error.contains("invalid typed Project View v3 create data"));
+}
+
+#[test]
 fn receipt_requires_the_canonical_response_prefix() {
     let event = build_initialize(
         profile(),

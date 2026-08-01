@@ -6,6 +6,10 @@ use std::time::Duration;
 use buzz_core::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
 use buzz_core::CommunityId;
 use buzz_project_view::v2::ProjectObjectCommand;
+use buzz_project_view::v3::{
+    CreateProjectObjectV3, DeleteProjectObjectV3, NewProjectViewObjectV3, ProjectObjectCommandV3,
+    ProjectObjectRequestV3, ProjectViewEntryV3, ProjectViewInitializeV3, UpdateProjectObjectV3,
+};
 use buzz_project_view::{
     CreateMutation, DeleteMutation, GoalView, InitializeGoal, IssueView, MutationRequest, PlanView,
     ProjectProfile, ProjectView, ProjectViewEntry, ProjectViewObject, ProjectViewObjectType,
@@ -17,7 +21,12 @@ use buzz_sdk::project_view::{
     ProjectedObject,
 };
 use buzz_sdk::project_view_v2::{build_project_object_command, V2MetaProjection};
+use buzz_sdk::project_view_v3::{
+    build_initialize_command as build_initialize_v3,
+    build_project_object_command as build_project_object_command_v3,
+};
 use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
+use buzz_sdk::role_brief_v3::VerifiedRoleBriefSnapshotV3;
 use nostr::Event;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,12 +34,12 @@ use uuid::Uuid;
 
 use crate::client::{create_response_with_id, normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_identity, read_verified_v2_snapshot, runtime_fence_from_env,
-    ProjectViewIdentity, ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
+    is_managed_runtime, read_identity, read_verified_v2_snapshot, read_verified_v3_snapshot,
+    runtime_fence_from_env, ProjectViewIdentity, ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
 };
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
-use crate::{OutputFormat, ProjectViewCmd};
+use crate::{OutputFormat, ProjectViewCmd, ProjectViewV3ClientCmd};
 
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
@@ -52,6 +61,51 @@ struct ProjectViewOutput {
     roles: Vec<ProjectViewObject>,
     resources: Vec<ProjectViewObject>,
     issue_references_by_target: BTreeMap<Uuid, Vec<buzz_project_view::ObjectRef>>,
+}
+
+#[derive(Serialize)]
+struct ProjectViewV3Output<'a> {
+    project_view_schema_version: u16,
+    initialized: bool,
+    project_revision: u64,
+    projection_generation: u64,
+    project: Option<&'a buzz_project_view::v3::ProjectViewObjectV3>,
+    goals: Vec<&'a buzz_project_view::v3::ProjectViewObjectV3>,
+    roles: Vec<&'a buzz_project_view::v3::ProjectViewObjectV3>,
+    resources: Vec<&'a buzz_project_view::v3::ProjectViewObjectV3>,
+    objects: Vec<&'a buzz_project_view::v3::ProjectViewObjectV3>,
+}
+
+impl<'a> ProjectViewV3Output<'a> {
+    fn from_snapshot(snapshot: &'a VerifiedRoleBriefSnapshotV3) -> Self {
+        let objects = snapshot.state().active_objects().collect::<Vec<_>>();
+        Self {
+            project_view_schema_version: 3,
+            initialized: true,
+            project_revision: snapshot.meta().project_revision,
+            projection_generation: snapshot.meta().projection_generation,
+            project: objects
+                .iter()
+                .copied()
+                .find(|object| object.object_type == ProjectViewObjectType::ProjectProfile),
+            goals: objects
+                .iter()
+                .copied()
+                .filter(|object| object.object_type == ProjectViewObjectType::Goal)
+                .collect(),
+            roles: objects
+                .iter()
+                .copied()
+                .filter(|object| object.object_type == ProjectViewObjectType::Role)
+                .collect(),
+            resources: objects
+                .iter()
+                .copied()
+                .filter(|object| object.object_type == ProjectViewObjectType::Resource)
+                .collect(),
+            objects,
+        }
+    }
 }
 
 impl ProjectViewOutput {
@@ -148,6 +202,12 @@ pub async fn dispatch(
             cmd_get_object(client, object_type.into(), id, format).await
         }
         ProjectViewCmd::Init { profile, goal } => cmd_init(client, &profile, &goal).await,
+        ProjectViewCmd::InitV3 { command } => cmd_init_v3(client, &command).await,
+        ProjectViewCmd::V3 { command } => match command {
+            ProjectViewV3ClientCmd::Resources { command } => {
+                crate::commands::project_view_v3_approval::dispatch(command, client).await
+            }
+        },
         ProjectViewCmd::Create {
             object_type,
             expected_project_revision,
@@ -178,17 +238,23 @@ pub async fn dispatch(
 
 async fn cmd_get(client: &BuzzClient, format: &OutputFormat) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
-    let output = match identity.schema {
+    match identity.schema {
         ProjectViewSchema::V1 => match fetch_consistent_snapshot(client, identity).await? {
-            Some(snapshot) => ProjectViewOutput::initialized(&snapshot.meta, snapshot.view),
-            None => ProjectViewOutput::uninitialized(),
+            Some(snapshot) => print_read_output(
+                &ProjectViewOutput::initialized(&snapshot.meta, snapshot.view),
+                format,
+            ),
+            None => print_read_output(&ProjectViewOutput::uninitialized(), format),
         },
         ProjectViewSchema::V2 => {
             let snapshot = read_verified_v2_snapshot(client, identity).await?;
-            ProjectViewOutput::initialized_v2(&snapshot)
+            print_read_output(&ProjectViewOutput::initialized_v2(&snapshot), format)
         }
-    };
-    print_read_output(&output, format)
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            print_read_output(&ProjectViewV3Output::from_snapshot(&snapshot), format)
+        }
+    }
 }
 
 async fn cmd_get_object(
@@ -198,21 +264,40 @@ async fn cmd_get_object(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
-    if identity.schema == ProjectViewSchema::V2 {
-        let snapshot = read_verified_v2_snapshot(client, identity).await?;
-        let entry = snapshot.entry(object_id).ok_or_else(|| {
-            CliError::NotFound(format!(
-                "Project View object {}:{} was not found",
-                object_type.as_str(),
-                object_id
-            ))
-        })?;
-        if entry.object_type() != object_type {
-            return Err(integrity_error(
-                "point lookup found the object ID under a different type",
-            ));
+    match identity.schema {
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let entry = snapshot.entry(object_id).ok_or_else(|| {
+                CliError::NotFound(format!(
+                    "Project View object {}:{} was not found",
+                    object_type.as_str(),
+                    object_id
+                ))
+            })?;
+            if entry.object_type() != object_type {
+                return Err(integrity_error(
+                    "point lookup found the object ID under a different type",
+                ));
+            }
+            return print_read_output(&v2_object_output(entry, snapshot.meta()), format);
         }
-        return print_read_output(&v2_object_output(entry, snapshot.meta()), format);
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            let entry = snapshot.entry(object_id).ok_or_else(|| {
+                CliError::NotFound(format!(
+                    "Project View object {}:{} was not found",
+                    object_type.as_str(),
+                    object_id
+                ))
+            })?;
+            if entry.object_type() != object_type {
+                return Err(integrity_error(
+                    "v3 point lookup found the object ID under a different type",
+                ));
+            }
+            return print_read_output(&v3_object_output(entry, &snapshot), format);
+        }
+        ProjectViewSchema::V1 => {}
     }
     let meta = read_meta(client, identity)
         .await?
@@ -233,9 +318,9 @@ async fn cmd_get_object(
 async fn cmd_init(client: &BuzzClient, profile: &str, goals: &[String]) -> Result<(), CliError> {
     require_single_stdin(std::iter::once(profile).chain(goals.iter().map(String::as_str)))?;
     let identity = require_capability(client).await?;
-    if identity.schema == ProjectViewSchema::V2 {
+    if identity.schema != ProjectViewSchema::V1 {
         return Err(CliError::Usage(
-            "Project View v2 is already initialized; `project-view init` only applies to v1"
+            "`project-view init` only applies to schema v1; use `project-view init-v3` for a prepared empty v3 Community"
                 .to_owned(),
         ));
     }
@@ -265,6 +350,21 @@ async fn cmd_init(client: &BuzzClient, profile: &str, goals: &[String]) -> Resul
     Ok(())
 }
 
+async fn cmd_init_v3(client: &BuzzClient, command_path: &str) -> Result<(), CliError> {
+    let command: ProjectViewInitializeV3 = read_json_file(command_path, "v3 initialization")?;
+    let event = client.sign_event_exact(build_initialize_v3(command).map_err(sdk_err)?)?;
+    let raw = submit_mutation(client, event.clone()).await?;
+    let receipt = parse_receipt(&raw, &event)?;
+    if receipt.object_id.is_some() || receipt.object_revision.is_some() || receipt.deleted.is_some()
+    {
+        return Err(integrity_error(
+            "v3 initialization receipt unexpectedly contains object fields",
+        ));
+    }
+    println!("{}", normalize_write_response(&raw));
+    Ok(())
+}
+
 async fn cmd_create(
     client: &BuzzClient,
     object_type: ProjectViewObjectType,
@@ -278,11 +378,16 @@ async fn cmd_create(
     }
     let identity = require_capability(client).await?;
     let object_id = Uuid::new_v4();
-    let object = create_input(object_type, object_id, read_json_value(data_path, "data")?)?;
+    let data = read_json_value(data_path, "data")?;
     let event = match identity.schema {
-        ProjectViewSchema::V1 => client
-            .sign_event_exact(build_create(expected_project_revision, object).map_err(sdk_err)?)?,
+        ProjectViewSchema::V1 => {
+            let object = create_input(object_type, object_id, data)?;
+            client.sign_event_exact(
+                build_create(expected_project_revision, object).map_err(sdk_err)?,
+            )?
+        }
         ProjectViewSchema::V2 => {
+            let object = create_input(object_type, object_id, data)?;
             let acting_assignment = v2_acting_assignment(client, identity).await?;
             let mut command = ProjectObjectCommand::new(
                 expected_project_revision,
@@ -291,6 +396,17 @@ async fn cmd_create(
             );
             command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
+        }
+        ProjectViewSchema::V3 => {
+            let object = create_input_v3(object_type, object_id, data)?;
+            let acting_assignment = v2_acting_assignment(client, identity).await?;
+            let mut command = ProjectObjectCommandV3::new(
+                expected_project_revision,
+                acting_assignment,
+                ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
+            );
+            command.runtime_fence = runtime_fence_from_env()?;
+            client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
@@ -315,15 +431,16 @@ async fn cmd_update(
     patch_path: &str,
 ) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
-    let update = update_input(
-        object_type,
-        object_id,
-        read_json_value(patch_path, "patch")?,
-    )?;
+    let patch = read_json_value(patch_path, "patch")?;
     let event = match identity.schema {
-        ProjectViewSchema::V1 => client
-            .sign_event_exact(build_update(expected_project_revision, update).map_err(sdk_err)?)?,
+        ProjectViewSchema::V1 => {
+            let update = update_input(object_type, object_id, patch)?;
+            client.sign_event_exact(
+                build_update(expected_project_revision, update).map_err(sdk_err)?,
+            )?
+        }
         ProjectViewSchema::V2 => {
+            let update = update_input(object_type, object_id, patch)?;
             let acting_assignment = v2_acting_assignment(client, identity).await?;
             let mut command = ProjectObjectCommand::new(
                 expected_project_revision,
@@ -332,6 +449,17 @@ async fn cmd_update(
             );
             command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
+        }
+        ProjectViewSchema::V3 => {
+            let update = update_input_v3(object_type, object_id, patch)?;
+            let acting_assignment = v2_acting_assignment(client, identity).await?;
+            let mut command = ProjectObjectCommandV3::new(
+                expected_project_revision,
+                acting_assignment,
+                ProjectObjectRequestV3::Update(update),
+            );
+            command.runtime_fence = runtime_fence_from_env()?;
+            client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
@@ -365,6 +493,19 @@ async fn cmd_delete(
             command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
+        ProjectViewSchema::V3 => {
+            let acting_assignment = v2_acting_assignment(client, identity).await?;
+            let mut command = ProjectObjectCommandV3::new(
+                expected_project_revision,
+                acting_assignment,
+                ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
+                    object_type,
+                    object_id,
+                }),
+            );
+            command.runtime_fence = runtime_fence_from_env()?;
+            client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
+        }
     };
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, object_id, true)?;
@@ -376,7 +517,7 @@ async fn cmd_delete(
 async fn require_capability(client: &BuzzClient) -> Result<ProjectViewIdentity, CliError> {
     read_identity(client).await?.ok_or_else(|| {
         CliError::Other(format!(
-            "unsupported: relay does not advertise {PROJECT_VIEW_V1_EXTENSION} or buzz-project-view-v2"
+            "unsupported: relay does not advertise {PROJECT_VIEW_V1_EXTENSION}, buzz-project-view-v2, or buzz-project-view-v3"
         ))
     })
 }
@@ -644,6 +785,29 @@ fn v2_object_output(entry: &ProjectViewEntry, meta: &V2MetaProjection) -> Value 
     }
 }
 
+fn v3_object_output(entry: &ProjectViewEntryV3, snapshot: &VerifiedRoleBriefSnapshotV3) -> Value {
+    let source = snapshot
+        .object_source(entry.id())
+        .or_else(|| snapshot.role_source(entry.id()));
+    match entry {
+        ProjectViewEntryV3::Active(object) => json!({
+            "project_view_schema_version": 3,
+            "project_revision": snapshot.meta().project_revision,
+            "projection_generation": snapshot.meta().projection_generation,
+            "deleted": false,
+            "object": object,
+            "source": source,
+        }),
+        ProjectViewEntryV3::Tombstone(tombstone) => json!({
+            "project_view_schema_version": 3,
+            "project_revision": snapshot.meta().project_revision,
+            "projection_generation": snapshot.meta().projection_generation,
+            "deleted": true,
+            "tombstone": tombstone,
+        }),
+    }
+}
+
 pub(crate) async fn v2_acting_assignment(
     client: &BuzzClient,
     identity: ProjectViewIdentity,
@@ -651,25 +815,35 @@ pub(crate) async fn v2_acting_assignment(
     if !is_managed_runtime() {
         return Ok(None);
     }
-    let snapshot = read_verified_v2_snapshot(client, identity)
-        .await
-        .map_err(|error| {
-            CliError::Auth(format!(
-                "assignment_unavailable: current Assignment could not be verified: {error}"
-            ))
-        })?;
-    let assignment_id = snapshot
-        .assignments()
-        .find(|assignment| {
-            assignment.member_pubkey == client.public_key() && assignment.is_active()
-        })
-        .map(|assignment| assignment.assignment_id)
-        .ok_or_else(|| {
-            CliError::Auth(
-                "assignment_unavailable: managed Agent has no active Assignment".to_owned(),
-            )
-        })?;
+    let assignment_id = match identity.schema {
+        ProjectViewSchema::V2 => read_verified_v2_snapshot(client, identity)
+            .await
+            .map_err(assignment_read_error)?
+            .assignments()
+            .find(|assignment| {
+                assignment.member_pubkey == client.public_key() && assignment.is_active()
+            })
+            .map(|assignment| assignment.assignment_id),
+        ProjectViewSchema::V3 => read_verified_v3_snapshot(client, identity)
+            .await
+            .map_err(assignment_read_error)?
+            .assignments()
+            .find(|assignment| {
+                assignment.member_pubkey == client.public_key() && assignment.is_active()
+            })
+            .map(|assignment| assignment.assignment_id),
+        ProjectViewSchema::V1 => None,
+    }
+    .ok_or_else(|| {
+        CliError::Auth("assignment_unavailable: managed Agent has no active Assignment".to_owned())
+    })?;
     Ok(Some(assignment_id))
+}
+
+fn assignment_read_error(error: CliError) -> CliError {
+    CliError::Auth(format!(
+        "assignment_unavailable: current Assignment could not be verified: {error}"
+    ))
 }
 
 fn create_input(
@@ -710,6 +884,46 @@ fn update_input(
         "patch": patch,
     }))
     .map_err(|error| CliError::Usage(format!("invalid typed Project View patch: {error}")))
+}
+
+fn create_input_v3(
+    object_type: ProjectViewObjectType,
+    object_id: Uuid,
+    data: Value,
+) -> Result<NewProjectViewObjectV3, CliError> {
+    let mut object = data.as_object().cloned().ok_or_else(|| {
+        CliError::Usage("Project View --data must contain one JSON object".to_owned())
+    })?;
+    if object.contains_key("id") || object.contains_key("object_type") {
+        return Err(CliError::Usage(
+            "--data must omit id and object_type; the CLI supplies both".to_owned(),
+        ));
+    }
+    object.insert("id".to_owned(), Value::String(object_id.to_string()));
+    object.insert(
+        "object_type".to_owned(),
+        Value::String(object_type.as_str().to_owned()),
+    );
+    serde_json::from_value(Value::Object(object))
+        .map_err(|error| CliError::Usage(format!("invalid typed Project View v3 data: {error}")))
+}
+
+fn update_input_v3(
+    object_type: ProjectViewObjectType,
+    object_id: Uuid,
+    patch: Value,
+) -> Result<UpdateProjectObjectV3, CliError> {
+    if !patch.is_object() {
+        return Err(CliError::Usage(
+            "Project View --patch must contain one JSON object".to_owned(),
+        ));
+    }
+    serde_json::from_value(json!({
+        "object_type": object_type.as_str(),
+        "object_id": object_id,
+        "patch": patch,
+    }))
+    .map_err(|error| CliError::Usage(format!("invalid typed Project View v3 patch: {error}")))
 }
 
 fn read_json_file<T: DeserializeOwned>(path: &str, label: &str) -> Result<T, CliError> {
@@ -792,6 +1006,30 @@ async fn confirm_object_receipt(
     object_id: Uuid,
     receipt: &ProjectViewReceipt,
 ) -> Result<(), CliError> {
+    if identity.schema == ProjectViewSchema::V3 {
+        let snapshot = read_verified_v3_snapshot(client, identity).await?;
+        if snapshot.meta().project_revision < receipt.project_revision {
+            return Err(integrity_error(
+                "v3 metadata projection is older than the successful mutation receipt",
+            ));
+        }
+        let entry = snapshot
+            .entry(object_id)
+            .ok_or_else(|| integrity_error("successful v3 mutation has no object projection"))?;
+        if entry.object_type() != object_type
+            || entry.object_revision() < receipt.object_revision.unwrap_or_default()
+        {
+            return Err(integrity_error(
+                "v3 object projection does not confirm the mutation receipt",
+            ));
+        }
+        if receipt.deleted == Some(true) && !matches!(entry, ProjectViewEntryV3::Tombstone(_)) {
+            return Err(integrity_error(
+                "v3 delete receipt was not confirmed by a tombstone projection",
+            ));
+        }
+        return Ok(());
+    }
     if identity.schema == ProjectViewSchema::V2 {
         let snapshot = read_verified_v2_snapshot(client, identity).await?;
         if snapshot.meta().project_revision < receipt.project_revision {

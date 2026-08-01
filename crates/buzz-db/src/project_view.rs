@@ -1156,18 +1156,26 @@ impl Db {
             let schema_version =
                 crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
                     .await?;
-            let ready = if schema_version == 2 {
-                crate::project_view_v2::project_view_v2_enable_ready_in_tx(
+            let ready = match schema_version {
+                1 => project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
+                    .await
+                    .map_err(project_view_error_to_db)?,
+                2 => crate::project_view_v2::project_view_v2_enable_ready_in_tx(
                     &mut tx,
                     community_id,
                     relay_pubkey,
                 )
                 .await
-                .map_err(project_view_v2_error_to_db)?
-            } else {
-                project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
-                    .await
-                    .map_err(project_view_error_to_db)?
+                .map_err(project_view_v2_error_to_db)?,
+                3 => {
+                    Self::project_view_v3_structural_ready_in_tx(
+                        &mut tx,
+                        community_id,
+                        relay_pubkey,
+                    )
+                    .await?
+                }
+                _ => false,
             };
             if !ready {
                 return Err(DbError::InvalidData(
@@ -3161,6 +3169,9 @@ mod tests {
         RoleContinuityReference, RoleHandoffContent, RoleLevel, RuntimeAvailability,
         RuntimeEvidence, RuntimeEvidenceRequest, RuntimeFence, RuntimeRecoveryPolicy,
         RUNTIME_SUPERVISION_SCHEMA_VERSION,
+    };
+    use buzz_project_view::v3::{
+        MaintenanceAckCommand, MaintenanceAckRequest, PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
     };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
@@ -7066,6 +7077,205 @@ mod tests {
             "deferred constraints must reject a partial runtime trust graph"
         );
         tamper.rollback().await.expect("roll back binding tamper");
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn project_view_maintenance_readiness_tracks_poll_and_durable_ack() {
+        let scratch = ScratchDatabase::create("buzz_pv_maintenance_readiness").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let supervisor = Keys::generate();
+        let relay = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap readiness owner");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, NULL), ($1, $3, $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .bind(agent.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("register readiness managed Agent");
+        initialize(&db, community_id, &owner, &relay).await;
+        let role_id = Uuid::new_v4();
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            create_role_mutation(1, role_id, "Readiness Role"),
+        )
+        .await;
+        db.set_project_view_enabled(community_id, false)
+            .await
+            .expect("pause v1 before readiness cutover");
+        let audit = buzz_audit::AuditService::new(scratch.pool.clone());
+        let cutover_audit = audit
+            .log(buzz_audit::NewAuditEntry {
+                community_id,
+                action: buzz_audit::AuditAction::ProjectViewCutover,
+                actor_pubkey: Some(owner.public_key().to_bytes().to_vec()),
+                object_id: Some(community_id.to_string()),
+                detail: serde_json::json!({"test": "maintenance readiness"}),
+            })
+            .await
+            .expect("append readiness cutover audit");
+        let cutover = db
+            .cutover_project_view_v2(
+                community_id,
+                &ProjectViewV2CutoverPlan {
+                    admin_assignments: Vec::new(),
+                    downgraded_admins: Vec::new(),
+                    audit_seq: cutover_audit.seq,
+                    idempotency_key_hash: [0x91; 32],
+                },
+                &relay,
+            )
+            .await
+            .expect("cut readiness fixture to v2");
+        assert!(db
+            .set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()))
+            .await
+            .expect("enable readiness fixture"));
+        let proposal_id = Uuid::new_v4();
+        commit_v2_role_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            RoleCommand::new(
+                cutover.project_revision,
+                None,
+                RoleCommandRequest::OfferRole {
+                    proposal_id,
+                    role_id,
+                    candidate_pubkey: agent.public_key(),
+                    expires_at: Utc::now() + chrono::Duration::days(1),
+                    reason: Some("maintenance readiness".to_owned()),
+                },
+            ),
+        )
+        .await;
+        let accepted = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &agent,
+            &relay,
+            RoleCommand::new(
+                cutover.project_revision + 1,
+                None,
+                RoleCommandRequest::AcceptProposal { proposal_id },
+            ),
+        )
+        .await;
+        let assignment_id = Uuid::parse_str(
+            accepted.receipt.result["assignment_id"]
+                .as_str()
+                .expect("readiness Assignment ID"),
+        )
+        .expect("valid readiness Assignment ID");
+        let binding = db
+            .register_runtime_supervisor(
+                community_id,
+                assignment_id,
+                supervisor.public_key(),
+                owner.public_key(),
+                RuntimeRecoveryPolicy {
+                    lease_seconds: 60,
+                    recovery_window_seconds: 30,
+                    max_recovery_attempts: 1,
+                    recovery_backoff_seconds: 1,
+                    monitor_timeout_seconds: 30,
+                    monitor_grace_seconds: 30,
+                    automatic_unrecoverable: true,
+                },
+            )
+            .await
+            .expect("register readiness supervisor");
+
+        let begin = db
+            .begin_project_view_v3_maintenance(
+                community_id,
+                owner.public_key(),
+                1,
+                "readiness-begin",
+                &relay.public_key(),
+            )
+            .await
+            .expect("begin readiness maintenance");
+        let readiness = db
+            .project_view_maintenance_readiness(community_id, begin.maintenance_epoch, 30)
+            .await
+            .expect("read maintenance readiness");
+        assert_eq!(readiness["exact_current_epoch"], true);
+        assert_eq!(readiness["fleet_protocol_ready"], false);
+        assert_eq!(readiness["fleet_poll_ready"], false);
+        assert_eq!(readiness["durable_acks_complete"], false);
+        assert_eq!(readiness["runtime_retirement_complete"], true);
+        assert_eq!(readiness["ready_to_freeze"], false);
+        assert_eq!(readiness["assignments"].as_array().map(Vec::len), Some(1));
+        assert_eq!(readiness["runtimes"], serde_json::json!([]));
+
+        db.project_view_maintenance_supervisor_status(
+            community_id,
+            supervisor.public_key(),
+            Some(begin.maintenance_epoch),
+            Some(1),
+            Some("buzz-acp/test"),
+        )
+        .await
+        .expect("record readiness supervisor poll");
+        let polled = db
+            .project_view_maintenance_readiness(community_id, begin.maintenance_epoch, 30)
+            .await
+            .expect("read polled maintenance readiness");
+        assert_eq!(polled["fleet_protocol_ready"], true);
+        assert_eq!(polled["fleet_poll_ready"], true);
+        assert_eq!(polled["durable_acks_complete"], false);
+        assert_eq!(polled["ready_to_freeze"], false);
+
+        let ack = MaintenanceAckCommand {
+            schema_version: PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
+            request: MaintenanceAckRequest::AssignmentQuiesced {
+                maintenance_epoch: begin.maintenance_epoch,
+                binding_id: binding.binding_id,
+                assignment_id,
+                client_protocol_version: 1,
+                client_build: "buzz-acp/test".to_owned(),
+                idempotency_key: Uuid::new_v4(),
+            },
+        };
+        db.acknowledge_project_view_maintenance(
+            community_id,
+            supervisor.public_key(),
+            [0x92; 32],
+            &ack,
+        )
+        .await
+        .expect("acknowledge idle readiness Assignment");
+        let ready = db
+            .project_view_maintenance_readiness(community_id, begin.maintenance_epoch, 30)
+            .await
+            .expect("read acknowledged maintenance readiness");
+        for field in [
+            "exact_current_epoch",
+            "fleet_protocol_ready",
+            "fleet_poll_ready",
+            "durable_acks_complete",
+            "runtime_retirement_complete",
+            "ready_to_freeze",
+        ] {
+            assert_eq!(ready[field], true, "{field}");
+        }
 
         scratch.cleanup().await;
     }

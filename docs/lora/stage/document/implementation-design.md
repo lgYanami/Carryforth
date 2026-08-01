@@ -5103,6 +5103,16 @@ Documents         │
 
 ### 阶段 5：dual clients、Resource Guide 与 v3 cutover
 
+> 交付状态（2026-08-01）：软件实现、unit/integration/isolated交付门禁，以及本地真实运行的
+> bounded v2 → v3 Community cutover与empty-state direct-v3 canary均已按
+> [`stage5-cutover-canary.md`](stage5-cutover-canary.md)完成。已交付strict v2/v3 CLI、
+> Tauri/Desktop Resource → Guide链路、base `RoleBriefV3`、ACP maintenance-aware完整生命周期、
+> durable Runtime → Assignment ACK及fleet readiness/cutover runbook；第一方UI范围仅为Desktop，
+> Mobile与Web未纳入。该验收不要求已部署或生产环境，但必须使用真实本地Relay、PostgreSQL、Redis、
+> 签名身份和ACP进程，不能由mock替代。本次证据时间为2026-08-01T10:58:58Z，artifact manifest
+> SHA-256为`246aa8a657b2ef4f8f931291557db421cad3d4ea5ab33876e1c3cf0e1001516a`。
+> `project_context_enabled`仍为`false`，阶段6与broad rollout均未开始。
+
 目标：让 Resource 以“资产坐标 + Guide”正式取代 legacy locator authority。
 
 开发内容：

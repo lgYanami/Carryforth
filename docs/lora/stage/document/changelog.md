@@ -1,5 +1,63 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-01 — 阶段 5 软件与本地真实 canary 完成
+
+阶段目标：交付可安全迁移到 Project View v3 的 dual clients、Resource → Guide 使用闭环与
+maintenance-aware ACP runtime；第一方图形客户端仅覆盖 Desktop。Mobile、Web、Context Reference
+与阶段 6 enrichment均不在本阶段软件交付范围。
+
+### 已交付
+
+- SDK新增strict `RoleBriefV3`与v3 Role/Resource surface；CLI可按signed metadata在v2/v3间严格分派
+  snapshot、Role continuity与object write，不进行dual write。`buzz resources guide`先验证Resource，
+  再按exact Document coordinate读取Guide，并在输出前复验v3 meta，避免读取窗口中的authority漂移。
+- CLI提供v3 Resource detached Human approval；Relay bridge提供versioned v3 current-entity分页，未知
+  `resource_kind`在SDK、CLI、Tauri和Desktop中原样往返。
+- Tauri提供strict v3 verified snapshot与write adapter；TypeScript拒绝v2/v3 discriminator混用、
+  nonempty Context和错误Document metadata状态。Desktop交付locator-free Resource form、metadata-first
+  Guide picker、Guide-first create saga、冲突保留以及inspector中的Resource → Guide入口。
+- ACP解析`ResolvedRoleBrief::V2 | V3`；base v3只包含bounded Project/Role/Assignment/Work continuity，
+  Context固定为`not_advertised_empty`，Document metadata固定为`not_required`。base prompt加入
+  `project-view get → get-object resource → resources guide --content-only`按需发现链，不自动读取Guide正文。
+- runtime supervisor在启动和持续轮询中优先处理maintenance，停止新turn admission，取消并join全部
+  lifecycle工作，回收active/idle child process group，再按Runtime、Assignment不可交换顺序提交durable
+  ACK并逐字段读回。轮询deadline不会被持续命令流重置；恢复只创建新的Runtime/fence。
+- child registry持久化PGID leader start-time和每次spawn的随机marker；异常恢复只有在证明进程身份后
+  才杀进程组，PID/PGID复用或无身份的leaderless group均fail closed。
+- `buzz-admin`提供fleet readiness与automation-safe `maintenance ack-probe`。数据库readiness把协议、
+  supervisor poll、baseline、durable ACK和invalidation分别报告；maintenance begin使用确定的
+  Assignment/binding加锁顺序，避免PostgreSQL禁止window function与`FOR UPDATE`同层组合的问题。
+- 新增[`stage5-cutover-canary.md`](stage5-cutover-canary.md)，固定reviewed Resource export、Guide publish、
+  detached approval、exact maintenance、freeze/cutover/verify/resume、旧客户端unsupported观察、
+  migration archive与empty-state direct-v3 canary合同。
+
+### 已完成的自动化与 isolated 证据
+
+- ACP全量单测619项通过；相关Rust包Clippy以`-D warnings`通过。
+- Project View unit/property/relation/wire门禁通过；PostgreSQL集成门禁20项通过，包含真实
+  maintenance begin → supervisor poll → durable ACK → ready-to-freeze状态推进。
+- 真实本地Relay的Project View WebSocket/HTTP读写、分页与live revocation E2E通过。
+- Desktop `pnpm check`与全量测试通过；strict RoleBriefV3 contract测试及Project View
+  Playwright E2E 30项通过，其中2项覆盖v3 Resource/Guide saga。Tauri Project View测试17项通过。
+
+### 已完成的本地真实运行交付
+
+- 2026-08-01T10:58:58Z在同一真实本地PostgreSQL、Redis、Relay、`buzz-cli`、`buzz-admin`、
+  `buzz-acp`与ACP child栈完成bounded v2 → v3 canary：一个active legacy Resource发布active Guide、
+  经Human detached approval与operator重验后，在maintenance epoch 1完成Runtime → Assignment durable
+  ACK、freeze、cutover、verify和resume。Resource revision从1变为2，未知`resource_kind`原样保留，
+  locator仅保留在Guide/review archive；恢复后的Runtime ID与旧ID不同，strict base `RoleBriefV3`通过。
+- 在同一进程中的独立empty-state Community完成prepare-v3、Human签名initialize-v3与enable：revision 1、
+  generation 1、3个active对象、1个exact Human governance Assignment，v2-only操作明确unsupported。
+- 真实运行发现并修复schema-v3 enable错误分派、Document `BIGINT`解码、CLI Role Brief/current v3分派、
+  ACP child identity启动竞态，以及greenfield prepare中间态、active-object双计数和已消费prepare指针未清除。
+- 完整证据位于`test-results/stage5-canary/20260801T105825Z-1319826`；
+  `artifact-digests.sha256`自身SHA-256为
+  `246aa8a657b2ef4f8f931291557db421cad3d4ea5ab33876e1c3cf0e1001516a`，逐文件校验通过。
+
+`project_context_enabled`保持`false`，NIP-11不广告Context，未进入阶段6或broad rollout；本地scratch
+数据库已删除，证据目录保留。
+
 ## 2026-08-01 — 阶段 4 完成
 
 阶段目标：交付默认关闭的 Project View v3 backend 与可审计 cutover control plane，使
@@ -60,7 +118,7 @@ Resource 的 legacy locator 能在后续阶段经 Human review迁移为“资产
 - v2 regression、v3 domain/SDK/Relay/admin unit gates以及fresh/upgrade/concurrent migration gate通过；未执行
   任何真实Community cutover。
 
-### 明确未进入阶段 4
+### 明确未进入阶段 5
 
 - 没有CLI/Tauri/Desktop v3 dual reader/writer、Resource Guide picker或`buzz resources guide`；
 - 没有ACP RoleBriefV3 resolver、maintenance watcher / full-lifecycle child reap或fleet probe；

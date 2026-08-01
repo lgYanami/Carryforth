@@ -76,24 +76,24 @@ struct DocumentListItem {
 }
 
 #[derive(Serialize)]
-struct DocumentReadOutput {
-    document_id: Uuid,
-    document_revision: u64,
-    state: DocumentState,
+pub(crate) struct DocumentReadOutput {
+    pub(crate) document_id: Uuid,
+    pub(crate) document_revision: u64,
+    pub(crate) state: DocumentState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
+    pub(crate) title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
+    pub(crate) summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content_markdown: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    created_by: PublicKey,
-    revision_at: chrono::DateTime<chrono::Utc>,
-    revision_by: PublicKey,
-    revision_event_id: EventId,
+    pub(crate) content_markdown: Option<String>,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_by: PublicKey,
+    pub(crate) revision_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) revision_by: PublicKey,
+    pub(crate) revision_event_id: EventId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    head_event_id: Option<EventId>,
-    source_event_id: EventId,
+    pub(crate) head_event_id: Option<EventId>,
+    pub(crate) source_event_id: EventId,
 }
 
 #[derive(Serialize)]
@@ -370,10 +370,33 @@ async fn cmd_get(
     content_only: bool,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
+    let output = read_verified_document(client, document_id, revision).await?;
+    if content_only {
+        let content = output.content_markdown.as_deref().ok_or_else(|| {
+            CliError::NotFound(format!(
+                "Document {document_id} revision {} is a tombstone",
+                output.document_revision
+            ))
+        })?;
+        std::io::stdout()
+            .lock()
+            .write_all(content.as_bytes())
+            .map_err(|error| CliError::Other(format!("failed to write stdout: {error}")))?;
+        return Ok(());
+    }
+    print_read_output(&output, format)
+}
+
+/// Resolve one current or pinned Document through the strict SDK boundary.
+pub(crate) async fn read_verified_document(
+    client: &BuzzClient,
+    document_id: Uuid,
+    requested_revision: Option<u64>,
+) -> Result<DocumentReadOutput, CliError> {
     let identity = require_identity(client).await?;
     let meta = read_meta(client, identity).await?;
     let project_id = CommunityId::from_uuid(meta.projection.project_id);
-    let (revision, head_event_id, current_tombstone) = match revision {
+    let (revision, head_event_id, current_tombstone) = match requested_revision {
         Some(revision) => (
             read_revision(client, identity, project_id, document_id, revision).await?,
             None,
@@ -414,21 +437,7 @@ async fn cmd_get(
             revision_document_revision(&revision.projection)
         )));
     }
-    let output = document_read_output(revision, head_event_id);
-    if content_only {
-        let content = output.content_markdown.as_deref().ok_or_else(|| {
-            CliError::NotFound(format!(
-                "Document {document_id} revision {} is a tombstone",
-                output.document_revision
-            ))
-        })?;
-        std::io::stdout()
-            .lock()
-            .write_all(content.as_bytes())
-            .map_err(|error| CliError::Other(format!("failed to write stdout: {error}")))?;
-        return Ok(());
-    }
-    print_read_output(&output, format)
+    Ok(document_read_output(revision, head_event_id))
 }
 
 async fn cmd_history(

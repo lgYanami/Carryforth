@@ -265,37 +265,45 @@ impl Db {
             ));
         }
 
-        let managed_assignments = sqlx::query(
-            "SELECT assignment.assignment_id, assignment.member_pubkey, \
-                    binding.binding_id, binding.supervisor_pubkey, \
-                    count(binding.binding_id) OVER (PARTITION BY assignment.assignment_id) \
-                        AS binding_count \
+        let managed_assignment_rows = sqlx::query(
+            "SELECT assignment.assignment_id, assignment.member_pubkey \
              FROM project_role_assignments assignment \
              JOIN users actor \
                ON actor.community_id = assignment.community_id \
               AND actor.pubkey = decode(assignment.member_pubkey, 'hex') \
               AND actor.agent_owner_pubkey IS NOT NULL \
-             LEFT JOIN project_runtime_supervisor_bindings binding \
-               ON binding.community_id = assignment.community_id \
-              AND binding.assignment_id = assignment.assignment_id \
-              AND binding.revoked_at IS NULL \
-              AND binding.system_change_id IS NULL \
              WHERE assignment.community_id = $1 AND assignment.ended_at IS NULL \
-             ORDER BY assignment.assignment_id, binding.binding_id \
-             FOR UPDATE OF assignment, binding",
+             ORDER BY assignment.assignment_id FOR UPDATE OF assignment",
         )
         .bind(community_id.as_uuid())
         .fetch_all(&mut *tx)
         .await?;
-        for row in &managed_assignments {
-            if row.try_get::<i64, _>("binding_count")? != 1
-                || row.try_get::<Option<Uuid>, _>("binding_id")?.is_none()
-            {
+        let mut managed_assignments = Vec::with_capacity(managed_assignment_rows.len());
+        for row in managed_assignment_rows {
+            let assignment_id: Uuid = row.try_get("assignment_id")?;
+            let member_pubkey: String = row.try_get("member_pubkey")?;
+            let binding_rows = sqlx::query(
+                "SELECT binding_id, supervisor_pubkey \
+                 FROM project_runtime_supervisor_bindings \
+                 WHERE community_id = $1 AND assignment_id = $2 \
+                   AND revoked_at IS NULL AND system_change_id IS NULL \
+                 ORDER BY binding_id FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .bind(assignment_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let [binding] = binding_rows.as_slice() else {
                 return Err(ProjectViewMaintenanceError::Conflict(format!(
-                    "managed Assignment {} does not have exactly one active supervisor binding",
-                    row.try_get::<Uuid, _>("assignment_id")?
+                    "managed Assignment {assignment_id} does not have exactly one active supervisor binding"
                 )));
-            }
+            };
+            managed_assignments.push((
+                assignment_id,
+                member_pubkey,
+                binding.try_get::<Uuid, _>("binding_id")?,
+                binding.try_get::<Vec<u8>, _>("supervisor_pubkey")?,
+            ));
         }
 
         let project_revision = db_u64(current.try_get("project_revision")?, "project_revision")?;
@@ -393,11 +401,7 @@ impl Db {
             .execute(&mut *tx)
             .await?;
 
-        for row in managed_assignments {
-            let assignment_id: Uuid = row.try_get("assignment_id")?;
-            let member_pubkey: String = row.try_get("member_pubkey")?;
-            let binding_id: Uuid = row.try_get("binding_id")?;
-            let supervisor_pubkey: Vec<u8> = row.try_get("supervisor_pubkey")?;
+        for (assignment_id, member_pubkey, binding_id, supervisor_pubkey) in managed_assignments {
             let runtime_count: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM project_runtime_leases \
                  WHERE community_id = $1 AND binding_id = $2 AND ended_at IS NULL",
@@ -474,6 +478,244 @@ impl Db {
             })
             .transpose()?;
         maintenance_status_with_executor(&self.pool, community_id, epoch).await
+    }
+
+    /// Return bounded fleet protocol diagnostics and the exact durable ACK /
+    /// retirement predicate consumed by cutover automation. This is read-only:
+    /// polling diagnostics are written only by authenticated supervisors.
+    #[allow(clippy::too_many_lines)]
+    pub async fn project_view_maintenance_readiness(
+        &self,
+        community_id: CommunityId,
+        maintenance_epoch: u64,
+        max_poll_age_seconds: u64,
+    ) -> ProjectViewMaintenanceResult<Value> {
+        require_safe_positive(maintenance_epoch, "maintenance_epoch")?;
+        require_safe_positive(max_poll_age_seconds, "max_poll_age_seconds")?;
+        if max_poll_age_seconds > 86_400 {
+            return Err(ProjectViewMaintenanceError::Invalid(
+                "max_poll_age_seconds must be at most 86400".to_owned(),
+            ));
+        }
+        let epoch = i64::try_from(maintenance_epoch).map_err(|_| {
+            ProjectViewMaintenanceError::Invalid("maintenance_epoch exceeds BIGINT".to_owned())
+        })?;
+        let poll_age = i64::try_from(max_poll_age_seconds).map_err(|_| {
+            ProjectViewMaintenanceError::Invalid("max_poll_age_seconds exceeds BIGINT".to_owned())
+        })?;
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
+        let coordinate = sqlx::query(
+            "SELECT maintenance.state, maintenance.current_epoch, epoch.outcome, \
+                    epoch.required_client_protocol_version, clock_timestamp() AS observed_at \
+             FROM project_view_maintenance maintenance \
+             JOIN project_view_maintenance_epochs epoch \
+               ON epoch.community_id = maintenance.community_id \
+              AND epoch.maintenance_epoch = $2 \
+             WHERE maintenance.community_id = $1 FOR SHARE OF maintenance, epoch",
+        )
+        .bind(community_id.as_uuid())
+        .bind(epoch)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ProjectViewMaintenanceError::Conflict("maintenance epoch missing".into()))?;
+        let state: String = coordinate.try_get("state")?;
+        let current_epoch: Option<i64> = coordinate.try_get("current_epoch")?;
+        let outcome: String = coordinate.try_get("outcome")?;
+        let required_protocol: i64 = coordinate.try_get("required_client_protocol_version")?;
+        let observed_at: DateTime<Utc> = coordinate.try_get("observed_at")?;
+        let poll_cutoff = observed_at - chrono::Duration::seconds(poll_age);
+
+        let assignment_rows = sqlx::query(
+            "SELECT baseline.assignment_id, baseline.binding_id, baseline.member_pubkey, \
+                    baseline.state_at_begin, baseline.last_polled_at, \
+                    baseline.client_protocol_version, baseline.client_build, \
+                    ack.status AS ack_status, ack.acked_at \
+             FROM project_view_maintenance_assignment_baselines baseline \
+             LEFT JOIN project_view_maintenance_assignment_acks ack \
+               ON ack.community_id = baseline.community_id \
+              AND ack.maintenance_epoch = baseline.maintenance_epoch \
+              AND ack.assignment_id = baseline.assignment_id \
+             WHERE baseline.community_id = $1 AND baseline.maintenance_epoch = $2 \
+             ORDER BY baseline.assignment_id",
+        )
+        .bind(community_id.as_uuid())
+        .bind(epoch)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut assignments = Vec::with_capacity(assignment_rows.len());
+        let mut protocol_pending = Vec::new();
+        let mut poll_pending = Vec::new();
+        let mut assignment_ack_pending = Vec::new();
+        for row in assignment_rows {
+            let assignment_id: Uuid = row.try_get("assignment_id")?;
+            let protocol: Option<i64> = row.try_get("client_protocol_version")?;
+            let last_polled_at: Option<DateTime<Utc>> = row.try_get("last_polled_at")?;
+            let ack_status: Option<String> = row.try_get("ack_status")?;
+            let protocol_ready = protocol.is_some_and(|version| version >= required_protocol);
+            let poll_recent = ack_status.as_deref() == Some("quiesced")
+                || last_polled_at.is_some_and(|polled| polled >= poll_cutoff);
+            if !protocol_ready {
+                protocol_pending.push(assignment_id);
+            }
+            if !poll_recent {
+                poll_pending.push(assignment_id);
+            }
+            if ack_status.as_deref() != Some("quiesced") {
+                assignment_ack_pending.push(assignment_id);
+            }
+            assignments.push(json!({
+                "assignment_id": assignment_id,
+                "binding_id": row.try_get::<Uuid, _>("binding_id")?,
+                "member_pubkey": row.try_get::<String, _>("member_pubkey")?,
+                "state_at_begin": row.try_get::<String, _>("state_at_begin")?,
+                "last_polled_at": last_polled_at,
+                "client_protocol_version": protocol
+                    .map(|value| db_u64(value, "client_protocol_version"))
+                    .transpose()?,
+                "client_build": row.try_get::<Option<String>, _>("client_build")?,
+                "protocol_ready": protocol_ready,
+                "poll_recent": poll_recent,
+                "ack_status": ack_status,
+                "acked_at": row.try_get::<Option<DateTime<Utc>>, _>("acked_at")?,
+            }));
+        }
+
+        let runtime_rows = sqlx::query(
+            "SELECT baseline.binding_id, baseline.assignment_id, baseline.runtime_id, \
+                    baseline.runtime_epoch, baseline.availability_at_begin, \
+                    ack.status AS ack_status, lease.availability, lease.ended_at \
+             FROM project_view_maintenance_runtime_baselines baseline \
+             LEFT JOIN project_view_maintenance_acks ack \
+               ON ack.community_id = baseline.community_id \
+              AND ack.maintenance_epoch = baseline.maintenance_epoch \
+              AND ack.binding_id = baseline.binding_id \
+              AND ack.assignment_id = baseline.assignment_id \
+              AND ack.runtime_id = baseline.runtime_id \
+              AND ack.runtime_epoch = baseline.runtime_epoch \
+             LEFT JOIN project_runtime_leases lease \
+               ON lease.community_id = baseline.community_id \
+              AND lease.binding_id = baseline.binding_id \
+              AND lease.assignment_id = baseline.assignment_id \
+              AND lease.runtime_id = baseline.runtime_id \
+              AND lease.runtime_epoch = baseline.runtime_epoch \
+             WHERE baseline.community_id = $1 AND baseline.maintenance_epoch = $2 \
+             ORDER BY baseline.assignment_id, baseline.runtime_id, baseline.runtime_epoch",
+        )
+        .bind(community_id.as_uuid())
+        .bind(epoch)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut runtimes = Vec::with_capacity(runtime_rows.len());
+        let mut runtime_ack_pending = Vec::new();
+        let mut runtime_live = Vec::new();
+        for row in runtime_rows {
+            let runtime_id: Uuid = row.try_get("runtime_id")?;
+            let runtime_epoch = db_u64(row.try_get("runtime_epoch")?, "runtime_epoch")?;
+            let ack_status: Option<String> = row.try_get("ack_status")?;
+            let ended_at: Option<DateTime<Utc>> = row.try_get("ended_at")?;
+            if ack_status.is_none() {
+                runtime_ack_pending.push(json!({
+                    "runtime_id": runtime_id,
+                    "runtime_epoch": runtime_epoch,
+                }));
+            }
+            if ended_at.is_none() {
+                runtime_live.push(json!({
+                    "runtime_id": runtime_id,
+                    "runtime_epoch": runtime_epoch,
+                }));
+            }
+            runtimes.push(json!({
+                "binding_id": row.try_get::<Uuid, _>("binding_id")?,
+                "assignment_id": row.try_get::<Uuid, _>("assignment_id")?,
+                "runtime_id": runtime_id,
+                "runtime_epoch": runtime_epoch,
+                "availability_at_begin": row.try_get::<String, _>("availability_at_begin")?,
+                "availability": row.try_get::<Option<String>, _>("availability")?,
+                "ended_at": ended_at,
+                "ack_status": ack_status,
+            }));
+        }
+
+        let blockers = sqlx::query(
+            "SELECT \
+                 (SELECT count(*) FROM project_view_maintenance_invalidations \
+                  WHERE community_id = $1 AND maintenance_epoch = $2 \
+                    AND phase = 'pre_cutover') AS invalidations, \
+                 (SELECT count(*) FROM project_runtime_supervisor_bindings binding \
+                  JOIN project_view_maintenance_assignment_baselines baseline \
+                    ON baseline.community_id = binding.community_id \
+                   AND baseline.binding_id = binding.binding_id \
+                   AND baseline.maintenance_epoch = $2 \
+                  WHERE binding.community_id = $1 \
+                    AND binding.scheduler_claim_token IS NOT NULL \
+                    AND binding.scheduler_claimed_until > clock_timestamp()) AS claims, \
+                 (SELECT count(*) FROM project_runtime_leases runtime \
+                  JOIN project_view_maintenance_assignment_baselines assignment \
+                    ON assignment.community_id = runtime.community_id \
+                   AND assignment.binding_id = runtime.binding_id \
+                   AND assignment.maintenance_epoch = $2 \
+                  LEFT JOIN project_view_maintenance_runtime_baselines baseline \
+                    ON baseline.community_id = runtime.community_id \
+                   AND baseline.maintenance_epoch = assignment.maintenance_epoch \
+                   AND baseline.binding_id = runtime.binding_id \
+                   AND baseline.assignment_id = runtime.assignment_id \
+                   AND baseline.runtime_id = runtime.runtime_id \
+                   AND baseline.runtime_epoch = runtime.runtime_epoch \
+                  WHERE runtime.community_id = $1 AND baseline.runtime_id IS NULL) AS new_runtimes",
+        )
+        .bind(community_id.as_uuid())
+        .bind(epoch)
+        .fetch_one(&mut *tx)
+        .await?;
+        let invalidations: i64 = blockers.try_get("invalidations")?;
+        let claims: i64 = blockers.try_get("claims")?;
+        let new_runtimes: i64 = blockers.try_get("new_runtimes")?;
+        let exact_current_epoch = current_epoch == Some(epoch);
+        let fleet_protocol_ready = protocol_pending.is_empty();
+        let fleet_poll_ready = poll_pending.is_empty();
+        let durable_acks_complete =
+            assignment_ack_pending.is_empty() && runtime_ack_pending.is_empty();
+        let runtime_retirement_complete =
+            runtime_live.is_empty() && claims == 0 && new_runtimes == 0;
+        let ready_to_freeze = state == "draining"
+            && outcome == "active"
+            && exact_current_epoch
+            && fleet_protocol_ready
+            && fleet_poll_ready
+            && durable_acks_complete
+            && runtime_retirement_complete
+            && invalidations == 0;
+        tx.commit().await?;
+        Ok(json!({
+            "community_id": community_id.to_string(),
+            "maintenance_epoch": maintenance_epoch,
+            "state": state,
+            "outcome": outcome,
+            "exact_current_epoch": exact_current_epoch,
+            "required_client_protocol_version": db_u64(
+                required_protocol,
+                "required_client_protocol_version",
+            )?,
+            "observed_at": observed_at,
+            "max_poll_age_seconds": max_poll_age_seconds,
+            "fleet_protocol_ready": fleet_protocol_ready,
+            "fleet_poll_ready": fleet_poll_ready,
+            "durable_acks_complete": durable_acks_complete,
+            "runtime_retirement_complete": runtime_retirement_complete,
+            "ready_to_freeze": ready_to_freeze,
+            "protocol_pending_assignment_ids": protocol_pending,
+            "poll_pending_assignment_ids": poll_pending,
+            "assignment_ack_pending_ids": assignment_ack_pending,
+            "runtime_ack_pending": runtime_ack_pending,
+            "live_runtimes": runtime_live,
+            "scheduler_claim_count": claims,
+            "post_begin_runtime_count": new_runtimes,
+            "pre_cutover_invalidation_count": invalidations,
+            "assignments": assignments,
+            "runtimes": runtimes,
+        }))
     }
 
     /// Return only the exact maintenance baselines owned by an authenticated

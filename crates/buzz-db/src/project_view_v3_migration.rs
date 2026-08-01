@@ -1163,7 +1163,7 @@ async fn require_document_projection_ready_in_tx(
         .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
     let catalog_revision = db_u64(state.try_get("catalog_revision")?, "catalog_revision")?;
     let active_count = db_u64(
-        i64::from(state.try_get::<i32, _>("active_document_count")?),
+        state.try_get::<i64, _>("active_document_count")?,
         "active_document_count",
     )?;
     let generation = db_u64(

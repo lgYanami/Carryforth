@@ -174,6 +174,25 @@ pub(crate) enum ProjectViewMaintenanceCommand {
         #[arg(long)]
         epoch: Option<u64>,
     },
+    /// Inspect ordered ACP fleet compatibility and exact drain blockers.
+    Readiness {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        /// A non-ACKed supervisor poll older than this is reported stale.
+        #[arg(long, default_value_t = 30)]
+        max_poll_age_seconds: u64,
+    },
+    /// Exit successfully only when the exact epoch is safe to freeze.
+    AckProbe {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long, default_value_t = 30)]
+        max_poll_age_seconds: u64,
+    },
     /// Freeze an exact fully acknowledged drain epoch.
     Freeze {
         #[arg(long)]
@@ -572,6 +591,43 @@ async fn run_maintenance(db: &Db, command: ProjectViewMaintenanceCommand) -> Res
                 .project_view_maintenance_status(status.community_id, epoch)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ProjectViewMaintenanceCommand::Readiness {
+            community,
+            epoch,
+            max_poll_age_seconds,
+        } => {
+            let status = required_status(db, &community).await?;
+            let result = db
+                .project_view_maintenance_readiness(
+                    status.community_id,
+                    epoch,
+                    max_poll_age_seconds,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ProjectViewMaintenanceCommand::AckProbe {
+            community,
+            epoch,
+            max_poll_age_seconds,
+        } => {
+            let status = required_status(db, &community).await?;
+            let result = db
+                .project_view_maintenance_readiness(
+                    status.community_id,
+                    epoch,
+                    max_poll_age_seconds,
+                )
+                .await?;
+            let ready = result
+                .get("ready_to_freeze")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!("readiness response omitted ready_to_freeze"))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if !ready {
+                bail!("maintenance epoch {epoch} is not ready to freeze");
+            }
         }
         ProjectViewMaintenanceCommand::Begin {
             community,

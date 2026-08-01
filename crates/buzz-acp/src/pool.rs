@@ -229,7 +229,7 @@ pub struct PromptResult {
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PromptSource {
     Channel(Uuid),
     Heartbeat,
@@ -1377,6 +1377,41 @@ pub async fn run_prompt_task(
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+    let lifecycle_cancel = ctx.role_brief_resolver.lifecycle_token();
+
+    // Maintenance cancellation covers the entire turn lifecycle, not only the
+    // final session/prompt call. Every potentially blocking preparation step
+    // uses this seam; cancellation returns ownership of the Agent to the main
+    // loop, which then kills and waits the registered child before ACK.
+    macro_rules! await_lifecycle {
+        ($future:expr) => {{
+            tokio::select! {
+                biased;
+                _ = lifecycle_cancel.cancelled() => {
+                    agent.state.invalidate_all();
+                    agent.acp.observe(
+                        "turn_cancelled",
+                        serde_json::json!({"reason": "runtime_maintenance"}),
+                    );
+                    let retry_batch = requeue_cancelled_batch(
+                        &ctx,
+                        ControlSignal::Interrupt,
+                        batch.clone(),
+                    );
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source.clone(),
+                        PromptOutcome::Cancelled,
+                        retry_batch,
+                    );
+                    return;
+                }
+                result = $future => result,
+            }
+        }};
+    }
 
     // Role identity is dynamic authorization context, not session
     // configuration. Every complete channel prompt and heartbeat verifies the
@@ -1385,10 +1420,9 @@ pub async fn run_prompt_task(
     // rebuilt session always receives a newly assembled full Brief. Any current
     // read failure remains fail closed and never injects the cached binding.
     let role_context_refresh = role_context_refresh_for(&agent.state, &source);
-    let role_context = ctx
+    let role_context = await_lifecycle!(ctx
         .role_brief_resolver
-        .resolve_bounded(role_context_refresh)
-        .await;
+        .resolve_bounded(role_context_refresh));
     agent.acp.observe(
         "role_context_resolved",
         serde_json::json!({
@@ -1457,18 +1491,19 @@ pub async fn run_prompt_task(
                     &ctx.agent_keys,
                     owner_pk,
                 );
-                let section = match tokio::time::timeout(CORE_FETCH_TIMEOUT, fetch).await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "engram::core",
-                            channel = %cid,
-                            timeout_ms = CORE_FETCH_TIMEOUT.as_millis() as u64,
-                            "core fetch timed out — emitting no section"
-                        );
-                        None
-                    }
-                };
+                let section =
+                    match await_lifecycle!(tokio::time::timeout(CORE_FETCH_TIMEOUT, fetch,)) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "engram::core",
+                                channel = %cid,
+                                timeout_ms = CORE_FETCH_TIMEOUT.as_millis() as u64,
+                                "core fetch timed out — emitting no section"
+                            );
+                            None
+                        }
+                    };
                 if let Some(rendered) = section {
                     tracing::info!(
                         target: "engram::core",
@@ -1500,14 +1535,13 @@ pub async fn run_prompt_task(
         if is_new_channel_session && !agent.state.canvas_sections.contains_key(cid) {
             // Resolve DM status: prefer the startup cache, lazy-fetch as fallback.
             // Unknown → treat as DM (fail-closed).
-            let is_dm = ctx
-                .channel_info
-                .resolve(*cid)
-                .await
+            let is_dm = await_lifecycle!(ctx.channel_info.resolve(*cid))
                 .map(|ci| ci.channel_type == "dm")
                 .unwrap_or(true);
             if !is_dm {
-                if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
+                if let Some(section) =
+                    await_lifecycle!(fetch_canvas_section(*cid, &ctx.rest_client))
+                {
                     pending_canvas = Some((*cid, section));
                 }
             }
@@ -1539,14 +1573,12 @@ pub async fn run_prompt_task(
                 (sid.clone(), false)
             } else {
                 // Create new session with model application.
-                match create_session_and_apply_model(
+                match await_lifecycle!(create_session_and_apply_model(
                     &mut agent,
                     &ctx,
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
-                )
-                .await
-                {
+                )) {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1591,7 +1623,9 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None).await {
+                match await_lifecycle!(
+                    create_session_and_apply_model(&mut agent, &ctx, None, None,)
+                ) {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1677,15 +1711,12 @@ pub async fn run_prompt_task(
                 &init_msg,
             );
             let init_msg = prepend_role_brief(&role_context.markdown, &init_msg);
-            let init_result = agent
-                .acp
-                .session_prompt_with_idle_timeout(
-                    &session_id,
-                    &init_msg,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                )
-                .await;
+            let init_result = await_lifecycle!(agent.acp.session_prompt_with_idle_timeout(
+                &session_id,
+                &init_msg,
+                ctx.idle_timeout,
+                ctx.max_turn_duration,
+            ));
 
             match init_result {
                 Ok(stop_reason) => {
@@ -1712,10 +1743,9 @@ pub async fn run_prompt_task(
                         "initial_message idle timeout ({}s) for channel {cid} — cancelling",
                         ctx.idle_timeout.as_secs()
                     );
-                    match agent
+                    match await_lifecycle!(agent
                         .acp
-                        .cancel_with_cleanup(&session_id, ctx.idle_timeout)
-                        .await
+                        .cancel_with_cleanup(&session_id, ctx.idle_timeout))
                     {
                         Ok(_) => {
                             agent.state.invalidate(&source);
@@ -1810,16 +1840,19 @@ pub async fn run_prompt_task(
     } else if let Some(ref b) = batch {
         // Build prompt from batch with context enrichment.
         // Try startup cache first; lazy-fetch via REST for dynamic channels.
-        let channel_info = ctx.channel_info.resolve(b.channel_id).await;
+        let channel_info = await_lifecycle!(ctx.channel_info.resolve(b.channel_id));
 
         let conversation_context = if ctx.context_message_limit > 0 {
-            fetch_conversation_context(b, &channel_info, &ctx).await
+            await_lifecycle!(fetch_conversation_context(b, &channel_info, &ctx))
         } else {
             None
         };
 
-        let profile_lookup =
-            fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        let profile_lookup = await_lifecycle!(fetch_prompt_profile_lookup(
+            b,
+            conversation_context.as_ref(),
+            &ctx.rest_client,
+        ));
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -1898,20 +1931,37 @@ pub async fn run_prompt_task(
     //
     let prompt_result = match control_rx {
         None => {
-            // Heartbeat / non-cancellable path.
-            tokio::select! {
-                biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
-                    &session_id,
-                    &prompt_blocks,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                ) => result,
-            }
+            await_lifecycle!(agent.acp.session_prompt_blocks_with_idle_timeout(
+                &session_id,
+                &prompt_blocks,
+                ctx.idle_timeout,
+                ctx.max_turn_duration,
+            ))
         }
         Some(rx) => {
             tokio::select! {
                 biased;
+                _ = lifecycle_cancel.cancelled() => {
+                    agent.state.invalidate_all();
+                    agent.acp.observe(
+                        "turn_cancelled",
+                        serde_json::json!({"reason": "runtime_maintenance"}),
+                    );
+                    let retry_batch = requeue_cancelled_batch(
+                        &ctx,
+                        ControlSignal::Interrupt,
+                        batch.clone(),
+                    );
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source.clone(),
+                        PromptOutcome::Cancelled,
+                        retry_batch,
+                    );
+                    return;
+                }
                 result = agent.acp.session_prompt_blocks_with_idle_timeout(
                     &session_id,
                     &prompt_blocks,

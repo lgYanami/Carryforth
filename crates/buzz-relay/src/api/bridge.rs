@@ -267,6 +267,12 @@ enum ProjectViewPageRequest {
         after: Option<buzz_db::project_view::ProjectViewV2EntityCursor>,
         limit: u16,
     },
+    V3CurrentEntities {
+        revision: u64,
+        projection_generation: u64,
+        after: Option<buzz_db::project_view::ProjectViewV2EntityCursor>,
+        limit: u16,
+    },
     RoleHistory {
         revision: u64,
         projection_generation: u64,
@@ -602,6 +608,20 @@ fn parse_project_view_page_request(
             const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
             reject_project_view_extension_fields(extension, ALLOWED)?;
             ProjectViewPageRequest::V2CurrentEntities {
+                revision,
+                projection_generation,
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_entity_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        "v3_current_entities" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v3-entity")?;
+            const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            ProjectViewPageRequest::V3CurrentEntities {
                 revision,
                 projection_generation,
                 after: extension
@@ -1966,6 +1986,27 @@ async fn query_events_authed(
                 after,
                 limit,
             } => {
+                state
+                    .db
+                    .project_view_v2_current_entities_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        revision,
+                        projection_generation,
+                        after,
+                        limit,
+                    )
+                    .await
+            }
+            ProjectViewPageRequest::V3CurrentEntities {
+                revision,
+                projection_generation,
+                after,
+                limit,
+            } => {
+                // The canonical current-set selection is schema-independent;
+                // the active Community schema determines which strict signed
+                // projection major each stored pointer resolves to.
                 state
                     .db
                     .project_view_v2_current_entities_page(
@@ -3458,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn project_view_extension_parses_v2_current_and_role_history_scopes() {
+    fn project_view_extension_parses_versioned_current_and_role_history_scopes() {
         let relay = Keys::generate().public_key();
         let role_id = uuid::Uuid::new_v4();
         let current = serde_json::json!({
@@ -3481,6 +3522,35 @@ mod tests {
                 ..
             }))
         ));
+
+        let v3_current = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v3-entity"],
+            "limit": 500,
+            "buzz_project_view": {
+                "scope": "v3_current_entities",
+                "revision": 8,
+                "projection_generation": 3,
+                "after": {
+                    "entity_type": "role_assignment",
+                    "entity_id": uuid::Uuid::new_v4(),
+                },
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(std::slice::from_ref(&v3_current), &relay),
+            Ok(Some(ProjectViewPageRequest::V3CurrentEntities {
+                revision: 8,
+                projection_generation: 3,
+                limit: 500,
+                after: Some(_),
+            }))
+        ));
+
+        let mut cross_version_tag = v3_current;
+        cross_version_tag["#t"] = serde_json::json!(["buzz-project-view-v2-entity"]);
+        assert!(parse_project_view_page_request(&[cross_version_tag], &relay).is_err());
 
         let history = serde_json::json!({
             "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],

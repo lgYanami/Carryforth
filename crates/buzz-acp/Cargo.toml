@@ -64,6 +64,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 atomic-write-file = "0.3"
 zeroize = { workspace = true }
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

@@ -9,6 +9,7 @@ import {
   writableProjectViewObject,
 } from "./model.ts";
 import {
+  assembleProjectViewV3,
   normalizeProjectView,
   normalizeProjectViewObject,
   serializeProjectViewMutationIntent,
@@ -29,6 +30,13 @@ function object(objectType, id, data, relations = {}) {
     updated_by: actor,
     data: { object_type: objectType, data },
     relations,
+  };
+}
+
+function objectV3(objectType, id, data, relations = {}) {
+  return {
+    ...object(objectType, id, data, relations),
+    context_references: [],
   };
 }
 
@@ -231,4 +239,53 @@ test("typed Human intents serialize optional relation clears without raw event f
       },
     },
   );
+});
+
+test("v3 assembly preserves unknown Resource kinds and Guide-only writes", () => {
+  const view = assembleProjectViewV3([
+    objectV3("project_profile", "profile", {
+      name: "Lora",
+      positioning: "Shared context",
+      purpose: "Coordinate",
+      problem: "Fragmentation",
+      scope: "Project context",
+    }),
+    objectV3("goal", "goal", {
+      title: "Ship",
+      desired_outcome: "One verified View",
+      directions: [],
+    }),
+    objectV3("resource", "resource", {
+      name: "Release console",
+      resource_kind: "internal-release-console-v7",
+      summary: "Coordinates release operations",
+      guide_document_id: "guide-document",
+    }),
+  ]);
+
+  assert.equal(
+    view.resources[0].data.resourceKind,
+    "internal-release-console-v7",
+  );
+  assert.deepEqual(
+    serializeProjectViewMutationIntent({
+      operation: "update",
+      expectedProjectRevision: 9,
+      objectId: "resource",
+      object: writableProjectViewObject(view.resources[0]),
+    }),
+    {
+      operation: "update",
+      expected_project_revision: 9,
+      object_type: "resource",
+      object_id: "resource",
+      patch: {
+        name: "Release console",
+        resource_kind: "internal-release-console-v7",
+        summary: "Coordinates release operations",
+        guide_document_id: "guide-document",
+      },
+    },
+  );
+  assert.equal(JSON.stringify(view.resources[0]).includes("locator"), false);
 });

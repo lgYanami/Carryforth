@@ -607,6 +607,18 @@ impl VerifiedRoleBriefSnapshot {
         self.entries.get(&object_id)
     }
 
+    /// Exact signed source for one active ordinary object.
+    #[must_use]
+    pub fn object_source(&self, object_id: Uuid) -> Option<&RoleBriefSourceReference> {
+        self.objects.get(&object_id).map(|head| &head.source)
+    }
+
+    /// Exact signed source for one active Role.
+    #[must_use]
+    pub fn role_source(&self, role_id: Uuid) -> Option<&RoleBriefSourceReference> {
+        self.roles.get(&role_id).map(|head| &head.source)
+    }
+
     /// Iterate over canonical Role definitions by stable Role ID.
     pub fn roles(&self) -> impl Iterator<Item = &RoleDefinition> {
         self.roles.values().map(|head| &head.entity)

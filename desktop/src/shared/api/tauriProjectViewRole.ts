@@ -9,6 +9,10 @@ import {
   type RawProjectRoleCheckpoint,
   type RawProjectRoleHandoff,
 } from "@/shared/api/tauriProjectViewRoleHistory";
+import {
+  type ProjectRoleBriefBaseContextV3,
+  validateBaseRoleBriefV3,
+} from "@/shared/api/tauriProjectViewRoleV3";
 
 export type {
   ProjectRoleCheckpoint,
@@ -63,6 +67,7 @@ type RawProjectRoleDefinition = {
   updated_at: string;
   created_by: string;
   updated_by: string;
+  context_references?: unknown[];
 };
 
 export type RawProjectRoleProposal = {
@@ -140,6 +145,7 @@ type RawRoleBriefObject = {
 };
 
 type RawProjectRoleBrief = {
+  project_view_schema_version?: number;
   generated_at: string;
   project_id: string;
   project_revision: number;
@@ -195,7 +201,9 @@ type RawProjectRoleBrief = {
     meta_change_id: string;
     membership_event_id: string;
     project_updated_at: string;
+    document_metadata?: unknown;
   };
+  context?: unknown;
 };
 
 export type RawProjectViewRoleContinuity = {
@@ -280,6 +288,7 @@ export type ProjectWorkCommitment = {
 };
 
 export type ProjectRoleBrief = {
+  schemaVersion: 2 | 3;
   generatedAt: string;
   projectId: string;
   projectRevision: number;
@@ -334,6 +343,7 @@ export type ProjectRoleBrief = {
     membershipEventId: string;
     projectUpdatedAt: string;
   };
+  baseContext?: ProjectRoleBriefBaseContextV3;
 };
 
 export type ProjectViewRoleContinuity = {
@@ -432,6 +442,8 @@ function briefObjectTitle(object: RawRoleBriefObject["object"]) {
 function normalizeRoleBrief(
   raw: RawProjectRoleBrief,
   projectRevision: number,
+  projectionGeneration: number,
+  schemaVersion: 2 | 3,
 ): ProjectRoleBrief {
   const profile = raw.project.profile.object;
   if (
@@ -444,6 +456,24 @@ function normalizeRoleBrief(
     );
   }
   const profileData = profile.data.data;
+  const baseContext =
+    schemaVersion === 3
+      ? validateBaseRoleBriefV3(
+          raw as unknown as Record<string, unknown>,
+          projectRevision,
+          projectionGeneration,
+        )
+      : undefined;
+  if (
+    schemaVersion === 2 &&
+    (raw.project_view_schema_version !== undefined ||
+      raw.context !== undefined ||
+      raw.source_revisions.document_metadata !== undefined)
+  ) {
+    throw new ProjectViewIntegrityError(
+      "schema-v2 Role Brief contains schema-v3 fields",
+    );
+  }
   const stringField = (name: string) => {
     const value = profileData[name];
     if (typeof value !== "string") {
@@ -518,6 +548,7 @@ function normalizeRoleBrief(
     };
   });
   return {
+    schemaVersion,
     generatedAt: raw.generated_at,
     projectId: raw.project_id,
     projectRevision: raw.project_revision,
@@ -550,6 +581,7 @@ function normalizeRoleBrief(
       membershipEventId: raw.source_revisions.membership_event_id,
       projectUpdatedAt: raw.source_revisions.project_updated_at,
     },
+    baseContext,
   };
 }
 
@@ -557,6 +589,8 @@ export function normalizeRoleContinuity(
   raw: RawProjectViewRoleContinuity,
   view: ProjectView,
   projectRevision: number,
+  projectionGeneration: number,
+  schemaVersion: 2 | 3,
 ): ProjectViewRoleContinuity {
   const roles = raw.roles.map<ProjectRoleDefinition>((role) => ({
     roleId: role.role_id,
@@ -594,7 +628,12 @@ export function normalizeRoleContinuity(
   const checkpoints = raw.checkpoints.map(normalizeCheckpoint);
   const handoffs = raw.handoffs.map(normalizeHandoff);
   const briefs = raw.briefs.map((brief) =>
-    normalizeRoleBrief(brief, projectRevision),
+    normalizeRoleBrief(
+      brief,
+      projectRevision,
+      projectionGeneration,
+      schemaVersion,
+    ),
   );
   const roleObjectIds = new Set(view.roles.map((role) => role.id));
   const roleIds = new Set<string>();

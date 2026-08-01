@@ -391,6 +391,7 @@ function ReadyProjectView({
   projectionGeneration,
   relayPubkey,
   roleContinuity,
+  schemaVersion,
   onRefresh,
   selectedObjectId,
   syncMessage,
@@ -675,6 +676,7 @@ function ReadyProjectView({
               ),
             )
           }
+          schemaVersion={schemaVersion}
           view={view}
         />
       ) : null}

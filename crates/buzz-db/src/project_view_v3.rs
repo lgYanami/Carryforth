@@ -296,6 +296,20 @@ impl Db {
         community_id: CommunityId,
         relay_pubkey: &PublicKey,
     ) -> crate::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let ready =
+            Self::project_view_v3_structural_ready_in_tx(&mut tx, community_id, relay_pubkey)
+                .await?;
+        tx.rollback().await?;
+        Ok(ready)
+    }
+
+    /// Validate schema-v3 readiness inside a caller-owned Community lock.
+    pub(crate) async fn project_view_v3_structural_ready_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+    ) -> crate::Result<bool> {
         let relay = relay_pubkey.to_bytes();
         let ready: Option<bool> = sqlx::query_scalar(
             "SELECT c.archived_at IS NULL \
@@ -419,14 +433,14 @@ impl Db {
         .bind(kind_i32(KIND_PROJECT_VIEW_META)?)
         .bind(kind_i32(KIND_NIP43_MEMBERSHIP_LIST)?)
         .bind(kind_i32(KIND_PROJECT_VIEW_OBJECT)?)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
         if ready != Some(true) {
             return Ok(false);
         }
         sqlx::query("SELECT project_view_v3_validate_community($1)")
             .bind(community_id.as_uuid())
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
         Ok(true)
     }
@@ -852,7 +866,9 @@ impl Db {
              VALUES ($1,1,$2,$3,$3,$4,$5,$6,$7,1,3,$4,$4,0,$8,0,0,0,$9)",
         )
         .bind(community_id.as_uuid())
-        .bind(count_i32(counts.active_objects, "active_object_count")?)
+        // `project_view_objects_adjust_active_count` advances this baseline as
+        // the initial Profile, Goals, and Roles are inserted below.
+        .bind(0_i32)
         .bind(canonical_time)
         .bind(command_event.id.as_bytes())
         .bind(actor_bytes.as_slice())
@@ -970,7 +986,7 @@ impl Db {
                 "initialize metadata projection already exists".to_owned(),
             ));
         }
-        sqlx::query(
+        let consumed = sqlx::query(
             "UPDATE project_view_provisioning_operations SET \
                  consumed_by_change_id = $3, consumed_at = $4 \
              WHERE community_id = $1 AND operation_id = $2 \
@@ -982,6 +998,26 @@ impl Db {
         .bind(canonical_time)
         .execute(&mut *tx)
         .await?;
+        if consumed.rows_affected() != 1 {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "initialize did not consume exactly one prepare-v3 receipt".to_owned(),
+            ));
+        }
+        let cleared = sqlx::query(
+            "UPDATE communities SET project_view_preparation_operation_id = NULL \
+             WHERE id = $1 AND project_view_preparation_operation_id = $2 \
+               AND project_view_schema_version = 3 AND NOT project_view_enabled",
+        )
+        .bind(community_id.as_uuid())
+        .bind(preparation_operation_id)
+        .execute(&mut *tx)
+        .await?;
+        if cleared.rows_affected() != 1 {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "initialize did not clear its exact prepare-v3 pointer".to_owned(),
+            ));
+        }
+        assert_counts_in_tx(&mut tx, community_id, counts).await?;
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
             .execute(&mut *tx)
             .await?;

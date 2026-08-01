@@ -1,5 +1,6 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import { ProjectViewIntegrityError } from "@/shared/api/tauriProjectViewIntegrity";
+import { assembleProjectViewV3 } from "@/shared/api/tauriProjectViewV3";
 import {
   normalizeRoleContinuity,
   type ProjectViewRoleContinuity,
@@ -14,6 +15,14 @@ export {
   mutateProjectViewRole,
   serializeProjectViewRoleMutationIntent,
 } from "@/shared/api/tauriProjectViewRole";
+export {
+  mutateProjectView,
+  serializeProjectViewMutationIntent,
+} from "@/shared/api/tauriProjectViewMutation";
+export {
+  assembleProjectViewV3,
+  normalizeProjectViewObjectV3,
+} from "@/shared/api/tauriProjectViewV3";
 export type {
   ProjectCommunityMemberRole,
   ProjectRoleAssignment,
@@ -157,6 +166,13 @@ type RawResourceData = {
   description: string;
 };
 
+type RawResourceDataV3 = {
+  name: string;
+  resource_kind: string;
+  summary?: string;
+  guide_document_id: string;
+};
+
 type RawDataByType = {
   project_profile: RawProjectProfileData;
   goal: RawGoalData;
@@ -168,6 +184,19 @@ type RawDataByType = {
   work: RawWorkData;
   resource: RawResourceData;
 };
+
+type RawDataByTypeV3 = Omit<RawDataByType, "resource"> & {
+  resource: RawResourceDataV3;
+};
+
+export type RawProjectViewContextReference =
+  | { type: "resource"; resource_id: string }
+  | {
+      type: "document";
+      document_id: string;
+      mode: "live" | "pinned";
+      document_revision?: number;
+    };
 
 export type RawProjectViewObjectRef = {
   object_type: ProjectViewObjectType;
@@ -200,6 +229,27 @@ type RawProjectViewObjectOf<T extends ProjectViewObjectType> = {
 
 export type RawProjectViewObject = {
   [T in ProjectViewObjectType]: RawProjectViewObjectOf<T>;
+}[ProjectViewObjectType];
+
+export type RawProjectViewObjectV3Of<T extends ProjectViewObjectType> = {
+  id: string;
+  object_type: T;
+  object_revision: number;
+  project_revision: number;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  updated_by: string;
+  data: {
+    object_type: T;
+    data: RawDataByTypeV3[T];
+  };
+  relations: RawProjectViewRelations;
+  context_references: RawProjectViewContextReference[];
+};
+
+export type RawProjectViewObjectV3 = {
+  [T in ProjectViewObjectType]: RawProjectViewObjectV3Of<T>;
 }[ProjectViewObjectType];
 
 export type RawProjectView = {
@@ -244,13 +294,26 @@ export type RawProjectViewLoadResult =
   | {
       status: "ready";
       relay_pubkey: string;
-      schema_version: number;
+      schema_version: 1 | 2;
       project_revision: number;
       projection_generation: number;
       active_object_count: number;
       updated_at: string;
       view: RawProjectView;
+      objects_v3?: never;
       role_continuity?: RawProjectViewRoleContinuity;
+    }
+  | {
+      status: "ready";
+      relay_pubkey: string;
+      schema_version: 3;
+      project_revision: number;
+      projection_generation: number;
+      active_object_count: number;
+      updated_at: string;
+      view?: never;
+      objects_v3: RawProjectViewObjectV3[];
+      role_continuity: RawProjectViewRoleContinuity;
     };
 
 export type ProjectProfileData = RawProjectProfileData;
@@ -265,7 +328,7 @@ export type ProjectStageData = RawStageData;
 export type ProjectRequirementData = RawRequirementData;
 export type ProjectIssueData = RawIssueData;
 export type ProjectWorkData = RawWorkData;
-export type ProjectResourceData = {
+export type ProjectResourceDataLegacy = {
   name: string;
   resourceType: ProjectViewResourceType;
   locator: {
@@ -274,6 +337,32 @@ export type ProjectResourceData = {
   };
   description: string;
 };
+
+export type ProjectResourceDataV3 = {
+  name: string;
+  resourceKind: string;
+  summary?: string;
+  guideDocumentId: string;
+};
+
+export type ProjectResourceData =
+  | ProjectResourceDataLegacy
+  | ProjectResourceDataV3;
+
+export function isProjectResourceDataV3(
+  resource: ProjectResourceData,
+): resource is ProjectResourceDataV3 {
+  return "guideDocumentId" in resource;
+}
+
+export type ProjectViewContextReference =
+  | { referenceType: "resource"; resourceId: string }
+  | {
+      referenceType: "document";
+      documentId: string;
+      mode: "live" | "pinned";
+      documentRevision?: number;
+    };
 
 type DataByType = {
   project_profile: ProjectProfileData;
@@ -311,6 +400,7 @@ export type ProjectViewObjectOf<T extends ProjectViewObjectType> = {
   updatedBy: string;
   data: DataByType[T];
   relations: ProjectViewRelations;
+  contextReferences?: ProjectViewContextReference[];
 };
 
 export type ProjectViewObject = {
@@ -359,7 +449,7 @@ export type ProjectViewLoadResult =
   | {
       status: "ready";
       relayPubkey: string;
-      schemaVersion: 1 | 2;
+      schemaVersion: 1 | 2 | 3;
       projectRevision: number;
       projectionGeneration: number;
       activeObjectCount: number;
@@ -775,27 +865,34 @@ export function normalizeProjectViewLoadResult(
         relayPubkey: raw.relay_pubkey,
       };
     case "ready": {
-      const view = normalizeProjectView(raw.view);
+      const view =
+        raw.schema_version === 3
+          ? assembleProjectViewV3(raw.objects_v3)
+          : normalizeProjectView(raw.view);
       assertProjectViewSnapshotIntegrity(
         view,
         raw.project_revision,
         raw.active_object_count,
       );
-      if (raw.schema_version !== 1 && raw.schema_version !== 2) {
-        throw new ProjectViewIntegrityError(
-          `unsupported native schema version ${raw.schema_version}`,
+      let roleContinuity: ProjectViewRoleContinuity | undefined;
+      if (raw.role_continuity) {
+        if (raw.schema_version === 1) {
+          throw new ProjectViewIntegrityError(
+            "schema-v1 Project View returned Role continuity",
+          );
+        }
+        roleContinuity = normalizeRoleContinuity(
+          raw.role_continuity,
+          view,
+          raw.project_revision,
+          raw.projection_generation,
+          raw.schema_version,
         );
       }
-      const roleContinuity = raw.role_continuity
-        ? normalizeRoleContinuity(
-            raw.role_continuity,
-            view,
-            raw.project_revision,
-          )
-        : undefined;
       if (
-        (raw.schema_version === 2 && !roleContinuity) ||
-        (raw.schema_version === 1 && roleContinuity)
+        ((raw.schema_version === 2 || raw.schema_version === 3) &&
+          !roleContinuity) ||
+        (raw.schema_version === 1 && Boolean(roleContinuity))
       ) {
         throw new ProjectViewIntegrityError(
           "Role continuity payload does not match the Project View schema",
@@ -819,136 +916,4 @@ export function normalizeProjectViewLoadResult(
 export async function getProjectView(): Promise<ProjectViewLoadResult> {
   const raw = await invokeTauri<RawProjectViewLoadResult>("get_project_view");
   return normalizeProjectViewLoadResult(raw);
-}
-
-function rawReference(reference: ProjectViewObjectRef) {
-  return {
-    object_type: reference.objectType,
-    object_id: reference.objectId,
-  };
-}
-
-function serializeWritableObject(
-  object: ProjectViewWritableObject,
-): Record<string, unknown> {
-  switch (object.objectType) {
-    case "project_profile":
-      return object.data;
-    case "goal":
-      return {
-        title: object.data.title,
-        desired_outcome: object.data.desiredOutcome,
-        directions: object.data.directions,
-      };
-    case "role":
-      return object.data;
-    case "plan":
-      return {
-        ...object.data,
-        under_goal_id: object.underGoalId ?? null,
-      };
-    case "stage":
-      return {
-        ...object.data,
-        under_plan_id: object.underPlanId,
-      };
-    case "requirement":
-      return {
-        ...object.data,
-        planned_in_stage_id: object.plannedInStageId ?? null,
-      };
-    case "issue":
-      return {
-        ...object.data,
-        planned_in_stage_id: object.plannedInStageId ?? null,
-        about: object.about ? rawReference(object.about) : null,
-      };
-    case "work":
-      return {
-        ...object.data,
-        handles: rawReference(object.handles),
-      };
-    case "resource":
-      return {
-        name: object.data.name,
-        resource_type: object.data.resourceType,
-        locator: {
-          locator_type: object.data.locator.locatorType,
-          value: object.data.locator.value,
-        },
-        description: object.data.description,
-      };
-  }
-}
-
-export function serializeProjectViewMutationIntent(
-  intent: ProjectViewMutationIntent,
-): Record<string, unknown> {
-  switch (intent.operation) {
-    case "initialize":
-      return {
-        operation: intent.operation,
-        profile: intent.profile,
-        goals: intent.goals.map((goal) => ({
-          title: goal.title,
-          desired_outcome: goal.desiredOutcome,
-          directions: goal.directions,
-        })),
-      };
-    case "create":
-      return {
-        operation: intent.operation,
-        expected_project_revision: intent.expectedProjectRevision,
-        object_type: intent.object.objectType,
-        data: serializeWritableObject(intent.object),
-      };
-    case "update":
-      return {
-        operation: intent.operation,
-        expected_project_revision: intent.expectedProjectRevision,
-        object_type: intent.object.objectType,
-        object_id: intent.objectId,
-        patch: serializeWritableObject(intent.object),
-      };
-    case "delete":
-      return {
-        operation: intent.operation,
-        expected_project_revision: intent.expectedProjectRevision,
-        object_type: intent.objectType,
-        object_id: intent.objectId,
-      };
-  }
-}
-
-function normalizeMutationResult(
-  raw: RawProjectViewMutationResult,
-): ProjectViewMutationResult {
-  switch (raw.status) {
-    case "applied":
-      return {
-        status: raw.status,
-        eventId: raw.event_id,
-        projectRevision: raw.project_revision,
-        objectId: raw.object_id,
-        objectRevision: raw.object_revision,
-        deleted: raw.deleted,
-      };
-    case "conflict":
-      return {
-        status: raw.status,
-        expectedProjectRevision: raw.expected_project_revision,
-        currentProjectRevision: raw.current_project_revision,
-        message: raw.message,
-      };
-  }
-}
-
-export async function mutateProjectView(
-  intent: ProjectViewMutationIntent,
-): Promise<ProjectViewMutationResult> {
-  const raw = await invokeTauri<RawProjectViewMutationResult>(
-    "mutate_project_view",
-    { input: serializeProjectViewMutationIntent(intent) },
-  );
-  return normalizeMutationResult(raw);
 }

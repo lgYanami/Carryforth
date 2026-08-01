@@ -6059,8 +6059,29 @@ BEGIN
     FROM project_view_state
     WHERE community_id = target_community;
 
-    IF NOT FOUND OR state_schema IS DISTINCT FROM target_schema THEN
-        RAISE EXCEPTION 'Project View v2 state missing for community %', target_community
+    IF NOT FOUND THEN
+        IF target_schema = 3 AND EXISTS (
+            SELECT 1
+            FROM communities community
+            JOIN project_view_provisioning_operations preparation
+              ON preparation.community_id = community.id
+             AND preparation.operation_id = community.project_view_preparation_operation_id
+            WHERE community.id = target_community
+              AND NOT community.project_view_enabled
+              AND NOT community.project_context_enabled
+              AND preparation.operation = 'prepare_v3'
+              AND preparation.target_schema_version = 3
+              AND preparation.consumed_by_change_id IS NULL
+              AND preparation.consumed_at IS NULL
+        ) THEN
+            RETURN;
+        END IF;
+        RAISE EXCEPTION 'Project View state missing for community %', target_community
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF state_schema IS DISTINCT FROM target_schema THEN
+        RAISE EXCEPTION 'Project View state schema mismatches community %', target_community
             USING ERRCODE = 'check_violation';
     END IF;
 

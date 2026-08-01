@@ -3,9 +3,15 @@ import { expect, test } from "@playwright/test";
 import type {
   RawProjectViewLoadResult,
   RawProjectViewObject,
+  RawProjectViewObjectV3,
   ProjectViewObjectType,
 } from "../../src/shared/api/tauriProjectView";
+import type {
+  ProjectDocument,
+  ProjectDocumentMeta,
+} from "../../src/shared/api/tauriProjectDocument";
 import type { RawProjectRoleHistoryPage } from "../../src/shared/api/tauriProjectViewRoleHistory";
+import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
 
@@ -15,6 +21,7 @@ const FORMER_ASSIGNEE = "e".repeat(64);
 const ALICE =
   "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f";
 const NOW = "2026-07-27T08:00:00Z";
+const GUIDE_ID = "30000000-0000-4000-8000-000000000001";
 const COMMUNITY_A = {
   id: "project-view-a",
   name: "Alpha",
@@ -477,6 +484,158 @@ const V2_READY_VIEW = {
   },
 } as RawProjectViewLoadResult;
 
+function legacyObjectAsV3(value: RawProjectViewObject): RawProjectViewObjectV3 {
+  if (value.object_type === "resource") {
+    throw new Error("legacy Resource data cannot be used in a v3 fixture");
+  }
+  return {
+    ...structuredClone(value),
+    context_references: [],
+  } as RawProjectViewObjectV3;
+}
+
+function roleContinuityFixture() {
+  if (
+    V2_READY_VIEW.status !== "ready" ||
+    V2_READY_VIEW.schema_version === 3 ||
+    !V2_READY_VIEW.role_continuity
+  ) {
+    throw new Error("v2 Role continuity fixture is unavailable");
+  }
+  return structuredClone(V2_READY_VIEW.role_continuity);
+}
+
+function roleContinuityFixtureV3() {
+  const continuity = roleContinuityFixture();
+  for (const role of continuity.roles) role.context_references = [];
+  for (const brief of continuity.briefs) {
+    brief.project_view_schema_version = 3;
+    brief.projection_generation = 3;
+    brief.project.profile.object = legacyObjectAsV3(
+      brief.project.profile.object,
+    );
+    for (const goal of brief.project.goals) {
+      goal.object = legacyObjectAsV3(goal.object);
+    }
+    for (const item of brief.responsible_work) {
+      item.work.object = legacyObjectAsV3(item.work.object);
+    }
+    for (const related of brief.related_objects) {
+      related.object = legacyObjectAsV3(related.object);
+    }
+    if (brief.state.status === "assigned") {
+      brief.state.role.role.context_references = [];
+    }
+    brief.context = {
+      availability: { state: "not_advertised_empty" },
+      resources: [],
+      live_documents: [],
+      pinned_documents: [],
+      truncation: {
+        truncated: false,
+        omitted_resources: 0,
+        omitted_live_documents: 0,
+        omitted_pinned_documents: 0,
+      },
+    };
+    brief.source_revisions.document_metadata = { state: "not_required" };
+  }
+  return continuity;
+}
+
+const resourceV3 = {
+  id: IDS.resource,
+  object_type: "resource",
+  object_revision: 2,
+  project_revision: 7,
+  created_at: NOW,
+  updated_at: NOW,
+  created_by: ACTOR,
+  updated_by: HUMAN,
+  data: {
+    object_type: "resource",
+    data: {
+      name: "Buzz repository",
+      resource_kind: "repository",
+      summary: "Source repository for the Buzz implementation.",
+      guide_document_id: GUIDE_ID,
+    },
+  },
+  relations: {},
+  context_references: [],
+} satisfies RawProjectViewObjectV3;
+
+const V3_READY_VIEW = {
+  status: "ready",
+  relay_pubkey: "b".repeat(64),
+  schema_version: 3,
+  project_revision: 7,
+  projection_generation: 3,
+  active_object_count: 10,
+  updated_at: NOW,
+  objects_v3: [
+    legacyObjectAsV3(profile),
+    legacyObjectAsV3(goal),
+    legacyObjectAsV3(plan),
+    legacyObjectAsV3(stage),
+    legacyObjectAsV3(requirement),
+    legacyObjectAsV3(issue),
+    legacyObjectAsV3(work),
+    legacyObjectAsV3(looseIssue),
+    legacyObjectAsV3(role),
+    resourceV3,
+  ],
+  role_continuity: roleContinuityFixtureV3(),
+} satisfies RawProjectViewLoadResult;
+
+function guideDocumentState(): MockProjectDocumentState {
+  const guide: ProjectDocument = {
+    communityKey: "fixture",
+    projectId: "40000000-0000-4000-8000-000000000001",
+    relayPubkey: "b".repeat(64),
+    projectionGeneration: 3,
+    documentId: GUIDE_ID,
+    documentRevision: 2,
+    state: "active",
+    title: "Buzz repository guide",
+    summary: "Verified repository entry point.",
+    contentMarkdown:
+      "# Buzz repository\n\nUse the reviewed clone and contribution workflow.",
+    createdAt: "2026-07-26T08:00:00Z",
+    createdBy: HUMAN,
+    revisionAt: NOW,
+    revisionBy: HUMAN,
+    revisionEventId: "1".repeat(64),
+    headEventId: "2".repeat(64),
+    sourceEventId: "3".repeat(64),
+  };
+  const meta: ProjectDocumentMeta = {
+    communityKey: "fixture",
+    projectId: guide.projectId,
+    relayPubkey: guide.relayPubkey,
+    projectionGeneration: guide.projectionGeneration,
+    catalogRevision: 2,
+    activeDocumentCount: 1,
+    updatedAt: NOW,
+    metaEventId: "4".repeat(64),
+  };
+  return {
+    meta,
+    documents: [
+      {
+        documentId: GUIDE_ID,
+        title: guide.title ?? "Buzz repository guide",
+        summary: guide.summary,
+        documentRevision: guide.documentRevision,
+        updatedAt: guide.revisionAt,
+        updatedBy: guide.revisionBy,
+        headEventId: guide.headEventId ?? "2".repeat(64),
+      },
+    ],
+    revisions: { [GUIDE_ID]: [guide] },
+  };
+}
+
 function readyViewAtRevision(
   revision: number,
   options?: {
@@ -675,6 +834,136 @@ test("View renders the verified canonical map and object inspector", async ({
 
   await page.getByRole("button", { name: "Close inspector" }).click();
   await expect(page).toHaveURL(/\/view$/);
+});
+
+test("v3 Resource creation uses an active Guide and never exposes a legacy locator", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectDocument: guideDocumentState(),
+    projectView: V3_READY_VIEW,
+    projectViewMutationResult: {
+      status: "applied",
+      event_id: "c".repeat(64),
+      project_revision: 8,
+      object_id: "50000000-0000-4000-8000-000000000001",
+      object_revision: 1,
+      deleted: false,
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+
+  await page.getByRole("button", { name: "Add Resource" }).click();
+  await expect(page.getByLabel("Locator")).toHaveCount(0);
+  await expect(page.getByLabel("Resource type")).toHaveCount(0);
+  await page.getByLabel("Name").fill("Deployment service");
+  await page.getByLabel("Resource kind").fill("internal-service-v9");
+  await page.getByLabel("Summary").fill("Unknown kinds remain first-class.");
+  await page.getByLabel("Guide").selectOption(GUIDE_ID);
+  await page.getByRole("button", { name: "Create Resource" }).click();
+
+  const mutations = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  );
+  expect(mutations?.[0]).toMatchObject({
+    operation: "create",
+    expected_project_revision: 7,
+    object_type: "resource",
+    data: {
+      name: "Deployment service",
+      resource_kind: "internal-service-v9",
+      summary: "Unknown kinds remain first-class.",
+      guide_document_id: GUIDE_ID,
+    },
+  });
+
+  await page
+    .getByRole("button", { name: "Inspect Resource Buzz repository" })
+    .click();
+  await page.getByRole("link", { name: "Open verified Guide" }).click();
+  await expect(page).toHaveURL(new RegExp(`/documents\\?document=${GUIDE_ID}`));
+  await expect(
+    page.getByRole("heading", { name: "Buzz repository guide" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("document-markdown")).toContainText(
+    "reviewed clone and contribution workflow",
+  );
+});
+
+test("v3 Resource saga preserves a newly committed Guide when the Resource conflicts", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectDocument: guideDocumentState(),
+    projectView: V3_READY_VIEW,
+    projectViewMutationResults: [
+      {
+        status: "conflict",
+        expected_project_revision: 7,
+        current_project_revision: 8,
+        message: "relay returned 409: project revision conflict",
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("open-view").click();
+  await page.getByRole("button", { name: "Add Resource" }).click();
+
+  await page.getByLabel("Name").fill("Canary environment");
+  await page.getByLabel("Resource kind").fill("environment");
+  await page.getByLabel("Guide").selectOption({ label: "Create a new Guide…" });
+  await page.getByLabel("Guide title").fill("Canary environment guide");
+  await page.getByLabel("Guide summary").fill("Bounded canary instructions");
+  await page
+    .getByLabel("Guide Markdown")
+    .fill("# Canary\n\nRun only in the declared cohort.");
+  await page.getByRole("button", { name: "Create Resource" }).click();
+
+  await expect(page.getByRole("alert")).toContainText("Project changed");
+  await expect(
+    page.getByText(
+      "Guide created and preserved; review the latest View, then retry the Resource.",
+    ),
+  ).toBeVisible();
+  const submitted = await page.evaluate(() => ({
+    documents: window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__?.filter(
+      (call) => call.command === "mutate_project_document",
+    ),
+    projectView: window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
+  }));
+  expect(submitted.documents).toHaveLength(1);
+  expect(submitted.documents?.[0]).toMatchObject({
+    payload: {
+      input: {
+        mutation: {
+          type: "create",
+          title: "Canary environment guide",
+          summary: "Bounded canary instructions",
+          contentMarkdown: "# Canary\n\nRun only in the declared cohort.",
+        },
+      },
+    },
+  });
+  expect(submitted.projectView).toHaveLength(1);
+  expect(submitted.projectView?.[0]).toMatchObject({
+    operation: "create",
+    expected_project_revision: 7,
+    object_type: "resource",
+    data: {
+      name: "Canary environment",
+      resource_kind: "environment",
+    },
+  });
+  const guideId = (
+    submitted.projectView?.[0] as {
+      data?: { guide_document_id?: string };
+    }
+  )?.data?.guide_document_id;
+  expect(guideId).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  await expect(page.getByLabel("Guide")).toHaveValue(guideId ?? "");
 });
 
 test("v2 Role cards and Inspector show one verified continuity state", async ({

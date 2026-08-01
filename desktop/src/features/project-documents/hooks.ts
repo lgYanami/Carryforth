@@ -108,14 +108,14 @@ function useDocumentCommunity() {
   };
 }
 
-export function useProjectDocumentMeta() {
+export function useProjectDocumentMeta(enabled = true) {
   const queryClient = useQueryClient();
   const { activeCommunity, communityKey, relayOrigin } = useDocumentCommunity();
   const previousIdentityRef = React.useRef<string | null>(null);
   const query = useQuery({
     queryKey: projectDocumentMetaKey(communityKey, relayOrigin),
     queryFn: () => getProjectDocumentMeta(communityKey),
-    enabled: Boolean(activeCommunity),
+    enabled: Boolean(activeCommunity) && enabled,
     staleTime: 15_000,
     refetchOnWindowFocus: true,
   });

@@ -226,7 +226,7 @@ async fn desktop_snapshot_verifies_and_assembles_read_model() {
 
     assert_eq!(project_revision, 1);
     assert_eq!(active_object_count, 2);
-    assert_eq!(view.goals.len(), 1);
+    assert_eq!(view.expect("legacy View payload").goals.len(), 1);
     assert_eq!(
         counters.meta_queries.load(Ordering::SeqCst),
         2,

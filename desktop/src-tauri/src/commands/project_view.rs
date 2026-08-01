@@ -11,6 +11,7 @@ use buzz_project_view_pkg::v2::{
     CommunityMemberRole, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpoint,
     RoleContinuityChange, RoleDefinition, RoleHandoff, RoleLevel, WorkCommitment,
 };
+use buzz_project_view_pkg::v3::ProjectViewObjectV3;
 use buzz_project_view_pkg::{
     ProjectRole, ProjectView, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
     ProjectViewObjectType, ProjectViewRelations, ProjectViewState,
@@ -29,18 +30,16 @@ use buzz_sdk_pkg::project_view_v2::{
 use buzz_sdk_pkg::role_brief::{RoleBrief, VerifiedRoleBriefSnapshot};
 use chrono::{DateTime, Utc};
 use nostr::Event;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use tauri::State;
 
 use crate::app_state::AppState;
-use crate::relay::{
-    classify_request_error, parse_json_response, query_relay, relay_api_base_url_with_override,
-    relay_error_message,
-};
+use crate::relay::query_relay;
 
 pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
 pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
+pub(crate) const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 
@@ -48,6 +47,7 @@ const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 pub(crate) enum ProjectViewSchema {
     V1,
     V2,
+    V3,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,14 +55,6 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
     pub(crate) schema: ProjectViewSchema,
     pub(crate) project_document_supported: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct Nip11Document {
-    #[serde(default)]
-    supported_extensions: Vec<String>,
-    #[serde(rename = "self")]
-    relay_self: Option<String>,
 }
 
 struct ProjectSnapshot {
@@ -89,6 +81,17 @@ pub struct ProjectViewRoleContinuity {
     handoffs: Vec<RoleHandoff>,
     members: Vec<ProjectViewMembershipMember>,
     briefs: Vec<RoleBrief>,
+}
+
+/// Versioned Role continuity payload. Its JSON shape stays stable while the
+/// Role definition and Role Brief major are selected by Project View schema.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ProjectViewRoleContinuityPayload {
+    /// Schema-v2 continuity and Role Briefs.
+    V2(ProjectViewRoleContinuity),
+    /// Schema-v3 continuity and strict base RoleBriefV3 values.
+    V3(ProjectViewRoleContinuityV3),
 }
 
 #[derive(Debug, Serialize)]
@@ -141,11 +144,16 @@ pub enum ProjectViewLoadResult {
         active_object_count: u32,
         /// Canonical server time of the projected state.
         updated_at: DateTime<Utc>,
-        /// Deterministically assembled Project View hierarchy.
-        view: Box<ProjectView>,
-        /// Verified Role continuity state for schema v2.
+        /// Deterministically assembled legacy Project View hierarchy.
         #[serde(skip_serializing_if = "Option::is_none")]
-        role_continuity: Option<Box<ProjectViewRoleContinuity>>,
+        view: Option<Box<ProjectView>>,
+        /// Strict flat schema-v3 objects. TypeScript assembles the hierarchy
+        /// without inventing a legacy Resource locator.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        objects_v3: Option<Vec<ProjectViewObjectV3>>,
+        /// Verified Role continuity state for schema v2 or v3.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role_continuity: Option<Box<ProjectViewRoleContinuityPayload>>,
     },
 }
 
@@ -155,8 +163,14 @@ pub async fn get_project_view(state: State<'_, AppState>) -> Result<ProjectViewL
     load_project_view(&state).await
 }
 
+mod identity;
+use identity::read_identity;
+pub(crate) use identity::read_identity_at;
 mod role_history;
 pub use role_history::*;
+mod v3;
+pub use v3::ProjectViewRoleContinuityV3;
+use v3::{fetch_consistent_v3_snapshot, read_v3_meta, V3ProjectSnapshot};
 
 fn read_error_message(error: ProjectViewReadError) -> String {
     match error {
@@ -184,7 +198,8 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
                         projection_generation: meta.projection_generation,
                         active_object_count: meta.active_object_count,
                         updated_at: meta.updated_at,
-                        view: Box::new(view),
+                        view: Some(Box::new(view)),
+                        objects_v3: None,
                         role_continuity: None,
                     },
                 )
@@ -205,8 +220,36 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
                             projection_generation: meta.projection_generation,
                             active_object_count: meta.entity_counts.active_objects,
                             updated_at: meta.updated_at,
-                            view: Box::new(view),
-                            role_continuity: Some(Box::new(role_continuity)),
+                            view: Some(Box::new(view)),
+                            objects_v3: None,
+                            role_continuity: Some(Box::new(ProjectViewRoleContinuityPayload::V2(
+                                role_continuity,
+                            ))),
+                        },
+                    )
+                })
+        }
+        ProjectViewSchema::V3 => {
+            fetch_consistent_v3_snapshot(state, identity)
+                .await
+                .map(|snapshot| {
+                    snapshot.map(
+                        |V3ProjectSnapshot {
+                             meta,
+                             objects,
+                             role_continuity,
+                         }| ProjectViewLoadResult::Ready {
+                            relay_pubkey: identity.relay_pubkey.to_hex(),
+                            schema_version: 3,
+                            project_revision: meta.project_revision,
+                            projection_generation: meta.projection_generation,
+                            active_object_count: meta.entity_counts.active_objects,
+                            updated_at: meta.updated_at,
+                            view: None,
+                            objects_v3: Some(objects),
+                            role_continuity: Some(Box::new(ProjectViewRoleContinuityPayload::V3(
+                                role_continuity,
+                            ))),
                         },
                     )
                 })
@@ -221,63 +264,6 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
         Err(ProjectViewReadError::Conflict(message))
         | Err(ProjectViewReadError::Other(message)) => Err(message),
     }
-}
-
-async fn read_identity(state: &AppState) -> Result<Option<ProjectViewIdentity>, String> {
-    read_identity_at(state, &relay_api_base_url_with_override(state)).await
-}
-
-pub(crate) async fn read_identity_at(
-    state: &AppState,
-    api_base_url: &str,
-) -> Result<Option<ProjectViewIdentity>, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/info", api_base_url.trim_end_matches('/'));
-    let response = state
-        .http_client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/nostr+json")
-        .send()
-        .await
-        .map_err(|error| classify_request_error(&error))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-    let info: Nip11Document = parse_json_response(response).await?;
-    let has_v2 = info
-        .supported_extensions
-        .iter()
-        .any(|extension| extension == PROJECT_VIEW_V2_EXTENSION);
-    let has_v1 = info
-        .supported_extensions
-        .iter()
-        .any(|extension| extension == PROJECT_VIEW_V1_EXTENSION);
-    let schema = if has_v2 {
-        ProjectViewSchema::V2
-    } else if has_v1 {
-        ProjectViewSchema::V1
-    } else {
-        return Ok(None);
-    };
-
-    let relay_self = info.relay_self.ok_or_else(|| {
-        integrity_error("NIP-11 advertises Project View without a Relay `self` key")
-    })?;
-    let relay_pubkey = PublicKey::from_hex(&relay_self)
-        .map_err(|error| integrity_error(format!("invalid NIP-11 Relay `self`: {error}")))?;
-    if relay_pubkey.to_hex() != relay_self {
-        return Err(integrity_error(
-            "NIP-11 Relay `self` is not canonical lowercase hex",
-        ));
-    }
-    Ok(Some(ProjectViewIdentity {
-        relay_pubkey,
-        schema,
-        project_document_supported: info
-            .supported_extensions
-            .iter()
-            .any(|extension| extension == "buzz-project-document-v1"),
-    }))
 }
 
 async fn fetch_consistent_snapshot(

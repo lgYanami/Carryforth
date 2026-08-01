@@ -14,7 +14,14 @@ use buzz_sdk::project_view_v2::{
     parse_entity_projection, parse_membership_projection, parse_meta_projection,
     parse_project_object_projection, V2EntityProjection, V2MembershipProjection, V2MetaProjection,
 };
+use buzz_sdk::project_view_v3::{
+    parse_entity_projection as parse_v3_entity_projection,
+    parse_meta_projection as parse_v3_meta_projection,
+    parse_project_object_projection as parse_v3_project_object_projection, V3EntityProjection,
+    V3MetaProjection,
+};
 use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
+use buzz_sdk::role_brief_v3::VerifiedRoleBriefSnapshotV3;
 use nostr::Event;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,6 +31,7 @@ use crate::error::CliError;
 
 pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
 pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
+pub(crate) const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_ENTITY_PAGE_SIZE: usize = 500;
 const RUNTIME_FENCE_FILE_MAX_BYTES: u64 = 4 * 1024;
@@ -33,6 +41,7 @@ const RUNTIME_FENCE_PATH_ENV: &str = "BUZZ_RUNTIME_FENCE_PATH";
 pub(crate) enum ProjectViewSchema {
     V1,
     V2,
+    V3,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +82,12 @@ pub(crate) async fn read_identity(
     let schema = if info
         .supported_extensions
         .iter()
+        .any(|extension| extension == PROJECT_VIEW_V3_EXTENSION)
+    {
+        ProjectViewSchema::V3
+    } else if info
+        .supported_extensions
+        .iter()
         .any(|extension| extension == PROJECT_VIEW_V2_EXTENSION)
     {
         ProjectViewSchema::V2
@@ -99,6 +114,187 @@ pub(crate) async fn read_identity(
         relay_pubkey,
         schema,
     }))
+}
+
+/// Read and validate one bounded schema-v3 current snapshot.
+pub(crate) async fn read_verified_v3_snapshot(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+) -> Result<VerifiedRoleBriefSnapshotV3, CliError> {
+    if identity.schema != ProjectViewSchema::V3 {
+        return Err(CliError::Other(
+            "unsupported: verified Role state requires Project View v3".to_owned(),
+        ));
+    }
+    for attempt in 0..SNAPSHOT_ATTEMPTS {
+        let before = read_v3_meta(client, identity).await?;
+        let ordinary_values = client
+            .query_all(json!({
+                "kinds": [KIND_PROJECT_VIEW_OBJECT],
+                "authors": [identity.relay_pubkey.to_hex()],
+                "#t": ["buzz-project-view-v3-object"],
+            }))
+            .await?;
+        let entity_projections =
+            read_current_v3_entity_projections(client, identity, &before).await?;
+
+        let mut event_ids =
+            HashSet::with_capacity(ordinary_values.len() + entity_projections.len());
+        let mut object_projections = Vec::with_capacity(ordinary_values.len());
+        for value in ordinary_values {
+            let event: Event = serde_json::from_value(value)
+                .map_err(|error| v3_integrity_error(format!("invalid v3 object event: {error}")))?;
+            if !event_ids.insert(event.id) {
+                return Err(v3_integrity_error(
+                    "v3 object query returned a duplicate event",
+                ));
+            }
+            object_projections.push(
+                parse_v3_project_object_projection(
+                    &event,
+                    &identity.relay_pubkey,
+                    before.project_id,
+                )
+                .map_err(|error| v3_integrity_error(error.to_string()))?,
+            );
+        }
+        for projection in &entity_projections {
+            if !event_ids.insert(projection.event_id) {
+                return Err(v3_integrity_error(
+                    "v3 entity query returned a duplicate event",
+                ));
+            }
+        }
+        let membership = read_v3_membership(client, identity, &before).await?;
+        let after = read_v3_meta(client, identity).await?;
+        if before.event_id != after.event_id {
+            if attempt + 1 < SNAPSHOT_ATTEMPTS {
+                let backoff_ms = 25_u64 << attempt;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
+            return Err(CliError::Conflict(
+                "Project View v3 changed during every bounded snapshot attempt".to_owned(),
+            ));
+        }
+        return VerifiedRoleBriefSnapshotV3::new_with_partial_history(
+            before,
+            membership,
+            object_projections,
+            entity_projections,
+        )
+        .map_err(|error| v3_integrity_error(error.to_string()));
+    }
+    Err(CliError::Conflict(
+        "Project View v3 snapshot could not be stabilized".to_owned(),
+    ))
+}
+
+async fn read_current_v3_entity_projections(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    meta: &V3MetaProjection,
+) -> Result<Vec<V3EntityProjection>, CliError> {
+    let mut projections = Vec::new();
+    let mut event_ids = HashSet::new();
+    let mut after: Option<Value> = None;
+    loop {
+        let mut extension = json!({
+            "scope": "v3_current_entities",
+            "revision": meta.project_revision,
+            "projection_generation": meta.projection_generation,
+        });
+        if let Some(cursor) = &after {
+            extension["after"] = cursor.clone();
+        }
+        let filter = json!({
+            "kinds": [KIND_PROJECT_VIEW_OBJECT],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "#t": ["buzz-project-view-v3-entity"],
+            "limit": V2_ENTITY_PAGE_SIZE,
+            "buzz_project_view": extension,
+        });
+        let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
+            .map_err(|error| v3_integrity_error(format!("invalid v3 entity page: {error}")))?;
+        if values.len() > V2_ENTITY_PAGE_SIZE {
+            return Err(v3_integrity_error(
+                "v3 current-entity page exceeded the requested limit",
+            ));
+        }
+        let page_len = values.len();
+        for value in values {
+            let event: Event = serde_json::from_value(value)
+                .map_err(|error| v3_integrity_error(format!("invalid v3 entity event: {error}")))?;
+            if !event_ids.insert(event.id) {
+                return Err(v3_integrity_error(
+                    "v3 current-entity pages contain a duplicate event",
+                ));
+            }
+            let projection =
+                parse_v3_entity_projection(&event, &identity.relay_pubkey, meta.project_id)
+                    .map_err(|error| v3_integrity_error(error.to_string()))?;
+            after = Some(json!({
+                "entity_type": projection.entity.entity_type().as_str(),
+                "entity_id": projection.entity.entity_id(),
+            }));
+            projections.push(projection);
+        }
+        if page_len < V2_ENTITY_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(projections)
+}
+
+pub(crate) async fn read_v3_meta(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+) -> Result<V3MetaProjection, CliError> {
+    let filter = json!({
+        "kinds": [KIND_PROJECT_VIEW_META],
+        "authors": [identity.relay_pubkey.to_hex()],
+        "limit": 2,
+    });
+    let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
+        .map_err(|error| v3_integrity_error(format!("invalid v3 metadata response: {error}")))?;
+    let [value] = values.as_slice() else {
+        return Err(v3_integrity_error(
+            "v3 metadata query did not return exactly one current head",
+        ));
+    };
+    let event: Event = serde_json::from_value(value.clone())
+        .map_err(|error| v3_integrity_error(format!("invalid v3 metadata event: {error}")))?;
+    parse_v3_meta_projection(&event, &identity.relay_pubkey)
+        .map_err(|error| v3_integrity_error(error.to_string()))
+}
+
+async fn read_v3_membership(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    meta: &V3MetaProjection,
+) -> Result<V2MembershipProjection, CliError> {
+    let filter = json!({
+        "ids": [meta.membership_snapshot_event_id.to_hex()],
+        "kinds": [KIND_NIP43_MEMBERSHIP_LIST],
+        "authors": [identity.relay_pubkey.to_hex()],
+        "limit": 2,
+    });
+    let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
+        .map_err(|error| v3_integrity_error(format!("invalid membership response: {error}")))?;
+    let [value] = values.as_slice() else {
+        return Err(v3_integrity_error(
+            "v3 metadata membership pointer did not resolve exactly once",
+        ));
+    };
+    let event: Event = serde_json::from_value(value.clone())
+        .map_err(|error| v3_integrity_error(format!("invalid membership event: {error}")))?;
+    if event.id != meta.membership_snapshot_event_id {
+        return Err(v3_integrity_error(
+            "membership query returned an event other than the v3 metadata pointer",
+        ));
+    }
+    parse_membership_projection(&event, &identity.relay_pubkey)
+        .map_err(|error| v3_integrity_error(error.to_string()))
 }
 
 pub(crate) async fn require_v2_identity(
@@ -600,6 +796,13 @@ async fn read_membership(
 pub(crate) fn integrity_error(message: impl Into<String>) -> CliError {
     CliError::Other(format!(
         "Project View v2 integrity error: {}",
+        message.into()
+    ))
+}
+
+pub(crate) fn v3_integrity_error(message: impl Into<String>) -> CliError {
+    CliError::Other(format!(
+        "Project View v3 integrity error: {}",
         message.into()
     ))
 }
