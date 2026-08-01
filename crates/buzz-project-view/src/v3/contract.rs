@@ -93,7 +93,7 @@ impl ProjectResourceV3 {
 }
 
 /// Document Context Reference behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentReferenceMode {
     /// Resolve the current active Document head when the Brief is assembled.

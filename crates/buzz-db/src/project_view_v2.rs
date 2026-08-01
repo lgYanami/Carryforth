@@ -1982,6 +1982,7 @@ impl ProjectViewV2WriteTx {
             command_event.pubkey,
             command.acting_assignment_id,
             command.runtime_fence,
+            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
         )
         .await?;
         if let Some(receipt) =
@@ -2777,27 +2778,36 @@ pub(crate) async fn project_view_v2_enable_ready_in_tx(
 }
 
 #[derive(Debug)]
-struct LoadedV2State {
-    state: RoleContinuityState,
-    canonical_time: DateTime<Utc>,
-    projection_generation: u64,
-    projection_pubkey: PublicKey,
-    meta_projection_event_id: [u8; 32],
-    membership_snapshot_event_id: Option<EventId>,
+pub(crate) struct LoadedContinuityState {
+    pub(crate) state: RoleContinuityState,
+    pub(crate) canonical_time: DateTime<Utc>,
+    pub(crate) projection_generation: u64,
+    pub(crate) projection_pubkey: PublicKey,
+    pub(crate) meta_projection_event_id: [u8; 32],
+    pub(crate) membership_snapshot_event_id: Option<EventId>,
 }
 
 async fn load_v2_state(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
-) -> ProjectViewV2WriteResult<LoadedV2State> {
+) -> ProjectViewV2WriteResult<LoadedContinuityState> {
+    load_continuity_state(tx, community_id, 2).await
+}
+
+pub(crate) async fn load_continuity_state(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    schema_version: i16,
+) -> ProjectViewV2WriteResult<LoadedContinuityState> {
     let state_row = sqlx::query(
         "SELECT project_revision, updated_at, projection_generation, \
                 projection_pubkey, meta_projection_event_id, \
                 membership_snapshot_event_id \
          FROM project_view_state \
-         WHERE community_id = $1 AND schema_version = 2 FOR UPDATE",
+         WHERE community_id = $1 AND schema_version = $2 FOR UPDATE",
     )
     .bind(community_id.as_uuid())
+    .bind(schema_version)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(ProjectViewV2WriteError::Unavailable { community_id })?;
@@ -2842,9 +2852,10 @@ async fn load_v2_state(
         "SELECT object_id, role_level, \
                 COALESCE((body->>'active')::boolean, FALSE) AS active \
          FROM project_view_objects \
-         WHERE community_id = $1 AND object_type = 'role' AND schema_version = 2",
+         WHERE community_id = $1 AND object_type = 'role' AND schema_version = $2",
     )
     .bind(community_id.as_uuid())
+    .bind(schema_version)
     .fetch_all(&mut **tx)
     .await?;
     let roles = role_rows
@@ -2885,7 +2896,7 @@ async fn load_v2_state(
         handoffs,
         referenceable_object_ids,
     )?;
-    Ok(LoadedV2State {
+    Ok(LoadedContinuityState {
         state,
         canonical_time,
         projection_generation,
@@ -3030,12 +3041,13 @@ async fn load_v2_project_object_state(
     })
 }
 
-async fn validate_project_object_actor_fence(
+pub(crate) async fn validate_project_object_actor_fence(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     actor: PublicKey,
     acting_assignment_id: Option<Uuid>,
     runtime_fence: Option<buzz_project_view::v2::RuntimeFence>,
+    policy: crate::project_runtime::RuntimeCommandFencePolicy,
 ) -> ProjectViewV2WriteResult<()> {
     let actor_bytes = actor.to_bytes();
     let managed: bool = sqlx::query_scalar(
@@ -3079,7 +3091,7 @@ async fn validate_project_object_actor_fence(
         community_id,
         Some(assignment_id),
         runtime_fence,
-        crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+        policy,
     )
     .await?;
     Ok(())
@@ -3112,13 +3124,24 @@ async fn reject_assigned_role_deactivation(
     if role_ids.is_empty() {
         return Ok(());
     }
+    reject_role_ids_with_active_authority(tx, community_id, &role_ids).await
+}
+
+pub(crate) async fn reject_role_ids_with_active_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    role_ids: &[Uuid],
+) -> ProjectViewV2WriteResult<()> {
+    if role_ids.is_empty() {
+        return Ok(());
+    }
     let assigned_role: Option<Uuid> = sqlx::query_scalar(
         "SELECT role_id FROM project_role_assignments \
          WHERE community_id = $1 AND role_id = ANY($2) AND ended_at IS NULL \
          ORDER BY role_id LIMIT 1",
     )
     .bind(community_id.as_uuid())
-    .bind(&role_ids)
+    .bind(role_ids)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(role_id) = assigned_role {
@@ -3139,7 +3162,7 @@ async fn reject_assigned_role_deactivation(
          ORDER BY responsible_role_id LIMIT 1",
     )
     .bind(community_id.as_uuid())
-    .bind(&role_ids)
+    .bind(role_ids)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(role_id) = responsible_role {
@@ -3643,7 +3666,7 @@ async fn load_handoffs(
         .collect()
 }
 
-async fn find_receipt(
+pub(crate) async fn find_receipt(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     change_id: &[u8],
@@ -3789,7 +3812,7 @@ async fn insert_project_object_change(
     Ok(())
 }
 
-async fn load_old_projection_ids(
+pub(crate) async fn load_old_projection_ids(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     changes: &[RoleContinuityChange],
@@ -3981,6 +4004,28 @@ async fn close_commitments_for_terminal_work(
     if work_ids.is_empty() {
         return Ok(Vec::new());
     }
+    close_commitments_for_work_ids(
+        tx,
+        community_id,
+        &work_ids,
+        actor,
+        canonical_time,
+        project_revision,
+    )
+    .await
+}
+
+pub(crate) async fn close_commitments_for_work_ids(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    work_ids: &[Uuid],
+    actor: PublicKey,
+    canonical_time: DateTime<Utc>,
+    project_revision: u64,
+) -> ProjectViewV2WriteResult<Vec<RoleContinuityChange>> {
+    if work_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let rows = sqlx::query(
         "SELECT commitment_id, work_id, assignment_id, member_pubkey, \
                 accepted_at, accepted_by, entity_revision \
@@ -3989,7 +4034,7 @@ async fn close_commitments_for_terminal_work(
          ORDER BY commitment_id FOR UPDATE",
     )
     .bind(community_id.as_uuid())
-    .bind(&work_ids)
+    .bind(work_ids)
     .fetch_all(&mut **tx)
     .await?;
     rows.into_iter()
@@ -4027,7 +4072,7 @@ async fn close_commitments_for_terminal_work(
         .collect()
 }
 
-async fn persist_changes(
+pub(crate) async fn persist_changes(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     change_id: &[u8],
@@ -4505,7 +4550,7 @@ async fn persist_continuity_references(
     Ok(())
 }
 
-async fn apply_membership_roles(
+pub(crate) async fn apply_membership_roles(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     actor: PublicKey,
@@ -4554,7 +4599,7 @@ async fn apply_membership_roles(
     Ok(())
 }
 
-async fn load_membership(
+pub(crate) async fn load_membership(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
 ) -> ProjectViewV2WriteResult<Vec<V2MembershipEntry>> {
@@ -4575,7 +4620,7 @@ async fn load_membership(
         .collect()
 }
 
-async fn load_counts(
+pub(crate) async fn load_counts(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
 ) -> ProjectViewV2WriteResult<V2CanonicalCounts> {
@@ -5044,7 +5089,7 @@ fn projected_object_matches_entry(
     }
 }
 
-fn verify_membership_projection(
+pub(crate) fn verify_membership_projection(
     event: &Event,
     relay_pubkey: PublicKey,
     members: &[V2MembershipEntry],
@@ -5096,7 +5141,7 @@ fn verify_membership_projection(
     Ok(())
 }
 
-async fn retire_membership_heads(
+pub(crate) async fn retire_membership_heads(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     relay_pubkey: PublicKey,
@@ -5117,7 +5162,7 @@ async fn retire_membership_heads(
     Ok(())
 }
 
-async fn update_projection_pointer(
+pub(crate) async fn update_projection_pointer(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     entity_type: RoleContinuityEntity,
@@ -5532,7 +5577,7 @@ struct CutoverRoleBody {
     active: bool,
 }
 
-fn build_cutover_membership_event(
+pub(crate) fn build_cutover_membership_event(
     members: &[V2MembershipEntry],
     canonical_time: DateTime<Utc>,
     relay_keys: &Keys,

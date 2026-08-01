@@ -323,7 +323,7 @@ pub async fn ban_member(
     crate::relay_members::acquire_membership_write_lock(&mut tx, community).await?;
     let schema_version =
         crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await?;
-    if schema_version == 2 {
+    if matches!(schema_version, 2 | 3) {
         let target_hex = hex::encode(pubkey);
         let target_is_owner: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
@@ -349,16 +349,10 @@ pub async fn ban_member(
             )
             .await?
         {
-            // Until the Assignment command/projection transaction lands in
-            // Stage 2, fail closed instead of committing a ban that would make
-            // canonical continuity state invalid.
             return Err(DbError::AccessDenied(
                 "forbidden:membership:assignment_active".to_owned(),
             ));
         }
-        return Err(DbError::AccessDenied(
-            "unavailable:project_view_v2:membership_coordinator".to_owned(),
-        ));
     }
 
     sqlx::query(
@@ -382,6 +376,15 @@ pub async fn ban_member(
     .execute(&mut *tx)
     .await?;
 
+    crate::project_view_maintenance::record_security_invalidation_in_tx(
+        &mut tx,
+        community,
+        Some(actor),
+        "ban",
+        Some(hex::encode(pubkey)),
+    )
+    .await?;
+
     tx.commit().await?;
     Ok(())
 }
@@ -395,11 +398,7 @@ pub async fn unban_member(
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
     crate::relay_members::acquire_membership_write_lock(&mut tx, community).await?;
-    if crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await? == 2 {
-        return Err(DbError::AccessDenied(
-            "unavailable:project_view_v2:membership_coordinator".to_owned(),
-        ));
-    }
+    crate::relay_members::project_view_schema_version_in_tx(&mut tx, community).await?;
 
     let result = sqlx::query(
         r#"
@@ -416,6 +415,16 @@ pub async fn unban_member(
     .await?;
 
     let lifted = result.rows_affected() > 0;
+    if lifted {
+        crate::project_view_maintenance::record_security_invalidation_in_tx(
+            &mut tx,
+            community,
+            Some(actor),
+            "unban",
+            Some(hex::encode(pubkey)),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(lifted)
 }
@@ -453,6 +462,15 @@ pub async fn timeout_member(
     .execute(&mut *tx)
     .await?;
 
+    crate::project_view_maintenance::record_security_invalidation_in_tx(
+        &mut tx,
+        community,
+        Some(actor),
+        "timeout",
+        Some(hex::encode(pubkey)),
+    )
+    .await?;
+
     tx.commit().await?;
     Ok(())
 }
@@ -483,6 +501,16 @@ pub async fn untimeout_member(
     .await?;
 
     let lifted = result.rows_affected() > 0;
+    if lifted {
+        crate::project_view_maintenance::record_security_invalidation_in_tx(
+            &mut tx,
+            community,
+            Some(actor),
+            "untimeout",
+            Some(hex::encode(pubkey)),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(lifted)
 }

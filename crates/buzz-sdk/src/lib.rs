@@ -20,6 +20,8 @@ pub mod project_document;
 pub mod project_view;
 /// Project View v2 Role continuity command and projection wire format.
 pub mod project_view_v2;
+/// Project View v3 command and strict Relay projection wire format.
+pub mod project_view_v3;
 /// Verified Project View v2 Role Brief assembly and Markdown rendering.
 pub mod role_brief;
 

@@ -10,6 +10,7 @@ description = "Pure domain model and mutation reducer for Buzz Project View"
 [dependencies]
 buzz-core = { workspace = true }
 chrono = { workspace = true }
+hex = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -119,11 +119,14 @@ impl Db {
                ON actor.community_id = assignment.community_id \
               AND actor.pubkey = decode(assignment.member_pubkey, 'hex') \
              JOIN communities community ON community.id = assignment.community_id \
+             JOIN project_view_maintenance maintenance \
+               ON maintenance.community_id = assignment.community_id \
              WHERE assignment.community_id = $1 AND assignment.assignment_id = $2 \
-               AND community.project_view_schema_version = 2 \
+               AND community.project_view_schema_version IN (2, 3) \
                AND community.project_view_enabled \
                AND community.archived_at IS NULL \
-             FOR UPDATE OF assignment",
+               AND maintenance.state = 'normal' \
+             FOR UPDATE OF assignment, maintenance",
         )
         .bind(community_id.as_uuid())
         .bind(assignment_id)
@@ -252,6 +255,7 @@ impl Db {
     ) -> RuntimeSupervisionResult<bool> {
         let mut tx = self.pool.begin().await?;
         crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        require_normal_maintenance_in_tx(&mut tx, community_id).await?;
         let revoked_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await?;
@@ -318,6 +322,8 @@ impl Db {
             buzz_project_view::v2::idempotency_key_hash(request.idempotency_key.as_bytes());
         let request_hash = runtime_evidence_request_hash(request)?;
         let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
+        let maintenance = maintenance_observation_in_tx(&mut tx, community_id).await?;
         let row = sqlx::query(
             "SELECT binding_id, supervisor_pubkey, lease_seconds, \
                     recovery_window_seconds, max_recovery_attempts, \
@@ -341,6 +347,15 @@ impl Db {
         if stored_supervisor != supervisor_pubkey {
             return Err(RuntimeSupervisionError::NotRegistered);
         }
+        validate_evidence_maintenance_fence(
+            &mut tx,
+            community_id,
+            maintenance,
+            row.try_get("binding_id")?,
+            supervisor_pubkey,
+            request,
+        )
+        .await?;
         if row
             .try_get::<Option<Vec<u8>>, _>("system_change_id")?
             .is_some()
@@ -616,91 +631,122 @@ impl Db {
                 "scheduler limit and claim duration must be positive".to_owned(),
             ));
         }
-        let rows = sqlx::query(
-            "WITH candidates AS ( \
-                 SELECT binding.community_id, binding.binding_id \
-                 FROM project_runtime_supervisor_bindings binding \
-                 JOIN project_role_assignments assignment \
-                   ON assignment.community_id = binding.community_id \
-                  AND assignment.assignment_id = binding.assignment_id \
-                 WHERE binding.revoked_at IS NULL \
-                   AND binding.automatic_unrecoverable \
-                   AND binding.system_change_id IS NULL \
-                   AND assignment.ended_at IS NULL \
-                   AND binding.last_monitor_at IS NOT NULL \
-                   AND binding.last_monitor_at \
-                       >= clock_timestamp() \
-                          - make_interval(secs => binding.monitor_timeout_seconds) \
-                   AND binding.monitor_grace_until <= clock_timestamp() \
-                   AND ( \
-                       binding.scheduler_claimed_until IS NULL \
-                       OR binding.scheduler_claimed_until < clock_timestamp() \
-                   ) \
-                   AND EXISTS ( \
-                       SELECT 1 FROM project_runtime_leases runtime \
-                       WHERE runtime.community_id = binding.community_id \
-                         AND runtime.binding_id = binding.binding_id \
-                         AND runtime.ended_at IS NULL \
-                   ) \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM project_runtime_leases runtime \
-                       WHERE runtime.community_id = binding.community_id \
-                         AND runtime.binding_id = binding.binding_id \
-                         AND runtime.ended_at IS NULL \
-                         AND runtime.availability <> 'unavailable' \
-                   ) \
-                 ORDER BY binding.updated_at, binding.community_id, binding.binding_id \
-                 FOR UPDATE OF binding SKIP LOCKED \
-                 LIMIT $1 \
-             ) \
-             UPDATE project_runtime_supervisor_bindings binding SET \
-                 scheduler_claim_token = gen_random_uuid(), \
-                 scheduler_claimed_until = clock_timestamp() + make_interval(secs => $2), \
-                 updated_at = clock_timestamp() \
-             FROM candidates \
-             WHERE binding.community_id = candidates.community_id \
-               AND binding.binding_id = candidates.binding_id \
-             RETURNING binding.community_id, binding.binding_id, \
-                       binding.assignment_id, binding.scheduler_claim_token",
+        // Discovery is intentionally read-only. Every actual claim is made in
+        // a per-Community transaction after taking that Community's shared
+        // advisory lock and rechecking the maintenance pointer.
+        let community_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT binding.community_id \
+             FROM project_runtime_supervisor_bindings binding \
+             JOIN project_view_maintenance maintenance \
+               ON maintenance.community_id = binding.community_id \
+             WHERE binding.revoked_at IS NULL \
+               AND binding.automatic_unrecoverable \
+               AND binding.system_change_id IS NULL \
+               AND maintenance.state = 'normal' \
+             ORDER BY binding.community_id \
+             LIMIT $1",
         )
         .bind(i64::from(limit))
-        .bind(claim_seconds)
         .fetch_all(&self.pool)
         .await?;
-        let mut claims = Vec::with_capacity(rows.len());
-        for row in rows {
-            let community_id = CommunityId::from_uuid(row.try_get::<Uuid, _>("community_id")?);
-            let binding_id: Uuid = row.try_get("binding_id")?;
-            let assignment_id: Uuid = row.try_get("assignment_id")?;
-            let claim_token: Uuid = row.try_get("scheduler_claim_token")?;
+        let mut claims = Vec::with_capacity(usize::from(limit));
+        for raw_community_id in community_ids {
+            if claims.len() >= usize::from(limit) {
+                break;
+            }
+            let community_id = CommunityId::from_uuid(raw_community_id);
+            let mut tx = self.pool.begin().await?;
+            crate::community_lock::acquire(&mut tx, community_id, true).await?;
+            require_normal_maintenance_in_tx(&mut tx, community_id).await?;
+            let remaining = i64::try_from(usize::from(limit) - claims.len()).map_err(|_| {
+                RuntimeSupervisionError::Invalid("scheduler claim limit overflow".to_owned())
+            })?;
+            let rows = sqlx::query(
+                "WITH candidates AS ( \
+                     SELECT binding.binding_id \
+                     FROM project_runtime_supervisor_bindings binding \
+                     JOIN project_role_assignments assignment \
+                       ON assignment.community_id = binding.community_id \
+                      AND assignment.assignment_id = binding.assignment_id \
+                     WHERE binding.community_id = $1 \
+                       AND binding.revoked_at IS NULL \
+                       AND binding.automatic_unrecoverable \
+                       AND binding.system_change_id IS NULL \
+                       AND assignment.ended_at IS NULL \
+                       AND binding.last_monitor_at IS NOT NULL \
+                       AND binding.last_monitor_at >= clock_timestamp() \
+                           - make_interval(secs => binding.monitor_timeout_seconds) \
+                       AND binding.monitor_grace_until <= clock_timestamp() \
+                       AND (binding.scheduler_claimed_until IS NULL \
+                            OR binding.scheduler_claimed_until < clock_timestamp()) \
+                       AND EXISTS ( \
+                           SELECT 1 FROM project_runtime_leases runtime \
+                           WHERE runtime.community_id = binding.community_id \
+                             AND runtime.binding_id = binding.binding_id \
+                             AND runtime.ended_at IS NULL \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM project_runtime_leases runtime \
+                           WHERE runtime.community_id = binding.community_id \
+                             AND runtime.binding_id = binding.binding_id \
+                             AND runtime.ended_at IS NULL \
+                             AND runtime.availability <> 'unavailable' \
+                       ) \
+                     ORDER BY binding.updated_at, binding.binding_id \
+                     FOR UPDATE OF binding SKIP LOCKED \
+                     LIMIT $2 \
+                 ) \
+                 UPDATE project_runtime_supervisor_bindings binding SET \
+                     scheduler_claim_token = gen_random_uuid(), \
+                     scheduler_claimed_until = clock_timestamp() \
+                         + make_interval(secs => $3), \
+                     updated_at = clock_timestamp() \
+                 FROM candidates \
+                 WHERE binding.community_id = $1 \
+                   AND binding.binding_id = candidates.binding_id \
+                 RETURNING binding.binding_id, binding.assignment_id, \
+                           binding.scheduler_claim_token",
+            )
+            .bind(community_id.as_uuid())
+            .bind(remaining)
+            .bind(claim_seconds)
+            .fetch_all(&mut *tx)
+            .await?;
             let community_host: String =
                 sqlx::query_scalar("SELECT host FROM communities WHERE id = $1")
                     .bind(community_id.as_uuid())
-                    .fetch_one(&self.pool)
+                    .fetch_one(&mut *tx)
                     .await?;
-            let evidence_rows: Vec<Vec<u8>> = sqlx::query_scalar(
-                "SELECT evidence_id FROM project_runtime_evidence \
-                 WHERE community_id = $1 AND binding_id = $2 \
-                 ORDER BY recorded_at, evidence_id",
-            )
-            .bind(community_id.as_uuid())
-            .bind(binding_id)
-            .fetch_all(&self.pool)
-            .await?;
-            let evidence_ids = evidence_rows
-                .into_iter()
-                .map(|bytes| bytes32(bytes, "evidence_id"))
-                .collect::<RuntimeSupervisionResult<Vec<_>>>()?;
-            let idempotency_key_hash = runtime_unrecoverable_idempotency_hash(binding_id);
-            claims.push(RuntimeUnrecoverableClaim {
-                community_id,
-                community_host,
-                binding_id,
-                assignment_id,
-                claim_token,
-                idempotency_key_hash,
-                evidence_ids,
-            });
+            let mut community_claims = Vec::with_capacity(rows.len());
+            for row in rows {
+                let binding_id: Uuid = row.try_get("binding_id")?;
+                let assignment_id: Uuid = row.try_get("assignment_id")?;
+                let claim_token: Uuid = row.try_get("scheduler_claim_token")?;
+                let evidence_rows: Vec<Vec<u8>> = sqlx::query_scalar(
+                    "SELECT evidence_id FROM project_runtime_evidence \
+                     WHERE community_id = $1 AND binding_id = $2 \
+                     ORDER BY recorded_at, evidence_id",
+                )
+                .bind(community_id.as_uuid())
+                .bind(binding_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let evidence_ids = evidence_rows
+                    .into_iter()
+                    .map(|bytes| bytes32(bytes, "evidence_id"))
+                    .collect::<RuntimeSupervisionResult<Vec<_>>>()?;
+                community_claims.push(RuntimeUnrecoverableClaim {
+                    community_id,
+                    community_host: community_host.clone(),
+                    binding_id,
+                    assignment_id,
+                    claim_token,
+                    idempotency_key_hash: runtime_unrecoverable_idempotency_hash(binding_id),
+                    evidence_ids,
+                });
+            }
+            tx.commit().await?;
+            claims.extend(community_claims);
         }
         Ok(claims)
     }
@@ -710,6 +756,8 @@ impl Db {
         &self,
         claim: &RuntimeUnrecoverableClaim,
     ) -> RuntimeSupervisionResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, claim.community_id, true).await?;
         let result = sqlx::query(
             "UPDATE project_runtime_supervisor_bindings SET \
                  scheduler_claim_token = NULL, scheduler_claimed_until = NULL, \
@@ -720,9 +768,116 @@ impl Db {
         .bind(claim.community_id.as_uuid())
         .bind(claim.binding_id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MaintenanceObservation {
+    state: String,
+    epoch: Option<i64>,
+}
+
+async fn maintenance_observation_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+) -> RuntimeSupervisionResult<MaintenanceObservation> {
+    let row = sqlx::query(
+        "SELECT state, current_epoch FROM project_view_maintenance \
+         WHERE community_id = $1 FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        RuntimeSupervisionError::Invalid("Project View maintenance pointer is missing".to_owned())
+    })?;
+    Ok(MaintenanceObservation {
+        state: row.try_get("state")?,
+        epoch: row.try_get("current_epoch")?,
+    })
+}
+
+async fn require_normal_maintenance_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+) -> RuntimeSupervisionResult<()> {
+    let maintenance = maintenance_observation_in_tx(tx, community_id).await?;
+    if maintenance.state == "normal" && maintenance.epoch.is_none() {
+        Ok(())
+    } else {
+        Err(RuntimeSupervisionError::Invalid(
+            "Project View maintenance fences runtime binding changes".to_owned(),
+        ))
+    }
+}
+
+async fn validate_evidence_maintenance_fence(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    maintenance: MaintenanceObservation,
+    binding_id: Uuid,
+    supervisor_pubkey: PublicKey,
+    request: &RuntimeEvidenceRequest,
+) -> RuntimeSupervisionResult<()> {
+    if maintenance.state == "normal" && maintenance.epoch.is_none() {
+        return Ok(());
+    }
+    if maintenance.state != "draining" {
+        return Err(RuntimeSupervisionError::Invalid(
+            "Project View maintenance fences runtime evidence".to_owned(),
+        ));
+    }
+    if !matches!(
+        request.evidence,
+        RuntimeEvidence::GracefulStop
+            | RuntimeEvidence::AbnormalExit { .. }
+            | RuntimeEvidence::RecoveryFailed { .. }
+            | RuntimeEvidence::SupervisorHeartbeat
+    ) {
+        return Err(RuntimeSupervisionError::Invalid(
+            "draining only accepts terminal evidence for an exact baseline runtime".to_owned(),
+        ));
+    }
+    let maintenance_epoch = maintenance.epoch.ok_or_else(|| {
+        RuntimeSupervisionError::Invalid(
+            "draining maintenance pointer has no current epoch".to_owned(),
+        )
+    })?;
+    let runtime_epoch = request
+        .runtime_epoch
+        .ok_or(RuntimeSupervisionError::StaleEpoch)?;
+    let runtime_epoch = i64::try_from(runtime_epoch).map_err(|_| {
+        RuntimeSupervisionError::Invalid("runtime_epoch exceeds PostgreSQL BIGINT".to_owned())
+    })?;
+    let supervisor = supervisor_pubkey.to_bytes();
+    let is_baseline: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM project_view_maintenance_runtime_baselines \
+             WHERE community_id = $1 AND maintenance_epoch = $2 \
+               AND binding_id = $3 AND assignment_id = $4 \
+               AND runtime_id = $5 AND runtime_epoch = $6 \
+               AND supervisor_pubkey = $7 \
+         )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(maintenance_epoch)
+    .bind(binding_id)
+    .bind(request.assignment_id)
+    .bind(request.runtime_id)
+    .bind(runtime_epoch)
+    .bind(supervisor.as_slice())
+    .fetch_one(&mut **tx)
+    .await?;
+    if is_baseline {
+        Ok(())
+    } else {
+        Err(RuntimeSupervisionError::Invalid(
+            "runtime evidence does not name the current maintenance baseline".to_owned(),
+        ))
     }
 }
 

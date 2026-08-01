@@ -2222,10 +2222,12 @@ pub(crate) async fn write_project_view_entry(
              under_plan_id, planned_in_stage_id, about_object_id, \
              about_object_type, handles_object_id, handles_object_type, \
              created_at, updated_at, created_by, updated_by, source_event_id, \
-             projection_event_id, deleted_at, role_level, responsible_role_id) \
+             projection_event_id, deleted_at, role_level, responsible_role_id, \
+             source_type, source_change_id) \
          VALUES \
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-             $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+             $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, \
+             'nostr_event', $19) \
          ON CONFLICT (community_id, object_id) DO UPDATE SET \
              object_type = EXCLUDED.object_type, \
              schema_version = EXCLUDED.schema_version, \
@@ -2244,6 +2246,8 @@ pub(crate) async fn write_project_view_entry(
              created_by = EXCLUDED.created_by, \
              updated_by = EXCLUDED.updated_by, \
              source_event_id = EXCLUDED.source_event_id, \
+             source_type = EXCLUDED.source_type, \
+             source_change_id = EXCLUDED.source_change_id, \
              projection_event_id = EXCLUDED.projection_event_id, \
              deleted_at = EXCLUDED.deleted_at, \
              role_level = EXCLUDED.role_level, \
@@ -4354,9 +4358,10 @@ mod tests {
                 (community_id, object_id, object_type, schema_version, \
                  object_revision, project_revision, body, under_goal_id, \
                  created_at, updated_at, created_by, updated_by, \
-                 source_event_id, projection_event_id) \
+                 source_event_id, projection_event_id, source_type, source_change_id) \
              VALUES ($1, $2, 'plan', 1, 1, 2, $3, $4, \
-                     clock_timestamp(), clock_timestamp(), $5, $5, $6, $7)",
+                     clock_timestamp(), clock_timestamp(), $5, $5, $6, $7, \
+                     'nostr_event', $6)",
         )
         .bind(community_b.as_uuid())
         .bind(cross_community_plan)

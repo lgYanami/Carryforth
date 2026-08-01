@@ -21,6 +21,8 @@ pub(crate) const SUPPORTED_NIPS: &[u32] = &[1, 2, 10, 11, 16, 17, 23, 25, 29, 33
 pub(crate) const NIP_RELAY_MEMBERSHIP: u32 = 43;
 const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
 const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
+const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
+const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
@@ -253,15 +255,28 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
     );
-    if project_view_capability == Some(ProjectViewCapability::V2) {
+    if matches!(
+        project_view_capability,
+        Some(ProjectViewCapability::V2 | ProjectViewCapability::V3)
+    ) {
+        let replacement = match project_view_capability {
+            Some(ProjectViewCapability::V2) => PROJECT_VIEW_V2_EXTENSION,
+            Some(ProjectViewCapability::V3) => PROJECT_VIEW_V3_EXTENSION,
+            Some(ProjectViewCapability::V1) | None => unreachable!("matched v2/v3 above"),
+        };
         if let Some(extensions) = info.supported_extensions.as_mut() {
             for extension in extensions {
                 if extension == PROJECT_VIEW_EXTENSION {
-                    *extension = PROJECT_VIEW_V2_EXTENSION.to_owned();
+                    *extension = replacement.to_owned();
                 }
             }
         }
     }
+    append_extension(
+        &mut info,
+        PROJECT_CONTEXT_EXTENSION,
+        project_context_ready_for_host(state, raw_host).await,
+    );
     append_project_document_extension(
         &mut info,
         project_document_ready_for_host(state, raw_host).await,
@@ -290,13 +305,37 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
 }
 
 fn append_project_document_extension(info: &mut RelayInfo, ready: bool) {
+    append_extension(info, PROJECT_DOCUMENT_EXTENSION, ready);
+}
+
+fn append_extension(info: &mut RelayInfo, extension: &str, ready: bool) {
     if ready {
         let extensions = info.supported_extensions.get_or_insert_default();
-        if !extensions
-            .iter()
-            .any(|extension| extension == PROJECT_DOCUMENT_EXTENSION)
-        {
-            extensions.push(PROJECT_DOCUMENT_EXTENSION.to_owned());
+        if !extensions.iter().any(|candidate| candidate == extension) {
+            extensions.push(extension.to_owned());
+        }
+    }
+}
+
+async fn project_context_ready_for_host(state: &crate::state::AppState, raw_host: &str) -> bool {
+    if state.config.relay_private_key.is_none() {
+        return false;
+    }
+    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
+        return false;
+    };
+    match state
+        .db
+        .project_context_v1_advertised_ready(tenant.community(), &state.relay_keypair.public_key())
+        .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Project Context NIP-11 readiness failed closed: {error}"
+            );
+            false
         }
     }
 }
@@ -328,6 +367,7 @@ async fn project_document_ready_for_host(state: &crate::state::AppState, raw_hos
 enum ProjectViewCapability {
     V1,
     V2,
+    V3,
 }
 
 async fn project_view_ready_for_host(
@@ -352,7 +392,15 @@ async fn project_view_ready_for_host(
             return None;
         }
     };
-    let ready = if schema_version == 2 {
+    let ready = if schema_version == 3 {
+        state
+            .db
+            .project_view_v3_advertised_write_ready(
+                tenant.community(),
+                &state.relay_keypair.public_key(),
+            )
+            .await
+    } else if schema_version == 2 {
         state
             .db
             .project_view_v2_capability_ready(tenant.community(), &state.relay_keypair.public_key())
@@ -366,6 +414,7 @@ async fn project_view_ready_for_host(
         return None;
     };
     match ready {
+        Ok(true) if schema_version == 3 => Some(ProjectViewCapability::V3),
         Ok(true) if schema_version == 2 => Some(ProjectViewCapability::V2),
         Ok(true) => Some(ProjectViewCapability::V1),
         Ok(false) => None,

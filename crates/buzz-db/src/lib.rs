@@ -42,8 +42,16 @@ pub mod project_document;
 pub mod project_runtime;
 /// Project View canonical state and atomic mutation persistence.
 pub mod project_view;
+/// Durable Project View v3 maintenance and provisioning operations.
+pub mod project_view_maintenance;
 /// Project View v2 Role Proposal/Assignment transaction coordinator.
 pub mod project_view_v2;
+/// Project View v3 canonical transactions and readiness checks.
+pub mod project_view_v3;
+/// Reviewed Resource manifest staging and schema-v3 cutover transactions.
+pub mod project_view_v3_migration;
+/// Frozen Project View v3 repair and reprojection transactions.
+pub mod project_view_v3_recovery;
 /// Community-scoped push lease and durable wake-outbox persistence.
 pub mod push;
 /// Reaction persistence.
@@ -983,30 +991,62 @@ impl Db {
         owner_pubkey: &str,
         protected_deployment_host: &str,
     ) -> Result<Option<ArchivedCommunityRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let community_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT community.id FROM communities community \
+             JOIN relay_members member ON member.community_id = community.id \
+             WHERE lower(community.host) = lower($1) \
+               AND lower(member.pubkey) = lower($2) AND member.role = 'owner' \
+               AND lower(community.host) <> lower($3)",
+        )
+        .bind(normalized_host)
+        .bind(owner_pubkey)
+        .bind(protected_deployment_host)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(community_id) = community_id else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let community = CommunityId::from_uuid(community_id);
+        relay_members::acquire_membership_write_lock(&mut tx, community).await?;
         let row = sqlx::query(
             r#"UPDATE communities c
-               SET archived_at = COALESCE(c.archived_at, now())
+               SET archived_at = COALESCE(c.archived_at, now()),
+                   project_view_enabled = FALSE
                FROM relay_members rm
-               WHERE lower(c.host) = lower($1)
-                 AND rm.community_id = c.id
+               WHERE c.id = $1 AND rm.community_id = c.id
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
                  AND lower(c.host) <> lower($3)
                RETURNING c.id, c.host, c.archived_at"#,
         )
-        .bind(normalized_host)
+        .bind(community_id)
         .bind(owner_pubkey)
         .bind(protected_deployment_host)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        row.map(|row| {
-            Ok(ArchivedCommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
-                archived_at: row.try_get("archived_at")?,
-            })
-        })
-        .transpose()
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let actor = hex::decode(owner_pubkey)
+            .map_err(|error| DbError::InvalidData(format!("invalid owner pubkey: {error}")))?;
+        project_view_maintenance::record_security_invalidation_in_tx(
+            &mut tx,
+            community,
+            Some(&actor),
+            "archive_community",
+            Some(normalized_host.to_owned()),
+        )
+        .await?;
+        let record = ArchivedCommunityRecord {
+            id: CommunityId::from_uuid(row.try_get("id")?),
+            host: row.try_get("host")?,
+            archived_at: row.try_get("archived_at")?,
+        };
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
     /// Idempotently restores a community when the asserted pubkey is its current owner.
@@ -1015,27 +1055,56 @@ impl Db {
         normalized_host: &str,
         owner_pubkey: &str,
     ) -> Result<Option<UnarchivedCommunityRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let community_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT community.id FROM communities community \
+             JOIN relay_members member ON member.community_id = community.id \
+             WHERE lower(community.host) = lower($1) \
+               AND lower(member.pubkey) = lower($2) AND member.role = 'owner'",
+        )
+        .bind(normalized_host)
+        .bind(owner_pubkey)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(community_id) = community_id else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let community = CommunityId::from_uuid(community_id);
+        relay_members::acquire_membership_write_lock(&mut tx, community).await?;
         let row = sqlx::query(
             r#"UPDATE communities c
                SET archived_at = NULL
                FROM relay_members rm
-               WHERE lower(c.host) = lower($1)
-                 AND rm.community_id = c.id
+               WHERE c.id = $1 AND rm.community_id = c.id
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
                RETURNING c.id, c.host"#,
         )
-        .bind(normalized_host)
+        .bind(community_id)
         .bind(owner_pubkey)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        row.map(|row| {
-            Ok(UnarchivedCommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
-            })
-        })
-        .transpose()
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let actor = hex::decode(owner_pubkey)
+            .map_err(|error| DbError::InvalidData(format!("invalid owner pubkey: {error}")))?;
+        project_view_maintenance::record_security_invalidation_in_tx(
+            &mut tx,
+            community,
+            Some(&actor),
+            "unarchive_community",
+            Some(normalized_host.to_owned()),
+        )
+        .await?;
+        let record = UnarchivedCommunityRecord {
+            id: CommunityId::from_uuid(row.try_get("id")?),
+            host: row.try_get("host")?,
+        };
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
     /// Returns the community that owns a channel, if the channel exists.

@@ -1,5 +1,75 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-01 — 阶段 4 完成
+
+阶段目标：交付默认关闭的 Project View v3 backend 与可审计 cutover control plane，使
+Resource 的 legacy locator 能在后续阶段经 Human review迁移为“资产坐标 + Guide”，但本阶段不切换
+任何真实 Community。
+
+### 已交付
+
+- 新增 `buzz-project-view::v3` closed domain：locator-free Resource、canonical Context set、
+  sparse Document target proof、RoleDefinitionV3单 head、ordinary object与continuity-only Role
+  command、greenfield InitializeV3，以及 deterministic projection plan。Context capability默认关闭，
+  nonempty替换 fail closed。
+- 新增 v3 SDK command / object / entity / reset-or-incremental meta builder与 strict parser；所有 projection
+  绑定 stable Relay signer、Project、generation、revision、source、coordinate和canonical time，v1/v2/v3
+  wire互相 fail closed。
+- 新增 additive migration `0033_project_view_v3.sql` 与 desired schema：schema 3 / Context flag、Guide FK、
+  normalized Resource / Document Context indexes、immutable per-object provenance、review staging / committed
+  Resource ledger、cutover receipt、durable maintenance epoch / baseline / ack / operation / invalidation ledger、
+  greenfield provisioning receipt，以及 deferred cross-domain validators和append-only/monotonic triggers。
+- Relay接入 schema-v3 initialize、ordinary object和Role continuity handler；每次写入在 Community exclusive
+  lock内重验 Human或managed Agent权限。schema 3 对managed Agent强制 owner、active Assignment与exact
+  Runtime fence，不再沿用 v2 optional-supervision兼容分支。
+- readiness拆为 structural、pre-enable与advertised-write三层；NIP-11只对 enabled + normal + signer / pointer
+  完整的 host广告 `buzz-project-view-v3`。`project_context_enabled = false`时不广告
+  `buzz-project-context-v1`，raw nonempty Context command仍拒绝。
+- `buzz-admin project-view v3 resources export / validate` 实现受限本地 review bundle、closed canonical
+  manifest codec、detached reviewer signature、legacy Resource / Guide / membership / base pointer重新验证与
+  immutable staging。输出目录和文件在Unix上限制为 owner-only，并拒绝symlink与覆盖。
+- `buzz-admin project-view v3 cutover` 实现 replay-first exact receipt、frozen epoch preflight、一次 global
+  revision与generation推进、每个Resource object revision +1、reviewer归因、全部current/bounded-history v3
+  重投影、reset meta、deferred parity和事务回滚；commit后的Redis故障明确报告并保持 frozen。
+- maintenance提供 `begin / status / freeze / abort / verify / repair / reproject / resume`。begin固定
+  Assignment / Runtime / supervisor baseline；online-idle Assignment也必须durable quiesced ack，旧协议、
+  活跃lease、scheduler claim、新Runtime或security invalidation都会阻止freeze。
+- `repair`只接受三种canonical sorted action，并绑定postcard plan digest；一次plan只推进一个Project
+  revision和受影响object revision。`reproject`只推进generation。两者都要求exact epoch、stable signer、
+  Human operator、audit与idempotency receipt，成功后仍保持 frozen；只有后续structural verify与显式
+  resume可恢复服务。
+- runtime evidence、binding、scheduler claim与Project View writer共享同一 Community lock / maintenance
+  fence；ban / unban / timeout、archive / unarchive等security path写audit-backed pre/post-cutover
+  invalidation。generic schema-2/3 membership writer继续fail closed，不能绕过Role continuity + NIP-43
+  coordinator；ban owner或仍承载active Assignment的Human/Agent同样拒绝。
+- 新增idempotent `prepare-v3` 与owner-signed empty-state InitializeV3；未初始化Community不需要伪造一次
+  legacy cutover，且preparation / initialize失败不会留下半初始化状态。
+
+### 本阶段验证的安全与一致性边界
+
+- migration从旧schema additive升级、并发migrator、desired-schema drift与全部Rust schema分支inventory
+  通过；既有Community不自动切换schema或开启Context。
+- Resource manifest任一base、legacy body、Guide revision/head/content、mapping digest、reviewer或signature
+  变化都会fail closed；cutover重试只能返回exact receipt，不能重复推进revision。
+- active与inactive Role都只有一个RoleDefinitionV3 head；Role tombstone才使用ordinary object head。
+- normalized Context与JSON body在deferred validator中保持exact parity，Resource/Document删除受反向FK
+  保护；Context flag关闭时初始化和cutover集合均为空。
+- maintenance ack绑定完整Assignment / Runtime / supervisor coordinate和客户端协议版本；abort不复活旧
+  Runtime fence，committed cutover不可回滚，post-cutover invalidation必须由之后的verify/repair/reproject
+  显式resolve。
+- v2 regression、v3 domain/SDK/Relay/admin unit gates以及fresh/upgrade/concurrent migration gate通过；未执行
+  任何真实Community cutover。
+
+### 明确未进入阶段 4
+
+- 没有CLI/Tauri/Desktop v3 dual reader/writer、Resource Guide picker或`buzz resources guide`；
+- 没有ACP RoleBriefV3 resolver、maintenance watcher / full-lifecycle child reap或fleet probe；
+- 没有发布reviewed Guide、运行真实cutover、执行empty-state canary或扩大任何canary cohort；
+- `project_context_enabled`保持false，没有Context chips、Role Context或Document正文注入。
+
+阶段 4 exit后，阶段 5可以部署dual clients与ACP maintenance-aware runtime，并只对声明过的有界canary
+执行reviewed Guide + cutover流程。
+
 ## 2026-08-01 — 阶段 3 完成
 
 阶段目标：让 Human 在 Desktop 中不依赖 CLI 即可维护、审阅和回看可靠的 Markdown

@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -991,6 +991,21 @@ mod tests {
         assert!(project_document.contains("project_document_revisions_append_only"));
         assert!(project_document.contains("project_document_reject_hard_delete"));
         assert!(project_document.contains("project_document_validate_community"));
+
+        // Project View v3 lands additively and keeps every capability off.
+        assert_eq!(migrations[32].version, 33);
+        let project_view_v3 = migrations[32].sql.as_str();
+        assert!(project_view_v3.contains("ADD COLUMN project_context_enabled"));
+        assert!(project_view_v3.contains("DEFAULT FALSE"));
+        assert!(project_view_v3.contains("CREATE TABLE project_view_object_provenance"));
+        assert!(project_view_v3.contains("CREATE TABLE project_view_resource_context_references"));
+        assert!(project_view_v3.contains("CREATE TABLE project_view_document_context_references"));
+        assert!(project_view_v3.contains("CREATE TABLE project_view_v3_resource_mappings"));
+        assert!(project_view_v3.contains("CREATE TABLE project_view_maintenance_epochs"));
+        assert!(project_view_v3.contains("CREATE TABLE project_view_provisioning_operations"));
+        assert!(project_view_v3
+            .contains("CREATE OR REPLACE FUNCTION project_role_continuity_validate_community"));
+        assert!(project_view_v3.contains("project_view_v3_validate_community"));
     }
 
     #[test]
@@ -1334,8 +1349,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0032");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
+            .expect("upgrade scratch database through 0033");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1471,8 +1486,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0032");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
+            .expect("upgrade scratch database through 0033");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -1549,7 +1564,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(32));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(33));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32) AND success",
@@ -1637,7 +1652,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
     }
 
     #[tokio::test]

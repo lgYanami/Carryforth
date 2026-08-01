@@ -107,6 +107,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/project-runtime/status",
             get(api::project_runtime::assignment_status),
         )
+        .route(
+            "/api/project-runtime/maintenance",
+            get(api::project_runtime::maintenance_status),
+        )
+        .route(
+            "/api/project-runtime/maintenance/ack",
+            post(api::project_runtime::acknowledge_maintenance),
+        )
         // Relay invites: mint (owner/admin) + claim (membership-gate exempt)
         .route("/api/invites", post(api::invites::mint_invite))
         .route("/api/join-policy", get(api::invites::join_policy))
