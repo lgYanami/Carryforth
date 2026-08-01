@@ -1020,6 +1020,7 @@ dependencies = [
  "buzz-core",
  "buzz-media",
  "buzz-persona",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "bytes",

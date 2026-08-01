@@ -35,6 +35,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_PROJECT_DOCUMENT_META,
   KIND_PROJECT_VIEW_META,
   KIND_REPO_ANNOUNCEMENT,
   KIND_REPO_STATE,
@@ -58,6 +59,13 @@ import type {
   RawProjectViewRoleMutationResult,
 } from "@/shared/api/tauriProjectView";
 import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRoleHistory";
+import type {
+  ProjectDocument,
+  ProjectDocumentHistory,
+  ProjectDocumentListItem,
+  ProjectDocumentMeta,
+  ProjectDocumentMutationResult,
+} from "@/shared/api/tauriProjectDocument";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -136,6 +144,13 @@ type MockSearchProfileSeed = {
   about?: string | null;
   ownerPubkey?: string | null;
   isAgent?: boolean;
+};
+
+export type MockProjectDocumentState = {
+  meta: ProjectDocumentMeta;
+  documents: ProjectDocumentListItem[];
+  /** Oldest-to-newest verified full snapshots, keyed by Document UUID. */
+  revisions: Record<string, ProjectDocument[]>;
 };
 
 type E2eConfig = {
@@ -305,6 +320,14 @@ type E2eConfig = {
     projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
     projectViewAfterRoleMutation?: RawProjectViewLoadResult;
     projectViewRoleHistoryPages?: RawProjectRoleHistoryPage[];
+    /** Verified Project Document catalog and immutable revision fixtures. */
+    projectDocument?: MockProjectDocumentState;
+    /** Community-isolated Document fixtures keyed by applied Relay URL. */
+    projectDocumentsByRelayUrl?: Record<string, MockProjectDocumentState>;
+    projectDocumentReadDelayMs?: number;
+    projectDocumentReadError?: string;
+    projectDocumentMutationError?: string;
+    projectDocumentMutationResults?: ProjectDocumentMutationResult[];
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1195,6 +1218,21 @@ declare global {
       kind?: number;
     }) => RelayEvent;
     __BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?: () => boolean;
+    /** Names and payloads of all five Project Document native calls. */
+    __BUZZ_E2E_PROJECT_DOCUMENT_CALLS__?: Array<{
+      command: string;
+      payload: unknown;
+      relayUrl: string;
+    }>;
+    __BUZZ_E2E_SET_PROJECT_DOCUMENT_STATE__?: (
+      state: MockProjectDocumentState,
+      relayUrl?: string,
+    ) => void;
+    /** Emit an untrusted projection hint; UI must re-read through native. */
+    __BUZZ_E2E_EMIT_PROJECT_DOCUMENT_EVENT__?: (input?: {
+      kind?: number;
+    }) => RelayEvent;
+    __BUZZ_E2E_HAS_PROJECT_DOCUMENT_SUBSCRIPTION__?: () => boolean;
   }
 }
 
@@ -9020,6 +9058,193 @@ function disconnectMockSocket(id: number) {
   sendWsClose(socket.handler);
 }
 
+let mockProjectDocumentSequence = 1;
+
+function projectDocumentState(
+  config: E2eConfig | undefined,
+): MockProjectDocumentState | undefined {
+  return (
+    config?.mock?.projectDocumentsByRelayUrl?.[mockAppliedRelayUrl] ??
+    config?.mock?.projectDocument
+  );
+}
+
+function projectDocumentIdentityFor(
+  state: MockProjectDocumentState,
+  communityKey: string,
+) {
+  return {
+    communityKey,
+    projectId: state.meta.projectId,
+    relayPubkey: state.meta.relayPubkey,
+    projectionGeneration: state.meta.projectionGeneration,
+  };
+}
+
+function requireProjectDocumentState(
+  config: E2eConfig | undefined,
+): MockProjectDocumentState {
+  const state = projectDocumentState(config);
+  if (!state) {
+    throw {
+      code: "unsupported",
+      message: "This Community does not advertise Project Documents.",
+      retryable: false,
+    };
+  }
+  return state;
+}
+
+function recordProjectDocumentCall(command: string, payload: unknown) {
+  window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__?.push({
+    command,
+    payload: structuredClone(payload),
+    relayUrl: mockAppliedRelayUrl,
+  });
+}
+
+function nextProjectDocumentEventId(): string {
+  const value = mockProjectDocumentSequence;
+  mockProjectDocumentSequence += 1;
+  return value.toString(16).padStart(64, "0");
+}
+
+function applyMockProjectDocumentMutation(
+  config: E2eConfig | undefined,
+  payload: unknown,
+): ProjectDocumentMutationResult {
+  const state = requireProjectDocumentState(config);
+  const input = ((payload as { input?: unknown }).input ?? payload) as {
+    communityKey: string;
+    mutation: {
+      type: "create" | "update" | "delete";
+      documentId?: string;
+      expectedDocumentRevision?: number;
+      title?: string;
+      summary?: string;
+      contentMarkdown?: string;
+    };
+  };
+  const mutation = input.mutation;
+  const sequence = config?.mock?.projectDocumentMutationResults;
+  const forced = sequence && sequence.length > 0 ? sequence.shift() : undefined;
+  const requestedId = mutation.documentId;
+  const forcedId = forced?.documentId;
+  const documentId =
+    requestedId ??
+    forcedId ??
+    `00000000-0000-4000-8000-${mockProjectDocumentSequence
+      .toString()
+      .padStart(12, "0")}`;
+  const revisions = state.revisions[documentId] ?? [];
+  const current = revisions.at(-1);
+  const expectedRevision = mutation.expectedDocumentRevision ?? 0;
+  if (forced?.status === "conflict") {
+    return {
+      ...structuredClone(forced),
+      communityKey: input.communityKey,
+    };
+  }
+  if (
+    (mutation.type === "create" && current) ||
+    (mutation.type !== "create" &&
+      (!current || current.documentRevision !== expectedRevision))
+  ) {
+    return {
+      status: "conflict",
+      communityKey: input.communityKey,
+      documentId,
+      expectedDocumentRevision: expectedRevision,
+      currentDocumentRevision: current?.documentRevision,
+    };
+  }
+
+  const actor =
+    getActiveIdentity(config)?.pubkey ?? getMockMemberPubkey(config);
+  const eventId =
+    forced?.status === "applied"
+      ? forced.eventId
+      : nextProjectDocumentEventId();
+  const documentRevision = expectedRevision + 1;
+  const now = new Date(
+    Date.parse("2026-07-30T08:00:00Z") + mockProjectDocumentSequence * 1_000,
+  ).toISOString();
+  const identity = projectDocumentIdentityFor(state, input.communityKey);
+  const next: ProjectDocument =
+    mutation.type === "delete"
+      ? {
+          ...identity,
+          documentId,
+          documentRevision,
+          state: "deleted",
+          createdAt: current?.createdAt ?? now,
+          createdBy: current?.createdBy ?? actor,
+          revisionAt: now,
+          revisionBy: actor,
+          revisionEventId: nextProjectDocumentEventId(),
+          headEventId: nextProjectDocumentEventId(),
+          sourceEventId: eventId,
+        }
+      : {
+          ...identity,
+          documentId,
+          documentRevision,
+          state: "active",
+          title: mutation.title ?? "Untitled",
+          summary: mutation.summary,
+          contentMarkdown: mutation.contentMarkdown ?? "",
+          createdAt: current?.createdAt ?? now,
+          createdBy: current?.createdBy ?? actor,
+          revisionAt: now,
+          revisionBy: actor,
+          revisionEventId: nextProjectDocumentEventId(),
+          headEventId: nextProjectDocumentEventId(),
+          sourceEventId: eventId,
+        };
+  state.revisions[documentId] = [...revisions, next];
+  const priorIndex = state.documents.findIndex(
+    (document) => document.documentId === documentId,
+  );
+  if (mutation.type === "delete") {
+    if (priorIndex >= 0) state.documents.splice(priorIndex, 1);
+  } else {
+    const item: ProjectDocumentListItem = {
+      documentId,
+      title: next.title ?? "Untitled",
+      summary: next.summary,
+      documentRevision,
+      updatedAt: now,
+      updatedBy: actor,
+      headEventId: next.headEventId ?? nextProjectDocumentEventId(),
+    };
+    if (priorIndex >= 0) state.documents[priorIndex] = item;
+    else state.documents.push(item);
+    state.documents.sort((left, right) =>
+      left.documentId.localeCompare(right.documentId),
+    );
+  }
+  state.meta = {
+    ...state.meta,
+    communityKey: input.communityKey,
+    catalogRevision: state.meta.catalogRevision + 1,
+    activeDocumentCount: state.documents.length,
+    updatedAt: now,
+    metaEventId: nextProjectDocumentEventId(),
+  };
+  return forced?.status === "applied"
+    ? { ...structuredClone(forced), communityKey: input.communityKey }
+    : {
+        status: "applied",
+        communityKey: input.communityKey,
+        documentId,
+        documentRevision,
+        catalogRevision: state.meta.catalogRevision,
+        eventId,
+        confirmation: "receipt_and_readback",
+        state: next.state,
+      };
+}
+
 export function maybeInstallE2eTauriMocks() {
   if (installed) {
     return;
@@ -9167,6 +9392,8 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__ = [];
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__ = [];
+  window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ = [];
+  mockProjectDocumentSequence = 1;
   window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
     if (!config.mock) {
       throw new Error("Mock Project View is unavailable in relay mode.");
@@ -9198,6 +9425,34 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__ = () =>
     hasMockLiveSubscription(GLOBAL_MOCK_SUBSCRIPTION, KIND_PROJECT_VIEW_META);
+  window.__BUZZ_E2E_SET_PROJECT_DOCUMENT_STATE__ = (state, relayUrl) => {
+    if (!config.mock) {
+      throw new Error("Mock Project Documents are unavailable in relay mode.");
+    }
+    const targetRelayUrl = relayUrl ?? mockAppliedRelayUrl;
+    if (config.mock.projectDocumentsByRelayUrl && targetRelayUrl) {
+      config.mock.projectDocumentsByRelayUrl[targetRelayUrl] =
+        structuredClone(state);
+    } else {
+      config.mock.projectDocument = structuredClone(state);
+    }
+  };
+  window.__BUZZ_E2E_EMIT_PROJECT_DOCUMENT_EVENT__ = (input) => {
+    const state = projectDocumentState(config);
+    const event = createMockEvent(
+      input?.kind ?? KIND_PROJECT_DOCUMENT_META,
+      "untrusted-live-body-must-not-render",
+      [],
+      state?.meta.relayPubkey ?? "b".repeat(64),
+    );
+    emitMockGlobalEvent(event);
+    return event;
+  };
+  window.__BUZZ_E2E_HAS_PROJECT_DOCUMENT_SUBSCRIPTION__ = () =>
+    hasMockLiveSubscription(
+      GLOBAL_MOCK_SUBSCRIPTION,
+      KIND_PROJECT_DOCUMENT_META,
+    );
   window.__BUZZ_E2E_DEFER_GET_EVENT__ = null;
   deferredGetEventQueue = [];
   window.__BUZZ_E2E_RELEASE_GET_EVENT__ = () => {
@@ -11011,6 +11266,106 @@ export function maybeInstallE2eTauriMocks() {
           );
         }
         return activeConfig?.mock?.relaySelf ?? null;
+      case "get_project_document_meta": {
+        recordProjectDocumentCall(command, payload);
+        if ((activeConfig?.mock?.projectDocumentReadDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectDocumentReadDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectDocumentReadError) {
+          throw new Error(activeConfig.mock.projectDocumentReadError);
+        }
+        const state = requireProjectDocumentState(activeConfig);
+        const communityKey =
+          (payload as { communityKey?: string }).communityKey ??
+          state.meta.communityKey;
+        return {
+          ...structuredClone(state.meta),
+          ...projectDocumentIdentityFor(state, communityKey),
+        };
+      }
+      case "list_project_documents": {
+        recordProjectDocumentCall(command, payload);
+        if (activeConfig?.mock?.projectDocumentReadError) {
+          throw new Error(activeConfig.mock.projectDocumentReadError);
+        }
+        const state = requireProjectDocumentState(activeConfig);
+        const input = ((payload as { input?: unknown }).input ?? payload) as {
+          communityKey: string;
+        };
+        return {
+          ...projectDocumentIdentityFor(state, input.communityKey),
+          catalogRevision: state.meta.catalogRevision,
+          documents: structuredClone(state.documents),
+        };
+      }
+      case "get_project_document": {
+        recordProjectDocumentCall(command, payload);
+        if (activeConfig?.mock?.projectDocumentReadError) {
+          throw new Error(activeConfig.mock.projectDocumentReadError);
+        }
+        const state = requireProjectDocumentState(activeConfig);
+        const input = ((payload as { input?: unknown }).input ?? payload) as {
+          communityKey: string;
+          documentId: string;
+          revision?: number;
+        };
+        const revisions = state.revisions[input.documentId] ?? [];
+        const document = input.revision
+          ? revisions.find(
+              (candidate) => candidate.documentRevision === input.revision,
+            )
+          : revisions.at(-1);
+        if (!document) throw new Error("Document revision was not found.");
+        return {
+          ...structuredClone(document),
+          ...projectDocumentIdentityFor(state, input.communityKey),
+          headEventId: input.revision ? undefined : document.headEventId,
+        };
+      }
+      case "get_project_document_history": {
+        recordProjectDocumentCall(command, payload);
+        if (activeConfig?.mock?.projectDocumentReadError) {
+          throw new Error(activeConfig.mock.projectDocumentReadError);
+        }
+        const state = requireProjectDocumentState(activeConfig);
+        const input = ((payload as { input?: unknown }).input ?? payload) as {
+          communityKey: string;
+          documentId: string;
+          maxDocumentRevision: number;
+        };
+        const revisions = state.revisions[input.documentId] ?? [];
+        const result: ProjectDocumentHistory = {
+          ...projectDocumentIdentityFor(state, input.communityKey),
+          documentId: input.documentId,
+          maxDocumentRevision: input.maxDocumentRevision,
+          revisions: revisions
+            .filter(
+              (revision) =>
+                revision.documentRevision <= input.maxDocumentRevision,
+            )
+            .reverse()
+            .map((revision) => ({
+              documentRevision: revision.documentRevision,
+              state: revision.state,
+              actor: revision.revisionBy,
+              canonicalAt: revision.revisionAt,
+              revisionEventId: revision.revisionEventId,
+            })),
+        };
+        return result;
+      }
+      case "mutate_project_document": {
+        recordProjectDocumentCall(command, payload);
+        if (activeConfig?.mock?.projectDocumentMutationError) {
+          throw new Error(activeConfig.mock.projectDocumentMutationError);
+        }
+        return applyMockProjectDocumentMutation(activeConfig, payload);
+      }
       case "get_project_view":
         if ((activeConfig?.mock?.projectViewReadDelayMs ?? 0) > 0) {
           await new Promise((resolve) =>

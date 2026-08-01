@@ -125,6 +125,7 @@ export function AppShell() {
   const {
     goAgents,
     goChannel,
+    goDocuments,
     goHome,
     goNewMessage,
     goProjects,
@@ -873,6 +874,7 @@ export function AppShell() {
                             await goChannel(directMessage.id);
                           }}
                           onSelectAgents={() => void goAgents()}
+                          onSelectDocuments={() => void goDocuments()}
                           onSelectChannel={(channelId) =>
                             void goChannel(channelId)
                           }

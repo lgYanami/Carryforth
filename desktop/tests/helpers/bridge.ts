@@ -5,6 +5,8 @@ import type {
   RawProjectViewMutationResult,
   RawProjectViewRoleMutationResult,
 } from "../../src/shared/api/tauriProjectView";
+import type { ProjectDocumentMutationResult } from "../../src/shared/api/tauriProjectDocument";
+import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -153,6 +155,12 @@ type MockBridgeOptions = {
   projectViewRoleMutationResult?: RawProjectViewRoleMutationResult;
   projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
   projectViewAfterRoleMutation?: RawProjectViewLoadResult;
+  projectDocument?: MockProjectDocumentState;
+  projectDocumentsByRelayUrl?: Record<string, MockProjectDocumentState>;
+  projectDocumentReadDelayMs?: number;
+  projectDocumentReadError?: string;
+  projectDocumentMutationError?: string;
+  projectDocumentMutationResults?: ProjectDocumentMutationResult[];
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
   /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */

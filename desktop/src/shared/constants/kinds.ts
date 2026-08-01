@@ -61,6 +61,11 @@ export const KIND_EVENT_REMINDER = 30300;
 // verifies a complete revision-consistent snapshot before anything is shown.
 export const KIND_PROJECT_VIEW_OBJECT = 40903;
 export const KIND_PROJECT_VIEW_META = 40904;
+// Relay-authored Project Document projections. The browser treats these only
+// as invalidation hints and always re-enters the verified native boundary.
+export const KIND_PROJECT_DOCUMENT_HEAD = 40905;
+export const KIND_PROJECT_DOCUMENT_REVISION = 40906;
+export const KIND_PROJECT_DOCUMENT_META = 40907;
 export const KIND_REPO_ANNOUNCEMENT = 30617;
 export const KIND_REPO_STATE = 30618;
 export const KIND_GIT_PATCH = 1617;

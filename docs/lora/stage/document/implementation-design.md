@@ -4990,6 +4990,13 @@ Documents         │
 
 目标：Human 不依赖 CLI 也能维护可靠 Markdown revision。
 
+> 交付状态（2026-08-01）：已完成。Desktop 已提供五个 native verified command、metadata-first
+> React Query cache、Documents list / reader / editor / history、safe Markdown、current/pinned
+> 隔离、conflict draft preserve、live hint invalidation与 Community switch隔离；native success同时
+> 验证 receipt和 exact immutable revision read-back。Desktop contract tests、6条 Playwright E2E与
+> hash互异截图已覆盖本阶段 exit criteria，具体记录见 [`changelog.md`](changelog.md)。Project View
+> v3 Resource / Context backend与 cutover tooling仍属于阶段 4，未在本阶段提前实现。
+
 开发内容：
 
 - Tauri verified read / mutate commands；

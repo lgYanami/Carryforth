@@ -54,6 +54,7 @@ pub(crate) enum ProjectViewSchema {
 pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
     pub(crate) schema: ProjectViewSchema,
+    pub(crate) project_document_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +273,10 @@ pub(crate) async fn read_identity_at(
     Ok(Some(ProjectViewIdentity {
         relay_pubkey,
         schema,
+        project_document_supported: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == "buzz-project-document-v1"),
     }))
 }
 

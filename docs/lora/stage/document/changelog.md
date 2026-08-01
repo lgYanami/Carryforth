@@ -1,5 +1,67 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-01 — 阶段 3 完成
+
+阶段目标：让 Human 在 Desktop 中不依赖 CLI 即可维护、审阅和回看可靠的 Markdown
+Document revision，同时把 Relay signer、signed pointer、Community switch 与 ambiguous write
+边界留在 native verified API 内。
+
+### 已交付
+
+- Tauri 注册并实现 `get_project_document_meta`、`list_project_documents`、
+  `get_project_document`、`get_project_document_history` 与 `mutate_project_document` 五个命令。
+  每次调用在首个 await 前捕获 opaque Community key、Relay endpoint和 signer key，再从捕获的
+  endpoint验证 NIP-11 identity与 `buzz-project-document-v1`；切换 Community不能把进行中的读取或
+  写入重定向到新 Relay。
+- native读取只接受 expected Relay signer的 strict meta / head / revision projection，并验证 signed
+  Project ID、projection generation、catalog pin、Document coordinate、current head pointer、完整
+  history与 current/pinned边界。TypeScript只收到 verified read model，不解析 raw Nostr event。
+- native写入使用 closed create / update / delete full snapshot、per-Document expected revision与同一
+  exact signed event retry。成功结果同时验证 stable receipt和 immutable revision read-back，并把
+  receipt的 actor、canonical time、catalog revision与 signed revision绑定；无法确定是否送达时只返回
+  body-free `delivery_unknown` coordinate，不把 ambiguous结果误报为拒绝。
+- 新增 body-free structured native errors和 typed HTTP transport category；Relay response body、
+  Document正文、title与summary不会进入跨层错误对象。
+- React Query实现 meta、catalog metadata、current、immutable pinned revision和history的权威分层
+  cache key。页面先取得 verified meta再拉 metadata list；只有用户选中文档或revision时才读取正文。
+  pinned cache不被普通 live/write invalidation破坏，signer/generation/Community变化会自然切换 authority
+  key；没有新增 Community-scoped module singleton。
+- Desktop新增 Documents route与侧栏入口，以及 metadata list、safe Markdown viewer、create/update
+  editor、delete确认、body-free history和current/pinned revision切换。编辑器持续提示“Documents are
+  not a Secret Store”，提交完整 snapshot并展示 exact line diff。
+- 409 conflict保留 base snapshot和完整本地 draft，展示 latest与本地差异；只有用户显式选择
+  “Edit on latest”后才以新 base再次提交，不自动 rebase或静默覆盖。
+- live subscription只把 Relay-signed head/meta到达当作 native refetch hint，不把 event body注入 UI；
+  close-race取消已调度 invalidation。Community remount后旧响应、旧列表、旧正文与未提交 draft都不会
+  出现在新 Community。
+- 新增 Desktop contract unit tests和 Playwright E2E，覆盖 metadata-first、safe Markdown、
+  current/pinned隔离、完整 CRUD/tombstone、Secret warning、conflict draft preserve/diff、live raw body
+  隔离、Community switch与 tampered signer/pointer fail closed；E2E产出 reader、editor warning和
+  conflict diff三张 hash互异截图。
+
+### 本阶段验证的安全与一致性边界
+
+- local Community key只用于客户端隔离；signed Project ID与expected Relay pubkey才是协议 authority，
+  两者不会互相替代。
+- catalog与history读取固定 signer/generation/snapshot；比已验证 meta更新的 head/revision触发显式
+  snapshot conflict，不拼接竞态快照。
+- current读取必须解析 head精确指向的 revision；wrong signer、wrong pointer、cross-Document或
+  cross-generation结果全部 fail closed。
+- Markdown按不可信项目内容安全渲染；raw HTML不会变成可执行 DOM，list/history/live路径不携正文。
+- receipt不是单独的成功依据；只有 exact command source对应的 immutable signed revision完成回读后
+  才报告 applied。
+
+### 明确未进入阶段 3
+
+- 没有 Project View v3 Resource / Context backend、migration或 legacy Resource cutover tooling；
+- 没有 Resource Guide picker、Context chips、Role Brief正文或 Agent prompt正文注入；
+- 没有改变阶段 2 的 managed Agent owner、active Assignment与 Runtime fence写入授权；
+- 没有 Secret Store、scrub / hard delete、全文搜索、semantic search、CRDT、external sync或 Mobile /
+  Web Documents UI。
+
+阶段 3 exit后，阶段 4可以继续实现 flag-off Project View v3 backend与 cutover tooling；阶段 5仍同时
+依赖阶段 3和阶段 4完成。
+
 ## 2026-07-31 — 阶段 2 完成
 
 阶段目标：在阶段 1 flag-off canonical kernel 上完成 Human / managed Agent 可用的 Relay 与

@@ -1,6 +1,7 @@
 import {
   Activity,
   Bot,
+  FileText,
   FolderGit2,
   Inbox,
   Map as MapIcon,
@@ -22,6 +23,7 @@ import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
 type SidebarSelectedView =
   | "home"
   | "channel"
+  | "documents"
   | "messages"
   | "agents"
   | "workflows"
@@ -46,6 +48,7 @@ type AppSidebarPinnedHeaderProps = {
 type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
+  onSelectDocuments: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
@@ -92,6 +95,7 @@ export function AppSidebarPinnedHeader({
 export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
+  onSelectDocuments,
   onSelectHome,
   onSelectProjects,
   onSelectPulse,
@@ -150,6 +154,20 @@ export function AppSidebarPrimaryMenu({
             >
               <MapIcon className="h-4 w-4" />
               <SidebarMenuLabel>View</SidebarMenuLabel>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </FeatureGate>
+        <FeatureGate feature="projectView">
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              data-testid="open-documents"
+              isActive={selectedView === "documents"}
+              onClick={onSelectDocuments}
+              tooltip="Documents"
+              type="button"
+            >
+              <FileText className="h-4 w-4" />
+              <SidebarMenuLabel>Documents</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </FeatureGate>
