@@ -216,8 +216,8 @@ Human 与 Agent 共同使用的共享文字会议室。
 - 启动 reconciliation 会检查完整的 `39000/39001/39002` 发现投影集合，进程若在
   提交后通知期间停止，重启扫描仍可恢复会议发现和名单读取。
 
-迁移使用 `0026_meeting_v0_lifecycle.sql`。`0025` 已由并行开发的 Project View 使用，
-两项工作因此不会复用同一个已发布迁移版本。
+合并 Project View 后，迁移使用 `0032_meeting_v0_lifecycle.sql`。`0025`–`0031`
+由 Project View 与角色连续性占用，两项工作因此不会复用迁移版本。
 
 自动化验证：
 
@@ -278,7 +278,7 @@ buzz meetings show --meeting <UUID>
   `crates/buzz-test-client/fixtures/meeting_v0_floor_v1.json`，覆盖
   `normal`、`lost`、`expired` 和乱序/缺口/重复事件下的 `reconnect`。
 
-迁移使用 `0027_meeting_v0_floor.sql`，新增轮次、Claim 和持久 outbox 表，并给
+迁移使用 `0033_meeting_v0_floor.sql`，新增轮次、Claim 和持久 outbox 表，并给
 `meeting_sessions` 增加当前轮次、Floor revision 和策略版本投影。
 
 自动化验证：
@@ -337,7 +337,7 @@ Grant 主动过期后，另一身份在下一轮获权并通过 `meetings say` �
   再次拒绝 shell、文件替换和 todo 写操作。正式发言只能经过专用 Meeting sender，
   Relay 仍以当前 round、holder、Grant 和单次消费作最终授权；
 - Ready/Pass、speech 和 Yield 一旦被接受就立即推进，不会固定等待完整 5 分钟；
-- 迁移使用 `0028_meeting_v0_agent_floor.sql`，共享协议夹具同步登记 kind `42104`。
+- 迁移使用 `0034_meeting_v0_agent_floor.sql`，共享协议夹具同步登记 kind `42104`。
 
 自动化验证：
 

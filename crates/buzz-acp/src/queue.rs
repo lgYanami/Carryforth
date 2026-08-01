@@ -1356,12 +1356,18 @@ pub struct FormatPromptArgs<'a> {
     pub channel_info: Option<&'a PromptChannelInfo>,
     pub conversation_context: Option<&'a ConversationContext>,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
-    /// When true, base_prompt and system_prompt are delivered via the system
-    /// role (session/new) and omitted from the user message. When false
-    /// (legacy agents), they are injected as `[Base]` and `[System]` sections.
+    /// When true, stable context is delivered via the system role
+    /// (`session/new`) and omitted from the user message. When false (legacy
+    /// agents), it is injected as labeled compatibility sections.
     pub has_system_prompt_support: bool,
     /// Base prompt content for legacy agents (protocol_version < 2).
     pub base_prompt: Option<&'a str>,
+    /// Platform-owned Project Space contract for legacy agents.
+    ///
+    /// Production dispatch always supplies the stable constant. Keeping it as
+    /// an explicit argument makes this legacy boundary visible and testable
+    /// instead of coupling queue formatting to session configuration.
+    pub project_space_contract: Option<&'a str>,
     /// System prompt content for legacy agents (protocol_version < 2).
     pub system_prompt: Option<&'a str>,
     /// Team instructions for legacy agents, rendered after `[System]`.
@@ -1388,11 +1394,14 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 ///
 /// Produces a stable prompt with these sections (in order):
 /// 0. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
-/// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
-/// 2. `[Agent Memory — core]` — if agent core memory is set
-/// 3. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 1. `[Project Space]` — stable contract (legacy agents)
+/// 2. `[System]` — system prompt (legacy agents)
+/// 3. `[Team Instructions]` — team instructions (legacy agents)
+/// 4. `[Agent Memory — core]` — if agent core memory is set
+/// 5. `[Channel Canvas]` — if channel canvas metadata is set
+/// 6. `[Context]` — scope, channel name, and contextual hints for the agent
+/// 7. `[Thread Context]` or `[Conversation Context]` — if fetched
+/// 8. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1422,7 +1431,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         .map(|ci| ci.channel_type == "dm")
         .unwrap_or(false);
 
-    let mut sections: Vec<String> = Vec::with_capacity(7);
+    let mut sections: Vec<String> = Vec::with_capacity(9);
 
     // For legacy agents (protocol_version < 2), inject base_prompt and
     // system_prompt as user-message sections. Modern agents receive these
@@ -1430,6 +1439,9 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     if !args.has_system_prompt_support {
         if let Some(bp) = args.base_prompt {
             sections.push(base_section(bp));
+        }
+        if let Some(contract) = args.project_space_contract {
+            sections.push(contract.to_string());
         }
         if let Some(sp) = args.system_prompt {
             sections.push(format!("[System]\n{sp}"));
@@ -2365,13 +2377,17 @@ mod tests {
         };
 
         let core = "[Agent Memory — core]\nremember this";
+        let canvas = "[Channel Canvas]\ncanvas metadata";
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
                 has_system_prompt_support: false,
                 base_prompt: Some("test base prompt"),
+                project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
                 system_prompt: Some("test system prompt"),
+                team_instructions: Some("test team instructions"),
                 agent_core: Some(core),
+                agent_canvas: Some(canvas),
                 ..Default::default()
             },
         )
@@ -2386,21 +2402,43 @@ mod tests {
             prompt.contains("[System]\ntest system prompt"),
             "missing [System] section"
         );
+        assert!(
+            prompt.contains(crate::project_space::PROJECT_SPACE_SECTION),
+            "missing [Project Space] section"
+        );
 
-        // [Base] and [System] must appear BEFORE [Agent Memory] and [Context]
+        // Stable ownership order must precede memory and turn context.
         let base_pos = prompt.find("[Base]").unwrap();
+        let project_space_pos = prompt.find("[Project Space]").unwrap();
         let system_pos = prompt.find("[System]").unwrap();
+        let team_pos = prompt.find("[Team Instructions]").unwrap();
         let core_pos = prompt.find("[Agent Memory").unwrap();
+        let canvas_pos = prompt.find("[Channel Canvas]").unwrap();
         let context_pos = prompt.find("[Context]").unwrap();
 
-        assert!(base_pos < system_pos, "[Base] should come before [System]");
         assert!(
-            system_pos < core_pos,
-            "[System] should come before [Agent Memory]"
+            base_pos < project_space_pos,
+            "[Base] should come before [Project Space]"
         );
         assert!(
-            core_pos < context_pos,
-            "[Agent Memory] should come before [Context]"
+            project_space_pos < system_pos,
+            "[Project Space] should come before [System]"
+        );
+        assert!(
+            system_pos < team_pos,
+            "[System] should come before [Team Instructions]"
+        );
+        assert!(
+            team_pos < core_pos,
+            "[Team Instructions] should come before [Agent Memory]"
+        );
+        assert!(
+            core_pos < canvas_pos,
+            "[Agent Memory] should come before [Channel Canvas]"
+        );
+        assert!(
+            canvas_pos < context_pos,
+            "[Channel Canvas] should come before [Context]"
         );
     }
 
@@ -2425,6 +2463,7 @@ mod tests {
             &FormatPromptArgs {
                 has_system_prompt_support: true,
                 base_prompt: Some("test base prompt"),
+                project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
                 system_prompt: Some("test system prompt"),
                 ..Default::default()
             },
@@ -2439,6 +2478,10 @@ mod tests {
         assert!(
             !prompt.contains("[System]"),
             "[System] should be suppressed for modern agents"
+        );
+        assert!(
+            !prompt.contains("[Project Space]"),
+            "[Project Space] should be suppressed from modern user context"
         );
         assert!(prompt.starts_with("[Context]"));
     }

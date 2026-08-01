@@ -76,6 +76,26 @@ export function saveCommunityDestination(
   );
 }
 
+/**
+ * Converts a visible shell route into a resumable Community work position.
+ *
+ * Overview, full Project View, settings, and other temporary surfaces must not
+ * replace the last Inbox/channel position. Returning `null` tells callers to
+ * preserve the destination already stored for this Community.
+ */
+export function communityDestinationFromRoute(
+  selectedView: string,
+  selectedChannelId: string | null,
+): CommunityDestination | null {
+  if (selectedView === "channel" && selectedChannelId) {
+    return { kind: "channel", channelId: selectedChannelId };
+  }
+  if (selectedView === "home") {
+    return { kind: "home" };
+  }
+  return null;
+}
+
 export function removeCommunityDestination(
   communityId: string,
   storage: Storage = localStorage,

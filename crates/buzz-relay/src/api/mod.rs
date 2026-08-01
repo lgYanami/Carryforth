@@ -9,6 +9,7 @@ pub mod media;
 pub mod mesh_demo;
 pub mod nip05;
 pub mod operator;
+pub mod project_runtime;
 
 // Re-export imeta helpers used by ingest pipeline.
 pub use crate::handlers::imeta::{validate_imeta_tags, verify_imeta_blobs};
@@ -69,12 +70,25 @@ pub mod relay_members {
         }
 
         let pubkey_hex = hex::encode(pubkey_bytes);
-        let is_member = state
+        let identity = state
             .db
-            .is_relay_member(community, &pubkey_hex)
+            .relay_membership_identity(community, pubkey_bytes)
             .await
-            .map_err(|e| format!("relay membership check failed: {e}"))?;
-        if is_member {
+            .map_err(|e| format!("relay membership identity check failed: {e}"))?;
+
+        // A persisted managed-Agent identity never becomes independent merely
+        // because an Assignment materialized a direct relay_members row. Its
+        // verified owner must still be an eligible Community Member.
+        if let Some(owner_bytes) = identity.managed_owner_pubkey {
+            if !identity.managed_owner_eligible {
+                return Ok(MembershipDecision::Denied);
+            }
+            let owner_pubkey = nostr::PublicKey::from_slice(&owner_bytes)
+                .map_err(|e| format!("stored managed Agent owner is invalid: {e}"))?;
+            return Ok(MembershipDecision::ViaOwner(owner_pubkey));
+        }
+
+        if identity.direct_member {
             return Ok(MembershipDecision::Member);
         }
 
@@ -86,12 +100,18 @@ pub mod relay_members {
                 match buzz_sdk::nip_oa::verify_auth_tag(tag_json, &agent_pubkey) {
                     Ok(owner_pubkey) => {
                         let owner_hex = owner_pubkey.to_hex();
-                        let owner_is_member = state
+                        let eligible = state
                             .db
-                            .is_relay_member(community, &owner_hex)
+                            .delegated_agent_owner_is_eligible(
+                                community,
+                                pubkey_bytes,
+                                owner_pubkey.as_bytes(),
+                            )
                             .await
-                            .map_err(|e| format!("relay membership check (owner) failed: {e}"))?;
-                        if owner_is_member {
+                            .map_err(|e| {
+                                format!("delegated Agent owner eligibility check failed: {e}")
+                            })?;
+                        if eligible {
                             debug!(
                                 agent = %pubkey_hex,
                                 owner = %owner_hex,

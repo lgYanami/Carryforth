@@ -346,6 +346,9 @@ git:
 
 # ── Migrations ───────────────────────────────────────────────────────────────
 # Relay runs sqlx migrations at startup via BUZZ_AUTO_MIGRATE=true.
+# For the first Project View rollout, override this to false, roll every Pod,
+# run the packaged `buzz-admin migrate`, then enable the centralized
+# per-Community database flag. See docs/project-view-operations.md.
 migrate:
   autoMigrate: true
   preUpgradeJob:

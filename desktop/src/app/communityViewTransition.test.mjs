@@ -4,6 +4,7 @@ import test, { afterEach, mock } from "node:test";
 import {
   completeCommunityViewTransition,
   replaceCommunityDestinationRoute,
+  replaceCommunityOverviewRoute,
   runCommunityViewTransition,
 } from "./communityViewTransition.ts";
 
@@ -31,6 +32,14 @@ test("replaceCommunityDestinationRoute uses router history and encodes the chann
     replace: (href) => replacements.push(href),
   });
   assert.deepEqual(replacements, ["/channels/channel%2Fwith%20spaces"]);
+});
+
+test("replaceCommunityOverviewRoute opens the active Project Space overview", () => {
+  const replacements = [];
+  replaceCommunityOverviewRoute({
+    replace: (href) => replacements.push(href),
+  });
+  assert.deepEqual(replacements, ["/community"]);
 });
 
 test("unsupported browsers execute the update and contain rejection", async () => {

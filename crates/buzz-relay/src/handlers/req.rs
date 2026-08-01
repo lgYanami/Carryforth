@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
-    is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC,
-    KIND_DM_VISIBILITY, KIND_PERSONA, P_GATED_KINDS, RESULT_GATED_KINDS,
+    has_indexed_d_tag, is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM,
+    KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_PERSONA, P_GATED_KINDS, RESULT_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -108,7 +108,7 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
-    let (conn_id, pubkey_bytes, token_channel_ids) = {
+    let (conn_id, pubkey_bytes, token_channel_ids, auth_scopes) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => {
@@ -132,7 +132,12 @@ pub async fn handle_req(
                     return;
                 }
 
-                (conn.conn_id, pk_bytes, ctx.channel_ids.clone())
+                (
+                    conn.conn_id,
+                    pk_bytes,
+                    ctx.channel_ids.clone(),
+                    ctx.scopes.clone(),
+                )
             }
             _ => {
                 conn.send(RelayMessage::notice(
@@ -146,6 +151,48 @@ pub async fn handle_req(
             }
         }
     };
+
+    let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(super::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match
+        && super::project_view::credential_can_read(&auth_scopes, token_channel_ids.as_deref())
+    {
+        match state
+            .db
+            .project_view_authorized_pubkey(conn.tenant.community(), &pubkey_bytes)
+            .await
+        {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                warn!(conn_id = %conn_id, "Project View read authorization failed: {error}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "restricted: Project View requires current Community membership and a global read credential",
+        ));
+        return;
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(super::project_view::filter_is_project_view_search)
+    {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_view:search",
+        ));
+        return;
+    }
 
     let mut accessible_channels = if filters_are_nip43_membership_only(&filters) {
         metrics::counter!("buzz_req_global_access_resolution_skips_total", "kind" => "13534")
@@ -314,6 +361,7 @@ pub async fn handle_req(
             &conn,
             &state,
             trace_state.as_ref(),
+            project_view_read_allowed,
         )
         .await;
         return;
@@ -382,6 +430,13 @@ pub async fn handle_req(
             // personas from starving older shared ones off the page.
             if filter_can_match_persona_shared_kinds(filter) {
                 params.persona_reader = Some(pubkey_bytes.clone());
+            }
+            if !project_view_read_allowed && super::project_view::filter_can_match(filter) {
+                params.excluded_kinds = Some(vec![
+                    buzz_core::kind::KIND_PROJECT_VIEW_MUTATION as i32,
+                    buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+                    buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+                ]);
             }
             (idx, per_filter_channel, params)
         })
@@ -473,6 +528,11 @@ pub async fn handle_req(
             // shared-gate (kind:30175 without ["shared","true"]). Single call
             // covers all three gated event classes.
             if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
+                continue;
+            }
+            if !project_view_read_allowed
+                && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
+            {
                 continue;
             }
 
@@ -599,6 +659,7 @@ async fn handle_search_req(
     conn: &ConnectionState,
     state: &AppState,
     trace_state: Option<&crate::conformance::AbstractState>,
+    project_view_read_allowed: bool,
 ) {
     // The community-wide channel scope (no #h tag on the filter). `None` means
     // "no accessible channels and no global access" → EOSE, exactly as the
@@ -792,6 +853,13 @@ async fn handle_search_req(
                     if !event_visible_to_reader(&stored.event, reader_pubkey_bytes) {
                         continue;
                     }
+                    if !project_view_read_allowed
+                        && buzz_core::kind::is_project_view_protocol_kind(
+                            stored.event.kind.as_u16() as u32,
+                        )
+                    {
+                        continue;
+                    }
                     // Dedup AFTER acceptance — an event that fails filter A's constraints
                     // must remain eligible for filter B (NIP-01 OR semantics).
                     if !seen_ids.insert(stored.event.id) {
@@ -852,20 +920,12 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
 /// an exact count without post-filtering.
 ///
 /// Pushed constraints: kinds, authors (single or multi), ids, since, until,
-/// channel_id (#h single), #p (single), #d (single, NIP-33-only kinds), #e (any),
+/// channel_id (#h single), #p (single), #d (single or multi, indexed-d kinds), #e (any),
 /// channel_ids (injected by caller).
 ///
-/// Anything else (multi-#p, #t, #a, search, multi-#h, #d on non-NIP-33)
+/// Anything else (multi-#p, #t, #a, search, multi-#h, #d on non-indexed kinds)
 /// requires post-filtering and cannot use the fast COUNT path.
 pub fn filter_fully_pushable(filter: &Filter) -> bool {
-    // Check if filter exclusively targets NIP-33 kinds (needed for #d pushability).
-    let is_nip33_only = filter.kinds.as_ref().is_some_and(|ks| {
-        !ks.is_empty()
-            && ks
-                .iter()
-                .all(|k| buzz_core::kind::is_parameterized_replaceable(k.as_u16() as u32))
-    });
-
     for (tag_key, tag_values) in filter.generic_tags.iter() {
         let key = tag_key.to_string();
         match key.as_str() {
@@ -882,9 +942,10 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
                 }
             }
             "d" => {
-                // #d is pushed (single or multi) ONLY for NIP-33-only kind filters.
+                // #d is pushed only when every explicitly requested kind
+                // materializes its d tag.
                 // Otherwise it's silently ignored by SQL → overcount.
-                if !tag_values.is_empty() && !is_nip33_only {
+                if !tag_values.is_empty() && !filter_targets_only_indexed_d_tag_kinds(filter) {
                     return false;
                 }
             }
@@ -904,6 +965,21 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
         return false;
     }
     true
+}
+
+/// Return whether a filter explicitly and exclusively targets kinds whose
+/// `d` tags are materialized by the event store.
+///
+/// A kindless or mixed filter must not push `#d` into SQL: rows for ordinary
+/// kinds retain `d_tag = NULL` even when their raw tags contain `d`, so doing
+/// so would change NIP-01 filter semantics.
+fn filter_targets_only_indexed_d_tag_kinds(filter: &Filter) -> bool {
+    filter.kinds.as_ref().is_some_and(|kinds| {
+        !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|kind| has_indexed_d_tag(kind.as_u16() as u32))
+    })
 }
 
 /// Return whether every filter exclusively targets the globally stored NIP-43
@@ -1020,22 +1096,16 @@ fn filter_to_query_params(
         }
     });
 
-    // Push single-value #d tag into SQL via the d_tag column (NIP-33).
-    // Critical for parameterized replaceable lookups (authors + kinds + #d)
-    // where many events from the same author would push the target past LIMIT.
+    // Push #d into SQL via the materialized d_tag column. This is critical for
+    // addressable-event and Project View projection point reads where newer
+    // rows would otherwise push the target past LIMIT before post-filtering.
     //
-    // Only push when the filter exclusively targets NIP-33 kinds (30000–39999),
-    // because `d_tag` is only populated for those kinds. Non-NIP-33 events have
-    // `d_tag = NULL`, so pushing `AND d_tag = $N` for a mixed-kind or kindless
-    // filter would silently exclude non-NIP-33 rows that match via their tags.
-    let filter_is_nip33_only = kinds.as_ref().is_some_and(|ks| {
-        !ks.is_empty()
-            && ks
-                .iter()
-                .all(|&k| buzz_core::kind::is_parameterized_replaceable(k as u32))
-    });
+    // Only push when every explicitly requested kind is classified by
+    // `has_indexed_d_tag`. Other events have `d_tag = NULL`, so pushing for a
+    // mixed-kind or kindless filter would silently exclude raw-tag matches.
+    let filter_has_only_indexed_d_tag_kinds = filter_targets_only_indexed_d_tag_kinds(filter);
     let d_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::D);
-    let (d_tag, d_tags) = if filter_is_nip33_only {
+    let (d_tag, d_tags) = if filter_has_only_indexed_d_tag_kinds {
         let values = filter.generic_tags.get(&d_tag_key);
         match values.map(|v| v.len()) {
             Some(1) => (
@@ -1723,61 +1793,104 @@ mod tests {
     }
 
     #[test]
-    fn d_tag_pushdown_only_for_nip33_kinds() {
+    fn d_tag_pushdown_supports_nip33_and_project_view_projection_kinds() {
         let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
 
-        // NIP-33 kind with #d → pushdown active
         let nip33_filter = Filter::new()
             .kind(nostr::Kind::Custom(30023))
             .custom_tags(d_tag, ["my-slug"]);
-        let q = filter_to_query_params(
-            &nip33_filter,
-            None,
-            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
-        );
+        let q = filter_to_query_params(&nip33_filter, None, community);
         assert_eq!(q.d_tag, Some("my-slug".to_string()));
+        assert!(q.d_tags.is_none());
+        assert!(filter_fully_pushable(&nip33_filter));
 
-        // Non-NIP-33 kind with #d → pushdown NOT active (would miss rows with d_tag=NULL)
-        let non_nip33_filter = Filter::new()
-            .kind(nostr::Kind::Custom(1))
-            .custom_tags(d_tag, ["some-value"]);
-        let q2 = filter_to_query_params(
-            &non_nip33_filter,
-            None,
-            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        let object_filter = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as u16,
+            ))
+            .custom_tags(d_tag, ["project-view:community:issue:object"]);
+        let object_query = filter_to_query_params(&object_filter, None, community);
+        assert_eq!(
+            object_query.d_tag.as_deref(),
+            Some("project-view:community:issue:object")
         );
-        assert_eq!(q2.d_tag, None);
+        assert!(object_query.d_tags.is_none());
+        assert!(filter_fully_pushable(&object_filter));
 
-        // Mixed kinds (one NIP-33, one not) → pushdown NOT active
-        let mixed_filter = Filter::new()
-            .kinds([nostr::Kind::Custom(30023), nostr::Kind::Custom(1)])
-            .custom_tags(d_tag, ["slug"]);
-        let q3 = filter_to_query_params(
-            &mixed_filter,
-            None,
-            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        let meta_filter = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_PROJECT_VIEW_META as u16,
+            ))
+            .custom_tags(d_tag, ["project-view:community:meta"]);
+        let meta_query = filter_to_query_params(&meta_filter, None, community);
+        assert_eq!(
+            meta_query.d_tag.as_deref(),
+            Some("project-view:community:meta")
         );
-        assert_eq!(q3.d_tag, None);
+        assert!(meta_query.d_tags.is_none());
+        assert!(filter_fully_pushable(&meta_filter));
+    }
 
-        // No kinds specified → pushdown NOT active
-        let no_kinds_filter = Filter::new().custom_tags(d_tag, ["slug"]);
-        let q4 = filter_to_query_params(
-            &no_kinds_filter,
-            None,
-            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
-        );
-        assert_eq!(q4.d_tag, None);
+    #[test]
+    fn d_tag_pushdown_handles_multiple_indexed_kinds_and_values() {
+        let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        let filter = Filter::new()
+            .kinds([
+                nostr::Kind::Custom(buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as u16),
+                nostr::Kind::Custom(buzz_core::kind::KIND_PROJECT_VIEW_META as u16),
+            ])
+            .custom_tags(
+                d_tag,
+                [
+                    "project-view:community:meta",
+                    "project-view:community:issue:object",
+                ],
+            );
 
-        // Multi-value #d → pushdown NOT active (can't push OR into single column match)
-        let multi_d_filter = Filter::new()
-            .kind(nostr::Kind::Custom(30023))
-            .custom_tags(d_tag, ["slug-a", "slug-b"]);
-        let q5 = filter_to_query_params(
-            &multi_d_filter,
-            None,
-            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        let query = filter_to_query_params(&filter, None, community);
+        assert!(query.d_tag.is_none());
+        let mut values = query.d_tags.expect("multi-value #d must be pushed");
+        values.sort();
+        assert_eq!(
+            values,
+            vec![
+                "project-view:community:issue:object".to_owned(),
+                "project-view:community:meta".to_owned(),
+            ]
         );
-        assert_eq!(q5.d_tag, None);
+        assert!(filter_fully_pushable(&filter));
+    }
+
+    #[test]
+    fn d_tag_pushdown_rejects_nonindexed_mixed_kindless_and_mutation_filters() {
+        let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        let filters = [
+            Filter::new()
+                .kind(nostr::Kind::Custom(1))
+                .custom_tags(d_tag, ["some-value"]),
+            Filter::new()
+                .kinds([
+                    nostr::Kind::Custom(buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as u16),
+                    nostr::Kind::Custom(1),
+                ])
+                .custom_tags(d_tag, ["coordinate"]),
+            Filter::new().custom_tags(d_tag, ["coordinate"]),
+            Filter::new()
+                .kind(nostr::Kind::Custom(
+                    buzz_core::kind::KIND_PROJECT_VIEW_MUTATION as u16,
+                ))
+                .custom_tags(d_tag, ["must-not-be-indexed"]),
+        ];
+
+        for filter in filters {
+            let query = filter_to_query_params(&filter, None, community);
+            assert!(query.d_tag.is_none());
+            assert!(query.d_tags.is_none());
+            assert!(!filter_fully_pushable(&filter));
+        }
     }
 
     #[test]

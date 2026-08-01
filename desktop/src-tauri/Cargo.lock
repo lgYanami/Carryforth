@@ -1020,6 +1020,7 @@ dependencies = [
  "buzz-core",
  "buzz-media",
  "buzz-persona",
+ "buzz-project-view",
  "buzz-sdk",
  "bytes",
  "bzip2 0.6.1",
@@ -1129,10 +1130,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-view"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-project-view",
+ "chrono",
+ "hex",
  "nostr",
  "serde",
  "serde_json",

@@ -99,6 +99,7 @@ export default defineConfig({
         "**/send-channel-binding.spec.ts",
         "**/project-commit-detail.spec.ts",
         "**/project-pr-review.spec.ts",
+        "**/project-view.spec.ts",
         "**/persona-model-combobox-screenshots.spec.ts",
         "**/drafts-screenshots.spec.ts",
         "**/buzz-theme-screenshots.spec.ts",

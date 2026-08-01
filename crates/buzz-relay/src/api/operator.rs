@@ -16,6 +16,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use buzz_core::{CommunityId, TenantContext};
+use buzz_project_view::v2::RuntimeRecoveryPolicy;
 
 use crate::handlers::community_provisioning::{
     normalize_candidate_host, validate_pubkey_hex, ProvisionCommunityRequest,
@@ -57,7 +58,7 @@ const OPERATOR_REPLAY_SCOPE: &str = "operator-management";
 /// Shared deployment-global operator auth prelude. The canonical management
 /// origin and replay namespace are configuration, never tenant registry state
 /// or an inbound proxy `Host` header.
-async fn authorize_operator_request(
+pub(crate) async fn authorize_operator_request(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     method: &str,
@@ -99,6 +100,154 @@ async fn authorize_operator_request(
     }
 
     Ok(pubkey)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRuntimeSupervisorRequest {
+    host: String,
+    assignment_id: Uuid,
+    supervisor_pubkey: String,
+    #[serde(default)]
+    policy: RuntimeRecoveryPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeRuntimeSupervisorRequest {
+    host: String,
+    assignment_id: Uuid,
+}
+
+/// Bind a trusted managed-runtime supervisor to one exact Assignment.
+pub async fn register_runtime_supervisor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const PATH: &str = "/operator/project-runtime/bindings";
+    let operator =
+        authorize_operator_request(&state, &headers, "POST", PATH, None, Some(&body)).await?;
+    let request: RegisterRuntimeSupervisorRequest =
+        serde_json::from_slice(&body).map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid runtime supervisor binding JSON: {error}"),
+            )
+        })?;
+    let normalized_host = normalize_candidate_host(&request.host)
+        .map_err(|message| api_error(StatusCode::BAD_REQUEST, &message))?;
+    let community = state
+        .db
+        .lookup_community_by_host(&normalized_host)
+        .await
+        .map_err(|error| internal_error(&format!("lookup runtime community: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "community not found"))?;
+    let supervisor_hex = validate_pubkey_hex(&request.supervisor_pubkey).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid supervisor_pubkey: expected 64-char hex pubkey",
+        )
+    })?;
+    let supervisor = nostr::PublicKey::from_hex(&supervisor_hex).map_err(|error| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid supervisor_pubkey: {error}"),
+        )
+    })?;
+    let binding = state
+        .db
+        .register_runtime_supervisor(
+            community.id,
+            request.assignment_id,
+            supervisor,
+            operator,
+            request.policy,
+        )
+        .await
+        .map_err(map_runtime_supervision_error)?;
+    metrics::counter!(
+        "buzz_project_runtime_bindings_total",
+        "operation" => "register"
+    )
+    .increment(1);
+    Ok(Json(serde_json::json!({
+        "community_id": binding.community_id.to_string(),
+        "host": community.host,
+        "binding_id": binding.binding_id,
+        "assignment_id": binding.assignment_id,
+        "supervisor_pubkey": binding.supervisor_pubkey,
+        "policy": binding.policy,
+        "registered_at": binding.registered_at,
+    })))
+}
+
+/// Revoke an Assignment-scoped runtime supervisor and every current epoch.
+pub async fn revoke_runtime_supervisor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const PATH: &str = "/operator/project-runtime/bindings/revoke";
+    let operator =
+        authorize_operator_request(&state, &headers, "POST", PATH, None, Some(&body)).await?;
+    let request: RevokeRuntimeSupervisorRequest =
+        serde_json::from_slice(&body).map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid runtime supervisor revocation JSON: {error}"),
+            )
+        })?;
+    let normalized_host = normalize_candidate_host(&request.host)
+        .map_err(|message| api_error(StatusCode::BAD_REQUEST, &message))?;
+    let community = state
+        .db
+        .lookup_community_by_host_for_management(&normalized_host)
+        .await
+        .map_err(|error| internal_error(&format!("lookup runtime community: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "community not found"))?;
+    let revoked = state
+        .db
+        .revoke_runtime_supervisor(community.id, request.assignment_id, operator)
+        .await
+        .map_err(map_runtime_supervision_error)?;
+    if revoked {
+        metrics::counter!(
+            "buzz_project_runtime_bindings_total",
+            "operation" => "revoke"
+        )
+        .increment(1);
+    }
+    Ok(Json(serde_json::json!({
+        "community_id": community.id.to_string(),
+        "host": community.host,
+        "assignment_id": request.assignment_id,
+        "revoked": revoked,
+    })))
+}
+
+fn map_runtime_supervision_error(
+    error: buzz_db::project_runtime::RuntimeSupervisionError,
+) -> (StatusCode, Json<Value>) {
+    use buzz_db::project_runtime::RuntimeSupervisionError;
+
+    let message = error.to_string();
+    match error {
+        RuntimeSupervisionError::Invalid(message) => api_error(StatusCode::BAD_REQUEST, &message),
+        RuntimeSupervisionError::NotRegistered => api_error(
+            StatusCode::NOT_FOUND,
+            "runtime supervisor binding not found",
+        ),
+        RuntimeSupervisionError::AssignmentEnded
+        | RuntimeSupervisionError::StaleEpoch
+        | RuntimeSupervisionError::BindingConflict
+        | RuntimeSupervisionError::CommandFence => api_error(StatusCode::CONFLICT, &message),
+        RuntimeSupervisionError::Database(_)
+        | RuntimeSupervisionError::Sqlx(_)
+        | RuntimeSupervisionError::Audit(_) => {
+            internal_error(&format!("runtime supervisor operation: {message}"))
+        }
+    }
 }
 
 async fn check_operator_replay(
@@ -424,6 +573,12 @@ pub async fn transfer_community(
             return Err(api_error(
                 StatusCode::CONFLICT,
                 "limit_reached: transferee already owns the maximum number of communities",
+            ));
+        }
+        buzz_db::relay_members::TransferResult::ManagedAgentIneligible => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "forbidden:managed_agent:owner_ineligible",
             ));
         }
     };

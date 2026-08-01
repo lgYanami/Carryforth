@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use buzz_core_pkg::agent_process_env::{MANAGED_AGENT_OWNER_ENV, MANAGED_AGENT_START_NONCE_ENV};
 use tauri::AppHandle;
 
 use super::agent_env::build_buzz_agent_provider_defaults;
@@ -19,6 +20,9 @@ pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::compose_path_entries;
 pub(crate) use path::should_skip_claude_executable;
 pub(crate) use path::should_use_inherited;
+
+mod metadata;
+pub(crate) use metadata::{resolve_effective_prompt_model_provider, runtime_metadata_env_vars};
 
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
@@ -168,7 +172,7 @@ pub(crate) fn current_instance_id(app: &AppHandle) -> String {
 /// against when scanning processes. Kept here so the spawn stamp and the sweep
 /// matcher can never drift apart.
 fn buzz_marker_entry(instance_id: &str) -> Vec<u8> {
-    format!("BUZZ_MANAGED_AGENT={instance_id}").into_bytes()
+    format!("{MANAGED_AGENT_OWNER_ENV}={instance_id}").into_bytes()
 }
 
 /// Check if a running process is one of *our* managed agents: it must carry
@@ -891,7 +895,7 @@ fn buffer_contains_identifier(buf: &[u8], id: &[u8]) -> bool {
 /// Returns `None` if the process doesn't have the marker or can't be read.
 #[cfg(target_os = "macos")]
 fn extract_buzz_marker_value(pid: u32) -> Option<String> {
-    let prefix = b"BUZZ_MANAGED_AGENT=";
+    let prefix = format!("{MANAGED_AGENT_OWNER_ENV}=").into_bytes();
     let buf = sweep::procargs2_buffer(pid)?;
 
     if buf.len() < std::mem::size_of::<libc::c_int>() {
@@ -927,7 +931,7 @@ fn extract_buzz_marker_value(pid: u32) -> Option<String> {
     }
     // Search environment entries for our marker.
     for entry in buf[pos..].split(|&b| b == 0) {
-        if entry.starts_with(prefix) {
+        if entry.starts_with(&prefix) {
             return String::from_utf8(entry[prefix.len()..].to_vec()).ok();
         }
     }
@@ -936,10 +940,10 @@ fn extract_buzz_marker_value(pid: u32) -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn extract_buzz_marker_value(pid: u32) -> Option<String> {
-    let prefix = b"BUZZ_MANAGED_AGENT=";
+    let prefix = format!("{MANAGED_AGENT_OWNER_ENV}=").into_bytes();
     let data = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
     for entry in data.split(|&b| b == 0) {
-        if entry.starts_with(prefix) {
+        if entry.starts_with(&prefix) {
             return String::from_utf8(entry[prefix.len()..].to_vec()).ok();
         }
     }
@@ -1120,8 +1124,8 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
         let Some(agent_instance_id) = extract_buzz_marker_value(upid) else {
             continue;
         };
-        // Skip agents belonging to our own instance (handled by sweep_system_agent_processes).
-        if agent_instance_id == our_instance_id {
+        let ancestry = sweep::tracked_ancestry_macos(upid, info.pbi_ppid, skip_pids);
+        if !sweep::should_collect_foreign_agent(&agent_instance_id, our_instance_id, ancestry) {
             continue;
         }
         foreign_agents
@@ -1180,7 +1184,8 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
         let Some(agent_instance_id) = extract_buzz_marker_value(upid) else {
             continue;
         };
-        if agent_instance_id == our_instance_id {
+        let ancestry = sweep::tracked_ancestry_linux(upid, skip_pids);
+        if !sweep::should_collect_foreign_agent(&agent_instance_id, our_instance_id, ancestry) {
             continue;
         }
         foreign_agents
@@ -1454,10 +1459,14 @@ pub fn build_managed_agent_summary(
     // stamped at spawn.  This catches out-of-band adapter changes (manual
     // npm install/downgrade) that Phase-1 auto-restart doesn't cover.  The
     // cache is read-only here — no subprocess is spawned.
+    let workspace_relay_url = {
+        use tauri::Manager;
+        crate::relay::relay_ws_url_with_override(&app.state::<crate::app_state::AppState>())
+    };
     let needs_restart = pair_key
         .as_ref()
-        .and_then(|key| runtimes.get(key).map(|runtime| (key, runtime)))
-        .is_some_and(|(key, runtime)| {
+        .and_then(|key| runtimes.get(key))
+        .is_some_and(|runtime| {
             let global_for_hash =
                 crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
             let teams_for_hash = crate::managed_agents::load_teams(app).unwrap_or_default();
@@ -1466,7 +1475,7 @@ pub fn build_managed_agent_summary(
                     record,
                     personas,
                     &teams_for_hash,
-                    &key.relay_url,
+                    &workspace_relay_url,
                     &global_for_hash,
                 );
             let availability_drift = super::availability_drift(
@@ -1618,6 +1627,15 @@ pub(crate) fn configure_runtime_cli(
     }
 }
 
+pub(crate) fn managed_agent_relay_target(
+    pubkey: impl Into<String>,
+    configured_relay_url: &str,
+) -> Result<(ManagedAgentRuntimeKey, &str), String> {
+    let connection_relay_url = configured_relay_url.trim();
+    let runtime_key = ManagedAgentRuntimeKey::new(pubkey, connection_relay_url)?;
+    Ok((runtime_key, connection_relay_url))
+}
+
 /// Spawn an agent process without holding any locks on records or runtimes.
 /// Returns the child process and log path on success. The caller is responsible
 /// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
@@ -1627,14 +1645,15 @@ pub(crate) fn configure_runtime_cli(
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
-    relay_url: &str,
+    connection_relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
-    let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
+    let (runtime_key, connection_relay_url) =
+        managed_agent_relay_target(record.pubkey.clone(), connection_relay_url)?;
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
         &log_path,
@@ -1685,9 +1704,11 @@ pub fn spawn_agent_child(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| effective_command.clone());
 
-    // The caller supplies the explicit canonical pair relay. This is the only
-    // relay this child may connect to, regardless of the record/workspace default.
-    let effective_relay_url = runtime_key.relay_url.clone();
+    // Keep the configured authority for every real network operation. The
+    // canonical URL in `runtime_key` exists only for process identity and
+    // deduplication; replacing `localhost` with `127.0.0.1` here would select a
+    // different host-scoped community on the relay.
+    let effective_relay_url = connection_relay_url.to_string();
 
     // Augment PATH for DMG launches so child processes can find:
     //   - bundled CLI via ~/.local/bin symlink
@@ -1719,6 +1740,45 @@ pub fn spawn_agent_child(
     command.env("RUST_LOG", child_rust_log_filter());
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
+    // Runtime supervision is opt-in through an operator-provisioned identity
+    // on the Desktop process. The secret is passed only to the trusted ACP
+    // harness, which consumes and removes it before spawning the model-facing
+    // Agent. Pair-scoped state lets a replacement harness reconcile an
+    // interrupted predecessor without reusing or guessing its epoch.
+    command
+        .env_remove("BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY")
+        .env_remove("BUZZ_RUNTIME_SUPERVISION_STATE_PATH")
+        .env_remove("BUZZ_RUNTIME_FENCE_PATH")
+        .env_remove("BUZZ_RUNTIME_ID")
+        .env_remove("BUZZ_RUNTIME_EPOCH");
+    match std::env::var("BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY") {
+        Ok(supervisor_key) => {
+            let supervisor_key = zeroize::Zeroizing::new(supervisor_key);
+            let supervisor_keys = nostr::Keys::parse(supervisor_key.trim())
+                .map_err(|error| format!("invalid Runtime supervisor private key: {error}"))?;
+            let member_pubkey = nostr::PublicKey::parse(&record.pubkey)
+                .map_err(|error| format!("invalid managed Agent public key: {error}"))?;
+            if supervisor_keys.public_key() == member_pubkey {
+                return Err(
+                    "Runtime supervisor identity must differ from the managed Agent identity"
+                        .to_owned(),
+                );
+            }
+            let state_path = super::managed_agents_base_dir(app)?
+                .join("runtime-supervision")
+                .join(format!("{}.json", runtime_key.runtime_id()));
+            command
+                .env(
+                    "BUZZ_RUNTIME_SUPERVISOR_PRIVATE_KEY",
+                    supervisor_key.as_str(),
+                )
+                .env("BUZZ_RUNTIME_SUPERVISION_STATE_PATH", state_path);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("Runtime supervisor private key contains invalid UTF-8".to_owned());
+        }
+    }
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
@@ -1979,10 +2039,9 @@ pub fn spawn_agent_child(
     // PERSONA < per-agent.
     //
     // These writes go LAST so user-provided values win over every Buzz-set env
-    // above — EXCEPT reserved keys (BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY,
-    // BUZZ_AUTH_TAG, BUZZ_API_TOKEN, BUZZ_ACP_PRIVATE_KEY, BUZZ_ACP_API_TOKEN),
-    // which `merged_user_env` strips. Those carry Buzz's identity and must
-    // never be GUI-overridable.
+    // above — EXCEPT reserved identity, authorization, Runtime-supervision and
+    // code-execution keys, which `merged_user_env` strips. Those define Buzz's
+    // trusted process boundary and must never be GUI-overridable.
     // global < live persona < agent (last-wins on collision at each layer).
     let persona_over_global = super::env_vars::merged_user_env(
         &global.env_vars,
@@ -2008,8 +2067,8 @@ pub fn spawn_agent_child(
     // Stamp desktop ownership and an unpredictable harness-generation identity.
     let start_nonce = uuid::Uuid::new_v4().simple().to_string();
     command
-        .env("BUZZ_MANAGED_AGENT", current_instance_id(app))
-        .env("BUZZ_MANAGED_AGENT_START_NONCE", &start_nonce);
+        .env(MANAGED_AGENT_OWNER_ENV, current_instance_id(app))
+        .env(MANAGED_AGENT_START_NONCE_ENV, &start_nonce);
 
     // Spawn the harness in its own process group so we can kill the entire
     // tree (harness + MCP servers + agent subprocesses) on shutdown.
@@ -2127,7 +2186,7 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
+    let mut process = spawn_agent_child(app, record, &relay_url, false, owner_hex)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),
@@ -2150,62 +2209,6 @@ pub fn start_managed_agent_process(
 
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
     Ok(())
-}
-
-/// Returns the (key, value) env var pairs that should be forwarded to the
-/// agent process for model and provider selection.
-///
-/// Model injection is unconditional — even agents that support ACP model
-/// switching need the initial bootstrap value. Provider injection is skipped
-/// when `provider_locked` is true (e.g. Claude runtimes that only work with
-/// Anthropic).
-pub(crate) fn runtime_metadata_env_vars<'a>(
-    model_env_var: Option<&'a str>,
-    provider_env_var: Option<&'a str>,
-    provider_locked: bool,
-    effective_model: Option<&'a str>,
-    effective_provider: Option<&'a str>,
-) -> Vec<(&'a str, &'a str)> {
-    let mut vars = Vec::new();
-    if let (Some(env_key), Some(model)) = (model_env_var, effective_model) {
-        vars.push((env_key, model));
-    }
-    if !provider_locked {
-        if let (Some(env_key), Some(provider)) = (provider_env_var, effective_provider) {
-            vars.push((env_key, provider));
-        }
-    }
-    vars
-}
-
-/// Resolve the effective (prompt, model, provider) triple for a persona-linked agent.
-///
-/// Given a persona_id, finds the persona in the list and returns its system_prompt,
-/// model, and provider as the authoritative values. When the persona leaves `model`
-/// or `provider` blank (None or whitespace-only), falls back to the record's own
-/// field using the same precedence rule as `persona_snapshot_with_agent_config_fallback`
-/// so the display surface matches spawn behavior. Falls back to the record's own
-/// prompt/model/provider when no persona is linked or found.
-///
-/// Used by `agent_config.rs` to inject persona defaults into the config surface
-/// before running the reader, so BuzzExplicit-tagged fields can be re-tagged to
-/// PersonaDefault for fields the record did not independently set.
-pub(crate) fn resolve_effective_prompt_model_provider(
-    persona_id: Option<&str>,
-    personas: &[crate::managed_agents::types::AgentDefinition],
-    record_prompt: Option<String>,
-    record_model: Option<String>,
-    record_provider: Option<String>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let fallback = crate::managed_agents::persona_events::persona_field_with_record_fallback;
-    match persona_id.and_then(|pid| personas.iter().find(|p| p.id == pid)) {
-        Some(p) => (
-            Some(p.system_prompt.clone()),
-            fallback(p.model.as_deref(), record_model.as_deref()), // fallback: record.model
-            fallback(p.provider.as_deref(), record_provider.as_deref()), // fallback: record.provider
-        ),
-        None => (record_prompt, record_model, record_provider),
-    }
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@ required-features = ["meeting-v1-acceptance"]
 [dependencies]
 # Internal
 buzz-core = { workspace = true }
+buzz-project-view = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
 
@@ -72,6 +73,8 @@ tracing-subscriber = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+atomic-write-file = "0.3"
+zeroize = { workspace = true }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

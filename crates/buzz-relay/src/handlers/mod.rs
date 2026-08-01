@@ -28,6 +28,8 @@ pub mod moderation_commands;
 pub mod moderation_notices;
 /// Product-feedback validation + deployment sidecar persistence.
 pub mod product_feedback;
+/// Project View mutation, authorization, and projection protocol helpers.
+pub mod project_view;
 #[allow(dead_code, missing_docs)]
 pub mod push_lease;
 /// NIP-43 relay membership admin command handler (kinds 9030–9032).

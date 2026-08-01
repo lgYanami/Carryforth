@@ -529,6 +529,12 @@ pub struct BuzzClient {
 }
 
 impl BuzzClient {
+    /// Return the public key used to sign CLI commands.
+    #[must_use]
+    pub fn public_key(&self) -> nostr::PublicKey {
+        self.keys.public_key()
+    }
+
     /// Create a new client pointing at `relay_url`.
     ///
     /// Timeout defaults are tuned for degraded WAN links and can be overridden
@@ -741,6 +747,15 @@ impl BuzzClient {
     /// silently drop the caller's owner attestation or double up an
     /// unrelated tag.
     pub fn sign_event_unchecked(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        self.sign_event_exact(builder)
+    }
+
+    /// Sign an event builder without adding a content-level `auth` tag.
+    ///
+    /// This is required by protocols whose outer tag sequence is closed, such
+    /// as Project View mutations. NIP-OA delegation is still sent separately
+    /// as the `x-auth-tag` HTTP header by [`submit_event`].
+    pub fn sign_event_exact(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
         builder
             .sign_with_keys(&self.keys)
             .map_err(|e| CliError::Other(format!("signing failed: {e}")))
@@ -844,6 +859,42 @@ impl BuzzClient {
                     .send()
                     .await?;
                 self.handle_response(resp).await
+            }
+        })
+        .await
+    }
+
+    /// POST typed JSON to a NIP-98-authenticated Relay endpoint.
+    ///
+    /// The serialized body is held stable across retries while each attempt
+    /// receives a fresh NIP-98 event. Callers must provide an application
+    /// idempotency key for state-changing operations.
+    pub async fn post_authed_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, CliError> {
+        let url = format!("{}{path}", self.relay_url);
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(body)
+                .map_err(|error| CliError::Other(format!("JSON serialization failed: {error}")))?,
+        );
+        self.with_retry_body(|| {
+            let url = url.clone();
+            let body = body.clone();
+            async move {
+                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let response = self
+                    .with_auth_tag(
+                        self.http
+                            .post(&url)
+                            .header("Authorization", auth)
+                            .header("Content-Type", "application/json")
+                            .body(body),
+                    )
+                    .send()
+                    .await?;
+                self.handle_response(response).await
             }
         })
         .await

@@ -5,6 +5,8 @@
 //! Provides [`StoredEvent`], filter matching, kind constants, and event
 //! verification. All other Buzz crates depend on this one.
 
+/// Environment-variable names shared by managed Agent process boundaries.
+pub mod agent_process_env;
 /// NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
 pub mod agent_turn_metric;
 /// Channel and membership enums shared across crates.

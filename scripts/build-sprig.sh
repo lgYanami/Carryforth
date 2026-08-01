@@ -7,6 +7,7 @@
 #   buzz-agent     link to sprig (ACP-compliant agent)
 #   buzz-dev-mcp   link to sprig (developer MCP server; also dispatches
 #                    rg/tree/buzz/git-credential-nostr/git-sign-nostr)
+#   buzz           link to sprig (agent-first Buzz CLI)
 #
 # Usage:
 #   ./scripts/build-sprig.sh [version] [target]
@@ -35,6 +36,7 @@
 #   buzz-acp
 #   buzz-agent
 #   buzz-dev-mcp
+#   buzz
 #   README.md
 #   sprig.json        { version, git_sha, target, binaries: [{name, sha256, size}] }
 
@@ -59,7 +61,7 @@ else
 fi
 
 BUNDLE_BIN="sprig"
-COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp)
+COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp buzz)
 
 echo "==> Building Sprig v${VERSION} for ${TARGET}"
 echo "    git_sha=${GIT_SHA}"
@@ -146,6 +148,7 @@ Commands:
 - `buzz-dev-mcp` — Developer MCP server (shell, str_replace, todo) and
   multicall entrypoint for `rg`, `tree`, `buzz`, `git-credential-nostr`,
   `git-sign-nostr`.
+- `buzz` — Agent-first Relay CLI, including typed `project-view` commands.
 
 See `sprig.json` for SHA-256s, sizes, target, and source git SHA.
 

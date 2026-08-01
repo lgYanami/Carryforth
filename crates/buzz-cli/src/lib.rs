@@ -340,12 +340,595 @@ enum Cmd {
     /// Agent engram management — persistent memory per NIP-AE
     #[command(subcommand)]
     Mem(MemCmd),
+    /// Read and mutate the Community's canonical Project View
+    #[command(subcommand, name = "project-view")]
+    ProjectView(ProjectViewCmd),
+    /// Read and govern Project View v2 Roles and Assignments
+    #[command(subcommand)]
+    Roles(RolesCmd),
+    /// Submit trusted managed-runtime evidence and read availability
+    #[command(subcommand)]
+    Runtime(RuntimeCmd),
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+}
+
+/// Project View object type accepted by CLI commands.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProjectViewObjectTypeArg {
+    /// The unique project profile.
+    #[value(name = "project_profile")]
+    ProjectProfile,
+    /// A desired project outcome.
+    Goal,
+    /// A stable semantic responsibility.
+    Role,
+    /// A body of planning logic.
+    Plan,
+    /// A segment within a plan.
+    Stage,
+    /// Something the project intends to satisfy.
+    Requirement,
+    /// A discovered problem or gap.
+    Issue,
+    /// A unit of execution.
+    Work,
+    /// A stable project resource.
+    Resource,
+}
+
+impl From<ProjectViewObjectTypeArg> for buzz_project_view::ProjectViewObjectType {
+    fn from(value: ProjectViewObjectTypeArg) -> Self {
+        match value {
+            ProjectViewObjectTypeArg::ProjectProfile => Self::ProjectProfile,
+            ProjectViewObjectTypeArg::Goal => Self::Goal,
+            ProjectViewObjectTypeArg::Role => Self::Role,
+            ProjectViewObjectTypeArg::Plan => Self::Plan,
+            ProjectViewObjectTypeArg::Stage => Self::Stage,
+            ProjectViewObjectTypeArg::Requirement => Self::Requirement,
+            ProjectViewObjectTypeArg::Issue => Self::Issue,
+            ProjectViewObjectTypeArg::Work => Self::Work,
+            ProjectViewObjectTypeArg::Resource => Self::Resource,
+        }
+    }
+}
+
+/// Commands for the Community-global Project View.
+#[derive(Subcommand)]
+pub enum ProjectViewCmd {
+    /// Read and assemble one consistent logical Project View snapshot
+    Get,
+    /// Read one active object or tombstone by stable coordinate
+    GetObject {
+        /// Canonical Project View object type.
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Stable object UUID.
+        id: Uuid,
+    },
+    /// Atomically create the profile and initial goals
+    Init {
+        /// JSON file containing the Project Profile, or `-` for stdin.
+        #[arg(long)]
+        profile: String,
+        /// JSON file containing one initial Goal; repeat for multiple goals.
+        #[arg(long, required = true)]
+        goal: Vec<String>,
+    },
+    /// Create one typed object with a CLI-generated UUID v4
+    Create {
+        /// Object type to create (the project profile is not creatable here).
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Project revision on which this intent was based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// JSON file containing the typed object body and relations, or `-`.
+        #[arg(long)]
+        data: String,
+    },
+    /// Apply one closed, typed patch to an active object
+    Update {
+        /// Canonical Project View object type.
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Stable object UUID.
+        id: Uuid,
+        /// Project revision on which this intent was based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// JSON file containing the typed patch, or `-` for stdin.
+        #[arg(long)]
+        patch: String,
+    },
+    /// Tombstone one active object
+    Delete {
+        /// Canonical Project View object type.
+        #[arg(value_enum)]
+        object_type: ProjectViewObjectTypeArg,
+        /// Stable object UUID.
+        id: Uuid,
+        /// Project revision on which this intent was based.
+        #[arg(long)]
+        expected_project_revision: u64,
+    },
+}
+
+/// Trusted runtime supervisor operations.
+#[derive(Subcommand)]
+pub enum RuntimeCmd {
+    /// Submit one immutable, Assignment-scoped supervisor observation
+    Evidence {
+        /// Closed evidence transition.
+        #[arg(value_enum)]
+        evidence: RuntimeEvidenceArg,
+        /// Exact managed-Agent Assignment UUID.
+        #[arg(long)]
+        assignment: Uuid,
+        /// Stable logical runtime UUID.
+        #[arg(long)]
+        runtime: Uuid,
+        /// Current server-allocated epoch; omit only for `start`.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Stable retry key; generated when omitted.
+        #[arg(long)]
+        idempotency_key: Option<Uuid>,
+        /// Bounded diagnostic summary for abnormal/failed recovery.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Operating-system exit status for `abnormal_exit`.
+        #[arg(long)]
+        exit_code: Option<i32>,
+    },
+    /// Read one Assignment's current runtime availability
+    Status {
+        /// Assignment UUID.
+        #[arg(long)]
+        assignment: Uuid,
+    },
+}
+
+/// Closed trusted runtime evidence type.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RuntimeEvidenceArg {
+    /// Open a newly fenced runtime epoch.
+    Start,
+    /// Renew the lease for an available epoch.
+    #[value(name = "lease_renewed")]
+    LeaseRenewed,
+    /// Retire a deliberately stopped available runtime without ending its Assignment.
+    #[value(name = "graceful_stop")]
+    GracefulStop,
+    /// Begin recovery after a trusted abnormal process exit.
+    #[value(name = "abnormal_exit")]
+    AbnormalExit,
+    /// Allocate the next fenced epoch for one bounded recovery attempt.
+    #[value(name = "recovery_attempt")]
+    RecoveryAttempt,
+    /// Mark the currently fenced replacement attempt as healthy.
+    #[value(name = "recovery_succeeded")]
+    RecoverySucceeded,
+    /// Record a failed recovery result.
+    #[value(name = "recovery_failed")]
+    RecoveryFailed,
+    /// Prove supervisor health without consuming a retry.
+    #[value(name = "supervisor_heartbeat")]
+    SupervisorHeartbeat,
+}
+
+/// Project View v2 Role continuity commands.
+#[derive(Subcommand)]
+pub enum RolesCmd {
+    /// List canonical Roles with their current assignee or vacancy
+    List,
+    /// Render the verified current Role Brief for one Member
+    Brief {
+        /// Member public key (hex or npub); defaults to the CLI signer.
+        #[arg(long)]
+        member: Option<String>,
+        /// Render the shared prompt/human Markdown form instead of JSON.
+        #[arg(long)]
+        markdown: bool,
+    },
+    /// Read one canonical Role and its current Assignment
+    Get {
+        /// Stable Role UUID.
+        role: Uuid,
+    },
+    /// Read one Member's current Role Assignment
+    Current {
+        /// Member public key (hex or npub); defaults to the CLI signer.
+        #[arg(long)]
+        member: Option<String>,
+    },
+    /// List Role Assignment Proposals
+    Proposals {
+        /// Limit to one effective status.
+        #[arg(long, value_enum)]
+        status: Option<RoleProposalStatusArg>,
+        /// Maximum history entries to scan and return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Request a Role as the current signer
+    Request {
+        /// Desired Role UUID.
+        #[arg(long)]
+        role: Uuid,
+        /// Project revision on which the request is based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Proposal lifetime in hours.
+        #[arg(long, default_value_t = 168, value_parser = clap::value_parser!(u16).range(1..=720))]
+        expires_in_hours: u16,
+        /// Optional request context.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Current active Assignment fence when already assigned.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Offer a Role to a candidate
+    Offer {
+        /// Offered Role UUID.
+        #[arg(long)]
+        role: Uuid,
+        /// Candidate public key (hex or npub).
+        #[arg(long)]
+        member: String,
+        /// Project revision on which the complete move is based.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Proposal lifetime in hours.
+        #[arg(long, default_value_t = 168, value_parser = clap::value_parser!(u16).range(1..=720))]
+        expires_in_hours: u16,
+        /// Optional offer context.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Active Leader Assignment fence when authorizing as a Leader.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Confirm, reject, withdraw, authorize, or expire a Proposal
+    Proposal {
+        #[command(subcommand)]
+        command: RoleProposalCmd,
+    },
+    /// Read or act on one Assignment
+    Assignment {
+        #[command(subcommand)]
+        command: RoleAssignmentCmd,
+    },
+    /// Assign, accept, release, or recommit Role-owned Work
+    Work {
+        #[command(subcommand)]
+        command: RoleWorkCmd,
+    },
+    /// Append or page through structured Role Checkpoints
+    Checkpoint {
+        #[command(subcommand)]
+        command: RoleCheckpointCmd,
+    },
+    /// Append or page through Role Handoff history
+    Handoff {
+        #[command(subcommand)]
+        command: RoleHandoffCmd,
+    },
+}
+
+/// Effective Proposal status accepted by `buzz roles proposals`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RoleProposalStatusArg {
+    /// Awaiting one or both confirmations.
+    Open,
+    /// Assignment was activated.
+    Consumed,
+    /// Explicitly rejected.
+    Rejected,
+    /// Withdrawn by its creator.
+    Withdrawn,
+    /// Canonical deadline has passed.
+    Expired,
+}
+
+/// Commands targeting one Proposal.
+#[derive(Subcommand)]
+pub enum RoleProposalCmd {
+    /// Accept an offer as its candidate
+    Accept {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Reject an open Proposal
+    Reject {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional explanation.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Withdraw a Proposal created by the signer
+    Withdraw {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional explanation.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Authorize a candidate request as owner or Leader
+    Authorize {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Materialize an already effective Proposal expiration
+    Expire {
+        /// Proposal UUID.
+        proposal: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional current Assignment fence.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+}
+
+/// Commands targeting Assignments.
+#[derive(Subcommand)]
+pub enum RoleAssignmentCmd {
+    /// List Assignment history, optionally narrowed by Role or Member
+    List {
+        /// Role UUID.
+        #[arg(long)]
+        role: Option<Uuid>,
+        /// Member public key (hex or npub).
+        #[arg(long)]
+        member: Option<String>,
+        /// Include ended tenure history.
+        #[arg(long)]
+        include_ended: bool,
+        /// Maximum history entries to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Read one Assignment by UUID
+    Get {
+        /// Assignment UUID.
+        assignment: Uuid,
+    },
+    /// End another Member's active Assignment
+    End {
+        /// Target Assignment UUID.
+        assignment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional governance explanation.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Ask governance to arrange a replacement without self-ending
+    RequestReplacement {
+        /// Caller's active Assignment UUID.
+        assignment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional context.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Report inability to continue without self-ending
+    ReportUnableToContinue {
+        /// Caller's active Assignment UUID.
+        assignment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional context.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// Commands targeting Work responsibility and Commitment.
+#[derive(Subcommand)]
+pub enum RoleWorkCmd {
+    /// Assign one Work to a stable Role
+    Assign {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Responsible Role UUID.
+        #[arg(long)]
+        role: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Clear the responsible Role from one uncommitted Work
+    Unassign {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Active Leader Assignment fence when not Community owner.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Accept Work owned by the caller's current Role
+    Accept {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Release the caller's active Commitment without changing Work status
+    Release {
+        /// Commitment UUID.
+        #[arg(long)]
+        commitment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Optional release context.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Atomically replace the caller's active Commitment to the same Work
+    Recommit {
+        /// Work UUID.
+        #[arg(long)]
+        work: Uuid,
+        /// Active Commitment observed by the caller.
+        #[arg(long)]
+        commitment: Uuid,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+}
+
+/// Commands targeting append-only Role Checkpoints.
+#[derive(Subcommand)]
+pub enum RoleCheckpointCmd {
+    /// Append a structured Checkpoint through the current Assignment
+    Append {
+        /// JSON file containing `RoleCheckpointContent`, or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Reviewed Project revision; defaults to the expected revision.
+        #[arg(long)]
+        based_on_project_revision: Option<u64>,
+        /// Earlier Checkpoint from this Assignment being corrected.
+        #[arg(long)]
+        supersedes: Option<Uuid>,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Page through Checkpoint history, newest first
+    List {
+        /// Limit to one Role.
+        #[arg(long)]
+        role: Option<Uuid>,
+        /// Limit to one Assignment.
+        #[arg(long)]
+        assignment: Option<Uuid>,
+        /// Maximum history entries to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
+    },
+}
+
+/// Member-authored Handoff causes.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RoleHandoffCauseArg {
+    /// A planned transition or context transfer.
+    Planned,
+    /// Other explicitly described transition context.
+    Other,
+}
+
+/// Commands targeting append-only Role Handoffs.
+#[derive(Subcommand)]
+pub enum RoleHandoffCmd {
+    /// Append a Handoff note without ending the Assignment
+    Append {
+        /// JSON file containing `RoleHandoffContent`, or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// Current project revision.
+        #[arg(long)]
+        expected_project_revision: u64,
+        /// Known successor Assignment in the same Role.
+        #[arg(long)]
+        to_assignment: Option<Uuid>,
+        /// Checkpoint explicitly carried into this Handoff.
+        #[arg(long)]
+        checkpoint: Option<Uuid>,
+        /// Member-authored transition cause.
+        #[arg(long, value_enum, default_value = "planned")]
+        cause: RoleHandoffCauseArg,
+        /// Current Assignment fence; managed runtimes resolve it automatically.
+        #[arg(long)]
+        acting_assignment: Option<Uuid>,
+    },
+    /// Page through Handoff history, newest first
+    List {
+        /// Limit to one Role.
+        #[arg(long)]
+        role: Option<Uuid>,
+        /// Limit to one source Assignment.
+        #[arg(long)]
+        assignment: Option<Uuid>,
+        /// Maximum history entries to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Opaque `next_before` cursor from the preceding page.
+        #[arg(long)]
+        before: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -2332,6 +2915,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
+        Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
+        Cmd::Roles(sub) => commands::roles::dispatch(sub, &client, &cli.format).await,
+        Cmd::Runtime(sub) => commands::runtime::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
@@ -2596,8 +3182,11 @@ mod tests {
             "pack",
             "patches",
             "pr",
+            "project-view",
             "reactions",
             "repos",
+            "roles",
+            "runtime",
             "social",
             "upload",
             "users",
@@ -2666,6 +3255,58 @@ mod tests {
                 "vote"
             ]
         );
+        assert_eq!(
+            names(&cmd, "project-view"),
+            vec!["create", "delete", "get", "get-object", "init", "update"]
+        );
+        assert_eq!(
+            names(&cmd, "roles"),
+            vec![
+                "assignment",
+                "brief",
+                "checkpoint",
+                "current",
+                "get",
+                "handoff",
+                "list",
+                "offer",
+                "proposal",
+                "proposals",
+                "request",
+                "work"
+            ]
+        );
+        let roles = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "roles")
+            .expect("roles command");
+        let work = roles
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "work")
+            .expect("roles work command");
+        let mut work_names: Vec<String> = work
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_string())
+            .filter(|name| name != "help")
+            .collect();
+        work_names.sort();
+        assert_eq!(
+            work_names,
+            vec!["accept", "assign", "recommit", "release", "unassign"]
+        );
+        for history_command in ["checkpoint", "handoff"] {
+            let history = roles
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == history_command)
+                .unwrap_or_else(|| panic!("roles {history_command} command"));
+            let mut history_names = history
+                .get_subcommands()
+                .map(|subcommand| subcommand.get_name().to_owned())
+                .filter(|name| name != "help")
+                .collect::<Vec<_>>();
+            history_names.sort();
+            assert_eq!(history_names, vec!["append", "list"]);
+        }
         assert_eq!(
             names(&cmd, "channels"),
             vec![
@@ -2800,8 +3441,10 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
+            ("project-view", 6),
             ("reactions", 3),
             ("repos", 4),
+            ("roles", 12),
             ("social", 7),
             ("upload", 1),
             ("users", 4),

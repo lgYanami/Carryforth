@@ -5,6 +5,7 @@ name: Sprig
 #   buzz-agent     ACP-compliant agent (spawns MCP, calls LLMs)
 #   buzz-dev-mcp   Developer MCP server (multicall: rg, tree, buzz,
 #                    git-credential-nostr, git-sign-nostr)
+#   buzz            Agent-first Buzz CLI, including Project View
 #
 # Targets: x86_64-unknown-linux-musl and aarch64-unknown-linux-musl (static
 # musl so the tarball runs on any modern Linux without libc surprises).
@@ -18,6 +19,20 @@ on:
   push:
     branches: [main]
     tags: ["sprig-v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/sprig.yml"
+      - "scripts/build-sprig.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/sprig/**"
+      - "crates/buzz-acp/**"
+      - "crates/buzz-agent/**"
+      - "crates/buzz-dev-mcp/**"
+      - "crates/buzz-cli/**"
+      - "crates/buzz-sdk/**"
+      - "crates/buzz-project-view/**"
   workflow_dispatch:
     inputs:
       publish:
@@ -137,7 +152,7 @@ jobs:
           set -euo pipefail
           TAG="sprig-latest"
           TITLE="Sprig (rolling)"
-          NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp), tracking \`main\` (\`${SHA}\`)."
+          NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp + buzz CLI), tracking \`main\` (\`${SHA}\`)."
 
           gh release edit "$TAG" \
             --prerelease \
@@ -180,5 +195,5 @@ jobs:
           set -euo pipefail
           gh release create "$TAG" \
             --title "Sprig v${VERSION}" \
-            --notes "Sprig v${VERSION} — Linux all-in-one builds of buzz-acp + buzz-agent + buzz-dev-mcp." \
+            --notes "Sprig v${VERSION} — Linux all-in-one builds of buzz-acp + buzz-agent + buzz-dev-mcp + buzz CLI." \
             dist/*

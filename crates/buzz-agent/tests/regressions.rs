@@ -1405,7 +1405,27 @@ async fn token_usage_over_budget_triggers_handoff() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"hello 1"}]}),
         )
         .await;
-    let _ = h.recv_until(|v| v["id"] == json!(p1)).await;
+    let mut saw_context_reset = false;
+    loop {
+        let frame = h.recv().await;
+        if frame["params"]["update"]["_meta"]["buzz"]["contextReset"]["reason"]
+            == json!("compaction")
+        {
+            assert_eq!(frame["params"]["sessionId"], sid);
+            assert_eq!(
+                frame["params"]["update"]["_meta"]["buzz"]["contextReset"]["handoff"],
+                1
+            );
+            saw_context_reset = true;
+        }
+        if frame["id"] == json!(p1) {
+            break;
+        }
+    }
+    assert!(
+        saw_context_reset,
+        "handoff must report model-visible context loss to the ACP harness"
+    );
     let captured = llm.captured.lock().await.len();
     assert_eq!(
         captured, 3,

@@ -20,6 +20,7 @@ members = [
     "crates/buzz-cli",
     "crates/buzz-pairing-cli",
     "crates/buzz-sdk",
+    "crates/buzz-project-view",
     "crates/buzz-persona",
     "crates/git-credential-nostr",
     "crates/git-sign-nostr",
@@ -131,6 +132,7 @@ buzz-audit = { path = "crates/buzz-audit" }
 buzz-workflow = { path = "crates/buzz-workflow" }
 buzz-media = { path = "crates/buzz-media" }
 buzz-sdk = { path = "crates/buzz-sdk" }
+buzz-project-view = { path = "crates/buzz-project-view" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
 

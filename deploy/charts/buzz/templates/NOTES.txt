@@ -72,6 +72,11 @@
     `helm install` / `helm upgrade`, or pods will start against an unmigrated
     schema. Readiness probes only verify DB connectivity, not schema freshness.
 {{- end }}
+  Project View first rollout is server-first:
+    roll every Pod with migrate.autoMigrate=false, run `buzz-admin migrate`,
+    verify the stable signer, then run
+    `buzz-admin project-view enable --community <host>`.
+    Never use a Pod-local Project View enable flag.
 {{- if or .Values.secrets.relayPrivateKey .Values.secrets.gitHookHmacSecret }}
   ⚠ Inline secret values are set in values.yaml
     ({{ if .Values.secrets.relayPrivateKey }}secrets.relayPrivateKey{{ end }}{{ if and .Values.secrets.relayPrivateKey .Values.secrets.gitHookHmacSecret }}, {{ end }}{{ if .Values.secrets.gitHookHmacSecret }}secrets.gitHookHmacSecret{{ end }}).

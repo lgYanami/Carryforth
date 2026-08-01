@@ -18,6 +18,14 @@
       ]
     },
     {
+      "id": "projectView",
+      "name": "View",
+      "description": "Verified project context for the active Community",
+      "platforms": [
+        "desktop"
+      ]
+    },
+    {
       "id": "pulse",
       "name": "Pulse",
       "description": "Activity feed with notes, social posts, and agent activity",

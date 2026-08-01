@@ -19,6 +19,8 @@ pub(crate) const SUPPORTED_NIPS: &[u32] = &[1, 2, 10, 11, 16, 17, 23, 25, 29, 33
 /// stable signing key — both are required for kind 13534/8000/8001 events
 /// to be verifiable by clients.
 pub(crate) const NIP_RELAY_MEMBERSHIP: u32 = 43;
+const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
+const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +139,7 @@ impl RelayInfo {
         relay_self: Option<&str>,
         icon: Option<&str>,
         advertise_nip43: bool,
+        advertise_project_view: bool,
         max_message_length: usize,
         pairing_relay_url: Option<&str>,
     ) -> Self {
@@ -150,6 +153,11 @@ impl RelayInfo {
             supported_nips.push(NIP_RELAY_MEMBERSHIP);
         }
 
+        let mut supported_extensions = vec!["nip-er".to_string()];
+        if advertise_project_view {
+            supported_extensions.push(PROJECT_VIEW_EXTENSION.to_owned());
+        }
+
         Self {
             name: "Buzz Relay".to_string(),
             description: "Buzz — private team communication relay".to_string(),
@@ -157,7 +165,7 @@ impl RelayInfo {
             pubkey: None,
             contact: None,
             supported_nips,
-            supported_extensions: Some(vec!["nip-er".to_string()]),
+            supported_extensions: Some(supported_extensions),
             push: None,
             software: "https://github.com/block/buzz".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -235,13 +243,24 @@ fn push_descriptor(
 pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &str) -> RelayInfo {
     let (relay_self, advertise_nip43) = nip11_facts(state);
     let icon = workspace_icon_for_host(state, raw_host).await;
+    let project_view_capability = project_view_ready_for_host(state, raw_host).await;
     let mut info = RelayInfo::build(
         relay_self.as_deref(),
         icon.as_deref(),
         advertise_nip43,
+        project_view_capability.is_some(),
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
     );
+    if project_view_capability == Some(ProjectViewCapability::V2) {
+        if let Some(extensions) = info.supported_extensions.as_mut() {
+            for extension in extensions {
+                if extension == PROJECT_VIEW_EXTENSION {
+                    *extension = PROJECT_VIEW_V2_EXTENSION.to_owned();
+                }
+            }
+        }
+    }
     let tenant_host = if state.config.push_gateway_delivery_url.is_some() {
         crate::tenant::bind_community(&state.db, raw_host)
             .await
@@ -263,6 +282,61 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         info.push = Some(push);
     }
     info
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectViewCapability {
+    V1,
+    V2,
+}
+
+async fn project_view_ready_for_host(
+    state: &crate::state::AppState,
+    raw_host: &str,
+) -> Option<ProjectViewCapability> {
+    state.config.relay_private_key.as_ref()?;
+    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
+        return None;
+    };
+    let schema_version = match state
+        .db
+        .project_view_schema_version(tenant.community())
+        .await
+    {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Project View NIP-11 schema lookup failed closed: {error}"
+            );
+            return None;
+        }
+    };
+    let ready = if schema_version == 2 {
+        state
+            .db
+            .project_view_v2_capability_ready(tenant.community(), &state.relay_keypair.public_key())
+            .await
+    } else if schema_version == 1 {
+        state
+            .db
+            .project_view_capability_ready(tenant.community(), &state.relay_keypair.public_key())
+            .await
+    } else {
+        return None;
+    };
+    match ready {
+        Ok(true) if schema_version == 2 => Some(ProjectViewCapability::V2),
+        Ok(true) => Some(ProjectViewCapability::V1),
+        Ok(false) => None,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Project View NIP-11 readiness failed closed: {error}"
+            );
+            None
+        }
+    }
 }
 
 /// Fetches the workspace icon for the community bound to `raw_host`, as the
@@ -330,6 +404,7 @@ const _RELAY_INFO_BUILD_STATIC_INPUT_FENCE: fn(
     Option<&str>,
     Option<&str>,
     bool,
+    bool,
     usize,
     Option<&str>,
 ) -> RelayInfo = RelayInfo::build;
@@ -386,7 +461,7 @@ mod tests {
 
     #[test]
     fn build_advertises_buzz_repository_url() {
-        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
         assert_eq!(info.software, "https://github.com/block/buzz");
     }
 
@@ -395,6 +470,7 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
+            false,
             false,
             DEFAULT_MAX_FRAME_BYTES,
             Some("wss://pairing.buzz.xyz"),
@@ -406,7 +482,7 @@ mod tests {
             Some("wss://pairing.buzz.xyz")
         );
 
-        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
         let json = serde_json::to_value(&info).expect("serialize");
         assert!(json.get("pairing_relay_url").is_none());
     }
@@ -419,6 +495,7 @@ mod tests {
         let info = RelayInfo::build(
             None,
             Some("data:image/webp;base64,UklGRg=="),
+            false,
             false,
             DEFAULT_MAX_FRAME_BYTES,
             None,
@@ -434,7 +511,7 @@ mod tests {
         );
 
         for icon in [None, Some("")] {
-            let info = RelayInfo::build(None, icon, false, DEFAULT_MAX_FRAME_BYTES, None);
+            let info = RelayInfo::build(None, icon, false, false, DEFAULT_MAX_FRAME_BYTES, None);
             assert!(info.icon.is_none());
             let json = serde_json::to_value(&info).expect("serialize");
             assert!(
@@ -454,7 +531,7 @@ mod tests {
 
     #[test]
     fn max_message_length_uses_configured_frame_limit() {
-        let info = RelayInfo::build(None, None, false, 262_144, None);
+        let info = RelayInfo::build(None, None, false, false, 262_144, None);
         let limitation = info.limitation.expect("limitation");
         assert_eq!(limitation.max_message_length, Some(262_144));
     }
@@ -485,9 +562,28 @@ mod tests {
     /// Open relay, ephemeral key — both `self` and NIP-43 are absent.
     #[test]
     fn build_open_relay_ephemeral_key_omits_self_and_nip43() {
-        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
         assert!(info.relay_self.is_none());
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
+    }
+
+    #[test]
+    fn project_view_extension_is_controlled_by_host_scoped_ready_scalar() {
+        let disabled = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        assert!(!disabled
+            .supported_extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions
+                .iter()
+                .any(|value| value == PROJECT_VIEW_EXTENSION)));
+
+        let enabled = RelayInfo::build(None, None, false, true, DEFAULT_MAX_FRAME_BYTES, None);
+        assert!(enabled
+            .supported_extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions
+                .iter()
+                .any(|value| value == PROJECT_VIEW_EXTENSION)));
     }
 
     /// Open relay with a stable signing key (e.g. for NIP-29 group metadata
@@ -498,7 +594,7 @@ mod tests {
     #[test]
     fn build_open_relay_stable_key_advertises_self_but_not_nip43() {
         let pk = "0000000000000000000000000000000000000000000000000000000000000001";
-        let info = RelayInfo::build(Some(pk), None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(Some(pk), None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
         assert_eq!(info.relay_self.as_deref(), Some(pk));
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
     }
@@ -507,7 +603,7 @@ mod tests {
     #[test]
     fn build_membership_relay_advertises_self_and_nip43() {
         let pk = "0000000000000000000000000000000000000000000000000000000000000001";
-        let info = RelayInfo::build(Some(pk), None, true, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(Some(pk), None, true, false, DEFAULT_MAX_FRAME_BYTES, None);
         assert_eq!(info.relay_self.as_deref(), Some(pk));
         assert!(info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
     }
@@ -518,6 +614,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "advertise_nip43=true requires relay_self=Some")]
     fn build_nip43_without_self_panics_in_debug() {
-        let _ = RelayInfo::build(None, None, true, DEFAULT_MAX_FRAME_BYTES, None);
+        let _ = RelayInfo::build(None, None, true, false, DEFAULT_MAX_FRAME_BYTES, None);
     }
 }

@@ -397,6 +397,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atomic-write-file"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d"
+dependencies = [
+ "nix 0.30.1",
+ "rand 0.9.4",
+]
+
+[[package]]
 name = "attohttpc"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,9 +775,11 @@ name = "buzz-acp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atomic-write-file",
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-view",
  "buzz-sdk",
  "chrono",
  "clap",
@@ -793,6 +805,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -805,7 +818,9 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "buzz-project-view",
  "buzz-pubsub",
+ "buzz-sdk",
  "buzz-search",
  "buzz-workflow",
  "clap",
@@ -818,6 +833,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -889,6 +905,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",
  "bytes",
@@ -947,7 +964,10 @@ dependencies = [
 name = "buzz-db"
 version = "0.1.0"
 dependencies = [
+ "buzz-audit",
  "buzz-core",
+ "buzz-project-view",
+ "buzz-sdk",
  "chrono",
  "hex",
  "nostr",
@@ -1068,6 +1088,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-view"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-pubsub"
 version = "0.1.0"
 dependencies = [
@@ -1136,6 +1171,7 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "buzz-project-view",
  "buzz-pubsub",
  "buzz-relay-mesh",
  "buzz-sdk",
@@ -1216,6 +1252,9 @@ name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-project-view",
+ "chrono",
+ "hex",
  "nostr",
  "serde",
  "serde_json",
@@ -1241,6 +1280,7 @@ dependencies = [
  "anyhow",
  "base64",
  "buzz-core",
+ "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",
  "chrono",
@@ -5373,6 +5413,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if 1.0.4",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

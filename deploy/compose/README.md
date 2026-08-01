@@ -36,6 +36,13 @@ keypair.
   `buzz-admin migrate` before starting the relay when bootstrapping a fresh
   database. Auto-migration requires an image that includes embedded SQLx
   migrations.
+- For the first Project View rollout, keep `BUZZ_AUTO_MIGRATE=false`, replace
+  the Relay container with the Project View-capable image, run that image's
+  `buzz-admin migrate`, and only then run
+  `buzz-admin project-view enable --community <host>`. The database flag is
+  shared by all Relay processes; there is no per-container enable flag. Follow
+  the [Project View operations runbook](../../docs/project-view-operations.md)
+  for monitoring, signer rotation, disable, and rollback.
 - The stack uses Postgres, Redis, MinIO, and a git data volume because
   those are real Buzz dependencies today. Minimal mode can simplify this later.
 

@@ -251,6 +251,481 @@ fn extract_channel_from_filter(filter: &nostr::Filter) -> Option<uuid::Uuid> {
 const BRIDGE_FEED_MAX_LIMIT: i64 = 100;
 const BRIDGE_THREAD_MAX_LIMIT: u32 = 500;
 
+enum ProjectViewPageRequest {
+    ActiveObjects {
+        revision: u64,
+        projection_generation: u64,
+        after: Option<buzz_db::project_view::ProjectViewSnapshotCursor>,
+        limit: u16,
+    },
+    V2CurrentEntities {
+        revision: u64,
+        projection_generation: u64,
+        after: Option<buzz_db::project_view::ProjectViewV2EntityCursor>,
+        limit: u16,
+    },
+    RoleHistory {
+        revision: u64,
+        projection_generation: u64,
+        filter: buzz_db::project_view::ProjectViewRoleHistoryFilter,
+        after: Option<buzz_db::project_view::ProjectViewRoleHistoryCursor>,
+        limit: u16,
+    },
+}
+
+fn parse_project_view_page_request(
+    raw_filters: &[Value],
+    relay_pubkey: &nostr::PublicKey,
+) -> Result<Option<ProjectViewPageRequest>, (StatusCode, Json<Value>)> {
+    let extension_count = raw_filters
+        .iter()
+        .filter(|filter| filter.get("buzz_project_view").is_some())
+        .count();
+    if extension_count == 0 {
+        return Ok(None);
+    }
+    if extension_count != 1 || raw_filters.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination requires exactly one filter",
+        ));
+    }
+
+    let raw = raw_filters[0].as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view filter must be a JSON object",
+        )
+    })?;
+    const ALLOWED_OUTER: &[&str] = &["kinds", "authors", "#t", "limit", "buzz_project_view"];
+    if raw.keys().any(|key| !ALLOWED_OUTER.contains(&key.as_str())) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination contains an unsupported outer field",
+        ));
+    }
+    let limit = raw
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| (1..=500).contains(value))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view limit must be in 1..=500",
+            )
+        })?;
+    let extension = raw
+        .get("buzz_project_view")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view must be an object",
+            )
+        })?;
+    let revision = project_view_safe_revision(extension, "revision")?;
+    let projection_generation = project_view_safe_revision(extension, "projection_generation")?;
+    let scope = extension
+        .get("scope")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "buzz_project_view scope must be a string",
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or("active_objects");
+
+    let request = match scope {
+        "active_objects" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-active")?;
+            const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            ProjectViewPageRequest::ActiveObjects {
+                revision,
+                projection_generation,
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        "v2_current_entities" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v2-entity")?;
+            const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            ProjectViewPageRequest::V2CurrentEntities {
+                revision,
+                projection_generation,
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_entity_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        "role_history" => {
+            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v2-entity")?;
+            const ALLOWED: &[&str] = &[
+                "scope",
+                "revision",
+                "projection_generation",
+                "entity_types",
+                "role_id",
+                "assignment_id",
+                "member_pubkey",
+                "after",
+            ];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            let entity_types = parse_project_view_history_entity_types(extension)?;
+            let role_id = extension
+                .get("role_id")
+                .map(|value| parse_project_view_uuid(value, "role_id"))
+                .transpose()?;
+            let assignment_id = extension
+                .get("assignment_id")
+                .map(|value| parse_project_view_uuid(value, "assignment_id"))
+                .transpose()?;
+            let member_pubkey = extension
+                .get("member_pubkey")
+                .map(parse_project_view_member_pubkey)
+                .transpose()?;
+            ProjectViewPageRequest::RoleHistory {
+                revision,
+                projection_generation,
+                filter: buzz_db::project_view::ProjectViewRoleHistoryFilter {
+                    entity_types,
+                    role_id,
+                    assignment_id,
+                    member_pubkey,
+                },
+                after: extension
+                    .get("after")
+                    .map(parse_project_view_history_cursor)
+                    .transpose()?,
+                limit,
+            }
+        }
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view scope is unsupported",
+            ));
+        }
+    };
+    Ok(Some(request))
+}
+
+fn require_project_view_outer_filter(
+    raw: &serde_json::Map<String, Value>,
+    relay_pubkey: &nostr::PublicKey,
+    expected_tag: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if raw.get("kinds")
+        != Some(&serde_json::json!([
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT
+        ]))
+        || raw.get("#t") != Some(&serde_json::json!([expected_tag]))
+        || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view pagination requires exact kinds, authors, and #t filters",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_project_view_extension_fields(
+    extension: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if extension.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view contains an unsupported field",
+        ));
+    }
+    Ok(())
+}
+
+fn project_view_safe_revision(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<u64, (StatusCode, Json<Value>)> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=buzz_project_view::MAX_SAFE_REVISION).contains(value))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("buzz_project_view {field} is outside the supported range"),
+            )
+        })
+}
+
+fn parse_project_view_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewSnapshotCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after must be an object",
+        )
+    })?;
+    if object.len() != 2 || !object.contains_key("object_type") || !object.contains_key("object_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after requires exactly object_type and object_id",
+        ));
+    }
+    let object_type = match object.get("object_type").and_then(Value::as_str) {
+        Some("project_profile") => buzz_project_view::ProjectViewObjectType::ProjectProfile,
+        Some("goal") => buzz_project_view::ProjectViewObjectType::Goal,
+        Some("role") => buzz_project_view::ProjectViewObjectType::Role,
+        Some("plan") => buzz_project_view::ProjectViewObjectType::Plan,
+        Some("stage") => buzz_project_view::ProjectViewObjectType::Stage,
+        Some("requirement") => buzz_project_view::ProjectViewObjectType::Requirement,
+        Some("issue") => buzz_project_view::ProjectViewObjectType::Issue,
+        Some("work") => buzz_project_view::ProjectViewObjectType::Work,
+        Some("resource") => buzz_project_view::ProjectViewObjectType::Resource,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view after.object_type is invalid",
+            ));
+        }
+    };
+    let object_id = object
+        .get("object_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view after.object_id must be a canonical UUID",
+            )
+        })?;
+    let canonical_object_id = object_id.to_string();
+    if object.get("object_id").and_then(Value::as_str) != Some(canonical_object_id.as_str()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after.object_id must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(buzz_db::project_view::ProjectViewSnapshotCursor {
+        object_type,
+        object_id,
+    })
+}
+
+fn parse_project_view_entity_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewV2EntityCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after must be an object",
+        )
+    })?;
+    if object.len() != 2 || !object.contains_key("entity_type") || !object.contains_key("entity_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "current-entity after requires exactly entity_type and entity_id",
+        ));
+    }
+    let entity_type = parse_project_view_entity_type(
+        object.get("entity_type").and_then(Value::as_str),
+        &[
+            buzz_project_view::v2::RoleContinuityEntity::Role,
+            buzz_project_view::v2::RoleContinuityEntity::RoleAssignmentProposal,
+            buzz_project_view::v2::RoleContinuityEntity::RoleAssignment,
+            buzz_project_view::v2::RoleContinuityEntity::WorkCommitment,
+            buzz_project_view::v2::RoleContinuityEntity::RoleCheckpoint,
+            buzz_project_view::v2::RoleContinuityEntity::RoleHandoff,
+        ],
+        "after.entity_type",
+    )?;
+    let entity_id = object
+        .get("entity_id")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "current-entity after is missing entity_id",
+            )
+        })
+        .and_then(|value| parse_project_view_uuid(value, "after.entity_id"))?;
+    Ok(buzz_db::project_view::ProjectViewV2EntityCursor {
+        entity_type,
+        entity_id,
+    })
+}
+
+fn parse_project_view_history_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewRoleHistoryCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view history after must be an object",
+        )
+    })?;
+    if object.len() != 3
+        || !object.contains_key("project_revision")
+        || !object.contains_key("entity_type")
+        || !object.contains_key("entity_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "history after requires exactly project_revision, entity_type, and entity_id",
+        ));
+    }
+    let project_revision = project_view_safe_revision(object, "project_revision")?;
+    let entity_type = parse_project_view_entity_type(
+        object.get("entity_type").and_then(Value::as_str),
+        &history_entity_types(),
+        "after.entity_type",
+    )?;
+    let entity_id = object
+        .get("entity_id")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "history after is missing entity_id",
+            )
+        })
+        .and_then(|value| parse_project_view_uuid(value, "after.entity_id"))?;
+    Ok(buzz_db::project_view::ProjectViewRoleHistoryCursor {
+        project_revision,
+        entity_type,
+        entity_id,
+    })
+}
+
+fn parse_project_view_history_entity_types(
+    extension: &serde_json::Map<String, Value>,
+) -> Result<Vec<buzz_project_view::v2::RoleContinuityEntity>, (StatusCode, Json<Value>)> {
+    let values = extension
+        .get("entity_types")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.len() <= 4)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view entity_types must contain 1..=4 history types",
+            )
+        })?;
+    let allowed = history_entity_types();
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let entity_type =
+            parse_project_view_entity_type(value.as_str(), &allowed, "entity_types entry")?;
+        if result.contains(&entity_type) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view entity_types must not contain duplicates",
+            ));
+        }
+        result.push(entity_type);
+    }
+    Ok(result)
+}
+
+const fn history_entity_types() -> [buzz_project_view::v2::RoleContinuityEntity; 4] {
+    [
+        buzz_project_view::v2::RoleContinuityEntity::RoleAssignmentProposal,
+        buzz_project_view::v2::RoleContinuityEntity::RoleAssignment,
+        buzz_project_view::v2::RoleContinuityEntity::RoleCheckpoint,
+        buzz_project_view::v2::RoleContinuityEntity::RoleHandoff,
+    ]
+}
+
+fn parse_project_view_entity_type(
+    value: Option<&str>,
+    allowed: &[buzz_project_view::v2::RoleContinuityEntity],
+    field: &str,
+) -> Result<buzz_project_view::v2::RoleContinuityEntity, (StatusCode, Json<Value>)> {
+    let entity_type = match value {
+        Some("role") => buzz_project_view::v2::RoleContinuityEntity::Role,
+        Some("role_assignment_proposal") => {
+            buzz_project_view::v2::RoleContinuityEntity::RoleAssignmentProposal
+        }
+        Some("role_assignment") => buzz_project_view::v2::RoleContinuityEntity::RoleAssignment,
+        Some("work_commitment") => buzz_project_view::v2::RoleContinuityEntity::WorkCommitment,
+        Some("role_checkpoint") => buzz_project_view::v2::RoleContinuityEntity::RoleCheckpoint,
+        Some("role_handoff") => buzz_project_view::v2::RoleContinuityEntity::RoleHandoff,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("buzz_project_view {field} is invalid"),
+            ));
+        }
+    };
+    if !allowed.contains(&entity_type) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} is not allowed for this scope"),
+        ));
+    }
+    Ok(entity_type)
+}
+
+fn parse_project_view_uuid(
+    value: &Value,
+    field: &str,
+) -> Result<uuid::Uuid, (StatusCode, Json<Value>)> {
+    let raw = value.as_str().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} must be a canonical UUID"),
+        )
+    })?;
+    let parsed = raw.parse::<uuid::Uuid>().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} must be a canonical UUID"),
+        )
+    })?;
+    if parsed.to_string() != raw {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("buzz_project_view {field} must be a canonical lowercase UUID"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_project_view_member_pubkey(
+    value: &Value,
+) -> Result<nostr::PublicKey, (StatusCode, Json<Value>)> {
+    let raw = value.as_str().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view member_pubkey must be canonical lowercase hex",
+        )
+    })?;
+    let parsed = nostr::PublicKey::from_hex(raw).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view member_pubkey must be canonical lowercase hex",
+        )
+    })?;
+    if parsed.to_hex() != raw {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view member_pubkey must be canonical lowercase hex",
+        ));
+    }
+    Ok(parsed)
+}
+
 /// The `before_id` extension field, with "present but malformed" kept distinct
 /// from "absent": NIP-CW's cursor grammar says a malformed value MUST reject
 /// the request, never silently demote it to a half cursor or a head request.
@@ -584,6 +1059,20 @@ fn event_in_accessible_channel(se: &buzz_core::StoredEvent, accessible: &[uuid::
     match se.channel_id {
         Some(ch_id) => accessible.contains(&ch_id),
         None => true,
+    }
+}
+
+fn exclude_project_view_if_unauthorized(
+    query: &mut buzz_db::EventQuery,
+    filter: &nostr::Filter,
+    project_view_read_allowed: bool,
+) {
+    if !project_view_read_allowed && crate::handlers::project_view::filter_can_match(filter) {
+        query.excluded_kinds = Some(vec![
+            buzz_core::kind::KIND_PROJECT_VIEW_MUTATION as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+        ]);
     }
 }
 
@@ -932,6 +1421,30 @@ async fn submit_event_authed(
                 response: e,
             }
         }
+        Err(IngestError::Conflict(msg)) => {
+            crate::handlers::ingest::reject_with_transport("http", "conflict");
+            let e = api_error(StatusCode::CONFLICT, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
+        Err(IngestError::Unsupported(msg)) => {
+            crate::handlers::ingest::reject_with_transport("http", "unsupported");
+            let e = api_error(StatusCode::BAD_REQUEST, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
+        Err(IngestError::Unavailable(msg)) => {
+            crate::handlers::ingest::reject_with_transport("http", "unavailable");
+            let e = api_error(StatusCode::SERVICE_UNAVAILABLE, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
         Err(IngestError::Internal(msg)) => {
             crate::handlers::ingest::reject_with_transport("http", "error");
             let e = internal_error(&msg);
@@ -1026,13 +1539,23 @@ async fn query_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    super::relay_members::enforce_relay_membership(
+    let nip_oa_owner = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
     )
-    .await?;
+    .await?
+    .or_else(|| {
+        if !state.config.require_relay_membership {
+            super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+        } else {
+            None
+        }
+    });
+    if let Some(owner) = nip_oa_owner {
+        super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
+    }
 
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
@@ -1043,6 +1566,145 @@ async fn query_events_authed(
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    let project_view_can_match = filters
+        .iter()
+        .any(crate::handlers::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(crate::handlers::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match {
+        state
+            .db
+            .project_view_authorized_pubkey(tenant.community(), &pubkey_bytes)
+            .await
+            .map_err(|error| {
+                internal_error(&format!("Project View authorization lookup: {error}"))
+            })?
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: Project View requires current Community membership",
+        ));
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::project_view::filter_is_project_view_search)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_view:search",
+        ));
+    }
+
+    if let Some(page) =
+        parse_project_view_page_request(&raw_filters, &state.relay_keypair.public_key())?
+    {
+        if state.config.relay_private_key.is_none() {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:project_view:stable_signer",
+            ));
+        }
+        let snapshot_started = std::time::Instant::now();
+        let page_result = match page {
+            ProjectViewPageRequest::ActiveObjects {
+                revision,
+                projection_generation,
+                after,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_view_snapshot_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        revision,
+                        projection_generation,
+                        after,
+                        limit,
+                    )
+                    .await
+            }
+            ProjectViewPageRequest::V2CurrentEntities {
+                revision,
+                projection_generation,
+                after,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_view_v2_current_entities_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        revision,
+                        projection_generation,
+                        after,
+                        limit,
+                    )
+                    .await
+            }
+            ProjectViewPageRequest::RoleHistory {
+                revision,
+                projection_generation,
+                filter,
+                after,
+                limit,
+            } => {
+                state
+                    .db
+                    .project_view_role_history_page(
+                        tenant.community(),
+                        &state.relay_keypair.public_key(),
+                        &buzz_db::project_view::ProjectViewRoleHistoryPageRequest {
+                            project_revision: revision,
+                            projection_generation,
+                            filter,
+                            after,
+                            limit,
+                        },
+                    )
+                    .await
+            }
+        };
+        metrics::histogram!("buzz_project_view_snapshot_duration_seconds")
+            .record(snapshot_started.elapsed().as_secs_f64());
+        let page = page_result.map_err(|error| match error {
+            buzz_db::project_view::ProjectViewReadError::Conflict => {
+                metrics::counter!(
+                    "buzz_project_view_snapshot_retries_total",
+                    "reason" => "revision_changed"
+                )
+                .increment(1);
+                api_error(
+                    StatusCode::CONFLICT,
+                    "conflict:project_view:snapshot_changed",
+                )
+            }
+            buzz_db::project_view::ProjectViewReadError::InvalidCursor(_) => {
+                api_error(StatusCode::BAD_REQUEST, "invalid:project_view:cursor")
+            }
+            buzz_db::project_view::ProjectViewReadError::Database(_)
+            | buzz_db::project_view::ProjectViewReadError::Sqlx(_)
+            | buzz_db::project_view::ProjectViewReadError::Inconsistent(_) => {
+                internal_error("Project View snapshot is unavailable")
+            }
+        })?;
+        let events = page
+            .events
+            .into_iter()
+            .map(|stored| serde_json::to_value(stored.event))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                internal_error(&format!("Project View snapshot serialization: {error}"))
+            })?;
+        return Ok(Json(Value::Array(events)));
+    }
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
@@ -1096,16 +1758,13 @@ async fn query_events_authed(
                 "mixed search and non-search filters not supported",
             ));
         }
-        return handle_bridge_search(
-            state,
-            &raw_filters,
-            &filters,
-            &accessible_channels,
-            tenant,
-            &authed_pubkey_hex,
-            &pubkey_bytes,
-        )
-        .await;
+        let reader = BridgeSearchReader {
+            accessible_channels: &accessible_channels,
+            pubkey_hex: &authed_pubkey_hex,
+            pubkey_bytes: &pubkey_bytes,
+            project_view_read_allowed,
+        };
+        return handle_bridge_search(state, &raw_filters, &filters, tenant, &reader).await;
     }
 
     if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await {
@@ -1315,6 +1974,7 @@ async fn query_events_authed(
         if crate::handlers::req::filter_can_match_persona_shared_kinds(filter) {
             query.persona_reader = Some(pubkey_bytes.clone());
         }
+        exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
 
         match extract_before_id(raw) {
             BeforeId::Malformed => {
@@ -1379,6 +2039,13 @@ async fn query_events_authed(
                     // shared-gate (kind:30175 without ["shared","true"]). Single call
                     // covers all three gated event classes.
                     if !crate::handlers::req::event_visible_to_reader(&se.event, &pubkey_bytes) {
+                        continue;
+                    }
+                    if !project_view_read_allowed
+                        && buzz_core::kind::is_project_view_protocol_kind(
+                            se.event.kind.as_u16() as u32
+                        )
+                    {
                         continue;
                     }
                     if let Ok(v) = serde_json::to_value(&se.event) {
@@ -1476,16 +2143,61 @@ async fn count_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    super::relay_members::enforce_relay_membership(
+    let nip_oa_owner = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
     )
-    .await?;
+    .await?
+    .or_else(|| {
+        if !state.config.require_relay_membership {
+            super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+        } else {
+            None
+        }
+    });
+    if let Some(owner) = nip_oa_owner {
+        super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
+    }
 
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    let project_view_can_match = filters
+        .iter()
+        .any(crate::handlers::project_view::filter_can_match);
+    let project_view_exclusive = !filters.is_empty()
+        && filters
+            .iter()
+            .all(crate::handlers::project_view::filter_is_exclusively_project_view);
+    let project_view_read_allowed = if project_view_can_match {
+        state
+            .db
+            .project_view_authorized_pubkey(tenant.community(), &pubkey_bytes)
+            .await
+            .map_err(|error| {
+                internal_error(&format!("Project View authorization lookup: {error}"))
+            })?
+    } else {
+        false
+    };
+    if project_view_exclusive && !project_view_read_allowed {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: Project View requires current Community membership",
+        ));
+    }
+    if project_view_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::project_view::filter_is_project_view_search)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_view:search",
+        ));
+    }
 
     // P-gated kinds enforcement — same as WS REQ and /query.
     let authed_pubkey_hex = pubkey.to_hex();
@@ -1563,6 +2275,7 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
             // Persona visibility pushdown: same as REQ and /query paths, so the
             // fallback's query_events call doesn't over-fetch private persona rows.
             if needs_persona_filtering {
@@ -1609,6 +2322,13 @@ async fn count_events_authed(
                             ) {
                                 continue;
                             }
+                            if !project_view_read_allowed
+                                && buzz_core::kind::is_project_view_protocol_kind(
+                                    se.event.kind.as_u16() as u32,
+                                )
+                            {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -1627,6 +2347,7 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
             query.channel_ids = Some(accessible_channels.to_vec());
             // Persona visibility pushdown: pre-filter before ORDER/LIMIT on the
             // fallback query_events path.
@@ -1673,6 +2394,13 @@ async fn count_events_authed(
                                 &se.event,
                                 &pubkey_bytes,
                             ) {
+                                continue;
+                            }
+                            if !project_view_read_allowed
+                                && buzz_core::kind::is_project_view_protocol_kind(
+                                    se.event.kind.as_u16() as u32,
+                                )
+                            {
                                 continue;
                             }
                             total += 1;
@@ -1725,22 +2453,27 @@ fn search_hit_accepted(
     true
 }
 
+struct BridgeSearchReader<'a> {
+    accessible_channels: &'a [uuid::Uuid],
+    pubkey_hex: &'a str,
+    pubkey_bytes: &'a [u8],
+    project_view_read_allowed: bool,
+}
+
 /// Handle search filters by routing to Postgres FTS, then fetching full events
 /// from DB. Supports a bridge-only `page` extension over the FTS result set.
 async fn handle_bridge_search(
     state: &AppState,
     raw_filters: &[Value],
     filters: &[nostr::Filter],
-    accessible_channels: &[uuid::Uuid],
     tenant: &buzz_core::tenant::TenantContext,
-    reader_pubkey_hex: &str,
-    pubkey_bytes: &[u8],
+    reader: &BridgeSearchReader<'_>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Bridge always includes global (channel-less) events — same as WS with
     // full scopes. `None` means no accessible channels and no global access →
     // empty result set (the caller short-circuits exactly as the WS door EOSEs).
     let channel_scope = match crate::handlers::req::build_search_channel_scope_filter(
-        accessible_channels,
+        reader.accessible_channels,
         true, // include_global
     ) {
         Some(scope) => scope,
@@ -1771,7 +2504,7 @@ async fn handle_bridge_search(
                 let valid: Vec<uuid::Uuid> = vs
                     .iter()
                     .filter_map(|v| v.parse::<uuid::Uuid>().ok())
-                    .filter(|id| accessible_channels.contains(id))
+                    .filter(|id| reader.accessible_channels.contains(id))
                     .collect();
                 if valid.is_empty() {
                     continue; // All #h values inaccessible — skip filter.
@@ -1843,7 +2576,12 @@ async fn handle_bridge_search(
                 Some(ev) => ev,
                 None => continue,
             };
-            if !search_hit_accepted(filter, stored, accessible_channels, reader_pubkey_hex) {
+            if !search_hit_accepted(
+                filter,
+                stored,
+                reader.accessible_channels,
+                reader.pubkey_hex,
+            ) {
                 continue;
             }
             // Defense-in-depth: apply the full per-event visibility gate, which
@@ -1853,7 +2591,12 @@ async fn handle_bridge_search(
             // branch cannot currently return unshared persona content — but the
             // check here ensures that a future FTS allowlist change cannot silently
             // reopen the bypass.
-            if !crate::handlers::req::event_visible_to_reader(&stored.event, pubkey_bytes) {
+            if !crate::handlers::req::event_visible_to_reader(&stored.event, reader.pubkey_bytes) {
+                continue;
+            }
+            if !reader.project_view_read_allowed
+                && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
+            {
                 continue;
             }
             // Dedup across filters.
@@ -2328,6 +3071,83 @@ mod tests {
             .expect("sign auth event")
             .id
             .to_bytes()
+    }
+
+    #[test]
+    fn project_view_extension_parses_v2_current_and_role_history_scopes() {
+        let relay = Keys::generate().public_key();
+        let role_id = uuid::Uuid::new_v4();
+        let current = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+            "limit": 100,
+            "buzz_project_view": {
+                "scope": "v2_current_entities",
+                "revision": 7,
+                "projection_generation": 2,
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(&[current], &relay),
+            Ok(Some(ProjectViewPageRequest::V2CurrentEntities {
+                revision: 7,
+                projection_generation: 2,
+                limit: 100,
+                ..
+            }))
+        ));
+
+        let history = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+            "limit": 20,
+            "buzz_project_view": {
+                "scope": "role_history",
+                "revision": 7,
+                "projection_generation": 2,
+                "entity_types": ["role_checkpoint", "role_handoff"],
+                "role_id": role_id,
+                "after": {
+                    "project_revision": 5,
+                    "entity_type": "role_checkpoint",
+                    "entity_id": uuid::Uuid::new_v4(),
+                },
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(&[history], &relay),
+            Ok(Some(ProjectViewPageRequest::RoleHistory {
+                revision: 7,
+                projection_generation: 2,
+                limit: 20,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn project_view_history_scope_rejects_noncanonical_or_cross_scope_cursor_types() {
+        let relay = Keys::generate().public_key();
+        let filter = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-entity"],
+            "limit": 20,
+            "buzz_project_view": {
+                "scope": "role_history",
+                "revision": 7,
+                "projection_generation": 2,
+                "entity_types": ["role_checkpoint"],
+                "after": {
+                    "project_revision": 5,
+                    "entity_type": "work_commitment",
+                    "entity_id": uuid::Uuid::new_v4(),
+                },
+            },
+        });
+        assert!(parse_project_view_page_request(&[filter], &relay).is_err());
     }
 
     #[test]

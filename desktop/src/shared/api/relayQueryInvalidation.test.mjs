@@ -18,6 +18,7 @@ test("relay invalidation includes relay-backed channel and profile queries", () 
     ["relayMembers"],
     ["archivedIdentities"],
     ["oaOwner", "alice"],
+    ["project-view", "community-1"],
   ]) {
     assert.equal(isRelayDependentQueryKey(queryKey), true, queryKey.join("/"));
   }

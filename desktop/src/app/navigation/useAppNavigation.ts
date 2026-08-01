@@ -90,6 +90,29 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goCommunity = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/community",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goView = React.useCallback(
+    (behavior?: NavigationBehavior & { objectId?: string }) =>
+      commitNavigation(
+        {
+          to: "/view",
+          search: behavior?.objectId ? { object: behavior.objectId } : {},
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProject = React.useCallback(
     (
       projectId: string,
@@ -297,6 +320,7 @@ export function useAppNavigation() {
     closeWorkflowDetail,
     goAgents,
     goChannel,
+    goCommunity,
     goForumPost,
     goHome,
     goNewMessage,
@@ -306,6 +330,7 @@ export function useAppNavigation() {
     goSettings,
     goWorkflow,
     goWorkflows,
+    goView,
     openSearchHit,
   };
 }

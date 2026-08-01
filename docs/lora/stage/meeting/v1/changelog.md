@@ -46,7 +46,7 @@ qualification 硬失败，不能在 Runner 中去重掩盖。
 
 ### 问题
 
-迁移 `0031_meeting_v1_moderator_attempts.sql` 已完整定义主持人乐观判断所需的配置列、
+迁移 `0037_meeting_v1_moderator_attempts.sql` 已完整定义主持人乐观判断所需的配置列、
 Candidate eligibility、DecisionAttempt、RetryTicket 和外键，但仓库的 desired-state
 `schema/schema.sql` 没有同步。brownfield 数据库通过 migration 升级后可以工作，直接应用
 desired schema 的 fresh install 则会在 V1 Create 时因

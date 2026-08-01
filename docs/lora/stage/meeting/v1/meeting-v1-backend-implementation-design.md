@@ -986,8 +986,9 @@ domain revision 继续表达 speech/intent/floor 各自是否变化，但不再�
 
 ## 8. 数据库设计
 
-阶段一使用 `0029_meeting_v1_baton.sql`，阶段二使用
-`0030_meeting_v1_stage2.sql`。迁移保持 additive，不删除 V0 数据和约束语义。
+合并 Project View 后，阶段一使用 `0035_meeting_v1_baton.sql`，阶段二使用
+`0036_meeting_v1_stage2.sql`，Moderator Attempt 使用
+`0037_meeting_v1_moderator_attempts.sql`。迁移保持 additive，不删除 V0 数据和约束语义。
 
 下文子表字段清单为主要字段；除非特别说明，每张表都包含
 `community_id, session_id`，并以复合外键指向 `meeting_sessions`。pubkey、event ID 和

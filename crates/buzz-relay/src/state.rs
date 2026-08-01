@@ -54,6 +54,7 @@ struct ConnEntry {
     backpressure_count: Arc<AtomicU8>,
     subscriptions: ConnectionSubscriptions,
     authenticated_pubkey: Arc<std::sync::RwLock<Option<Vec<u8>>>>,
+    project_view_read_eligible: AtomicBool,
     grace_limit: u8,
 }
 
@@ -225,6 +226,7 @@ impl ConnectionManager {
                 backpressure_count,
                 subscriptions,
                 authenticated_pubkey: Arc::new(std::sync::RwLock::new(None)),
+                project_view_read_eligible: AtomicBool::new(false),
                 grace_limit,
             },
         );
@@ -250,6 +252,23 @@ impl ConnectionManager {
                 *slot = Some(pubkey_bytes);
             }
         }
+    }
+
+    /// Record whether the authenticated credential is Community-global and
+    /// carries Project View's required read scope.
+    pub fn set_project_view_read_eligible(&self, conn_id: Uuid, eligible: bool) {
+        if let Some(entry) = self.connections.get(&conn_id) {
+            entry
+                .project_view_read_eligible
+                .store(eligible, Ordering::Release);
+        }
+    }
+
+    /// Return the static credential half of the Project View live-read gate.
+    pub fn project_view_read_eligible(&self, conn_id: Uuid) -> bool {
+        self.connections
+            .get(&conn_id)
+            .is_some_and(|entry| entry.project_view_read_eligible.load(Ordering::Acquire))
     }
 
     /// Return live connection IDs authenticated as `pubkey_bytes` in one community.

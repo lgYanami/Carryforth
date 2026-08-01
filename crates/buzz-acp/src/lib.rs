@@ -11,8 +11,11 @@ mod meeting_v1;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project_space;
 mod queue;
 mod relay;
+mod role_brief;
+mod runtime_supervisor;
 mod setup_mode;
 mod usage;
 
@@ -24,6 +27,9 @@ use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
+use buzz_core::agent_process_env::{
+    MANAGED_AGENT_OWNER_ENV, MANAGED_AGENT_START_NONCE_ENV, MANAGED_RUNTIME_MODE_ENV,
+};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -42,7 +48,7 @@ use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    PromptResult, PromptSource, RoleContextRefreshRequestResult, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -889,9 +895,54 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("refresh_role_context") => {
+            handle_refresh_role_context_control(&payload, pool, observer);
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
+    }
+}
+
+/// Handle a `refresh_role_context` control frame without interrupting work.
+///
+/// The request applies at the next complete turn. An active native steer or
+/// tool call remains part of its current turn and does not become a synthetic
+/// Role Context or authorization boundary.
+fn handle_refresh_role_context_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(channel_id) = payload
+        .get("channelId")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<Uuid>().ok())
+    else {
+        tracing::warn!("observer refresh_role_context control frame missing valid channelId");
+        return;
+    };
+
+    let status = match pool.request_role_context_refresh(channel_id) {
+        RoleContextRefreshRequestResult::Scheduled => "scheduled",
+        RoleContextRefreshRequestResult::NextSessionFull => "next_session_full",
+    };
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: None,
+                turn_id: None,
+                started_at: None,
+            },
+            serde_json::json!({
+                "type": "refresh_role_context",
+                "status": status,
+                "appliesAt": "next_complete_turn",
+            }),
+        );
     }
 }
 
@@ -1236,11 +1287,15 @@ impl Drop for RespawnGuard {
 
 pub fn run() -> Result<()> {
     config::propagate_legacy_env_vars();
-    tokio_main()
+    let runtime_supervisor = runtime_supervisor::RuntimeSupervisorConfig::take_from_env()
+        .map_err(|error| anyhow::anyhow!("runtime supervisor configuration error: {error}"))?;
+    tokio_main(runtime_supervisor)
 }
 
 #[tokio::main]
-async fn tokio_main() -> Result<()> {
+async fn tokio_main(
+    runtime_supervisor_config: Option<runtime_supervisor::RuntimeSupervisorConfig>,
+) -> Result<()> {
     // Install the ring crypto provider for rustls (required for wss:// connections).
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -1336,12 +1391,11 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    let mut pool = if config.lazy_pool {
-        AgentPool::from_slots((0..config.agents).map(|_| None).collect())
-    } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
-    };
-    let mut pool_ready = !config.lazy_pool;
+    // Runtime supervision must allocate the epoch before a model-facing Agent
+    // child is spawned. Keep every slot empty until the verified Assignment
+    // and optional operator-installed binding have been resolved below.
+    let mut pool = AgentPool::from_slots((0..config.agents).map(|_| None).collect());
+    let mut pool_ready = false;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
 
     // Capture a startup watermark BEFORE connecting to the relay. This timestamp
@@ -1376,6 +1430,68 @@ async fn tokio_main() -> Result<()> {
     }
 
     tracing::info!("connected to relay at {}", config.relay_url);
+
+    let role_brief_resolver =
+        role_brief::RoleBriefResolver::new(relay.rest_client(), config.keys.public_key());
+    let startup_role_context = role_brief_resolver
+        .resolve_bounded(role_brief::RoleContextRefresh::Full)
+        .await;
+    match startup_role_context.error_code {
+        Some(code) => tracing::warn!(
+            status = startup_role_context.status,
+            error_code = code,
+            "managed Agent startup could not verify a Role Brief; writes remain fail-closed"
+        ),
+        None => tracing::info!(
+            status = startup_role_context.status,
+            assignment_id = ?startup_role_context.assignment_id,
+            project_revision = ?startup_role_context.project_revision,
+            projection_generation = ?startup_role_context.projection_generation,
+            "managed Agent startup Role context resolved"
+        ),
+    }
+    if startup_role_context.error_code.is_some() && runtime_supervisor_config.is_some() {
+        return Err(anyhow::anyhow!(
+            "Runtime supervision requires a verified startup Role context; \
+             persisted state was left untouched"
+        ));
+    }
+
+    let mut runtime_supervisor = runtime_supervisor::RuntimeSupervisorCoordinator::new(
+        runtime_supervisor_config,
+        relay.rest_client(),
+        config.keys.public_key(),
+        config.relay_url.clone(),
+    );
+    config.runtime_fence_path = runtime_supervisor.fence_path();
+    runtime_supervisor
+        .prepare_startup(startup_role_context.assignment_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("Runtime supervision failed closed: {error}"))?;
+
+    if !config.lazy_pool {
+        match initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None)
+            .await
+        {
+            Ok(initialized) => {
+                pool = initialized;
+                pool_ready = true;
+            }
+            Err(error) => {
+                let _ = runtime_supervisor
+                    .mark_start_failed(error.to_string())
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    runtime_supervisor
+        .mark_healthy()
+        .await
+        .map_err(|error| anyhow::anyhow!("Runtime health receipt failed: {error}"))?;
+    let (runtime_supervisor, runtime_supervisor_task) = runtime_supervisor.spawn();
+    let role_brief_resolver =
+        role_brief_resolver.with_runtime_supervisor(runtime_supervisor.clone());
 
     relay
         .subscribe_membership_notifications()
@@ -1529,7 +1645,7 @@ async fn tokio_main() -> Result<()> {
         ));
     }
 
-    let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    let runtime_start_nonce = std::env::var(MANAGED_AGENT_START_NONCE_ENV).unwrap_or_default();
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
@@ -1579,6 +1695,7 @@ async fn tokio_main() -> Result<()> {
             .to_string_lossy()
             .to_string(),
         rest_client: relay.rest_client(),
+        role_brief_resolver,
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
@@ -1613,6 +1730,7 @@ async fn tokio_main() -> Result<()> {
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
         rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
         channel_info: ctx.channel_info.clone(),
         context_message_limit: 0,
         max_turns_per_session: ctx.max_turns_per_session,
@@ -1640,6 +1758,7 @@ async fn tokio_main() -> Result<()> {
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
         rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
         channel_info: ctx.channel_info.clone(),
         context_message_limit: 0,
         max_turns_per_session: ctx.max_turns_per_session,
@@ -1809,7 +1928,13 @@ async fn tokio_main() -> Result<()> {
         Wake(u32, Result<AgentPool, String>),
     }
 
-    loop {
+    #[derive(Clone, Copy)]
+    enum MainLoopExit {
+        Graceful,
+        Abnormal(&'static str),
+    }
+
+    let main_loop_exit = loop {
         pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
         meeting_controller.set_available_agent_slots(if pool_ready {
             pool.idle_count()
@@ -1894,7 +2019,10 @@ async fn tokio_main() -> Result<()> {
                 }
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
+                let env = managed_agent_env(
+                    &config.persona_env_vars,
+                    config.runtime_fence_path.as_deref(),
+                );
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -1987,7 +2115,7 @@ async fn tokio_main() -> Result<()> {
                     Some(result) => Some(PoolEvent::Result(Box::new(result))),
                     None => {
                         tracing::info!("result channel closed — exiting main loop");
-                        break;
+                        break MainLoopExit::Abnormal("agent result channel closed");
                     }
                 },
                 // Guard: join_next() returns None immediately when JoinSet is
@@ -2478,7 +2606,7 @@ async fn tokio_main() -> Result<()> {
                             if let Err(e) = relay.reconnect().await {
                                 tracing::error!("relay background task is gone: {e} — exiting");
                                 tokio::time::sleep(Duration::from_secs(1)).await;
-                                break;
+                                break MainLoopExit::Abnormal("Relay reconnect failed");
                             }
                             meeting_controller.mark_all_for_resync();
                         }
@@ -2553,7 +2681,7 @@ async fn tokio_main() -> Result<()> {
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("shutting down");
-                    break;
+                    break MainLoopExit::Graceful;
                 }
             }
         };
@@ -2588,7 +2716,9 @@ async fn tokio_main() -> Result<()> {
                         .await;
                 }
                 if loop_action == LoopAction::Exit {
-                    break;
+                    break MainLoopExit::Abnormal(
+                        "Agent pool exhausted while handling a prompt result",
+                    );
                 }
                 let (drain_action, failed_meeting_turns) = drain_ready_join_results(
                     &mut pool,
@@ -2607,7 +2737,9 @@ async fn tokio_main() -> Result<()> {
                     meeting_controller.handle_turn_failure(&turn_id).await;
                 }
                 if drain_action == LoopAction::Exit {
-                    break;
+                    break MainLoopExit::Abnormal(
+                        "Agent pool exhausted while draining completed work",
+                    );
                 }
                 dispatch_meeting_pending(
                     &mut pool,
@@ -2644,7 +2776,7 @@ async fn tokio_main() -> Result<()> {
                 }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
-                    break;
+                    break MainLoopExit::Abnormal("all Agent processes are unavailable");
                 }
                 dispatch_meeting_pending(
                     &mut pool,
@@ -2825,7 +2957,42 @@ async fn tokio_main() -> Result<()> {
             }
             None => {} // relay/heartbeat/shutdown branches handled inline above
         }
+    };
+
+    // Record the harness-level exit before the longer Agent-pool drain. Desktop
+    // grants the harness only a short SIGTERM window before escalating to
+    // SIGKILL. Only an explicit signal/owner shutdown is graceful; Relay or
+    // Agent-pool failure must retain state and open recovery instead of silently
+    // minting a replacement logical Runtime. A timeout keeps local shutdown
+    // authoritative and leaves state for the next trusted generation.
+    let evidence_result = tokio::time::timeout(Duration::from_millis(750), async {
+        match main_loop_exit {
+            MainLoopExit::Graceful => runtime_supervisor.graceful_stop().await,
+            MainLoopExit::Abnormal(summary) => runtime_supervisor.abnormal_stop(summary).await,
+        }
+    })
+    .await;
+    match evidence_result {
+        Ok(Ok(())) => match main_loop_exit {
+            MainLoopExit::Graceful => {
+                tracing::info!("Runtime supervisor reconciled graceful harness stop")
+            }
+            MainLoopExit::Abnormal(summary) => {
+                tracing::warn!(
+                    summary,
+                    "Runtime supervisor reconciled abnormal harness exit"
+                )
+            }
+        },
+        Ok(Err(error)) => {
+            tracing::warn!("managed Runtime exit evidence failed: {error}")
+        }
+        Err(_) => {
+            tracing::warn!("managed Runtime exit evidence timed out; recovery state retained")
+        }
     }
+    runtime_supervisor_task.abort();
+    let _ = runtime_supervisor_task.await;
 
     // Drain wake tasks gracefully rather than aborting: an in-flight
     // initialize_agent_pool observes the shutdown watch at its biased per-slot
@@ -3523,6 +3690,13 @@ fn handle_prompt_result(
     for ch in removed_channels {
         result.agent.state.invalidate_channel(ch);
     }
+    if let PromptSource::Channel(channel_id) = &result.source {
+        if removed_channels.contains(channel_id) {
+            pool.discard_pending_role_context_refresh(*channel_id);
+        } else {
+            pool.apply_pending_role_context_refresh(&mut result.agent.state, &result.source);
+        }
+    }
 
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
@@ -3860,7 +4034,10 @@ fn recover_panicked_agent(
     }
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = managed_agent_env(
+        &config.persona_env_vars,
+        config.runtime_fence_path.as_deref(),
+    );
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -4062,7 +4239,10 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = managed_agent_env(
+        &config.persona_env_vars,
+        config.runtime_fence_path.as_deref(),
+    );
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -4129,12 +4309,61 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env: managed_agent_env(
+                &config.persona_env_vars,
+                config.runtime_fence_path.as_deref(),
+            ),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
         }
     }
+}
+
+fn managed_agent_env(
+    persona_env: &[(String, String)],
+    runtime_fence_path: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let desktop_owner_marker = std::env::var(MANAGED_AGENT_OWNER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    managed_agent_env_for_owner(
+        persona_env,
+        runtime_fence_path,
+        desktop_owner_marker.as_deref(),
+    )
+}
+
+fn managed_agent_env_for_owner(
+    persona_env: &[(String, String)],
+    runtime_fence_path: Option<&std::path::Path>,
+    desktop_owner_marker: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = persona_env
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                MANAGED_AGENT_OWNER_ENV
+                    | MANAGED_RUNTIME_MODE_ENV
+                    | "BUZZ_RUNTIME_ID"
+                    | "BUZZ_RUNTIME_EPOCH"
+                    | runtime_supervisor::RUNTIME_FENCE_PATH_ENV
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    env.push((MANAGED_RUNTIME_MODE_ENV.to_owned(), "1".to_owned()));
+    if let Some(owner) = desktop_owner_marker.filter(|value| !value.is_empty()) {
+        env.push((MANAGED_AGENT_OWNER_ENV.to_owned(), owner.to_owned()));
+    }
+    if let Some(path) = runtime_fence_path {
+        env.push((
+            runtime_supervisor::RUNTIME_FENCE_PATH_ENV.to_owned(),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    env
 }
 
 async fn initialize_agent_pool(
@@ -4538,6 +4767,16 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
+    let desktop_owner_marker = std::env::var(MANAGED_AGENT_OWNER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    build_mcp_servers_for_owner(config, desktop_owner_marker.as_deref())
+}
+
+fn build_mcp_servers_for_owner(
+    config: &Config,
+    desktop_owner_marker: Option<&str>,
+) -> Vec<McpServer> {
     if config.mcp_command.is_empty() {
         return vec![];
     }
@@ -4566,7 +4805,23 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         .to_bech32()
                         .expect("secret key bech32 encoding should never fail"),
                 },
+                EnvVar {
+                    name: MANAGED_RUNTIME_MODE_ENV.into(),
+                    value: "1".into(),
+                },
             ];
+            if let Some(owner) = desktop_owner_marker.filter(|value| !value.is_empty()) {
+                env.push(EnvVar {
+                    name: MANAGED_AGENT_OWNER_ENV.into(),
+                    value: owner.to_owned(),
+                });
+            }
+            if let Some(path) = &config.runtime_fence_path {
+                env.push(EnvVar {
+                    name: runtime_supervisor::RUNTIME_FENCE_PATH_ENV.into(),
+                    value: path.to_string_lossy().into_owned(),
+                });
+            }
             // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
             // so the MCP server can attach it to every signed event.
             if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
@@ -5426,6 +5681,7 @@ mod build_mcp_servers_tests {
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            runtime_fence_path: None,
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
@@ -5438,7 +5694,7 @@ mod build_mcp_servers_tests {
     #[test]
     fn session_new_mcp_server_has_required_fields() {
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
         assert_eq!(server.name, "test-mcp-server");
@@ -5452,6 +5708,114 @@ mod build_mcp_servers_tests {
             names.contains(&"BUZZ_PRIVATE_KEY"),
             "missing BUZZ_PRIVATE_KEY; got {names:?}"
         );
+        assert!(
+            names.contains(&MANAGED_RUNTIME_MODE_ENV),
+            "missing {MANAGED_RUNTIME_MODE_ENV}; got {names:?}"
+        );
+        assert_eq!(
+            server
+                .env
+                .iter()
+                .find(|env| env.name == MANAGED_RUNTIME_MODE_ENV)
+                .map(|env| env.value.as_str()),
+            Some("1")
+        );
+        assert!(!names.contains(&MANAGED_AGENT_OWNER_ENV));
+    }
+
+    #[test]
+    fn session_new_mcp_server_preserves_desktop_owner_marker() {
+        let config = test_config();
+        let servers = build_mcp_servers_for_owner(&config, Some("xyz.block.buzz.app.dev"));
+        assert_eq!(
+            servers[0]
+                .env
+                .iter()
+                .find(|env| env.name == MANAGED_AGENT_OWNER_ENV)
+                .map(|env| env.value.as_str()),
+            Some("xyz.block.buzz.app.dev")
+        );
+    }
+
+    #[test]
+    fn session_new_mcp_server_receives_dynamic_runtime_fence_path() {
+        let mut config = test_config();
+        config.runtime_fence_path = Some(std::path::PathBuf::from("/tmp/buzz-runtime.fence.json"));
+        let servers = build_mcp_servers_for_owner(&config, None);
+        assert_eq!(
+            servers[0]
+                .env
+                .iter()
+                .find(|env| env.name == runtime_supervisor::RUNTIME_FENCE_PATH_ENV)
+                .map(|env| env.value.as_str()),
+            Some("/tmp/buzz-runtime.fence.json")
+        );
+    }
+
+    #[test]
+    fn managed_runtime_mode_and_desktop_owner_override_persona_values() {
+        let env = managed_agent_env_for_owner(
+            &[
+                ("PERSONA".to_owned(), "developer".to_owned()),
+                (
+                    MANAGED_AGENT_OWNER_ENV.to_owned(),
+                    "forged-owner".to_owned(),
+                ),
+                (MANAGED_RUNTIME_MODE_ENV.to_owned(), "0".to_owned()),
+            ],
+            None,
+            Some("xyz.block.buzz.app.dev"),
+        );
+        let mode_values = env
+            .iter()
+            .filter(|(name, _)| name == MANAGED_RUNTIME_MODE_ENV)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(mode_values, vec!["1"]);
+        let owner_values = env
+            .iter()
+            .filter(|(name, _)| name == MANAGED_AGENT_OWNER_ENV)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(owner_values, vec!["xyz.block.buzz.app.dev"]);
+        assert!(env
+            .iter()
+            .any(|(name, value)| name == "PERSONA" && value == "developer"));
+    }
+
+    #[test]
+    fn standalone_managed_runtime_does_not_invent_desktop_owner() {
+        let env = managed_agent_env_for_owner(&[], None, None);
+        assert!(env
+            .iter()
+            .any(|(name, value)| name == MANAGED_RUNTIME_MODE_ENV && value == "1"));
+        assert!(!env.iter().any(|(name, _)| name == MANAGED_AGENT_OWNER_ENV));
+    }
+
+    #[test]
+    fn runtime_fence_path_overrides_persona_and_removes_static_pair() {
+        let expected_path = std::path::Path::new("/tmp/buzz-runtime.fence.json");
+        let env = managed_agent_env_for_owner(
+            &[
+                ("BUZZ_RUNTIME_ID".to_owned(), Uuid::new_v4().to_string()),
+                ("BUZZ_RUNTIME_EPOCH".to_owned(), "999".to_owned()),
+                (
+                    runtime_supervisor::RUNTIME_FENCE_PATH_ENV.to_owned(),
+                    "/tmp/persona-controlled".to_owned(),
+                ),
+            ],
+            Some(expected_path),
+            None,
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == runtime_supervisor::RUNTIME_FENCE_PATH_ENV)
+                .map(|(_, value)| value.as_str()),
+            expected_path.to_str()
+        );
+        assert!(!env
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "BUZZ_RUNTIME_ID" | "BUZZ_RUNTIME_EPOCH")));
     }
 
     #[test]
@@ -5459,7 +5823,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -5476,7 +5840,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -5488,7 +5852,7 @@ mod build_mcp_servers_tests {
     fn empty_mcp_command_returns_no_servers() {
         let mut config = test_config();
         config.mcp_command = "".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert!(
             servers.is_empty(),
             "empty mcp_command should produce no MCP servers"
@@ -5499,7 +5863,7 @@ mod build_mcp_servers_tests {
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
         config.mcp_command = "/opt/bin/my-mcp-server".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "my-mcp-server");
     }
@@ -5520,7 +5884,7 @@ mod build_mcp_servers_tests {
 
         // Confirm a non-empty command with no stem (e.g. just a dot) also falls back.
         config.mcp_command = ".".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers_for_owner(&config, None);
         assert_eq!(servers.len(), 1);
         assert_eq!(
             servers[0].name, "mcp",
@@ -5592,6 +5956,7 @@ mod error_outcome_emission_tests {
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            runtime_fence_path: None,
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,

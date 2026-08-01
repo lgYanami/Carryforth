@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   clearCommunityDestinations,
+  communityDestinationFromRoute,
   loadCommunityDestination,
   removeCommunityDestination,
   saveCommunityDestination,
@@ -97,4 +98,32 @@ test("clears all destinations", () => {
   clearCommunityDestinations(storage);
 
   assert.equal(storage.length, 0);
+});
+
+test("only Inbox and channels replace a Community work destination", () => {
+  assert.deepEqual(communityDestinationFromRoute("home", null), {
+    kind: "home",
+  });
+  assert.deepEqual(communityDestinationFromRoute("channel", "general"), {
+    kind: "channel",
+    channelId: "general",
+  });
+  assert.equal(communityDestinationFromRoute("channel", null), null);
+
+  for (const temporaryView of [
+    "community",
+    "view",
+    "settings",
+    "projects",
+    "agents",
+    "workflows",
+    "pulse",
+    "messages",
+  ]) {
+    assert.equal(
+      communityDestinationFromRoute(temporaryView, null),
+      null,
+      `${temporaryView} must preserve the existing work destination`,
+    );
+  }
 });

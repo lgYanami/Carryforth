@@ -67,6 +67,11 @@ export const KIND_USER_STATUS = 30315;
 export const KIND_AGENT_OBSERVER_FRAME = 24200;
 export const KIND_AGENT_TURN_METRIC = 44200;
 export const KIND_EVENT_REMINDER = 30300;
+// Relay-authored Project View projection. These events are only live
+// invalidation signals in the React client; the native command re-reads and
+// verifies a complete revision-consistent snapshot before anything is shown.
+export const KIND_PROJECT_VIEW_OBJECT = 40903;
+export const KIND_PROJECT_VIEW_META = 40904;
 export const KIND_REPO_ANNOUNCEMENT = 30617;
 export const KIND_REPO_STATE = 30618;
 export const KIND_GIT_PATCH = 1617;

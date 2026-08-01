@@ -503,7 +503,7 @@ export type SwitchManagedAgentModelStatus =
   | "no_active_turn";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
+  type: "cancel_turn" | "switch_model" | "refresh_role_context";
   status: string;
   modelId?: string;
 };

@@ -424,6 +424,8 @@ pub fn sanitized_reason_for(err: &crate::handlers::ingest::IngestError) -> Sanit
     match err {
         E::Rejected(_) => SanitizedReason::Invalid,
         E::AuthFailed(_) => SanitizedReason::Restricted,
+        E::Conflict(_) | E::Unsupported(_) => SanitizedReason::Invalid,
+        E::Unavailable(_) => SanitizedReason::ServerError,
         E::Internal(_) => SanitizedReason::ServerError,
     }
 }

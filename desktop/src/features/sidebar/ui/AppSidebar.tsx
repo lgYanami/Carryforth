@@ -105,7 +105,10 @@ type AppSidebarProps = {
     | "agents"
     | "workflows"
     | "pulse"
-    | "projects";
+    | "community"
+    | "view"
+    | "projects"
+    | "settings";
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
   communities: Community[];
@@ -143,6 +146,7 @@ type AppSidebarProps = {
   onRemoveCommunity: (id: string) => void;
   onCreateAgent: () => void;
   onSelectAgents: () => void;
+  onSelectCommunity: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;
@@ -212,6 +216,7 @@ export function AppSidebar({
   onRemoveCommunity,
   onCreateAgent,
   onSelectAgents,
+  onSelectCommunity,
   onSelectProjects,
   onSelectPulse,
   onSelectWorkflows,
@@ -567,6 +572,7 @@ export function AppSidebar({
         data-testid="app-sidebar-scroll-anchor"
       >
         <AppSidebarPinnedHeader
+          activeCommunityName={activeCommunity?.name ?? "Community"}
           channelLabels={dmChannelLabels}
           currentPubkey={currentPubkey}
           onBrowseChannels={onBrowseChannels}
@@ -574,9 +580,11 @@ export function AppSidebar({
           onCreateChannel={handleOpenCreateChannel}
           onOpenDm={onOpenDm}
           onOpenSearchResult={onOpenSearchResult}
+          onSelectCommunity={onSelectCommunity}
           onSelectChannel={onSelectChannel}
           searchChannels={searchChannels}
           searchFocusRequest={searchFocusRequest}
+          selectedView={selectedView}
           suggestionChannels={channels}
         />
 

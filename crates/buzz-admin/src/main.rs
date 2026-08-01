@@ -20,6 +20,8 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod project_view;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -80,6 +82,11 @@ enum Command {
     ProductFeedback {
         #[command(subcommand)]
         command: ProductFeedbackCommand,
+    },
+    /// Inspect or change the centralized Project View feature gate.
+    ProjectView {
+        #[command(subcommand)]
+        command: project_view::ProjectViewCommand,
     },
     /// Emit kind:39000/39002 events for channels missing them.
     ///
@@ -148,6 +155,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::ProductFeedback {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
+        Command::ProjectView { command } => project_view::run(command).await,
         Command::ReconcileChannels { relay_key } => {
             reconcile_channels(relay_key).await?;
             Ok(0)
@@ -235,6 +243,16 @@ async fn cmd_remove_member(pubkey_arg: String, role_filter: Option<String>) -> R
         Ok(RemoveResult::RoleMismatch) => {
             let role_str = role_filter.as_deref().unwrap_or("(unknown)");
             eprintln!("error: role mismatch — {pubkey_hex} is not currently '{role_str}'");
+            return Ok(4);
+        }
+        Ok(RemoveResult::AssignmentActive) => {
+            eprintln!(
+                "error: {pubkey_hex} has an active Role Assignment; end the Assignment first"
+            );
+            return Ok(4);
+        }
+        Ok(RemoveResult::ManagedAgentAssignmentActive) => {
+            eprintln!("error: {pubkey_hex} owns a managed Agent with an active Role Assignment");
             return Ok(4);
         }
         Err(e) => {
@@ -399,6 +417,12 @@ async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
         Keys::parse(&hex).map_err(|e| anyhow::anyhow!("invalid BUZZ_RELAY_PRIVATE_KEY: {e}"))?
     };
 
+    let pubsub = connect_pubsub().await?;
+
+    Ok((db, pubsub, relay_keypair))
+}
+
+pub(crate) async fn connect_pubsub() -> Result<Arc<PubSubManager>> {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
@@ -414,10 +438,10 @@ async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
             .map_err(|e| anyhow::anyhow!("PubSub init failed: {e}"))?,
     );
 
-    Ok((db, pubsub, relay_keypair))
+    Ok(pubsub)
 }
 
-async fn connect_db() -> Result<Db> {
+pub(crate) async fn connect_db() -> Result<Db> {
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
     let db = Db::new(&DbConfig {

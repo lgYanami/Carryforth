@@ -10,8 +10,9 @@ use tracing::{debug, error, info, warn};
 
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
-    event_kind_u32, is_ephemeral, is_unshared_persona_event, AUTHOR_ONLY_KINDS,
-    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    event_kind_u32, is_ephemeral, is_project_view_protocol_kind, is_unshared_persona_event,
+    AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -43,10 +44,11 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         20000..=29999 => kind.to_string(),
         30023 | 30315 | 39000..=39003 => kind.to_string(),
         40002..=40100 => kind.to_string(),
+        40903..=40904 => kind.to_string(),
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
-        44200 => kind.to_string(),
+        44200 | 44300 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
@@ -61,6 +63,12 @@ fn event_frame_for_sub(sub_id: &str, event_json: &str) -> String {
 
 fn event_frame_bytes_for_sub(sub_id: &str, event_json: &str) -> Arc<Bytes> {
     Arc::new(Bytes::from(event_frame_for_sub(sub_id, event_json)))
+}
+
+fn record_project_view_projection_dispatch_error(kind: u32) {
+    if matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META) {
+        metrics::counter!("buzz_project_view_projection_dispatch_errors_total").increment(1);
+    }
 }
 
 fn fanout_frame_cache<'a, I>(sub_ids: I, event_json: &str) -> HashMap<&'a str, Arc<Bytes>>
@@ -132,6 +140,47 @@ pub async fn filter_fanout_by_access(
             state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
         })
         .collect();
+
+    // Project View is Community-global but never public. Revalidate both
+    // halves of its read gate at the final send chokepoint: the connection's
+    // immutable credential scope and current DB member/agent-owner + ban state.
+    // One set-based lookup covers every candidate recipient on this pod.
+    let matches = if is_project_view_protocol_kind(event_kind_u32(&stored_event.event)) {
+        let credential_eligible: Vec<_> = matches
+            .into_iter()
+            .filter(|(conn_id, _)| state.conn_manager.project_view_read_eligible(*conn_id))
+            .collect();
+        let pubkeys: HashSet<Vec<u8>> = credential_eligible
+            .iter()
+            .filter_map(|(conn_id, _)| state.conn_manager.pubkey_for_conn(*conn_id))
+            .collect();
+        let pubkeys: Vec<Vec<u8>> = pubkeys.into_iter().collect();
+        let authorized = match state
+            .db
+            .project_view_authorized_pubkeys(community_id, &pubkeys)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                warn!(
+                    community_id = %community_id,
+                    "Project View fan-out authorization failed closed: {error}"
+                );
+                return Vec::new();
+            }
+        };
+        credential_eligible
+            .into_iter()
+            .filter(|(conn_id, _)| {
+                state
+                    .conn_manager
+                    .pubkey_for_conn(*conn_id)
+                    .is_some_and(|pubkey| authorized.contains(&pubkey))
+            })
+            .collect()
+    } else {
+        matches
+    };
 
     // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
     // event's own author. This gate lives here — the chokepoint shared by the
@@ -417,16 +466,62 @@ pub(crate) async fn dispatch_persistent_event(
     actor_pubkey_hex: &str,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
 ) -> usize {
-    let event_id_hex = stored_event.event.id.to_hex();
-    enqueue_event_created_audit(
+    dispatch_persistent_event_with_options(
         tenant,
         state,
         stored_event,
         kind_u32,
         actor_pubkey_hex,
-        &event_id_hex,
+        threaded_visibility,
+        PersistentDispatchOptions::default(),
     )
-    .await;
+    .await
+}
+
+/// Explicit post-commit side-effect policy.
+///
+/// Ordinary ingest uses the default. Relay-authored Project View projections
+/// disable audit and workflow here because the accepted member command is the
+/// one attributable business action.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PersistentDispatchOptions {
+    /// Enqueue an event-created audit record.
+    pub audit: bool,
+    /// Allow the stored event to trigger workflows.
+    pub workflow: bool,
+}
+
+impl Default for PersistentDispatchOptions {
+    fn default() -> Self {
+        Self {
+            audit: true,
+            workflow: true,
+        }
+    }
+}
+
+/// Schedule delivery with an explicit audit/workflow policy.
+pub(crate) async fn dispatch_persistent_event_with_options(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    stored_event: &StoredEvent,
+    kind_u32: u32,
+    actor_pubkey_hex: &str,
+    threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
+    options: PersistentDispatchOptions,
+) -> usize {
+    let event_id_hex = stored_event.event.id.to_hex();
+    if options.audit {
+        enqueue_event_created_audit(
+            tenant,
+            state,
+            stored_event,
+            kind_u32,
+            actor_pubkey_hex,
+            &event_id_hex,
+        )
+        .await;
+    }
 
     let tenant = tenant.clone();
     let state = Arc::clone(state);
@@ -441,7 +536,10 @@ pub(crate) async fn dispatch_persistent_event(
             &stored_event,
             kind_u32,
             &actor_pubkey_hex,
-            PersistentDispatchOptions::default(),
+            PersistentDispatchOptions {
+                audit: false,
+                workflow: options.workflow,
+            },
             threaded_visibility,
         )
         .await
@@ -487,8 +585,8 @@ pub(crate) async fn dispatch_persistent_event_now(
         kind_u32,
         actor_pubkey_hex,
         PersistentDispatchOptions {
-            suppress_workflow: true,
-            ..PersistentDispatchOptions::default()
+            audit: false,
+            workflow: false,
         },
         threaded_visibility,
     )
@@ -503,12 +601,6 @@ pub(crate) async fn dispatch_persistent_event_now(
     )
     .await;
     Ok(recipients)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct PersistentDispatchOptions {
-    enqueue_audit: bool,
-    suppress_workflow: bool,
 }
 
 /// Run post-commit delivery/side effects for a stored event.
@@ -542,6 +634,7 @@ async fn dispatch_persistent_event_inner(
         state
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
+        record_project_view_projection_dispatch_error(kind_u32);
         warn!(event_id = %event_id_hex, "Redis publish failed: {error}");
         Some(format!("Redis publish failed: {error}"))
     } else {
@@ -573,6 +666,7 @@ async fn dispatch_persistent_event_inner(
             error!(event_id = %event_id_hex, "Failed to serialize event for fan-out: {e}");
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
+            record_project_view_projection_dispatch_error(kind_u32);
             return Err(format!("serialize event for fan-out: {e}"));
         }
     };
@@ -627,7 +721,7 @@ async fn dispatch_persistent_event_inner(
     // out-of-band index to feed. The old Typesense `index_event` worker and its
     // `search_index_tx` mpsc are gone with the Typesense backend.
 
-    if options.enqueue_audit {
+    if options.audit {
         enqueue_event_created_audit(
             tenant,
             state,
@@ -651,7 +745,7 @@ async fn dispatch_persistent_event_inner(
     // fails. Defer workflow side effects until a publish succeeds so one
     // canonical meeting event cannot start the same workflow on every retry.
     if publish_error.is_none()
-        && !options.suppress_workflow
+        && options.workflow
         && !buzz_core::kind::is_workflow_execution_kind(kind_u32)
         && !buzz_core::kind::is_command_kind(kind_u32)
         && !is_relay_workflow_msg
@@ -881,6 +975,9 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             let (msg, reason) = match &e {
                 IngestError::Rejected(m) => (m.clone(), "invalid"),
                 IngestError::AuthFailed(m) => (m.clone(), "auth"),
+                IngestError::Conflict(m) => (m.clone(), "conflict"),
+                IngestError::Unsupported(m) => (m.clone(), "unsupported"),
+                IngestError::Unavailable(m) => (m.clone(), "unavailable"),
                 IngestError::Internal(_) => ("error: internal server error".to_string(), "error"),
             };
             reject(reason);
@@ -1934,8 +2031,8 @@ mod tests {
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
                 super::super::PersistentDispatchOptions {
-                    enqueue_audit: true,
-                    ..super::super::PersistentDispatchOptions::default()
+                    audit: true,
+                    workflow: true,
                 },
                 None,
             )
@@ -2040,8 +2137,8 @@ mod tests {
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
                 super::super::PersistentDispatchOptions {
-                    enqueue_audit: true,
-                    ..super::super::PersistentDispatchOptions::default()
+                    audit: true,
+                    workflow: true,
                 },
                 None,
             )
@@ -2054,8 +2151,8 @@ mod tests {
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
                 super::super::PersistentDispatchOptions {
-                    enqueue_audit: true,
-                    ..super::super::PersistentDispatchOptions::default()
+                    audit: true,
+                    workflow: true,
                 },
                 None,
             )

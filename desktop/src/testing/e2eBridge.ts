@@ -35,6 +35,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_PROJECT_VIEW_META,
   KIND_REPO_ANNOUNCEMENT,
   KIND_REPO_STATE,
   KIND_STREAM_MESSAGE_EDIT,
@@ -51,6 +52,12 @@ import type {
   RawInstallRuntimeResult,
   RuntimeFileConfigSubset,
 } from "@/shared/api/tauri";
+import type {
+  RawProjectViewLoadResult,
+  RawProjectViewMutationResult,
+  RawProjectViewRoleMutationResult,
+} from "@/shared/api/tauriProjectView";
+import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRoleHistory";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -70,6 +77,7 @@ type MockManagedAgentSeed = {
   name: string;
   avatarUrl?: string | null;
   personaId?: string | null;
+  relayUrl?: string;
   status?: RawManagedAgent["status"];
   channelNames?: string[];
   channelIds?: string[];
@@ -281,6 +289,23 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    /** Verified Project View command result returned to the View screen. */
+    projectView?: RawProjectViewLoadResult;
+    /** Community-isolated Project View results keyed by applied Relay URL. */
+    projectViewsByRelayUrl?: Record<string, RawProjectViewLoadResult>;
+    projectViewReadDelayMs?: number;
+    projectViewReadError?: string;
+    projectViewMutationDelayMs?: number;
+    projectViewMutationError?: string;
+    projectViewMutationResult?: RawProjectViewMutationResult;
+    projectViewMutationResults?: RawProjectViewMutationResult[];
+    projectViewAfterMutation?: RawProjectViewLoadResult;
+    projectViewRoleMutationDelayMs?: number;
+    projectViewRoleMutationError?: string;
+    projectViewRoleMutationResult?: RawProjectViewRoleMutationResult;
+    projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
+    projectViewAfterRoleMutation?: RawProjectViewLoadResult;
+    projectViewRoleHistoryPages?: RawProjectRoleHistoryPage[];
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1155,6 +1180,22 @@ declare global {
     /** Count of `get_event` invocations for the current defer-target ID since
      *  the last time `__BUZZ_E2E_DEFER_GET_EVENT__` was set. */
     __BUZZ_E2E_GET_EVENT_CALL_COUNT__?: number;
+    /** Typed Project View mutation payloads submitted during the current test. */
+    __BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?: unknown[];
+    /** Typed Project View Role intents submitted during the current test. */
+    __BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?: unknown[];
+    /** Revision-pinned Role history page requests made during the current test. */
+    __BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__?: unknown[];
+    /** Replace the next trusted Project View command result. */
+    __BUZZ_E2E_SET_PROJECT_VIEW__?: (
+      result: RawProjectViewLoadResult,
+      relayUrl?: string,
+    ) => void;
+    /** Emit one Project View projection signal through the mock live socket. */
+    __BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?: (input?: {
+      kind?: number;
+    }) => RelayEvent;
+    __BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?: () => boolean;
   }
 }
 
@@ -1985,7 +2026,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     pubkey: seed.pubkey,
     name: seed.name,
     persona_id: seed.personaId ?? null,
-    relay_url: DEFAULT_RELAY_WS_URL,
+    relay_url: seed.relayUrl ?? DEFAULT_RELAY_WS_URL,
     acp_command: "buzz-acp",
     agent_command: "goose",
     agent_args: ["acp"],
@@ -2758,6 +2799,7 @@ const mockUserStatuses: RelayEvent[] = [];
 const mockReminderEvents: RelayEvent[] = [];
 let mockRelayMembers: RawRelayMember[] = [];
 const mockSockets = new Map<number, MockSocket>();
+let mockAppliedRelayUrl = DEFAULT_RELAY_WS_URL;
 let mockWebsocketSendMutexWedged = false;
 let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
@@ -8990,6 +9032,7 @@ export function maybeInstallE2eTauriMocks() {
   }
 
   mockClosedChannelLiveSubscription = false;
+  mockAppliedRelayUrl = getRelayWsUrl(config);
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
     ? { ...config.mock.globalAgentConfig }
     : null;
@@ -9122,6 +9165,40 @@ export function maybeInstallE2eTauriMocks() {
   };
   // get_event defer/release seam — reset counter and queue on each install.
   window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
+  window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
+  window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__ = [];
+  window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__ = [];
+  window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
+    if (!config.mock) {
+      throw new Error("Mock Project View is unavailable in relay mode.");
+    }
+    const targetRelayUrl = relayUrl ?? mockAppliedRelayUrl;
+    if (config.mock.projectViewsByRelayUrl && targetRelayUrl) {
+      config.mock.projectViewsByRelayUrl[targetRelayUrl] =
+        structuredClone(result);
+    } else {
+      config.mock.projectView = structuredClone(result);
+    }
+  };
+  window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__ = (input) => {
+    const projectView =
+      config.mock?.projectViewsByRelayUrl?.[mockAppliedRelayUrl] ??
+      config.mock?.projectView;
+    const relayPubkey =
+      projectView?.status === "ready" || projectView?.status === "uninitialized"
+        ? projectView.relay_pubkey
+        : "b".repeat(64);
+    const event = createMockEvent(
+      input?.kind ?? KIND_PROJECT_VIEW_META,
+      "",
+      [],
+      relayPubkey,
+    );
+    emitMockGlobalEvent(event);
+    return event;
+  };
+  window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__ = () =>
+    hasMockLiveSubscription(GLOBAL_MOCK_SUBSCRIPTION, KIND_PROJECT_VIEW_META);
   window.__BUZZ_E2E_DEFER_GET_EVENT__ = null;
   deferredGetEventQueue = [];
   window.__BUZZ_E2E_RELEASE_GET_EVENT__ = () => {
@@ -9452,10 +9529,13 @@ export function maybeInstallE2eTauriMocks() {
       case "apply_workspace": {
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
         if (applyDelayMs > 0) {
-          return new Promise((resolve) =>
+          await new Promise((resolve) =>
             window.setTimeout(resolve, applyDelayMs),
           );
         }
+        mockAppliedRelayUrl =
+          (payload as { relayUrl?: string } | null)?.relayUrl ??
+          mockAppliedRelayUrl;
         return;
       }
       case "get_profile":
@@ -10932,6 +11012,122 @@ export function maybeInstallE2eTauriMocks() {
           );
         }
         return activeConfig?.mock?.relaySelf ?? null;
+      case "get_project_view":
+        if ((activeConfig?.mock?.projectViewReadDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectViewReadDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectViewReadError) {
+          throw new Error(activeConfig.mock.projectViewReadError);
+        }
+        return (
+          activeConfig?.mock?.projectViewsByRelayUrl?.[mockAppliedRelayUrl] ??
+          activeConfig?.mock?.projectView ?? { status: "unsupported" }
+        );
+      case "get_project_view_role_history": {
+        const input = structuredClone(
+          (payload as { input?: unknown }).input ?? payload,
+        );
+        window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__?.push(input);
+        const pages = activeConfig?.mock?.projectViewRoleHistoryPages;
+        if (pages && pages.length > 0) {
+          return structuredClone(pages.shift());
+        }
+        const request = input as {
+          project_revision?: number;
+          projection_generation?: number;
+        };
+        return {
+          project_revision: request.project_revision ?? 1,
+          projection_generation: request.projection_generation ?? 1,
+          items: [],
+        };
+      }
+      case "mutate_project_view": {
+        window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.push(
+          structuredClone((payload as { input?: unknown }).input ?? payload),
+        );
+        if ((activeConfig?.mock?.projectViewMutationDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectViewMutationDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectViewMutationError) {
+          throw new Error(activeConfig.mock.projectViewMutationError);
+        }
+        const sequence = activeConfig?.mock?.projectViewMutationResults;
+        const result = (sequence && sequence.length > 0
+          ? sequence.shift()
+          : activeConfig?.mock?.projectViewMutationResult) ?? {
+          status: "applied",
+          event_id: "c".repeat(64),
+          project_revision: 8,
+          object_id: "00000000-0000-4000-8000-000000000099",
+          object_revision: 1,
+          deleted: false,
+        };
+        if (
+          result.status === "applied" &&
+          activeConfig?.mock?.projectViewAfterMutation
+        ) {
+          if (activeConfig.mock.projectViewsByRelayUrl) {
+            activeConfig.mock.projectViewsByRelayUrl[mockAppliedRelayUrl] =
+              activeConfig.mock.projectViewAfterMutation;
+          } else {
+            activeConfig.mock.projectView =
+              activeConfig.mock.projectViewAfterMutation;
+          }
+        }
+        return result;
+      }
+      case "mutate_project_view_role": {
+        const input = structuredClone(
+          (payload as { input?: unknown }).input ?? payload,
+        );
+        window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?.push(input);
+        if ((activeConfig?.mock?.projectViewRoleMutationDelayMs ?? 0) > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              activeConfig?.mock?.projectViewRoleMutationDelayMs ?? 0,
+            ),
+          );
+        }
+        if (activeConfig?.mock?.projectViewRoleMutationError) {
+          throw new Error(activeConfig.mock.projectViewRoleMutationError);
+        }
+        const sequence = activeConfig?.mock?.projectViewRoleMutationResults;
+        const result = (sequence && sequence.length > 0
+          ? sequence.shift()
+          : activeConfig?.mock?.projectViewRoleMutationResult) ?? {
+          status: "applied",
+          event_id: "d".repeat(64),
+          project_revision: 8,
+          operation:
+            (input as { operation?: string }).operation ?? "role_mutation",
+          changed_entities: [],
+        };
+        if (
+          result.status === "applied" &&
+          activeConfig?.mock?.projectViewAfterRoleMutation
+        ) {
+          if (activeConfig.mock.projectViewsByRelayUrl) {
+            activeConfig.mock.projectViewsByRelayUrl[mockAppliedRelayUrl] =
+              activeConfig.mock.projectViewAfterRoleMutation;
+          } else {
+            activeConfig.mock.projectView =
+              activeConfig.mock.projectViewAfterRoleMutation;
+          }
+        }
+        return result;
+      }
       case "archive_identity":
       case "unarchive_identity":
         // The spec only verifies UI state, not the submitted request shape;

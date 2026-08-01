@@ -17,7 +17,14 @@ import {
   KIND_HUDDLE_PARTICIPANT_JOINED,
   KIND_HUDDLE_PARTICIPANT_LEFT,
   KIND_HUDDLE_ENDED,
+  KIND_PROJECT_VIEW_META,
+  KIND_PROJECT_VIEW_OBJECT,
 } from "./kinds.ts";
+
+test("Project View projection kinds mirror buzz-core", () => {
+  assert.equal(KIND_PROJECT_VIEW_OBJECT, 40903);
+  assert.equal(KIND_PROJECT_VIEW_META, 40904);
+});
 
 test("isConversationalUnreadKind_streamMessage_counts", () => {
   assert.equal(isConversationalUnreadKind(KIND_STREAM_MESSAGE), true);

@@ -560,9 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        // Moderator optimistic-decision support adds migration 0031 after the
-        // 29 migrations present in the Meeting V1 Stage 2 baseline.
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 37);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -882,13 +880,108 @@ mod tests {
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
 
-        // Meeting V0 lifecycle projection is additive and keeps 0001
-        // checksum-stable for brownfield deployments.
-        // Version 25 is reserved by the independently developed Project View
-        // migration. Keeping Meeting V0 at 26 lets the two feature branches
-        // merge without reusing a migration version already applied elsewhere.
-        assert_eq!(migrations[24].version, 26);
-        let meeting_v0 = migrations[24].sql.as_str();
+        // Project View canonical state is additive and disabled by default.
+        // The schema, tenant-leading keys, active-count trigger, and deferred
+        // aggregate guard all land together so no relay can observe a partial
+        // storage contract.
+        assert_eq!(migrations[24].version, 25);
+        let project_view = migrations[24].sql.as_str();
+        assert!(project_view.contains("ADD COLUMN project_view_enabled"));
+        assert!(project_view.contains("DEFAULT FALSE"));
+        assert!(project_view.contains("CREATE TABLE project_view_state"));
+        assert!(project_view.contains("CREATE TABLE project_view_objects"));
+        assert!(project_view.contains("CREATE TABLE project_view_mutations"));
+        assert!(project_view.contains("PRIMARY KEY (community_id, object_id)"));
+        assert!(project_view.contains("PRIMARY KEY (community_id, event_id)"));
+        assert!(project_view.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(project_view.contains("project_view_adjust_active_count"));
+        assert!(project_view.contains("project_view_validate_aggregate"));
+        assert!(project_view.contains("project_view_validate_object"));
+        assert!(!project_view.contains("SELECT count(*) INTO actual_count"));
+        assert!(!migrations[0].sql.as_str().contains("project_view_objects"));
+
+        // Role continuity is another additive, disabled-by-default layer.
+        // Community schema version 1 remains the default, while the v2 tables,
+        // partial uniqueness constraints, and deferred cross-table guard land
+        // before any Community can be cut over.
+        assert_eq!(migrations[25].version, 26);
+        let role_continuity = migrations[25].sql.as_str();
+        assert!(role_continuity.contains("ADD COLUMN project_view_schema_version"));
+        assert!(role_continuity.contains("DEFAULT 1"));
+        assert!(role_continuity.contains("CREATE TABLE project_view_changes"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_assignments"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_assignment_proposals"));
+        assert!(role_continuity.contains("CREATE TABLE project_work_commitments"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_checkpoints"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_handoffs"));
+        assert!(role_continuity.contains("CREATE TABLE project_role_continuity_references"));
+        assert!(role_continuity
+            .contains("CREATE UNIQUE INDEX idx_project_role_assignments_active_role"));
+        assert!(role_continuity
+            .contains("CREATE UNIQUE INDEX idx_project_role_assignments_active_member"));
+        assert!(role_continuity.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(role_continuity.contains("project_role_continuity_validate_community"));
+
+        // Stage 2 adds the lifecycle fields and materialized counts needed by
+        // the first live v2 Proposal / Assignment coordinator.
+        assert_eq!(migrations[26].version, 27);
+        let role_assignment_state = migrations[26].sql.as_str();
+        assert!(role_assignment_state.contains("ADD COLUMN open_proposal_count"));
+        assert!(role_assignment_state.contains("ADD COLUMN entity_revision"));
+        assert!(role_assignment_state.contains("ADD COLUMN replaced_by_assignment_id"));
+        assert!(role_assignment_state.contains("project_role_continuity_validate_counts"));
+
+        // Stage 5 promotes the reserved Commitment relation into a complete
+        // projected lifecycle entity with immutable Member attribution.
+        assert_eq!(migrations[27].version, 28);
+        let work_commitments = migrations[27].sql.as_str();
+        assert!(work_commitments.contains("ADD COLUMN member_pubkey"));
+        assert!(work_commitments.contains("ADD COLUMN entity_revision"));
+        assert!(work_commitments.contains("ADD COLUMN last_change_id"));
+        assert!(work_commitments.contains("project_work_commitments_validate_stage5_community"));
+
+        // Stage 6 activates the reserved append-only continuity history
+        // tables and validates attribution and typed references at commit.
+        assert_eq!(migrations[28].version, 29);
+        let role_history = migrations[28].sql.as_str();
+        assert!(role_history.contains("ADD COLUMN based_on_project_revision"));
+        assert!(role_history.contains("ADD COLUMN checkpoint_id"));
+        assert!(role_history.contains("project_role_history_append_only"));
+        assert!(role_history.contains("project_role_history_validate_stage6_community"));
+        assert!(
+            role_history.contains("source_change.operation IS DISTINCT FROM 'append_checkpoint'")
+        );
+        assert!(role_history.contains("source_change.operation IS DISTINCT FROM 'append_handoff'"));
+
+        // Stage 7 keeps high-frequency runtime state outside Project revisions,
+        // while deferring the terminal trust-chain validation until the atomic
+        // system change is complete.
+        assert_eq!(migrations[29].version, 30);
+        let runtime_supervision = migrations[29].sql.as_str();
+        assert!(runtime_supervision.contains("CREATE TABLE project_runtime_supervisor_bindings"));
+        assert!(runtime_supervision.contains("CREATE TABLE project_runtime_leases"));
+        assert!(runtime_supervision.contains("CREATE TABLE project_runtime_evidence"));
+        assert!(runtime_supervision.contains("recovery_backoff_seconds"));
+        assert!(runtime_supervision.contains("recovery_attempt_in_flight"));
+        assert!(runtime_supervision.contains("next_recovery_at"));
+        assert!(runtime_supervision.contains("project_runtime_evidence_append_only"));
+        assert!(runtime_supervision.contains("project_runtime_supervision_validate_community"));
+        assert!(runtime_supervision
+            .contains("Runtime lease is not backed by its exact latest evidence"));
+        assert!(runtime_supervision.contains("Runtime evidence does not match its trusted binding"));
+        assert!(runtime_supervision.contains("DEFERRABLE INITIALLY DEFERRED"));
+
+        // The concrete supervisor adapter needs a non-failure terminal state
+        // for deliberate Desktop/ACP shutdowns.
+        assert_eq!(migrations[30].version, 31);
+        let graceful_stop = migrations[30].sql.as_str();
+        assert!(graceful_stop.contains("project_runtime_evidence_type_check"));
+        assert!(graceful_stop.contains("'graceful_stop'"));
+
+        // Meeting V0 lifecycle projection follows the complete Project View
+        // series so every migration version remains globally unique.
+        assert_eq!(migrations[31].version, 32);
+        let meeting_v0 = migrations[31].sql.as_str();
         assert!(meeting_v0.contains("ADD COLUMN room_kind"));
         assert!(meeting_v0.contains("CREATE TABLE meeting_sessions"));
         assert!(meeting_v0.contains("PRIMARY KEY (community_id, session_id)"));
@@ -896,8 +989,8 @@ mod tests {
 
         // Meeting V0 stage 2 persists the complete floor state machine and its
         // transactional delivery outbox in the next additive migration.
-        assert_eq!(migrations[25].version, 27);
-        let meeting_floor = migrations[25].sql.as_str();
+        assert_eq!(migrations[32].version, 33);
+        let meeting_floor = migrations[32].sql.as_str();
         assert!(meeting_floor.contains("CREATE TABLE meeting_rounds"));
         assert!(meeting_floor.contains("CREATE TABLE meeting_floor_claims"));
         assert!(meeting_floor.contains("CREATE TABLE meeting_event_outbox"));
@@ -906,8 +999,8 @@ mod tests {
 
         // Meeting V0 stage 3 adds agent decision signals and enables early
         // cohort settlement without changing either prior Meeting migration.
-        assert_eq!(migrations[26].version, 28);
-        let meeting_agent_floor = migrations[26].sql.as_str();
+        assert_eq!(migrations[33].version, 34);
+        let meeting_agent_floor = migrations[33].sql.as_str();
         assert!(meeting_agent_floor.contains("CREATE TABLE meeting_floor_signals"));
         assert!(meeting_agent_floor.contains("action IN ('ready', 'pass', 'yield')"));
         assert!(meeting_agent_floor.contains("CREATE TABLE meeting_round_decision_cohort"));
@@ -916,8 +1009,8 @@ mod tests {
 
         // Meeting V1 remains additive and persists a policy-isolated,
         // recoverable moderated-baton projection.
-        assert_eq!(migrations[27].version, 29);
-        let meeting_baton = migrations[27].sql.as_str();
+        assert_eq!(migrations[34].version, 35);
+        let meeting_baton = migrations[34].sql.as_str();
         assert!(meeting_baton.contains("moderated-baton-v1"));
         assert!(meeting_baton.contains("CREATE TABLE meeting_participants"));
         assert!(meeting_baton.contains("CREATE TABLE meeting_baton_config"));
@@ -937,8 +1030,8 @@ mod tests {
 
         // Stage 2 corrects the deterministic Progress vocabulary without
         // rewriting the checksum-frozen Meeting V1 foundation migration.
-        assert_eq!(migrations[28].version, 30);
-        let meeting_baton_stage_two = migrations[28].sql.as_str();
+        assert_eq!(migrations[35].version, 36);
+        let meeting_baton_stage_two = migrations[35].sql.as_str();
         assert!(meeting_baton_stage_two.contains("'context_sync'"));
         assert!(meeting_baton_stage_two.contains("'tool_use'"));
         assert!(meeting_baton_stage_two.contains("'generating'"));
@@ -954,8 +1047,8 @@ mod tests {
         // Moderator optimistic-decision state remains additive: candidate
         // eligibility, signed Attempt snapshots, and one-use retry evidence
         // upgrade existing V1 sessions without rewriting prior migrations.
-        assert_eq!(migrations[29].version, 31);
-        let meeting_moderator_attempts = migrations[29].sql.as_str();
+        assert_eq!(migrations[36].version, 37);
+        let meeting_moderator_attempts = migrations[36].sql.as_str();
         assert!(meeting_moderator_attempts.contains("eligible_decision_epoch"));
         assert!(
             meeting_moderator_attempts.contains("CREATE TABLE meeting_moderator_decision_attempts")
@@ -981,9 +1074,117 @@ mod tests {
         ] {
             assert!(
                 schema.contains(required),
-                "schema/schema.sql must include migration 0031 object {required}"
+                "schema/schema.sql must include migration 0037 object {required}"
             );
         }
+    }
+
+    #[test]
+    fn checked_in_schema_contains_project_view_migration_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+        for fragment in [
+            "project_view_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE TABLE project_view_state",
+            "CREATE TABLE project_view_objects",
+            "CREATE TABLE project_view_mutations",
+            "project_view_objects_adjust_active_count",
+            "project_view_validate_object",
+            "project_view_state_validate",
+            "project_view_objects_validate",
+            "project_view_schema_version SMALLINT NOT NULL DEFAULT 1",
+            "CREATE TABLE project_view_changes",
+            "CREATE TABLE project_role_assignments",
+            "idx_project_role_assignments_active_role",
+            "idx_project_role_assignments_active_member",
+            "project_role_continuity_validate_community",
+            "open_proposal_count INTEGER NOT NULL DEFAULT 0",
+            "project_role_continuity_validate_counts",
+            "project_work_commitments_member_pubkey_check",
+            "project_work_commitments_validate_stage5_community",
+            "project_role_checkpoints_content_check",
+            "project_role_handoffs_content_check",
+            "project_role_history_append_only",
+            "project_role_history_validate_stage6_community",
+            "CREATE TABLE project_runtime_supervisor_bindings",
+            "CREATE TABLE project_runtime_leases",
+            "CREATE TABLE project_runtime_evidence",
+            "recovery_backoff_seconds",
+            "recovery_attempt_in_flight",
+            "next_recovery_at",
+            "project_runtime_evidence_append_only",
+            "'graceful_stop'",
+            "project_runtime_supervision_validate_community",
+            "Runtime lease is not backed by its exact latest evidence",
+            "Runtime evidence does not match its trusted binding",
+        ] {
+            assert!(
+                schema.contains(fragment),
+                "schema/schema.sql is missing Project View fragment: {fragment}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn checked_in_schema_builds_project_view_without_a_migration_ledger() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!("buzz_pv_schema_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create schema scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect schema scratch database");
+
+        sqlx::raw_sql(include_str!("../../../schema/schema.sql"))
+            .execute(&pool)
+            .await
+            .expect("apply checked-in schema");
+        let has_ledger: bool =
+            sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("inspect migration ledger");
+        assert!(!has_ledger);
+        let project_view_enabled: bool = sqlx::query_scalar(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) \
+             RETURNING project_view_enabled",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(format!("schema-{}.test", uuid::Uuid::new_v4().simple()))
+        .fetch_one(&pool)
+        .await
+        .expect("read schema-created Project View default");
+        assert!(!project_view_enabled);
+        for relation in [
+            "project_view_state",
+            "project_view_objects",
+            "project_view_mutations",
+        ] {
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(format!("public.{relation}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("inspect {relation}: {error}"));
+            assert!(exists, "{relation} must exist in checked-in schema");
+        }
+
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop schema scratch database");
+        admin.close().await;
     }
 
     #[test]
@@ -1130,13 +1331,17 @@ mod tests {
     }
 
     async fn connect_test_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = test_database_url();
 
         PgPool::connect(&database_url)
             .await
             .expect("connect to test DB")
+    }
+
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned())
     }
 
     async fn reset_public_schema(pool: &PgPool) {
@@ -1157,6 +1362,202 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("read applied migrations")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn project_view_upgrade_from_0024_is_additive_and_disabled() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!("buzz_pv_upgrade_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create migration scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect migration scratch database");
+
+        MIGRATOR
+            .run_to(24, &pool)
+            .await
+            .expect("apply migrations through 0024");
+        let active_id = uuid::Uuid::new_v4();
+        let archived_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2), ($3, $4)")
+            .bind(active_id)
+            .bind(format!("active-{}.test", active_id.simple()))
+            .bind(archived_id)
+            .bind(format!("archived-{}.test", archived_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("seed pre-0025 communities");
+        sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+            .bind(archived_id)
+            .execute(&pool)
+            .await
+            .expect("archive pre-0025 community");
+
+        run_migrations(&pool)
+            .await
+            .expect("upgrade scratch database through 0037");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(37));
+        let flags: Vec<(uuid::Uuid, bool)> =
+            sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("read upgraded feature flags");
+        assert_eq!(flags.len(), 2);
+        assert!(flags.iter().all(|(_, enabled)| !enabled));
+        let legacy_rows: Vec<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT id, host FROM communities ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("pre-feature community projection remains readable");
+        assert_eq!(legacy_rows.len(), 2);
+        let legacy_insert_id = uuid::Uuid::new_v4();
+        let legacy_insert_flag: bool = sqlx::query_scalar(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) \
+             RETURNING project_view_enabled",
+        )
+        .bind(legacy_insert_id)
+        .bind(format!("legacy-insert-{}.test", legacy_insert_id.simple()))
+        .fetch_one(&pool)
+        .await
+        .expect("pre-feature insert shape remains compatible");
+        assert!(!legacy_insert_flag);
+        let legacy_event_id = vec![0x25_u8; 32];
+        let legacy_actor = vec![0x26_u8; 32];
+        let legacy_meta_id = vec![0x27_u8; 32];
+        let legacy_signer = vec![0x28_u8; 32];
+        let mut legacy_tx = pool
+            .begin()
+            .await
+            .expect("begin legacy v1 write-shape transaction");
+        let legacy_state: (i16, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+            "INSERT INTO project_view_state ( \
+                 community_id, project_revision, active_object_count, \
+                 initialized_at, updated_at, last_event_id, last_actor_pubkey, \
+                 meta_projection_event_id, projection_pubkey, projection_generation \
+             ) VALUES ($1, 1, 0, now(), now(), $2, $3, $4, $5, 1) \
+             RETURNING schema_version, last_change_id, last_source_event_id",
+        )
+        .bind(legacy_insert_id)
+        .bind(&legacy_event_id)
+        .bind(&legacy_actor)
+        .bind(&legacy_meta_id)
+        .bind(&legacy_signer)
+        .fetch_one(&mut *legacy_tx)
+        .await
+        .expect("migration 0027 accepts the exact v1 state insert shape");
+        assert_eq!(
+            legacy_state,
+            (1, legacy_event_id.clone(), Some(legacy_event_id))
+        );
+
+        let next_legacy_event_id = vec![0x29_u8; 32];
+        let mirrored_change_id: Vec<u8> = sqlx::query_scalar(
+            "UPDATE project_view_state \
+             SET project_revision = 2, updated_at = now(), last_event_id = $2 \
+             WHERE community_id = $1 \
+             RETURNING last_change_id",
+        )
+        .bind(legacy_insert_id)
+        .bind(&next_legacy_event_id)
+        .fetch_one(&mut *legacy_tx)
+        .await
+        .expect("migration 0027 accepts the exact v1 state update shape");
+        assert_eq!(mirrored_change_id, next_legacy_event_id);
+        legacy_tx
+            .rollback()
+            .await
+            .expect("rollback isolated v1 write-shape probe");
+
+        for table in [
+            "project_view_state",
+            "project_view_objects",
+            "project_view_mutations",
+            "project_view_changes",
+            "project_role_assignments",
+            "project_role_assignment_proposals",
+            "project_work_commitments",
+            "project_role_checkpoints",
+            "project_role_handoffs",
+            "project_role_continuity_references",
+        ] {
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(format!("public.{table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("inspect {table}: {error}"));
+            assert!(exists, "{table} must exist after upgrade");
+        }
+
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop migration scratch database");
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn concurrent_migrators_reach_project_view_schema_once() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!(
+            "buzz_pv_concurrent_migrate_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create concurrent-migration scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let first = PgPool::connect(&database_url)
+            .await
+            .expect("connect first migrator");
+        let second = PgPool::connect(&database_url)
+            .await
+            .expect("connect second migrator");
+
+        let (first_result, second_result) =
+            tokio::join!(run_migrations(&first), run_migrations(&second));
+        first_result.expect("first concurrent migrator succeeds");
+        second_result.expect("second concurrent migrator succeeds");
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(37));
+        let project_view_migration_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM _sqlx_migrations \
+             WHERE version IN (25, 26, 27, 28, 29, 30, 31) AND success",
+        )
+        .fetch_one(&first)
+        .await
+        .expect("count Project View migration ledger entries");
+        assert_eq!(project_view_migration_count, 7);
+
+        first.close().await;
+        second.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop concurrent-migration scratch database");
+        admin.close().await;
     }
 
     #[tokio::test]
@@ -1226,7 +1627,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(24));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(37));
     }
 
     #[tokio::test]
@@ -1314,6 +1715,9 @@ mod tests {
             "channels",
             "scheduled_workflow_fires",
             "audit_log",
+            "project_view_state",
+            "project_view_objects",
+            "project_view_mutations",
         ] {
             let exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
@@ -1347,6 +1751,24 @@ mod tests {
         assert!(
             search_expression.contains("ELSE NULL::tsvector"),
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
+        );
+
+        let community_id = uuid::Uuid::new_v4();
+        let project_view_enabled: bool = sqlx::query_scalar(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) \
+             RETURNING project_view_enabled",
+        )
+        .bind(community_id)
+        .bind(format!(
+            "project-view-default-{}.test",
+            community_id.simple()
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("read fresh Community Project View default");
+        assert!(
+            !project_view_enabled,
+            "fresh Communities must keep Project View disabled"
         );
     }
 }

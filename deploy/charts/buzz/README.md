@@ -104,9 +104,17 @@ default so long-lived WebSocket connections have time to drain.
 
 ## Upgrades
 
-Schema migrations are embedded in the relay binary via `sqlx::migrate!` and run at startup, gated by `BUZZ_AUTO_MIGRATE` (default `true`). Multiple replicas race-safely behind a Postgres advisory lock. `helm upgrade` is the entire upgrade procedure.
+Schema migrations are embedded in the relay binary via `sqlx::migrate!` and run at startup, gated by `BUZZ_AUTO_MIGRATE` (default `true`). Multiple replicas race-safely behind a Postgres advisory lock. For ordinary additive upgrades, `helm upgrade` is the entire upgrade procedure.
 
 If you prefer decoupling migrations from serving, set `migrate.autoMigrate=false`. **In that mode the chart does not run migrations for you** — you own running `buzz-admin migrate` (separate Pod / one-shot Job) against the database before every `helm install` / `helm upgrade`. Readiness probes only verify DB connectivity, not schema freshness, so a pod will appear healthy against an unmigrated schema and fail under load. A pre-upgrade Helm Job for this is on the chart roadmap; the values knob `migrate.preUpgradeJob.enabled` is reserved.
+
+Project View's first rollout deliberately uses that decoupled mode: deploy every
+Pod with `migrate.autoMigrate=false`, apply migration 25 with the packaged
+`buzz-admin`, verify the stable Relay signer, and only then run
+`buzz-admin project-view enable --community <host>`. The feature gate is stored
+in PostgreSQL; there is no Pod-local enable environment variable. See the
+[Project View operations runbook](../../../docs/project-view-operations.md) for
+enable, monitoring, signer rotation, and the two rollback boundaries.
 
 ## Backups
 

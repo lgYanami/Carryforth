@@ -13,6 +13,12 @@ export function replaceCommunityDestinationRoute(
   history.replace(`/channels/${encodeURIComponent(channelId)}`);
 }
 
+export function replaceCommunityOverviewRoute(history: {
+  replace: (href: string) => void;
+}): void {
+  history.replace("/community");
+}
+
 export async function runCommunityViewTransition(
   update: () => Promise<void> | void,
   options: { timeoutMs?: number } = {},

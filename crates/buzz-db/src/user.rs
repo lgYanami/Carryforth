@@ -294,6 +294,10 @@ pub async fn set_agent_owner(
     agent_pubkey: &[u8],
     owner_pubkey: &[u8],
 ) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::relay_members::acquire_membership_write_lock(&mut tx, community_id).await?;
+    crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id).await?;
+
     // Conditional UPDATE: only set owner if currently NULL. This makes
     // "first mint wins" atomic — no TOCTOU race between concurrent mints.
     let result = sqlx::query(
@@ -302,7 +306,7 @@ pub async fn set_agent_owner(
     .bind(owner_pubkey)
     .bind(community_id.as_uuid())
     .bind(agent_pubkey)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -311,7 +315,7 @@ pub async fn set_agent_owner(
         let exists = sqlx::query(r#"SELECT 1 FROM users WHERE community_id = $1 AND pubkey = $2"#)
             .bind(community_id.as_uuid())
             .bind(agent_pubkey)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if exists.is_none() {
             return Err(crate::error::DbError::NotFound(
@@ -319,8 +323,10 @@ pub async fn set_agent_owner(
             ));
         }
         // Row exists but owner already set — return false (not an error).
+        tx.rollback().await?;
         return Ok(false);
     }
+    tx.commit().await?;
     Ok(true)
 }
 

@@ -208,6 +208,16 @@ pub struct Config {
     /// Set `BUZZ_AUDIT_ENABLED=false` for deployments that do not require it.
     pub audit_enabled: bool,
 
+    /// Deployment kill switch for automatic managed-runtime
+    /// `ended(unrecoverable)` transitions. Defaults to false.
+    pub runtime_unrecoverable_enabled: bool,
+    /// Runtime supervision scheduler polling interval.
+    pub runtime_supervision_interval_secs: u64,
+    /// Maximum Assignment claims processed by one scheduler tick.
+    pub runtime_supervision_batch_limit: u16,
+    /// Duration of one multi-pod scheduler claim.
+    pub runtime_supervision_claim_secs: u64,
+
     /// Optional override for ephemeral channel TTL (in seconds).
     /// When set, any channel created with a TTL tag will use this value instead
     /// of the client-provided one. Useful for testing ephemeral expiry quickly.
@@ -800,6 +810,44 @@ impl Config {
         let privacy_markdown = read_policy_markdown("BUZZ_PRIVACY_POLICY_MARKDOWN")?;
         let age_attestation_required = parse_optional_bool("BUZZ_AGE_ATTESTATION_REQUIRED")?;
         let audit_enabled = parse_bool("BUZZ_AUDIT_ENABLED", true)?;
+        let runtime_unrecoverable_enabled = parse_bool("BUZZ_RUNTIME_UNRECOVERABLE", false)?;
+        let runtime_supervision_interval_secs =
+            positive_u64_from_env("BUZZ_RUNTIME_SUPERVISION_INTERVAL_SECS", 5)?;
+        if runtime_supervision_interval_secs > 60 {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_RUNTIME_SUPERVISION_INTERVAL_SECS must be in 1..=60".to_owned(),
+            ));
+        }
+        let runtime_supervision_batch_limit =
+            positive_u64_from_env("BUZZ_RUNTIME_SUPERVISION_BATCH_LIMIT", 25)?;
+        let runtime_supervision_batch_limit = u16::try_from(runtime_supervision_batch_limit)
+            .ok()
+            .filter(|value| *value <= 1_000)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(
+                    "BUZZ_RUNTIME_SUPERVISION_BATCH_LIMIT must be in 1..=1000".to_owned(),
+                )
+            })?;
+        let runtime_supervision_claim_secs =
+            positive_u64_from_env("BUZZ_RUNTIME_SUPERVISION_CLAIM_SECS", 60)?;
+        if !(10..=300).contains(&runtime_supervision_claim_secs)
+            || runtime_supervision_claim_secs < runtime_supervision_interval_secs.saturating_mul(2)
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_RUNTIME_SUPERVISION_CLAIM_SECS must be in 10..=300 and at least twice the scheduler interval"
+                    .to_owned(),
+            ));
+        }
+        if runtime_unrecoverable_enabled && !audit_enabled {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_RUNTIME_UNRECOVERABLE requires BUZZ_AUDIT_ENABLED=true".to_owned(),
+            ));
+        }
+        if runtime_unrecoverable_enabled && relay_private_key.is_none() {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_RUNTIME_UNRECOVERABLE requires a stable BUZZ_RELAY_PRIVATE_KEY".to_owned(),
+            ));
+        }
         let join_policy = if terms_markdown.is_none()
             && privacy_markdown.is_none()
             && !age_attestation_required
@@ -914,6 +962,10 @@ impl Config {
             media_uploads_per_minute,
             require_media_get_auth,
             audit_enabled,
+            runtime_unrecoverable_enabled,
+            runtime_supervision_interval_secs,
+            runtime_supervision_batch_limit,
+            runtime_supervision_claim_secs,
             ephemeral_ttl_override,
             git_repo_path,
             git_pack_cache_path,
@@ -996,6 +1048,13 @@ mod tests {
             !config.meeting_v1_create_enabled,
             "Meeting V1 creation must remain opt-in during the backend rollout"
         );
+        assert!(
+            !config.runtime_unrecoverable_enabled,
+            "automatic runtime unrecoverable must default fail-closed"
+        );
+        assert_eq!(config.runtime_supervision_interval_secs, 5);
+        assert_eq!(config.runtime_supervision_batch_limit, 25);
+        assert_eq!(config.runtime_supervision_claim_secs, 60);
     }
 
     #[test]
@@ -1031,6 +1090,49 @@ mod tests {
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_MEETING_V1_CREATE_ENABLED")
         ));
+    }
+
+    #[test]
+    fn runtime_automation_requires_audit_and_a_stable_relay_key() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let names = [
+            "BUZZ_RUNTIME_UNRECOVERABLE",
+            "BUZZ_AUDIT_ENABLED",
+            "BUZZ_RELAY_PRIVATE_KEY",
+        ];
+        let previous = names.map(std::env::var_os);
+
+        std::env::set_var("BUZZ_RUNTIME_UNRECOVERABLE", "true");
+        std::env::set_var("BUZZ_AUDIT_ENABLED", "false");
+        std::env::set_var("BUZZ_RELAY_PRIVATE_KEY", "11".repeat(32));
+        let without_audit = Config::from_env();
+
+        std::env::set_var("BUZZ_AUDIT_ENABLED", "true");
+        std::env::remove_var("BUZZ_RELAY_PRIVATE_KEY");
+        let without_key = Config::from_env();
+
+        std::env::set_var("BUZZ_RELAY_PRIVATE_KEY", "11".repeat(32));
+        let enabled = Config::from_env().expect("fully fenced runtime automation config");
+
+        for (name, value) in names.into_iter().zip(previous) {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+
+        assert!(matches!(
+            without_audit,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_AUDIT_ENABLED")
+        ));
+        assert!(matches!(
+            without_key,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_RELAY_PRIVATE_KEY")
+        ));
+        assert!(enabled.runtime_unrecoverable_enabled);
     }
 
     #[test]

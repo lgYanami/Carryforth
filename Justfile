@@ -48,6 +48,18 @@ bootstrap:
 setup: bootstrap
     ./scripts/dev-setup.sh
 
+# Start Docker services, relay, and desktop in the background
+start:
+    ./scripts/dev-start.sh
+
+# Force-rebuild Buzz executables, then start the local stack
+rebuild-start:
+    ./scripts/dev-rebuild-start.sh
+
+# Stop the app and Docker containers without deleting containers or data
+stop:
+    ./scripts/dev-stop.sh
+
 # Install git hooks via lefthook (dispatches from the shared .git/hooks dir so all
 # linked worktrees inherit the same hooks without a worktree-relative .hooks path)
 hooks:
@@ -71,7 +83,7 @@ reset:
 
 # Stop all dev services (keep data)
 down:
-    docker compose down
+    ./scripts/dev-stop.sh
 
 # Show dev service status
 ps:
@@ -274,6 +286,7 @@ test:
 # Run unit tests only (no infra needed)
 test-unit:
     #!/usr/bin/env bash
+    set -euo pipefail
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
@@ -288,6 +301,10 @@ test-unit:
         # replay — so it belongs in the unit job. Run all targets (lib + the
         # tests/replay_fixtures.rs integration test), not just --lib.
         cargo nextest run -p buzz-conformance
+        # Project View spans the domain, protocol registry, SDK, Relay adapter,
+        # and agent CLI. Keep that complete no-infra slice in the ordinary unit
+        # gate so adding a new package cannot silently drop coverage.
+        just project-view-test-unit
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
@@ -301,6 +318,43 @@ test-unit:
     else
         ./scripts/run-tests.sh unit
     fi
+
+# Run the complete no-infrastructure Project View contract.
+project-view-test-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        # Domain wire/property contracts live in integration-test targets.
+        cargo nextest run -p buzz-project-view
+        cargo nextest run \
+          -p buzz-core \
+          -p buzz-sdk \
+          -p buzz-relay \
+          -p buzz-cli \
+          --lib \
+          -E 'test(project_view)'
+    else
+        cargo test -p buzz-project-view
+        cargo test -p buzz-core --lib project_view
+        cargo test -p buzz-sdk --lib project_view
+        cargo test -p buzz-relay --lib project_view
+        cargo test -p buzz-cli --lib project_view
+    fi
+
+# Run isolated Postgres-backed Project View transaction tests.
+project-view-test-db:
+    ./scripts/test-project-view-db.sh
+
+# Run fresh/upgrade/concurrent migration tests and the Project View schema-drift gate.
+test-migrations:
+    ./scripts/test-project-view-migrations.sh
+
+# Run the real Relay + real buzz CLI Project View end-to-end test.
+project-view-test-e2e:
+    ./scripts/test-project-view-e2e.sh
+
+# Run every Project View quality gate, including infrastructure-backed tests.
+project-view-test: project-view-test-unit project-view-test-db test-migrations project-view-test-e2e
 
 # Run integration tests only (starts services if needed)
 test-integration:
@@ -441,6 +495,16 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
         done
     fi
     cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr -p buzz-relay
+    TARGET=$(rustc -vV | sed -n 's|host: ||p')
+    TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
+    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+        src="${TARGET_DIR}/debug/${bin}"
+        dest="desktop/src-tauri/binaries/${bin}-${TARGET}"
+        if ! cmp -s "$src" "$dest"; then
+            cp "$src" "$dest"
+            chmod +x "$dest"
+        fi
+    done
     if [[ -n "{{mesh}}" ]]; then
         export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
     fi
@@ -779,7 +843,7 @@ _release-pr lane version:
             TAG_PREFIX="relay-v"
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
-            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/)
+            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/buzz-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/project-view-operations.md deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-compatible-rollback-smoke.sh scripts/test-project-view-release-contract.sh)
             ARTIFACT="Buzz Relay" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"

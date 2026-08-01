@@ -32,6 +32,75 @@ async function seedCommunities(
   );
 }
 
+async function rememberSnapshotChannel(
+  page: import("@playwright/test").Page,
+  {
+    channelName,
+    destinationChannelId,
+    sourceRelayUrl,
+    targetCommunityId,
+    targetRelayUrl,
+  }: {
+    channelName: string;
+    destinationChannelId?: string;
+    sourceRelayUrl: string;
+    targetCommunityId: string;
+    targetRelayUrl: string;
+  },
+) {
+  return page.evaluate(
+    ({ name, replacementId, sourceRelay, targetCommunity, targetRelay }) => {
+      const source = window.localStorage.getItem(
+        `buzz-channels.v1:${sourceRelay}`,
+      );
+      if (!source) throw new Error("missing source channel snapshot");
+      const snapshot = JSON.parse(source) as {
+        channels: Array<{ id: string; name: string }>;
+      };
+      const channel = snapshot.channels.find(
+        (candidate) => candidate.name === name,
+      );
+      if (!channel) throw new Error(`missing ${name} channel snapshot`);
+
+      const channelId = replacementId ?? channel.id;
+      if (replacementId) {
+        channel.id = replacementId;
+      }
+      window.localStorage.setItem(
+        `buzz-channels.v1:${targetRelay}`,
+        JSON.stringify(snapshot),
+      );
+
+      const destinations = JSON.parse(
+        window.localStorage.getItem("buzz-community-destinations") ?? "{}",
+      ) as Record<string, unknown>;
+      destinations[targetCommunity] = { kind: "channel", channelId };
+      window.localStorage.setItem(
+        "buzz-community-destinations",
+        JSON.stringify(destinations),
+      );
+      return channelId;
+    },
+    {
+      name: channelName,
+      replacementId: destinationChannelId,
+      sourceRelay: sourceRelayUrl,
+      targetCommunity: targetCommunityId,
+      targetRelay: targetRelayUrl,
+    },
+  );
+}
+
+async function readCommunityDestination(
+  page: import("@playwright/test").Page,
+  communityId: string,
+) {
+  return page.evaluate((targetCommunityId) => {
+    const raw = window.localStorage.getItem("buzz-community-destinations");
+    return raw ? JSON.parse(raw)[targetCommunityId] : null;
+  }, communityId);
+}
+
 test.describe("community rail", () => {
   test("shows the rail with multiple communities despite a stale opt-out", async ({
     page,
@@ -289,8 +358,7 @@ test.describe("community rail", () => {
 
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
 
-    // Switching persists the newly active community id (the app then remounts
-    // against that relay via the existing community-init path).
+    await expect(page).toHaveURL(/#\/community$/);
     await expect
       .poll(() =>
         page.evaluate(() =>
@@ -298,9 +366,14 @@ test.describe("community rail", () => {
         ),
       )
       .toBe(COMMUNITY_B.id);
+
+    await page.getByTestId("channel-random").click();
+    await expect(page).toHaveURL(/#\/channels\//);
+    await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+    await expect(page).toHaveURL(/#\/community$/);
   });
 
-  test("restores the last Home or channel destination per community", async ({
+  test("preserves independent work positions behind each Community overview", async ({
     page,
   }) => {
     await installMockBridge(page, undefined, { skipCommunitySeed: true });
@@ -308,220 +381,179 @@ test.describe("community rail", () => {
     await page.goto("/");
 
     await page.getByTestId("channel-general").click();
-    await expect(page).toHaveURL(/#\/channels\//);
     const generalUrl = page.url();
-
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+
+    await expect(page).toHaveURL(/#\/community$/);
+    await expect(page.getByTestId("community-continue-work")).toContainText(
+      "Open Inbox",
+    );
+    await page.getByTestId("community-continue-work").click();
     await expect(page).toHaveURL(/#\/$/);
 
     await page.getByTestId("channel-random").click();
-    await expect(page).toHaveURL(/#\/channels\//);
     const randomUrl = page.url();
-
     await page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`).click();
+
+    await expect(page).toHaveURL(/#\/community$/);
+    await expect(page.getByTestId("community-continue-work")).toContainText(
+      "Continue in #general",
+    );
+    await page.getByTestId("community-continue-work").click();
     await expect(page).toHaveURL(generalUrl);
 
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+    await expect(page).toHaveURL(/#\/community$/);
+    await expect(page.getByTestId("community-continue-work")).toContainText(
+      "Continue in #random",
+    );
+    await page.getByTestId("community-continue-work").click();
     await expect(page).toHaveURL(randomUrl);
-
-    await page.getByRole("button", { name: "Inbox" }).click();
-    await expect(page).toHaveURL(/#\/$/);
-    await page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`).click();
-    await expect(page).toHaveURL(generalUrl);
-    await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-    await expect(page).toHaveURL(/#\/$/);
   });
 
-  test("enters a remembered channel before live validation completes", async ({
+  test("waits for live validation before offering a cached channel", async ({
     page,
   }) => {
     await installMockBridge(page, undefined, { skipCommunitySeed: true });
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
     await page.goto("/");
     await expect(page.getByTestId("app-sidebar")).toBeVisible();
-    const rememberedChannelId = await page.evaluate((communityId) => {
-      const source = window.localStorage.getItem(
-        "buzz-channels.v1:ws://localhost:3000",
-      );
-      if (!source) throw new Error("missing source channel snapshot");
-      const snapshot = JSON.parse(source) as {
-        channels: Array<{ id: string; name: string }>;
-      };
-      const generalChannel = snapshot.channels.find(
-        (channel) => channel.name === "general",
-      );
-      if (!generalChannel) throw new Error("missing general channel snapshot");
-      window.localStorage.setItem(
-        "buzz-channels.v1:ws://localhost:3001",
-        source,
-      );
-      window.localStorage.setItem(
-        "buzz-community-destinations",
-        JSON.stringify({
-          [communityId]: {
-            kind: "channel",
-            channelId: generalChannel.id,
-          },
-        }),
-      );
-      return generalChannel.id;
-    }, COMMUNITY_B.id);
-
+    const rememberedChannelId = await rememberSnapshotChannel(page, {
+      channelName: "general",
+      sourceRelayUrl: COMMUNITY_A.relayUrl,
+      targetCommunityId: COMMUNITY_B.id,
+      targetRelayUrl: COMMUNITY_B.relayUrl,
+    });
     await page.evaluate(() => {
       const testWindow = window as typeof window & {
         __BUZZ_E2E__?: { mock?: { channelsReadDelayMs?: number } };
       };
-      if (!testWindow.__BUZZ_E2E__) {
-        throw new Error("missing E2E config");
-      }
+      if (!testWindow.__BUZZ_E2E__) throw new Error("missing E2E config");
       testWindow.__BUZZ_E2E__.mock = {
         ...testWindow.__BUZZ_E2E__.mock,
         channelsReadDelayMs: 800,
       };
     });
+
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
 
-    await expect(page).toHaveURL(
-      new RegExp(`#/channels/${rememberedChannelId}$`),
+    await expect(page).toHaveURL(/#\/community$/);
+    const continueButton = page.getByTestId("community-continue-work");
+    await expect(continueButton).toContainText("Open Inbox", { timeout: 700 });
+    await expect(continueButton).toHaveAttribute(
+      "data-destination-status",
+      "pending",
       { timeout: 700 },
     );
-    await expect(page.getByTestId("message-timeline")).toBeVisible({
-      timeout: 700,
-    });
+    await expect(continueButton).toContainText("Continue in #general");
+    await expect(continueButton).toHaveAttribute(
+      "data-destination-status",
+      "ready",
+    );
+    await continueButton.click();
+    await expect(page).toHaveURL(
+      new RegExp(`#/channels/${rememberedChannelId}$`),
+    );
   });
 
-  test("clears a remembered channel that is unavailable after switching", async ({
+  test("falls back to Inbox when live validation rejects a cached channel", async ({
     page,
   }) => {
     await installMockBridge(page, undefined, { skipCommunitySeed: true });
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
-    await page.addInitScript((communityId) => {
-      window.localStorage.setItem(
-        "buzz-community-destinations",
-        JSON.stringify({
-          [communityId]: { kind: "channel", channelId: "missing-channel" },
-        }),
-      );
-    }, COMMUNITY_B.id);
-
-    await page.goto("/");
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.localStorage.getItem("buzz-channels.v1:ws://localhost:3000"),
-        ),
-      )
-      .not.toBeNull();
-    await page.evaluate(() => {
-      const source = window.localStorage.getItem(
-        "buzz-channels.v1:ws://localhost:3000",
-      );
-      if (!source) throw new Error("missing source channel snapshot");
-      const snapshot = JSON.parse(source);
-      snapshot.channels = snapshot.channels.map(
-        (channel: Record<string, unknown>, index: number) =>
-          index === 0 ? { ...channel, id: "missing-channel" } : channel,
-      );
-      window.localStorage.setItem(
-        "buzz-channels.v1:ws://localhost:3001",
-        JSON.stringify(snapshot),
-      );
-    });
-    await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-
-    await expect(page).not.toHaveURL(/#\/channels\//);
-    await expect
-      .poll(() =>
-        page.evaluate((communityId) => {
-          const raw = window.localStorage.getItem(
-            "buzz-community-destinations",
-          );
-          if (!raw) return null;
-          return JSON.parse(raw)[communityId];
-        }, COMMUNITY_B.id),
-      )
-      .toEqual({ kind: "home" });
-  });
-
-  test("does not repair a remembered channel until live validation succeeds", async ({
-    page,
-  }) => {
-    await installMockBridge(
-      page,
-      {
-        channelsReadDelayMs: 300,
-        channelsReadErrors: [null, "temporary channel read failure"],
-      },
-      { skipCommunitySeed: true },
-    );
-    await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
-    await page.addInitScript((communityId) => {
-      window.localStorage.setItem(
-        "buzz-community-destinations",
-        JSON.stringify({
-          [communityId]: { kind: "channel", channelId: "general" },
-        }),
-      );
-    }, COMMUNITY_B.id);
     await page.goto("/");
     await expect(page.getByTestId("app-sidebar")).toBeVisible();
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.localStorage.getItem("buzz-channels.v1:ws://localhost:3000"),
-        ),
-      )
-      .not.toBeNull();
+    await rememberSnapshotChannel(page, {
+      channelName: "general",
+      destinationChannelId: "missing-channel",
+      sourceRelayUrl: COMMUNITY_A.relayUrl,
+      targetCommunityId: COMMUNITY_B.id,
+      targetRelayUrl: COMMUNITY_B.relayUrl,
+    });
     await page.evaluate(() => {
-      const source = window.localStorage.getItem(
-        "buzz-channels.v1:ws://localhost:3000",
-      );
-      if (!source) throw new Error("missing source channel snapshot");
-      const snapshot = JSON.parse(source);
-      snapshot.channels = snapshot.channels.filter(
-        (channel: { id: string }) => channel.id !== "general",
-      );
-      window.localStorage.setItem(
-        "buzz-channels.v1:ws://localhost:3001",
-        JSON.stringify(snapshot),
-      );
+      const testWindow = window as typeof window & {
+        __BUZZ_E2E__?: { mock?: { channelsReadDelayMs?: number } };
+      };
+      if (!testWindow.__BUZZ_E2E__) throw new Error("missing E2E config");
+      testWindow.__BUZZ_E2E__.mock = {
+        ...testWindow.__BUZZ_E2E__.mock,
+        channelsReadDelayMs: 500,
+      };
     });
 
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-    await expect(page).toHaveURL(/#\/channels\/general$/);
-    await expect
-      .poll(() =>
-        page.evaluate((communityId) => {
-          const raw = window.localStorage.getItem(
-            "buzz-community-destinations",
-          );
-          return raw ? JSON.parse(raw)[communityId] : null;
-        }, COMMUNITY_B.id),
-      )
-      .toEqual({ kind: "channel", channelId: "general" });
-    await page.waitForTimeout(400);
-    await expect
-      .poll(() =>
-        page.evaluate((communityId) => {
-          const raw = window.localStorage.getItem(
-            "buzz-community-destinations",
-          );
-          return raw ? JSON.parse(raw)[communityId] : null;
-        }, COMMUNITY_B.id),
-      )
-      .toEqual({ kind: "channel", channelId: "general" });
 
-    await expect(page.getByTestId("channel-general")).toBeVisible();
+    const continueButton = page.getByTestId("community-continue-work");
+    await expect(continueButton).toContainText("Open Inbox");
     await expect
-      .poll(() =>
-        page.evaluate((communityId) => {
-          const raw = window.localStorage.getItem(
-            "buzz-community-destinations",
-          );
-          return raw ? JSON.parse(raw)[communityId] : null;
-        }, COMMUNITY_B.id),
-      )
-      .toEqual({ kind: "channel", channelId: "general" });
+      .poll(() => readCommunityDestination(page, COMMUNITY_B.id))
+      .toEqual({ kind: "home" });
+    await expect(page).toHaveURL(/#\/community$/);
+  });
+
+  test("keeps a remembered channel through a transient validation failure", async ({
+    page,
+  }) => {
+    await installMockBridge(page, undefined, { skipCommunitySeed: true });
+    await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
+    await page.goto("/");
+    await expect(page.getByTestId("app-sidebar")).toBeVisible();
+    const rememberedChannelId = await rememberSnapshotChannel(page, {
+      channelName: "general",
+      sourceRelayUrl: COMMUNITY_A.relayUrl,
+      targetCommunityId: COMMUNITY_B.id,
+      targetRelayUrl: COMMUNITY_B.relayUrl,
+    });
+    await page.evaluate(() => {
+      const testWindow = window as typeof window & {
+        __BUZZ_E2E__?: {
+          mock?: {
+            channelsReadError?: string;
+            channelsReadDelayMs?: number;
+          };
+        };
+      };
+      if (!testWindow.__BUZZ_E2E__) throw new Error("missing E2E config");
+      testWindow.__BUZZ_E2E__.mock = {
+        ...testWindow.__BUZZ_E2E__.mock,
+        channelsReadDelayMs: 300,
+        channelsReadError: "temporary channel read failure",
+      };
+    });
+
+    await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
+
+    const continueButton = page.getByTestId("community-continue-work");
+    await expect(continueButton).toHaveAttribute(
+      "data-destination-status",
+      "pending",
+    );
+    await page.waitForTimeout(1_800);
+    await expect
+      .poll(() => readCommunityDestination(page, COMMUNITY_B.id))
+      .toEqual({ kind: "channel", channelId: rememberedChannelId });
+    await page.evaluate(async () => {
+      const testWindow = window as typeof window & {
+        __BUZZ_E2E__?: {
+          mock?: {
+            channelsReadError?: string;
+            channelsReadDelayMs?: number;
+          };
+        };
+      };
+      if (!testWindow.__BUZZ_E2E__) throw new Error("missing E2E config");
+      testWindow.__BUZZ_E2E__.mock = {
+        ...testWindow.__BUZZ_E2E__.mock,
+        channelsReadDelayMs: 0,
+        channelsReadError: undefined,
+      };
+      await window.__BUZZ_E2E_INVALIDATE_CHANNELS__?.();
+    });
+    await expect(continueButton).toContainText("Continue in #general");
+    await expect(continueButton).toHaveAttribute(
+      "data-destination-status",
+      "ready",
+    );
   });
 
   test("does not restore a remembered destination on cold boot", async ({
@@ -543,7 +575,7 @@ test.describe("community rail", () => {
     await expect(page).not.toHaveURL(/#\/channels\//);
   });
 
-  test("removing the active community restores the fallback destination", async ({
+  test("removing the active community opens the fallback overview with its work position", async ({
     page,
   }) => {
     await installMockBridge(page, undefined, { skipCommunitySeed: true });
@@ -562,7 +594,7 @@ test.describe("community rail", () => {
     await page.getByRole("menuitem", { name: "Community settings" }).click();
     await page.getByRole("button", { name: "Remove Community" }).click();
 
-    await expect(page).toHaveURL(randomUrl);
+    await expect(page).toHaveURL(/#\/community$/);
     await expect
       .poll(() =>
         page.evaluate(() =>
@@ -570,6 +602,11 @@ test.describe("community rail", () => {
         ),
       )
       .toBe(COMMUNITY_B.id);
+    await expect(page.getByTestId("community-continue-work")).toContainText(
+      "Continue in #random",
+    );
+    await page.getByTestId("community-continue-work").click();
+    await expect(page).toHaveURL(randomUrl);
   });
 
   test("shows the quiet switch gate, not the boot splash, while switching", async ({

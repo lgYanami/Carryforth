@@ -441,6 +441,16 @@ pub const KIND_SYSTEM_MESSAGE: u32 = 40099;
 pub const KIND_CHANNEL_SUMMARY: u32 = 40901;
 /// Bulk presence state (relay-signed sidecar).
 pub const KIND_PRESENCE_SNAPSHOT: u32 = 40902;
+/// NIP-PV: relay-signed current head for one Project View object.
+///
+/// This kind carries an indexed `d` tag, but it is not a NIP-33 addressable
+/// event. Project View owns replacement through its domain revision protocol.
+pub const KIND_PROJECT_VIEW_OBJECT: u32 = 40903;
+/// NIP-PV: relay-signed current Project View metadata head.
+///
+/// This kind carries an indexed `d` tag, but it is not a NIP-33 addressable
+/// event. Project View owns replacement through its domain revision protocol.
+pub const KIND_PROJECT_VIEW_META: u32 = 40904;
 
 // Direct messages (41000–41999)
 /// Open/create DM (p-tags = participants).
@@ -507,6 +517,9 @@ pub const KIND_MEMBER_REMOVED_NOTIFICATION: u32 = 44101;
 /// Stored globally (channel_id = NULL); owner-scoped reads only (p-gated, NIP-42).
 /// See `docs/nips/NIP-AM.md`.
 pub const KIND_AGENT_TURN_METRIC: u32 = 44200;
+
+/// NIP-PV: member-signed, append-only Project View mutation command.
+pub const KIND_PROJECT_VIEW_MUTATION: u32 = 44300;
 
 // Forum / social (45000–45999)
 // V1 used addressable range (30001–30003) — wrong.
@@ -664,6 +677,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
     KIND_PRESENCE_SNAPSHOT,
+    KIND_PROJECT_VIEW_OBJECT,
+    KIND_PROJECT_VIEW_META,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -688,6 +703,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEMBER_ADDED_NOTIFICATION,
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_AGENT_TURN_METRIC,
+    KIND_PROJECT_VIEW_MUTATION,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
     KIND_USER_STATUS,
@@ -746,6 +762,35 @@ pub const fn is_parameterized_replaceable(kind: u32) -> bool {
     kind >= PARAM_REPLACEABLE_KIND_MIN && kind <= PARAM_REPLACEABLE_KIND_MAX
 }
 
+/// Returns `true` when the event store materializes this kind's `d` tag.
+///
+/// NIP-33 addressable events use `d` as part of their replacement key.
+/// Project View object and metadata projections use `d` only as a
+/// relay-managed query coordinate; they deliberately retain separate domain
+/// revision and replacement semantics.
+pub const fn has_indexed_d_tag(kind: u32) -> bool {
+    is_parameterized_replaceable(kind)
+        || matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META)
+}
+
+/// Returns `true` for relay-signed Project View current-state projections.
+pub const fn is_project_view_projection_kind(kind: u32) -> bool {
+    matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META)
+}
+
+/// Returns `true` for the member-signed Project View mutation command.
+pub const fn is_project_view_mutation_kind(kind: u32) -> bool {
+    kind == KIND_PROJECT_VIEW_MUTATION
+}
+
+/// Returns `true` for every event kind in the Project View wire protocol.
+///
+/// These Community-global events require Project View's stricter member-only
+/// read gate instead of the ordinary `channel_id IS NULL` visibility rule.
+pub const fn is_project_view_protocol_kind(kind: u32) -> bool {
+    is_project_view_projection_kind(kind) || is_project_view_mutation_kind(kind)
+}
+
 /// Returns `true` if `kind` is a workflow execution event (46001–46012).
 /// These must not trigger workflows (prevents infinite loops).
 pub const fn is_workflow_execution_kind(kind: u32) -> bool {
@@ -793,6 +838,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
+            | KIND_PROJECT_VIEW_MUTATION
     )
 }
 
@@ -804,6 +850,8 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
         KIND_NIP43_MEMBERSHIP_LIST
             | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
+            | KIND_PROJECT_VIEW_OBJECT
+            | KIND_PROJECT_VIEW_META
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -833,6 +881,17 @@ const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 303
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_OBJECT));
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_META));
+const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_OBJECT));
+const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_META));
+const _: () = assert!(!has_indexed_d_tag(KIND_PROJECT_VIEW_MUTATION));
+const _: () = assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_OBJECT));
+const _: () = assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_META));
+const _: () = assert!(is_project_view_mutation_kind(KIND_PROJECT_VIEW_MUTATION));
+const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_OBJECT));
+const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_META));
+const _: () = assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_MUTATION));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -906,6 +965,41 @@ mod tests {
         assert!(is_parameterized_replaceable(39000)); // NIP-29 group metadata
         assert!(is_parameterized_replaceable(39999));
         assert!(!is_parameterized_replaceable(40000));
+    }
+
+    #[test]
+    fn indexed_d_tag_kinds_are_distinct_from_replacement_semantics() {
+        assert!(!has_indexed_d_tag(29999));
+        assert!(has_indexed_d_tag(30000));
+        assert!(has_indexed_d_tag(39999));
+        assert!(!has_indexed_d_tag(40000));
+        assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_OBJECT));
+        assert!(has_indexed_d_tag(KIND_PROJECT_VIEW_META));
+        assert!(!has_indexed_d_tag(KIND_PROJECT_VIEW_MUTATION));
+        assert!(!has_indexed_d_tag(KIND_TEXT_NOTE));
+
+        assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_OBJECT));
+        assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_META));
+    }
+
+    #[test]
+    fn project_view_projection_kinds_are_relay_only() {
+        assert!(is_relay_only_kind(KIND_PROJECT_VIEW_OBJECT));
+        assert!(is_relay_only_kind(KIND_PROJECT_VIEW_META));
+        assert!(!is_relay_only_kind(KIND_PROJECT_VIEW_MUTATION));
+    }
+
+    #[test]
+    fn project_view_protocol_classifiers_cover_commands_and_projections() {
+        assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_OBJECT));
+        assert!(is_project_view_projection_kind(KIND_PROJECT_VIEW_META));
+        assert!(!is_project_view_projection_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(is_project_view_mutation_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(is_command_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_OBJECT));
+        assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_META));
+        assert!(is_project_view_protocol_kind(KIND_PROJECT_VIEW_MUTATION));
+        assert!(!is_project_view_protocol_kind(KIND_TEXT_NOTE));
     }
 
     #[test]
