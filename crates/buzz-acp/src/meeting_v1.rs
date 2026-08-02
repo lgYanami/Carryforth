@@ -37,18 +37,21 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::meeting::{
-    fetch_meeting_history, now_ms, sign_builder, tag_value, validate_bounded_text, MeetingTurnKind,
-    MeetingTurnRequest,
+    fetch_meeting_history, now_ms, remaining_before, sign_builder, tag_value,
+    validate_bounded_text, MeetingBatonProtocol, MeetingTurnKind, MeetingTurnRequest,
 };
 #[cfg(feature = "meeting-v1-acceptance")]
 use crate::meeting_acceptance::{
     self, AcceptanceCandidateRef, PreSubmitAcceptanceBarrier, PreSubmitBarrierFrame,
 };
+use crate::meeting_v2::{
+    attach_current_board, detach_current_board, fetch_current_board, CurrentBoardPrompt,
+};
 use crate::observer::{self, ObserverHandle};
 use crate::relay::{BuzzEvent, ProtocolSubmitOutcome, ProtocolSubmitRejected, RestClient};
 
-const LEDGER_VERSION: u32 = 4;
-const PREVIOUS_LEDGER_VERSION: u32 = 3;
+const LEDGER_VERSION: u32 = 5;
+const PREVIOUS_LEDGER_VERSION: u32 = 4;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const SYNC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -68,6 +71,9 @@ const DEFAULT_MODERATOR_DECISION_DURATION: Duration = Duration::from_secs(3 * 60
 const MAX_MODERATOR_FAST_REBASES: u8 = 3;
 const MODERATOR_REBASE_QUIESCENCE: Duration = Duration::from_millis(250);
 const MAX_MODERATOR_TERMINAL_TURNS: usize = 4_096;
+const BOARD_LOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const BOARD_LOAD_RETRY_DELAY: Duration = Duration::from_millis(250);
+const BOARD_LOAD_MAX_ATTEMPTS: u8 = 3;
 
 const PARTICIPANT_INTENT_PROMPT: &str = include_str!("meeting_participant_intent_prompt.md");
 const GRANTED_SPEECH_PROMPT: &str = include_str!("meeting_granted_speech_prompt.md");
@@ -76,6 +82,7 @@ const MODERATOR_PROMPT: &str = include_str!("meeting_moderator_prompt.md");
 #[derive(Debug, Clone)]
 struct MeetingRuntime {
     epoch: u64,
+    protocol: MeetingBatonProtocol,
     view: Option<MeetingView>,
     last_sync: Option<Instant>,
     retry_at: Instant,
@@ -88,9 +95,10 @@ struct MeetingRuntime {
 }
 
 impl MeetingRuntime {
-    fn new(epoch: u64) -> Self {
+    fn new(epoch: u64, protocol: MeetingBatonProtocol) -> Self {
         Self {
             epoch,
+            protocol,
             view: None,
             last_sync: None,
             retry_at: Instant::now(),
@@ -107,6 +115,7 @@ impl MeetingRuntime {
 #[derive(Debug, Clone)]
 struct MeetingView {
     session_id: Uuid,
+    protocol: MeetingBatonProtocol,
     title: String,
     description: Option<String>,
     ended: bool,
@@ -460,6 +469,8 @@ struct AgentLedger {
 struct MeetingLedger {
     session_id: String,
     agent_pubkey: String,
+    #[serde(default)]
+    protocol: MeetingBatonProtocol,
     meeting_synced: bool,
     state_revision: u64,
     speech_revision: u64,
@@ -656,6 +667,24 @@ struct SyncTaskResult {
     result: std::result::Result<MeetingView, String>,
 }
 
+struct BoardLoadTaskResult {
+    session_id: Uuid,
+    session_epoch: u64,
+    load_id: u64,
+    request: MeetingTurnRequest,
+    attempt: u8,
+    started_at_ms: i64,
+    result: std::result::Result<CurrentBoardPrompt, String>,
+}
+
+#[derive(Debug, Clone)]
+struct BoardLoadInFlight {
+    session_epoch: u64,
+    load_id: u64,
+    request: MeetingTurnRequest,
+    attempt: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncApplyResult {
     Applied,
@@ -826,6 +855,10 @@ pub(super) struct MeetingV1Coordinator {
     sync_result_tx: tokio::sync::mpsc::UnboundedSender<SyncTaskResult>,
     sync_result_rx: tokio::sync::mpsc::UnboundedReceiver<SyncTaskResult>,
     deferred_turn_results: HashMap<Uuid, DeferredTurnResult>,
+    next_board_load_id: u64,
+    board_load_in_flight: HashMap<Uuid, BoardLoadInFlight>,
+    board_load_result_tx: tokio::sync::mpsc::UnboundedSender<BoardLoadTaskResult>,
+    board_load_result_rx: tokio::sync::mpsc::UnboundedReceiver<BoardLoadTaskResult>,
     next_protocol_submission_id: u64,
     protocol_in_flight: HashMap<ProtocolSubmissionKey, ProtocolInFlight>,
     protocol_result_tx: tokio::sync::mpsc::UnboundedSender<ProtocolTaskResult>,
@@ -869,6 +902,7 @@ impl MeetingV1Coordinator {
             .ok()
             .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let (sync_result_tx, sync_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (board_load_result_tx, board_load_result_rx) = tokio::sync::mpsc::unbounded_channel();
         let (protocol_result_tx, protocol_result_rx) = tokio::sync::mpsc::unbounded_channel();
         let (progress_result_tx, progress_result_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -895,6 +929,10 @@ impl MeetingV1Coordinator {
             sync_result_tx,
             sync_result_rx,
             deferred_turn_results: HashMap::new(),
+            next_board_load_id: 0,
+            board_load_in_flight: HashMap::new(),
+            board_load_result_tx,
+            board_load_result_rx,
             next_protocol_submission_id: 0,
             protocol_in_flight: HashMap::new(),
             protocol_result_tx,
@@ -910,7 +948,7 @@ impl MeetingV1Coordinator {
     }
 
     pub(super) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.board_load_in_flight.is_empty()
     }
 
     pub(super) fn set_available_agent_slots(&mut self, available: usize) {
@@ -934,19 +972,106 @@ impl MeetingV1Coordinator {
             .min(self.agent_capacity)
     }
 
+    pub(super) fn board_dispatch_reserved_slots(&self) -> usize {
+        let mut sessions = BTreeSet::new();
+        for load in self.board_load_in_flight.values() {
+            if self.board_request_needs_extra_slot(&load.request) {
+                sessions.insert(load.request.session_id);
+            }
+        }
+        for request in &self.pending {
+            if request.baton_protocol == Some(MeetingBatonProtocol::V2)
+                && request.board_event_id.is_some()
+                && self.board_request_needs_extra_slot(request)
+            {
+                sessions.insert(request.session_id);
+            }
+        }
+        sessions.len().min(self.agent_capacity)
+    }
+
+    pub(super) fn preempt_board_reserved_intents(&mut self, limit: usize) -> usize {
+        let mut sessions: BTreeSet<_> = self
+            .board_load_in_flight
+            .values()
+            .filter(|load| load.request.kind == MeetingTurnKind::V1Intent)
+            .map(|load| load.request.session_id)
+            .collect();
+        sessions.extend(
+            self.pending
+                .iter()
+                .filter(|request| {
+                    request.kind == MeetingTurnKind::V1Intent
+                        && request.baton_protocol == Some(MeetingBatonProtocol::V2)
+                        && request.board_event_id.is_some()
+                })
+                .map(|request| request.session_id),
+        );
+        let selected: Vec<_> = sessions.into_iter().take(limit).collect();
+        for session_id in &selected {
+            self.preempt_intent_turn(*session_id);
+        }
+        selected.len()
+    }
+
+    fn board_request_needs_extra_slot(&self, request: &MeetingTurnRequest) -> bool {
+        match request.kind {
+            MeetingTurnKind::V1Intent => true,
+            MeetingTurnKind::V1Granted => !self.granted_request_uses_active_reservation(request),
+            MeetingTurnKind::V1ModeratorControl
+            | MeetingTurnKind::V0Intent
+            | MeetingTurnKind::V0Granted => false,
+        }
+    }
+
     pub(super) fn front_kind(&self) -> Option<MeetingTurnKind> {
         self.pending.front().map(|request| request.kind)
     }
 
     pub(super) fn pop_pending(&mut self) -> Option<MeetingTurnRequest> {
-        self.pending.pop_front()
+        let request = self.pending.pop_front()?;
+        let needs_board = request.baton_protocol == Some(MeetingBatonProtocol::V2)
+            && matches!(
+                request.kind,
+                MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted
+            )
+            && request.board_event_id.is_none();
+        if needs_board {
+            let protected_slots = self
+                .unassigned_reserved_slots()
+                .saturating_add(self.board_dispatch_reserved_slots());
+            if self.board_request_needs_extra_slot(&request)
+                && self.available_agent_slots <= protected_slots
+            {
+                self.pending.push_front(request);
+                return None;
+            }
+            self.start_current_board_load(request, 1, Duration::ZERO);
+            return None;
+        }
+        Some(request)
     }
 
-    pub(super) fn requeue_front(&mut self, request: MeetingTurnRequest) {
+    pub(super) fn requeue_front(&mut self, mut request: MeetingTurnRequest) {
+        if request.baton_protocol == Some(MeetingBatonProtocol::V2)
+            && request.board_event_id.take().is_some()
+            && matches!(
+                request.kind,
+                MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted
+            )
+        {
+            request.prompt = detach_current_board(&request.prompt);
+        }
         self.pending.push_front(request);
     }
 
     pub(super) fn mark_dispatched(&mut self, turn_id: String, request: MeetingTurnRequest) {
+        debug_assert!(
+            request.baton_protocol != Some(MeetingBatonProtocol::V2)
+                || request.kind == MeetingTurnKind::V1ModeratorControl
+                || request.board_event_id.is_some(),
+            "Meeting V2 participant Turn dispatched without a current Board"
+        );
         let turn_started_at_ms = now_ms();
         let moderator_turn = request.kind == MeetingTurnKind::V1ModeratorControl;
         let session_epoch = self
@@ -1016,6 +1141,8 @@ impl MeetingV1Coordinator {
                     _ => "invalid",
                 },
                 "queued_latency_ms": now_ms().saturating_sub(request.queued_at_unix_ms),
+                "protocol": request.baton_protocol.map(MeetingBatonProtocol::label),
+                "board_event_id": request.board_event_id,
             }),
         );
         if let Some(session_epoch) = session_epoch {
@@ -1028,25 +1155,27 @@ impl MeetingV1Coordinator {
         self.in_flight.contains_key(turn_id)
     }
 
-    pub(super) async fn register(&mut self, session_id: Uuid) {
-        if self.register_local(session_id) {
+    pub(super) async fn register(&mut self, session_id: Uuid, protocol: MeetingBatonProtocol) {
+        if self.register_local(session_id, protocol) {
             self.request_full_sync(session_id);
         }
     }
 
-    fn register_local(&mut self, session_id: Uuid) -> bool {
+    fn register_local(&mut self, session_id: Uuid, protocol: MeetingBatonProtocol) -> bool {
         if self.meetings.contains_key(&session_id) {
             return false;
         }
         self.next_session_epoch = self.next_session_epoch.saturating_add(1).max(1);
-        self.meetings
-            .insert(session_id, MeetingRuntime::new(self.next_session_epoch));
+        self.meetings.insert(
+            session_id,
+            MeetingRuntime::new(self.next_session_epoch, protocol),
+        );
         self.ensure_meeting_ledger(session_id);
         self.emit(
             "meeting_v1_discovered",
             session_id,
             None,
-            json!({ "session_id": session_id }),
+            json!({ "session_id": session_id, "protocol": protocol.label() }),
         );
         true
     }
@@ -1064,6 +1193,7 @@ impl MeetingV1Coordinator {
             self.preemptions.remove(&session_id);
         }
         self.deferred_turn_results.remove(&session_id);
+        self.board_load_in_flight.remove(&session_id);
         self.protocol_in_flight
             .retain(|key, _| key.session_id() != session_id);
         self.progress_in_flight
@@ -1109,6 +1239,7 @@ impl MeetingV1Coordinator {
             self.preemptions.remove(&session_id);
         }
         let deferred_turn_result = self.deferred_turn_results.remove(&session_id);
+        self.board_load_in_flight.remove(&session_id);
         // A primary Moderator action may already be committed at the Relay
         // even when the terminal State wins the local delivery race. Keep its
         // submission identity until the HTTP result arrives so the observer
@@ -1168,6 +1299,7 @@ impl MeetingV1Coordinator {
     pub(super) async fn tick(&mut self) {
         self.retry_terminal_ledger_cleanup_if_due();
         self.drain_protocol_results().await;
+        self.drain_board_load_results().await;
         self.drain_progress_results();
         let now = Instant::now();
         let control_due: Vec<_> = self
@@ -1226,6 +1358,347 @@ impl MeetingV1Coordinator {
             .next();
         if let Some(session_id) = due {
             self.request_full_sync(session_id);
+        }
+    }
+
+    fn start_current_board_load(
+        &mut self,
+        mut request: MeetingTurnRequest,
+        attempt: u8,
+        retry_delay: Duration,
+    ) {
+        let session_id = request.session_id;
+        let Some((session_epoch, relay_pubkey, moderator_pubkey, protocol)) =
+            self.meetings.get(&session_id).and_then(|runtime| {
+                runtime.view.as_ref().map(|view| {
+                    (
+                        runtime.epoch,
+                        view.relay_pubkey.clone(),
+                        view.baton.moderator_pubkey.clone(),
+                        runtime.protocol,
+                    )
+                })
+            })
+        else {
+            if let Some(runtime) = self.meetings.get_mut(&session_id) {
+                runtime.queued = false;
+            }
+            self.request_full_sync(session_id);
+            return;
+        };
+        if protocol != MeetingBatonProtocol::V2
+            || request.baton_protocol != Some(MeetingBatonProtocol::V2)
+        {
+            tracing::error!(
+                meeting = %session_id,
+                "BUG: current-Board load requested outside a Meeting V2 participant Turn"
+            );
+            if let Some(runtime) = self.meetings.get_mut(&session_id) {
+                runtime.queued = false;
+            }
+            return;
+        }
+
+        request.board_event_id = None;
+        self.next_board_load_id = self.next_board_load_id.saturating_add(1).max(1);
+        let load_id = self.next_board_load_id;
+        self.board_load_in_flight.insert(
+            session_id,
+            BoardLoadInFlight {
+                session_epoch,
+                load_id,
+                request: request.clone(),
+                attempt,
+            },
+        );
+        self.emit(
+            "meeting_v2_board_load_started",
+            session_id,
+            None,
+            json!({
+                "load_id": load_id,
+                "attempt": attempt,
+                "turn_type": board_turn_type(request.kind),
+            }),
+        );
+
+        let rest = self.rest.clone();
+        let result_tx = self.board_load_result_tx.clone();
+        let _task = tokio::spawn(async move {
+            if !retry_delay.is_zero() {
+                tokio::time::sleep(retry_delay).await;
+            }
+            let started_at_ms = now_ms();
+            let remaining = remaining_before(request.hard_deadline_unix_ms);
+            let timeout = remaining.min(BOARD_LOAD_ATTEMPT_TIMEOUT);
+            let result = if timeout.is_zero() {
+                Err("Meeting V2 Board read started after the Turn deadline".to_string())
+            } else {
+                let attempt_result = AssertUnwindSafe(tokio::time::timeout(
+                    timeout,
+                    fetch_current_board(&rest, session_id, &relay_pubkey, &moderator_pubkey),
+                ))
+                .catch_unwind()
+                .await;
+                match attempt_result {
+                    Ok(Ok(Ok(board))) => Ok(board),
+                    Ok(Ok(Err(error))) => Err(error.to_string()),
+                    Ok(Err(_)) => Err(format!(
+                        "Meeting V2 Board read exceeded {}ms",
+                        timeout.as_millis()
+                    )),
+                    Err(_) => Err("Meeting V2 Board read task panicked".to_string()),
+                }
+            };
+            if result_tx
+                .send(BoardLoadTaskResult {
+                    session_id,
+                    session_epoch,
+                    load_id,
+                    request,
+                    attempt,
+                    started_at_ms,
+                    result,
+                })
+                .is_err()
+            {
+                tracing::debug!(
+                    meeting = %session_id,
+                    load_id,
+                    "Meeting coordinator stopped before the V2 Board read completed"
+                );
+            }
+        });
+    }
+
+    async fn drain_board_load_results(&mut self) {
+        let mut completed = Vec::new();
+        while let Ok(result) = self.board_load_result_rx.try_recv() {
+            completed.push(result);
+        }
+        for completed in completed {
+            self.handle_board_load_result(completed).await;
+        }
+    }
+
+    async fn handle_board_load_result(&mut self, completed: BoardLoadTaskResult) {
+        let Some(active) = self
+            .board_load_in_flight
+            .get(&completed.session_id)
+            .filter(|active| {
+                active.session_epoch == completed.session_epoch
+                    && active.load_id == completed.load_id
+                    && active.attempt == completed.attempt
+                    && active.request.basis_id == completed.request.basis_id
+            })
+            .cloned()
+        else {
+            return;
+        };
+        self.board_load_in_flight.remove(&completed.session_id);
+        if self
+            .meetings
+            .get(&completed.session_id)
+            .is_none_or(|runtime| runtime.epoch != completed.session_epoch)
+            || !self.board_request_is_current(&completed.request)
+        {
+            self.discard_board_load_request(&active.request, "authority_changed");
+            return;
+        }
+
+        match completed.result {
+            Ok(board) => {
+                let event_id = board.event_id.clone();
+                let original_bytes = board.original_bytes;
+                let truncated = board.truncated;
+                let mut request = completed.request;
+                request.prompt = attach_current_board(&request.prompt, &board);
+                request.board_event_id = Some(event_id.clone());
+                match request.kind {
+                    MeetingTurnKind::V1Granted => self.pending.push_front(request),
+                    MeetingTurnKind::V1Intent => self.pending.push_back(request),
+                    MeetingTurnKind::V1ModeratorControl
+                    | MeetingTurnKind::V0Intent
+                    | MeetingTurnKind::V0Granted => {
+                        self.discard_board_load_request(&active.request, "invalid_turn_type");
+                        return;
+                    }
+                }
+                self.emit(
+                    "meeting_v2_board_load_completed",
+                    completed.session_id,
+                    None,
+                    json!({
+                        "load_id": completed.load_id,
+                        "attempt": completed.attempt,
+                        "turn_type": board_turn_type(active.request.kind),
+                        "board_event_id": event_id,
+                        "original_bytes": original_bytes,
+                        "truncated": truncated,
+                        "latency_ms": now_ms().saturating_sub(completed.started_at_ms),
+                    }),
+                );
+            }
+            Err(error) => {
+                let retry_delay_ms = BOARD_LOAD_RETRY_DELAY.as_millis() as i64;
+                let retry_allowed = completed.attempt < BOARD_LOAD_MAX_ATTEMPTS
+                    && now_ms().saturating_add(retry_delay_ms)
+                        < completed.request.hard_deadline_unix_ms;
+                tracing::warn!(
+                    meeting = %completed.session_id,
+                    load_id = completed.load_id,
+                    attempt = completed.attempt,
+                    retry = retry_allowed,
+                    "Meeting V2 current Board read failed: {error}"
+                );
+                if retry_allowed {
+                    self.start_current_board_load(
+                        completed.request,
+                        completed.attempt.saturating_add(1),
+                        BOARD_LOAD_RETRY_DELAY,
+                    );
+                    return;
+                }
+                self.finish_board_load_failure(completed.request, completed.attempt)
+                    .await;
+            }
+        }
+    }
+
+    fn board_request_is_current(&self, request: &MeetingTurnRequest) -> bool {
+        let Some(view) = self
+            .meetings
+            .get(&request.session_id)
+            .and_then(|runtime| runtime.view.as_ref())
+        else {
+            return false;
+        };
+        if view.ended
+            || view.protocol != MeetingBatonProtocol::V2
+            || view.baton.moderator_pubkey == self.agent_pubkey
+        {
+            return false;
+        }
+        match request.kind {
+            MeetingTurnKind::V1Intent => {
+                view.baton.speech_revision == request.round_number
+                    && view
+                        .baton
+                        .offer
+                        .as_ref()
+                        .is_none_or(|offer| offer.target_pubkey != self.agent_pubkey)
+                    && view
+                        .baton
+                        .grant
+                        .as_ref()
+                        .is_none_or(|grant| grant.holder_pubkey != self.agent_pubkey)
+                    && self
+                        .ledger_for(request.session_id)
+                        .and_then(|ledger| ledger.triggers.get(&request.basis_id))
+                        .is_some_and(|trigger| {
+                            matches!(trigger.state.as_str(), "pending" | "queued")
+                        })
+            }
+            MeetingTurnKind::V1Granted => {
+                request.grant_event_id.as_deref().is_some_and(|grant_id| {
+                    view.baton.grant.as_ref().is_some_and(|grant| {
+                        grant.grant_id == grant_id
+                            && grant.holder_pubkey == self.agent_pubkey
+                            && now_ms() < request.hard_deadline_unix_ms
+                    })
+                })
+            }
+            MeetingTurnKind::V1ModeratorControl
+            | MeetingTurnKind::V0Intent
+            | MeetingTurnKind::V0Granted => false,
+        }
+    }
+
+    fn discard_board_load_request(&mut self, request: &MeetingTurnRequest, reason: &str) {
+        if let Some(runtime) = self.meetings.get_mut(&request.session_id) {
+            runtime.queued = false;
+        }
+        match request.kind {
+            MeetingTurnKind::V1Intent => {
+                self.mark_trigger_state(request.session_id, &request.basis_id, "stale");
+            }
+            MeetingTurnKind::V1Granted => {
+                if let Some(grant_id) = request.grant_event_id.as_deref() {
+                    self.mark_grant_state(request.session_id, grant_id, "stale");
+                }
+            }
+            MeetingTurnKind::V1ModeratorControl
+            | MeetingTurnKind::V0Intent
+            | MeetingTurnKind::V0Granted => {}
+        }
+        self.emit(
+            "meeting_v2_board_load_discarded",
+            request.session_id,
+            None,
+            json!({
+                "turn_type": board_turn_type(request.kind),
+                "reason": reason,
+            }),
+        );
+    }
+
+    async fn finish_board_load_failure(&mut self, request: MeetingTurnRequest, attempts: u8) {
+        if let Some(runtime) = self.meetings.get_mut(&request.session_id) {
+            runtime.queued = false;
+        }
+        self.emit(
+            "meeting_v2_board_load_failed",
+            request.session_id,
+            None,
+            json!({
+                "turn_type": board_turn_type(request.kind),
+                "attempts": attempts,
+                "outcome": if request.kind == MeetingTurnKind::V1Intent {
+                    "pass"
+                } else {
+                    "yield"
+                },
+            }),
+        );
+        match request.kind {
+            MeetingTurnKind::V1Intent => {
+                self.mark_trigger_state(request.session_id, &request.basis_id, "passed");
+                self.emit(
+                    "meeting_v1_intent_completed",
+                    request.session_id,
+                    None,
+                    json!({
+                        "trigger_id": request.basis_id,
+                        "decision": "PASS",
+                        "outcome": "current_board_unavailable",
+                    }),
+                );
+            }
+            MeetingTurnKind::V1Granted => {
+                let grant = request.grant_event_id.as_deref().and_then(|grant_id| {
+                    self.meetings
+                        .get(&request.session_id)
+                        .and_then(|runtime| runtime.view.as_ref())
+                        .and_then(|view| view.baton.grant.as_ref())
+                        .filter(|grant| {
+                            grant.grant_id == grant_id && grant.holder_pubkey == self.agent_pubkey
+                        })
+                        .cloned()
+                });
+                if let Some(grant) = grant {
+                    self.mark_grant_state(request.session_id, &grant.grant_id, "received");
+                    self.prepare_and_submit_yield(
+                        request.session_id,
+                        &grant,
+                        MeetingV1GrantYieldReason::UnableToAnswer,
+                        "Current Meeting Board could not be read authoritatively",
+                    )
+                    .await;
+                }
+            }
+            MeetingTurnKind::V1ModeratorControl
+            | MeetingTurnKind::V0Intent
+            | MeetingTurnKind::V0Granted => {}
         }
     }
 
@@ -1358,12 +1831,30 @@ impl MeetingV1Coordinator {
 
     fn ensure_meeting_ledger(&mut self, session_id: Uuid) {
         let key = session_id.to_string();
+        let protocol = self
+            .meetings
+            .get(&session_id)
+            .map_or(MeetingBatonProtocol::V1, |runtime| runtime.protocol);
+        if self
+            .ledger
+            .meetings
+            .get(&key)
+            .is_some_and(|ledger| ledger.protocol != protocol)
+        {
+            tracing::warn!(
+                meeting = %session_id,
+                protocol = protocol.label(),
+                "Meeting ledger protocol differs from Relay registration; rebuilding Session ledger"
+            );
+            self.ledger.meetings.remove(&key);
+        }
         self.ledger
             .meetings
             .entry(key.clone())
             .or_insert_with(|| MeetingLedger {
                 session_id: key,
                 agent_pubkey: self.agent_pubkey.clone(),
+                protocol,
                 ..MeetingLedger::default()
             });
         self.persist_ledger_best_effort();
@@ -1388,7 +1879,7 @@ impl MeetingV1Coordinator {
             .context("Meeting V1 live State content is malformed")?;
         let raw_state: RawBatonState = serde_json::from_value(raw_value.clone())
             .context("Meeting V1 live State shape is malformed")?;
-        validate_baton_state_event(&event.event, event.channel_id, &raw_state)?;
+        validate_baton_state_event(&event.event, event.channel_id, current.protocol, &raw_state)?;
         validate_live_state_roster(&raw_state, &current.roster)?;
 
         if raw_state.state_revision < current.baton.state_revision {
@@ -2230,6 +2721,7 @@ impl MeetingV1Coordinator {
             return;
         }
         let session_epoch = runtime.epoch;
+        let protocol = runtime.protocol;
         runtime.sync_in_flight = Some(request_id);
         self.emit(
             "meeting_v1_sync_started",
@@ -2246,7 +2738,7 @@ impl MeetingV1Coordinator {
         let _task = tokio::spawn(async move {
             let attempt = AssertUnwindSafe(tokio::time::timeout(
                 SYNC_ATTEMPT_TIMEOUT,
-                fetch_meeting_view(&rest, session_id),
+                fetch_meeting_view(&rest, session_id, protocol),
             ))
             .catch_unwind()
             .await;
@@ -2254,10 +2746,14 @@ impl MeetingV1Coordinator {
                 Ok(Ok(Ok(view))) => Ok(view),
                 Ok(Ok(Err(error))) => Err(error.to_string()),
                 Ok(Err(_)) => Err(format!(
-                    "Meeting V1 sync exceeded the {}ms controller budget",
+                    "Meeting {} sync exceeded the {}ms controller budget",
+                    protocol.label(),
                     SYNC_ATTEMPT_TIMEOUT.as_millis()
                 )),
-                Err(_) => Err("Meeting V1 background sync task panicked".to_string()),
+                Err(_) => Err(format!(
+                    "Meeting {} background sync task panicked",
+                    protocol.label()
+                )),
             };
             if result_tx
                 .send(SyncTaskResult {
@@ -2360,6 +2856,19 @@ impl MeetingV1Coordinator {
     }
 
     fn apply_synced_view(&mut self, session_id: Uuid, view: MeetingView) -> SyncApplyResult {
+        if self
+            .meetings
+            .get(&session_id)
+            .is_none_or(|runtime| runtime.protocol != view.protocol)
+        {
+            tracing::warn!(
+                meeting = %session_id,
+                protocol = view.protocol.label(),
+                "Meeting full sync attempted to change the registered protocol"
+            );
+            self.schedule_sync_retry(session_id);
+            return SyncApplyResult::Failed;
+        }
         if let Some(previous) = self
             .meetings
             .get(&session_id)
@@ -2666,6 +3175,7 @@ impl MeetingV1Coordinator {
             .baton
             .active_decision_attempt
             .clone()
+            .filter(|_| view.protocol == MeetingBatonProtocol::V1)
             .filter(|_| view.baton.moderator_pubkey == agent_pubkey)
             .filter(|attempt| previous_attempt_id.as_deref() != Some(attempt.attempt_id.as_str()));
         let Some(ledger) = self.ledger.meetings.get_mut(&key) else {
@@ -2877,7 +3387,8 @@ impl MeetingV1Coordinator {
         }
 
         let active_attempt = view.baton.active_decision_attempt.clone();
-        if view.baton.moderator_pubkey == agent_pubkey {
+        if view.protocol == MeetingBatonProtocol::V1 && view.baton.moderator_pubkey == agent_pubkey
+        {
             match active_attempt {
                 Some(active) => {
                     let same_attempt = ledger
@@ -3016,6 +3527,21 @@ impl MeetingV1Coordinator {
         if view.ended {
             self.pending
                 .retain(|request| request.session_id != session_id);
+            if let Some(runtime) = self.meetings.get_mut(&session_id) {
+                runtime.queued = false;
+            }
+            return;
+        }
+
+        if view.protocol == MeetingBatonProtocol::V2
+            && view.baton.moderator_pubkey == self.agent_pubkey
+        {
+            // Stage 3 is participant-only. Do not ACK, speak, or borrow the V1
+            // moderator controller for a V2 host; Stage 4 owns both Board and
+            // Floor model Turns.
+            self.pending
+                .retain(|request| request.session_id != session_id);
+            self.board_load_in_flight.remove(&session_id);
             if let Some(runtime) = self.meetings.get_mut(&session_id) {
                 runtime.queued = false;
             }
@@ -3211,6 +3737,8 @@ impl MeetingV1Coordinator {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: Some(moderator_observer_snapshot),
+            baton_protocol: Some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         });
         self.emit(
             "meeting_v1_moderator_control_started",
@@ -4183,10 +4711,21 @@ impl MeetingV1Coordinator {
                 || request.kind != MeetingTurnKind::V1Granted
                 || request.grant_event_id.as_deref() == active_grant_id
         });
+        let stale_board_load = self
+            .board_load_in_flight
+            .get(&session_id)
+            .is_some_and(|load| {
+                load.request.kind == MeetingTurnKind::V1Granted
+                    && load.request.grant_event_id.as_deref() != active_grant_id
+            });
+        if stale_board_load {
+            self.board_load_in_flight.remove(&session_id);
+        }
         let still_queued = self
             .pending
             .iter()
-            .any(|request| request.session_id == session_id);
+            .any(|request| request.session_id == session_id)
+            || self.board_load_in_flight.contains_key(&session_id);
         if let Some(runtime) = self.meetings.get_mut(&session_id) {
             runtime.queued = still_queued;
         }
@@ -4285,7 +4824,13 @@ impl MeetingV1Coordinator {
             .find(|request| {
                 request.session_id == session_id && request.kind == MeetingTurnKind::V1Intent
             })
-            .map(|request| (request.basis_id.clone(), request.round_number));
+            .map(|request| (request.basis_id.clone(), request.round_number))
+            .or_else(|| {
+                self.board_load_in_flight.get(&session_id).and_then(|load| {
+                    (load.request.kind == MeetingTurnKind::V1Intent)
+                        .then(|| (load.request.basis_id.clone(), load.request.round_number))
+                })
+            });
         let Some((queued_basis, queued_revision)) = queued else {
             return;
         };
@@ -4299,6 +4844,13 @@ impl MeetingV1Coordinator {
         self.pending.retain(|request| {
             !(request.session_id == session_id && request.kind == MeetingTurnKind::V1Intent)
         });
+        if self
+            .board_load_in_flight
+            .get(&session_id)
+            .is_some_and(|load| load.request.kind == MeetingTurnKind::V1Intent)
+        {
+            self.board_load_in_flight.remove(&session_id);
+        }
         if let Some(runtime) = self.meetings.get_mut(&session_id) {
             runtime.queued = false;
         }
@@ -4426,12 +4978,17 @@ impl MeetingV1Coordinator {
             && reserved_elsewhere < self.agent_capacity
             && has_physical_slot;
         let (state, ack_event, decline_event, event) = if should_ack {
-            let event = match buzz_sdk::build_meeting_v1_offer_ack(MeetingV1OfferAckParams {
+            let params = MeetingV1OfferAckParams {
                 session_id,
                 offer_id: &offer.offer_id,
-            })
-            .map_err(|error| anyhow!(error.to_string()))
-            .and_then(|builder| sign_builder(builder, &self.keys))
+            };
+            let builder = match view.protocol {
+                MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_offer_ack(params),
+                MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_offer_ack(params),
+            };
+            let event = match builder
+                .map_err(|error| anyhow!(error.to_string()))
+                .and_then(|builder| sign_builder(builder, &self.keys))
             {
                 Ok(event) => event,
                 Err(error) => {
@@ -4457,25 +5014,29 @@ impl MeetingV1Coordinator {
             } else {
                 "no physical Agent turn slot is currently available"
             };
-            let event =
-                match buzz_sdk::build_meeting_v1_offer_decline(MeetingV1OfferDeclineParams {
-                    session_id,
-                    offer_id: &offer.offer_id,
-                    reason: Some(reason),
-                })
+            let params = MeetingV1OfferDeclineParams {
+                session_id,
+                offer_id: &offer.offer_id,
+                reason: Some(reason),
+            };
+            let builder = match view.protocol {
+                MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_offer_decline(params),
+                MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_offer_decline(params),
+            };
+            let event = match builder
                 .map_err(|error| anyhow!(error.to_string()))
                 .and_then(|builder| sign_builder(builder, &self.keys))
-                {
-                    Ok(event) => event,
-                    Err(error) => {
-                        tracing::warn!(
-                            meeting = %session_id,
-                            offer = %offer.offer_id,
-                            "could not prepare deterministic Meeting V1 Decline: {error}"
-                        );
-                        return true;
-                    }
-                };
+            {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(
+                        meeting = %session_id,
+                        offer = %offer.offer_id,
+                        "could not prepare deterministic Meeting V1 Decline: {error}"
+                    );
+                    return true;
+                }
+            };
             (
                 "decline_prepared",
                 None,
@@ -4652,6 +5213,15 @@ impl MeetingV1Coordinator {
             }
             !remove
         });
+        if let Some(load) = self
+            .board_load_in_flight
+            .get(&session_id)
+            .filter(|load| load.request.kind == MeetingTurnKind::V1Intent)
+            .cloned()
+        {
+            removed_bases.push(load.request.basis_id);
+            self.board_load_in_flight.remove(&session_id);
+        }
         if !removed_bases.is_empty() {
             if let Some(runtime) = self.meetings.get_mut(&session_id) {
                 runtime.queued = false;
@@ -4690,6 +5260,15 @@ impl MeetingV1Coordinator {
             }
             !remove
         });
+        if let Some(load) = self
+            .board_load_in_flight
+            .get(&session_id)
+            .filter(|load| load.request.kind == MeetingTurnKind::V1Intent)
+            .cloned()
+        {
+            removed_bases.push(load.request.basis_id);
+            self.board_load_in_flight.remove(&session_id);
+        }
         if !removed_bases.is_empty() {
             if let Some(runtime) = self.meetings.get_mut(&session_id) {
                 runtime.queued = false;
@@ -4745,6 +5324,8 @@ impl MeetingV1Coordinator {
             grant_event_id: Some(grant.grant_id.clone()),
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(view.protocol),
+            board_event_id: None,
         });
         self.emit(
             "meeting_v1_grant_received",
@@ -4805,6 +5386,8 @@ impl MeetingV1Coordinator {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(view.protocol),
+            board_event_id: None,
         });
         self.emit(
             "meeting_v1_intent_started",
@@ -4817,7 +5400,7 @@ impl MeetingV1Coordinator {
         );
     }
 
-    fn queue_turn(&mut self, request: MeetingTurnRequest) {
+    fn queue_turn(&mut self, mut request: MeetingTurnRequest) {
         let session_id = request.session_id;
         if self.deferred_turn_results.contains_key(&session_id)
             || self
@@ -4832,6 +5415,16 @@ impl MeetingV1Coordinator {
         };
         if runtime.queued || runtime.in_flight_turn.is_some() {
             return;
+        }
+        if request.baton_protocol == Some(MeetingBatonProtocol::V2)
+            && matches!(
+                request.kind,
+                MeetingTurnKind::V1Intent | MeetingTurnKind::V1Granted
+            )
+        {
+            // Every model call, including a format retry, performs its own
+            // current-Board read immediately before dispatch.
+            request.board_event_id = None;
         }
         runtime.queued = true;
         match request.kind {
@@ -5069,21 +5662,29 @@ impl MeetingV1Coordinator {
             .iter()
             .find(|intent| intent.author_pubkey == self.agent_pubkey);
         let builder = if let Some(intent) = own_pending {
-            buzz_sdk::build_meeting_v1_intent_refresh(MeetingV1IntentRefreshParams {
+            let params = MeetingV1IntentRefreshParams {
                 session_id: request.session_id,
                 intent_id: &intent.intent_id,
                 previous_event_id: &intent.current_event_id,
                 basis_speech_revision: view.baton.speech_revision,
                 addressed_to: output.addressed_to.as_deref(),
                 summary,
-            })
+            };
+            match view.protocol {
+                MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_intent_refresh(params),
+                MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_intent_refresh(params),
+            }
         } else {
-            buzz_sdk::build_meeting_v1_intent_submit(MeetingV1IntentSubmitParams {
+            let params = MeetingV1IntentSubmitParams {
                 session_id: request.session_id,
                 basis_speech_revision: view.baton.speech_revision,
                 addressed_to: output.addressed_to.as_deref(),
                 summary,
-            })
+            };
+            match view.protocol {
+                MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_intent_submit(params),
+                MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_intent_submit(params),
+            }
         };
         let event = match builder
             .map_err(|error| anyhow!(error.to_string()))
@@ -5300,16 +5901,21 @@ impl MeetingV1Coordinator {
                 handoff_type,
                 reason: &handoff.reason,
             });
-        let event = match buzz_sdk::build_meeting_v1_speech(MeetingV1SpeechParams {
+        let params = MeetingV1SpeechParams {
             session_id: request.session_id,
             grant_id,
             speech_revision: view.baton.speech_revision.saturating_add(1),
             content,
             mentions: &mention_refs,
             handoff,
-        })
-        .map_err(|error| anyhow!(error.to_string()))
-        .and_then(|builder| sign_builder(builder, &self.keys))
+        };
+        let builder = match view.protocol {
+            MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_speech(params),
+            MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_speech(params),
+        };
+        let event = match builder
+            .map_err(|error| anyhow!(error.to_string()))
+            .and_then(|builder| sign_builder(builder, &self.keys))
         {
             Ok(event) => event,
             Err(error) => {
@@ -5413,6 +6019,13 @@ impl MeetingV1Coordinator {
         reason_code: MeetingV1GrantYieldReason,
         reason: &str,
     ) {
+        let Some(protocol) = self
+            .meetings
+            .get(&session_id)
+            .map(|runtime| runtime.protocol)
+        else {
+            return;
+        };
         let existing = self
             .ledger_for(session_id)
             .and_then(|ledger| ledger.grants.get(&grant.grant_id))
@@ -5432,14 +6045,19 @@ impl MeetingV1Coordinator {
             }
         } else {
             let bounded_reason: String = reason.chars().take(500).collect();
-            let event = match buzz_sdk::build_meeting_v1_grant_yield(MeetingV1GrantYieldParams {
+            let params = MeetingV1GrantYieldParams {
                 session_id,
                 grant_id: &grant.grant_id,
                 reason_code: Some(reason_code),
                 reason: Some(&bounded_reason),
-            })
-            .map_err(|error| anyhow!(error.to_string()))
-            .and_then(|builder| sign_builder(builder, &self.keys))
+            };
+            let builder = match protocol {
+                MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_grant_yield(params),
+                MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_grant_yield(params),
+            };
+            let event = match builder
+                .map_err(|error| anyhow!(error.to_string()))
+                .and_then(|builder| sign_builder(builder, &self.keys))
             {
                 Ok(event) => event,
                 Err(error) => {
@@ -5569,10 +6187,21 @@ impl MeetingV1Coordinator {
                 || request.kind != MeetingTurnKind::V1Granted
                 || request.grant_event_id.as_deref() != Some(grant_id)
         });
+        if self
+            .board_load_in_flight
+            .get(&session_id)
+            .is_some_and(|load| {
+                load.request.kind == MeetingTurnKind::V1Granted
+                    && load.request.grant_event_id.as_deref() == Some(grant_id)
+            })
+        {
+            self.board_load_in_flight.remove(&session_id);
+        }
         let still_queued = self
             .pending
             .iter()
-            .any(|request| request.session_id == session_id);
+            .any(|request| request.session_id == session_id)
+            || self.board_load_in_flight.contains_key(&session_id);
         if let Some(runtime) = self.meetings.get_mut(&session_id) {
             runtime.queued = still_queued;
         }
@@ -5585,7 +6214,7 @@ impl MeetingV1Coordinator {
         }
     }
 
-    fn submit_progress(&mut self, session_id: Uuid, _view: &MeetingView, grant: &GrantView) {
+    fn submit_progress(&mut self, session_id: Uuid, view: &MeetingView, grant: &GrantView) {
         let in_flight_key = (session_id, grant.grant_id.clone());
         if self.progress_in_flight.contains_key(&in_flight_key)
             || self.progress_waiting_for_state.contains_key(&in_flight_key)
@@ -5611,26 +6240,30 @@ impl MeetingV1Coordinator {
         } else {
             let seq = grant.progress_seq.saturating_add(1);
             let stage = self.progress_stage(session_id, &grant.grant_id);
-            let event =
-                match buzz_sdk::build_meeting_v1_grant_progress(MeetingV1GrantProgressParams {
-                    session_id,
-                    grant_id: &grant.grant_id,
-                    progress_seq: seq,
-                    stage,
-                })
+            let params = MeetingV1GrantProgressParams {
+                session_id,
+                grant_id: &grant.grant_id,
+                progress_seq: seq,
+                stage,
+            };
+            let builder = match view.protocol {
+                MeetingBatonProtocol::V1 => buzz_sdk::build_meeting_v1_grant_progress(params),
+                MeetingBatonProtocol::V2 => buzz_sdk::build_meeting_v2_grant_progress(params),
+            };
+            let event = match builder
                 .map_err(|error| anyhow!(error.to_string()))
                 .and_then(|builder| sign_builder(builder, &self.keys))
-                {
-                    Ok(event) => event,
-                    Err(error) => {
-                        tracing::warn!(
-                            meeting = %session_id,
-                            grant = %grant.grant_id,
-                            "could not prepare Meeting V1 Progress: {error}"
-                        );
-                        return;
-                    }
-                };
+            {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(
+                        meeting = %session_id,
+                        grant = %grant.grant_id,
+                        "could not prepare Meeting V1 Progress: {error}"
+                    );
+                    return;
+                }
+            };
             if let Some(record) = self
                 .ledger_for_mut(session_id)
                 .and_then(|ledger| ledger.grants.get_mut(&grant.grant_id))
@@ -6140,7 +6773,21 @@ fn protocol_retry_ticket_id<T>(
     }
 }
 
-async fn fetch_meeting_view(rest: &RestClient, session_id: Uuid) -> Result<MeetingView> {
+fn board_turn_type(kind: MeetingTurnKind) -> &'static str {
+    match kind {
+        MeetingTurnKind::V1Intent => "participant_intent",
+        MeetingTurnKind::V1Granted => "granted_speech",
+        MeetingTurnKind::V1ModeratorControl => "moderator_control",
+        MeetingTurnKind::V0Intent => "v0_intent",
+        MeetingTurnKind::V0Granted => "v0_granted",
+    }
+}
+
+async fn fetch_meeting_view(
+    rest: &RestClient,
+    session_id: Uuid,
+    protocol: MeetingBatonProtocol,
+) -> Result<MeetingView> {
     let d_tag = SingleLetterTag::lowercase(Alphabet::D);
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
     let session = session_id.to_string();
@@ -6206,8 +6853,8 @@ async fn fetch_meeting_view(rest: &RestClient, session_id: Uuid) -> Result<Meeti
             event.kind.as_u16() as u32 == KIND_MEETING_ROUND_STATE
                 && event.pubkey.to_hex() == relay_pubkey
                 && tag_value(event, "h") == Some(session.as_str())
-                && tag_value(event, "v") == Some("2")
-                && tag_value(event, "policy") == Some("moderated-baton-v1")
+                && tag_value(event, "v") == Some(protocol.schema_version())
+                && tag_value(event, "policy") == Some(protocol.policy())
         })
         .cloned()
         .collect();
@@ -6231,7 +6878,7 @@ async fn fetch_meeting_view(rest: &RestClient, session_id: Uuid) -> Result<Meeti
         .context("Meeting V1 State content is malformed JSON")?;
     let raw_state: RawBatonState = serde_json::from_value(raw_state_value.clone())
         .context("Meeting V1 State content has an invalid shape")?;
-    validate_baton_state_event(state_event, session_id, &raw_state)?;
+    validate_baton_state_event(state_event, session_id, protocol, &raw_state)?;
 
     let mut roster = BTreeMap::new();
     for tag in members.tags.iter() {
@@ -6293,12 +6940,12 @@ async fn fetch_meeting_view(rest: &RestClient, session_id: Uuid) -> Result<Meeti
         return Err(anyhow!("Meeting V1 moderator is absent from the roster"));
     }
 
-    let intents = collect_intent_contexts(&events, session_id, &roster);
+    let intents = collect_intent_contexts(&events, session_id, protocol, &roster);
     let mut speeches = Vec::new();
     for event in events {
         if event.kind.as_u16() as u32 != KIND_STREAM_MESSAGE
             || tag_value(&event, "h") != Some(session.as_str())
-            || tag_value(&event, "v") != Some("2")
+            || tag_value(&event, "v") != Some(protocol.schema_version())
         {
             continue;
         }
@@ -6371,6 +7018,7 @@ async fn fetch_meeting_view(rest: &RestClient, session_id: Uuid) -> Result<Meeti
 
     Ok(MeetingView {
         session_id,
+        protocol,
         title: tag_value(&metadata, "name")
             .unwrap_or("Untitled meeting")
             .to_string(),
@@ -6466,6 +7114,7 @@ fn same_frozen_roster(
 fn collect_intent_contexts(
     events: &[Event],
     session_id: Uuid,
+    protocol: MeetingBatonProtocol,
     roster: &BTreeMap<String, Participant>,
 ) -> BTreeMap<String, IntentContext> {
     #[derive(Clone)]
@@ -6481,7 +7130,7 @@ fn collect_intent_contexts(
     for event in events {
         if event.kind.as_u16() as u32 != KIND_MEETING_SPEECH_INTENT
             || tag_value(event, "h") != Some(session.as_str())
-            || tag_value(event, "v") != Some("2")
+            || tag_value(event, "v") != Some(protocol.schema_version())
         {
             continue;
         }
@@ -6744,12 +7393,13 @@ fn retained_pre_human_attempt(
 fn validate_baton_state_event(
     event: &Event,
     session_id: Uuid,
+    protocol: MeetingBatonProtocol,
     state: &RawBatonState,
 ) -> Result<()> {
     let expected = [
         ("h", session_id.to_string()),
-        ("v", "2".to_string()),
-        ("policy", "moderated-baton-v1".to_string()),
+        ("v", protocol.schema_version().to_string()),
+        ("policy", protocol.policy().to_string()),
         ("phase", state.phase.clone()),
         ("floor-revision", state.floor_revision.to_string()),
         ("intent-revision", state.intent_revision.to_string()),
@@ -7976,9 +8626,9 @@ fn load_ledger(path: &Path) -> Result<AgentLedger> {
 
 fn migrate_loaded_ledger(ledger: &mut AgentLedger, agent_pubkey: &str, path: &Path) -> bool {
     if ledger.agent_pubkey == agent_pubkey && ledger.version == PREVIOUS_LEDGER_VERSION {
-        // V3 already contains durable ACK/Intent/Progress/SAY/YIELD events.
-        // V4 optimistic-decision fields deserialize with defaults, so only
-        // advance the version and preserve every previously signed event.
+        // V4 already contains durable ACK/Intent/Progress/SAY/YIELD events.
+        // V5's protocol discriminator defaults to V1, so only advance the
+        // version and preserve every previously signed event.
         ledger.version = LEDGER_VERSION;
         return true;
     }
@@ -8217,6 +8867,7 @@ mod tests {
         baton.raw_state["moderator_pubkey"] = json!(other_pubkey);
         MeetingView {
             session_id,
+            protocol: MeetingBatonProtocol::V1,
             title: "Test meeting".to_string(),
             description: Some("Test-only Meeting V1 context".to_string()),
             ended: false,
@@ -8227,6 +8878,48 @@ mod tests {
             speech_cursor: None,
             baton,
         }
+    }
+
+    fn meeting_v2_view(
+        session_id: Uuid,
+        agent_pubkey: &str,
+        moderator_pubkey: &str,
+        relay: &Keys,
+    ) -> MeetingView {
+        let mut view = meeting_view(session_id, agent_pubkey, moderator_pubkey);
+        view.protocol = MeetingBatonProtocol::V2;
+        view.relay_pubkey = relay.public_key().to_hex();
+        view.description = Some("Test-only Meeting V2 context".to_string());
+        view
+    }
+
+    fn meeting_v2_board_event(
+        relay: &Keys,
+        session_id: Uuid,
+        moderator_pubkey: &str,
+        body: &str,
+        timestamp: u64,
+    ) -> Event {
+        let session = session_id.to_string();
+        let content = serde_json::to_string(&buzz_sdk::MeetingV2BoardContent {
+            format: buzz_sdk::MEETING_V2_BOARD_FORMAT.to_string(),
+            body: body.to_string(),
+        })
+        .expect("serialize test Meeting V2 Board");
+        EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_BOARD as u16),
+            content,
+        )
+        .tags([
+            Tag::parse(["h", session.as_str()]).expect("Board h tag"),
+            Tag::parse(["v", buzz_sdk::MEETING_V2_SCHEMA_VERSION]).expect("Board v tag"),
+            Tag::parse(["policy", buzz_sdk::MEETING_V2_POLICY]).expect("Board policy tag"),
+            Tag::parse(["format", buzz_sdk::MEETING_V2_BOARD_FORMAT]).expect("Board format tag"),
+            Tag::parse(["moderator", moderator_pubkey]).expect("Board moderator tag"),
+        ])
+        .custom_created_at(Timestamp::from(timestamp))
+        .sign_with_keys(relay)
+        .expect("sign test Meeting V2 Board")
     }
 
     fn ended_meeting_view(
@@ -8252,6 +8945,7 @@ mod tests {
     ) -> MeetingV1Coordinator {
         let agent_pubkey = keys.public_key().to_hex();
         let (sync_result_tx, sync_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (board_load_result_tx, board_load_result_rx) = tokio::sync::mpsc::unbounded_channel();
         let (protocol_result_tx, protocol_result_rx) = tokio::sync::mpsc::unbounded_channel();
         let (progress_result_tx, progress_result_rx) = tokio::sync::mpsc::unbounded_channel();
         MeetingV1Coordinator {
@@ -8287,6 +8981,10 @@ mod tests {
             sync_result_tx,
             sync_result_rx,
             deferred_turn_results: HashMap::new(),
+            next_board_load_id: 0,
+            board_load_in_flight: HashMap::new(),
+            board_load_result_tx,
+            board_load_result_rx,
             next_protocol_submission_id: 0,
             protocol_in_flight: HashMap::new(),
             protocol_result_tx,
@@ -8352,11 +9050,14 @@ mod tests {
             grant_event_id: Some(grant_id.to_string()),
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         }
     }
 
     fn runtime_with_view(epoch: u64, view: MeetingView) -> MeetingRuntime {
-        let mut runtime = MeetingRuntime::new(epoch);
+        let protocol = view.protocol;
+        let mut runtime = MeetingRuntime::new(epoch, protocol);
         runtime.view = Some(view);
         runtime.last_sync = Some(Instant::now());
         runtime
@@ -8517,6 +9218,95 @@ mod tests {
             },
             server,
         )
+    }
+
+    async fn rest_responding_in_order(
+        keys: Keys,
+        responses: Vec<Value>,
+    ) -> (RestClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ordered test HTTP bridge");
+        let address = listener.local_addr().expect("read test HTTP address");
+        let server = tokio::spawn(async move {
+            for response_value in responses {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept ordered test HTTP request");
+                let mut request = vec![0_u8; 16 * 1024];
+                let bytes_read = socket
+                    .read(&mut request)
+                    .await
+                    .expect("read ordered test HTTP request");
+                assert!(bytes_read > 0, "ordered HTTP request must not be empty");
+                let body = serde_json::to_string(&response_value)
+                    .expect("serialize ordered test HTTP response");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write ordered test HTTP response");
+            }
+        });
+        (
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: format!("http://{address}"),
+                keys,
+                auth_tag_json: None,
+            },
+            server,
+        )
+    }
+
+    async fn wait_for_board_load(coordinator: &mut MeetingV1Coordinator) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                coordinator.drain_board_load_results().await;
+                if coordinator.board_load_in_flight.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("current Board load must finish");
+    }
+
+    fn install_final_board_failure(
+        coordinator: &mut MeetingV1Coordinator,
+        request: MeetingTurnRequest,
+    ) -> BoardLoadTaskResult {
+        let session_id = request.session_id;
+        let session_epoch = coordinator
+            .meetings
+            .get(&session_id)
+            .expect("Meeting runtime")
+            .epoch;
+        coordinator.next_board_load_id = coordinator.next_board_load_id.saturating_add(1).max(1);
+        let load_id = coordinator.next_board_load_id;
+        coordinator.board_load_in_flight.insert(
+            session_id,
+            BoardLoadInFlight {
+                session_epoch,
+                load_id,
+                request: request.clone(),
+                attempt: BOARD_LOAD_MAX_ATTEMPTS,
+            },
+        );
+        BoardLoadTaskResult {
+            session_id,
+            session_epoch,
+            load_id,
+            request,
+            attempt: BOARD_LOAD_MAX_ATTEMPTS,
+            started_at_ms: now_ms(),
+            result: Err("test current Board failure".to_string()),
+        }
     }
 
     async fn gated_rest_responding_to(
@@ -9112,6 +9902,7 @@ mod tests {
         baton.raw_state["moderator_pubkey"] = json!(moderator_pubkey);
         let mut shared_view = MeetingView {
             session_id,
+            protocol: MeetingBatonProtocol::V1,
             title: "Ten-Agent stress meeting".to_string(),
             description: Some("Twenty canonical speech rounds".to_string()),
             ended: false,
@@ -9663,7 +10454,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let mut coordinator = test_coordinator(keys, ledger_path.clone(), None);
 
-        assert!(coordinator.register_local(session_id));
+        assert!(coordinator.register_local(session_id, MeetingBatonProtocol::V1));
         let mut trigger = TriggerRecord::new("terminal-retry".to_string(), Some(pubkey(78)), 1);
         trigger.state = "prepared".to_string();
         trigger.prepared_event = Some(json!({ "content": PRIVATE_CONTENT }));
@@ -9784,6 +10575,8 @@ mod tests {
                     moderator_observer_snapshot: Some(moderator_observer_snapshot(
                         &attempt, &view,
                     )),
+                    baton_protocol: Some(MeetingBatonProtocol::V1),
+                    board_event_id: None,
                 },
                 raw_output: r#"{"rejections":[],"handoff_dismissals":[],"deferrals":[],"next_action":{"action":"select_intent","id":"unused","reason":"unused"}}"#.to_string(),
                 succeeded: true,
@@ -9841,9 +10634,10 @@ mod tests {
                 cancelled_sessions.insert(session_id);
             }
             turns.push(turn_id.clone());
-            coordinator
-                .meetings
-                .insert(session_id, MeetingRuntime::new(epoch));
+            coordinator.meetings.insert(
+                session_id,
+                MeetingRuntime::new(epoch, MeetingBatonProtocol::V1),
+            );
             coordinator.ensure_meeting_ledger(session_id);
             let mut request = granted_turn_request(session_id, &grant_id);
             request.kind = kind;
@@ -9931,7 +10725,7 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         let mut original = test_coordinator(keys.clone(), ledger_path.clone(), None);
-        assert!(original.register_local(session_id));
+        assert!(original.register_local(session_id, MeetingBatonProtocol::V1));
         let first_ended = ended_meeting_view(session_id, &agent_pubkey, &other_pubkey, 2);
         assert_eq!(
             original.apply_synced_view(session_id, first_ended),
@@ -9948,7 +10742,7 @@ mod tests {
 
         for state_revision in [2, 3] {
             assert!(
-                restarted.register_local(session_id),
+                restarted.register_local(session_id, MeetingBatonProtocol::V1),
                 "terminal teardown must allow an idempotent detector re-registration"
             );
             assert!(restarted.meetings.contains_key(&session_id));
@@ -10039,9 +10833,10 @@ mod tests {
                 },
             );
         let offer_view = agent_offer_view(offer_session, &agent_pubkey, &other_pubkey, &offer_id);
-        coordinator
-            .meetings
-            .insert(offer_session, MeetingRuntime::new(2));
+        coordinator.meetings.insert(
+            offer_session,
+            MeetingRuntime::new(2, MeetingBatonProtocol::V1),
+        );
         assert_eq!(
             coordinator.apply_synced_view(offer_session, offer_view.clone()),
             SyncApplyResult::Applied
@@ -10108,9 +10903,10 @@ mod tests {
         let mut grant_view = meeting_view(grant_session, &agent_pubkey, &other_pubkey);
         grant_view.baton.phase = "granted".to_string();
         grant_view.baton.grant = Some(grant.clone());
-        coordinator
-            .meetings
-            .insert(grant_session, MeetingRuntime::new(3));
+        coordinator.meetings.insert(
+            grant_session,
+            MeetingRuntime::new(3, MeetingBatonProtocol::V1),
+        );
         assert_eq!(
             coordinator.apply_synced_view(grant_session, grant_view.clone()),
             SyncApplyResult::Applied
@@ -10184,7 +10980,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_state_validation_pins_v2_tags_and_active_object_invariants() {
+    fn relay_state_validation_pins_v1_and_v2_protocol_tags() {
         let meeting_id = Uuid::new_v4();
         let state = base_state();
         let content = serde_json::to_string(&json!({
@@ -10222,11 +11018,52 @@ mod tests {
             ])
             .sign_with_keys(&keys)
             .expect("sign State");
-        assert!(validate_baton_state_event(&event, meeting_id, &state).is_ok());
+        assert!(
+            validate_baton_state_event(&event, meeting_id, MeetingBatonProtocol::V1, &state)
+                .is_ok()
+        );
+        assert!(
+            validate_baton_state_event(&event, meeting_id, MeetingBatonProtocol::V2, &state)
+                .is_err(),
+            "a V1 State must not enter a V2 Session"
+        );
+
+        let v2_event = EventBuilder::new(
+            Kind::Custom(KIND_MEETING_ROUND_STATE as u16),
+            event.content.clone(),
+        )
+        .tags([
+            Tag::parse(["h", &meeting_id.to_string()]).expect("h"),
+            Tag::parse(["v", "3"]).expect("v"),
+            Tag::parse(["policy", "moderated-board-v1"]).expect("policy"),
+            Tag::parse(["phase", "moderator_idle"]).expect("phase"),
+            Tag::parse(["floor-revision", "1"]).expect("floor"),
+            Tag::parse(["intent-revision", "0"]).expect("intent"),
+            Tag::parse(["speech-revision", "0"]).expect("speech"),
+            Tag::parse(["state-revision", "1"]).expect("state"),
+            Tag::parse(["moderator", &pubkey(1)]).expect("moderator"),
+        ])
+        .sign_with_keys(&keys)
+        .expect("sign V2 State");
+        assert!(validate_baton_state_event(
+            &v2_event,
+            meeting_id,
+            MeetingBatonProtocol::V2,
+            &state
+        )
+        .is_ok());
+        assert!(
+            validate_baton_state_event(&v2_event, meeting_id, MeetingBatonProtocol::V1, &state)
+                .is_err(),
+            "a V2 State must not enter a V1 Session"
+        );
 
         let mut invalid = base_state();
         invalid.phase = "offered".to_string();
-        assert!(validate_baton_state_event(&event, meeting_id, &invalid).is_err());
+        assert!(
+            validate_baton_state_event(&event, meeting_id, MeetingBatonProtocol::V1, &invalid)
+                .is_err()
+        );
     }
 
     #[test]
@@ -10859,6 +11696,7 @@ mod tests {
         let contexts = collect_intent_contexts(
             &[refresh_two.clone(), submit.clone(), refresh_one],
             session_id,
+            MeetingBatonProtocol::V1,
             &roster,
         );
         let intent_id = submit.id.to_hex();
@@ -12111,6 +12949,8 @@ mod tests {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         };
         coordinator.handle_moderator_control_result("control-1", &request, "{malformed", true);
 
@@ -12268,6 +13108,8 @@ mod tests {
                 grant_event_id: None,
                 queued_at_unix_ms: now_ms(),
                 moderator_observer_snapshot: None,
+                baton_protocol: Some(MeetingBatonProtocol::V1),
+                board_event_id: None,
             },
         );
 
@@ -12358,6 +13200,8 @@ mod tests {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         };
         let mut runtime = runtime_with_view(1, view.clone());
         runtime.in_flight_turn = Some("moderator-turn".to_string());
@@ -12862,6 +13706,8 @@ mod tests {
                 grant_event_id: None,
                 queued_at_unix_ms: now_ms(),
                 moderator_observer_snapshot: None,
+                baton_protocol: Some(MeetingBatonProtocol::V1),
+                board_event_id: None,
             },
         );
 
@@ -12983,6 +13829,8 @@ mod tests {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         };
         coordinator.in_flight.insert(
             "participant-turn".to_string(),
@@ -13020,6 +13868,603 @@ mod tests {
         assert!(coordinator.in_flight.contains_key("moderator-turn"));
     }
 
+    #[tokio::test]
+    async fn meeting_v2_intent_and_granted_turn_read_independent_current_boards() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let board_a = meeting_v2_board_event(
+            &relay,
+            session_id,
+            &moderator_pubkey,
+            "# BOARD A ONLY\nForm an Intent.",
+            10,
+        );
+        let board_b = meeting_v2_board_event(
+            &relay,
+            session_id,
+            &moderator_pubkey,
+            "# BOARD B ONLY\nSpeak from the new conclusion.",
+            11,
+        );
+        let board_a_id = board_a.id.to_hex();
+        let board_b_id = board_b.id.to_hex();
+        let (rest, server) =
+            rest_responding_in_order(agent_keys.clone(), vec![json!([board_a]), json!([board_b])])
+                .await;
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        coordinator.rest = rest;
+        coordinator
+            .meetings
+            .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V2));
+        let mut view = meeting_v2_view(session_id, &agent_pubkey, &moderator_pubkey, &relay);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view.clone()),
+            SyncApplyResult::Applied
+        );
+
+        coordinator.reconcile(session_id).await;
+        assert_eq!(coordinator.front_kind(), Some(MeetingTurnKind::V1Intent));
+        assert!(
+            coordinator.pop_pending().is_none(),
+            "V2 Intent must stop at the Board-read fence"
+        );
+        assert_eq!(coordinator.board_dispatch_reserved_slots(), 1);
+        wait_for_board_load(&mut coordinator).await;
+        let intent_request = coordinator
+            .pop_pending()
+            .expect("Board-backed V2 Intent is dispatchable");
+        assert_eq!(
+            intent_request.board_event_id.as_deref(),
+            Some(board_a_id.as_str())
+        );
+        assert!(intent_request.prompt.contains("BOARD A ONLY"));
+        assert!(!intent_request.prompt.contains("BOARD B ONLY"));
+
+        if let Some(runtime) = coordinator.meetings.get_mut(&session_id) {
+            runtime.queued = false;
+        }
+        coordinator.mark_trigger_state(session_id, &intent_request.basis_id, "passed");
+        let grant = test_grant(&agent_pubkey, &pubkey(31), &pubkey(32));
+        view.baton.phase = "granted".to_string();
+        view.baton.state_revision = 2;
+        view.baton.state_event_id = pubkey(33);
+        view.baton.grant = Some(grant.clone());
+        view.baton.raw_state["phase"] = json!("granted");
+        view.baton.raw_state["state_revision"] = json!(2);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view.clone()),
+            SyncApplyResult::Applied
+        );
+
+        coordinator.reconcile(session_id).await;
+        assert_eq!(coordinator.front_kind(), Some(MeetingTurnKind::V1Granted));
+        assert!(
+            coordinator.pop_pending().is_none(),
+            "V2 Granted Speech must perform a second Board read"
+        );
+        wait_for_board_load(&mut coordinator).await;
+        let granted_request = coordinator
+            .pop_pending()
+            .expect("Board-backed V2 Granted Speech is dispatchable");
+        assert_eq!(
+            granted_request.board_event_id.as_deref(),
+            Some(board_b_id.as_str())
+        );
+        assert_ne!(
+            intent_request.board_event_id,
+            granted_request.board_event_id
+        );
+        assert!(granted_request.prompt.contains("BOARD B ONLY"));
+        assert!(!granted_request.prompt.contains("BOARD A ONLY"));
+
+        server.await.expect("ordered Board server finishes");
+    }
+
+    #[test]
+    fn meeting_v2_dispatch_requeue_discards_the_previous_board_snapshot() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let keys = Keys::generate();
+        let mut coordinator =
+            test_coordinator(keys, directory.path().join("meeting-v2-ledger.json"), None);
+        let board = CurrentBoardPrompt {
+            trust: "untrusted_meeting_context",
+            format: "markdown".to_string(),
+            event_id: pubkey(39),
+            read_at_unix_ms: now_ms(),
+            original_bytes: 14,
+            truncated: false,
+            body: "STALE BOARD".to_string(),
+        };
+        let request = MeetingTurnRequest {
+            session_id: Uuid::new_v4(),
+            prompt: attach_current_board("base turn", &board),
+            hard_deadline_unix_ms: now_ms() + 60_000,
+            kind: MeetingTurnKind::V1Intent,
+            format_retry: false,
+            basis_id: "activation:test".to_string(),
+            round_number: 0,
+            speech_cursor: None,
+            floor_revision: 1,
+            grant_event_id: None,
+            queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V2),
+            board_event_id: Some(board.event_id),
+        };
+
+        coordinator.requeue_front(request);
+
+        let requeued = coordinator.pending.front().expect("requeued V2 Turn");
+        assert!(requeued.board_event_id.is_none());
+        assert_eq!(requeued.prompt, "base turn");
+        assert!(!requeued.prompt.contains("STALE BOARD"));
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_restart_recovery_requires_a_new_board_read() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        coordinator
+            .meetings
+            .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V2));
+        let view = meeting_v2_view(session_id, &agent_pubkey, &moderator_pubkey, &relay);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+        let activation = format!("activation:{session_id}");
+        coordinator.mark_trigger_state(session_id, &activation, "running");
+        let recovery = coordinator
+            .ledger_for_mut(session_id)
+            .map(recover_interrupted_meeting_turns)
+            .expect("V2 Meeting ledger");
+        assert_eq!(recovery, (1, 0, true));
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.triggers.get(&activation))
+                .map(|trigger| trigger.state.as_str()),
+            Some("pending")
+        );
+        let serialized = serde_json::to_string(
+            coordinator
+                .ledger_for(session_id)
+                .expect("serialized V2 Meeting ledger"),
+        )
+        .expect("serialize V2 Meeting ledger");
+        assert!(!serialized.contains("current_board"));
+        assert!(!serialized.contains("board_event_id"));
+
+        coordinator.reconcile(session_id).await;
+
+        let request = coordinator.pending.front().expect("recovered V2 Intent");
+        assert_eq!(request.baton_protocol, Some(MeetingBatonProtocol::V2));
+        assert!(request.board_event_id.is_none());
+        assert!(!request.prompt.contains("CURRENT MEETING BOARD"));
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_late_board_result_cannot_cross_a_session_epoch() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        assert!(coordinator.register_local(session_id, MeetingBatonProtocol::V2));
+        let view = meeting_v2_view(session_id, &agent_pubkey, &moderator_pubkey, &relay);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view.clone()),
+            SyncApplyResult::Applied
+        );
+        coordinator.reconcile(session_id).await;
+        let request = coordinator
+            .pending
+            .pop_front()
+            .expect("queued V2 Intent before Board read");
+        let completion = install_final_board_failure(&mut coordinator, request);
+
+        coordinator.remove(session_id);
+        assert!(coordinator.register_local(session_id, MeetingBatonProtocol::V2));
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+        let stale_success = BoardLoadTaskResult {
+            result: Ok(CurrentBoardPrompt {
+                trust: "untrusted_meeting_context",
+                format: "markdown".to_string(),
+                event_id: pubkey(40),
+                read_at_unix_ms: now_ms(),
+                original_bytes: 20,
+                truncated: false,
+                body: "WRONG SESSION EPOCH".to_string(),
+            }),
+            ..completion
+        };
+
+        coordinator.handle_board_load_result(stale_success).await;
+
+        assert!(coordinator.pending.is_empty());
+        assert!(coordinator.board_load_in_flight.is_empty());
+        assert!(!serde_json::to_string(&coordinator.ledger)
+            .expect("serialize ledger")
+            .contains("WRONG SESSION EPOCH"));
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_board_failure_passes_intent_without_a_model_turn() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        coordinator
+            .meetings
+            .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V2));
+        let view = meeting_v2_view(session_id, &agent_pubkey, &moderator_pubkey, &relay);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+        coordinator.reconcile(session_id).await;
+        let request = coordinator
+            .pending
+            .pop_front()
+            .expect("queued V2 Intent before Board read");
+        let trigger_id = request.basis_id.clone();
+        let failure = install_final_board_failure(&mut coordinator, request);
+
+        coordinator.handle_board_load_result(failure).await;
+
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.triggers.get(&trigger_id))
+                .map(|trigger| trigger.state.as_str()),
+            Some("passed")
+        );
+        assert!(coordinator.pending.is_empty());
+        assert!(coordinator.in_flight.is_empty());
+        assert!(coordinator.board_load_in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_board_failure_yields_grant_on_v3_wire_without_a_model_turn() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let grant = test_grant(&agent_pubkey, &pubkey(41), &pubkey(42));
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        coordinator
+            .meetings
+            .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V2));
+        let mut view = meeting_v2_view(session_id, &agent_pubkey, &moderator_pubkey, &relay);
+        view.baton.phase = "granted".to_string();
+        view.baton.grant = Some(grant.clone());
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+        coordinator.reconcile(session_id).await;
+        let request = coordinator
+            .pending
+            .pop_front()
+            .expect("queued V2 Granted Turn before Board read");
+        let failure = install_final_board_failure(&mut coordinator, request);
+
+        coordinator.handle_board_load_result(failure).await;
+
+        let yield_event: Event = serde_json::from_value(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.grants.get(&grant.grant_id))
+                .and_then(|record| record.yield_event.clone())
+                .expect("prepared V2 Yield"),
+        )
+        .expect("deserialize V2 Yield");
+        assert_eq!(
+            tag_value(&yield_event, "v"),
+            Some(buzz_sdk::MEETING_V2_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            tag_value(&yield_event, "reason-code"),
+            Some("unable_to_answer")
+        );
+        assert!(coordinator.pending.is_empty());
+        assert!(coordinator.in_flight.is_empty());
+        assert!(coordinator.board_load_in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_local_moderator_remains_fail_closed_in_stage_three() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        coordinator
+            .meetings
+            .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V2));
+        let mut view = meeting_v2_view(session_id, &agent_pubkey, &other_pubkey, &relay);
+        view.baton.moderator_pubkey = agent_pubkey.clone();
+        view.baton.raw_state["moderator_pubkey"] = json!(agent_pubkey);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+
+        coordinator.reconcile(session_id).await;
+
+        assert!(coordinator.pending.is_empty());
+        assert!(coordinator.in_flight.is_empty());
+        assert!(coordinator.board_load_in_flight.is_empty());
+        assert!(coordinator.protocol_in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_state_change_without_semantic_input_does_not_start_a_turn() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let moderator_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+        coordinator
+            .meetings
+            .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V2));
+        let mut view = meeting_v2_view(session_id, &agent_pubkey, &moderator_pubkey, &relay);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view.clone()),
+            SyncApplyResult::Applied
+        );
+        let activation = format!("activation:{session_id}");
+        coordinator.mark_trigger_state(session_id, &activation, "passed");
+        let trigger_count = coordinator
+            .ledger_for(session_id)
+            .map(|ledger| ledger.triggers.len())
+            .unwrap_or_default();
+
+        view.baton.state_revision = 2;
+        view.baton.state_event_id = pubkey(51);
+        view.baton.raw_state["state_revision"] = json!(2);
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+        coordinator.reconcile(session_id).await;
+
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .map(|ledger| ledger.triggers.len()),
+            Some(trigger_count)
+        );
+        assert!(coordinator.pending.is_empty());
+        assert!(coordinator.board_load_in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_model_outputs_use_v3_intent_speech_and_handoff_builders() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+
+        let intent_session = Uuid::new_v4();
+        coordinator.meetings.insert(
+            intent_session,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2),
+        );
+        let intent_view = meeting_v2_view(intent_session, &agent_pubkey, &other_pubkey, &relay);
+        assert_eq!(
+            coordinator.apply_synced_view(intent_session, intent_view),
+            SyncApplyResult::Applied
+        );
+        coordinator.reconcile(intent_session).await;
+        let mut intent_request = coordinator.pending.pop_front().expect("queued V2 Intent");
+        intent_request.board_event_id = Some(pubkey(61));
+        coordinator.mark_trigger_state(intent_session, &intent_request.basis_id, "running");
+        coordinator
+            .handle_intent_result(
+                "v2-intent-turn",
+                &intent_request,
+                r#"{"action":"SUBMIT","summary":"I can answer","addressed_to":null}"#,
+                true,
+            )
+            .await;
+        let intent_event: Event = serde_json::from_value(
+            coordinator
+                .ledger_for(intent_session)
+                .and_then(|ledger| ledger.triggers.get(&intent_request.basis_id))
+                .and_then(|trigger| trigger.prepared_event.clone())
+                .expect("prepared V2 Intent"),
+        )
+        .expect("deserialize V2 Intent");
+        assert_eq!(
+            tag_value(&intent_event, "v"),
+            Some(buzz_sdk::MEETING_V2_SCHEMA_VERSION)
+        );
+
+        let speech_session = Uuid::new_v4();
+        let grant = test_grant(&agent_pubkey, &pubkey(62), &pubkey(63));
+        coordinator.meetings.insert(
+            speech_session,
+            MeetingRuntime::new(2, MeetingBatonProtocol::V2),
+        );
+        let mut speech_view = meeting_v2_view(speech_session, &agent_pubkey, &other_pubkey, &relay);
+        speech_view.baton.phase = "granted".to_string();
+        speech_view.baton.grant = Some(grant.clone());
+        assert_eq!(
+            coordinator.apply_synced_view(speech_session, speech_view),
+            SyncApplyResult::Applied
+        );
+        coordinator.reconcile(speech_session).await;
+        let mut speech_request = coordinator
+            .pending
+            .pop_front()
+            .expect("queued V2 Granted Speech");
+        speech_request.board_event_id = Some(pubkey(64));
+        coordinator
+            .handle_granted_result(
+                "v2-speech-turn",
+                &speech_request,
+                &json!({
+                    "action": "SAY",
+                    "content": "The current Board supports this conclusion.",
+                    "mention_pubkeys": [],
+                    "handoff": {
+                        "target_pubkey": other_pubkey,
+                        "handoff_type": "question",
+                        "reason": "Please confirm"
+                    },
+                    "reason": null
+                })
+                .to_string(),
+                true,
+            )
+            .await;
+        let speech_event: Event = serde_json::from_value(
+            coordinator
+                .ledger_for(speech_session)
+                .and_then(|ledger| ledger.grants.get(&grant.grant_id))
+                .and_then(|record| record.speech_event.clone())
+                .expect("prepared V2 Speech"),
+        )
+        .expect("deserialize V2 Speech");
+        assert_eq!(
+            tag_value(&speech_event, "v"),
+            Some(buzz_sdk::MEETING_V2_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            tag_value(&speech_event, "handoff-to"),
+            Some(other_pubkey.as_str())
+        );
+        assert_eq!(tag_value(&speech_event, "handoff-type"), Some("question"));
+    }
+
+    #[tokio::test]
+    async fn meeting_v2_offer_ack_and_progress_use_v3_builders() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let other_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let mut coordinator = test_coordinator(
+            agent_keys,
+            directory.path().join("meeting-v2-ledger.json"),
+            None,
+        );
+
+        let offer_session = Uuid::new_v4();
+        let offer_id = pubkey(71);
+        coordinator.meetings.insert(
+            offer_session,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2),
+        );
+        let mut offer_view =
+            agent_offer_view(offer_session, &agent_pubkey, &other_pubkey, &offer_id);
+        offer_view.protocol = MeetingBatonProtocol::V2;
+        offer_view.relay_pubkey = relay.public_key().to_hex();
+        assert_eq!(
+            coordinator.apply_synced_view(offer_session, offer_view.clone()),
+            SyncApplyResult::Applied
+        );
+        assert!(coordinator.handle_offer(offer_session, &offer_view).await);
+        let ack_event: Event = serde_json::from_value(
+            coordinator
+                .ledger_for(offer_session)
+                .and_then(|ledger| ledger.reservations.get(&offer_id))
+                .and_then(|reservation| reservation.ack_event.clone())
+                .expect("prepared V2 Offer ACK"),
+        )
+        .expect("deserialize V2 Offer ACK");
+        assert_eq!(
+            tag_value(&ack_event, "v"),
+            Some(buzz_sdk::MEETING_V2_SCHEMA_VERSION)
+        );
+
+        let grant_session = Uuid::new_v4();
+        let grant = test_grant(&agent_pubkey, &pubkey(72), &pubkey(73));
+        coordinator.meetings.insert(
+            grant_session,
+            MeetingRuntime::new(2, MeetingBatonProtocol::V2),
+        );
+        let mut grant_view = meeting_v2_view(grant_session, &agent_pubkey, &other_pubkey, &relay);
+        grant_view.baton.phase = "granted".to_string();
+        grant_view.baton.grant = Some(grant.clone());
+        assert_eq!(
+            coordinator.apply_synced_view(grant_session, grant_view.clone()),
+            SyncApplyResult::Applied
+        );
+        coordinator.submit_progress(grant_session, &grant_view, &grant);
+        let progress_event: Event = serde_json::from_value(
+            coordinator
+                .ledger_for(grant_session)
+                .and_then(|ledger| ledger.grants.get(&grant.grant_id))
+                .and_then(|record| record.prepared_progress.as_ref())
+                .map(|progress| progress.event.clone())
+                .expect("prepared V2 Progress"),
+        )
+        .expect("deserialize V2 Progress");
+        assert_eq!(
+            tag_value(&progress_event, "v"),
+            Some(buzz_sdk::MEETING_V2_SCHEMA_VERSION)
+        );
+    }
+
     #[test]
     fn local_queue_orders_granted_then_moderator_then_participant() {
         let dir = tempfile::tempdir().expect("temp ledger directory");
@@ -13032,7 +14477,7 @@ mod tests {
         for session_id in [participant_session, moderator_session, granted_session] {
             coordinator
                 .meetings
-                .insert(session_id, MeetingRuntime::new(1));
+                .insert(session_id, MeetingRuntime::new(1, MeetingBatonProtocol::V1));
         }
         let request = |session_id, kind| MeetingTurnRequest {
             session_id,
@@ -13047,6 +14492,8 @@ mod tests {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         };
         coordinator.queue_turn(request(participant_session, MeetingTurnKind::V1Intent));
         coordinator.queue_turn(request(
@@ -13070,7 +14517,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_ledger_migration_preserves_every_prepared_protocol_event() {
+    fn v4_ledger_migration_preserves_events_and_defaults_protocol_to_v1() {
         let agent_pubkey = pubkey(110);
         let session_id = Uuid::new_v4();
         let session_key = session_id.to_string();
@@ -13142,19 +14589,20 @@ mod tests {
             )]),
         };
 
-        let mut raw = serde_json::to_value(ledger).expect("serialize V3-shaped ledger");
+        let mut raw = serde_json::to_value(ledger).expect("serialize V4-shaped ledger");
         let meeting = raw["meetings"][session_key.as_str()]
             .as_object_mut()
             .expect("serialized Meeting ledger");
         meeting.remove("moderator_decision");
         meeting.remove("prepared_moderator_action");
         meeting.remove("replacement_attempt_id");
+        meeting.remove("protocol");
         meeting["triggers"][trigger_id.as_str()]
             .as_object_mut()
-            .expect("serialized V3 Trigger")
+            .expect("serialized V4 Trigger")
             .remove("hard_deadline_unix_ms");
         let mut loaded: AgentLedger =
-            serde_json::from_value(raw).expect("load a V3 ledger without optimistic fields");
+            serde_json::from_value(raw).expect("load a V4 ledger without V5 fields");
 
         assert!(migrate_loaded_ledger(
             &mut loaded,
@@ -13166,6 +14614,7 @@ mod tests {
             .meetings
             .get(&session_key)
             .expect("migrated Meeting ledger");
+        assert_eq!(meeting.protocol, MeetingBatonProtocol::V1);
         assert_eq!(
             meeting
                 .triggers

@@ -8,6 +8,7 @@ mod meeting;
 #[cfg(feature = "meeting-v1-acceptance")]
 mod meeting_acceptance;
 mod meeting_v1;
+mod meeting_v2;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1770,6 +1771,33 @@ async fn tokio_main(
         harness_name: ctx.harness_name.clone(),
         relay_url: ctx.relay_url.clone(),
     });
+    let meeting_v2_ctx = Arc::new(PromptContext {
+        // Stage 3 keeps the V1 advisory tool surface but installs a V2
+        // participant-only authority boundary. Host Turns arrive in Stage 4.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V2_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
     let mut meeting_controller = meeting::MeetingCoordinator::new(
         ctx.rest_client.clone(),
         config.keys.clone(),
@@ -1777,6 +1805,7 @@ async fn tokio_main(
         config.agents as usize,
     );
     pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+    pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
     meeting_controller.set_available_agent_slots(if pool_ready { pool.idle_count() } else { 0 });
     for channel_id in meeting_channel_ids {
         meeting_controller.register(channel_id).await;
@@ -1936,6 +1965,7 @@ async fn tokio_main(
 
     let main_loop_exit = loop {
         pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+        pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
         meeting_controller.set_available_agent_slots(if pool_ready {
             pool.idle_count()
         } else {
@@ -1950,8 +1980,12 @@ async fn tokio_main(
                 &mut meeting_controller,
                 &meeting_v0_ctx,
                 &meeting_v1_ctx,
+                &meeting_v2_ctx,
             );
             pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+            pool.set_reserved_meeting_board_slots(
+                meeting_controller.board_dispatch_reserved_slots(),
+            );
             meeting_controller.set_available_agent_slots(pool.idle_count());
         }
         // Whether buffered work is waiting on a lazy pool. Also gates the
@@ -2098,6 +2132,7 @@ async fn tokio_main(
                 &mut meeting_controller,
                 &meeting_v0_ctx,
                 &meeting_v1_ctx,
+                &meeting_v2_ctx,
             );
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                 typing_channels.insert(channel_id, thread_tags);
@@ -2746,6 +2781,7 @@ async fn tokio_main(
                     &mut meeting_controller,
                     &meeting_v0_ctx,
                     &meeting_v1_ctx,
+                    &meeting_v2_ctx,
                 );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2783,6 +2819,7 @@ async fn tokio_main(
                     &mut meeting_controller,
                     &meeting_v0_ctx,
                     &meeting_v1_ctx,
+                    &meeting_v2_ctx,
                 );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2935,6 +2972,7 @@ async fn tokio_main(
                             &mut meeting_controller,
                             &meeting_v0_ctx,
                             &meeting_v1_ctx,
+                            &meeting_v2_ctx,
                         );
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
@@ -3320,19 +3358,24 @@ fn dispatch_meeting_pending(
     controller: &mut meeting::MeetingCoordinator,
     v0_ctx: &Arc<PromptContext>,
     v1_ctx: &Arc<PromptContext>,
+    v2_ctx: &Arc<PromptContext>,
 ) {
     while let Some(request) = controller.pop_pending() {
         let channel_id = request.session_id;
-        let ctx = if request.kind.is_v1() {
-            Arc::clone(v1_ctx)
-        } else {
-            Arc::clone(v0_ctx)
+        let ctx = match request.baton_protocol {
+            Some(meeting::MeetingBatonProtocol::V1) => Arc::clone(v1_ctx),
+            Some(meeting::MeetingBatonProtocol::V2) => Arc::clone(v2_ctx),
+            None => Arc::clone(v0_ctx),
         };
-        // Only a V1 Granted turn owns a slot protected by the local Offer
-        // reservation. Participant and moderator planning turns must respect
-        // that floor or they could consume the exact slot an ACK promised.
+        // Granted turns may consume their Offer reservation. A Board-backed V2
+        // participant Turn may consume only its short-lived Board reservation,
+        // while still respecting every stronger Offer/Grant reservation.
         let claimed = if request.kind == meeting::MeetingTurnKind::V1Granted {
             pool.try_claim_meeting(channel_id)
+        } else if request.baton_protocol == Some(meeting::MeetingBatonProtocol::V2)
+            && request.board_event_id.is_some()
+        {
+            pool.try_claim_meeting_board(channel_id)
         } else {
             pool.try_claim(Some(channel_id))
         };
@@ -3386,12 +3429,19 @@ fn dispatch_meeting_pending(
             },
         );
         controller.mark_dispatched(turn_id, request);
+        controller.set_available_agent_slots(pool.idle_count());
         tracing::info!(
             agent = agent_index,
             meeting = %channel_id,
             "meeting_turn_dispatched"
         );
     }
+    // `pop_pending` may have started or cancelled a current-Board read even
+    // when it returned no dispatchable request. Refresh both floors before any
+    // caller proceeds to ordinary channel work in the same main-loop branch.
+    pool.set_reserved_meeting_slots(controller.unassigned_reserved_slots());
+    pool.set_reserved_meeting_board_slots(controller.board_dispatch_reserved_slots());
+    controller.set_available_agent_slots(pool.idle_count());
 }
 
 /// Flush queued work to available agents.

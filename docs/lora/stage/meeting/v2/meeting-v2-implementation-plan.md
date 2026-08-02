@@ -951,7 +951,7 @@ V1，也不能跳过 Board gate。
 |---|---|---|
 | 1. 协议、当前看板与 CLI 基础 | 已完成（2026-08-02） | wire/data 细化设计、migration 0038、SDK fixture、CLI 当前看板链路、真实 Relay E2E |
 | 2. Relay 权威主持控制周期与终态 | 已完成（2026-08-02） | CLI-only 生命周期、双 deadline、竞态、重启与恢复测试 |
-| 3. 普通参会 Agent | 未开始 | Intent/Grant 按需看板注入、read failure 和无订阅测试 |
+| 3. 普通参会 Agent | 已完成（2026-08-02） | Intent/Grant 独立按需读板、read failure、无订阅与 V2 wire 测试 |
 | 4. 主持 Agent | 未开始 | Board/Floor 双 Turn、Human preemption、全 Agent 闭会证据 |
 | 5. 后端综合验收与发布准备 | 未开始 | 专项 gate、真实 qualification、运维与发布候选 |
 
@@ -1025,6 +1025,47 @@ cargo fmt --all -- --check
 阶段二完成的是不依赖 ACP 的完整后端生命周期。V2 Create 默认开关仍保持关闭；普通参会
 Agent 的按需看板注入属于阶段三，ACP Agent 主持人的 Board/Floor 双 Turn 属于阶段四，
 前端仍不在本计划范围内。
+
+### 14.3 阶段三交付记录（2026-08-02）
+
+阶段三已经冻结并实现：
+
+- ACP 识别 `v=3 + moderated-board-v1` Session，并由 V1/V2 共用的 Baton coordinator 按
+  Session 持久协议严格分流 State、history 与 SDK builder；
+- V2 Participant Intent 和 Granted Speech 在各自模型 Turn 前独立查询当前 Board，Grant
+  不复用 Intent 快照，format retry 也重新读取；
+- Board loader 固定 Relay signer、主持人、`h/v/policy/format` 与严格 content envelope，
+  正文采用 UTF-8 安全的有界 head/tail 截断；
+- Board 正文仅进入当前 Prompt，不进入 subscription、ACP ledger、observer payload、普通
+  日志或跨 Turn cache；ledger v5 只增加 Baton protocol discriminator，v4 缺省迁移为 V1；
+- Board 作为 `untrusted_meeting_context`，不能覆盖系统策略、Agent 身份、Grant、输出
+  schema、工具权限或外部授权；普通参会 Turn 不执行持久写入；
+- 读取使用独立短超时和三次有界尝试；最终失败不启动模型，Intent 私有 PASS，Granted
+  Speech 提交 `YIELD(unable_to_answer)`；
+- Board load/待派发 Turn 使用短暂容量保护，同时服从更强的 Offer/Grant reservation；若
+  dispatch 未取得 Agent，会丢弃刚读快照并在下次出队重新读取；
+- Offer ACK、Intent、Progress、SAY/YIELD 和 Directed Handoff 均按 V2 `v=3` wire 构建；
+- Board 更新不在 Meeting subscription 中，单纯 Board/State 推进不会形成新的语义 Turn；
+- 本地 ACP 身份为 V2 主持人时保持 fail closed，不借用 V1 主持路径；Board Maintenance
+  Turn、Floor Decision Turn 和 Agent 闭会仍属于阶段四。
+
+协议、调度、Prompt、失败和恢复边界见
+[阶段三普通参会 Agent 看板上下文设计](./meeting-v2-stage3-design.md)。自动化证据覆盖看板
+A Intent → 看板 B Granted Speech、读取失败 PASS/YIELD、V2 wire、截断与注入防线、排队
+重读、restart、迟到 epoch、Board-only State、容量隔离、本地主持 fail closed，以及完整
+`buzz-acp` V0/V1 regression。
+
+阶段交付时通过以下可复现门禁：
+
+```bash
+cargo test -p buzz-acp --lib
+cargo clippy -p buzz-acp --all-targets -- -D warnings
+./scripts/run-meeting-backend-tests.sh
+cargo fmt --all -- --check
+```
+
+阶段三完成的是普通参会 Agent。它没有实现 ACP Agent 主持，也没有增加前端、会议模板、
+Project View 绑定或任何外部系统写回。
 
 ## 15. 后端完成定义
 

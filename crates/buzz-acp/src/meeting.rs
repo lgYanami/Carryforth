@@ -49,6 +49,8 @@ const MAX_MENTIONS: usize = 32;
 pub(crate) const V0_SYSTEM_PROMPT: &str = include_str!("meeting_prompt.md");
 /// Meeting V1 advisory system policy installed for moderated baton turns.
 pub(crate) const V1_SYSTEM_PROMPT: &str = include_str!("meeting_v1_prompt.md");
+/// Meeting V2 participant policy installed for moderated Board turns.
+pub(crate) const V2_SYSTEM_PROMPT: &str = include_str!("meeting_v2_participant_prompt.md");
 
 /// The dedicated room subscription used independently of ordinary ACP rules.
 pub(crate) fn subscription_filter() -> ChannelFilter {
@@ -88,6 +90,44 @@ pub(crate) struct MeetingTurnRequest {
     /// Turn so a terminal Meeting can still emit its natural completion and
     /// final disposition after the durable Meeting ledger is erased.
     pub(super) moderator_observer_snapshot: Option<Value>,
+    /// `None` for legacy V0; otherwise the immutable moderated protocol of the
+    /// owning Session.
+    pub(super) baton_protocol: Option<MeetingBatonProtocol>,
+    /// Present only after a V2 current-Board read completed for this exact
+    /// model Turn. The Board body lives only in `prompt`, never in the ledger.
+    pub(super) board_event_id: Option<String>,
+}
+
+/// Immutable protocol discriminator for the shared moderated Baton engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MeetingBatonProtocol {
+    #[default]
+    V1,
+    V2,
+}
+
+impl MeetingBatonProtocol {
+    pub(super) const fn schema_version(self) -> &'static str {
+        match self {
+            Self::V1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
+            Self::V2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+        }
+    }
+
+    pub(super) const fn policy(self) -> &'static str {
+        match self {
+            Self::V1 => buzz_sdk::MEETING_V1_POLICY,
+            Self::V2 => buzz_sdk::MEETING_V2_POLICY,
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +337,7 @@ struct GrantedOutput {
 enum RegisteredMeetingProtocol {
     UniformV0,
     ModeratedBatonV1,
+    ModeratedBoardV2,
 }
 
 struct PendingV0TurnCompletion {
@@ -330,7 +371,7 @@ struct RunningMeetingTurn {
 /// Per-process protocol-neutral coordinator for every visible Meeting room.
 ///
 /// Registration probes the Relay-signed State once, then delegates the room to
-/// exactly one protocol controller. V0 and V1 therefore share the Agent-pool
+/// exactly one protocol controller. V0 and moderated Meetings therefore share the Agent-pool
 /// scheduling surface without running competing synchronizers for one Session.
 pub(crate) struct MeetingCoordinator {
     rest: RestClient,
@@ -405,8 +446,13 @@ impl MeetingCoordinator {
     }
 
     pub(crate) fn pop_pending(&mut self) -> Option<MeetingTurnRequest> {
+        if self.available_agent_slots == 0 {
+            return None;
+        }
         if self.v1.front_kind() == Some(MeetingTurnKind::V1Granted) {
-            return self.v1.pop_pending();
+            if let Some(request) = self.v1.pop_pending() {
+                return Some(request);
+            }
         }
         if self
             .v0
@@ -494,7 +540,10 @@ impl MeetingCoordinator {
                     self.v0_deferred_removals.insert(session_id);
                 }
             }
-            Some(RegisteredMeetingProtocol::ModeratedBatonV1) => self.v1.remove(session_id),
+            Some(
+                RegisteredMeetingProtocol::ModeratedBatonV1
+                | RegisteredMeetingProtocol::ModeratedBoardV2,
+            ) => self.v1.remove(session_id),
             None => {}
         }
     }
@@ -546,7 +595,10 @@ impl MeetingCoordinator {
                     self.v0_deferred_resyncs.insert(event.channel_id);
                 }
             }
-            Some(RegisteredMeetingProtocol::ModeratedBatonV1) => self.v1.handle_event(event).await,
+            Some(
+                RegisteredMeetingProtocol::ModeratedBatonV1
+                | RegisteredMeetingProtocol::ModeratedBoardV2,
+            ) => self.v1.handle_event(event).await,
             None => {}
         }
     }
@@ -622,7 +674,8 @@ impl MeetingCoordinator {
         });
         let ordinary_idle = self
             .available_agent_slots
-            .saturating_sub(self.v1.unassigned_reserved_slots());
+            .saturating_sub(self.v1.unassigned_reserved_slots())
+            .saturating_sub(self.v1.board_dispatch_reserved_slots());
         let cancellation_credit = self
             .running_turns
             .values()
@@ -632,8 +685,10 @@ impl MeetingCoordinator {
                     && matches!(running.request.kind, MeetingTurnKind::V1Intent)
             })
             .count();
-        let required =
+        let mut required =
             pending_v0_grants.saturating_sub(ordinary_idle.saturating_add(cancellation_credit));
+        let released_board_slots = self.v1.preempt_board_reserved_intents(required);
+        required = required.saturating_sub(released_board_slots);
         let mut candidates: Vec<_> = self
             .running_turns
             .values()
@@ -709,6 +764,10 @@ impl MeetingCoordinator {
     /// for V1 Offers already ACKed by this process.
     pub(crate) fn unassigned_reserved_slots(&self) -> usize {
         self.v1.unassigned_reserved_slots()
+    }
+
+    pub(crate) fn board_dispatch_reserved_slots(&self) -> usize {
+        self.v1.board_dispatch_reserved_slots()
     }
 
     fn start_next_v0_completion(&mut self) {
@@ -859,8 +918,21 @@ impl MeetingCoordinator {
                 self.detection_retry_at.remove(&session_id);
                 self.protocols
                     .insert(session_id, RegisteredMeetingProtocol::ModeratedBatonV1);
-                let _ =
-                    tokio::time::timeout(MAIN_LOOP_IO_BUDGET, self.v1.register(session_id)).await;
+                let _ = tokio::time::timeout(
+                    MAIN_LOOP_IO_BUDGET,
+                    self.v1.register(session_id, MeetingBatonProtocol::V1),
+                )
+                .await;
+            }
+            Ok(RegisteredMeetingProtocol::ModeratedBoardV2) => {
+                self.detection_retry_at.remove(&session_id);
+                self.protocols
+                    .insert(session_id, RegisteredMeetingProtocol::ModeratedBoardV2);
+                let _ = tokio::time::timeout(
+                    MAIN_LOOP_IO_BUDGET,
+                    self.v1.register(session_id, MeetingBatonProtocol::V2),
+                )
+                .await;
             }
             Err(error) => {
                 tracing::warn!(
@@ -989,6 +1061,7 @@ fn classify_meeting_protocol(
     let relay_pubkey = metadata.pubkey;
     let mut saw_v0 = false;
     let mut saw_v1 = false;
+    let mut saw_v2 = false;
     for event in events {
         if event.kind.as_u16() as u32 != KIND_MEETING_ROUND_STATE
             || event.pubkey != relay_pubkey
@@ -1000,6 +1073,10 @@ fn classify_meeting_protocol(
             && tag_value(event, "policy") == Some("moderated-baton-v1")
         {
             saw_v1 = true;
+        } else if tag_value(event, "v") == Some("3")
+            && tag_value(event, "policy") == Some("moderated-board-v1")
+        {
+            saw_v2 = true;
         } else if tag_value(event, "v").is_none()
             && tag_value(event, "policy") == Some("uniform-v0")
         {
@@ -1010,13 +1087,14 @@ fn classify_meeting_protocol(
             ));
         }
     }
-    match (saw_v0, saw_v1) {
-        (false, true) => Ok(RegisteredMeetingProtocol::ModeratedBatonV1),
-        (true, false) => Ok(RegisteredMeetingProtocol::UniformV0),
-        (true, true) => Err(anyhow!(
+    match (saw_v0, saw_v1, saw_v2) {
+        (true, false, false) => Ok(RegisteredMeetingProtocol::UniformV0),
+        (false, true, false) => Ok(RegisteredMeetingProtocol::ModeratedBatonV1),
+        (false, false, true) => Ok(RegisteredMeetingProtocol::ModeratedBoardV2),
+        (false, false, false) => Err(anyhow!("Meeting has no authoritative State event")),
+        _ => Err(anyhow!(
             "Meeting contains conflicting authoritative protocol States"
         )),
-        (false, false) => Err(anyhow!("Meeting has no authoritative State event")),
     }
 }
 
@@ -1565,6 +1643,8 @@ impl V0MeetingCoordinator {
                 grant_event_id: Some(grant_id.clone()),
                 queued_at_unix_ms: now_ms(),
                 moderator_observer_snapshot: None,
+                baton_protocol: None,
+                board_event_id: None,
             });
             self.emit(
                 "grant_received",
@@ -1653,6 +1733,8 @@ impl V0MeetingCoordinator {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: None,
+            board_event_id: None,
         });
         self.emit(
             "intent_started",
@@ -3405,6 +3487,8 @@ mod tests {
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: None,
+            board_event_id: None,
         }
     }
 
@@ -3426,6 +3510,8 @@ mod tests {
             .then(|| "a".repeat(64)),
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
+            baton_protocol: kind.is_v1().then_some(MeetingBatonProtocol::V1),
+            board_event_id: None,
         }
     }
 
@@ -3459,6 +3545,10 @@ mod tests {
             RegisteredMeetingProtocol::ModeratedBatonV1 => {
                 tags.push(Tag::parse(["v", "2"]).expect("V1 version tag"));
                 tags.push(Tag::parse(["policy", "moderated-baton-v1"]).expect("V1 policy tag"));
+            }
+            RegisteredMeetingProtocol::ModeratedBoardV2 => {
+                tags.push(Tag::parse(["v", "3"]).expect("V2 version tag"));
+                tags.push(Tag::parse(["policy", "moderated-board-v1"]).expect("V2 policy tag"));
             }
         }
         let event = EventBuilder::new(Kind::Custom(KIND_MEETING_ROUND_STATE as u16), "{}")
@@ -3875,6 +3965,25 @@ mod tests {
     }
 
     #[test]
+    fn protocol_detection_accepts_v2_state_from_metadata_signer() {
+        let session_id = Uuid::new_v4();
+        let relay = Keys::generate();
+        let events = vec![
+            signed_meeting_metadata(&relay, session_id),
+            signed_meeting_state(
+                &relay,
+                session_id,
+                RegisteredMeetingProtocol::ModeratedBoardV2,
+            ),
+        ];
+
+        assert_eq!(
+            classify_meeting_protocol(&events, session_id).expect("detect V2"),
+            RegisteredMeetingProtocol::ModeratedBoardV2
+        );
+    }
+
+    #[test]
     fn protocol_detection_keeps_stage_one_v2_bootstrap_fail_closed() {
         let session_id = Uuid::new_v4();
         let session = session_id.to_string();
@@ -3896,7 +4005,7 @@ mod tests {
         let events = vec![signed_meeting_metadata(&relay, session_id), board];
 
         let error = classify_meeting_protocol(&events, session_id)
-            .expect_err("stage-one V2 must not register a V0/V1 controller");
+            .expect_err("stage-one V2 without State must not register a controller");
         assert!(error.to_string().contains("no authoritative State event"));
     }
 

@@ -333,8 +333,11 @@ impl OwnedAgent {
 /// tasks for panic recovery.
 pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
-    /// Idle slots held for Relay-issued Meeting V1 Grants.
+    /// Idle slots held for Relay-issued moderated Meeting Grants.
     reserved_meeting_slots: usize,
+    /// Additional idle slots held briefly while a Meeting V2 participant Turn
+    /// reads its current Board or waits for immediate model dispatch.
+    reserved_meeting_board_slots: usize,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
@@ -742,6 +745,7 @@ impl AgentPool {
         Self {
             agents: slots,
             reserved_meeting_slots: 0,
+            reserved_meeting_board_slots: 0,
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -758,10 +762,23 @@ impl AgentPool {
     /// Returns `None` when no idle agent remains above the Meeting reservation
     /// floor, even if a reserved idle slot still exists.
     pub fn try_claim(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
-        if self.idle_count() <= self.reserved_meeting_slots {
+        if self.idle_count()
+            <= self
+                .reserved_meeting_slots
+                .saturating_add(self.reserved_meeting_board_slots)
+        {
             return None;
         }
         self.try_claim_inner(channel_id)
+    }
+
+    /// Claim a slot protected for a Board-backed participant Turn while still
+    /// honoring the stronger Offer/Grant reservation floor.
+    pub fn try_claim_meeting_board(&mut self, channel_id: Uuid) -> Option<OwnedAgent> {
+        if self.idle_count() <= self.reserved_meeting_slots {
+            return None;
+        }
+        self.try_claim_inner(Some(channel_id))
     }
 
     /// Claim a slot for a controller-owned Meeting turn, including one held by
@@ -788,9 +805,14 @@ impl AgentPool {
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
-    /// Hold this many live slots for accepted Meeting V1 Offers/Grants.
+    /// Hold this many live slots for accepted moderated Meeting Offers/Grants.
     pub fn set_reserved_meeting_slots(&mut self, reserved: usize) {
         self.reserved_meeting_slots = reserved.min(self.live_count());
+    }
+
+    /// Hold spare capacity between a V2 current-Board read and model dispatch.
+    pub fn set_reserved_meeting_board_slots(&mut self, reserved: usize) {
+        self.reserved_meeting_board_slots = reserved.min(self.live_count());
     }
 
     /// Return an agent to its slot after a task completes.
@@ -4509,6 +4531,35 @@ mod tests {
             .try_claim_meeting(meeting_id)
             .expect("Meeting can reclaim its reserved slot");
         agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn board_reservation_cannot_consume_a_grant_reservation() {
+        let meeting_id = Uuid::new_v4();
+        let first = meeting_pool_test_agent(0).await;
+        let second = meeting_pool_test_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        pool.set_reserved_meeting_slots(1);
+        pool.set_reserved_meeting_board_slots(1);
+
+        assert!(
+            pool.try_claim(None).is_none(),
+            "ordinary work must respect both reservation classes"
+        );
+        let mut board_agent = pool
+            .try_claim_meeting_board(meeting_id)
+            .expect("Board-backed Turn may consume capacity above the Grant floor");
+        assert_eq!(pool.idle_count(), 1);
+        assert!(
+            pool.try_claim_meeting_board(meeting_id).is_none(),
+            "Board-backed Turn must not consume the final Grant slot"
+        );
+        let mut grant_agent = pool
+            .try_claim_meeting(meeting_id)
+            .expect("Granted Turn may consume its stronger reservation");
+
+        board_agent.acp.shutdown().await;
+        grant_agent.acp.shutdown().await;
     }
 
     #[tokio::test]
