@@ -11,6 +11,12 @@ MEETING_CONTRACT_DB="buzz_meeting_gate_$$_contracts"
 MEETING_RELAY_DB="buzz_meeting_gate_$$_relay"
 MEETING_CONTRACT_DB_CREATED=false
 MEETING_RELAY_DB_CREATED=false
+MEETING_RELAY_PORT="${BUZZ_TEST_RELAY_PORT:-3000}"
+if [[ ! "${MEETING_RELAY_PORT}" =~ ^[0-9]+$ ]] \
+  || ((MEETING_RELAY_PORT < 1 || MEETING_RELAY_PORT > 65535)); then
+  echo "BUZZ_TEST_RELAY_PORT must be an integer between 1 and 65535." >&2
+  exit 1
+fi
 # secp256k1 generator x-coordinate; startup only needs a stable deployment
 # owner while the revocation E2E seeds its own actor identities.
 MEETING_RELAY_OWNER_PUBKEY="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -18,15 +24,18 @@ MEETING_RELAY_PRIVATE_KEY="00000000000000000000000000000000000000000000000000000
 
 cd "${REPO_ROOT}"
 
-if curl --silent --fail --max-time 1 http://127.0.0.1:3000/_readiness >/dev/null 2>&1; then
-  echo "A Relay is already listening on port 3000; stop it before running this gate." >&2
+if curl --silent --fail --max-time 1 \
+  "http://127.0.0.1:${MEETING_RELAY_PORT}/_readiness" >/dev/null 2>&1; then
+  echo "A Relay is already listening on port ${MEETING_RELAY_PORT}; stop it or set BUZZ_TEST_RELAY_PORT before running this gate." >&2
   exit 1
 fi
 
 # This gate owns a local Docker/Relay topology. Do not inherit developer or CI
 # endpoints: doing so could send signed test events to an unrelated service.
-export REDIS_URL="redis://localhost:6379"
-export RELAY_URL="ws://localhost:3000"
+# Explicit BUZZ_TEST_* overrides exist only for an equally isolated topology.
+export BUZZ_TEST_RELAY_PORT="${MEETING_RELAY_PORT}"
+export REDIS_URL="${BUZZ_TEST_REDIS_URL:-redis://localhost:6379}"
+export RELAY_URL="ws://localhost:${MEETING_RELAY_PORT}"
 export BUZZ_MEETING_V1_CREATE_ENABLED=true
 export BUZZ_MEETING_V2_CREATE_ENABLED=true
 export BUZZ_MEETING_ROLLOUT_FIXTURE="${ROLLOUT_FIXTURE_FILE}"

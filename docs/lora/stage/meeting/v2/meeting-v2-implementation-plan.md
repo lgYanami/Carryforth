@@ -1,6 +1,6 @@
 # Meeting V2 后端分阶段实现计划
 
-> 状态：阶段一、阶段二已完成；下一阶段为普通参会 Agent
+> 状态：阶段一至阶段四已完成；下一阶段为后端综合验收与发布准备
 >
 > 产品语义基线：
 > [Meeting V2：主持人维护的共享会议看板](./meeting-v2.md)
@@ -952,7 +952,7 @@ V1，也不能跳过 Board gate。
 | 1. 协议、当前看板与 CLI 基础 | 已完成（2026-08-02） | wire/data 细化设计、migration 0038、SDK fixture、CLI 当前看板链路、真实 Relay E2E |
 | 2. Relay 权威主持控制周期与终态 | 已完成（2026-08-02） | CLI-only 生命周期、双 deadline、竞态、重启与恢复测试 |
 | 3. 普通参会 Agent | 已完成（2026-08-02） | Intent/Grant 独立按需读板、read failure、无订阅与 V2 wire 测试 |
-| 4. 主持 Agent | 未开始 | Board/Floor 双 Turn、Human preemption、全 Agent 闭会证据 |
+| 4. 主持 Agent | 已完成（2026-08-02） | Board/Floor 双 Turn、Human preemption、全 Agent 闭会与主动 abort 证据 |
 | 5. 后端综合验收与发布准备 | 未开始 | 专项 gate、真实 qualification、运维与发布候选 |
 
 每个阶段开始时把状态更新为“进行中”；对应交付物、测试门槛和完成标志全部满足后更新为
@@ -1065,7 +1065,59 @@ cargo fmt --all -- --check
 ```
 
 阶段三完成的是普通参会 Agent。它没有实现 ACP Agent 主持，也没有增加前端、会议模板、
-Project View 绑定或任何外部系统写回。
+Project View 绑定或任何外部系统写回。这里描述的是阶段三交付时的边界；ACP Agent 主持的
+fail-closed 限制已经由阶段四解除。
+
+### 14.4 阶段四交付记录（2026-08-02）
+
+阶段四已经冻结并实现：
+
+- ACP 将主持控制机会拆成独立 `Moderator Board Maintenance` 与 `Moderator Floor Decision`
+  模型 Turn，并使用不同的本地记录、Prompt、current-board read 和 hard deadline；
+- Board Turn 读取协议允许的完整当前 Board，严格输出完整替换 `UPDATE` 或显式
+  `UNCHANGED`，但读取、provider、格式或构建失败绝不伪造 unchanged；
+- ACP 等待 Relay 将 Board window 收敛为 `floor_ready`，再执行新的权威 Board query，
+  Floor 不复用 Board Turn 的输入快照；
+- Board Harness deadline 在 Relay deadline 前保留动态安全余量，同一 window 的重复同步
+  不得向后延长该边界；绝对 hard deadline 和 Board-reserved pool slot 保证卡住的 Board
+  provider 不侵占 Floor 的独立预算；
+- Human priority、Offer/Grant、End 或 control/window 变化会取消旧主持 Turn，迟到 Board 或
+  Floor 结果无法提交；无候选 Floor 运行期间出现新候选时也立即取消并释放 slot；
+- 有候选 Floor 复用 V1 的 Relay-frozen Candidate Cohort、Decision Attempt、CAS、
+  Offer/ACK/Grant、Handoff、fallback 和 self Intent 规则，所有命令按 V2 `v=3` wire 构建；
+- 无候选 Floor 只允许 `IDLE | CLOSE | ABORT`；idle 在同一 window 不热循环，主持人如需发言
+  必须先形成 self Intent 并重新进入 Cohort；
+- normal close 只允许显式 `updated|unchanged` Board，`timed_out|preempted` 不能被解释为主持
+  确认；主动 abort 使用固定低基数 reason-code allowlist，并生成可区分的 `aborted` End；
+- ledger v6 恢复未签名的 Board/Floor Turn，并保留、核验和精确重放已经签名的 Board、
+  moderator 或 End command；current-board 读取快照不进入 ledger、日志、observer 或跨 Turn
+  cache。为精确重放，未决签名 `UPDATE` 命令会在 `0600` 本地 ledger 中暂存完整事件（因此
+  暂含 replacement Board 正文），并在 Relay State 前进、终态或撤权后清除；
+- V2 主持使用独立系统 Prompt，会议内容只作不可信 evidence，工具保持 advisory read，不能
+  写 Project View、Work、Issue、代码、Git 或其他外部系统；
+- Meeting 后端 gate 支持显式隔离 Relay、health、metrics 端口和 Redis URL，默认端口行为
+  保持不变，可在已有开发 Relay 运行时使用独立数据库与 Redis 完成真实 E2E；
+- 阶段四收口补齐主持人 self Speech 的确定性控制器路径：`IDLE → self Intent →
+  Candidate Floor → Offer/ACK → Grant → Speech`，各语义 Turn 独立读取当前 Board；同时修正
+  candidate Floor Prompt 的 `turn_kind`、`board_control` 和 normal-close 判断信息；
+- 确定性的三 Agent 多轮协议轨迹覆盖两名参会 Agent 依次发言、主持多次更新 Board、最终
+  close；独立测试覆盖主持主动 abort。
+
+主持 Agent 的控制、Prompt、安全、容量、恢复和验收边界见
+[阶段四主持 Agent 双 Turn 设计](./meeting-v2-stage4-design.md)。阶段交付时通过以下可复现
+门禁：
+
+```bash
+cargo test -p buzz-acp --lib
+cargo clippy -p buzz-acp --all-targets -- -D warnings
+./scripts/run-meeting-backend-tests.sh
+cargo clippy -p buzz-core -p buzz-sdk -p buzz-db -p buzz-relay -p buzz-cli -p buzz-acp -p buzz-test-client --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+阶段四完成的是 ACP Agent 主持控制器及确定性后端证据。它没有增加前端、模板、Project
+View 绑定或外部效果，也不把确定性 wire trace 冒充真实模型 qualification。真实 Agent
+矩阵、混合场景、fleet capability、SLO、灰度与发布候选仍属于阶段五。
 
 ## 15. 后端完成定义
 

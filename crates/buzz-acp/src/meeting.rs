@@ -51,6 +51,8 @@ pub(crate) const V0_SYSTEM_PROMPT: &str = include_str!("meeting_prompt.md");
 pub(crate) const V1_SYSTEM_PROMPT: &str = include_str!("meeting_v1_prompt.md");
 /// Meeting V2 participant policy installed for moderated Board turns.
 pub(crate) const V2_SYSTEM_PROMPT: &str = include_str!("meeting_v2_participant_prompt.md");
+/// Meeting V2 moderator policy installed for Board/Floor control turns.
+pub(crate) const V2_MODERATOR_SYSTEM_PROMPT: &str = include_str!("meeting_v2_moderator_prompt.md");
 
 /// The dedicated room subscription used independently of ordinary ACP rules.
 pub(crate) fn subscription_filter() -> ChannelFilter {
@@ -137,14 +139,24 @@ pub(super) enum MeetingTurnKind {
     V1Intent,
     V1ModeratorControl,
     V1Granted,
+    V2ModeratorBoard,
+    V2ModeratorFloor,
 }
 
 impl MeetingTurnKind {
-    pub(super) fn is_v1(self) -> bool {
+    pub(super) fn is_moderated(self) -> bool {
         matches!(
             self,
-            Self::V1Intent | Self::V1ModeratorControl | Self::V1Granted
+            Self::V1Intent
+                | Self::V1ModeratorControl
+                | Self::V1Granted
+                | Self::V2ModeratorBoard
+                | Self::V2ModeratorFloor
         )
+    }
+
+    pub(super) const fn is_v2_moderator(self) -> bool {
+        matches!(self, Self::V2ModeratorBoard | Self::V2ModeratorFloor)
     }
 }
 
@@ -468,7 +480,7 @@ impl MeetingCoordinator {
     }
 
     pub(crate) fn requeue_front(&mut self, request: MeetingTurnRequest) {
-        if request.kind.is_v1() {
+        if request.kind.is_moderated() {
             self.v1.requeue_front(request);
         } else if let Some(v0) = self.v0.as_mut() {
             v0.requeue_front(request);
@@ -478,7 +490,7 @@ impl MeetingCoordinator {
     }
 
     pub(crate) fn mark_dispatched(&mut self, turn_id: String, request: MeetingTurnRequest) {
-        if request.kind.is_v1() {
+        if request.kind.is_moderated() {
             self.running_turns.insert(
                 turn_id.clone(),
                 RunningMeetingTurn {
@@ -630,7 +642,7 @@ impl MeetingCoordinator {
             return;
         };
         self.refresh_v1_external_reclaimable_turns();
-        if running.request.kind.is_v1() {
+        if running.request.kind.is_moderated() {
             debug_assert!(
                 self.v1.owns_turn(turn_id),
                 "protocol-neutral V1 ownership diverged from the V1 controller"
@@ -1290,7 +1302,9 @@ impl V0MeetingCoordinator {
             }
             MeetingTurnKind::V1Intent
             | MeetingTurnKind::V1ModeratorControl
-            | MeetingTurnKind::V1Granted => {
+            | MeetingTurnKind::V1Granted
+            | MeetingTurnKind::V2ModeratorBoard
+            | MeetingTurnKind::V2ModeratorFloor => {
                 tracing::error!("V1 Meeting turn was routed to the V0 controller");
             }
         }
@@ -1831,7 +1845,9 @@ impl V0MeetingCoordinator {
             MeetingTurnKind::V0Intent => self.pending.push_back(request),
             MeetingTurnKind::V1Intent
             | MeetingTurnKind::V1ModeratorControl
-            | MeetingTurnKind::V1Granted => {
+            | MeetingTurnKind::V1Granted
+            | MeetingTurnKind::V2ModeratorBoard
+            | MeetingTurnKind::V2ModeratorFloor => {
                 tracing::error!("V1 Meeting turn was queued in the V0 controller");
             }
         }
@@ -3026,7 +3042,9 @@ fn format_correction_prompt(kind: MeetingTurnKind) -> String {
         }
         MeetingTurnKind::V1Intent
         | MeetingTurnKind::V1ModeratorControl
-        | MeetingTurnKind::V1Granted => {
+        | MeetingTurnKind::V1Granted
+        | MeetingTurnKind::V2ModeratorBoard
+        | MeetingTurnKind::V2ModeratorFloor => {
             "V1 Meeting format correction is owned by the V1 controller.".to_string()
         }
     }
@@ -3510,7 +3528,7 @@ mod tests {
             .then(|| "a".repeat(64)),
             queued_at_unix_ms: now_ms(),
             moderator_observer_snapshot: None,
-            baton_protocol: kind.is_v1().then_some(MeetingBatonProtocol::V1),
+            baton_protocol: kind.is_moderated().then_some(MeetingBatonProtocol::V1),
             board_event_id: None,
         }
     }
@@ -3694,9 +3712,10 @@ mod tests {
 
     #[test]
     fn moderator_turn_kinds_route_to_the_v1_controller() {
-        assert!(MeetingTurnKind::V1ModeratorControl.is_v1());
-        assert!(!MeetingTurnKind::V0Intent.is_v1());
-        assert!(!MeetingTurnKind::V0Granted.is_v1());
+        assert!(MeetingTurnKind::V1ModeratorControl.is_moderated());
+        assert!(MeetingTurnKind::V2ModeratorBoard.is_moderated());
+        assert!(!MeetingTurnKind::V0Intent.is_moderated());
+        assert!(!MeetingTurnKind::V0Granted.is_moderated());
     }
 
     #[test]

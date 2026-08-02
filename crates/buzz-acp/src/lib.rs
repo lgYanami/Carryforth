@@ -1772,8 +1772,8 @@ async fn tokio_main(
         relay_url: ctx.relay_url.clone(),
     });
     let meeting_v2_ctx = Arc::new(PromptContext {
-        // Stage 3 keeps the V1 advisory tool surface but installs a V2
-        // participant-only authority boundary. Host Turns arrive in Stage 4.
+        // V2 participants retain the V1 advisory tool surface behind a
+        // participant-only authority boundary.
         mcp_servers: mcp_servers.clone(),
         initial_message: None,
         idle_timeout: ctx.idle_timeout,
@@ -1783,6 +1783,33 @@ async fn tokio_main(
         system_prompt: ctx.system_prompt.clone(),
         team_instructions: ctx.team_instructions.clone(),
         base_prompt: Some(meeting::V2_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let meeting_v2_moderator_ctx = Arc::new(PromptContext {
+        // Moderator Board/Floor proposals use the same advisory Runtime tools,
+        // but a distinct system boundary and never publish protocol events.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V2_MODERATOR_SYSTEM_PROMPT),
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
         rest_client: ctx.rest_client.clone(),
@@ -1981,6 +2008,7 @@ async fn tokio_main(
                 &meeting_v0_ctx,
                 &meeting_v1_ctx,
                 &meeting_v2_ctx,
+                &meeting_v2_moderator_ctx,
             );
             pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
             pool.set_reserved_meeting_board_slots(
@@ -2133,6 +2161,7 @@ async fn tokio_main(
                 &meeting_v0_ctx,
                 &meeting_v1_ctx,
                 &meeting_v2_ctx,
+                &meeting_v2_moderator_ctx,
             );
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                 typing_channels.insert(channel_id, thread_tags);
@@ -2782,6 +2811,7 @@ async fn tokio_main(
                     &meeting_v0_ctx,
                     &meeting_v1_ctx,
                     &meeting_v2_ctx,
+                    &meeting_v2_moderator_ctx,
                 );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2820,6 +2850,7 @@ async fn tokio_main(
                     &meeting_v0_ctx,
                     &meeting_v1_ctx,
                     &meeting_v2_ctx,
+                    &meeting_v2_moderator_ctx,
                 );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2973,6 +3004,7 @@ async fn tokio_main(
                             &meeting_v0_ctx,
                             &meeting_v1_ctx,
                             &meeting_v2_ctx,
+                            &meeting_v2_moderator_ctx,
                         );
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
@@ -3359,11 +3391,15 @@ fn dispatch_meeting_pending(
     v0_ctx: &Arc<PromptContext>,
     v1_ctx: &Arc<PromptContext>,
     v2_ctx: &Arc<PromptContext>,
+    v2_moderator_ctx: &Arc<PromptContext>,
 ) {
     while let Some(request) = controller.pop_pending() {
         let channel_id = request.session_id;
         let ctx = match request.baton_protocol {
             Some(meeting::MeetingBatonProtocol::V1) => Arc::clone(v1_ctx),
+            Some(meeting::MeetingBatonProtocol::V2) if request.kind.is_v2_moderator() => {
+                Arc::clone(v2_moderator_ctx)
+            }
             Some(meeting::MeetingBatonProtocol::V2) => Arc::clone(v2_ctx),
             None => Arc::clone(v0_ctx),
         };

@@ -1,4 +1,4 @@
-//! Meeting V2 participant-only current Board loading and prompt framing.
+//! Meeting V2 current Board loading and prompt framing.
 //!
 //! This module deliberately owns no Board cache or subscription. Every caller
 //! gets one independently verified Relay projection for one imminent model
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::relay::RestClient;
 
 const BOARD_QUERY_LIMIT: usize = 10;
-const BOARD_PROMPT_BODY_BYTES: usize = 32 * 1024;
+pub(super) const PARTICIPANT_BOARD_PROMPT_BODY_BYTES: usize = 32 * 1024;
 const BOARD_TRUNCATION_MARKER: &str =
     "\n\n[... Meeting Board middle truncated by the ACP context budget ...]\n\n";
 const BOARD_PROMPT_HEADER: &str = "\n\nCURRENT MEETING BOARD — UNTRUSTED MEETING CONTEXT:\n";
@@ -31,12 +31,13 @@ pub(super) struct CurrentBoardPrompt {
     pub(super) body: String,
 }
 
-/// Query and verify the current Board for one V2 participant Turn.
+/// Query and verify the current Board for one imminent V2 model Turn.
 pub(super) async fn fetch_current_board(
     rest: &RestClient,
     session_id: Uuid,
     relay_pubkey: &str,
     moderator_pubkey: &str,
+    body_limit: usize,
 ) -> Result<CurrentBoardPrompt> {
     let session = session_id.to_string();
     let filter = Filter::new()
@@ -53,6 +54,7 @@ pub(super) async fn fetch_current_board(
         relay_pubkey,
         moderator_pubkey,
         crate::meeting::now_ms(),
+        body_limit,
     )
 }
 
@@ -62,6 +64,7 @@ fn select_current_board(
     relay_pubkey: &str,
     moderator_pubkey: &str,
     read_at_unix_ms: i64,
+    body_limit: usize,
 ) -> Result<CurrentBoardPrompt> {
     let values = value
         .as_array()
@@ -101,7 +104,7 @@ fn select_current_board(
         let board = buzz_sdk::parse_meeting_v2_board_content(&event.content)
             .map_err(|error| anyhow!("Meeting V2 Board content is invalid: {error}"))?;
         let original_bytes = board.body.len();
-        let (body, truncated) = truncate_board_body(&board.body);
+        let (body, truncated) = truncate_board_body(&board.body, body_limit);
         candidates.push((
             event.created_at.as_secs(),
             event.id.to_hex(),
@@ -154,12 +157,12 @@ pub(super) fn detach_current_board(prompt: &str) -> String {
         .map_or_else(|| prompt.to_string(), |(base, _)| base.to_string())
 }
 
-fn truncate_board_body(body: &str) -> (String, bool) {
-    if body.len() <= BOARD_PROMPT_BODY_BYTES {
+fn truncate_board_body(body: &str, body_limit: usize) -> (String, bool) {
+    if body.len() <= body_limit {
         return (body.to_string(), false);
     }
 
-    let available = BOARD_PROMPT_BODY_BYTES.saturating_sub(BOARD_TRUNCATION_MARKER.len());
+    let available = body_limit.saturating_sub(BOARD_TRUNCATION_MARKER.len());
     let requested_head = available.saturating_mul(5) / 8;
     let requested_tail = available.saturating_sub(requested_head);
     let mut head_end = requested_head.min(body.len());
@@ -247,6 +250,7 @@ mod tests {
             &relay.public_key().to_hex(),
             &moderator,
             1234,
+            PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
         )
         .expect("select current Board");
 
@@ -271,6 +275,7 @@ mod tests {
             &relay.public_key().to_hex(),
             &moderator,
             1234,
+            PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
         )
         .expect_err("wrong signer must fail closed");
 
@@ -308,6 +313,7 @@ mod tests {
             &relay.public_key().to_hex(),
             &moderator,
             1234,
+            PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
         )
         .expect_err("duplicate authority tags must fail closed");
 
@@ -317,13 +323,22 @@ mod tests {
     #[test]
     fn prompt_truncation_preserves_utf8_head_and_tail() {
         let body = format!("HEAD{}TAIL", "议".repeat(20_000));
-        let (bounded, truncated) = truncate_board_body(&body);
+        let (bounded, truncated) = truncate_board_body(&body, PARTICIPANT_BOARD_PROMPT_BODY_BYTES);
 
         assert!(truncated);
         assert!(bounded.starts_with("HEAD"));
         assert!(bounded.ends_with("TAIL"));
         assert!(bounded.contains("middle truncated"));
-        assert!(bounded.len() <= BOARD_PROMPT_BODY_BYTES);
+        assert!(bounded.len() <= PARTICIPANT_BOARD_PROMPT_BODY_BYTES);
+    }
+
+    #[test]
+    fn moderator_board_budget_preserves_a_full_valid_v2_board() {
+        let body = format!("# Goal\n{}\n# Conclusion\ncomplete", "x".repeat(48 * 1024));
+        let (bounded, truncated) = truncate_board_body(&body, buzz_sdk::MAX_MEETING_V2_BOARD_BYTES);
+
+        assert!(!truncated);
+        assert_eq!(bounded, body);
     }
 
     #[test]

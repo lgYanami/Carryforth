@@ -15,7 +15,7 @@
 #   --no-schema           Reuse an already-prepared database (Relay restart tests)
 #
 # Exports:
-#   RELAY_URL=ws://localhost:3000
+#   RELAY_URL=ws://localhost:${BUZZ_TEST_RELAY_PORT:-3000}
 # =============================================================================
 set -euo pipefail
 
@@ -29,6 +29,16 @@ SKIP_BUILD=false
 SKIP_SCHEMA=false
 RELAY_PID_FILE="${BUZZ_TEST_RELAY_PID_FILE:-/tmp/buzz-relay.pid}"
 RELAY_LOG_FILE="${BUZZ_TEST_RELAY_LOG_FILE:-/tmp/buzz-relay.log}"
+RELAY_PORT="${BUZZ_TEST_RELAY_PORT:-3000}"
+RELAY_HEALTH_PORT="${BUZZ_TEST_RELAY_HEALTH_PORT:-8080}"
+RELAY_METRICS_PORT="${BUZZ_TEST_RELAY_METRICS_PORT:-9102}"
+for port_setting in RELAY_PORT RELAY_HEALTH_PORT RELAY_METRICS_PORT; do
+  port_value="${!port_setting}"
+  if [[ ! "${port_value}" =~ ^[0-9]+$ ]] || ((port_value < 1 || port_value > 65535)); then
+    echo "${port_setting} must be an integer between 1 and 65535." >&2
+    exit 1
+  fi
+done
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -128,14 +138,14 @@ fi
 # ── Seed the deployment community ────────────────────────────────────────────
 # Multi-tenant: the relay resolves every connection's tenant from the durable
 # communities host map (WHERE host = normalize_host($1)). normalize_host keeps
-# non-default ports, so the host must be 'localhost:3000' verbatim to match
-# RELAY_URL=ws://localhost:3000. The relay never auto-seeds a community
+# non-default ports, so the host must include the selected test port verbatim
+# to match RELAY_URL. The relay never auto-seeds a community
 # (ensure_configured_community has no callers) and fails closed on an unmapped
 # host, so without this row every e2e connection would 404 at host-binding.
 # The unique index is on lower(host), so ON CONFLICT must target that expression.
 # psql is not on PATH in the hermit env; postgres runs as the buzz-postgres
 # docker container, so exec into it (same fallback as setup-desktop-test-data.sh).
-log "Seeding deployment community (host=localhost:3000)..."
+log "Seeding deployment community (host=localhost:${RELAY_PORT})..."
 if command -v psql >/dev/null 2>&1; then
   seed_psql() { PGPASSWORD="${PGPASSWORD}" psql -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" -qtA "$@"; }
 else
@@ -143,7 +153,7 @@ else
 fi
 seed_psql -c "
 INSERT INTO communities (id, host)
-VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:3000')
+VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:${RELAY_PORT}')
 ON CONFLICT (lower(host)) DO NOTHING
 ;
 "
@@ -171,8 +181,10 @@ log "Starting relay..."
 nohup env \
   DATABASE_URL="${DATABASE_URL}" \
   REDIS_URL="${REDIS_URL:-redis://localhost:6379}" \
-  RELAY_URL=ws://localhost:3000 \
-  BUZZ_BIND_ADDR=0.0.0.0:3000 \
+  RELAY_URL="ws://localhost:${RELAY_PORT}" \
+  BUZZ_BIND_ADDR="0.0.0.0:${RELAY_PORT}" \
+  BUZZ_HEALTH_PORT="${RELAY_HEALTH_PORT}" \
+  BUZZ_METRICS_PORT="${RELAY_METRICS_PORT}" \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \
   BUZZ_GIT_PROBE_WRITERS=8 \
@@ -188,10 +200,11 @@ for attempt in $(seq 1 60); do
     cat "${RELAY_LOG_FILE}"
     exit 1
   fi
-  status_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/_readiness || true)
+  status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    "http://127.0.0.1:${RELAY_PORT}/_readiness" || true)
   if [ "${status_code}" = "200" ]; then
-    ok "Relay is ready at ws://localhost:3000"
-    export RELAY_URL=ws://localhost:3000
+    ok "Relay is ready at ws://localhost:${RELAY_PORT}"
+    export RELAY_URL="ws://localhost:${RELAY_PORT}"
     exit 0
   fi
   sleep 1
