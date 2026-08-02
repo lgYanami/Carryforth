@@ -4131,6 +4131,9 @@ mod tests {
     fn legacy_agent_gets_project_space_contract_without_base_prompt() {
         let composed = prepend_project_space_for_legacy(1, "hello channel");
         assert!(composed.starts_with("[Project Space]\n"));
+        assert!(composed.contains("versioned Project Documents"));
+        assert!(composed.contains("referenced directly from Project View"));
+        assert!(composed.contains("explicitly write the change back through Buzz"));
         assert!(composed.ends_with("\n\nhello channel"));
     }
 
@@ -4272,10 +4275,13 @@ mod tests {
 
     #[test]
     fn test_framed_system_prompt_contract_survives_no_base_and_no_persona() {
-        assert_eq!(
-            framed_system_prompt("/", None, None).as_deref(),
-            Some(crate::project_space::PROJECT_SPACE_SECTION)
-        );
+        let framed = framed_system_prompt("/", None, None)
+            .expect("Project Space contract survives without base or persona");
+        assert_eq!(framed, crate::project_space::PROJECT_SPACE_SECTION);
+        assert!(framed.contains("versioned Project Documents"));
+        assert!(framed.contains("Guide Document"));
+        assert!(framed.contains("Context References"));
+        assert!(framed.contains("materially changes"));
     }
 
     #[test]
@@ -4361,6 +4367,9 @@ mod tests {
             positions.windows(2).all(|pair| pair[0] < pair[1]),
             "unexpected system context order: {prompt}"
         );
+        assert!(prompt.contains("referenced directly from Project View"));
+        assert!(prompt.contains("read only the needed body on demand"));
+        assert!(prompt.contains("explicitly write the change back through Buzz"));
     }
 
     #[test]

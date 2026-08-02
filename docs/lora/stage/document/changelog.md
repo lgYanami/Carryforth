@@ -1,5 +1,32 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-02 — Project Context 最小核心语义完成
+
+阶段目标：在不扩张Role Brief v3、Context closure、协议、权限或客户端范围的前提下，让所有Buzz
+managed Agent从session开始就具备Document、Resource、Context Reference与显式写回的稳定核心认知。
+
+### 已交付
+
+- `buzz-acp`的platform-owned`[Project Space]` contract从v2提升到v3。固定说明Project Document是
+  可由Project View直接引用的版本化长文本资产，Resource是通过mandatory Guide Document说明用法的
+  Project View资产坐标，Project View对象可通过Context Reference关联二者。
+- 固定契约要求Agent只按需读取相关Document正文，并在工作实质改变Project View、Resource信息或Guide
+  关联、Document正文或Context Reference时，通过Buzz显式写回；聊天、本地文件和模型记忆不会自动更新
+  Project。
+- 新语义保持capability-neutral，不注入当前Community、Project、Role、Resource、Document或revision等
+  动态事实。动态相关坐标继续由verified Role Brief / Binding交付，授权继续由Buzz工具与Relay执行。
+- modern`session/new.systemPrompt`、legacy user-context compatibility和`--no-base-prompt`路径均由测试固定。
+  contract version与内容hash继续触发现有旧session失效；replacement session继续强制获取Full Role Brief。
+- Base prompt已有`buzz documents`、正文按需读取和`buzz resources guide ... --content-only`操作闭环，因此
+  未重复增加命令说明。Role Brief v3 Context来源路径补强仍按决议延期观察。
+
+### 本地验证
+
+- `cargo test -p buzz-acp --lib`：641项通过；
+- `cargo clippy -p buzz-acp --all-targets -- -D warnings`通过；
+- `cargo fmt --all -- --check`与`git diff --check`通过；
+- 测试批次使用`CARGO_INCREMENTAL=0`，交付结束再次清理workspace与Tauri Cargo incremental缓存。
+
 ## 2026-08-01 — 阶段 7 单机预发布 hardening 完成
 
 阶段目标：在不假装存在生产环境的前提下，用一台开发机证明 Project Document 的 signer轮换、
