@@ -102,6 +102,94 @@ pub(crate) fn baton_config_from_env() -> BatonConfig {
     }
 }
 
+/// Load the Meeting V2 Baton policy independently from the Board budget.
+pub(crate) fn v2_baton_config_from_env() -> BatonConfig {
+    let defaults = BatonConfig::default();
+    let configured = BatonConfig {
+        timing_profile_version: buzz_db::meeting_v2::DEFAULT_BATON_TIMING_PROFILE_VERSION
+            .to_string(),
+        agent_offer_ack_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_AGENT_OFFER_ACK_MS",
+            defaults.agent_offer_ack_ms,
+            86_400_000,
+        ),
+        human_offer_ack_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_HUMAN_OFFER_ACK_MS",
+            defaults.human_offer_ack_ms,
+            86_400_000,
+        ),
+        moderator_decision_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_MODERATOR_DECISION_MS",
+            defaults.moderator_decision_ms,
+            86_400_000,
+        ),
+        grant_soft_lease_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_GRANT_SOFT_LEASE_MS",
+            defaults.grant_soft_lease_ms,
+            86_400_000,
+        ),
+        progress_interval_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_PROGRESS_INTERVAL_MS",
+            defaults.progress_interval_ms,
+            86_400_000,
+        ),
+        grant_hard_deadline_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_GRANT_HARD_DEADLINE_MS",
+            defaults.grant_hard_deadline_ms,
+            86_400_000,
+        ),
+        agent_safety_margin_ms: env_positive_i64(
+            "BUZZ_MEETING_V2_AGENT_SAFETY_MARGIN_MS",
+            defaults.agent_safety_margin_ms,
+            86_400_000,
+        ),
+        max_handoff_depth: env_bounded_i32(
+            "BUZZ_MEETING_V2_MAX_HANDOFF_DEPTH",
+            defaults.max_handoff_depth,
+            0,
+            255,
+        ),
+        max_open_handoffs: env_bounded_i32(
+            "BUZZ_MEETING_V2_MAX_OPEN_HANDOFFS",
+            defaults.max_open_handoffs,
+            1,
+            32,
+        ),
+        moderator_max_rejudgments: env_bounded_i32(
+            "BUZZ_MEETING_V2_MODERATOR_MAX_REJUDGMENTS",
+            defaults.moderator_max_rejudgments,
+            0,
+            8,
+        ),
+        moderator_max_cas_rebases_per_attempt: env_bounded_i32(
+            "BUZZ_MEETING_V2_MODERATOR_MAX_CAS_REBASES_PER_ATTEMPT",
+            defaults.moderator_max_cas_rebases_per_attempt,
+            1,
+            64,
+        ),
+        fallback_policy_version: defaults.fallback_policy_version.clone(),
+    };
+    if valid_baton_config(&configured) {
+        configured
+    } else {
+        warn!("Ignoring incoherent Meeting V2 Baton overrides; using the complete default profile");
+        BatonConfig {
+            timing_profile_version: buzz_db::meeting_v2::DEFAULT_BATON_TIMING_PROFILE_VERSION
+                .to_string(),
+            ..defaults
+        }
+    }
+}
+
+/// Load the independently frozen Meeting V2 Board Maintenance budget.
+pub(crate) fn v2_board_maintenance_ms_from_env() -> i64 {
+    env_positive_i64(
+        "BUZZ_MEETING_V2_BOARD_MAINTENANCE_MS",
+        buzz_db::meeting_v2::DEFAULT_BOARD_MAINTENANCE_MS,
+        buzz_db::meeting_baton::MAX_BATON_DURATION_MS,
+    )
+}
+
 /// Load the configured Claim settle delay, maximum window, and Grant lease.
 ///
 /// Values are milliseconds so integration tests can exercise deadlines without

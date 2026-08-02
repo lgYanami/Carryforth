@@ -1415,7 +1415,7 @@ pub enum MeetingsCmd {
         #[arg(long)]
         meeting: String,
     },
-    /// Read the current Meeting V2 board
+    /// Read or maintain the current Meeting V2 board
     Board {
         #[command(subcommand)]
         command: MeetingBoardCmd,
@@ -1456,22 +1456,22 @@ pub enum MeetingsCmd {
         #[arg(long, requires = "handoff_to")]
         handoff_reason: Option<String>,
     },
-    /// Read and manage Meeting V1 speech intents
+    /// Read and manage moderated Meeting speech intents
     Intents {
         #[command(subcommand)]
         command: MeetingIntentsCmd,
     },
-    /// Submit Meeting V1 moderator decisions
+    /// Submit moderated Meeting decisions
     Moderator {
         #[command(subcommand)]
         command: MeetingModeratorCmd,
     },
-    /// Respond to the current Meeting V1 Offer
+    /// Respond to the current moderated Meeting Offer
     Offer {
         #[command(subcommand)]
         command: MeetingOfferCmd,
     },
-    /// Maintain or yield the current Meeting V1 Grant
+    /// Maintain or yield the current moderated Meeting Grant
     Grant {
         #[command(subcommand)]
         command: MeetingGrantCmd,
@@ -1487,6 +1487,24 @@ pub enum MeetingsCmd {
         #[arg(long)]
         meeting: String,
     },
+    /// Normally close a Meeting V2 after its final explicit Board result
+    Close {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Abnormally terminate a Meeting V2 without declaring its goal reached
+    Abort {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Stable machine-readable abort reason
+        #[arg(long)]
+        reason_code: String,
+        /// Optional short explanation
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// Meeting V2 current-board operations.
@@ -1498,9 +1516,36 @@ pub enum MeetingBoardCmd {
         #[arg(long)]
         meeting: String,
     },
+    /// Replace the complete current board and open the Floor window
+    Update {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Path to the complete Markdown board; use '-' to read from stdin
+        #[arg(long)]
+        board: String,
+        /// Explicit Control Token epoch; defaults to current State
+        #[arg(long)]
+        control_epoch: Option<u64>,
+        /// Explicit Board window fence; defaults to current State
+        #[arg(long)]
+        board_window: Option<u64>,
+    },
+    /// Confirm the current board is unchanged and open the Floor window
+    Unchanged {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Explicit Control Token epoch; defaults to current State
+        #[arg(long)]
+        control_epoch: Option<u64>,
+        /// Explicit Board window fence; defaults to current State
+        #[arg(long)]
+        board_window: Option<u64>,
+    },
 }
 
-/// Meeting V1 speech-intent operations.
+/// Moderated Meeting speech-intent operations.
 #[derive(Subcommand)]
 pub enum MeetingIntentsCmd {
     /// List the Relay-authoritative pending intent pool
@@ -1547,7 +1592,7 @@ pub enum MeetingIntentsCmd {
     },
 }
 
-/// Meeting V1 moderator control operations.
+/// Moderated Meeting moderator-control operations.
 #[derive(Subcommand)]
 pub enum MeetingModeratorCmd {
     /// Select exactly one pending intent or open handoff
@@ -1696,7 +1741,7 @@ pub enum MeetingModeratorCmd {
     },
 }
 
-/// Meeting V1 Offer response operations.
+/// Moderated Meeting Offer response operations.
 #[derive(Subcommand)]
 pub enum MeetingOfferCmd {
     /// Acknowledge the current Offer
@@ -1722,7 +1767,7 @@ pub enum MeetingOfferCmd {
     },
 }
 
-/// Meeting V1 active Grant operations.
+/// Moderated Meeting active Grant operations.
 #[derive(Subcommand)]
 pub enum MeetingGrantCmd {
     /// Extend the active Grant's soft lease
@@ -3046,6 +3091,51 @@ mod tests {
             "00000000-0000-4000-8000-000000000001",
         ])
         .expect("parse Meeting V2 board get");
+
+        Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "board",
+            "update",
+            "--meeting",
+            "00000000-0000-4000-8000-000000000001",
+            "--board",
+            "# Updated",
+            "--control-epoch",
+            "2",
+            "--board-window",
+            "3",
+        ])
+        .expect("parse Meeting V2 board update");
+        Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "board",
+            "unchanged",
+            "--meeting",
+            "00000000-0000-4000-8000-000000000001",
+        ])
+        .expect("parse Meeting V2 board unchanged with inferred fences");
+        Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "close",
+            "--meeting",
+            "00000000-0000-4000-8000-000000000001",
+        ])
+        .expect("parse Meeting V2 close");
+        Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "abort",
+            "--meeting",
+            "00000000-0000-4000-8000-000000000001",
+            "--reason-code",
+            "goal_unreachable",
+            "--reason",
+            "Evidence unavailable",
+        ])
+        .expect("parse Meeting V2 abort");
     }
 
     #[test]
@@ -3395,7 +3485,9 @@ mod tests {
         assert_eq!(
             names(&cmd, "meetings"),
             vec![
+                "abort",
                 "board",
+                "close",
                 "create",
                 "end",
                 "floor",
@@ -3500,7 +3592,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
-            ("meetings", 13),
+            ("meetings", 15),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

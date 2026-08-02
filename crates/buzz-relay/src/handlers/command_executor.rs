@@ -131,6 +131,9 @@ pub async fn handle_command(
         | KIND_MEETING_GRANT_SIGNAL => {
             super::meeting_baton::handle_command(tenant, state, &event, &auth).await
         }
+        KIND_MEETING_BOARD_COMMAND => {
+            super::meeting_baton::handle_board_action(tenant, state, &event, &auth).await
+        }
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
@@ -584,6 +587,9 @@ async fn handle_meeting_create(
                     participant_pubkeys: &participant_pubkeys,
                     initial_board,
                     relay_keys: &state.relay_keypair,
+                    baton_config: crate::meeting_runtime::v2_baton_config_from_env(),
+                    board_maintenance_ms: crate::meeting_runtime::v2_board_maintenance_ms_from_env(
+                    ),
                 },
             )
             .await
@@ -664,11 +670,6 @@ async fn handle_meeting_end(
     event: &Event,
     auth: &IngestAuth,
 ) -> Result<IngestResult, IngestError> {
-    if !event.content.is_empty() {
-        return Err(IngestError::Rejected(
-            "invalid: meeting end content must be empty".into(),
-        ));
-    }
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
     if auth
         .channel_ids()
@@ -724,14 +725,57 @@ async fn handle_meeting_end(
 
     let create_event_id_hex = require_single_tag(event, "e")?;
     let create_event_id = decode_event_id(&create_event_id_hex, "meeting create event id")?;
-    let reason = require_single_tag(event, "reason")?;
-    if reason != "manual" {
-        return Err(IngestError::Rejected(
-            "invalid: client meeting end reason must be manual".into(),
-        ));
-    }
+    let v2_terminal = if protocol == MeetingProtocol::ModeratedBoardV2 {
+        let outcome = match require_single_tag(event, "outcome")?.as_str() {
+            "closed" => buzz_db::meeting_v2::TerminalOutcome::Closed,
+            "aborted" => buzz_db::meeting_v2::TerminalOutcome::Aborted,
+            _ => {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting V2 End outcome must be closed or aborted".into(),
+                ));
+            }
+        };
+        (outcome, optional_single_tag(event, "reason-code")?)
+    } else {
+        if !event.content.is_empty() {
+            return Err(IngestError::Rejected(
+                "invalid: Meeting V0/V1 End content must be empty".into(),
+            ));
+        }
+        let reason = require_single_tag(event, "reason")?;
+        if reason != "manual" {
+            return Err(IngestError::Rejected(
+                "invalid: client meeting end reason must be manual".into(),
+            ));
+        }
+        (buzz_db::meeting_v2::TerminalOutcome::Closed, None)
+    };
 
     let actor_pubkey = auth.pubkey().to_bytes().to_vec();
+    // A normal close is a Floor Decision, so a due Board/Floor deadline must
+    // linearize first. The DB End transaction fences the deadline again under
+    // the Session lock in case it becomes due between these transactions.
+    if protocol == MeetingProtocol::ModeratedBoardV2
+        && v2_terminal.0 == buzz_db::meeting_v2::TerminalOutcome::Closed
+        && persisted_policy.moderator_pubkey.as_deref() == Some(actor_pubkey.as_slice())
+    {
+        let recovery = buzz_db::meeting_baton::recover_meeting_v1(
+            &state.db,
+            tenant.community(),
+            session_id,
+            &state.relay_keypair,
+        )
+        .await
+        .map_err(map_meeting_db_error)?;
+        if recovery
+            .iter()
+            .any(|transition| transition.primary_type == "participant_revoked")
+        {
+            return Err(IngestError::AuthFailed(
+                "restricted: meeting ended because a participant was revoked".into(),
+            ));
+        }
+    }
     let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
         PersistResult::Duplicate => {
             if !buzz_db::meeting::is_meeting_actor_session_security_active(
@@ -747,6 +791,37 @@ async fn handle_meeting_end(
                     "restricted: meeting End author is no longer active".into(),
                 ));
             }
+            if protocol == MeetingProtocol::ModeratedBoardV2 {
+                let terminal_outcome = buzz_db::meeting_v2::get_terminal_outcome(
+                    &state.db,
+                    tenant.community(),
+                    session_id,
+                )
+                .await
+                .map_err(map_meeting_db_error)?
+                .ok_or_else(|| {
+                    IngestError::Internal(
+                        "error: duplicate Meeting V2 End exists for an active Session".into(),
+                    )
+                })?;
+                let terminal_outcome = match terminal_outcome {
+                    buzz_db::meeting_v2::TerminalOutcome::Closed => "closed",
+                    buzz_db::meeting_v2::TerminalOutcome::Aborted => "aborted",
+                };
+                return Ok(IngestResult {
+                    event_id: event.id.to_hex(),
+                    accepted: true,
+                    message: format!(
+                        "response:{}",
+                        serde_json::json!({
+                            "meeting_id": session_id.to_string(),
+                            "status": "ended",
+                            "already_ended": true,
+                            "terminal_outcome": terminal_outcome,
+                        })
+                    ),
+                });
+            }
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
@@ -758,7 +833,7 @@ async fn handle_meeting_end(
 
     enum ManualEndResult {
         Ended,
-        AlreadyEnded,
+        AlreadyEnded(Option<buzz_db::meeting_v2::TerminalOutcome>),
         ParticipantRevoked,
     }
 
@@ -797,7 +872,7 @@ async fn handle_meeting_end(
             }
             match outcome {
                 EndMeetingOutcome::Ended => ManualEndResult::Ended,
-                EndMeetingOutcome::AlreadyEnded => ManualEndResult::AlreadyEnded,
+                EndMeetingOutcome::AlreadyEnded => ManualEndResult::AlreadyEnded(None),
                 EndMeetingOutcome::ParticipantRevoked => ManualEndResult::ParticipantRevoked,
             }
         }
@@ -818,7 +893,7 @@ async fn handle_meeting_end(
             {
                 buzz_db::meeting_baton::EndMeetingV1Outcome::Ended(_) => ManualEndResult::Ended,
                 buzz_db::meeting_baton::EndMeetingV1Outcome::AlreadyEnded => {
-                    ManualEndResult::AlreadyEnded
+                    ManualEndResult::AlreadyEnded(None)
                 }
                 buzz_db::meeting_baton::EndMeetingV1Outcome::ParticipantRevoked(_) => {
                     ManualEndResult::ParticipantRevoked
@@ -826,15 +901,36 @@ async fn handle_meeting_end(
             }
         }
         MeetingProtocol::ModeratedBoardV2 => {
-            return Err(IngestError::Rejected(
-                "restricted: Meeting V2 End is unavailable during stage one".into(),
-            ));
+            match buzz_db::meeting_v2::end_meeting_v2_tx(
+                &mut tx,
+                buzz_db::meeting_v2::EndMeetingV2Params {
+                    community_id: tenant.community(),
+                    session_id,
+                    actor_pubkey: &actor_pubkey,
+                    create_event_id: &create_event_id,
+                    end_event_id: event.id.as_bytes(),
+                    outcome: v2_terminal.0,
+                    reason_code: v2_terminal.1.as_deref(),
+                    relay_keys: &state.relay_keypair,
+                },
+            )
+            .await
+            .map_err(map_meeting_db_error)?
+            {
+                buzz_db::meeting_v2::EndMeetingV2Outcome::Ended(_) => ManualEndResult::Ended,
+                buzz_db::meeting_v2::EndMeetingV2Outcome::AlreadyEnded(outcome) => {
+                    ManualEndResult::AlreadyEnded(Some(outcome))
+                }
+                buzz_db::meeting_v2::EndMeetingV2Outcome::ParticipantRevoked(_) => {
+                    ManualEndResult::ParticipantRevoked
+                }
+            }
         }
     };
 
     match end_result {
         ManualEndResult::Ended => {}
-        ManualEndResult::AlreadyEnded => {
+        ManualEndResult::AlreadyEnded(terminal_outcome) => {
             tx.rollback().await.map_err(|e| {
                 IngestError::Internal(format!("error: rollback duplicate end: {e}"))
             })?;
@@ -847,6 +943,12 @@ async fn handle_meeting_end(
                         "meeting_id": session_id.to_string(),
                         "status": "ended",
                         "already_ended": true,
+                        "terminal_outcome": terminal_outcome.map(|outcome| {
+                            match outcome {
+                                buzz_db::meeting_v2::TerminalOutcome::Closed => "closed",
+                                buzz_db::meeting_v2::TerminalOutcome::Aborted => "aborted",
+                            }
+                        }),
                     })
                 ),
             });
@@ -882,6 +984,14 @@ async fn handle_meeting_end(
                 "already_ended": false,
                 "schema_version": persisted_policy.schema_version,
                 "floor_policy_version": persisted_policy.floor_policy_version,
+                "terminal_outcome": if protocol == MeetingProtocol::ModeratedBoardV2 {
+                    Some(match v2_terminal.0 {
+                        buzz_db::meeting_v2::TerminalOutcome::Closed => "closed",
+                        buzz_db::meeting_v2::TerminalOutcome::Aborted => "aborted",
+                    })
+                } else {
+                    None
+                },
             })
         ),
     })
@@ -1334,10 +1444,78 @@ fn validate_meeting_end_protocol(
             }
             Ok(())
         }
-        MeetingProtocol::ModeratedBoardV2 => Err(IngestError::Rejected(
-            "restricted: Meeting V2 End is unavailable during stage one".into(),
-        )),
+        MeetingProtocol::ModeratedBoardV2 => {
+            if require_single_tag(event, "v")? != buzz_sdk::MEETING_V2_SCHEMA_VERSION {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting V2 End must use schema version 3".into(),
+                ));
+            }
+            if require_single_tag(event, "policy")? != MEETING_V2_POLICY {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: Meeting V2 End policy must be {MEETING_V2_POLICY}"
+                )));
+            }
+            match require_single_tag(event, "outcome")?.as_str() {
+                "closed" => {
+                    validate_meeting_tag_schema(
+                        event,
+                        &["h", "v", "policy", "e", "outcome"],
+                        &[],
+                        &[],
+                    )?;
+                    if !event.content.is_empty() {
+                        return Err(IngestError::Rejected(
+                            "invalid: Meeting V2 close content must be empty".into(),
+                        ));
+                    }
+                }
+                "aborted" => {
+                    validate_meeting_tag_schema(
+                        event,
+                        &["h", "v", "policy", "e", "outcome", "reason-code"],
+                        &[],
+                        &[],
+                    )?;
+                    validate_meeting_v2_end_text(
+                        &require_single_tag(event, "reason-code")?,
+                        128,
+                        "abort reason code",
+                        false,
+                    )?;
+                    validate_meeting_v2_end_text(&event.content, 1_024, "abort reason", true)?;
+                }
+                _ => {
+                    return Err(IngestError::Rejected(
+                        "invalid: Meeting V2 End outcome must be closed or aborted".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+fn validate_meeting_v2_end_text(
+    value: &str,
+    max_bytes: usize,
+    field_name: &str,
+    allow_empty: bool,
+) -> Result<(), IngestError> {
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            Err(IngestError::Rejected(format!(
+                "invalid: Meeting V2 {field_name} is required"
+            )))
+        };
+    }
+    if value.trim() != value || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Meeting V2 {field_name} must be clean and at most {max_bytes} UTF-8 bytes"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_positive_round(event: &Event) -> Result<i64, IngestError> {
@@ -2450,7 +2628,11 @@ mod meeting_protocol_tests {
     }
 
     fn meeting_end(tags: Vec<Tag>) -> Event {
-        EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), "")
+        meeting_end_with_content(tags, "")
+    }
+
+    fn meeting_end_with_content(tags: Vec<Tag>, content: &str) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), content)
             .tags(tags)
             .sign_with_keys(&Keys::generate())
             .expect("test meeting event")
@@ -2583,6 +2765,35 @@ mod meeting_protocol_tests {
         assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::UniformV0).is_ok());
         assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::ModeratedBatonV1).is_err());
         assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::ModeratedBoardV2).is_err());
+
+        let v2_close = meeting_end(vec![
+            tag(&["h", &session]),
+            tag(&["v", "3"]),
+            tag(&["policy", MEETING_V2_POLICY]),
+            tag(&["e", &create_event_id]),
+            tag(&["outcome", "closed"]),
+        ]);
+        assert!(
+            validate_meeting_end_protocol(&v2_close, MeetingProtocol::ModeratedBoardV2).is_ok()
+        );
+        assert!(
+            validate_meeting_end_protocol(&v2_close, MeetingProtocol::ModeratedBatonV1).is_err()
+        );
+
+        let v2_abort = meeting_end_with_content(
+            vec![
+                tag(&["h", &session]),
+                tag(&["v", "3"]),
+                tag(&["policy", MEETING_V2_POLICY]),
+                tag(&["e", &create_event_id]),
+                tag(&["outcome", "aborted"]),
+                tag(&["reason-code", "goal_unreachable"]),
+            ],
+            "Required evidence is unavailable.",
+        );
+        assert!(
+            validate_meeting_end_protocol(&v2_abort, MeetingProtocol::ModeratedBoardV2).is_ok()
+        );
     }
 
     #[test]

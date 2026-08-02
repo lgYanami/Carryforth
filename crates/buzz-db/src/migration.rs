@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 38);
+        assert_eq!(migrations.len(), 39);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1065,6 +1065,16 @@ mod tests {
         assert!(meeting_v2_stage_one.contains("CREATE TABLE meeting_current_boards"));
         assert!(meeting_v2_stage_one.contains("CREATE TABLE meeting_v2_bootstrap_state"));
         assert!(meeting_v2_stage_one.contains("bootstrap_locked"));
+
+        // Meeting V2 stage two adds the Board/Floor gate, command receipts,
+        // independent Board timing, and explicit closed/aborted outcomes.
+        assert_eq!(migrations[38].version, 39);
+        let meeting_v2_stage_two = migrations[38].sql.as_str();
+        assert!(meeting_v2_stage_two.contains("CREATE TABLE meeting_v2_config"));
+        assert!(meeting_v2_stage_two.contains("board_pending"));
+        assert!(meeting_v2_stage_two.contains("floor_ready"));
+        assert!(meeting_v2_stage_two.contains("CREATE TABLE meeting_v2_board_command_receipts"));
+        assert!(meeting_v2_stage_two.contains("terminal_outcome"));
     }
 
     #[test]
@@ -1102,6 +1112,26 @@ mod tests {
             assert!(
                 schema.contains(required),
                 "schema/schema.sql must include migration 0038 object {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_schema_contains_meeting_v2_stage_two_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "CREATE TABLE meeting_v2_config",
+            "board_maintenance_ms",
+            "board_window",
+            "board_pending",
+            "floor_ready",
+            "CREATE TABLE meeting_v2_board_command_receipts",
+            "terminal_outcome",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0039 object {required}"
             );
         }
     }
@@ -1393,7 +1423,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn meeting_v2_upgrade_from_0037_preserves_v0_v1_and_adds_strict_v2_shape() {
+    async fn meeting_v2_stage_two_upgrade_preserves_v0_v1_and_stage_one_v2() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
         MIGRATOR
@@ -1472,38 +1502,10 @@ mod tests {
         .await
         .expect("seed frozen V1 participant");
 
-        run_migrations(&pool)
+        MIGRATOR
+            .run_to(38, &pool)
             .await
             .expect("upgrade Meeting schema through V2 stage one");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(38));
-        let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
-            "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
-             FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
-        )
-        .bind(community_id)
-        .fetch_all(&pool)
-        .await
-        .expect("read preserved V0/V1 Sessions");
-        assert_eq!(preserved.len(), 2);
-        assert!(preserved.iter().any(|row| {
-            row.0 == v0_session && row.1 == 1 && row.2 == "uniform-v0" && row.3.is_none()
-        }));
-        assert!(preserved.iter().any(|row| {
-            row.0 == v1_session
-                && row.1 == 2
-                && row.2 == "moderated-baton-v1"
-                && row.3.as_deref() == Some(v1_moderator.as_slice())
-        }));
-        let new_projection_rows: (i64, i64) = sqlx::query_as(
-            "SELECT \
-                 (SELECT count(*) FROM meeting_current_boards), \
-                 (SELECT count(*) FROM meeting_v2_bootstrap_state)",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count additive V2 projections");
-        assert_eq!(new_projection_rows, (0, 0));
-
         sqlx::query(
             "INSERT INTO meeting_sessions \
                  (community_id, session_id, create_event_id, host_pubkey, \
@@ -1516,7 +1518,78 @@ mod tests {
         .bind(&host)
         .execute(&pool)
         .await
-        .expect("accept creator-moderated V2 protocol shape");
+        .expect("seed stage-one V2 Session");
+        sqlx::query(
+            "INSERT INTO meeting_v2_bootstrap_state (community_id, session_id) \
+             VALUES ($1, $2)",
+        )
+        .bind(community_id)
+        .bind(v2_session)
+        .execute(&pool)
+        .await
+        .expect("seed stage-one V2 bootstrap runtime");
+        sqlx::query(
+            "INSERT INTO meeting_current_boards \
+                 (community_id, session_id, board_event_id, board_format, board_content) \
+             VALUES ($1, $2, $3, 'markdown', '# Existing stage-one Board')",
+        )
+        .bind(community_id)
+        .bind(v2_session)
+        .bind([0x87_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed stage-one V2 current Board");
+
+        run_migrations(&pool)
+            .await
+            .expect("upgrade Meeting schema through V2 stage two");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(39));
+        let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
+             FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
+        )
+        .bind(community_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read preserved V0/V1/V2 Sessions");
+        assert_eq!(preserved.len(), 3);
+        assert!(preserved.iter().any(|row| {
+            row.0 == v0_session && row.1 == 1 && row.2 == "uniform-v0" && row.3.is_none()
+        }));
+        assert!(preserved.iter().any(|row| {
+            row.0 == v1_session
+                && row.1 == 2
+                && row.2 == "moderated-baton-v1"
+                && row.3.as_deref() == Some(v1_moderator.as_slice())
+        }));
+        assert!(preserved.iter().any(|row| {
+            row.0 == v2_session
+                && row.1 == 3
+                && row.2 == "moderated-board-v1"
+                && row.3.as_deref() == Some(host.as_slice())
+        }));
+        let new_projection_rows: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM meeting_current_boards), \
+                 (SELECT count(*) FROM meeting_v2_bootstrap_state), \
+                 (SELECT count(*) FROM meeting_v2_config)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count additive V2 projections");
+        assert_eq!(new_projection_rows, (1, 1, 0));
+        let upgraded_runtime: (String, i64, i64, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT runtime_phase, control_epoch, board_window, board_deadline_at \
+                 FROM meeting_v2_bootstrap_state \
+                 WHERE community_id = $1 AND session_id = $2",
+            )
+            .bind(community_id)
+            .bind(v2_session)
+            .fetch_one(&pool)
+            .await
+            .expect("read upgraded stage-one V2 runtime");
+        assert_eq!(upgraded_runtime, ("bootstrap_locked".into(), 1, 0, None));
         let invalid = sqlx::query(
             "INSERT INTO meeting_sessions \
                  (community_id, session_id, create_event_id, host_pubkey, \
@@ -1575,8 +1648,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0038");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(38));
+            .expect("upgrade scratch database through 0039");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(39));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1708,7 +1781,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(38));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(39));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version IN (25, 26, 27, 28, 29, 30, 31) AND success",
@@ -1796,7 +1869,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(38));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(39));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # Meeting V2 后端分阶段实现计划
 
-> 状态：阶段一已完成；阶段二待设计
+> 状态：阶段一、阶段二已完成；下一阶段为普通参会 Agent
 >
 > 产品语义基线：
 > [Meeting V2：主持人维护的共享会议看板](./meeting-v2.md)
@@ -950,7 +950,7 @@ V1，也不能跳过 Board gate。
 | 阶段 | 状态 | 主要交付证据 |
 |---|---|---|
 | 1. 协议、当前看板与 CLI 基础 | 已完成（2026-08-02） | wire/data 细化设计、migration 0038、SDK fixture、CLI 当前看板链路、真实 Relay E2E |
-| 2. Relay 权威主持控制周期与终态 | 未开始 | CLI-only 生命周期、双 deadline、竞态与恢复测试 |
+| 2. Relay 权威主持控制周期与终态 | 已完成（2026-08-02） | CLI-only 生命周期、双 deadline、竞态、重启与恢复测试 |
 | 3. 普通参会 Agent | 未开始 | Intent/Grant 按需看板注入、read failure 和无订阅测试 |
 | 4. 主持 Agent | 未开始 | Board/Floor 双 Turn、Human preemption、全 Agent 闭会证据 |
 | 5. 后端综合验收与发布准备 | 未开始 | 专项 gate、真实 qualification、运维与发布候选 |
@@ -988,6 +988,44 @@ cargo fmt --all -- --check
 开关仍须保持关闭，仅可在可丢弃的隔离测试环境中临时开启。Board Maintenance、Floor、
 speech、close/abort、恢复及 ACP Turn 必须等阶段二及后续阶段交付。
 
+### 14.2 阶段二交付记录（2026-08-02）
+
+阶段二已经冻结并实现：
+
+- kind `42111` 主持人 Board Maintenance command，以及 `update|unchanged`、
+  `expected-control-epoch` 和 `board-window` fencing；
+- migration `0039_meeting_v2_stage2.sql` 中的 V2 冻结 timing、Board runtime、command
+  receipt 与 `closed|aborted` 终态分类；
+- V2 对 V1 Baton 的协议隔离复用，包括 Intent、Human Request、Offer、Grant、speech、
+  Yield、Recall、fallback 和 Directed Handoff；
+- `board_pending → floor_ready` 权威 gate，Board timeout 与 Floor Decision 各自取得完整且
+  独立的数据库 deadline；
+- Human Request 抢占 Board、Directed Handoff 跳过 Board、Control return 重开 Board，以及
+  迟到和重复命令收敛；
+- Board 更新正文的 pull-only 单投影替换，不进入 Meeting outbox、State 正文或 speech
+  timeline；初始正文仍按阶段一 wire 包含在 Create；
+- 主持人 normal close、主持人/Community operator abort，以及重复终止返回已持久化真实结果；
+- CLI Board update/unchanged、完整 V2 Baton 操作、close/abort 和终态查询；
+- 关闭 V1/V2 Create gate 并重启 Relay 后，已有 Session 仍可继续 Board/Floor 并结束。
+
+协议、状态、并发与错误语义见
+[阶段二权威控制周期与终态设计](./meeting-v2-stage2-design.md)。自动化证据覆盖 SDK wire
+fixture、阶段一 V2 lazy upgrade、Board update/unchanged/timeout、双 deadline、Human 抢占、
+Directed Handoff、正常 close、operator abort、终态幂等、pull-only Board、真实 CLI 多身份
+生命周期、Relay 重启、关闭新建、撤权和 V0/V1 回归。
+
+阶段交付时通过以下可复现门禁：
+
+```bash
+./scripts/run-meeting-backend-tests.sh
+cargo clippy -p buzz-core -p buzz-sdk -p buzz-db -p buzz-relay -p buzz-cli -p buzz-acp -p buzz-test-client --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+阶段二完成的是不依赖 ACP 的完整后端生命周期。V2 Create 默认开关仍保持关闭；普通参会
+Agent 的按需看板注入属于阶段三，ACP Agent 主持人的 Board/Floor 双 Turn 属于阶段四，
+前端仍不在本计划范围内。
+
 ## 15. 后端完成定义
 
 Meeting V2 后端完成需要同时满足：
@@ -1019,16 +1057,9 @@ Meeting V2 后端完成需要同时满足：
 
 ## 16. 留到后续阶段开发时讨论的细节
 
-阶段一的 wire schema、kind、初始看板 envelope、当前看板表和最小 CLI 已由阶段一设计冻结。
-为避免本计划过早固化后续实现，以下问题只在对应阶段开始时决定：
+阶段一、阶段二的 wire、持久状态、Board/Floor gate、终态和 CLI 契约已经由对应阶段设计
+冻结。为避免本计划过早固化后续实现，以下问题只在对应阶段开始时决定：
 
-- Board update、Floor 和终态需要新增或复用哪些 Meeting kind；
-- 后续 action 的 tag、content 和错误码完整形状；
-- Board gate 和 terminal outcome 的具体表结构；
-- 内部 event ID、receipt、control epoch 和 attempt 如何组合 fencing；
-- Board Maintenance 的具体 deadline 和重试次数；
-- sweeper SQL、锁顺序和 State effect shape；
-- 阶段二以后新增 CLI 子命令和文件输入格式；
 - ACP Prompt 全文、context budget 和模型输出 schema；
 - ACP Turn capacity、抢占和 safety margin 的精确策略；
 - metric 名称、告警阈值和 acceptance artifact 格式；

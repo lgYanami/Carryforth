@@ -125,6 +125,10 @@ export BUZZ_TEST_DATABASE_URL="${DATABASE_URL}"
 echo "Running Postgres-backed Meeting state-machine contracts serially..."
 cargo test -p buzz-db --lib meeting -- --ignored --test-threads=1 --nocapture
 
+echo "Building the real agent-facing CLI for Meeting V2 lifecycle coverage..."
+cargo build -p buzz-cli
+export MEETING_E2E_BUZZ_BIN="${REPO_ROOT}/target/debug/buzz"
+
 export PGDATABASE="${MEETING_RELAY_DB}"
 export DATABASE_URL="postgres://buzz:buzz_dev@localhost:5432/${MEETING_RELAY_DB}"
 export BUZZ_TEST_PGDATABASE="${MEETING_RELAY_DB}"
@@ -147,21 +151,22 @@ cargo test -p buzz-test-client --test e2e_meeting_baton -- \
   --skip relay_member_removal_disconnects_live_meeting_reader_and_blocks_reentry \
   --nocapture
 
-echo "Creating a Meeting V1 fixture before closing the rollout gate..."
+echo "Creating Meeting V1/V2 fixtures before closing the rollout gates..."
 cargo test -p buzz-test-client --test e2e_meeting_rollout \
   create_rollout_fixture_before_gate_closes -- \
   --ignored \
   --test-threads=1 \
   --nocapture
 
-echo "Restarting Relay with Meeting V1 creation disabled..."
+echo "Restarting Relay with Meeting V1/V2 creation disabled..."
 stop_relay
 BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
   BUZZ_MEETING_V1_CREATE_ENABLED=false \
+  BUZZ_MEETING_V2_CREATE_ENABLED=false \
   "${SCRIPT_DIR}/start-relay-for-tests.sh" --no-build --no-schema
 
 cargo test -p buzz-test-client --test e2e_meeting_rollout \
-  existing_v1_survives_closed_gate_and_v0_still_works -- \
+  existing_v1_and_v2_survive_closed_gates_and_v0_still_works -- \
   --ignored \
   --test-threads=1 \
   --nocapture

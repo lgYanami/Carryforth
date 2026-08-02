@@ -1,4 +1,4 @@
-//! Strict Meeting V1 moderated-baton command ingestion.
+//! Strict moderated-baton Meeting command ingestion for V1 and V2.
 //!
 //! Wire parsing belongs at the Relay boundary. The database receives a closed,
 //! typed command and remains authoritative for participant roles, revisions,
@@ -18,6 +18,7 @@ use buzz_db::meeting_baton::{
     BatonCommand, BatonCommandOutcome, BatonCommandTxParams, BatonDecisionAttemptFinishOutcome,
     BatonHandoffInput, BatonIntentDeferral, BatonProgressStage, BatonSelectionSource,
 };
+use buzz_db::meeting_v2::{BoardAction, BoardActionOutcome, BoardActionTxParams};
 use buzz_db::DbError;
 use nostr::Event;
 use serde::Deserialize;
@@ -31,7 +32,6 @@ use super::command_executor::{
 };
 use super::ingest::{IngestAuth, IngestError, IngestResult};
 
-const V1_SCHEMA_VERSION: &str = "2";
 const MAX_INTENT_SUMMARY_BYTES: usize = 512;
 const MAX_SELECTION_REASON_BYTES: usize = 512;
 const MAX_CONTROL_REASON_BYTES: usize = 1_024;
@@ -77,7 +77,7 @@ const ATTEMPT_DISCARDED_REASON_CODES: &[&str] = &[
     "runtime_replaced",
 ];
 
-/// Parse and execute one participant-authored Meeting V1 control command.
+/// Parse and execute one participant-authored moderated control command.
 pub(crate) async fn handle_command(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -88,13 +88,188 @@ pub(crate) async fn handle_command(
     // parsing can disclose protocol details (for example which action tags are
     // required), so non-participants must be rejected before that validation.
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
-    authorize_participant_command(tenant, state, session_id, auth).await?;
-    let (parsed_session_id, command) = parse_control_command(event)?;
+    let protocol = authorize_participant_command(tenant, state, session_id, auth).await?;
+    let (parsed_session_id, command) = parse_control_command(event, protocol)?;
     debug_assert_eq!(parsed_session_id, session_id);
     execute(tenant, state, session_id, event, command).await
 }
 
-/// Parse and execute one Grant-bound Meeting V1 canonical speech.
+/// Parse and execute one moderator-authored Meeting V2 Board Maintenance result.
+///
+/// Board commands are receipt-backed commands rather than durable Meeting
+/// history. The database atomically replaces the pull-only current Board,
+/// completes the Board window, and emits the next canonical State.
+pub(crate) async fn handle_board_action(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    let protocol = authorize_participant_command(tenant, state, session_id, auth).await?;
+    if protocol != MeetingProtocol::ModeratedBoardV2 {
+        return Err(IngestError::Rejected(
+            "invalid: Board Maintenance command targets a non-V2 Meeting".into(),
+        ));
+    }
+    let (parsed_session_id, expected_control_epoch, board_window, action) =
+        parse_board_action(event)?;
+    debug_assert_eq!(parsed_session_id, session_id);
+    let commit = buzz_db::meeting_v2::execute_board_action(
+        &state.db,
+        BoardActionTxParams {
+            community_id: tenant.community(),
+            session_id,
+            event,
+            relay_keys: &state.relay_keypair,
+            expected_control_epoch,
+            board_window,
+            action,
+        },
+    )
+    .await
+    .map_err(map_baton_db_error)?;
+    let recovery = usize::from(commit.recovery_transition.is_some());
+    match commit.outcome {
+        BoardActionOutcome::Accepted {
+            state_revision,
+            board_event_id,
+        } => Ok(board_success_result(
+            event,
+            session_id,
+            false,
+            "accepted",
+            Some(state_revision),
+            Some(&board_event_id),
+            recovery,
+        )),
+        BoardActionOutcome::Duplicate {
+            accepted: true,
+            outcome_code,
+            state_revision,
+            board_event_id,
+            ..
+        } => Ok(board_success_result(
+            event,
+            session_id,
+            true,
+            &outcome_code,
+            state_revision,
+            board_event_id.as_deref(),
+            recovery,
+        )),
+        BoardActionOutcome::Duplicate {
+            accepted: false,
+            outcome_class,
+            outcome_code,
+            ..
+        } => Err(board_rejection(
+            if outcome_class == "rejected_after_recovery" {
+                "expired"
+            } else {
+                "conflict"
+            },
+            &outcome_code,
+            recovery,
+        )),
+        BoardActionOutcome::Rejected {
+            code,
+            after_recovery,
+        } => Err(board_rejection(
+            if after_recovery {
+                "expired"
+            } else {
+                "conflict"
+            },
+            &code,
+            recovery,
+        )),
+    }
+}
+
+fn parse_board_action(event: &Event) -> Result<(Uuid, i64, i64, BoardAction), IngestError> {
+    validate_meeting_tag_schema(
+        event,
+        &[
+            "h",
+            "v",
+            "policy",
+            "action",
+            "expected-control-epoch",
+            "board-window",
+        ],
+        &[],
+        &[],
+    )?;
+    if require_single_tag(event, "v")? != buzz_sdk::MEETING_V2_SCHEMA_VERSION {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting V2 Board command must use schema version 3".into(),
+        ));
+    }
+    if require_single_tag(event, "policy")? != buzz_sdk::MEETING_V2_POLICY {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Meeting V2 Board command policy must be {}",
+            buzz_sdk::MEETING_V2_POLICY
+        )));
+    }
+    let action = match require_single_tag(event, "action")?.as_str() {
+        "update" => BoardAction::Update(
+            buzz_sdk::parse_meeting_v2_board_content(&event.content)
+                .map_err(|error| IngestError::Rejected(error.to_string()))?,
+        ),
+        "unchanged" => {
+            require_empty_content(event, "Meeting V2 Board unchanged")?;
+            BoardAction::Unchanged
+        }
+        _ => {
+            return Err(IngestError::Rejected(
+                "invalid: Meeting V2 Board action must be update or unchanged".into(),
+            ));
+        }
+    };
+    let expected_control_epoch = parse_positive_i64_tag(event, "expected-control-epoch")?;
+    let board_window = parse_positive_i64_tag(event, "board-window")?;
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    Ok((session_id, expected_control_epoch, board_window, action))
+}
+
+fn board_success_result(
+    event: &Event,
+    session_id: Uuid,
+    duplicate: bool,
+    outcome: &str,
+    state_revision: Option<i64>,
+    board_event_id: Option<&[u8]>,
+    recovery_count: usize,
+) -> IngestResult {
+    IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "meeting_id": session_id,
+                "outcome": outcome,
+                "duplicate": duplicate,
+                "state_revision": state_revision,
+                "board_event_id": board_event_id.map(hex::encode),
+                "recovery_transitions": recovery_count,
+            })
+        ),
+    }
+}
+
+fn board_rejection(prefix: &str, code: &str, recovery_count: usize) -> IngestError {
+    IngestError::Rejected(format!(
+        "{prefix}: {}",
+        serde_json::json!({
+            "code": code,
+            "recovery_transitions": recovery_count,
+        })
+    ))
+}
+
+/// Parse and execute one Grant-bound moderated Meeting canonical speech.
 ///
 /// The ordinary ingest path has already enforced channel token scope,
 /// membership, archival state, and message-size limits before reaching here.
@@ -102,8 +277,9 @@ pub(crate) async fn handle_speech(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
+    protocol: MeetingProtocol,
 ) -> Result<IngestResult, IngestError> {
-    let (session_id, command) = parse_speech(event)?;
+    let (session_id, command) = parse_speech(event, protocol)?;
     execute(tenant, state, session_id, event, command).await
 }
 
@@ -112,7 +288,7 @@ async fn authorize_participant_command(
     state: &Arc<AppState>,
     session_id: Uuid,
     auth: &IngestAuth,
-) -> Result<(), IngestError> {
+) -> Result<MeetingProtocol, IngestError> {
     if auth
         .channel_ids()
         .is_some_and(|ids| !ids.contains(&session_id))
@@ -138,11 +314,14 @@ async fn authorize_participant_command(
     let persisted = buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
         .await
         .map_err(map_meeting_db_error)?;
-    if MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?
-        != MeetingProtocol::ModeratedBatonV1
-    {
+    let protocol =
+        MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
+    if !matches!(
+        protocol,
+        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2
+    ) {
         return Err(IngestError::Rejected(
-            "invalid: Meeting V1 command targets a non-V1 session".into(),
+            "invalid: moderated Baton command targets an unsupported Session".into(),
         ));
     }
     let restriction = state
@@ -151,7 +330,7 @@ async fn authorize_participant_command(
         .await
         .map_err(|error| {
             IngestError::Internal(format!(
-                "error: checking Meeting V1 author restriction state: {error}"
+                "error: checking moderated Meeting author restriction state: {error}"
             ))
         })?;
     if restriction.banned {
@@ -167,7 +346,7 @@ async fn authorize_participant_command(
             "restricted: you are timed out from writing".into(),
         ));
     }
-    Ok(())
+    Ok(protocol)
 }
 
 async fn execute(
@@ -375,7 +554,7 @@ fn record_command_metrics(
 fn map_baton_db_error(error: DbError) -> IngestError {
     match error {
         DbError::AccessDenied(_) => IngestError::AuthFailed(
-            "restricted: not authorized for this Meeting V1 operation".into(),
+            "restricted: not authorized for this moderated Meeting operation".into(),
         ),
         other => map_meeting_db_error(other),
     }
@@ -423,20 +602,26 @@ fn command_rejection(
     IngestError::Rejected(format!("{prefix}: {details}"))
 }
 
-fn parse_control_command(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_control_command(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     match event.kind.as_u16() as u32 {
-        KIND_MEETING_SPEECH_INTENT => parse_intent(event),
-        KIND_MEETING_MODERATOR_COMMAND => parse_moderator_command(event),
-        KIND_MEETING_HUMAN_FLOOR_REQUEST => parse_human_request(event),
-        KIND_MEETING_OFFER_RESPONSE => parse_offer_response(event),
-        KIND_MEETING_GRANT_SIGNAL => parse_grant_signal(event),
+        KIND_MEETING_SPEECH_INTENT => parse_intent(event, protocol),
+        KIND_MEETING_MODERATOR_COMMAND => parse_moderator_command(event, protocol),
+        KIND_MEETING_HUMAN_FLOOR_REQUEST => parse_human_request(event, protocol),
+        KIND_MEETING_OFFER_RESPONSE => parse_offer_response(event, protocol),
+        KIND_MEETING_GRANT_SIGNAL => parse_grant_signal(event, protocol),
         kind => Err(IngestError::Rejected(format!(
-            "invalid: kind {kind} is not a Meeting V1 baton command"
+            "invalid: kind {kind} is not a moderated Meeting baton command"
         ))),
     }
 }
 
-fn parse_intent(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_intent(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     let action = require_single_tag(event, "action")?;
     let command = match action.as_str() {
         "submit" => {
@@ -488,10 +673,13 @@ fn parse_intent(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
             ));
         }
     };
-    Ok((parse_v1_session(event)?, command))
+    Ok((parse_baton_session(event, protocol)?, command))
 }
 
-fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_moderator_command(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     let action = require_single_tag(event, "action")?;
     let command = match action.as_str() {
         "select" => parse_moderator_select(event)?,
@@ -724,7 +912,7 @@ fn parse_moderator_command(event: &Event) -> Result<(Uuid, BatonCommand), Ingest
             ));
         }
     };
-    Ok((parse_v1_session(event)?, command))
+    Ok((parse_baton_session(event, protocol)?, command))
 }
 
 fn parse_moderator_select(event: &Event) -> Result<BatonCommand, IngestError> {
@@ -823,7 +1011,10 @@ fn parse_moderator_select(event: &Event) -> Result<BatonCommand, IngestError> {
     })
 }
 
-fn parse_human_request(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_human_request(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     let action = require_single_tag(event, "action")?;
     let command = match action.as_str() {
         "request" => {
@@ -844,10 +1035,13 @@ fn parse_human_request(event: &Event) -> Result<(Uuid, BatonCommand), IngestErro
             ));
         }
     };
-    Ok((parse_v1_session(event)?, command))
+    Ok((parse_baton_session(event, protocol)?, command))
 }
 
-fn parse_offer_response(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_offer_response(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     validate_meeting_tag_schema(event, &["h", "v", "action", "meeting-offer"], &[], &[])?;
     let offer_id = event_id_tag(event, "meeting-offer")?;
     let command = match require_single_tag(event, "action")?.as_str() {
@@ -869,10 +1063,13 @@ fn parse_offer_response(event: &Event) -> Result<(Uuid, BatonCommand), IngestErr
             ));
         }
     };
-    Ok((parse_v1_session(event)?, command))
+    Ok((parse_baton_session(event, protocol)?, command))
 }
 
-fn parse_grant_signal(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_grant_signal(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     let action = require_single_tag(event, "action")?;
     let command = match action.as_str() {
         "progress" => {
@@ -913,10 +1110,13 @@ fn parse_grant_signal(event: &Event) -> Result<(Uuid, BatonCommand), IngestError
             ));
         }
     };
-    Ok((parse_v1_session(event)?, command))
+    Ok((parse_baton_session(event, protocol)?, command))
 }
 
-fn parse_speech(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
+fn parse_speech(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, BatonCommand), IngestError> {
     validate_meeting_tag_schema(
         event,
         &["h", "v", "meeting-grant", "speech-revision"],
@@ -957,7 +1157,7 @@ fn parse_speech(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
         }
     };
     Ok((
-        parse_v1_session(event)?,
+        parse_baton_session(event, protocol)?,
         BatonCommand::Speech {
             grant_id: event_id_tag(event, "meeting-grant")?,
             speech_revision: parse_positive_i64_tag(event, "speech-revision")?,
@@ -966,16 +1166,25 @@ fn parse_speech(event: &Event) -> Result<(Uuid, BatonCommand), IngestError> {
     ))
 }
 
-fn parse_v1_session(event: &Event) -> Result<Uuid, IngestError> {
-    if require_single_tag(event, "v")? != V1_SCHEMA_VERSION {
+fn parse_baton_session(event: &Event, protocol: MeetingProtocol) -> Result<Uuid, IngestError> {
+    let expected_version = match protocol {
+        MeetingProtocol::ModeratedBatonV1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
+        MeetingProtocol::ModeratedBoardV2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+        MeetingProtocol::UniformV0 => {
+            return Err(IngestError::Rejected(
+                "invalid: uniform Meeting does not accept Baton commands".into(),
+            ));
+        }
+    };
+    if require_single_tag(event, "v")? != expected_version {
         return Err(IngestError::Rejected(
-            "invalid: Meeting V1 command must use v=2".into(),
+            "invalid: Meeting Baton command schema does not match the persisted Session".into(),
         ));
     }
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
     if session_id.is_nil() {
         return Err(IngestError::Rejected(
-            "invalid: Meeting V1 session id must not be nil".into(),
+            "invalid: Meeting Baton session id must not be nil".into(),
         ));
     }
     Ok(session_id)
@@ -1265,7 +1474,8 @@ mod tests {
         let mut tags = common(session_id, "submit");
         tags.push(Tag::parse(["basis-speech-revision", "0"]).expect("basis"));
         let event = signed(KIND_MEETING_SPEECH_INTENT, "I have evidence", tags);
-        let (parsed_session, command) = parse_control_command(&event).expect("parse");
+        let (parsed_session, command) =
+            parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).expect("parse");
         assert_eq!(parsed_session, session_id);
         assert!(matches!(
             command,
@@ -1273,6 +1483,56 @@ mod tests {
                 basis_speech_revision: 0,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn v2_intent_and_board_actions_parse_with_v2_identity() {
+        let session_id = Uuid::new_v4();
+        let intent =
+            buzz_sdk::build_meeting_v2_intent_submit(buzz_sdk::MeetingV1IntentSubmitParams {
+                session_id,
+                basis_speech_revision: 0,
+                addressed_to: None,
+                summary: "I have V2 evidence",
+            })
+            .expect("build V2 Intent")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign V2 Intent");
+        assert!(matches!(
+            parse_control_command(&intent, MeetingProtocol::ModeratedBoardV2),
+            Ok((parsed, BatonCommand::IntentSubmit { .. })) if parsed == session_id
+        ));
+        assert!(parse_control_command(&intent, MeetingProtocol::ModeratedBatonV1).is_err());
+
+        let update =
+            buzz_sdk::build_meeting_v2_board_action(buzz_sdk::MeetingV2BoardActionParams {
+                session_id,
+                expected_control_epoch: 3,
+                board_window: 2,
+                board: Some("# Goal\nShip safely."),
+            })
+            .expect("build Board update")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign Board update");
+        assert!(matches!(
+            parse_board_action(&update),
+            Ok((parsed, 3, 2, BoardAction::Update(_))) if parsed == session_id
+        ));
+
+        let unchanged =
+            buzz_sdk::build_meeting_v2_board_action(buzz_sdk::MeetingV2BoardActionParams {
+                session_id,
+                expected_control_epoch: 3,
+                board_window: 2,
+                board: None,
+            })
+            .expect("build Board unchanged")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign Board unchanged");
+        assert!(matches!(
+            parse_board_action(&unchanged),
+            Ok((parsed, 3, 2, BoardAction::Unchanged)) if parsed == session_id
         ));
     }
 
@@ -1468,8 +1728,8 @@ mod tests {
                 .expect("valid SDK builder")
                 .sign_with_keys(&keys)
                 .expect("sign SDK event");
-            let (_, command) =
-                parse_control_command(&event).expect("Relay must accept SDK command");
+            let (_, command) = parse_control_command(&event, MeetingProtocol::ModeratedBatonV1)
+                .expect("Relay must accept SDK command");
             assert_eq!(command_metric_action(&command), expected_action);
         }
 
@@ -1488,7 +1748,8 @@ mod tests {
         .expect("valid SDK speech")
         .sign_with_keys(&keys)
         .expect("sign SDK speech");
-        let (_, command) = parse_speech(&speech).expect("Relay must accept SDK speech");
+        let (_, command) = parse_speech(&speech, MeetingProtocol::ModeratedBatonV1)
+            .expect("Relay must accept SDK speech");
         assert_eq!(command_metric_action(&command), "speech");
     }
 
@@ -1604,7 +1865,7 @@ mod tests {
             tags.push(Tag::parse([name, value]).expect("revision"));
         }
         let event = signed(KIND_MEETING_MODERATOR_COMMAND, r#"{"deferrals":[]}"#, tags);
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1621,7 +1882,7 @@ mod tests {
             tags.push(Tag::parse([name, value]).expect("revision"));
         }
         let event = signed(KIND_MEETING_MODERATOR_COMMAND, r#"{"deferrals":[]}"#, tags);
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1649,7 +1910,7 @@ mod tests {
         })
         .to_string();
         let event = signed(KIND_MEETING_MODERATOR_COMMAND, &self_deferral, intent_tags);
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
 
         let mut handoff_tags = common(session_id, "select");
         handoff_tags.extend([
@@ -1677,7 +1938,7 @@ mod tests {
             &handoff_deferral,
             handoff_tags,
         );
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1685,7 +1946,7 @@ mod tests {
         let mut tags = common(Uuid::nil(), "submit");
         tags.push(Tag::parse(["basis-speech-revision", "0"]).expect("basis"));
         let event = signed(KIND_MEETING_SPEECH_INTENT, "I have evidence", tags);
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1699,7 +1960,7 @@ mod tests {
             Tag::parse(["stage", "planning"]).expect("old stage"),
         ]);
         let event = signed(KIND_MEETING_GRANT_SIGNAL, "", tags);
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1716,7 +1977,7 @@ mod tests {
                 Tag::parse(["handoff-to", &"33".repeat(32)]).expect("target"),
             ],
         );
-        assert!(parse_speech(&event).is_err());
+        assert!(parse_speech(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1738,7 +1999,7 @@ mod tests {
             Tag::parse(["p", &duplicate.to_ascii_uppercase()]).expect("duplicate mention"),
         ]);
         let event = signed(9, "Speech", duplicate_tags);
-        assert!(parse_speech(&event).is_err());
+        assert!(parse_speech(&event, MeetingProtocol::ModeratedBatonV1).is_err());
 
         let mut excessive_tags = base_tags();
         for index in 1..=(MAX_MEETING_PARTICIPANTS + 1) {
@@ -1746,7 +2007,7 @@ mod tests {
             excessive_tags.push(Tag::parse(["p", mention.as_str()]).expect("mention"));
         }
         let event = signed(9, "Speech", excessive_tags);
-        assert!(parse_speech(&event).is_err());
+        assert!(parse_speech(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 
     #[test]
@@ -1758,6 +2019,6 @@ mod tests {
             Tag::parse(["reason-code", "anything"]).expect("reason code"),
         ]);
         let event = signed(KIND_MEETING_GRANT_SIGNAL, "", tags);
-        assert!(parse_control_command(&event).is_err());
+        assert!(parse_control_command(&event, MeetingProtocol::ModeratedBatonV1).is_err());
     }
 }

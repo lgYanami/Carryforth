@@ -10,12 +10,13 @@ use buzz_core::{
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
-        KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST,
-        KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT,
-        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
-        KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_MEETING_BOARD_COMMAND, KIND_MEETING_CREATE, KIND_MEETING_END,
+        KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL, KIND_MEETING_GRANT_SIGNAL,
+        KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND,
+        KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT, KIND_MODERATION_BAN,
+        KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+        KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -72,6 +73,50 @@ pub struct MeetingV2CreateParams<'a> {
     pub participant_pubkeys: &'a [&'a str],
     /// Complete initial Markdown board body.
     pub initial_board: &'a str,
+}
+
+/// Inputs for a Meeting V2 Board Maintenance command.
+pub struct MeetingV2BoardActionParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current Control Token epoch observed in Relay State.
+    pub expected_control_epoch: u64,
+    /// Current internal Board window fencing token observed in Relay State.
+    pub board_window: u64,
+    /// Complete replacement Markdown body for `update`; `None` means `unchanged`.
+    pub board: Option<&'a str>,
+}
+
+/// Product outcome carried by a Meeting V2 End command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV2EndOutcome {
+    /// The moderator declares the goal reached with an effective conclusion.
+    Closed,
+    /// The moderator or an authorized operator terminates without success.
+    Aborted,
+}
+
+impl MeetingV2EndOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// Inputs for a Meeting V2 close or abort command.
+pub struct MeetingV2EndParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Event ID of the corresponding V2 Create command.
+    pub create_event_id: &'a str,
+    /// Successful close or abnormal abort.
+    pub outcome: MeetingV2EndOutcome,
+    /// Required closed reason for abort; absent for close.
+    pub reason_code: Option<&'a str>,
+    /// Optional short explanation for abort; absent for close.
+    pub reason: Option<&'a str>,
 }
 
 /// Inputs for a strict Meeting V1 Create command.
@@ -655,11 +700,15 @@ fn check_meeting_v1_i32(value: u64, field: &str) -> Result<(), SdkError> {
     Ok(())
 }
 
-fn meeting_v1_command_tags(session_id: Uuid, action: &str) -> Result<Vec<Tag>, SdkError> {
+fn meeting_command_tags(
+    session_id: Uuid,
+    schema_version: &str,
+    action: &str,
+) -> Result<Vec<Tag>, SdkError> {
     check_meeting_v1_session(session_id)?;
     Ok(vec![
         tag(&["h", &session_id.to_string()])?,
-        tag(&["v", MEETING_V1_SCHEMA_VERSION])?,
+        tag(&["v", schema_version])?,
         tag(&["action", action])?,
     ])
 }
@@ -2426,6 +2475,77 @@ pub fn validate_meeting_v2_board_content(board: &MeetingV2BoardContent) -> Resul
     Ok(())
 }
 
+/// Build a strict Meeting V2 Board update or unchanged command (kind 42111).
+pub fn build_meeting_v2_board_action(
+    params: MeetingV2BoardActionParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_session(params.session_id)?;
+    if params.expected_control_epoch == 0 || params.board_window == 0 {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 Board fencing values must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.expected_control_epoch, "expected control epoch")?;
+    check_meeting_v1_i64(params.board_window, "Board window")?;
+    let (action, content) = if let Some(body) = params.board {
+        let board = MeetingV2BoardContent {
+            format: MEETING_V2_BOARD_FORMAT.to_string(),
+            body: body.to_string(),
+        };
+        validate_meeting_v2_board_content(&board)?;
+        let content = serde_json::to_string(&board).map_err(|error| {
+            SdkError::InvalidInput(format!("serialize Meeting V2 board update: {error}"))
+        })?;
+        ("update", content)
+    } else {
+        ("unchanged", String::new())
+    };
+    let tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V2_POLICY])?,
+        tag(&["action", action])?,
+        tag(&[
+            "expected-control-epoch",
+            &params.expected_control_epoch.to_string(),
+        ])?,
+        tag(&["board-window", &params.board_window.to_string()])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_BOARD_COMMAND as u16), content).tags(tags))
+}
+
+/// Build a strict Meeting V2 normal close or abnormal abort (kind 42101).
+pub fn build_meeting_v2_end(params: MeetingV2EndParams<'_>) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_session(params.session_id)?;
+    let create_event_id = check_hex_exact(params.create_event_id, 64, "meeting create event id")?;
+    let reason = check_meeting_v1_optional_text(params.reason, "Meeting V2 abort reason", 1024)?;
+    let mut tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V2_POLICY])?,
+        tag(&["e", &create_event_id])?,
+        tag(&["outcome", params.outcome.as_str()])?,
+    ];
+    match params.outcome {
+        MeetingV2EndOutcome::Closed => {
+            if params.reason_code.is_some() || reason.is_some() {
+                return Err(SdkError::InvalidInput(
+                    "Meeting V2 close cannot carry an abort reason".into(),
+                ));
+            }
+        }
+        MeetingV2EndOutcome::Aborted => {
+            let reason_code = params.reason_code.ok_or_else(|| {
+                SdkError::InvalidInput("Meeting V2 abort requires a reason code".into())
+            })?;
+            let reason_code =
+                check_meeting_v1_text(reason_code, "Meeting V2 abort reason code", 128)?;
+            tags.push(tag(&["reason-code", reason_code])?);
+        }
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), reason.unwrap_or("")).tags(tags))
+}
+
 /// Build a strict manual Meeting V1 end command (kind 42101).
 ///
 /// The reason is fixed to `manual`; Relay-authored security termination uses a
@@ -2451,9 +2571,23 @@ pub fn build_meeting_v1_end(params: MeetingV1EndParams<'_>) -> Result<EventBuild
 pub fn build_meeting_v1_intent_submit(
     params: MeetingV1IntentSubmitParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_intent_submit(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 speech-intent Submit command (kind 42105).
+pub fn build_meeting_v2_intent_submit(
+    params: MeetingV1IntentSubmitParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_intent_submit(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_intent_submit(
+    params: MeetingV1IntentSubmitParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     check_meeting_v1_i64(params.basis_speech_revision, "basis speech revision")?;
     let summary = check_meeting_v1_text(params.summary, "meeting intent summary", 512)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "submit")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "submit")?;
     tags.push(tag(&[
         "basis-speech-revision",
         &params.basis_speech_revision.to_string(),
@@ -2469,12 +2603,26 @@ pub fn build_meeting_v1_intent_submit(
 pub fn build_meeting_v1_intent_refresh(
     params: MeetingV1IntentRefreshParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_intent_refresh(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 speech-intent Refresh command (kind 42105).
+pub fn build_meeting_v2_intent_refresh(
+    params: MeetingV1IntentRefreshParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_intent_refresh(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_intent_refresh(
+    params: MeetingV1IntentRefreshParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     check_meeting_v1_i64(params.basis_speech_revision, "basis speech revision")?;
     let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
     let previous_event_id =
         check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
     let summary = check_meeting_v1_text(params.summary, "meeting intent summary", 512)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "refresh")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "refresh")?;
     tags.push(tag(&["intent", &intent_id])?);
     tags.push(tag(&["prev", &previous_event_id])?);
     tags.push(tag(&[
@@ -2492,10 +2640,24 @@ pub fn build_meeting_v1_intent_refresh(
 pub fn build_meeting_v1_intent_withdraw(
     params: MeetingV1IntentWithdrawParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_intent_withdraw(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 speech-intent Withdraw command (kind 42105).
+pub fn build_meeting_v2_intent_withdraw(
+    params: MeetingV1IntentWithdrawParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_intent_withdraw(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_intent_withdraw(
+    params: MeetingV1IntentWithdrawParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
     let previous_event_id =
         check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "withdraw")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "withdraw")?;
     tags.push(tag(&["intent", &intent_id])?);
     tags.push(tag(&["prev", &previous_event_id])?);
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_SPEECH_INTENT as u16), "").tags(tags))
@@ -2504,6 +2666,20 @@ pub fn build_meeting_v1_intent_withdraw(
 /// Build a Meeting V1 moderator Select command (kind 42106).
 pub fn build_meeting_v1_moderator_select(
     params: MeetingV1ModeratorSelectParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_select(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator Select command (kind 42106).
+pub fn build_meeting_v2_moderator_select(
+    params: MeetingV1ModeratorSelectParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_select(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_moderator_select(
+    params: MeetingV1ModeratorSelectParams<'_>,
+    schema_version: &str,
 ) -> Result<EventBuilder, SdkError> {
     if params.expected_control_epoch == 0 {
         return Err(SdkError::InvalidInput(
@@ -2525,7 +2701,7 @@ pub fn build_meeting_v1_moderator_select(
             "meeting Select cannot defer more than 12 intents".into(),
         ));
     }
-    let mut tags = meeting_v1_command_tags(params.session_id, "select")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "select")?;
     let selected_intent_id = match params.selection {
         MeetingV1Selection::Intent { intent_id } => {
             let intent_id = check_hex_exact(intent_id, 64, "meeting intent id")?;
@@ -2636,12 +2812,26 @@ pub fn build_meeting_v1_moderator_select(
 pub fn build_meeting_v1_moderator_reject(
     params: MeetingV1ModeratorRejectParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_reject(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator Reject command (kind 42106).
+pub fn build_meeting_v2_moderator_reject(
+    params: MeetingV1ModeratorRejectParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_reject(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_moderator_reject(
+    params: MeetingV1ModeratorRejectParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
     let previous_event_id =
         check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
     let author = check_pubkey_hex(params.intent_author_pubkey, "intent author pubkey")?;
     let reason_text = check_meeting_v1_text(params.reason_text, "intent rejection reason", 1024)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "reject")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "reject")?;
     tags.push(tag(&["intent", &intent_id])?);
     tags.push(tag(&["prev", &previous_event_id])?);
     tags.push(tag(&["reason-code", params.reason_code.as_str()])?);
@@ -2661,6 +2851,20 @@ pub fn build_meeting_v1_moderator_reject(
 pub fn build_meeting_v1_moderator_dismiss_handoff(
     params: MeetingV1ModeratorDismissHandoffParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_dismiss_handoff(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator Dismiss Handoff command (kind 42106).
+pub fn build_meeting_v2_moderator_dismiss_handoff(
+    params: MeetingV1ModeratorDismissHandoffParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_dismiss_handoff(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_moderator_dismiss_handoff(
+    params: MeetingV1ModeratorDismissHandoffParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     check_meeting_v1_i64(params.expected_speech_revision, "expected speech revision")?;
     check_meeting_v1_i32(
         params.expected_attempt_count,
@@ -2668,7 +2872,7 @@ pub fn build_meeting_v1_moderator_dismiss_handoff(
     )?;
     let handoff_id = check_hex_exact(params.handoff_id, 64, "meeting handoff id")?;
     let reason_text = check_meeting_v1_text(params.reason_text, "handoff dismiss reason", 1024)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "dismiss-handoff")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "dismiss-handoff")?;
     tags.push(tag(&["handoff", &handoff_id])?);
     tags.push(tag(&[
         "expected-speech-revision",
@@ -2694,6 +2898,20 @@ pub fn build_meeting_v1_moderator_dismiss_handoff(
 pub fn build_meeting_v1_decision_attempt_start(
     params: MeetingV1DecisionAttemptStartParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_attempt_start(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator DecisionAttempt Start command (kind 42106).
+pub fn build_meeting_v2_decision_attempt_start(
+    params: MeetingV1DecisionAttemptStartParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_attempt_start(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_decision_attempt_start(
+    params: MeetingV1DecisionAttemptStartParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     if params.expected_control_epoch == 0 {
         return Err(SdkError::InvalidInput(
             "expected control epoch must be positive".into(),
@@ -2712,7 +2930,8 @@ pub fn build_meeting_v1_decision_attempt_start(
         64,
         "expected Relay State event id",
     )?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "decision-attempt-start")?;
+    let mut tags =
+        meeting_command_tags(params.session_id, schema_version, "decision-attempt-start")?;
     tags.push(tag(&[
         "expected-control-epoch",
         &params.expected_control_epoch.to_string(),
@@ -2742,6 +2961,20 @@ pub fn build_meeting_v1_decision_attempt_start(
 pub fn build_meeting_v1_decision_attempt_finish(
     params: MeetingV1DecisionAttemptFinishParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_attempt_finish(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator DecisionAttempt Finish command (kind 42106).
+pub fn build_meeting_v2_decision_attempt_finish(
+    params: MeetingV1DecisionAttemptFinishParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_attempt_finish(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_decision_attempt_finish(
+    params: MeetingV1DecisionAttemptFinishParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
     let reason_code = check_meeting_v1_text(params.reason_code, "attempt finish reason code", 128)?;
     let supported = match params.outcome {
@@ -2765,7 +2998,8 @@ pub fn build_meeting_v1_decision_attempt_finish(
             "unsupported moderator DecisionAttempt finish reason".into(),
         ));
     }
-    let mut tags = meeting_v1_command_tags(params.session_id, "decision-attempt-finish")?;
+    let mut tags =
+        meeting_command_tags(params.session_id, schema_version, "decision-attempt-finish")?;
     tags.push(tag(&["decision-attempt", &attempt_id])?);
     tags.push(tag(&["outcome", params.outcome.as_str()])?);
     tags.push(tag(&["reason-code", reason_code])?);
@@ -2775,6 +3009,20 @@ pub fn build_meeting_v1_decision_attempt_finish(
 /// Build a Meeting V1 moderator DecisionRetry command (kind 42106).
 pub fn build_meeting_v1_decision_retry(
     params: MeetingV1DecisionRetryParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_retry(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator DecisionRetry command (kind 42106).
+pub fn build_meeting_v2_decision_retry(
+    params: MeetingV1DecisionRetryParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_retry(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_decision_retry(
+    params: MeetingV1DecisionRetryParams<'_>,
+    schema_version: &str,
 ) -> Result<EventBuilder, SdkError> {
     if params.expected_control_epoch == 0
         || params.expected_decision_epoch == 0
@@ -2794,7 +3042,7 @@ pub fn build_meeting_v1_decision_retry(
         64,
         "failed moderator action event id",
     )?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "decision-retry")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "decision-retry")?;
     tags.push(tag(&["decision-attempt", &attempt_id])?);
     tags.push(tag(&["retry-ticket", &retry_ticket_id])?);
     tags.push(tag(&["failed-action", &failed_action_event_id])?);
@@ -2817,6 +3065,20 @@ pub fn build_meeting_v1_decision_retry(
 pub fn build_meeting_v1_complete_cohort(
     params: MeetingV1CompleteCohortParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_complete_cohort(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator CompleteCohort command (kind 42106).
+pub fn build_meeting_v2_complete_cohort(
+    params: MeetingV1CompleteCohortParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_complete_cohort(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_complete_cohort(
+    params: MeetingV1CompleteCohortParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     if params.expected_control_epoch == 0 || params.expected_decision_epoch == 0 {
         return Err(SdkError::InvalidInput(
             "CompleteCohort epochs must be positive".into(),
@@ -2825,7 +3087,7 @@ pub fn build_meeting_v1_complete_cohort(
     check_meeting_v1_i64(params.expected_control_epoch, "expected control epoch")?;
     check_meeting_v1_i64(params.expected_decision_epoch, "expected decision epoch")?;
     let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "complete-cohort")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "complete-cohort")?;
     tags.push(tag(&["decision-attempt", &attempt_id])?);
     tags.push(tag(&[
         "expected-control-epoch",
@@ -2842,8 +3104,26 @@ pub fn build_meeting_v1_complete_cohort(
 pub fn build_meeting_v1_decision_attempt_abandon(
     params: MeetingV1DecisionAttemptAbandonParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_attempt_abandon(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator DecisionAttempt Abandon command (kind 42106).
+pub fn build_meeting_v2_decision_attempt_abandon(
+    params: MeetingV1DecisionAttemptAbandonParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_decision_attempt_abandon(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_decision_attempt_abandon(
+    params: MeetingV1DecisionAttemptAbandonParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "decision-attempt-abandon")?;
+    let mut tags = meeting_command_tags(
+        params.session_id,
+        schema_version,
+        "decision-attempt-abandon",
+    )?;
     tags.push(tag(&["decision-attempt", &attempt_id])?);
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16), "").tags(tags))
 }
@@ -2852,11 +3132,25 @@ pub fn build_meeting_v1_decision_attempt_abandon(
 pub fn build_meeting_v1_moderator_withdraw_self(
     params: MeetingV1ModeratorWithdrawSelfParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_withdraw_self(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build an attempt-bound Meeting V2 moderator self-Intent withdrawal.
+pub fn build_meeting_v2_moderator_withdraw_self(
+    params: MeetingV1ModeratorWithdrawSelfParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_withdraw_self(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_moderator_withdraw_self(
+    params: MeetingV1ModeratorWithdrawSelfParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let attempt_id = check_hex_exact(params.attempt_id, 64, "moderator decision attempt id")?;
     let intent_id = check_hex_exact(params.intent_id, 64, "meeting intent id")?;
     let previous_event_id =
         check_hex_exact(params.previous_event_id, 64, "previous intent event id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "withdraw-self")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "withdraw-self")?;
     tags.push(tag(&["decision-attempt", &attempt_id])?);
     tags.push(tag(&["intent", &intent_id])?);
     tags.push(tag(&["prev", &previous_event_id])?);
@@ -2867,6 +3161,20 @@ pub fn build_meeting_v1_moderator_withdraw_self(
 pub fn build_meeting_v1_moderator_recall(
     params: MeetingV1ModeratorRecallParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_recall(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 moderator Recall command (kind 42106).
+pub fn build_meeting_v2_moderator_recall(
+    params: MeetingV1ModeratorRecallParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_moderator_recall(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_moderator_recall(
+    params: MeetingV1ModeratorRecallParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     if params.control_epoch == 0 {
         return Err(SdkError::InvalidInput(
             "meeting control epoch must be positive".into(),
@@ -2874,7 +3182,7 @@ pub fn build_meeting_v1_moderator_recall(
     }
     check_meeting_v1_i64(params.control_epoch, "meeting control epoch")?;
     let reason = check_meeting_v1_optional_text(params.reason, "recall reason", 1024)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "recall")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "recall")?;
     tags.push(tag(&["control-epoch", &params.control_epoch.to_string()])?);
     Ok(EventBuilder::new(
         Kind::Custom(KIND_MEETING_MODERATOR_COMMAND as u16),
@@ -2887,7 +3195,21 @@ pub fn build_meeting_v1_moderator_recall(
 pub fn build_meeting_v1_human_floor_request(
     params: MeetingV1HumanFloorRequestParams,
 ) -> Result<EventBuilder, SdkError> {
-    let tags = meeting_v1_command_tags(params.session_id, "request")?;
+    build_meeting_human_floor_request(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 Human Floor Request command (kind 42107).
+pub fn build_meeting_v2_human_floor_request(
+    params: MeetingV1HumanFloorRequestParams,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_human_floor_request(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_human_floor_request(
+    params: MeetingV1HumanFloorRequestParams,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
+    let tags = meeting_command_tags(params.session_id, schema_version, "request")?;
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_HUMAN_FLOOR_REQUEST as u16), "").tags(tags))
 }
 
@@ -2895,8 +3217,22 @@ pub fn build_meeting_v1_human_floor_request(
 pub fn build_meeting_v1_human_floor_withdraw(
     params: MeetingV1HumanFloorWithdrawParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_human_floor_withdraw(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 Human Floor Request Withdraw command (kind 42107).
+pub fn build_meeting_v2_human_floor_withdraw(
+    params: MeetingV1HumanFloorWithdrawParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_human_floor_withdraw(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_human_floor_withdraw(
+    params: MeetingV1HumanFloorWithdrawParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let request_id = check_hex_exact(params.request_id, 64, "human floor request id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "withdraw")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "withdraw")?;
     tags.push(tag(&["request", &request_id])?);
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_HUMAN_FLOOR_REQUEST as u16), "").tags(tags))
 }
@@ -2905,8 +3241,22 @@ pub fn build_meeting_v1_human_floor_withdraw(
 pub fn build_meeting_v1_offer_ack(
     params: MeetingV1OfferAckParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_offer_ack(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 Offer ACK command (kind 42108).
+pub fn build_meeting_v2_offer_ack(
+    params: MeetingV1OfferAckParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_offer_ack(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_offer_ack(
+    params: MeetingV1OfferAckParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let offer_id = check_hex_exact(params.offer_id, 64, "meeting offer id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "ack")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "ack")?;
     tags.push(tag(&["meeting-offer", &offer_id])?);
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_OFFER_RESPONSE as u16), "").tags(tags))
 }
@@ -2915,9 +3265,23 @@ pub fn build_meeting_v1_offer_ack(
 pub fn build_meeting_v1_offer_decline(
     params: MeetingV1OfferDeclineParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_offer_decline(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 Offer Decline command (kind 42108).
+pub fn build_meeting_v2_offer_decline(
+    params: MeetingV1OfferDeclineParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_offer_decline(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_offer_decline(
+    params: MeetingV1OfferDeclineParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let offer_id = check_hex_exact(params.offer_id, 64, "meeting offer id")?;
     let reason = check_meeting_v1_optional_text(params.reason, "offer decline reason", 512)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "decline")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "decline")?;
     tags.push(tag(&["meeting-offer", &offer_id])?);
     Ok(EventBuilder::new(
         Kind::Custom(KIND_MEETING_OFFER_RESPONSE as u16),
@@ -2930,6 +3294,20 @@ pub fn build_meeting_v1_offer_decline(
 pub fn build_meeting_v1_grant_progress(
     params: MeetingV1GrantProgressParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_grant_progress(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 Grant Progress signal (kind 42109).
+pub fn build_meeting_v2_grant_progress(
+    params: MeetingV1GrantProgressParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_grant_progress(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_grant_progress(
+    params: MeetingV1GrantProgressParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     if params.progress_seq == 0 {
         return Err(SdkError::InvalidInput(
             "meeting Grant progress sequence must be positive".into(),
@@ -2937,7 +3315,7 @@ pub fn build_meeting_v1_grant_progress(
     }
     check_meeting_v1_i64(params.progress_seq, "meeting Grant progress sequence")?;
     let grant_id = check_hex_exact(params.grant_id, 64, "meeting grant id")?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "progress")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "progress")?;
     tags.push(tag(&["meeting-grant", &grant_id])?);
     tags.push(tag(&["progress-seq", &params.progress_seq.to_string()])?);
     tags.push(tag(&["stage", params.stage.as_str()])?);
@@ -2948,9 +3326,23 @@ pub fn build_meeting_v1_grant_progress(
 pub fn build_meeting_v1_grant_yield(
     params: MeetingV1GrantYieldParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_grant_yield(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Meeting V2 Grant Yield signal (kind 42109).
+pub fn build_meeting_v2_grant_yield(
+    params: MeetingV1GrantYieldParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_grant_yield(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_grant_yield(
+    params: MeetingV1GrantYieldParams<'_>,
+    schema_version: &str,
+) -> Result<EventBuilder, SdkError> {
     let grant_id = check_hex_exact(params.grant_id, 64, "meeting grant id")?;
     let reason = check_meeting_v1_optional_text(params.reason, "meeting Grant Yield reason", 512)?;
-    let mut tags = meeting_v1_command_tags(params.session_id, "yield")?;
+    let mut tags = meeting_command_tags(params.session_id, schema_version, "yield")?;
     tags.push(tag(&["meeting-grant", &grant_id])?);
     if let Some(reason_code) = params.reason_code {
         tags.push(tag(&["reason-code", reason_code.as_str()])?);
@@ -2965,6 +3357,20 @@ pub fn build_meeting_v1_grant_yield(
 /// Build a Grant-bound Meeting V1 speech message (kind 9).
 pub fn build_meeting_v1_speech(
     params: MeetingV1SpeechParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_baton_speech(params, MEETING_V1_SCHEMA_VERSION)
+}
+
+/// Build a Grant-bound Meeting V2 speech message (kind 9).
+pub fn build_meeting_v2_speech(
+    params: MeetingV1SpeechParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_baton_speech(params, MEETING_V2_SCHEMA_VERSION)
+}
+
+fn build_meeting_baton_speech(
+    params: MeetingV1SpeechParams<'_>,
+    schema_version: &str,
 ) -> Result<EventBuilder, SdkError> {
     check_meeting_v1_session(params.session_id)?;
     if params.speech_revision == 0 {
@@ -2982,7 +3388,7 @@ pub fn build_meeting_v1_speech(
     check_content(params.content, 256 * 1024)?;
     let mut tags = vec![
         tag(&["h", &params.session_id.to_string()])?,
-        tag(&["v", MEETING_V1_SCHEMA_VERSION])?,
+        tag(&["v", schema_version])?,
         tag(&["meeting-grant", &grant_id])?,
         tag(&["speech-revision", &params.speech_revision.to_string()])?,
     ];

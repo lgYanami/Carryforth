@@ -1,15 +1,18 @@
-//! Two-phase Meeting V1 rollout/restart acceptance test.
+//! Two-phase Meeting V1/V2 rollout and restart acceptance test.
 //!
 //! Run `create_rollout_fixture_before_gate_closes` with V1 creation enabled,
-//! restart the same Relay/database with creation disabled, then run
-//! `existing_v1_survives_closed_gate_and_v0_still_works` with the same fixture
-//! path. CI owns the process restart between phases.
+//! restart the same Relay/database with V1/V2 creation disabled, then run
+//! `existing_v1_and_v2_survive_closed_gates_and_v0_still_works` with the same
+//! fixture path. CI owns the process restart between phases.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use buzz_core::kind::KIND_MEETING_STATE;
-use buzz_sdk::{MeetingV1CreateParams, MeetingV1EndParams, MeetingV1HumanFloorRequestParams};
+use buzz_sdk::{
+    MeetingV1CreateParams, MeetingV1EndParams, MeetingV1HumanFloorRequestParams,
+    MeetingV2BoardActionParams, MeetingV2EndOutcome, MeetingV2EndParams,
+};
 use nostr::{Event, Keys};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,8 +24,10 @@ const HUMAN_SECRET: &str = "0000000000000000000000000000000000000000000000000000
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RolloutFixture {
-    meeting_id: Uuid,
-    create_event: Event,
+    v1_meeting_id: Uuid,
+    v1_create_event: Event,
+    v2_meeting_id: Uuid,
+    v2_create_event: Event,
 }
 
 fn relay_url() -> String {
@@ -181,11 +186,11 @@ async fn create_rollout_fixture_before_gate_closes() {
     seed_human(&pool, community_id, &owner, "owner").await;
     seed_human(&pool, community_id, &human, "member").await;
 
-    let meeting_id = Uuid::new_v4();
+    let v1_meeting_id = Uuid::new_v4();
     let owner_pubkey = owner.public_key().to_hex();
     let human_pubkey = human.public_key().to_hex();
-    let create_event = buzz_sdk::build_meeting_v1_create(MeetingV1CreateParams {
-        session_id: meeting_id,
+    let v1_create_event = buzz_sdk::build_meeting_v1_create(MeetingV1CreateParams {
+        session_id: v1_meeting_id,
         title: "Meeting V1 rollout restart",
         description: Some("persists across the create-gate restart"),
         source_channel_id: None,
@@ -196,13 +201,32 @@ async fn create_rollout_fixture_before_gate_closes() {
     .expect("build rollout Meeting V1 Create")
     .sign_with_keys(&owner)
     .expect("sign rollout Meeting V1 Create");
-    let (status, body) = post_event(&owner, &create_event).await;
+    let (status, body) = post_event(&owner, &v1_create_event).await;
     assert_accepted(status, &body);
-    wait_for_phase(&owner, meeting_id, "moderator_idle").await;
+    wait_for_phase(&owner, v1_meeting_id, "moderator_idle").await;
+
+    let v2_meeting_id = Uuid::new_v4();
+    let v2_create_event = buzz_sdk::build_meeting_v2_create(buzz_sdk::MeetingV2CreateParams {
+        session_id: v2_meeting_id,
+        title: "Meeting V2 rollout restart",
+        description: Some("persists across the create-gate restart"),
+        source_channel_id: None,
+        author_pubkey: &owner_pubkey,
+        participant_pubkeys: &[&human_pubkey],
+        initial_board: "# Goal\nContinue this V2 lifecycle after Relay restart.",
+    })
+    .expect("build rollout Meeting V2 Create")
+    .sign_with_keys(&owner)
+    .expect("sign rollout Meeting V2 Create");
+    let (status, body) = post_event(&owner, &v2_create_event).await;
+    assert_accepted(status, &body);
+    wait_for_phase(&owner, v2_meeting_id, "moderator_idle").await;
 
     let fixture = RolloutFixture {
-        meeting_id,
-        create_event,
+        v1_meeting_id,
+        v1_create_event,
+        v2_meeting_id,
+        v2_create_event,
     };
     std::fs::write(
         fixture_path(),
@@ -212,8 +236,8 @@ async fn create_rollout_fixture_before_gate_closes() {
 }
 
 #[tokio::test]
-#[ignore = "phase 2 requires the phase-1 database and a restarted Relay with V1 creation disabled"]
-async fn existing_v1_survives_closed_gate_and_v0_still_works() {
+#[ignore = "phase 2 requires the phase-1 database and a restarted Relay with V1/V2 creation disabled"]
+async fn existing_v1_and_v2_survive_closed_gates_and_v0_still_works() {
     let fixture: RolloutFixture = serde_json::from_slice(
         &std::fs::read(fixture_path()).expect("read phase-1 rollout fixture"),
     )
@@ -227,7 +251,7 @@ async fn existing_v1_survives_closed_gate_and_v0_still_works() {
 
     // Exact Create replay remains idempotent even after operators close the
     // gate, because duplicate detection precedes the new-create check.
-    let (status, body) = post_event(&owner, &fixture.create_event).await;
+    let (status, body) = post_event(&owner, &fixture.v1_create_event).await;
     assert_accepted(status, &body);
     assert!(
         body.contains("duplicate"),
@@ -236,14 +260,42 @@ async fn existing_v1_survives_closed_gate_and_v0_still_works() {
 
     let floor_request =
         buzz_sdk::build_meeting_v1_human_floor_request(MeetingV1HumanFloorRequestParams {
-            session_id: fixture.meeting_id,
+            session_id: fixture.v1_meeting_id,
         })
         .expect("build post-restart Human Floor Request")
         .sign_with_keys(&human)
         .expect("sign post-restart Human Floor Request");
     let (status, body) = post_event(&human, &floor_request).await;
     assert_accepted(status, &body);
-    wait_for_phase(&owner, fixture.meeting_id, "offered").await;
+    wait_for_phase(&owner, fixture.v1_meeting_id, "offered").await;
+
+    let (status, body) = post_event(&owner, &fixture.v2_create_event).await;
+    assert_accepted(status, &body);
+    assert!(
+        body.contains("duplicate"),
+        "exact V2 Create replay must preserve duplicate success: {body}"
+    );
+    let board = buzz_sdk::build_meeting_v2_board_action(MeetingV2BoardActionParams {
+        session_id: fixture.v2_meeting_id,
+        expected_control_epoch: 1,
+        board_window: 1,
+        board: None,
+    })
+    .expect("build post-restart V2 Board result")
+    .sign_with_keys(&owner)
+    .expect("sign post-restart V2 Board result");
+    let (status, body) = post_event(&owner, &board).await;
+    assert_accepted(status, &body);
+    let v2_floor_request =
+        buzz_sdk::build_meeting_v2_human_floor_request(MeetingV1HumanFloorRequestParams {
+            session_id: fixture.v2_meeting_id,
+        })
+        .expect("build post-restart V2 Human Floor Request")
+        .sign_with_keys(&human)
+        .expect("sign post-restart V2 Human Floor Request");
+    let (status, body) = post_event(&human, &v2_floor_request).await;
+    assert_accepted(status, &body);
+    wait_for_phase(&owner, fixture.v2_meeting_id, "offered").await;
 
     let rejected_id = Uuid::new_v4();
     let owner_pubkey = owner.public_key().to_hex();
@@ -266,6 +318,25 @@ async fn existing_v1_survives_closed_gate_and_v0_still_works() {
         "new V1 must be rejected after closing the gate, got HTTP {status}: {body}"
     );
 
+    let rejected_v2_id = Uuid::new_v4();
+    let rejected_v2_create = buzz_sdk::build_meeting_v2_create(buzz_sdk::MeetingV2CreateParams {
+        session_id: rejected_v2_id,
+        title: "must not expand V2 rollout",
+        description: None,
+        source_channel_id: None,
+        author_pubkey: &owner_pubkey,
+        participant_pubkeys: &[&human_pubkey],
+        initial_board: "# Goal\nThis meeting must not be created.",
+    })
+    .expect("build gated Meeting V2 Create")
+    .sign_with_keys(&owner)
+    .expect("sign gated Meeting V2 Create");
+    let (status, body) = post_event(&owner, &rejected_v2_create).await;
+    assert!(
+        !status.is_success() && body.contains("Meeting V2 creation is disabled"),
+        "new V2 must be rejected after closing the gate, got HTTP {status}: {body}"
+    );
+
     let v0_id = Uuid::new_v4();
     let v0_create =
         buzz_sdk::build_meeting_create(v0_id, "V0 remains available", None, None, &[&human_pubkey])
@@ -276,13 +347,27 @@ async fn existing_v1_survives_closed_gate_and_v0_still_works() {
     assert_accepted(status, &body);
 
     let end = buzz_sdk::build_meeting_v1_end(MeetingV1EndParams {
-        session_id: fixture.meeting_id,
-        create_event_id: &fixture.create_event.id.to_hex(),
+        session_id: fixture.v1_meeting_id,
+        create_event_id: &fixture.v1_create_event.id.to_hex(),
     })
     .expect("build post-restart Meeting V1 End")
     .sign_with_keys(&owner)
     .expect("sign post-restart Meeting V1 End");
     let (status, body) = post_event(&owner, &end).await;
     assert_accepted(status, &body);
-    wait_for_phase(&owner, fixture.meeting_id, "ended").await;
+    wait_for_phase(&owner, fixture.v1_meeting_id, "ended").await;
+
+    let abort = buzz_sdk::build_meeting_v2_end(MeetingV2EndParams {
+        session_id: fixture.v2_meeting_id,
+        create_event_id: &fixture.v2_create_event.id.to_hex(),
+        outcome: MeetingV2EndOutcome::Aborted,
+        reason_code: Some("restart_acceptance_complete"),
+        reason: Some("The restart continuation path has been verified."),
+    })
+    .expect("build post-restart Meeting V2 abort")
+    .sign_with_keys(&owner)
+    .expect("sign post-restart Meeting V2 abort");
+    let (status, body) = post_event(&owner, &abort).await;
+    assert_accepted(status, &body);
+    wait_for_phase(&owner, fixture.v2_meeting_id, "ended").await;
 }

@@ -31,6 +31,40 @@ pub const DEFAULT_FALLBACK_POLICY_VERSION: &str = "fallback-v1";
 /// Largest accepted persisted Meeting V1 duration (24 hours).
 pub const MAX_BATON_DURATION_MS: i64 = 86_400_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatonProtocol {
+    V1,
+    V2,
+}
+
+impl BatonProtocol {
+    pub(crate) fn parse(schema_version: i32, policy: &str, session_id: Uuid) -> Result<Self> {
+        match (schema_version, policy) {
+            (SCHEMA_VERSION, BATON_POLICY_VERSION) => Ok(Self::V1),
+            (crate::meeting_v2::SCHEMA_VERSION, crate::meeting_v2::BOARD_POLICY_VERSION) => {
+                Ok(Self::V2)
+            }
+            _ => Err(DbError::InvalidData(format!(
+                "meeting {session_id} is not a supported moderated Baton session"
+            ))),
+        }
+    }
+
+    pub(crate) const fn schema_tag(self) -> &'static str {
+        match self {
+            Self::V1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
+            Self::V2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+        }
+    }
+
+    pub(crate) const fn policy(self) -> &'static str {
+        match self {
+            Self::V1 => BATON_POLICY_VERSION,
+            Self::V2 => crate::meeting_v2::BOARD_POLICY_VERSION,
+        }
+    }
+}
+
 /// Frozen Meeting V1 protocol configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatonConfig {
@@ -371,6 +405,7 @@ pub async fn create_meeting_v1_tx(
     );
     let state_event = build_state_event(
         params.relay_keys,
+        BatonProtocol::V1,
         params.session_id,
         params.moderator_pubkey,
         BatonPhase::ModeratorIdle,
@@ -382,6 +417,7 @@ pub async fn create_meeting_v1_tx(
         0,
         &params.config,
         &participants,
+        None,
         &transition,
         now,
     )?;
@@ -575,6 +611,124 @@ pub(crate) async fn create_moderated_meeting_base_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn initialize_baton_runtime_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    moderator_pubkey: &[u8],
+    participants: &[BatonParticipant],
+    relay_keys: &Keys,
+    config: &BatonConfig,
+    protocol: BatonProtocol,
+    caused_by_event_id: Option<&[u8]>,
+    transition_type: &str,
+    now: DateTime<Utc>,
+) -> Result<BatonSnapshot> {
+    validate_config(config)?;
+    insert_config_tx(tx, community_id, session_id, config).await?;
+    let transition = meeting_transition(
+        transition_type,
+        "accepted",
+        session_id,
+        caused_by_event_id,
+        now,
+        transition_type,
+        None,
+        Some("active"),
+        None,
+        Some(BatonPhase::ModeratorIdle.as_str()),
+    );
+    let board_control = if protocol == BatonProtocol::V2 {
+        Some(crate::meeting_v2::runtime_state_json_tx(tx, community_id, session_id).await?)
+    } else {
+        None
+    };
+    let state_event = build_state_event(
+        relay_keys,
+        protocol,
+        session_id,
+        moderator_pubkey,
+        BatonPhase::ModeratorIdle,
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        config,
+        participants,
+        board_control,
+        &transition,
+        now,
+    )?;
+    persist_state_event_tx(tx, community_id, session_id, &state_event, now).await?;
+    insert_history_tx(
+        tx,
+        community_id,
+        session_id,
+        &state_event,
+        1,
+        1,
+        0,
+        0,
+        1,
+        0,
+        transition_type,
+        transition
+            .get("effects")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        now,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO meeting_baton_state \
+             (community_id, session_id, phase, floor_revision, intent_revision, \
+              speech_revision, state_revision, control_epoch, decision_epoch, \
+              state_event_id, created_at, updated_at) \
+         VALUES ($1, $2, 'moderator_idle', 1, 0, 0, 1, 1, 0, $3, $4, $4)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(state_event.id.as_bytes().as_slice())
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    crate::meeting::enqueue_meeting_event_tx(
+        tx,
+        community_id,
+        session_id,
+        state_event.id.as_bytes().as_slice(),
+    )
+    .await?;
+    Ok(BatonSnapshot {
+        session_id,
+        moderator_pubkey: moderator_pubkey.to_vec(),
+        phase: BatonPhase::ModeratorIdle,
+        floor_revision: 1,
+        intent_revision: 0,
+        speech_revision: 0,
+        state_revision: 1,
+        control_epoch: 1,
+        decision_epoch: 0,
+        decision_attempt: 0,
+        active_decision_attempt_id: None,
+        state_event_id: state_event.id.as_bytes().to_vec(),
+        active_offer_id: None,
+        active_grant_id: None,
+        handoff_depth: 0,
+        consecutive_moderator_speeches: 0,
+        forced_return_to_moderator: false,
+        moderator_decision_deadline: None,
+        next_action_at: None,
+        config: config.clone(),
+        participants: participants.to_vec(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
 /// End an active Meeting V1 and commit its terminal State through the meeting
 /// outbox in the same transaction.
 pub async fn end_meeting_v1_tx(
@@ -594,7 +748,13 @@ pub async fn end_meeting_v1_tx(
     )
     .await?;
 
-    let session = lock_v1_session_tx(tx, params.community_id, params.session_id).await?;
+    let session = lock_baton_session_tx(tx, params.community_id, params.session_id).await?;
+    if session.protocol != BatonProtocol::V1 {
+        return Err(DbError::InvalidData(format!(
+            "meeting {} is not a {BATON_POLICY_VERSION} session",
+            params.session_id
+        )));
+    }
     if session.create_event_id != params.create_event_id {
         return Err(DbError::InvalidData(
             "meeting end references the wrong create event".to_string(),
@@ -919,17 +1079,18 @@ pub async fn release_revocation_job(
 }
 
 #[derive(Debug)]
-struct V1SessionLock {
-    create_event_id: Vec<u8>,
-    host_pubkey: Vec<u8>,
-    status: String,
+pub(crate) struct BatonSessionLock {
+    pub(crate) create_event_id: Vec<u8>,
+    pub(crate) host_pubkey: Vec<u8>,
+    pub(crate) status: String,
+    pub(crate) protocol: BatonProtocol,
 }
 
-async fn lock_v1_session_tx(
+pub(crate) async fn lock_baton_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     session_id: Uuid,
-) -> Result<V1SessionLock> {
+) -> Result<BatonSessionLock> {
     let row = sqlx::query(
         "SELECT create_event_id, host_pubkey, moderator_pubkey, status, \
                 schema_version, floor_policy_version \
@@ -944,24 +1105,21 @@ async fn lock_v1_session_tx(
     .ok_or_else(|| DbError::NotFound(format!("meeting {session_id}")))?;
     let schema_version: i32 = row.try_get("schema_version")?;
     let policy: String = row.try_get("floor_policy_version")?;
-    if schema_version != SCHEMA_VERSION || policy != BATON_POLICY_VERSION {
-        return Err(DbError::InvalidData(format!(
-            "meeting {session_id} is not a {BATON_POLICY_VERSION} session"
-        )));
-    }
+    let protocol = BatonProtocol::parse(schema_version, &policy, session_id)?;
     let moderator_pubkey: Option<Vec<u8>> = row.try_get("moderator_pubkey")?;
     let moderator_pubkey = moderator_pubkey.ok_or_else(|| {
         DbError::InvalidData(format!("meeting {session_id} is missing its moderator"))
     })?;
     validate_32_bytes(&moderator_pubkey, "meeting moderator pubkey")?;
-    Ok(V1SessionLock {
+    Ok(BatonSessionLock {
         create_event_id: row.try_get("create_event_id")?,
         host_pubkey: row.try_get("host_pubkey")?,
         status: row.try_get("status")?,
+        protocol,
     })
 }
 
-async fn close_baton_locked_tx(
+pub(crate) async fn close_baton_locked_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     session_id: Uuid,
@@ -970,6 +1128,7 @@ async fn close_baton_locked_tx(
     relay_keys: &Keys,
     now: DateTime<Utc>,
 ) -> Result<BatonSnapshot> {
+    let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
     let state = load_state_tx(tx, community_id, session_id, true).await?;
     if state.phase == BatonPhase::Ended {
         return load_snapshot_tx(tx, community_id, session_id).await;
@@ -1259,8 +1418,14 @@ async fn close_baton_locked_tx(
         "at_ms": now.timestamp_millis(),
         "effects": effects,
     });
+    let board_control = if protocol == BatonProtocol::V2 {
+        Some(crate::meeting_v2::runtime_state_json_tx(tx, community_id, session_id).await?)
+    } else {
+        None
+    };
     let state_event = build_state_event(
         relay_keys,
+        protocol,
         session_id,
         &moderator_pubkey,
         BatonPhase::Ended,
@@ -1272,6 +1437,7 @@ async fn close_baton_locked_tx(
         state.decision_epoch,
         &config,
         &participants,
+        board_control,
         &transition,
         now,
     )?;
@@ -1439,6 +1605,21 @@ async fn load_state_tx(
     state_row_from_pg(row)
 }
 
+pub(crate) async fn moderator_controls_floor_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let state = load_state_tx(tx, community_id, session_id, true).await?;
+    Ok(matches!(
+        state.phase,
+        BatonPhase::ModeratorIdle | BatonPhase::ModeratorControl
+    ) && state.active_offer_id.is_none()
+        && state.active_grant_id.is_none()
+        && state.next_action_at.is_none_or(|deadline| deadline > now))
+}
+
 fn state_row_from_pg(row: sqlx::postgres::PgRow) -> Result<StateRow> {
     let phase: String = row.try_get("phase")?;
     Ok(StateRow {
@@ -1471,7 +1652,7 @@ async fn load_snapshot_pool(
     community_id: CommunityId,
     session_id: Uuid,
 ) -> Result<BatonSnapshot> {
-    assert_v1_session_pool(pool, community_id, session_id).await?;
+    assert_baton_session_pool(pool, community_id, session_id).await?;
     let row = sqlx::query(
         "SELECT phase, floor_revision, intent_revision, speech_revision, \
                 state_revision, control_epoch, decision_epoch, decision_attempt, \
@@ -1553,7 +1734,7 @@ fn snapshot_from_parts(
     }
 }
 
-async fn assert_v1_session_pool(
+async fn assert_baton_session_pool(
     pool: &PgPool,
     community_id: CommunityId,
     session_id: Uuid,
@@ -1571,15 +1752,36 @@ async fn assert_v1_session_pool(
     let schema_version: i32 = row.try_get("schema_version")?;
     let policy: String = row.try_get("floor_policy_version")?;
     let moderator: Option<Vec<u8>> = row.try_get("moderator_pubkey")?;
-    if schema_version != SCHEMA_VERSION
-        || policy != BATON_POLICY_VERSION
+    if BatonProtocol::parse(schema_version, &policy, session_id).is_err()
         || moderator.as_ref().is_none_or(|value| value.len() != 32)
     {
         return Err(DbError::InvalidData(format!(
-            "meeting {session_id} is not a valid {BATON_POLICY_VERSION} session"
+            "meeting {session_id} is not a valid moderated Baton session"
         )));
     }
     Ok(())
+}
+
+pub(crate) async fn load_baton_protocol_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+) -> Result<BatonProtocol> {
+    let row = sqlx::query(
+        "SELECT schema_version, floor_policy_version \
+         FROM meeting_sessions \
+         WHERE community_id = $1 AND session_id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or_else(|| DbError::NotFound(format!("meeting {session_id}")))?;
+    BatonProtocol::parse(
+        row.try_get("schema_version")?,
+        row.try_get::<String, _>("floor_policy_version")?.as_str(),
+        session_id,
+    )
 }
 
 async fn load_moderator_pool(
@@ -1590,18 +1792,20 @@ async fn load_moderator_pool(
     let moderator: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT moderator_pubkey FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 \
-           AND schema_version = 2 AND floor_policy_version = $3",
+           AND ((schema_version = 2 AND floor_policy_version = $3) \
+             OR (schema_version = 3 AND floor_policy_version = $4))",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(BATON_POLICY_VERSION)
+    .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
     .fetch_optional(pool)
     .await?
     .flatten();
     moderator.ok_or_else(|| DbError::NotFound(format!("meeting moderator {session_id}")))
 }
 
-async fn load_moderator_tx(
+pub(crate) async fn load_moderator_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     session_id: Uuid,
@@ -1609,11 +1813,13 @@ async fn load_moderator_tx(
     let moderator: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT moderator_pubkey FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 \
-           AND schema_version = 2 AND floor_policy_version = $3",
+           AND ((schema_version = 2 AND floor_policy_version = $3) \
+             OR (schema_version = 3 AND floor_policy_version = $4))",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(BATON_POLICY_VERSION)
+    .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
     .fetch_optional(tx.as_mut())
     .await?
     .flatten();
@@ -1638,7 +1844,7 @@ async fn load_participants_pool(
     participants_from_rows(rows)
 }
 
-async fn load_participants_tx(
+pub(crate) async fn load_participants_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     session_id: Uuid,
@@ -2004,7 +2210,7 @@ async fn authorize_end_tx(
     ))
 }
 
-async fn ensure_existing_command_event_tx(
+pub(crate) async fn ensure_existing_command_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     session_id: Uuid,
@@ -2131,6 +2337,7 @@ async fn insert_history_tx(
 #[allow(clippy::too_many_arguments)]
 fn build_state_event(
     relay_keys: &Keys,
+    protocol: BatonProtocol,
     session_id: Uuid,
     moderator_pubkey: &[u8],
     phase: BatonPhase,
@@ -2142,6 +2349,7 @@ fn build_state_event(
     decision_epoch: i64,
     config: &BatonConfig,
     participants: &[BatonParticipant],
+    board_control: Option<serde_json::Value>,
     transition: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<Event> {
@@ -2153,8 +2361,8 @@ fn build_state_event(
     let state_revision_string = state_revision.to_string();
     let tags = vec![
         parse_tag(["h", session.as_str()])?,
-        parse_tag(["v", "2"])?,
-        parse_tag(["policy", BATON_POLICY_VERSION])?,
+        parse_tag(["v", protocol.schema_tag()])?,
+        parse_tag(["policy", protocol.policy()])?,
         parse_tag(["phase", phase.as_str()])?,
         parse_tag(["floor-revision", floor_revision_string.as_str()])?,
         parse_tag(["intent-revision", intent_revision_string.as_str()])?,
@@ -2162,7 +2370,7 @@ fn build_state_event(
         parse_tag(["state-revision", state_revision_string.as_str()])?,
         parse_tag(["moderator", moderator.as_str()])?,
     ];
-    let content = serde_json::json!({
+    let mut content = serde_json::json!({
         "phase": phase,
         "state_revision": state_revision,
         "floor_revision": floor_revision,
@@ -2187,6 +2395,12 @@ fn build_state_event(
         "grant": null,
         "transition": transition,
     });
+    if let Some(board_control) = board_control {
+        let object = content.as_object_mut().ok_or_else(|| {
+            DbError::InvalidData("Meeting Baton State content is not an object".to_string())
+        })?;
+        object.insert("board_control".to_string(), board_control);
+    }
     let timestamp =
         u64::try_from(now.timestamp()).map_err(|_| DbError::InvalidTimestamp(now.timestamp()))?;
     EventBuilder::new(
@@ -2557,6 +2771,7 @@ mod tests {
         );
         let event = build_state_event(
             &relay_keys,
+            BatonProtocol::V1,
             session_id,
             &moderator,
             BatonPhase::ModeratorIdle,
@@ -2568,6 +2783,7 @@ mod tests {
             0,
             &BatonConfig::default(),
             &[participant],
+            None,
             &transition,
             now,
         )

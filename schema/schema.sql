@@ -178,6 +178,8 @@ CREATE TABLE meeting_sessions (
     floor_revision    BIGINT NOT NULL DEFAULT 0,
     floor_policy_version TEXT NOT NULL DEFAULT 'uniform-v0',
     moderator_pubkey  BYTEA,
+    terminal_outcome TEXT,
+    terminal_reason_code TEXT,
     PRIMARY KEY (community_id, session_id),
     UNIQUE (community_id, create_event_id),
     UNIQUE (community_id, end_event_id),
@@ -216,17 +218,37 @@ CREATE TABLE meeting_sessions (
                 AND floor_policy_version = 'moderated-board-v1'
                 AND moderator_pubkey = host_pubkey)
         ),
+    CONSTRAINT chk_meeting_terminal_reason_code CHECK (
+        terminal_reason_code IS NULL
+        OR OCTET_LENGTH(terminal_reason_code) BETWEEN 1 AND 128
+    ),
     CONSTRAINT chk_meeting_terminal_shape
         CHECK (
             (status = 'active'
                 AND ended_at IS NULL
                 AND ended_by IS NULL
-                AND end_event_id IS NULL)
+                AND end_event_id IS NULL
+                AND terminal_outcome IS NULL
+                AND terminal_reason_code IS NULL)
             OR
             (status = 'ended'
                 AND ended_at IS NOT NULL
                 AND ended_by IS NOT NULL
-                AND end_event_id IS NOT NULL)
+                AND end_event_id IS NOT NULL
+                AND (
+                    (schema_version IN (1, 2)
+                        AND terminal_outcome IS NULL
+                        AND terminal_reason_code IS NULL)
+                    OR
+                    (schema_version = 3
+                        AND (
+                            (terminal_outcome = 'closed'
+                                AND terminal_reason_code IS NULL)
+                            OR
+                            (terminal_outcome = 'aborted'
+                                AND terminal_reason_code IS NOT NULL)
+                        ))
+                ))
         )
 );
 
@@ -510,15 +532,136 @@ CREATE TABLE meeting_v2_bootstrap_state (
     community_id   UUID NOT NULL REFERENCES communities(id),
     session_id     UUID NOT NULL,
     runtime_phase  TEXT NOT NULL DEFAULT 'bootstrap_locked'
-        CHECK (runtime_phase = 'bootstrap_locked'),
+        CHECK (runtime_phase IN (
+            'bootstrap_locked', 'board_pending', 'floor_ready', 'ended'
+        )),
     control_epoch  BIGINT NOT NULL DEFAULT 1
-        CHECK (control_epoch = 1),
+        CHECK (control_epoch > 0),
+    board_window   BIGINT NOT NULL DEFAULT 0 CHECK (board_window >= 0),
+    board_started_at TIMESTAMPTZ,
+    board_deadline_at TIMESTAMPTZ,
+    board_completed_at TIMESTAMPTZ,
+    board_outcome TEXT CHECK (
+        board_outcome IS NULL
+        OR board_outcome IN ('updated', 'unchanged', 'timed_out', 'preempted')
+    ),
+    terminal_outcome TEXT CHECK (
+        terminal_outcome IS NULL OR terminal_outcome IN ('closed', 'aborted')
+    ),
+    terminal_reason_code TEXT CHECK (
+        terminal_reason_code IS NULL
+        OR OCTET_LENGTH(terminal_reason_code) BETWEEN 1 AND 128
+    ),
+    terminal_at TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (community_id, session_id),
     FOREIGN KEY (community_id, session_id)
-        REFERENCES meeting_sessions (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id),
+    CONSTRAINT chk_meeting_v2_runtime_shape CHECK (
+        (runtime_phase = 'bootstrap_locked'
+            AND board_window = 0
+            AND board_started_at IS NULL
+            AND board_deadline_at IS NULL
+            AND board_completed_at IS NULL
+            AND board_outcome IS NULL
+            AND terminal_outcome IS NULL
+            AND terminal_reason_code IS NULL
+            AND terminal_at IS NULL)
+        OR
+        (runtime_phase = 'board_pending'
+            AND board_window > 0
+            AND board_started_at IS NOT NULL
+            AND board_deadline_at > board_started_at
+            AND board_completed_at IS NULL
+            AND board_outcome IS NULL
+            AND terminal_outcome IS NULL
+            AND terminal_reason_code IS NULL
+            AND terminal_at IS NULL)
+        OR
+        (runtime_phase = 'floor_ready'
+            AND board_window > 0
+            AND board_started_at IS NOT NULL
+            AND board_deadline_at IS NULL
+            AND board_completed_at IS NOT NULL
+            AND board_outcome IS NOT NULL
+            AND terminal_outcome IS NULL
+            AND terminal_reason_code IS NULL
+            AND terminal_at IS NULL)
+        OR
+        (runtime_phase = 'ended'
+            AND board_deadline_at IS NULL
+            AND terminal_outcome IS NOT NULL
+            AND terminal_at IS NOT NULL
+            AND ((terminal_outcome = 'closed' AND terminal_reason_code IS NULL)
+                OR (terminal_outcome = 'aborted'
+                    AND terminal_reason_code IS NOT NULL)))
+    )
 );
+
+CREATE INDEX idx_meeting_v2_board_due
+    ON meeting_v2_bootstrap_state (
+        board_deadline_at, community_id, session_id
+    )
+    WHERE runtime_phase = 'board_pending';
+
+CREATE TABLE meeting_v2_config (
+    community_id        UUID NOT NULL REFERENCES communities(id),
+    session_id          UUID NOT NULL,
+    timing_profile_version TEXT NOT NULL,
+    board_maintenance_ms BIGINT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (community_id, session_id),
+    FOREIGN KEY (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id),
+    CONSTRAINT chk_meeting_v2_timing_profile
+        CHECK (OCTET_LENGTH(timing_profile_version) BETWEEN 1 AND 128),
+    CONSTRAINT chk_meeting_v2_board_maintenance_ms
+        CHECK (board_maintenance_ms BETWEEN 1 AND 86400000)
+);
+
+CREATE TABLE meeting_v2_board_command_receipts (
+    community_id        UUID NOT NULL REFERENCES communities(id),
+    session_id          UUID NOT NULL,
+    command_event_id    BYTEA NOT NULL,
+    author_pubkey       BYTEA NOT NULL,
+    action              TEXT NOT NULL CHECK (action IN ('update', 'unchanged')),
+    accepted            BOOLEAN NOT NULL,
+    outcome_class       TEXT NOT NULL CHECK (
+        outcome_class IN ('accepted', 'rejected_terminal', 'rejected_after_recovery')
+    ),
+    outcome_code        TEXT NOT NULL,
+    control_epoch       BIGINT,
+    board_window        BIGINT,
+    state_revision      BIGINT,
+    board_event_id      BYTEA,
+    response_json       JSONB NOT NULL,
+    recorded_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (community_id, command_event_id),
+    FOREIGN KEY (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id),
+    CONSTRAINT chk_meeting_v2_board_receipt_event_id
+        CHECK (LENGTH(command_event_id) = 32),
+    CONSTRAINT chk_meeting_v2_board_receipt_author
+        CHECK (LENGTH(author_pubkey) = 32),
+    CONSTRAINT chk_meeting_v2_board_receipt_outcome
+        CHECK (OCTET_LENGTH(outcome_code) BETWEEN 1 AND 128),
+    CONSTRAINT chk_meeting_v2_board_receipt_epoch
+        CHECK (control_epoch IS NULL OR control_epoch > 0),
+    CONSTRAINT chk_meeting_v2_board_receipt_window
+        CHECK (board_window IS NULL OR board_window > 0),
+    CONSTRAINT chk_meeting_v2_board_receipt_state
+        CHECK (state_revision IS NULL OR state_revision > 0),
+    CONSTRAINT chk_meeting_v2_board_receipt_board_event
+        CHECK (board_event_id IS NULL OR LENGTH(board_event_id) = 32),
+    CONSTRAINT chk_meeting_v2_board_receipt_response
+        CHECK (jsonb_typeof(response_json) = 'object')
+);
+
+CREATE INDEX idx_meeting_v2_board_receipts_session
+    ON meeting_v2_board_command_receipts (
+        community_id, session_id, recorded_at, command_event_id
+    );
 
 CREATE TABLE meeting_baton_config (
     community_id              UUID NOT NULL REFERENCES communities(id),

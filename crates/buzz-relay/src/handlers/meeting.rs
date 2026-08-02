@@ -32,11 +32,11 @@ pub async fn handle_speech(
     match protocol {
         MeetingProtocol::UniformV0 => handle_v0_speech(tenant, state, event, session_id).await,
         MeetingProtocol::ModeratedBatonV1 => {
-            super::meeting_baton::handle_speech(tenant, state, event).await
+            super::meeting_baton::handle_speech(tenant, state, event, protocol).await
         }
-        MeetingProtocol::ModeratedBoardV2 => Err(IngestError::Rejected(
-            "restricted: Meeting V2 speech is unavailable during stage one".into(),
-        )),
+        MeetingProtocol::ModeratedBoardV2 => {
+            super::meeting_baton::handle_speech(tenant, state, event, protocol).await
+        }
     }
 }
 

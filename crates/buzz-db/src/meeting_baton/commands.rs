@@ -2538,6 +2538,7 @@ async fn build_dynamic_state_event_tx(
     transition: &TransitionSpec,
     now: DateTime<Utc>,
 ) -> Result<(Event, i64, i64, i64, i64, Value)> {
+    let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
     let floor_revision = state.floor_revision + i64::from(delta.floor);
     let intent_revision = state.intent_revision + i64::from(delta.intent);
     let speech_revision = state.speech_revision + i64::from(delta.speech);
@@ -2568,7 +2569,7 @@ async fn build_dynamic_state_event_tx(
     )
     .await?;
     let moderator = hex::encode(moderator_pubkey);
-    let content = json!({
+    let mut content = json!({
         "phase": target.phase,
         "state_revision": state_revision,
         "floor_revision": floor_revision,
@@ -2593,6 +2594,14 @@ async fn build_dynamic_state_event_tx(
         "grant": grant,
         "transition": transition_json,
     });
+    if protocol == BatonProtocol::V2 {
+        let program =
+            crate::meeting_v2::runtime_state_json_tx(tx, community_id, session_id).await?;
+        let object = content.as_object_mut().ok_or_else(|| {
+            DbError::InvalidData("Meeting Baton State content is not an object".to_string())
+        })?;
+        object.insert("board_control".to_string(), program);
+    }
     let session = session_id.to_string();
     let floor = floor_revision.to_string();
     let intent = intent_revision.to_string();
@@ -2600,8 +2609,8 @@ async fn build_dynamic_state_event_tx(
     let state_revision_text = state_revision.to_string();
     let mut tags = vec![
         parse_tag(["h", session.as_str()])?,
-        parse_tag(["v", "2"])?,
-        parse_tag(["policy", BATON_POLICY_VERSION])?,
+        parse_tag(["v", protocol.schema_tag()])?,
+        parse_tag(["policy", protocol.policy()])?,
         parse_tag(["phase", target.phase.as_str()])?,
         parse_tag(["floor-revision", floor.as_str()])?,
         parse_tag(["intent-revision", intent.as_str()])?,
@@ -2626,7 +2635,7 @@ async fn build_dynamic_state_event_tx(
     .tags(tags)
     .custom_created_at(Timestamp::from(timestamp))
     .sign_with_keys(relay_keys)
-    .map_err(|error| DbError::InvalidData(format!("sign Meeting V1 State: {error}")))?;
+    .map_err(|error| DbError::InvalidData(format!("sign Meeting Baton State: {error}")))?;
     Ok((
         event,
         floor_revision,
@@ -3096,8 +3105,38 @@ async fn return_control_to_moderator_tx(
     now: DateTime<Utc>,
     increment_control_epoch: bool,
 ) -> Result<ModeratorControlReturn> {
+    let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
     let unblocked_handoff_ids =
         release_human_request_handoff_blocks_tx(tx, community_id, session_id).await?;
+    if protocol == BatonProtocol::V2 {
+        let mut target = StateTarget::from_state(state);
+        target.active_offer_id = None;
+        target.active_grant_id = None;
+        target.active_decision_attempt_id = None;
+        target.handoff_depth = 0;
+        target.forced_return_to_moderator = false;
+        target.recall_event_id = None;
+        target.decision_attempt = 0;
+        if increment_control_epoch {
+            target.control_epoch += 1;
+        }
+        target.phase = BatonPhase::ModeratorIdle;
+        target.moderator_decision_started_at = None;
+        target.moderator_decision_deadline = None;
+        target.next_action_at = None;
+        crate::meeting_v2::open_board_window_tx(
+            tx,
+            community_id,
+            session_id,
+            target.control_epoch,
+            now,
+        )
+        .await?;
+        return Ok(ModeratorControlReturn {
+            target,
+            unblocked_handoff_ids,
+        });
+    }
     let next_epoch = next_decision_epoch(state.decision_epoch)?;
     let next_has_intent = fallback_candidate_tx(tx, community_id, session_id, state, next_epoch)
         .await?
@@ -3181,6 +3220,37 @@ async fn ensure_moderator_window_tx(
     };
     let candidate =
         fallback_candidate_tx(tx, community_id, session_id, state, eligible_through_epoch).await?;
+    if load_baton_protocol_tx(tx, community_id, session_id).await? == BatonProtocol::V2
+        && state.phase == BatonPhase::ModeratorIdle
+        && candidate.is_some()
+    {
+        let runtime =
+            crate::meeting_v2::load_runtime_tx(tx, community_id, session_id, true).await?;
+        match runtime.phase {
+            crate::meeting_v2::RuntimePhase::BoardPending => {
+                return Ok(StateTarget::from_state(state));
+            }
+            crate::meeting_v2::RuntimePhase::FloorReady => {
+                crate::meeting_v2::open_board_window_tx(
+                    tx,
+                    community_id,
+                    session_id,
+                    state.control_epoch,
+                    now,
+                )
+                .await?;
+                return Ok(StateTarget::from_state(state));
+            }
+            crate::meeting_v2::RuntimePhase::BootstrapLocked => {
+                return Err(DbError::InvalidData(
+                    "Meeting V2 Baton command reached an uninitialized runtime".to_string(),
+                ));
+            }
+            crate::meeting_v2::RuntimePhase::Ended => {
+                return Ok(StateTarget::from_state(state));
+            }
+        }
+    }
     let mut target = StateTarget::from_state(state);
     match (state.phase, candidate.is_some()) {
         (BatonPhase::ModeratorIdle, true) => {
@@ -3203,6 +3273,86 @@ async fn ensure_moderator_window_tx(
         _ => {}
     }
     Ok(target)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_v2_board_window_state_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    relay_keys: &Keys,
+    transition_type: &'static str,
+    caused_by_event_id: Option<&[u8]>,
+    board_window: i64,
+    now: DateTime<Utc>,
+) -> Result<BatonTransitionResult> {
+    if load_baton_protocol_tx(tx, community_id, session_id).await? != BatonProtocol::V2 {
+        return Err(DbError::InvalidData(format!(
+            "meeting {session_id} is not a Meeting V2 session"
+        )));
+    }
+    let state = load_state_tx(tx, community_id, session_id, true).await?;
+    if state.phase != BatonPhase::ModeratorIdle
+        || state.active_offer_id.is_some()
+        || state.active_grant_id.is_some()
+    {
+        return Err(DbError::InvalidData(
+            "Meeting V2 Board completion requires idle moderator control".to_string(),
+        ));
+    }
+    let config = load_config_tx(tx, community_id, session_id).await?;
+    let next_epoch = next_decision_epoch(state.decision_epoch)?;
+    let next_has_intent = fallback_candidate_tx(tx, community_id, session_id, &state, next_epoch)
+        .await?
+        .is_some();
+    let next_has_handoff =
+        current_cohort_has_handoffs_tx(tx, community_id, session_id, next_epoch).await?;
+    let mut target = StateTarget::from_state(&state);
+    target.active_decision_attempt_id = None;
+    target.decision_attempt = 0;
+    if next_has_intent || next_has_handoff {
+        target.decision_epoch = next_epoch;
+    }
+    if next_has_intent {
+        clear_handoff_retry_suppression_tx(tx, community_id, session_id).await?;
+        target.phase = BatonPhase::ModeratorControl;
+        target.moderator_decision_started_at = Some(now);
+        let deadline = now + Duration::milliseconds(config.moderator_decision_ms);
+        target.moderator_decision_deadline = Some(deadline);
+        target.next_action_at = Some(deadline);
+    } else {
+        target.phase = BatonPhase::ModeratorIdle;
+        target.moderator_decision_started_at = None;
+        target.moderator_decision_deadline = None;
+        target.next_action_at = None;
+    }
+    let mut effects = vec![json!({
+        "type": transition_type,
+        "object_type": "board_window",
+        "object_id": board_window.to_string(),
+        "from": "board_pending",
+        "to": "floor_ready",
+    })];
+    if target.phase != state.phase {
+        effects.push(phase_effect(session_id, state.phase, target.phase));
+    }
+    let transition = match caused_by_event_id {
+        Some(event_id) => TransitionSpec::command(transition_type, None, event_id, effects),
+        None => TransitionSpec::deadline(transition_type, None, "board_maintenance", effects),
+    };
+    let (_, result) = commit_transition_tx(
+        tx,
+        community_id,
+        session_id,
+        relay_keys,
+        &state,
+        target,
+        RevisionDelta::FLOOR,
+        transition,
+        now,
+    )
+    .await?;
+    Ok(result)
 }
 
 async fn release_offer_deferrals_tx(
@@ -3612,6 +3762,20 @@ async fn advance_due_locked_tx(
 ) -> Result<(StateRow, Vec<BatonTransitionResult>)> {
     let config = load_config_tx(tx, community_id, session_id).await?;
     let mut transitions = Vec::new();
+    if load_baton_protocol_tx(tx, community_id, session_id).await? == BatonProtocol::V2 {
+        if let Some(transition) = crate::meeting_v2::recover_due_board_locked_tx(
+            tx,
+            community_id,
+            session_id,
+            relay_keys,
+            now,
+        )
+        .await?
+        {
+            transitions.push(transition);
+            state = load_state_tx(tx, community_id, session_id, true).await?;
+        }
+    }
     if state.phase == BatonPhase::Offered {
         let offer_id = state.active_offer_id.as_deref().ok_or_else(|| {
             DbError::InvalidData("offered Baton state has no active Offer".to_string())
@@ -3882,7 +4046,7 @@ async fn advance_due_locked_tx(
     Ok((state, transitions))
 }
 
-/// List a bounded set of Meeting V1 Sessions whose current deadline is due.
+/// List a bounded set of moderated Meeting Sessions whose current deadline is due.
 ///
 /// Each candidate must subsequently pass through [`recover_meeting_v1`],
 /// which locks the Session and rechecks the database clock. Claiming is atomic
@@ -3893,19 +4057,57 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
     if limit <= 0 {
         return Ok(Vec::new());
     }
+    let bootstrap_rows = sqlx::query(
+        "SELECT runtime.community_id, runtime.session_id, \
+                runtime.created_at AS next_action_at \
+         FROM meeting_v2_bootstrap_state runtime \
+         JOIN meeting_sessions session \
+           ON session.community_id = runtime.community_id \
+          AND session.session_id = runtime.session_id \
+         WHERE runtime.runtime_phase = 'bootstrap_locked' \
+           AND session.status = 'active' \
+           AND session.schema_version = 3 \
+           AND session.floor_policy_version = $1 \
+         ORDER BY runtime.created_at, runtime.community_id, runtime.session_id \
+         LIMIT $2",
+    )
+    .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+    let mut sessions = bootstrap_rows
+        .into_iter()
+        .map(|row| {
+            Ok(BatonDueSession {
+                community_id: CommunityId::from_uuid(row.try_get("community_id")?),
+                session_id: row.try_get("session_id")?,
+                next_action_at: row.try_get("next_action_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let remaining = limit.saturating_sub(i64::try_from(sessions.len()).unwrap_or(i64::MAX));
+    if remaining == 0 {
+        return Ok(sessions);
+    }
     let rows = sqlx::query(
         "WITH due AS ( \
-             SELECT s.community_id, s.session_id \
+             SELECT s.community_id, s.session_id, \
+                    COALESCE(LEAST(s.next_action_at, v2.board_deadline_at), \
+                             s.next_action_at, v2.board_deadline_at) AS effective_deadline \
              FROM meeting_baton_state s \
              JOIN meeting_sessions m \
                ON m.community_id = s.community_id AND m.session_id = s.session_id \
-             WHERE s.next_action_at <= clock_timestamp() \
+             LEFT JOIN meeting_v2_bootstrap_state v2 \
+               ON v2.community_id = s.community_id AND v2.session_id = s.session_id \
+             WHERE COALESCE(LEAST(s.next_action_at, v2.board_deadline_at), \
+                            s.next_action_at, v2.board_deadline_at) <= clock_timestamp() \
                AND s.recovery_retry_at <= clock_timestamp() \
-               AND m.status = 'active' AND m.schema_version = 2 \
-               AND m.floor_policy_version = $1 \
-             ORDER BY s.next_action_at, s.community_id, s.session_id \
+               AND m.status = 'active' \
+               AND ((m.schema_version = 2 AND m.floor_policy_version = $1) \
+                 OR (m.schema_version = 3 AND m.floor_policy_version = $2)) \
+             ORDER BY effective_deadline, s.community_id, s.session_id \
              FOR UPDATE OF s SKIP LOCKED \
-             LIMIT $2 \
+             LIMIT $3 \
          ), claimed AS ( \
              UPDATE meeting_baton_state s \
              SET recovery_retry_at = clock_timestamp() \
@@ -3915,17 +4117,20 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
              FROM due \
              WHERE s.community_id = due.community_id \
                AND s.session_id = due.session_id \
-             RETURNING s.community_id, s.session_id, s.next_action_at \
+             RETURNING s.community_id, s.session_id \
          ) \
-         SELECT community_id, session_id, next_action_at \
+         SELECT claimed.community_id, claimed.session_id, due.effective_deadline AS next_action_at \
          FROM claimed \
+         JOIN due USING (community_id, session_id) \
          ORDER BY next_action_at, community_id, session_id",
     )
     .bind(BATON_POLICY_VERSION)
-    .bind(limit)
+    .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(remaining)
     .fetch_all(&db.pool)
     .await?;
-    rows.into_iter()
+    let mut due = rows
+        .into_iter()
         .map(|row| {
             Ok(BatonDueSession {
                 community_id: CommunityId::from_uuid(row.try_get("community_id")?),
@@ -3933,11 +4138,23 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
                 next_action_at: row.try_get("next_action_at")?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    sessions.append(&mut due);
+    sessions.sort_by(|left, right| {
+        left.next_action_at
+            .cmp(&right.next_action_at)
+            .then_with(|| {
+                left.community_id
+                    .as_uuid()
+                    .cmp(right.community_id.as_uuid())
+            })
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    Ok(sessions)
 }
 
-/// Recover any due Offer, Grant, or moderator-decision deadline for one V1
-/// Session and commit Relay State/outbox rows atomically.
+/// Recover any due Board, Offer, Grant, or moderator-decision deadline for one
+/// moderated Session and commit Relay State/outbox rows atomically.
 ///
 /// Returning an empty vector means another worker or a participant command
 /// already advanced the Session, or its deadline has moved into the future.
@@ -3948,29 +4165,41 @@ pub async fn recover_meeting_v1(
     relay_keys: &Keys,
 ) -> Result<Vec<BatonTransitionResult>> {
     let mut tx = db.begin_transaction().await?;
-    let session = lock_v1_session_tx(&mut tx, community_id, session_id).await?;
+    let session = lock_baton_session_tx(&mut tx, community_id, session_id).await?;
     if session.status != "active" {
         tx.commit().await?;
         return Ok(Vec::new());
     }
-    if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
-        &mut tx,
-        community_id,
-        session_id,
-        relay_keys,
-    )
-    .await?
-    {
-        let transition = BatonTransitionResult {
-            primary_type: "participant_revoked".to_string(),
-            state_revision: snapshot.state_revision,
-            state_event_id: snapshot.state_event_id,
-        };
-        tx.commit().await?;
-        return Ok(vec![transition]);
+    let now = database_now(&mut tx).await?;
+    if session.protocol == BatonProtocol::V2 {
+        crate::meeting_v2::ensure_runtime_initialized_tx(
+            &mut tx,
+            community_id,
+            session_id,
+            relay_keys,
+            now,
+        )
+        .await?;
+    }
+    if matches!(session.protocol, BatonProtocol::V1 | BatonProtocol::V2) {
+        if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
+            &mut tx,
+            community_id,
+            session_id,
+            relay_keys,
+        )
+        .await?
+        {
+            let transition = BatonTransitionResult {
+                primary_type: "participant_revoked".to_string(),
+                state_revision: snapshot.state_revision,
+                state_event_id: snapshot.state_event_id,
+            };
+            tx.commit().await?;
+            return Ok(vec![transition]);
+        }
     }
     let state = load_state_tx(&mut tx, community_id, session_id, true).await?;
-    let now = database_now(&mut tx).await?;
     let (_, transitions) =
         advance_due_locked_tx(&mut tx, community_id, session_id, relay_keys, state, now).await?;
     if transitions.is_empty() {
@@ -4079,9 +4308,19 @@ pub async fn execute_baton_command(
     let event_id = params.event.id.as_bytes().to_vec();
     let action = params.command.action();
     let mut tx = db.begin_transaction().await?;
-    let session = lock_v1_session_tx(&mut tx, params.community_id, params.session_id).await?;
-    let actor = load_actor_tx(&mut tx, params.community_id, params.session_id, &author).await?;
+    let session = lock_baton_session_tx(&mut tx, params.community_id, params.session_id).await?;
     let now = database_now(&mut tx).await?;
+    if session.protocol == BatonProtocol::V2 && session.status == "active" {
+        crate::meeting_v2::ensure_runtime_initialized_tx(
+            &mut tx,
+            params.community_id,
+            params.session_id,
+            params.relay_keys,
+            now,
+        )
+        .await?;
+    }
+    let actor = load_actor_tx(&mut tx, params.community_id, params.session_id, &author).await?;
     let state = load_state_tx(&mut tx, params.community_id, params.session_id, true).await?;
     let state_before_recovery = state.clone();
     let command_depended_on_recovered_object = command_depends_on_current_deadline_tx(
@@ -4092,7 +4331,9 @@ pub async fn execute_baton_command(
         &params.command,
     )
     .await?;
-    if session.status == "active" {
+    if session.status == "active"
+        && matches!(session.protocol, BatonProtocol::V1 | BatonProtocol::V2)
+    {
         if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
             &mut tx,
             params.community_id,
@@ -4184,7 +4425,9 @@ pub async fn execute_baton_command(
         ));
     }
     if !actor_security_active_tx(&mut tx, params.community_id, &actor.pubkey).await? {
-        if session.status == "active" {
+        if session.status == "active"
+            && matches!(session.protocol, BatonProtocol::V1 | BatonProtocol::V2)
+        {
             if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
                 &mut tx,
                 params.community_id,
@@ -7535,6 +7778,10 @@ async fn apply_human_command_tx(
             .bind(now)
             .execute(tx.as_mut())
             .await?;
+            if load_baton_protocol_tx(tx, community_id, session_id).await? == BatonProtocol::V2 {
+                crate::meeting_v2::preempt_board_window_tx(tx, community_id, session_id, now)
+                    .await?;
+            }
             let request = load_request_tx(tx, community_id, session_id, &request_id)
                 .await?
                 .ok_or_else(|| DbError::InvalidData("new Human Request is missing".to_string()))?;
