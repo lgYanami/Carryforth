@@ -13,8 +13,10 @@ use buzz_core::kind::{
 use buzz_core::{CommunityId, EventId, PublicKey, StoredEvent};
 use buzz_project_document::{
     reduce_document, CurrentDocument, DocumentAttribution, DocumentCatalog, DocumentChangeContext,
-    DocumentCommandRequest, DocumentError, DocumentRevision, DocumentState, DocumentTransition,
+    DocumentCommandRequest, DocumentError, DocumentHeadProjection, DocumentRevision,
+    DocumentRevisionProjection, DocumentSnapshot, DocumentState, DocumentTransition,
     ProjectDocument, ProjectDocumentCommand, ProjectDocumentReceipt, MAX_SAFE_REVISION,
+    PROJECT_DOCUMENT_SCHEMA_VERSION,
 };
 use buzz_sdk::project_document::{
     parse_document_command, parse_document_head, parse_document_meta, parse_document_revision,
@@ -23,7 +25,7 @@ use buzz_sdk::project_document::{
 use chrono::{DateTime, Utc};
 use nostr::Event;
 use serde_json::Value;
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{Db, DbError};
@@ -245,6 +247,114 @@ pub struct ProjectDocumentFeatureStatus {
     pub projection_pubkey: Option<PublicKey>,
 }
 
+/// Durable state of one inactive-generation full-history reprojection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDocumentReprojectStatus {
+    /// Stable operation identity used for safe resume.
+    pub operation_id: Uuid,
+    /// Community whose projections are being replaced.
+    pub community_id: CommunityId,
+    /// `staging`, `ready`, `activated`, or `aborted`.
+    pub state: String,
+    /// Generation visible when staging started.
+    pub source_generation: u64,
+    /// Inactive generation being built.
+    pub target_generation: u64,
+    /// Signer of the inactive generation.
+    pub target_pubkey: PublicKey,
+    /// Immutable revisions fixed in the staging snapshot.
+    pub revision_count: u64,
+    /// Current heads fixed in the staging snapshot.
+    pub document_count: u64,
+    /// Signed revision events currently staged.
+    pub staged_revision_count: u64,
+    /// Signed current-head events currently staged.
+    pub staged_head_count: u64,
+    /// Whether the reset metadata event is staged.
+    pub meta_staged: bool,
+}
+
+/// Indexed pointer diagnostics for operator status output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectDocumentIntegrityStatus {
+    /// Live projection events that are not named by the active generation.
+    pub orphan_projection_count: u64,
+    /// Canonical meta/head/revision pointers whose event envelope is absent or
+    /// belongs to another signer/generation.
+    pub pointer_mismatch_count: u64,
+}
+
+/// Fixed canonical basis for an inactive-generation reprojection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDocumentReprojectContext {
+    /// Durable operation identity.
+    pub operation_id: Uuid,
+    /// Community/Project identity.
+    pub community_id: CommunityId,
+    /// Source generation that remains visible until activation.
+    pub source_generation: u64,
+    /// Inactive target generation.
+    pub target_generation: u64,
+    /// Target stable signer.
+    pub target_pubkey: PublicKey,
+    /// Fixed current catalog revision.
+    pub catalog_revision: u64,
+    /// Fixed active Document count.
+    pub active_document_count: u64,
+    /// Fixed current-row count, including tombstones.
+    pub document_count: u64,
+    /// Fixed immutable revision count.
+    pub revision_count: u64,
+    /// Canonical catalog initialization time.
+    pub initialized_at: DateTime<Utc>,
+    /// Canonical current catalog observation time.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One immutable canonical revision plus the creation provenance needed to
+/// reconstruct its Relay-signed projection without loading the whole history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDocumentReprojectRevision {
+    /// Stable Document identity.
+    pub document_id: Uuid,
+    /// Positive Document-local revision.
+    pub document_revision: u64,
+    /// Catalog revision originally committed with this revision.
+    pub catalog_revision: u64,
+    /// Active snapshot or tombstone.
+    pub revision: DocumentRevision,
+    /// Immutable Document creation attribution.
+    pub created: DocumentAttribution,
+    /// Original Human command event used as projection source.
+    pub source_event_id: EventId,
+    /// Whether this revision is the current head target.
+    pub is_current: bool,
+}
+
+/// Staging subtype for one signed inactive-generation event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDocumentReprojectEventType {
+    /// Immutable revision projection.
+    Revision,
+    /// Current head projection.
+    Head,
+    /// Reset catalog metadata projection.
+    Meta,
+}
+
+/// One signed event prepared for inactive-generation staging.
+#[derive(Debug, Clone)]
+pub struct PreparedProjectDocumentReprojectEvent {
+    /// Projection subtype.
+    pub projection_type: ProjectDocumentReprojectEventType,
+    /// Document identity for revision/head events.
+    pub document_id: Option<Uuid>,
+    /// Document revision for revision/head events.
+    pub document_revision: Option<u64>,
+    /// Strict signed Nostr event.
+    pub event: Event,
+}
+
 /// Read-only preflight explaining whether an already-bootstrapped catalog is
 /// safe for a future explicit enable operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,8 +414,11 @@ impl Db {
                 AND to_regclass('project_documents') IS NOT NULL \
                 AND to_regclass('project_document_revisions') IS NOT NULL \
                 AND to_regclass('project_document_changes') IS NOT NULL \
+                AND to_regclass('project_document_reprojects') IS NOT NULL \
+                AND to_regclass('project_document_reproject_events') IS NOT NULL \
                 AND to_regclass('idx_project_documents_active') IS NOT NULL \
-                AND to_regclass('idx_project_document_revisions_history') IS NOT NULL",
+                AND to_regclass('idx_project_document_revisions_history') IS NOT NULL \
+                AND to_regprocedure('project_document_validate_history_projection(uuid)') IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -359,19 +472,23 @@ impl Db {
         community_id: CommunityId,
         expected_pubkey: &PublicKey,
     ) -> crate::Result<bool> {
-        let Some(status) = self.project_document_status(community_id).await? else {
-            return Ok(false);
-        };
-        if status.archived
-            || !status.enabled
-            || !matches!(status.project_view_schema_version, 2 | 3)
-        {
+        if !self.project_document_schema_ready().await? {
             return Ok(false);
         }
-        Ok(self
-            .project_document_preflight(community_id, expected_pubkey)
-            .await?
-            .ready)
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM communities c \
+                 JOIN project_document_state s ON s.community_id = c.id \
+                 WHERE c.id = $1 AND c.archived_at IS NULL \
+                   AND c.project_document_enabled \
+                   AND c.project_view_schema_version IN (2, 3) \
+                   AND s.projection_pubkey = $2 \
+                   AND s.projection_generation BETWEEN 1 AND 9007199254740991)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(expected_pubkey.as_bytes())
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     /// Document readers use the same current Human / managed-owner and active
@@ -408,13 +525,9 @@ impl Db {
                     c.project_document_enabled, c.project_view_schema_version, \
                     s.catalog_revision, s.active_document_count, \
                     s.projection_generation, s.projection_pubkey, \
-                    count(r.document_revision)::bigint AS revision_count \
+                    COALESCE(s.catalog_revision, 0)::bigint AS revision_count \
              FROM communities c \
              LEFT JOIN project_document_state s ON s.community_id = c.id \
-             LEFT JOIN project_document_revisions r ON r.community_id = c.id \
-             GROUP BY c.id, c.host, c.archived_at, c.project_document_enabled, \
-                      c.project_view_schema_version, s.catalog_revision, \
-                      s.active_document_count, s.projection_generation, s.projection_pubkey \
              ORDER BY c.id",
         )
         .fetch_all(&self.pool)
@@ -435,14 +548,10 @@ impl Db {
                     c.project_document_enabled, c.project_view_schema_version, \
                     s.catalog_revision, s.active_document_count, \
                     s.projection_generation, s.projection_pubkey, \
-                    count(r.document_revision)::bigint AS revision_count \
+                    COALESCE(s.catalog_revision, 0)::bigint AS revision_count \
              FROM communities c \
              LEFT JOIN project_document_state s ON s.community_id = c.id \
-             LEFT JOIN project_document_revisions r ON r.community_id = c.id \
-             WHERE c.id = $1 \
-             GROUP BY c.id, c.host, c.archived_at, c.project_document_enabled, \
-                      c.project_view_schema_version, s.catalog_revision, \
-                      s.active_document_count, s.projection_generation, s.projection_pubkey",
+             WHERE c.id = $1",
         )
         .bind(community_id.as_uuid())
         .fetch_optional(&self.pool)
@@ -777,6 +886,82 @@ impl Db {
         Ok(ProjectDocumentProjectionPage { events })
     }
 
+    /// Explain the exact closed history-page query under the same reader and
+    /// generation gates used by live requests. Intended for local capacity
+    /// acceptance; no business content is included in the plan.
+    pub async fn project_document_history_query_plan(
+        &self,
+        request: ProjectDocumentHistoryPageRequest<'_>,
+    ) -> Result<Value, ProjectDocumentReadError> {
+        let ProjectDocumentHistoryPageRequest {
+            community_id,
+            expected_pubkey,
+            reader_pubkey,
+            projection_generation,
+            document_id,
+            max_document_revision,
+            before_revision,
+            limit,
+        } = request;
+        if !(1..=50).contains(&limit)
+            || max_document_revision == 0
+            || max_document_revision > MAX_SAFE_REVISION
+            || before_revision.is_some_and(|value| value == 0 || value > MAX_SAFE_REVISION)
+        {
+            return Err(ProjectDocumentReadError::InvalidRequest(
+                "history revision or limit is outside the v1 range".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
+        require_document_reader_in_tx(&mut tx, community_id, reader_pubkey).await?;
+        require_document_read_state_in_tx(
+            &mut tx,
+            community_id,
+            expected_pubkey,
+            projection_generation,
+            None,
+        )
+        .await?;
+        let plan: Value = sqlx::query_scalar(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) \
+             SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, \
+                    e.received_at, e.channel_id \
+             FROM project_document_revisions r \
+             JOIN events e ON e.community_id = r.community_id \
+                          AND e.id = r.projection_event_id \
+             WHERE r.community_id = $1 AND r.document_id = $2 \
+               AND r.document_revision <= $3 \
+               AND ($4::bigint IS NULL OR r.document_revision < $4) \
+               AND r.projection_generation = $5 \
+               AND e.deleted_at IS NULL AND e.kind = $6 AND e.pubkey = $7 \
+             ORDER BY r.document_revision DESC LIMIT $8",
+        )
+        .bind(community_id.as_uuid())
+        .bind(document_id)
+        .bind(
+            revision_to_i64(max_document_revision, "max_document_revision")
+                .map_err(|error| ProjectDocumentReadError::InvalidRequest(error.to_string()))?,
+        )
+        .bind(
+            before_revision
+                .map(|value| revision_to_i64(value, "before_revision"))
+                .transpose()
+                .map_err(|error| ProjectDocumentReadError::InvalidRequest(error.to_string()))?,
+        )
+        .bind(
+            revision_to_i64(projection_generation, "projection_generation")
+                .map_err(|error| ProjectDocumentReadError::InvalidRequest(error.to_string()))?,
+        )
+        .bind(KIND_PROJECT_DOCUMENT_REVISION as i32)
+        .bind(expected_pubkey.as_bytes())
+        .bind(i64::from(limit))
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(plan)
+    }
+
     /// Commit a signed revision-zero reset catalog while the capability is off.
     ///
     /// The controlled admin workflow invokes this only while the capability is
@@ -856,6 +1041,538 @@ impl Db {
         Ok(())
     }
 
+    /// Return the newest durable reprojection operation for one Community.
+    pub async fn project_document_reproject_status(
+        &self,
+        community_id: CommunityId,
+    ) -> crate::Result<Option<ProjectDocumentReprojectStatus>> {
+        if !self.project_document_schema_ready().await? {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT operation_id, community_id, state, source_projection_generation, \
+                    target_projection_generation, target_projection_pubkey, revision_count, \
+                    document_count, \
+                    (SELECT count(*)::bigint FROM project_document_reproject_events e \
+                     WHERE e.community_id = r.community_id AND e.operation_id = r.operation_id \
+                       AND e.projection_type = 'revision') AS staged_revision_count, \
+                    (SELECT count(*)::bigint FROM project_document_reproject_events e \
+                     WHERE e.community_id = r.community_id AND e.operation_id = r.operation_id \
+                       AND e.projection_type = 'head') AS staged_head_count, \
+                    EXISTS (SELECT 1 FROM project_document_reproject_events e \
+                     WHERE e.community_id = r.community_id AND e.operation_id = r.operation_id \
+                       AND e.projection_type = 'meta') AS meta_staged \
+             FROM project_document_reprojects r WHERE community_id = $1 \
+             ORDER BY started_at DESC, operation_id DESC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(reproject_status_from_row).transpose()
+    }
+
+    /// Count active-generation pointer mismatches and unreferenced live
+    /// projection events under the Community shared lock.
+    pub async fn project_document_integrity_status(
+        &self,
+        community_id: CommunityId,
+    ) -> crate::Result<ProjectDocumentIntegrityStatus> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
+        let row = sqlx::query(
+            "WITH state AS ( \
+                 SELECT projection_pubkey, projection_generation, meta_projection_event_id \
+                 FROM project_document_state WHERE community_id = $1), \
+             mismatches AS ( \
+                 SELECT 1 FROM state s WHERE NOT EXISTS ( \
+                     SELECT 1 FROM events e WHERE e.community_id = $1 \
+                       AND e.id = s.meta_projection_event_id AND e.kind = $2 \
+                       AND e.pubkey = s.projection_pubkey AND e.deleted_at IS NULL) \
+                 UNION ALL \
+                 SELECT 1 FROM project_documents d CROSS JOIN state s \
+                 WHERE d.community_id = $1 AND ( \
+                     NOT EXISTS (SELECT 1 FROM events e WHERE e.community_id = d.community_id \
+                       AND e.id = d.current_head_event_id AND e.kind = $3 \
+                       AND e.pubkey = s.projection_pubkey AND e.deleted_at IS NULL) \
+                     OR NOT EXISTS (SELECT 1 FROM events e WHERE e.community_id = d.community_id \
+                       AND e.id = d.current_revision_event_id AND e.kind = $4 \
+                       AND e.pubkey = s.projection_pubkey AND e.deleted_at IS NULL)) \
+                 UNION ALL \
+                 SELECT 1 FROM project_document_revisions r CROSS JOIN state s \
+                 WHERE r.community_id = $1 AND ( \
+                     r.projection_generation <> s.projection_generation \
+                     OR NOT EXISTS (SELECT 1 FROM events e \
+                        WHERE e.community_id = r.community_id \
+                          AND e.id = r.projection_event_id AND e.kind = $4 \
+                          AND e.pubkey = s.projection_pubkey AND e.deleted_at IS NULL))), \
+             active_pointers AS ( \
+                 SELECT meta_projection_event_id AS event_id FROM state \
+                 UNION SELECT current_head_event_id FROM project_documents WHERE community_id = $1 \
+                 UNION SELECT projection_event_id FROM project_document_revisions WHERE community_id = $1) \
+             SELECT (SELECT count(*)::bigint FROM mismatches) AS pointer_mismatch_count, \
+                    (SELECT count(*)::bigint FROM events e \
+                     WHERE e.community_id = $1 AND e.kind IN ($2, $3, $4) \
+                       AND e.deleted_at IS NULL \
+                       AND NOT EXISTS (SELECT 1 FROM active_pointers p WHERE p.event_id = e.id)) \
+                       AS orphan_projection_count",
+        )
+        .bind(community_id.as_uuid())
+        .bind(KIND_PROJECT_DOCUMENT_META as i32)
+        .bind(KIND_PROJECT_DOCUMENT_HEAD as i32)
+        .bind(KIND_PROJECT_DOCUMENT_REVISION as i32)
+        .fetch_one(&mut *tx)
+        .await?;
+        let status = ProjectDocumentIntegrityStatus {
+            orphan_projection_count: db_nonnegative_revision_db(
+                row.try_get("orphan_projection_count")?,
+                "orphan_projection_count",
+            )?,
+            pointer_mismatch_count: db_nonnegative_revision_db(
+                row.try_get("pointer_mismatch_count")?,
+                "pointer_mismatch_count",
+            )?,
+        };
+        tx.commit().await?;
+        Ok(status)
+    }
+
+    /// Start or safely resume one inactive target generation while member
+    /// access remains disabled.
+    pub async fn begin_project_document_reproject(
+        &self,
+        community_id: CommunityId,
+        target_pubkey: PublicKey,
+    ) -> ProjectDocumentWriteResult<ProjectDocumentReprojectContext> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        let row = sqlx::query(
+            "SELECT c.project_document_enabled, c.archived_at IS NULL AS active, \
+                    c.project_view_schema_version, s.catalog_revision, \
+                    s.active_document_count, s.projection_pubkey, s.projection_generation, \
+                    s.initialized_at, s.updated_at, \
+                    (SELECT count(*)::bigint FROM project_documents d \
+                     WHERE d.community_id = c.id) AS document_count \
+             FROM communities c JOIN project_document_state s ON s.community_id = c.id \
+             WHERE c.id = $1 FOR UPDATE OF c, s",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(ProjectDocumentWriteError::Unavailable { community_id });
+        };
+        let enabled: bool = row.try_get("project_document_enabled")?;
+        let active: bool = row.try_get("active")?;
+        let schema: i16 = row.try_get("project_view_schema_version")?;
+        if enabled || !active || !matches!(schema, 2 | 3) {
+            return Err(ProjectDocumentWriteError::Unavailable { community_id });
+        }
+        let source_generation = db_positive_revision(
+            row.try_get("projection_generation")?,
+            "projection_generation",
+        )?;
+        let target_generation = source_generation.checked_add(1).ok_or_else(|| {
+            ProjectDocumentWriteError::InvalidCommit(
+                "projection generation cannot advance beyond the safe range".to_owned(),
+            )
+        })?;
+        if target_generation > MAX_SAFE_REVISION {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "projection generation cannot advance beyond the safe range".to_owned(),
+            ));
+        }
+        let source_pubkey: Vec<u8> = row.try_get("projection_pubkey")?;
+        let catalog_revision =
+            db_nonnegative_revision(row.try_get("catalog_revision")?, "catalog_revision")?;
+        let active_document_count = db_nonnegative_revision(
+            row.try_get("active_document_count")?,
+            "active_document_count",
+        )?;
+        let document_count =
+            db_nonnegative_revision(row.try_get("document_count")?, "document_count")?;
+        let initialized_at = row.try_get("initialized_at")?;
+        let updated_at = row.try_get("updated_at")?;
+        let open = sqlx::query(
+            "SELECT operation_id, source_projection_pubkey, source_projection_generation, \
+                    target_projection_pubkey, target_projection_generation, catalog_revision, \
+                    active_document_count, document_count, revision_count \
+             FROM project_document_reprojects \
+             WHERE community_id = $1 AND state IN ('staging', 'ready') FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let operation_id = if let Some(open) = open {
+            let staged_target: Vec<u8> = open.try_get("target_projection_pubkey")?;
+            let staged_source: Vec<u8> = open.try_get("source_projection_pubkey")?;
+            let exact = staged_target.as_slice() == target_pubkey.as_bytes()
+                && staged_source == source_pubkey
+                && open.try_get::<i64, _>("source_projection_generation")?
+                    == i64::try_from(source_generation).unwrap_or(i64::MAX)
+                && open.try_get::<i64, _>("target_projection_generation")?
+                    == i64::try_from(target_generation).unwrap_or(i64::MAX)
+                && open.try_get::<i64, _>("catalog_revision")?
+                    == i64::try_from(catalog_revision).unwrap_or(i64::MAX)
+                && open.try_get::<i64, _>("active_document_count")?
+                    == i64::try_from(active_document_count).unwrap_or(i64::MAX)
+                && open.try_get::<i64, _>("document_count")?
+                    == i64::try_from(document_count).unwrap_or(i64::MAX)
+                && open.try_get::<i64, _>("revision_count")?
+                    == i64::try_from(catalog_revision).unwrap_or(i64::MAX);
+            if !exact {
+                return Err(ProjectDocumentWriteError::InvalidCommit(
+                    "a different or stale Project Document reproject is already open".to_owned(),
+                ));
+            }
+            open.try_get("operation_id")?
+        } else {
+            let operation_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO project_document_reprojects \
+                    (operation_id, community_id, state, source_projection_pubkey, \
+                     source_projection_generation, target_projection_pubkey, \
+                     target_projection_generation, catalog_revision, active_document_count, \
+                     document_count, revision_count) \
+                 VALUES ($1, $2, 'staging', $3, $4, $5, $6, $7, $8, $9, $7)",
+            )
+            .bind(operation_id)
+            .bind(community_id.as_uuid())
+            .bind(source_pubkey.as_slice())
+            .bind(revision_to_i64(source_generation, "source_generation")?)
+            .bind(target_pubkey.as_bytes())
+            .bind(revision_to_i64(target_generation, "target_generation")?)
+            .bind(revision_to_i64(catalog_revision, "catalog_revision")?)
+            .bind(revision_to_i64(
+                active_document_count,
+                "active_document_count",
+            )?)
+            .bind(revision_to_i64(document_count, "document_count")?)
+            .execute(&mut *tx)
+            .await?;
+            append_document_control_audit(&mut tx, community_id, "reproject_stage_begin").await?;
+            operation_id
+        };
+        tx.commit().await?;
+        Ok(ProjectDocumentReprojectContext {
+            operation_id,
+            community_id,
+            source_generation,
+            target_generation,
+            target_pubkey,
+            catalog_revision,
+            active_document_count,
+            document_count,
+            revision_count: catalog_revision,
+            initialized_at,
+            updated_at,
+        })
+    }
+
+    /// Load a bounded keyset page from the immutable canonical history fixed by
+    /// an open reprojection operation.
+    pub async fn project_document_reproject_revision_page(
+        &self,
+        context: &ProjectDocumentReprojectContext,
+        after_catalog_revision: u64,
+        limit: u16,
+    ) -> ProjectDocumentWriteResult<Vec<ProjectDocumentReprojectRevision>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "reproject page limit must be in 1..=1000".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, context.community_id, true).await?;
+        require_reproject_basis(&mut tx, context, "staging").await?;
+        let rows = sqlx::query(
+            "SELECT r.document_id, r.document_revision, r.catalog_revision, r.state, \
+                    r.title, r.summary, r.content_markdown, r.actor_pubkey, r.canonical_at, \
+                    r.source_event_id, d.created_at AS document_created_at, d.created_by, \
+                    r.document_revision = d.current_revision AS is_current \
+             FROM project_document_revisions r \
+             JOIN project_documents d ON d.community_id = r.community_id \
+                                     AND d.document_id = r.document_id \
+             WHERE r.community_id = $1 AND r.catalog_revision > $2 \
+               AND r.catalog_revision <= $3 \
+             ORDER BY r.catalog_revision ASC LIMIT $4",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(revision_to_i64(
+            after_catalog_revision,
+            "after_catalog_revision",
+        )?)
+        .bind(revision_to_i64(
+            context.catalog_revision,
+            "catalog_revision",
+        )?)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        let revisions = rows
+            .iter()
+            .map(reproject_revision_from_row)
+            .collect::<ProjectDocumentWriteResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(revisions)
+    }
+
+    /// Persist one bounded batch of already-signed events in the inactive
+    /// staging table. Staged rows are not protocol-visible.
+    pub async fn stage_project_document_reproject_events(
+        &self,
+        context: &ProjectDocumentReprojectContext,
+        events: &[PreparedProjectDocumentReprojectEvent],
+    ) -> ProjectDocumentWriteResult<()> {
+        if events.is_empty() || events.len() > 1000 {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "reproject event batch must contain 1..=1000 events".to_owned(),
+            ));
+        }
+        let staged = events
+            .iter()
+            .map(|prepared| validate_staged_reproject_event(context, prepared))
+            .collect::<ProjectDocumentWriteResult<Vec<_>>>()?;
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, context.community_id, true).await?;
+        require_reproject_basis(&mut tx, context, "staging").await?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO project_document_reproject_events \
+             (community_id, operation_id, event_key, projection_type, document_id, \
+              document_revision, event_id, pubkey, created_at, kind, tags, content, sig, d_tag) ",
+        );
+        query.push_values(staged, |mut row, event| {
+            row.push_bind(context.community_id.as_uuid())
+                .push_bind(context.operation_id)
+                .push_bind(event.event_key)
+                .push_bind(event.projection_type)
+                .push_bind(event.document_id)
+                .push_bind(event.document_revision)
+                .push_bind(event.event_id)
+                .push_bind(event.pubkey)
+                .push_bind(event.created_at)
+                .push_bind(event.kind)
+                .push_bind(event.tags)
+                .push_bind(event.content)
+                .push_bind(event.sig)
+                .push_bind(event.d_tag);
+        });
+        query.push(" ON CONFLICT DO NOTHING");
+        query.build().execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Close staging only after exact canonical identity coverage is present.
+    pub async fn ready_project_document_reproject(
+        &self,
+        context: &ProjectDocumentReprojectContext,
+    ) -> ProjectDocumentWriteResult<()> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, context.community_id, false).await?;
+        require_reproject_basis(&mut tx, context, "staging").await?;
+        let complete: bool = sqlx::query_scalar(
+            "SELECT \
+                (SELECT count(*) FROM project_document_reproject_events e \
+                 WHERE e.community_id = $1 AND e.operation_id = $2 \
+                   AND e.projection_type = 'revision') = $3 \
+                AND (SELECT count(*) FROM project_document_reproject_events e \
+                 WHERE e.community_id = $1 AND e.operation_id = $2 \
+                   AND e.projection_type = 'head') = $4 \
+                AND (SELECT count(*) FROM project_document_reproject_events e \
+                 WHERE e.community_id = $1 AND e.operation_id = $2 \
+                   AND e.projection_type = 'meta') = 1 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM project_document_revisions r \
+                    LEFT JOIN project_document_reproject_events e \
+                      ON e.community_id = r.community_id AND e.operation_id = $2 \
+                     AND e.projection_type = 'revision' AND e.document_id = r.document_id \
+                     AND e.document_revision = r.document_revision \
+                    WHERE r.community_id = $1 AND e.event_id IS NULL) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM project_documents d \
+                    LEFT JOIN project_document_reproject_events e \
+                      ON e.community_id = d.community_id AND e.operation_id = $2 \
+                     AND e.projection_type = 'head' AND e.document_id = d.document_id \
+                     AND e.document_revision = d.current_revision \
+                    WHERE d.community_id = $1 AND e.event_id IS NULL)",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .bind(revision_to_i64(context.revision_count, "revision_count")?)
+        .bind(revision_to_i64(context.document_count, "document_count")?)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !complete {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "inactive Project Document generation is incomplete".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE project_document_reprojects SET state = 'ready', ready_at = clock_timestamp() \
+             WHERE community_id = $1 AND operation_id = $2 AND state = 'staging'",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .execute(&mut *tx)
+        .await?;
+        append_document_control_audit(&mut tx, context.community_id, "reproject_stage_ready")
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically expose the staged generation, rebind all canonical pointers,
+    /// retire the old generation, and run full-history parity validation.
+    pub async fn activate_project_document_reproject(
+        &self,
+        context: &ProjectDocumentReprojectContext,
+    ) -> ProjectDocumentWriteResult<()> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, context.community_id, false).await?;
+        require_reproject_basis(&mut tx, context, "ready").await?;
+        sqlx::query("SELECT set_config('buzz.project_document_reproject', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO events \
+                (community_id, id, pubkey, created_at, kind, tags, content, sig, \
+                 received_at, channel_id, d_tag, not_before) \
+             SELECT community_id, event_id, pubkey, created_at, kind, tags, content, sig, \
+                    clock_timestamp(), NULL, d_tag, NULL \
+             FROM project_document_reproject_events \
+             WHERE community_id = $1 AND operation_id = $2",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .execute(&mut *tx)
+        .await?;
+        let expected_events = context
+            .revision_count
+            .checked_add(context.document_count)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                ProjectDocumentWriteError::InvalidCommit(
+                    "reproject event count overflow".to_owned(),
+                )
+            })?;
+        if inserted.rows_affected() != expected_events {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "inactive generation inserted an unexpected event count".to_owned(),
+            ));
+        }
+        let old_generation_tag = serde_json::json!([[
+            "projection_generation",
+            context.source_generation.to_string()
+        ]]);
+        sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND kind IN ($2, $3, $4) \
+               AND tags @> $5 AND deleted_at IS NULL",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(KIND_PROJECT_DOCUMENT_HEAD as i32)
+        .bind(KIND_PROJECT_DOCUMENT_REVISION as i32)
+        .bind(KIND_PROJECT_DOCUMENT_META as i32)
+        .bind(old_generation_tag)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE project_document_revisions r \
+             SET projection_generation = $3, projection_event_id = e.event_id \
+             FROM project_document_reproject_events e \
+             WHERE r.community_id = $1 AND e.operation_id = $2 \
+               AND e.community_id = r.community_id AND e.projection_type = 'revision' \
+               AND e.document_id = r.document_id \
+               AND e.document_revision = r.document_revision",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .bind(revision_to_i64(
+            context.target_generation,
+            "target_generation",
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE project_documents d \
+             SET current_head_event_id = h.event_id, current_revision_event_id = r.event_id \
+             FROM project_document_reproject_events h, project_document_reproject_events r \
+             WHERE d.community_id = $1 AND h.operation_id = $2 AND r.operation_id = $2 \
+               AND h.community_id = d.community_id AND r.community_id = d.community_id \
+               AND h.projection_type = 'head' AND r.projection_type = 'revision' \
+               AND h.document_id = d.document_id AND r.document_id = d.document_id \
+               AND h.document_revision = d.current_revision \
+               AND r.document_revision = d.current_revision",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .execute(&mut *tx)
+        .await?;
+        let state_updated = sqlx::query(
+            "UPDATE project_document_state s \
+             SET projection_pubkey = $3, projection_generation = $4, \
+                 meta_projection_event_id = e.event_id \
+             FROM project_document_reproject_events e \
+             WHERE s.community_id = $1 AND e.operation_id = $2 \
+               AND e.community_id = s.community_id AND e.projection_type = 'meta'",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .bind(context.target_pubkey.as_bytes())
+        .bind(revision_to_i64(
+            context.target_generation,
+            "target_generation",
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        if state_updated.rows_affected() != 1 {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "inactive generation has no unique metadata event".to_owned(),
+            ));
+        }
+        sqlx::query("SELECT project_document_validate_community($1)")
+            .bind(context.community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT project_document_validate_history_projection($1)")
+            .bind(context.community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        if !document_projection_parity(
+            &mut tx,
+            context.community_id,
+            &context.target_pubkey,
+            None,
+            Some(i64::try_from(context.active_document_count).unwrap_or(i64::MAX)),
+        )
+        .await?
+        {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "activated generation failed cryptographic parity".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE project_document_reprojects \
+             SET state = 'activated', activated_at = clock_timestamp() \
+             WHERE community_id = $1 AND operation_id = $2 AND state = 'ready'",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM project_document_reproject_events \
+             WHERE community_id = $1 AND operation_id = $2",
+        )
+        .bind(context.community_id.as_uuid())
+        .bind(context.operation_id)
+        .execute(&mut *tx)
+        .await?;
+        append_document_control_audit(&mut tx, context.community_id, "reproject_activate").await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Begin a flag-on business write and acquire the Community exclusive lock.
     ///
     /// `expected_projection_pubkey` is the deployment's currently configured
@@ -887,6 +1604,375 @@ impl Db {
             loaded: None,
         })
     }
+}
+
+#[derive(Debug)]
+struct StagedReprojectEvent {
+    event_key: String,
+    projection_type: &'static str,
+    document_id: Option<Uuid>,
+    document_revision: Option<i64>,
+    event_id: Vec<u8>,
+    pubkey: Vec<u8>,
+    created_at: DateTime<Utc>,
+    kind: i32,
+    tags: Value,
+    content: String,
+    sig: Vec<u8>,
+    d_tag: String,
+}
+
+async fn require_reproject_basis(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProjectDocumentReprojectContext,
+    required_state: &str,
+) -> ProjectDocumentWriteResult<()> {
+    let exact: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM project_document_reprojects r \
+             JOIN project_document_state s ON s.community_id = r.community_id \
+             JOIN communities c ON c.id = r.community_id \
+             WHERE r.community_id = $1 AND r.operation_id = $2 AND r.state = $3 \
+               AND NOT c.project_document_enabled AND c.archived_at IS NULL \
+               AND c.project_view_schema_version IN (2, 3) \
+               AND s.projection_pubkey = r.source_projection_pubkey \
+               AND s.projection_generation = r.source_projection_generation \
+               AND s.catalog_revision = r.catalog_revision \
+               AND s.active_document_count = r.active_document_count \
+               AND r.source_projection_generation = $4 \
+               AND r.target_projection_generation = $5 \
+               AND r.target_projection_pubkey = $6 \
+               AND r.catalog_revision = $7 \
+               AND r.active_document_count = $8 \
+               AND r.document_count = $9 AND r.revision_count = $10)",
+    )
+    .bind(context.community_id.as_uuid())
+    .bind(context.operation_id)
+    .bind(required_state)
+    .bind(revision_to_i64(
+        context.source_generation,
+        "source_generation",
+    )?)
+    .bind(revision_to_i64(
+        context.target_generation,
+        "target_generation",
+    )?)
+    .bind(context.target_pubkey.as_bytes())
+    .bind(revision_to_i64(
+        context.catalog_revision,
+        "catalog_revision",
+    )?)
+    .bind(revision_to_i64(
+        context.active_document_count,
+        "active_document_count",
+    )?)
+    .bind(revision_to_i64(context.document_count, "document_count")?)
+    .bind(revision_to_i64(context.revision_count, "revision_count")?)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !exact {
+        return Err(ProjectDocumentWriteError::InvalidCommit(
+            "Project Document reproject basis changed or is in the wrong state".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn reproject_revision_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> ProjectDocumentWriteResult<ProjectDocumentReprojectRevision> {
+    let document_id: Uuid = row.try_get("document_id")?;
+    let document_revision =
+        db_positive_revision(row.try_get("document_revision")?, "document_revision")?;
+    let catalog_revision =
+        db_positive_revision(row.try_get("catalog_revision")?, "catalog_revision")?;
+    let actor = public_key_from_bytes(&row.try_get::<Vec<u8>, _>("actor_pubkey")?, "actor")?;
+    let canonical_at = row.try_get("canonical_at")?;
+    let state = parse_state(&row.try_get::<String, _>("state")?)?;
+    let revision = match state {
+        DocumentState::Active => DocumentRevision::Active {
+            schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION,
+            document_id,
+            document_revision,
+            snapshot: DocumentSnapshot {
+                title: row.try_get::<Option<String>, _>("title")?.ok_or_else(|| {
+                    ProjectDocumentWriteError::InvalidCommit(
+                        "active reproject revision has no title".to_owned(),
+                    )
+                })?,
+                summary: row.try_get("summary")?,
+                content_markdown: row
+                    .try_get::<Option<String>, _>("content_markdown")?
+                    .ok_or_else(|| {
+                        ProjectDocumentWriteError::InvalidCommit(
+                            "active reproject revision has no Markdown".to_owned(),
+                        )
+                    })?,
+            },
+            actor,
+            canonical_at,
+        },
+        DocumentState::Deleted => DocumentRevision::Deleted {
+            schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION,
+            document_id,
+            document_revision,
+            actor,
+            canonical_at,
+        },
+    };
+    revision.validate()?;
+    let source = row
+        .try_get::<Option<Vec<u8>>, _>("source_event_id")?
+        .ok_or_else(|| {
+            ProjectDocumentWriteError::InvalidCommit(
+                "all v1 revisions must retain their Human source event for reprojection".to_owned(),
+            )
+        })?;
+    Ok(ProjectDocumentReprojectRevision {
+        document_id,
+        document_revision,
+        catalog_revision,
+        revision,
+        created: DocumentAttribution {
+            at: row.try_get("document_created_at")?,
+            by: public_key_from_bytes(&row.try_get::<Vec<u8>, _>("created_by")?, "created_by")?,
+        },
+        source_event_id: event_id_from_bytes(&source, "source_event_id")?,
+        is_current: row.try_get("is_current")?,
+    })
+}
+
+fn validate_staged_reproject_event(
+    context: &ProjectDocumentReprojectContext,
+    prepared: &PreparedProjectDocumentReprojectEvent,
+) -> ProjectDocumentWriteResult<StagedReprojectEvent> {
+    prepared.event.verify().map_err(|error| {
+        ProjectDocumentWriteError::InvalidCommit(format!(
+            "invalid staged projection signature: {error}"
+        ))
+    })?;
+    if prepared.event.pubkey != context.target_pubkey {
+        return Err(ProjectDocumentWriteError::InvalidCommit(
+            "staged projection signer does not match target generation".to_owned(),
+        ));
+    }
+    let (projection_type, document_id, document_revision, generation) = match prepared
+        .projection_type
+    {
+        ProjectDocumentReprojectEventType::Revision => {
+            let verified = parse_document_revision(
+                &prepared.event,
+                &context.target_pubkey,
+                context.community_id,
+            )
+            .map_err(|error| ProjectDocumentWriteError::InvalidCommit(error.to_string()))?;
+            match verified.projection {
+                DocumentRevisionProjection::Active {
+                    projection_generation,
+                    document_id,
+                    document_revision,
+                    ..
+                }
+                | DocumentRevisionProjection::Deleted {
+                    projection_generation,
+                    document_id,
+                    document_revision,
+                    ..
+                } => (
+                    "revision",
+                    Some(document_id),
+                    Some(document_revision),
+                    projection_generation,
+                ),
+            }
+        }
+        ProjectDocumentReprojectEventType::Head => {
+            let verified = parse_document_head(
+                &prepared.event,
+                &context.target_pubkey,
+                context.community_id,
+            )
+            .map_err(|error| ProjectDocumentWriteError::InvalidCommit(error.to_string()))?;
+            match verified.projection {
+                DocumentHeadProjection::Active {
+                    projection_generation,
+                    document_id,
+                    document_revision,
+                    ..
+                }
+                | DocumentHeadProjection::Deleted {
+                    projection_generation,
+                    document_id,
+                    document_revision,
+                    ..
+                } => (
+                    "head",
+                    Some(document_id),
+                    Some(document_revision),
+                    projection_generation,
+                ),
+            }
+        }
+        ProjectDocumentReprojectEventType::Meta => {
+            let verified = parse_document_meta(&prepared.event, &context.target_pubkey)
+                .map_err(|error| ProjectDocumentWriteError::InvalidCommit(error.to_string()))?;
+            if verified.projection.project_id != *context.community_id.as_uuid()
+                || !verified.projection.reset
+                || verified.projection.catalog_revision != context.catalog_revision
+                || verified.projection.active_document_count != context.active_document_count
+                || verified.projection.updated_at != context.updated_at
+            {
+                return Err(ProjectDocumentWriteError::InvalidCommit(
+                    "staged reset metadata does not match the fixed canonical catalog".to_owned(),
+                ));
+            }
+            (
+                "meta",
+                None,
+                None,
+                verified.projection.projection_generation,
+            )
+        }
+    };
+    if generation != context.target_generation
+        || prepared.document_id != document_id
+        || prepared.document_revision != document_revision
+    {
+        return Err(ProjectDocumentWriteError::InvalidCommit(
+            "staged projection identity or generation does not match its envelope".to_owned(),
+        ));
+    }
+    let created_at_seconds = i64::try_from(prepared.event.created_at.as_secs()).map_err(|_| {
+        ProjectDocumentWriteError::InvalidCommit(
+            "staged projection timestamp does not fit PostgreSQL".to_owned(),
+        )
+    })?;
+    let created_at = DateTime::from_timestamp(created_at_seconds, 0).ok_or_else(|| {
+        ProjectDocumentWriteError::InvalidCommit(
+            "staged projection timestamp is invalid".to_owned(),
+        )
+    })?;
+    let event_key = match (projection_type, document_id, document_revision) {
+        ("meta", None, None) => "meta".to_owned(),
+        (kind, Some(document_id), Some(revision)) => {
+            format!("{kind}:{document_id}:{revision}")
+        }
+        _ => {
+            return Err(ProjectDocumentWriteError::InvalidCommit(
+                "invalid staged projection key".to_owned(),
+            ));
+        }
+    };
+    let kind = i32::from(prepared.event.kind.as_u16());
+    let d_tag = crate::event::extract_d_tag(&prepared.event).ok_or_else(|| {
+        ProjectDocumentWriteError::InvalidCommit(
+            "staged projection has no canonical d tag".to_owned(),
+        )
+    })?;
+    Ok(StagedReprojectEvent {
+        event_key,
+        projection_type,
+        document_id,
+        document_revision: document_revision
+            .map(|value| revision_to_i64(value, "document_revision"))
+            .transpose()?,
+        event_id: prepared.event.id.as_bytes().to_vec(),
+        pubkey: prepared.event.pubkey.to_bytes().to_vec(),
+        created_at,
+        kind,
+        tags: serde_json::to_value(&prepared.event.tags).map_err(DbError::from)?,
+        content: prepared.event.content.clone(),
+        sig: prepared.event.sig.serialize().to_vec(),
+        d_tag,
+    })
+}
+
+fn expected_reproject_revision_projection(
+    community_id: CommunityId,
+    generation: u64,
+    source: &ProjectDocumentReprojectRevision,
+) -> DocumentRevisionProjection {
+    match &source.revision {
+        DocumentRevision::Active {
+            snapshot,
+            actor,
+            canonical_at,
+            ..
+        } => DocumentRevisionProjection::Active {
+            schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION,
+            projection_type: buzz_project_document::DocumentProjectionType::DocumentRevision,
+            project_id: *community_id.as_uuid(),
+            projection_generation: generation,
+            catalog_revision: source.catalog_revision,
+            document_id: source.document_id,
+            document_revision: source.document_revision,
+            title: snapshot.title.clone(),
+            summary: snapshot.summary.clone(),
+            content_markdown: snapshot.content_markdown.clone(),
+            created_at: source.created.at,
+            created_by: source.created.by,
+            revision_at: *canonical_at,
+            revision_by: *actor,
+            source_event_id: source.source_event_id,
+        },
+        DocumentRevision::Deleted {
+            actor,
+            canonical_at,
+            ..
+        } => DocumentRevisionProjection::Deleted {
+            schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION,
+            projection_type: buzz_project_document::DocumentProjectionType::DocumentRevision,
+            project_id: *community_id.as_uuid(),
+            projection_generation: generation,
+            catalog_revision: source.catalog_revision,
+            document_id: source.document_id,
+            document_revision: source.document_revision,
+            created_at: source.created.at,
+            created_by: source.created.by,
+            revision_at: *canonical_at,
+            revision_by: *actor,
+            source_event_id: source.source_event_id,
+        },
+    }
+}
+
+fn reproject_status_from_row(
+    row: sqlx::postgres::PgRow,
+) -> crate::Result<ProjectDocumentReprojectStatus> {
+    Ok(ProjectDocumentReprojectStatus {
+        operation_id: row.try_get("operation_id")?,
+        community_id: CommunityId::from_uuid(row.try_get("community_id")?),
+        state: row.try_get("state")?,
+        source_generation: db_positive_revision_db(
+            row.try_get("source_projection_generation")?,
+            "source_projection_generation",
+        )?,
+        target_generation: db_positive_revision_db(
+            row.try_get("target_projection_generation")?,
+            "target_projection_generation",
+        )?,
+        target_pubkey: PublicKey::from_slice(
+            &row.try_get::<Vec<u8>, _>("target_projection_pubkey")?,
+        )
+        .map_err(|error| DbError::InvalidData(format!("invalid target signer: {error}")))?,
+        revision_count: db_nonnegative_revision_db(
+            row.try_get("revision_count")?,
+            "revision_count",
+        )?,
+        document_count: db_nonnegative_revision_db(
+            row.try_get("document_count")?,
+            "document_count",
+        )?,
+        staged_revision_count: db_nonnegative_revision_db(
+            row.try_get("staged_revision_count")?,
+            "staged_revision_count",
+        )?,
+        staged_head_count: db_nonnegative_revision_db(
+            row.try_get("staged_head_count")?,
+            "staged_head_count",
+        )?,
+        meta_staged: row.try_get("meta_staged")?,
+    })
 }
 
 async fn append_document_control_audit(
@@ -1421,15 +2507,11 @@ async fn require_document_read_state_in_tx(
     {
         return Err(ProjectDocumentReadError::Conflict);
     }
-    sqlx::query("SELECT project_document_validate_community($1)")
-        .bind(community_id.as_uuid())
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| {
-            ProjectDocumentReadError::Inconsistent(format!(
-                "canonical pointer validation failed: {error}"
-            ))
-        })?;
+    // Canonical writers and controlled enable/reproject paths enforce pointer
+    // parity. Re-running a whole-Community validator for every history page
+    // makes keyset pagination O(total history × pages), defeating its bounded
+    // query contract. The fixed generation/signer basis above plus the exact
+    // indexed pointer join below are the read-time fence.
     Ok(())
 }
 
@@ -2045,14 +3127,9 @@ pub(crate) async fn document_projection_parity(
     meta_event_id: Option<&[u8]>,
     active_count: Option<i64>,
 ) -> crate::Result<bool> {
-    let (Some(meta_event_id), Some(active_count)) = (meta_event_id, active_count) else {
-        return Ok(false);
-    };
-    if meta_event_id.len() != 32 || active_count < 0 {
-        return Ok(false);
-    }
     let state = sqlx::query(
-        "SELECT catalog_revision, projection_generation, initialized_at, updated_at \
+        "SELECT catalog_revision, projection_generation, initialized_at, updated_at, \
+                meta_projection_event_id, active_document_count \
          FROM project_document_state WHERE community_id = $1",
     )
     .bind(community_id.as_uuid())
@@ -2064,6 +3141,13 @@ pub(crate) async fn document_projection_parity(
     let catalog_revision: i64 = state.try_get("catalog_revision")?;
     let generation: i64 = state.try_get("projection_generation")?;
     let updated_at: DateTime<Utc> = state.try_get("updated_at")?;
+    let stored_meta_event_id: Vec<u8> = state.try_get("meta_projection_event_id")?;
+    let stored_active_count: i64 = state.try_get("active_document_count")?;
+    let meta_event_id = meta_event_id.unwrap_or(&stored_meta_event_id);
+    let active_count = active_count.unwrap_or(stored_active_count);
+    if meta_event_id.len() != 32 || active_count < 0 {
+        return Ok(false);
+    }
     let meta = project_document_event_by_id(connection, community_id, meta_event_id).await?;
     let Some(meta) = meta else {
         return Ok(false);
@@ -2130,6 +3214,65 @@ pub(crate) async fn document_projection_parity(
             return Ok(false);
         }
     }
+    let generation = db_positive_revision_db(generation, "projection_generation")?;
+    let mut after_catalog_revision = 0_i64;
+    let mut verified_revision_count = 0_u64;
+    loop {
+        let rows = sqlx::query(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, \
+                    e.received_at, e.channel_id, r.document_id, r.document_revision, \
+                    r.catalog_revision, r.state, r.title, r.summary, r.content_markdown, \
+                    r.actor_pubkey, r.canonical_at, r.source_event_id, \
+                    d.created_at AS document_created_at, \
+                    d.created_by, r.document_revision = d.current_revision AS is_current \
+             FROM project_document_revisions r \
+             JOIN project_documents d ON d.community_id = r.community_id \
+                                     AND d.document_id = r.document_id \
+             JOIN events e ON e.community_id = r.community_id \
+                          AND e.id = r.projection_event_id \
+                          AND e.kind = $2 AND e.pubkey = $3 AND e.deleted_at IS NULL \
+             WHERE r.community_id = $1 AND r.catalog_revision > $4 \
+               AND r.projection_generation = $5 \
+             ORDER BY r.catalog_revision ASC LIMIT 500",
+        )
+        .bind(community_id.as_uuid())
+        .bind(KIND_PROJECT_DOCUMENT_REVISION as i32)
+        .bind(expected_pubkey.as_bytes())
+        .bind(after_catalog_revision)
+        .bind(i64::try_from(generation).unwrap_or(i64::MAX))
+        .fetch_all(&mut *connection)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let canonical = reproject_revision_from_row(&row).map_err(|error| {
+                DbError::InvalidData(format!(
+                    "invalid canonical revision during full parity: {error}"
+                ))
+            })?;
+            let stored = crate::event::row_to_stored_event(row)?.ok_or_else(|| {
+                DbError::InvalidData(
+                    "historical revision event could not be reconstructed".to_owned(),
+                )
+            })?;
+            let parsed = match parse_document_revision(&stored.event, expected_pubkey, community_id)
+            {
+                Ok(parsed) => parsed,
+                Err(_) => return Ok(false),
+            };
+            if parsed.projection
+                != expected_reproject_revision_projection(community_id, generation, &canonical)
+            {
+                return Ok(false);
+            }
+            after_catalog_revision = i64::try_from(canonical.catalog_revision).unwrap_or(i64::MAX);
+            verified_revision_count = verified_revision_count.saturating_add(1);
+        }
+    }
+    if i64::try_from(verified_revision_count).ok() != Some(catalog_revision) {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -2187,8 +3330,9 @@ mod tests {
 
     use buzz_project_document::{DocumentProjectionPlan, DocumentSnapshot};
     use buzz_sdk::project_document::{
-        build_document_command, build_document_head_projection, build_document_meta_projection,
-        build_document_revision_projection, changed_head_for,
+        build_document_command, build_document_head_projection, build_document_head_reprojection,
+        build_document_meta_projection, build_document_revision_projection,
+        build_document_revision_reprojection, changed_head_for, document_revision_coordinate,
     };
     use nostr::Keys;
     use sqlx::PgPool;
@@ -2404,6 +3548,262 @@ mod tests {
                 content_markdown: format!("# Runbook\n\n{suffix}"),
             },
         )
+    }
+
+    fn test_reproject_head(
+        context: &ProjectDocumentReprojectContext,
+        source: &ProjectDocumentReprojectRevision,
+        revision_event_id: EventId,
+    ) -> DocumentHeadProjection {
+        let revision_coordinate = document_revision_coordinate(
+            context.community_id,
+            source.document_id,
+            source.document_revision,
+        );
+        match &source.revision {
+            DocumentRevision::Active {
+                snapshot,
+                actor,
+                canonical_at,
+                ..
+            } => DocumentHeadProjection::Active {
+                schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION,
+                projection_type: buzz_project_document::DocumentProjectionType::DocumentHead,
+                project_id: *context.community_id.as_uuid(),
+                projection_generation: context.target_generation,
+                catalog_revision: source.catalog_revision,
+                document_id: source.document_id,
+                document_revision: source.document_revision,
+                title: snapshot.title.clone(),
+                summary: snapshot.summary.clone(),
+                created_at: source.created.at,
+                created_by: source.created.by,
+                updated_at: *canonical_at,
+                updated_by: *actor,
+                revision_coordinate,
+                revision_event_id,
+                source_event_id: source.source_event_id,
+            },
+            DocumentRevision::Deleted {
+                actor,
+                canonical_at,
+                ..
+            } => DocumentHeadProjection::Deleted {
+                schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION,
+                projection_type: buzz_project_document::DocumentProjectionType::DocumentHead,
+                project_id: *context.community_id.as_uuid(),
+                projection_generation: context.target_generation,
+                catalog_revision: source.catalog_revision,
+                document_id: source.document_id,
+                document_revision: source.document_revision,
+                created_at: source.created.at,
+                created_by: source.created.by,
+                deleted_at: *canonical_at,
+                deleted_by: *actor,
+                revision_coordinate,
+                revision_event_id,
+                source_event_id: source.source_event_id,
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn inactive_generation_reproject_rotates_all_history_atomically() {
+        let scratch = ScratchDatabase::create("buzz_pd_reproject").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let actor = Keys::generate();
+        let old_relay = Keys::generate();
+        let new_relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        bootstrap(&db, community_id, &old_relay).await;
+        enable_for_storage_test(&scratch.pool, community_id).await;
+
+        let document_id = Uuid::new_v4();
+        let (write, create) = prepare_for_commit(
+            &db,
+            community_id,
+            create_command(document_id),
+            &actor,
+            &old_relay,
+        )
+        .await
+        .expect("prepare create");
+        write.commit(create).await.expect("commit create");
+        let (write, update) = prepare_for_commit(
+            &db,
+            community_id,
+            update_command(document_id, 1, "rotated"),
+            &actor,
+            &old_relay,
+        )
+        .await
+        .expect("prepare update");
+        write.commit(update).await.expect("commit update");
+        db.set_project_document_enabled_checked(community_id, false, None)
+            .await
+            .expect("disable before rotation");
+        let historical_event_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT projection_event_id FROM project_document_revisions \
+             WHERE community_id = $1 AND document_id = $2 AND document_revision = 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(document_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("load historical projection pointer");
+        sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(historical_event_id)
+        .execute(&scratch.pool)
+        .await
+        .expect("simulate a repairable historical projection loss");
+        assert!(
+            !db.project_document_preflight(community_id, &old_relay.public_key())
+                .await
+                .expect("detect historical projection mismatch")
+                .projection_parity
+        );
+
+        // This storage-kernel test isolates Document reprojection from the
+        // already-covered Project View v2 cutover. Bypass cross-domain fixture
+        // triggers only in this disposable database after Document writes end.
+        let mut fixture_tx = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin fixture schema switch");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *fixture_tx)
+            .await
+            .expect("suspend fixture triggers");
+        sqlx::query("UPDATE communities SET project_view_schema_version = 2 WHERE id = $1")
+            .bind(community_id.as_uuid())
+            .execute(&mut *fixture_tx)
+            .await
+            .expect("use supported Project View schema");
+        fixture_tx
+            .commit()
+            .await
+            .expect("commit fixture schema switch");
+
+        let context = db
+            .begin_project_document_reproject(community_id, new_relay.public_key())
+            .await
+            .expect("begin inactive generation");
+        assert_eq!(context.source_generation, 1);
+        assert_eq!(context.target_generation, 2);
+        assert_eq!(context.revision_count, 2);
+        let revisions = db
+            .project_document_reproject_revision_page(&context, 0, 100)
+            .await
+            .expect("load immutable history");
+        let mut staged = Vec::new();
+        for source in &revisions {
+            let projection = expected_reproject_revision_projection(
+                community_id,
+                context.target_generation,
+                source,
+            );
+            let revision_event = build_document_revision_reprojection(&projection)
+                .expect("build replacement revision")
+                .sign_with_keys(&new_relay)
+                .expect("sign replacement revision");
+            staged.push(PreparedProjectDocumentReprojectEvent {
+                projection_type: ProjectDocumentReprojectEventType::Revision,
+                document_id: Some(source.document_id),
+                document_revision: Some(source.document_revision),
+                event: revision_event.clone(),
+            });
+            if source.is_current {
+                let head = test_reproject_head(&context, source, revision_event.id);
+                staged.push(PreparedProjectDocumentReprojectEvent {
+                    projection_type: ProjectDocumentReprojectEventType::Head,
+                    document_id: Some(source.document_id),
+                    document_revision: Some(source.document_revision),
+                    event: build_document_head_reprojection(&head, &revision_event)
+                        .expect("build replacement head")
+                        .sign_with_keys(&new_relay)
+                        .expect("sign replacement head"),
+                });
+            }
+        }
+        db.stage_project_document_reproject_events(&context, &staged)
+            .await
+            .expect("stage revision and head events");
+        let catalog = DocumentCatalog::from_snapshot(
+            community_id,
+            context.catalog_revision,
+            context.active_document_count,
+            context.target_generation,
+            context.initialized_at,
+            context.updated_at,
+        )
+        .expect("reconstruct catalog");
+        let meta_plan =
+            DocumentProjectionPlan::for_reprojection(&catalog).expect("reset projection plan");
+        let meta = build_document_meta_projection(&meta_plan, &[])
+            .expect("build reset metadata")
+            .sign_with_keys(&new_relay)
+            .expect("sign reset metadata");
+        db.stage_project_document_reproject_events(
+            &context,
+            &[PreparedProjectDocumentReprojectEvent {
+                projection_type: ProjectDocumentReprojectEventType::Meta,
+                document_id: None,
+                document_revision: None,
+                event: meta,
+            }],
+        )
+        .await
+        .expect("stage reset metadata");
+        db.ready_project_document_reproject(&context)
+            .await
+            .expect("close inactive generation");
+        db.activate_project_document_reproject(&context)
+            .await
+            .expect("activate target generation");
+
+        let report = db
+            .project_document_preflight(community_id, &new_relay.public_key())
+            .await
+            .expect("verify target generation");
+        assert!(report.signer_matches);
+        assert!(report.projection_parity);
+        let old_report = db
+            .project_document_preflight(community_id, &old_relay.public_key())
+            .await
+            .expect("old signer fails closed");
+        assert!(!old_report.signer_matches);
+        let canonical: (i64, String) = sqlx::query_as(
+            "SELECT current_revision, state FROM project_documents \
+             WHERE community_id = $1 AND document_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(document_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read unchanged canonical Document");
+        assert_eq!(canonical, (2, "active".to_owned()));
+        let live_by_signer: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT pubkey, count(*)::bigint FROM events \
+             WHERE community_id = $1 AND kind IN ($2, $3, $4) AND deleted_at IS NULL \
+             GROUP BY pubkey",
+        )
+        .bind(community_id.as_uuid())
+        .bind(KIND_PROJECT_DOCUMENT_HEAD as i32)
+        .bind(KIND_PROJECT_DOCUMENT_REVISION as i32)
+        .bind(KIND_PROJECT_DOCUMENT_META as i32)
+        .fetch_all(&scratch.pool)
+        .await
+        .expect("count active generation events");
+        assert_eq!(live_by_signer.len(), 1);
+        assert_eq!(live_by_signer[0].0, new_relay.public_key().to_bytes());
+        assert_eq!(live_by_signer[0].1, 4);
+        scratch.cleanup().await;
     }
 
     #[tokio::test]

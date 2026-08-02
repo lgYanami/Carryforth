@@ -1,5 +1,62 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-01 — 阶段 7 单机预发布 hardening 完成
+
+阶段目标：在不假装存在生产环境的前提下，用一台开发机证明 Project Document 的 signer轮换、
+完整历史重投影、backup / restore、安全事件与10万级revision增长路径可恢复、可测量且不会失控。
+阶段 7不授权发布、部署、默认启用或broad rollout。
+
+### 已交付
+
+- 新增 additive migration `0035_project_document_reproject.sql`：新 generation的完整revision、head与
+  reset meta先进入普通查询不可见的staging表；固定source basis并验证完整覆盖后，在capability disabled
+  状态下用一个Community独占事务原子激活。失败全部回滚，成功只切换projection pointer、signer与
+  generation，不修改canonical business字段。
+- `buzz-admin project-document reproject --all-revisions`支持1–1000条有界分页、staging / ready恢复、
+  after-commit replay与target signer校验；`status`新增reproject状态、orphan与pointer mismatch计数。
+  `verify`对全部历史revision执行有界分页的canonical、generation、pointer与cryptographic parity。
+- SDK新增显式revision / head reprojection builder；DB补齐全历史repair、atomic activation、closed keyset
+  query plan与generation-aware read fence。正常readiness继续使用轻量索引检查，昂贵全历史校验只进入
+  operator verify / enable / reproject路径。
+- 新增[`stage7-hardening-runbook.md`](stage7-hardening-runbook.md)，固定signer rotation、恢复、容量、
+  retention / compliance待决项与未来Adapter观察标准；当前明确不实现在线无停机rotation、hard delete、
+  Secret Store、installer或隐式external action。
+- 新增`project-document-stage7-recovery`、`project-document-stage7-capacity`与聚合
+  `project-document-stage7-test`。所有Cargo批次关闭incremental，并精确清理scratch数据库、key、backup、
+  临时文件及workspace / Tauri incremental目录。
+
+### 本地真实验收
+
+- 真实PostgreSQL、Redis、Relay、CLI与admin栈完成generation 1 → 2 signer rotation；完整历史重投影、
+  after-commit replay、独立database `pg_dump` / restore parity、新 signer Relay读取与最终disable均通过。
+  同一演练完成Secret incident流程和低配额HTTP burst，结果为3次接受、3次429拒绝。证据位于
+  `test-results/stage7-recovery/20260801T160349Z-106900`，JSON报告SHA-256为
+  `c1424ab6385b91914971f5650fdd3a567408f8ce342fc52a4d11d4bcf0324206`。
+- 100,000条revision容量验收通过：50,000条hot Document历史 + 50,000个wide catalog Document，
+  256–1,024 byte正文；seed耗时15,481 ms，database增长627,736,576 bytes。1,000个closed keyset page
+  每页上限50，最慢239 ms（门槛2 s），使用revision主键backward Index Scan、无revision表Seq Scan；
+  RSS peak / retained增长952 KiB。强制250 ms Community writer lock时shared wait为253 ms，暂无证据支持
+  引入per-Document lock。证据位于`test-results/stage7-capacity/20260801T155849Z_95746_24750`，JSON报告
+  SHA-256为`146c74c62ed5d0e91d72a8edd2a586cbe54a3133ab8d30ea34a26dca623b335a`。
+- migration / desired-schema、Document unit / PostgreSQL transaction与race门禁全部通过；Stage 5与Stage 6
+  真实本地canary已在最终业务代码上重跑，证据分别位于
+  `test-results/stage5-canary/20260801T155950Z-97709`与
+  `test-results/stage6-canary/20260801T160105Z-101707`。scratch资源已清理。
+
+百万revision extended soak未运行，按当前单机预发布合同属于通过磁盘preflight后才执行的non-blocking
+项目。capability最终保持disabled，首次真实部署前仍需单独定义deployment / rollout gate。
+
+## 2026-08-01 — 阶段 7 调整为单机预发布交付基线
+
+Buzz尚未发布或部署，当前只有一台开发机。阶段 7不再以生产dashboard、真实用户观察或百万级
+revision作为完成条件：必做容量门降为至少100,000条小正文revision，覆盖hot Document与宽catalog；
+百万级仅作为通过磁盘preflight后的non-blocking extended soak，上限正文只做小规模边界case。
+
+生产dashboard改为可归档的本地JSON / Markdown报告；多节点 / HA、生产错误率窗口和Adapter真实usage
+evidence延期到首次部署规划。signer rotation、backup / restore、projection parity、权限、安全与Secret
+incident仍保留本地真实scratch验收。阶段 7完成不授权发布、v3默认启用或broad rollout，首次部署前需
+另立deployment / rollout gate。
+
 ## 2026-08-01 — 阶段 6 软件与本地真实 Context canary 完成
 
 阶段目标：让 Project View v3 的 Resource、Live / Pinned Document成为可沿Project / Goal / Role /

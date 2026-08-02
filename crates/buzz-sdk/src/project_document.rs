@@ -265,22 +265,24 @@ pub fn build_document_revision_projection(
     plan: &DocumentProjectionPlan,
 ) -> Result<EventBuilder, SdkError> {
     let projection = revision_projection_from_plan(plan)?;
-    let current = plan.current().ok_or_else(|| {
-        SdkError::InvalidInput("bootstrap has no Document revision projection".to_owned())
-    })?;
-    let catalog = plan.catalog();
-    let coordinate = document_revision_coordinate(
-        catalog.project_id(),
-        current.document().document_id(),
-        current.document().current_revision(),
-    );
-    let state_tag = lifecycle_tag(current.document().state());
-    let source = plan
-        .source_event_id()
-        .ok_or_else(|| {
-            SdkError::InvalidInput("mutation projection has no source event".to_owned())
-        })?
-        .to_hex();
+    build_document_revision_reprojection(&projection)
+}
+
+/// Build an unsigned immutable revision from an explicitly reconstructed
+/// canonical projection. This is reserved for generation reprojection: normal
+/// writes must use [`build_document_revision_projection`] and a reducer plan.
+pub fn build_document_revision_reprojection(
+    projection: &DocumentRevisionProjection,
+) -> Result<EventBuilder, SdkError> {
+    projection
+        .validate()
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let common = revision_common(projection);
+    let project_id = CommunityId::from_uuid(common.project_id);
+    let coordinate =
+        document_revision_coordinate(project_id, common.document_id, common.document_revision);
+    let state_tag = lifecycle_tag(common.state);
+    let source = common.source_event_id.to_hex();
     let tags = vec![
         tag(["-"])?,
         tag(["d", coordinate.as_str()])?,
@@ -289,24 +291,24 @@ pub fn build_document_revision_projection(
         tag(["t", state_tag])?,
         tag([
             "projection_generation",
-            &canonical_decimal(catalog.projection_generation()),
+            &canonical_decimal(common.projection_generation),
         ])?,
         tag([
             "catalog_revision",
-            &canonical_decimal(catalog.catalog_revision()),
+            &canonical_decimal(common.catalog_revision),
         ])?,
         tag([
             "document_revision",
-            &canonical_decimal(current.document().current_revision()),
+            &canonical_decimal(common.document_revision),
         ])?,
         tag(["e", source.as_str(), "", "source"])?,
     ];
     Ok(EventBuilder::new(
         Kind::Custom(KIND_PROJECT_DOCUMENT_REVISION as u16),
-        canonical_json(&projection, "serialize Document revision projection")?,
+        canonical_json(projection, "serialize Document revision projection")?,
     )
     .tags(tags)
-    .custom_created_at(timestamp(catalog.updated_at())?))
+    .custom_created_at(timestamp(revision_timestamp(projection))?))
 }
 
 /// Build the unsigned current head after the immutable revision is signed.
@@ -323,18 +325,31 @@ pub fn build_document_head_projection(
         ));
     }
     let projection = head_projection_from_plan(plan, revision_event.id)?;
-    let current = plan.current().ok_or_else(|| {
-        SdkError::InvalidInput("bootstrap has no Document head projection".to_owned())
-    })?;
-    let catalog = plan.catalog();
-    let coordinate = document_head_coordinate(project_id, current.document().document_id());
-    let state_tag = lifecycle_tag(current.document().state());
-    let source = plan
-        .source_event_id()
-        .ok_or_else(|| {
-            SdkError::InvalidInput("mutation projection has no source event".to_owned())
-        })?
-        .to_hex();
+    build_document_head_reprojection(&projection, revision_event)
+}
+
+/// Build an unsigned current head from an explicitly reconstructed canonical
+/// projection and its already-signed revision event. This is reserved for
+/// generation reprojection.
+pub fn build_document_head_reprojection(
+    projection: &DocumentHeadProjection,
+    revision_event: &Event,
+) -> Result<EventBuilder, SdkError> {
+    projection
+        .validate()
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let common = head_common(projection);
+    let project_id = CommunityId::from_uuid(common.project_id);
+    let revision = parse_document_revision(revision_event, &revision_event.pubkey, project_id)?;
+    let revision_common = revision_common(&revision.projection);
+    if revision.event_id != head_revision_event_id(projection) || revision_common != common {
+        return Err(SdkError::InvalidInput(
+            "reprojected Document head does not match its signed revision".to_owned(),
+        ));
+    }
+    let coordinate = document_head_coordinate(project_id, common.document_id);
+    let state_tag = lifecycle_tag(common.state);
+    let source = common.source_event_id.to_hex();
     let revision_id = revision_event.id.to_hex();
     let tags = vec![
         tag(["-"])?,
@@ -344,25 +359,25 @@ pub fn build_document_head_projection(
         tag(["t", state_tag])?,
         tag([
             "projection_generation",
-            &canonical_decimal(catalog.projection_generation()),
+            &canonical_decimal(common.projection_generation),
         ])?,
         tag([
             "catalog_revision",
-            &canonical_decimal(catalog.catalog_revision()),
+            &canonical_decimal(common.catalog_revision),
         ])?,
         tag([
             "document_revision",
-            &canonical_decimal(current.document().current_revision()),
+            &canonical_decimal(common.document_revision),
         ])?,
         tag(["e", revision_id.as_str(), "", "revision"])?,
         tag(["e", source.as_str(), "", "source"])?,
     ];
     Ok(EventBuilder::new(
         Kind::Custom(KIND_PROJECT_DOCUMENT_HEAD as u16),
-        canonical_json(&projection, "serialize Document head projection")?,
+        canonical_json(projection, "serialize Document head projection")?,
     )
     .tags(tags)
-    .custom_created_at(timestamp(catalog.updated_at())?))
+    .custom_created_at(timestamp(head_timestamp(projection))?))
 }
 
 /// Bind signed head and revision events into one incremental metadata entry.

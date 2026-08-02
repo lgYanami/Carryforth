@@ -391,6 +391,35 @@ project-document-test-e2e:
 # Run every Project Document Stage 2 quality gate.
 project-document-test: project-document-test-unit project-document-test-db test-migrations project-document-test-e2e
 
+# Run the real local signer-rotation, backup/restore, Secret incident, and
+# bounded admission-burst drill against an exact scratch database.
+project-document-stage7-recovery:
+    PROJECT_DOCUMENT_STAGE7_RECOVERY=1 ./scripts/test-project-document-e2e.sh
+
+# Run the single-machine disk-preflight + 100k revision capacity acceptance.
+project-document-stage7-capacity:
+    ./scripts/test-project-document-stage7-capacity.sh
+
+# Complete Stage 7 local gate. Stage 5/6 canaries are intentionally rerun on
+# the final code rather than treated as historical evidence.
+project-document-stage7-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_INCREMENTAL=0
+    stage7_repo_root="$(pwd -P)"
+    cleanup_incremental() {
+        find "${stage7_repo_root}/target" "${stage7_repo_root}/desktop/src-tauri/target" \
+          -type d -name incremental -prune -exec rm -rf -- {} + 2>/dev/null || true
+    }
+    trap cleanup_incremental EXIT
+    just project-document-test-unit
+    just project-document-test-db
+    just test-migrations
+    just project-document-stage7-recovery
+    just project-document-stage7-capacity
+    ./scripts/test-project-view-stage5-canary.sh
+    ./scripts/test-project-view-stage6-canary.sh
+
 # Run integration tests only (starts services if needed)
 test-integration:
     ./scripts/run-tests.sh integration

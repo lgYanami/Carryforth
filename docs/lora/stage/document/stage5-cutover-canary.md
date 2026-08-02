@@ -228,7 +228,7 @@ isolated canary、真实 bounded Community canary；未执行的层级保持 pen
 | Desktop v3 Resource | completed | Project View Playwright E2E 30项；包含2条strict-v3 Resource/Guide saga，以及Guide已提交后Resource conflict不误回滚 |
 | bounded legacy Community | completed | 真实本地栈完成reviewed Guide、detached approval、exact Runtime/Assignment ACK、freeze/cutover/verify/resume与strict v3恢复检查 |
 | empty-state direct-v3 Community | completed | 独立真实本地Community完成prepare、Human签名initialize、enable、v3读取与v2-only unsupported观察 |
-| broad rollout | not authorized | 阶段5/6仅允许声明过的bounded canary；阶段7 gate前不得扩大 |
+| broad rollout | not authorized | 阶段5/6仅允许本地bounded canary；单机阶段7完成也不授权扩大，首次部署前另立rollout gate |
 
 ### 2026-08-01 本地真实运行记录
 

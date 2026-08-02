@@ -491,6 +491,20 @@ impl DocumentProjectionPlan {
         })
     }
 
+    /// Build a reset observation for a fully staged signer generation.
+    ///
+    /// Unlike bootstrap, reprojection preserves the positive catalog revision
+    /// and active count while carrying no business change or current head.
+    pub fn for_reprojection(catalog: &DocumentCatalog) -> DocumentResult<Self> {
+        catalog.validate()?;
+        Ok(Self {
+            catalog: catalog.clone(),
+            current: None,
+            source_event_id: None,
+            reset: true,
+        })
+    }
+
     /// Build one deterministic mutation projection plan from canonical output.
     pub fn for_transition(
         catalog: &DocumentCatalog,

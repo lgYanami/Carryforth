@@ -4182,10 +4182,10 @@ preflight），再由 admin显式 enable。它不需要 legacy Resource manifest
 条件证明没有旧 Project View / Assignment / Runtime state可迁移。
 
 阶段 4 交付 prepare / initialize domain、DB、Relay、SDK与 rollback tests；阶段 5 只在
-bounded canary验证真实初始化和 enable。阶段 7 broad-rollout gate通过后，新 Community
-provisioner才可以把“显式选择 v3”作为产品默认；migration仍不通过改变 SQL default替
-existing rows做隐式决定。本文末尾延期的“v1 → v3 direct cutover”仅指跳过 v2迁移已有
-v1 history，不包括这条 empty-state v3初始化路径。
+bounded canary验证真实初始化和 enable。当前未发布、单机开发阶段即使完成阶段 7，也不把 v3
+自动设为产品默认；首次真实部署前必须根据当时的拓扑、数据保留和运维能力另立 rollout gate。
+migration仍不通过改变 SQL default替existing rows做隐式决定。本文末尾延期的“v1 → v3 direct
+cutover”仅指跳过 v2迁移已有v1 history，不包括这条 empty-state v3初始化路径。
 
 ## 23. Error model
 
@@ -4840,7 +4840,7 @@ Documents         │
    ↓
 阶段 6  Context Reference + Role Brief / Agent
    ↓
-阶段 7  hardening / rollout / adapter observation
+阶段 7  单机预发布 hardening / 本地恢复与容量验证
 ```
 
 阶段之间不以“代码写完”为完成标准，而以对应 exit criteria 为准。
@@ -5200,7 +5200,8 @@ Documents         │
 - 旧 Runtime /旧 Assignment不能借 Context Reference 提权；
 - capability缺失时 nonempty Context不可写，capability出现后 CLI / Desktop /
   RoleBrief都能立即观察同一 canonical set；
-- 仍只在声明过的小规模 canary cohort运行，不在阶段 7 gate前 broad rollout。
+- 仍只在本地scratch / 声明过的 bounded canary运行；阶段 7完成也不自动授权真实部署或
+  broad rollout。
 
 建议 PR：
 
@@ -5209,35 +5210,56 @@ Documents         │
 3. ACP cache / prompt；
 4. Agent E2E / bounded canary。
 
-### 阶段 7：hardening、运维与真实使用观察
+### 阶段 7：单机预发布 hardening 与本地恢复演练
 
-目标：在扩大使用前解决容量、恢复和长期运维。
+> 当前交付基线：Buzz尚未发布或部署，只有一台开发机。阶段 7不要求生产 dashboard、
+> 多节点 / HA、真实用户 cohort或百万级数据成为完成条件；这些在首次真实部署前按当时环境
+> 重新规划。阶段 7完成只表示当前代码具备可重复的本地恢复、容量与安全证据，不授权
+> broad rollout，也不把 v3自动设为新 Community默认值。
+
+> 交付状态（2026-08-01）：已完成。inactive-generation全历史重投影、signer rotation、独立
+> backup / restore、Secret incident与有界rate-limit演练均已在真实本地进程中通过；100,000条
+> revision容量门、Stage 5 / 6最终代码canary和完整质量门禁通过。操作合同见
+> [`stage7-hardening-runbook.md`](stage7-hardening-runbook.md)，指标与证据见
+> [`changelog.md`](changelog.md)。capability最终保持disabled，未执行部署或broad rollout。
+
+目标：用一台开发机证明当前实现不会在常见增长、恢复和故障路径上失控，为继续开发和未来
+部署建立可重复基线，而不是模拟尚不存在的生产环境。
 
 开发内容：
 
-- body / revision growth dashboard；
-- lock wait / snapshot restart dashboard；
-- inactive generation staged reproject；
-- signer rotation runbook；
-- backup / restore演练；
-- projection parity repair；
-- large history pagination压测；
-- rate limit / abuse tests；
-- Secret incident演练、通知 / forensic治理与未来 scrub requirements；
-- 文档 retention / compliance 需求调研；
-- 评估 shared + per-document lock；
-- 收集 Guide 中重复步骤的 Adapter 候选。
+- 输出本地 JSON / Markdown 容量报告：body / revision / table / index增长、lock wait与
+  snapshot restart；不要求接入生产 dashboard；
+- inactive generation staged reproject、generation-aware status与projection parity repair；
+- signer rotation runbook，并在独立scratch Community完成一次disable → rotate → reproject →
+  verify → enable演练；
+- 独立scratch数据库的backup / restore演练；
+- 单机history pagination容量工具：必做10万条小正文revision，百万级降为磁盘允许时的可选
+  extended soak；
+- 有界本地rate limit / abuse burst tests，不要求分布式压测；
+- Secret incident通知 / forensic本地演练，并记录未来scrub requirements；
+- 记录Document retention / compliance待决问题，不要求在未上线阶段取得生产政策结论；
+- 测量Community shared lock；只有数据证明必要时才实现per-document lock；
+- 记录未来Adapter观察标准；没有真实使用时不要求提出Adapter proposal；
+- 容量工具先运行小样本估算磁盘，设置剩余空间熔断，并在退出时精确清理scratch数据库、
+  临时文件和Cargo incremental产物。
 
 验收：
 
-- signer change可以在 capability disabled 状态完成全量重投影并恢复；
-- million-scale revision synthetic test有有界 memory / query；
-- restore 后 canonical / projection parity；
-- lock 优化若实施，有正式 race proof / test；
-- 没有因“支持 Resource”而暗中引入 Secret Store / installer；
-- Adapter proposal有真实 usage evidence，而不是预先扩协议；
-- Stage 5/6 canary的错误率、maintenance drill、restore、security与capacity gates全部通过
-  后，才允许 broad Community rollout；新 Community此后才可显式默认选择 v3。
+- capability disabled状态下，signer change可在本地scratch完成全量重投影、verify与恢复；
+- 本地backup / restore后canonical state、head / revision projection与generation parity一致；
+- 必做数据集至少100,000条revision，正文以256–1,024字节为主，同时覆盖一个hot Document和
+  多Document宽catalog；上限正文另用小规模case验证，不生成100万条49,152字节正文；
+- history page继续使用closed keyset cursor与`limit <= 50`，查询计划命中预期索引且不扫描完整
+  revision表；本机单页timeout为2秒，Relay / test client RSS不随翻页数量线性增长；
+- 百万级revision只作为non-blocking extended soak，必须通过磁盘preflight才可运行，失败或未运行
+  不阻止阶段 7交付；
+- lock优化若实施，有正式race proof / test；若未实施，保留测量报告和不实施理由；
+- Stage 5 / 6真实本地canary在阶段 7最终代码上各重跑一次，maintenance、restore、security与
+  10万级capacity gate通过；不要求生产错误率或真实用户观察窗口；
+- 没有因“支持Resource”而引入Secret Store、installer或隐式external action；
+- 阶段完成后仍维持显式opt-in。首次发布或部署前另建deployment / rollout gate，再决定默认值、
+  真实cohort、监控和容量要求。
 
 本阶段之后才讨论：
 
@@ -5279,7 +5301,7 @@ Documents         │
 没有 durable Assignment + Runtime baseline / ack / frozen fence → 不执行 v3 cutover
 没有 cross-domain lock / constraints → 不开放 Context Reference
 没有 dual Context clients + RoleBrief closure → 不 enable/广告 Context capability
-没有阶段 7 rollout gate → 不做 broad Community rollout
+没有首次部署时单独批准的 deployment / rollout gate → 不做 broad Community rollout
 ```
 
 ## 28. 总体验收标准
@@ -5336,7 +5358,8 @@ Documents         │
 36. cutover支持 after-commit replay-first；post-commit fault只通过 frozen、
     exact-epoch、audited repair / reproject前进。
 37. empty-state Community可显式 direct initialize v3；任何已有 v1 history不走该捷径。
-38. Stage 5/6只运行 bounded canary，Stage 7 gate前不 broad rollout。
+38. Stage 5/6只运行本地bounded canary；单机阶段 7完成不自动授权broad rollout，首次真实
+    部署前必须另立deployment / rollout gate。
 
 ## 29. 明确延期的设计
 

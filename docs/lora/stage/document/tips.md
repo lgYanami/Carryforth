@@ -27,6 +27,25 @@ Buzz目前没有已部署的真实环境，没有已发布版本，也没有需�
 当本提示与阶段规划冲突时，应区分两类事项：已发布版本兼容和生产rollout属于未来发布准备；当前代码
 实际保留的初始化、迁移、maintenance与恢复路径属于当前本地真实运行验收，仍是阶段完成条件。
 
+## 阶段 7 使用单机预发布基线
+
+当前只有一台开发机，因此阶段 7不把生产规模或不存在的真实用户观察作为交付门槛：
+
+- 必做容量数据集为至少100,000条小正文revision，并同时包含hot Document与宽catalog；
+- 1,000,000条revision是non-blocking extended soak，只在磁盘preflight通过时运行；
+- 不生成100万条上限正文。49,152字节正文只用小规模case验证；
+- 生产dashboard替换为可归档的本地JSON / Markdown报告；多节点、HA与分布式压测延期到出现真实
+  部署拓扑后；
+- 没有真实用户时不要求生产错误率窗口或Adapter usage evidence；阶段 5 / 6 canary在最终代码上各
+  重跑一次即可；
+- signer rotation、backup / restore、projection parity、权限、安全和Secret incident路径仍必须使用
+  独立scratch环境真实运行，不能只做mock；
+- 阶段 7完成不授权发布、默认启用v3或broad rollout。首次部署前根据当时磁盘、数据量、拓扑和
+  运维责任另立deployment / rollout gate。
+
+容量工具必须先用小样本估算数据库、索引与WAL空间，设置剩余空间熔断，并在退出时精确清理测试
+数据库和临时文件。不得为了达到名义行数耗尽唯一开发机。
+
 ## 动态管理本地构建产物
 
 本项目的Rust workspace与Desktop Tauri会分别在`target/`和`desktop/src-tauri/target/`产生大量增量编译

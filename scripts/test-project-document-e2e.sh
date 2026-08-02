@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+export CARGO_INCREMENTAL=0
+
 docker compose up -d postgres redis minio minio-init >/dev/null
 for container in buzz-postgres buzz-redis buzz-minio; do
   status=""
@@ -47,6 +49,7 @@ test_host="localhost:${port}"
 relay_pid=""
 relay_log="$(mktemp)"
 temporary_files=("${relay_log}")
+restore_database_name=""
 
 cleanup() {
   if [[ -n "${relay_pid}" ]] && kill -0 "${relay_pid}" 2>/dev/null; then
@@ -56,7 +59,14 @@ cleanup() {
   rm -f "${temporary_files[@]}"
   docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
     psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
-    -c "DROP DATABASE IF EXISTS ${database_name} WITH (FORCE)" >/dev/null
+    -c "DROP DATABASE IF EXISTS ${database_name} WITH (FORCE)" >/dev/null || true
+  if [[ -n "${restore_database_name}" ]]; then
+    docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+      psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
+      -c "DROP DATABASE IF EXISTS ${restore_database_name} WITH (FORCE)" >/dev/null || true
+  fi
+  find "${REPO_ROOT}/target" "${REPO_ROOT}/desktop/src-tauri/target" \
+    -type d -name incremental -prune -exec rm -rf -- {} + 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -422,4 +432,212 @@ if (( control_audits < 5 )); then
   exit 1
 fi
 
-echo "Project Document Stage 2 E2E and synthetic Secret incident drill passed."
+if [[ "${PROJECT_DOCUMENT_STAGE7_RECOVERY:-0}" == "1" ]]; then
+  # Real local signer rotation: keep the capability disabled, build every
+  # historical projection in an invisible generation, then activate once.
+  stop_relay
+  generated_key="$(${bin_dir}/buzz-admin generate-key)"
+  rotated_relay_pubkey="$(awk '/Public key:/ {print $3}' <<<"${generated_key}")"
+  rotated_relay_private_key="$(awk '/Secret key:/ {print $3}' <<<"${generated_key}")"
+  [[ "${rotated_relay_pubkey}" =~ ^[0-9a-f]{64}$ ]]
+  [[ "${rotated_relay_private_key}" =~ ^[0-9a-f]{64}$ ]]
+  rotated_key_file="$(mktemp)"
+  backup_file="$(mktemp)"
+  temporary_files+=("${rotated_key_file}" "${backup_file}")
+  printf '%s\n' "${rotated_relay_private_key}" >"${rotated_key_file}"
+  chmod 600 "${rotated_key_file}"
+
+  buzz_admin reproject \
+    --community "${test_host}" \
+    --all-revisions \
+    --relay-key-file "${rotated_key_file}" \
+    --expected-pubkey "${rotated_relay_pubkey}" >/dev/null
+  jq -e '.replayed == true and .projection_parity == true' \
+    <<<"$(buzz_admin reproject \
+      --community "${test_host}" \
+      --all-revisions \
+      --relay-key-file "${rotated_key_file}" \
+      --expected-pubkey "${rotated_relay_pubkey}")" >/dev/null
+  buzz_admin verify \
+    --community "${test_host}" \
+    --expected-pubkey "${rotated_relay_pubkey}" >/dev/null
+  status_json="$(buzz_admin status --community "${test_host}")"
+  jq -e --arg signer "${rotated_relay_pubkey}" '
+    length == 1
+    and .[0].enabled == false
+    and .[0].projection_generation == 2
+    and .[0].projection_pubkey == $signer
+    and .[0].meta_parity == true
+    and .[0].orphan_projection_count == 0
+    and .[0].pointer_mismatch_count == 0
+    and .[0].reproject.state == "activated"
+  ' <<<"${status_json}" >/dev/null
+
+  # Back up the rotated, disabled generation and restore it into a second
+  # exact scratch database. Verify canonical business rows and every active
+  # projection with the new signer before starting a Relay from that identity.
+  docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    pg_dump -U buzz -d "${database_name}" -Fc >"${backup_file}"
+  [[ -s "${backup_file}" ]]
+  restore_database_name="${database_name}_restore"
+  if [[ ! "${restore_database_name}" =~ ^buzz_pd_e2e_[0-9_]+_restore$ ]]; then
+    echo "Refusing unsafe restore database name: ${restore_database_name}" >&2
+    exit 1
+  fi
+  docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
+    -c "CREATE DATABASE ${restore_database_name}" >/dev/null
+  docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
+    pg_restore -U buzz -d "${restore_database_name}" --no-owner --no-privileges \
+    <"${backup_file}"
+  restored_database_url="postgres://buzz:buzz_dev@localhost:5432/${restore_database_name}"
+  env \
+    DATABASE_URL="${restored_database_url}" \
+    BUZZ_RELAY_PRIVATE_KEY="${rotated_relay_private_key}" \
+    "${bin_dir}/buzz-admin" project-document verify \
+      --community "${test_host}" \
+      --expected-pubkey "${rotated_relay_pubkey}" >/dev/null
+  canonical_digest_sql="SELECT md5(string_agg(
+      document_id::text || ':' || document_revision::text || ':' || catalog_revision::text || ':' ||
+      state || ':' || encode(actor_pubkey, 'hex') || ':' || canonical_at::text || ':' ||
+      coalesce(title, '') || ':' || coalesce(summary, '') || ':' || coalesce(content_markdown, ''),
+      E'\\n' ORDER BY document_id, document_revision))
+    FROM project_document_revisions
+    WHERE community_id = '00000000-0000-4000-8000-00000000d0c0'"
+  source_digest="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d "${database_name}" -Atc "${canonical_digest_sql}")"
+  restored_digest="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d "${restore_database_name}" -Atc "${canonical_digest_sql}")"
+  [[ -n "${source_digest}" && "${source_digest}" == "${restored_digest}" ]]
+
+  relay_private_key="${rotated_relay_private_key}"
+  export BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN=3
+  export BUZZ_RATE_LIMIT_HUMAN_API_CALLS_PER_MIN=3
+  export BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC=100
+  docker exec buzz-redis redis-cli DEL \
+    "buzz:00000000-0000-4000-8000-00000000d0c0:ratelimit:${member_pubkey}:msg" \
+    "buzz:00000000-0000-4000-8000-00000000d0c0:ratelimit:${member_pubkey}:ws" \
+    "buzz:00000000-0000-4000-8000-00000000d0c0:ratelimit:${member_pubkey}:api" \
+    >/dev/null
+  start_relay
+  buzz_admin enable \
+    --community "${test_host}" \
+    --relay-key-file "${rotated_key_file}" \
+    --expected-pubkey "${rotated_relay_pubkey}" >/dev/null
+  jq -e 'length == 4 and .[0].state == "deleted"' \
+    <<<"$(buzz_cli documents history "${document_id}")" >/dev/null
+
+  # Bounded abuse burst: the normal shared HTTP admission limiter must reject
+  # the fourth/following private Document history query. This exercises the
+  # real Document query gate without creating ambiguous write/readback results.
+  docker exec buzz-redis redis-cli DEL \
+    "buzz:00000000-0000-4000-8000-00000000d0c0:ratelimit:${member_pubkey}:api" \
+    >/dev/null
+  current_catalog_revision="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d "${database_name}" -Atc \
+    "SELECT catalog_revision FROM project_document_state
+     WHERE community_id = '00000000-0000-4000-8000-00000000d0c0'")"
+  burst_query="$(jq -cn \
+    --arg signer "${rotated_relay_pubkey}" \
+    --argjson catalog_revision "${current_catalog_revision}" \
+    '[{
+      kinds: [40905],
+      authors: [$signer],
+      "#t": ["buzz-project-document-head"],
+      limit: 1,
+      buzz_project_document: {
+        scope: "active_heads",
+        projection_generation: 2,
+        catalog_revision: $catalog_revision
+      }
+    }]')"
+  burst_accepted=0
+  burst_rejected=0
+  for burst_index in $(seq 1 6); do
+    burst_log="$(mktemp)"
+    temporary_files+=("${burst_log}")
+    burst_status="$(curl -sS -o "${burst_log}" -w '%{http_code}' \
+      -X POST "http://${test_host}/query" \
+      -H 'Content-Type: application/json' \
+      -H "X-Pubkey: ${member_pubkey}" \
+      --data-binary "${burst_query}")"
+    if [[ "${burst_status}" == "200" ]]; then
+      burst_accepted=$((burst_accepted + 1))
+    elif [[ "${burst_status}" == "429" ]] \
+      && rg -qi "rate-limited|quota exceeded" "${burst_log}"; then
+      burst_rejected=$((burst_rejected + 1))
+    else
+      cat "${burst_log}" >&2
+      echo "Project Document Stage 7: unexpected bounded-burst failure" >&2
+      exit 1
+    fi
+  done
+  if (( burst_accepted != 3 || burst_rejected != 3 )); then
+    echo "Project Document Stage 7: bounded burst accepted=${burst_accepted}, rejected=${burst_rejected}, expected 3/3" >&2
+    exit 1
+  fi
+  admission_metric="$(curl -fsS "http://127.0.0.1:${metrics_port}/metrics" \
+    | rg 'buzz_admission_rejections_total.*reason="quota"' || true)"
+  [[ "${admission_metric}" == *'transport="http"'* ]]
+  buzz_admin disable --community "${test_host}" >/dev/null
+  stop_relay
+  unset BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN
+  unset BUZZ_RATE_LIMIT_HUMAN_API_CALLS_PER_MIN
+  unset BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC
+
+  recovery_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  recovery_report_dir="${STAGE7_RECOVERY_REPORT_DIR:-${REPO_ROOT}/test-results/stage7-recovery/${recovery_run_id}}"
+  mkdir -p "${recovery_report_dir}"
+  backup_bytes="$(wc -c <"${backup_file}")"
+  jq -n \
+    --arg run_id "${recovery_run_id}" \
+    --arg community_id "00000000-0000-4000-8000-00000000d0c0" \
+    --arg target_pubkey "${rotated_relay_pubkey}" \
+    --argjson revision_count "${revision_rows_after_disable}" \
+    --argjson backup_bytes "${backup_bytes}" \
+    --argjson burst_accepted "${burst_accepted}" \
+    --argjson burst_rejected "${burst_rejected}" \
+    '{
+      schema_version: 1,
+      run_id: $run_id,
+      mode: "single_machine_prerelease",
+      community_id: $community_id,
+      source_generation: 1,
+      target_generation: 2,
+      target_pubkey: $target_pubkey,
+      revision_count_before_rotation: $revision_count,
+      inactive_generation_staged: true,
+      activated: true,
+      replay_after_commit_verified: true,
+      orphan_projection_count: 0,
+      pointer_mismatch_count: 0,
+      backup_bytes: $backup_bytes,
+      restored_to_independent_database: true,
+      canonical_digest_matched: true,
+      restored_projection_parity: true,
+      new_signer_relay_history_read: true,
+      secret_incident_drill: true,
+      bounded_abuse: {
+        http_budget: 3,
+        accepted: $burst_accepted,
+        rejected_429: $burst_rejected
+      },
+      final_enabled: false,
+      passed: true
+    }' >"${recovery_report_dir}/recovery-report.json"
+  {
+    echo "# Project Document Stage 7 recovery report"
+    echo
+    echo "- Run: \`${recovery_run_id}\`"
+    echo "- Signer generation: 1 → 2"
+    echo "- Revisions reprojected: ${revision_rows_after_disable}"
+    echo "- Backup bytes: ${backup_bytes}"
+    echo "- Independent restore parity: PASS"
+    echo "- Bounded HTTP burst: ${burst_accepted} accepted / ${burst_rejected} rejected"
+    echo "- Final capability: disabled"
+    echo "- Result: PASS"
+  } >"${recovery_report_dir}/recovery-report.md"
+  echo "Stage 7 recovery evidence: ${recovery_report_dir}"
+fi
+
+echo "Project Document Stage 2 E2E, Secret incident, and requested recovery drills passed."

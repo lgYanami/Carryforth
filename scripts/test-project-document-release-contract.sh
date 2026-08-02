@@ -21,6 +21,7 @@ for script in \
   scripts/test-project-document-db.sh \
   scripts/test-project-document-e2e.sh \
   scripts/test-project-document-release-contract.sh \
+  scripts/test-project-document-stage7-capacity.sh \
   scripts/test-project-view-migrations.sh; do
   if [[ ! -x "${script}" ]]; then
     echo "Project Document release contract: ${script} must be executable" >&2
@@ -33,6 +34,13 @@ require_literal "just project-document-test-unit" Justfile
 require_literal "project-document-test-db:" Justfile
 require_literal "project-document-test-e2e:" Justfile
 require_literal "project-document-test:" Justfile
+require_literal "project-document-stage7-recovery:" Justfile
+require_literal "project-document-stage7-capacity:" Justfile
+require_literal "project-document-stage7-test:" Justfile
+require_literal "just project-document-test-unit" Justfile
+require_literal "just project-document-test-db" Justfile
+require_literal "just project-document-stage7-recovery" Justfile
+require_literal "just project-document-stage7-capacity" Justfile
 require_literal "cargo test -p buzz-project-document" scripts/run-tests.sh
 require_literal "cargo test -p buzz-acp --lib project_document" scripts/run-tests.sh
 require_literal "cargo test -p buzz-admin project_document" scripts/run-tests.sh
@@ -45,6 +53,7 @@ require_literal "crates/buzz-project-document/**" .github/workflows/ci.yml
 require_literal "crates/buzz-acp/**" .github/workflows/ci.yml
 require_literal "crates/buzz-admin/**" .github/workflows/ci.yml
 require_literal "scripts/test-project-document-*.sh" .github/workflows/ci.yml
+require_literal "scripts/project-document-capacity-fixture.sql" .github/workflows/ci.yml
 require_literal "--test e2e_project_document_disabled" .github/workflows/ci.yml
 require_literal "--test e2e_project_document_enabled" .github/workflows/ci.yml
 require_literal "project-document-integration:" .github/workflows/ci.yml
@@ -64,6 +73,8 @@ require_literal "enum DocumentsCmd" crates/buzz-cli/src/lib.rs
 require_literal "Cmd::Documents" crates/buzz-cli/src/lib.rs
 require_literal "Project Documents are not a Secret Store" crates/buzz-cli/src/commands/documents.rs
 require_literal "buzz-project-document-v1" crates/buzz-relay/src/nip11.rs
-require_literal "synthetic Secret incident drill" scripts/test-project-document-e2e.sh
+require_literal "Synthetic Secret incident drill" scripts/test-project-document-e2e.sh
+require_literal "PROJECT_DOCUMENT_STAGE7_RECOVERY" scripts/test-project-document-e2e.sh
+require_literal "project-document-capacity-fixture.sql" scripts/test-project-document-stage7-capacity.sh
 
 echo "Project Document Stage 2 release contract passed."
