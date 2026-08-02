@@ -2349,6 +2349,10 @@ async fn validate_v3_structural_in_tx(
         .bind(community_id.as_uuid())
         .execute(&mut **tx)
         .await?;
+    sqlx::query("SELECT project_role_open_proposal_validate_community($1)")
+        .bind(community_id.as_uuid())
+        .execute(&mut **tx)
+        .await?;
     let relay = relay_pubkey.to_bytes();
     let row = sqlx::query(
         "SELECT state.meta_projection_event_id, state.project_revision, \
@@ -2375,6 +2379,20 @@ async fn validate_v3_structural_in_tx(
                SELECT 1 FROM project_view_objects object \
                WHERE object.community_id = community.id \
                  AND (object.schema_version <> 3 OR object.source_provenance_id IS NULL) \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 \
+               FROM project_role_assignment_proposals proposal \
+               LEFT JOIN project_view_objects role \
+                 ON role.community_id = proposal.community_id \
+                AND role.object_id = proposal.role_id \
+               WHERE proposal.community_id = community.id \
+                 AND proposal.status = 'open' \
+                 AND (role.object_id IS NULL \
+                      OR role.object_type <> 'role' \
+                      OR role.schema_version <> 3 \
+                      OR role.deleted_at IS NOT NULL \
+                      OR role.body->'active' IS DISTINCT FROM 'true'::jsonb) \
            ) \
            AND NOT EXISTS ( \
                SELECT 1 FROM ( \

@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 
 use super::*;
 use crate::app_state::build_app_state;
+use crate::relay::SubmitEventResponse;
 
 #[derive(Clone, Copy)]
 enum MutationServerMode {
@@ -416,6 +417,107 @@ fn receipt_requires_the_canonical_response_prefix() {
 
     let error = parse_receipt(&response, &event).expect_err("raw JSON must fail closed");
     assert!(error.contains("canonical `response:` prefix"));
+}
+
+#[test]
+fn v3_object_receipt_is_normalized_for_projection_confirmation() {
+    let event = build_initialize(
+        profile(),
+        vec![InitializeGoal {
+            id: Uuid::new_v4(),
+            title: "Ship".to_owned(),
+            desired_outcome: "A usable View".to_owned(),
+            directions: Vec::new(),
+        }],
+    )
+    .expect("build receipt fixture event")
+    .sign_with_keys(&Keys::generate())
+    .expect("sign receipt fixture event");
+    let object_id = Uuid::new_v4();
+    let response = SubmitEventResponse {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            json!({
+                "schema_version": 3,
+                "operation": "create",
+                "project_revision": 2,
+                "objects": [{
+                    "object_id": object_id,
+                    "object_type": "role",
+                    "object_revision": 1,
+                    "deleted": false,
+                }],
+                "continuity_entities": [],
+            })
+        ),
+    };
+
+    let receipt = validate_receipt(
+        parse_receipt(&response, &event).expect("parse v3 receipt"),
+        Some(MutationTarget {
+            operation: "create",
+            object_type: ProjectViewObjectType::Role,
+            object_id,
+            deleted: false,
+        }),
+    )
+    .expect("validate v3 receipt");
+
+    assert_eq!(receipt.project_revision, 2);
+    assert_eq!(receipt.object_id, Some(object_id));
+    assert_eq!(receipt.object_revision, Some(1));
+    assert_eq!(receipt.deleted, Some(false));
+}
+
+#[test]
+fn v3_object_receipt_rejects_a_different_requested_operation() {
+    let event = build_initialize(
+        profile(),
+        vec![InitializeGoal {
+            id: Uuid::new_v4(),
+            title: "Ship".to_owned(),
+            desired_outcome: "A usable View".to_owned(),
+            directions: Vec::new(),
+        }],
+    )
+    .expect("build receipt fixture event")
+    .sign_with_keys(&Keys::generate())
+    .expect("sign receipt fixture event");
+    let object_id = Uuid::new_v4();
+    let response = SubmitEventResponse {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            json!({
+                "schema_version": 3,
+                "operation": "create",
+                "project_revision": 2,
+                "objects": [{
+                    "object_id": object_id,
+                    "object_type": "role",
+                    "object_revision": 1,
+                    "deleted": false,
+                }],
+                "continuity_entities": [],
+            })
+        ),
+    };
+
+    let error = validate_receipt(
+        parse_receipt(&response, &event).expect("parse v3 receipt"),
+        Some(MutationTarget {
+            operation: "update",
+            object_type: ProjectViewObjectType::Role,
+            object_id,
+            deleted: false,
+        }),
+    )
+    .expect_err("receipt operation must match the signed intent");
+
+    assert!(error.contains("v3 mutation receipt does not match"));
 }
 
 #[tokio::test]

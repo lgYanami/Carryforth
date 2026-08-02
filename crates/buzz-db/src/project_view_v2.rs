@@ -3135,6 +3135,25 @@ pub(crate) async fn reject_role_ids_with_active_authority(
     if role_ids.is_empty() {
         return Ok(());
     }
+    let proposed_role: Option<Uuid> = sqlx::query_scalar(
+        "SELECT role_id FROM project_role_assignment_proposals \
+         WHERE community_id = $1 AND role_id = ANY($2) AND status = 'open' \
+         ORDER BY role_id LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(role_ids)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(role_id) = proposed_role {
+        return Err(ProjectViewV2WriteError::ObjectDomain(
+            DomainError::InvalidField {
+                field: "active",
+                reason: format!(
+                    "Role {role_id} has an open Proposal; resolve or withdraw the Proposal before deactivating or deleting the Role"
+                ),
+            },
+        ));
+    }
     let assigned_role: Option<Uuid> = sqlx::query_scalar(
         "SELECT role_id FROM project_role_assignments \
          WHERE community_id = $1 AND role_id = ANY($2) AND ended_at IS NULL \

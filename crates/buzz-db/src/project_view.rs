@@ -5481,6 +5481,71 @@ mod tests {
             ),
         )
         .await;
+
+        let mut invalid_role = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin direct Role tombstone attempt");
+        sqlx::query(
+            "UPDATE project_view_objects \
+             SET body = jsonb_set(body, '{active}', 'false'::jsonb) \
+             WHERE community_id = $1 AND object_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(role_id)
+        .execute(&mut *invalid_role)
+        .await
+        .expect("stage direct Role tombstone");
+        let integrity_error =
+            sqlx::query("SELECT project_role_open_proposal_validate_community($1)")
+                .bind(community_id.as_uuid())
+                .execute(&mut *invalid_role)
+                .await
+                .expect_err("database guard must reject an orphaned open Proposal");
+        assert!(integrity_error
+            .to_string()
+            .contains("Open Role Proposal references a missing or inactive Role"));
+        invalid_role
+            .rollback()
+            .await
+            .expect("roll back direct Role tombstone attempt");
+
+        let deactivate_with_open_proposal = ProjectObjectCommand::new(
+            4,
+            None,
+            MutationRequest::Update(UpdateMutation::Role {
+                object_id: role_id,
+                patch: RolePatch {
+                    active: Patch::Set(false),
+                    ..RolePatch::default()
+                },
+            }),
+        );
+        let deactivate_event = build_project_object_command(deactivate_with_open_proposal.clone())
+            .expect("build rejected Role deactivation")
+            .sign_with_keys(&owner)
+            .expect("sign rejected Role deactivation");
+        let mut write = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin rejected Role deactivation");
+        let error = write
+            .prepare_project_object_command(&deactivate_event, &deactivate_with_open_proposal)
+            .await
+            .expect_err("a Role with an open Proposal cannot be deactivated");
+        assert!(matches!(
+            error,
+            ProjectViewV2WriteError::ObjectDomain(DomainError::InvalidField {
+                field: "active",
+                reason,
+            }) if reason.contains("open Proposal")
+        ));
+        write
+            .rollback()
+            .await
+            .expect("roll back rejected Role deactivation");
+
         let accepted = commit_v2_role_for_test(
             &db,
             community_id,

@@ -1261,6 +1261,35 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
   await expect(page.getByLabel("Active role")).toBeDisabled();
 });
 
+test("an open Role Proposal blocks deletion and deactivation", async ({
+  page,
+}) => {
+  const projectView = structuredClone(V2_READY_VIEW);
+  projectView.role_continuity.assignments = [];
+  projectView.role_continuity.commitments = [];
+  projectView.role_continuity.workResponsibilities = [];
+  await installMockBridge(page, { projectView });
+  await page.goto("/");
+  await openFullProjectView(page);
+
+  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  const inspector = page.getByTestId("project-view-inspector");
+  await expect(
+    inspector.getByRole("button", { name: "Delete" }),
+  ).toBeDisabled();
+  await expect(page.getByTestId("project-role-lifecycle-guard")).toContainText(
+    "This Role has an open Proposal",
+  );
+
+  await inspector.getByRole("button", { name: "Edit" }).click();
+  await expect(page.getByLabel("Active role")).toBeDisabled();
+  await expect(
+    page.getByText(
+      "Resolve or withdraw the open Proposal before deactivating this Role.",
+    ),
+  ).toBeVisible();
+});
+
 test("Role Inspector loads the next history page through the native boundary", async ({
   page,
 }) => {

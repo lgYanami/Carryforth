@@ -362,6 +362,7 @@ export function ProjectViewObjectDialog({
   open,
   projectRevision,
   roleHasActiveAssignment,
+  roleHasOpenProposal,
   schemaVersion,
   view,
 }: {
@@ -375,6 +376,7 @@ export function ProjectViewObjectDialog({
   open: boolean;
   projectRevision: number;
   roleHasActiveAssignment?: boolean;
+  roleHasOpenProposal?: boolean;
   schemaVersion: 1 | 2 | 3;
   view: ProjectView;
 }) {
@@ -506,9 +508,15 @@ export function ProjectViewObjectDialog({
     setConflict(undefined);
     let createdGuideForRetry: string | undefined;
     try {
-      if (roleHasActiveAssignment && objectType === "role" && !form.active) {
+      if (
+        (roleHasActiveAssignment || roleHasOpenProposal) &&
+        objectType === "role" &&
+        !form.active
+      ) {
         setError(
-          "End or replace the active Assignment before deactivating this Role.",
+          roleHasActiveAssignment
+            ? "End or replace the active Assignment before deactivating this Role."
+            : "Resolve or withdraw the open Proposal before deactivating this Role.",
         );
         return;
       }
@@ -683,6 +691,7 @@ export function ProjectViewObjectDialog({
               form={form}
               guideOptions={guideOptions}
               roleHasActiveAssignment={roleHasActiveAssignment}
+              roleHasOpenProposal={roleHasOpenProposal}
               schemaVersion={schemaVersion}
               set={set}
               type={objectType}

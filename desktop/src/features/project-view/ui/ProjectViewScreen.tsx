@@ -621,6 +621,17 @@ function ReadyProjectView({
               ),
             )
           }
+          roleHasOpenProposal={
+            editor.mode === "edit" &&
+            editor.object.objectType === "role" &&
+            Boolean(
+              roleContinuity?.proposals.some(
+                (proposal) =>
+                  proposal.roleId === editor.object.id &&
+                  proposal.status === "open",
+              ),
+            )
+          }
           schemaVersion={schemaVersion}
           view={view}
         />

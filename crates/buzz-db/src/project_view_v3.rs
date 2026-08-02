@@ -364,6 +364,20 @@ impl Db {
                         SELECT count(*)::integer FROM project_role_assignment_proposals proposal \
                         WHERE proposal.community_id = c.id AND proposal.status = 'open' \
                     ) \
+                    AND NOT EXISTS ( \
+                        SELECT 1 \
+                        FROM project_role_assignment_proposals proposal \
+                        LEFT JOIN project_view_objects role \
+                          ON role.community_id = proposal.community_id \
+                         AND role.object_id = proposal.role_id \
+                        WHERE proposal.community_id = c.id \
+                          AND proposal.status = 'open' \
+                          AND (role.object_id IS NULL \
+                               OR role.object_type <> 'role' \
+                               OR role.schema_version <> 3 \
+                               OR role.deleted_at IS NOT NULL \
+                               OR role.body->'active' IS DISTINCT FROM 'true'::jsonb) \
+                    ) \
                     AND s.active_assignment_count = ( \
                         SELECT count(*)::integer FROM project_role_assignments assignment \
                         WHERE assignment.community_id = c.id AND assignment.ended_at IS NULL \
@@ -478,6 +492,10 @@ impl Db {
             return Ok(false);
         }
         sqlx::query("SELECT project_view_v3_validate_community($1)")
+            .bind(community_id.as_uuid())
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("SELECT project_role_open_proposal_validate_community($1)")
             .bind(community_id.as_uuid())
             .execute(&mut **tx)
             .await?;

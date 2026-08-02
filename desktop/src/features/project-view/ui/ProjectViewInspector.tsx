@@ -261,6 +261,14 @@ function ProjectViewInspectorContent({
           assignment.roleId === roleDefinition.roleId && !assignment.endedAt,
       ),
   );
+  const roleHasOpenProposal = Boolean(
+    roleDefinition &&
+      roleContinuity?.proposals.some(
+        (proposal) =>
+          proposal.roleId === roleDefinition.roleId &&
+          proposal.status === "open",
+      ),
+  );
   const roleHasResponsibleWork = Boolean(
     roleDefinition &&
       roleContinuity?.workResponsibilities.some(
@@ -268,7 +276,7 @@ function ProjectViewInspectorContent({
       ),
   );
   const roleLifecycleBlocked =
-    roleHasActiveAssignment || roleHasResponsibleWork;
+    roleHasActiveAssignment || roleHasOpenProposal || roleHasResponsibleWork;
 
   return (
     <>
@@ -319,9 +327,11 @@ function ProjectViewInspectorContent({
             title={
               roleHasActiveAssignment
                 ? "End the active Assignment before deleting this Role."
-                : roleHasResponsibleWork
-                  ? "Clear or reassign this Role's Work before deleting it."
-                  : undefined
+                : roleHasOpenProposal
+                  ? "Resolve or withdraw the open Proposal before deleting this Role."
+                  : roleHasResponsibleWork
+                    ? "Clear or reassign this Role's Work before deleting it."
+                    : undefined
             }
             type="button"
             variant="outline"
@@ -342,7 +352,9 @@ function ProjectViewInspectorContent({
           >
             {roleHasActiveAssignment
               ? "This Role has an active Assignment. End or replace the tenure before deactivating or deleting the Role."
-              : "This Role is responsible for Work. Clear or reassign that responsibility before deactivating or deleting the Role."}
+              : roleHasOpenProposal
+                ? "This Role has an open Proposal. Resolve or withdraw it before deactivating or deleting the Role."
+                : "This Role is responsible for Work. Clear or reassign that responsibility before deactivating or deleting the Role."}
           </p>
         ) : null}
 

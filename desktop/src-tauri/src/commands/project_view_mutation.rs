@@ -37,10 +37,14 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::relay::{
     query_relay_at_with_keys, relay_api_base_url_with_override, submit_signed_event_at_with_keys,
-    SubmitEventResponse,
 };
 
 use super::project_view::{read_identity_at, ProjectViewIdentity, ProjectViewSchema};
+
+#[path = "project_view_mutation_receipt.rs"]
+mod receipt;
+
+use receipt::{parse_receipt, validate_receipt, ProjectViewReceipt};
 
 /// One initial Goal entered by a Human before Project View has an identity.
 #[derive(Debug, Deserialize)]
@@ -149,17 +153,10 @@ struct PreparedMutation {
 
 #[derive(Debug, Clone, Copy)]
 struct MutationTarget {
+    operation: &'static str,
     object_type: ProjectViewObjectType,
     object_id: Uuid,
     deleted: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectViewReceipt {
-    project_revision: u64,
-    object_id: Option<Uuid>,
-    object_revision: Option<u64>,
-    deleted: Option<bool>,
 }
 
 struct MutationContext {
@@ -295,8 +292,7 @@ async fn execute_mutation(
             Err(message) => return Err(message),
         };
 
-    let receipt = parse_receipt(&response, &event)?;
-    validate_receipt(&receipt, prepared.target)?;
+    let receipt = validate_receipt(parse_receipt(&response, &event)?, prepared.target)?;
     confirm_projection(state, &context, &event, &receipt, prepared.target).await?;
 
     Ok(ProjectViewMutationResult::Applied {
@@ -354,6 +350,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
                 request: Some(request),
                 expected_project_revision,
                 target: Some(MutationTarget {
+                    operation: "create",
                     object_type,
                     object_id,
                     deleted: false,
@@ -374,6 +371,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
                 request: Some(request),
                 expected_project_revision,
                 target: Some(MutationTarget {
+                    operation: "update",
                     object_type,
                     object_id,
                     deleted: false,
@@ -395,6 +393,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
                 request: Some(request),
                 expected_project_revision,
                 target: Some(MutationTarget {
+                    operation: "delete",
                     object_type,
                     object_id,
                     deleted: true,
@@ -425,6 +424,7 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
             (
                 expected_project_revision,
                 MutationTarget {
+                    operation: "create",
                     object_type,
                     object_id,
                     deleted: false,
@@ -440,6 +440,7 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
         } => (
             expected_project_revision,
             MutationTarget {
+                operation: "update",
                 object_type,
                 object_id,
                 deleted: false,
@@ -453,6 +454,7 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
         } => (
             expected_project_revision,
             MutationTarget {
+                operation: "delete",
                 object_type,
                 object_id,
                 deleted: true,
@@ -470,6 +472,7 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
         } => (
             expected_project_revision,
             MutationTarget {
+                operation: "update",
                 object_type,
                 object_id,
                 deleted: false,
@@ -564,53 +567,6 @@ fn update_input_v3(
         "patch": patch,
     }))
     .map_err(|error| format!("invalid typed Project View v3 update patch: {error}"))
-}
-
-fn parse_receipt(
-    response: &SubmitEventResponse,
-    event: &Event,
-) -> Result<ProjectViewReceipt, String> {
-    if response.event_id != event.id.to_hex() {
-        return Err(
-            "Project View integrity error: mutation response event_id differs from the submitted event"
-                .to_owned(),
-        );
-    }
-    let payload = response.message.strip_prefix("response:").ok_or_else(|| {
-        "Project View integrity error: mutation receipt is missing the canonical `response:` prefix"
-            .to_owned()
-    })?;
-    serde_json::from_str(payload)
-        .map_err(|error| format!("Project View integrity error: invalid mutation receipt: {error}"))
-}
-
-fn validate_receipt(
-    receipt: &ProjectViewReceipt,
-    target: Option<MutationTarget>,
-) -> Result<(), String> {
-    match target {
-        None if receipt.object_id.is_none()
-            && receipt.object_revision.is_none()
-            && receipt.deleted.is_none() =>
-        {
-            Ok(())
-        }
-        None => Err(
-            "Project View integrity error: initialization receipt contains object fields"
-                .to_owned(),
-        ),
-        Some(target)
-            if receipt.object_id == Some(target.object_id)
-                && receipt.object_revision.is_some()
-                && receipt.deleted == Some(target.deleted) =>
-        {
-            Ok(())
-        }
-        Some(_) => Err(
-            "Project View integrity error: mutation receipt does not match the requested object"
-                .to_owned(),
-        ),
-    }
 }
 
 async fn confirm_projection(
