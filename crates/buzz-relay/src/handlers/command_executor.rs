@@ -39,6 +39,7 @@ use super::side_effects::{
 };
 
 const MEETING_V1_POLICY: &str = buzz_sdk::MEETING_V1_POLICY;
+const MEETING_V2_POLICY: &str = buzz_sdk::MEETING_V2_POLICY;
 
 /// Frozen Meeting floor-control protocol selected by the persisted Session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,8 @@ pub(crate) enum MeetingProtocol {
     UniformV0,
     /// Meeting V1 moderator-controlled baton.
     ModeratedBatonV1,
+    /// Meeting V2 moderator-maintained current board.
+    ModeratedBoardV2,
 }
 
 impl MeetingProtocol {
@@ -54,6 +57,15 @@ impl MeetingProtocol {
         match self {
             Self::UniformV0 => buzz_db::meeting_floor::FLOOR_POLICY_VERSION,
             Self::ModeratedBatonV1 => MEETING_V1_POLICY,
+            Self::ModeratedBoardV2 => MEETING_V2_POLICY,
+        }
+    }
+
+    fn schema_version(self) -> i32 {
+        match self {
+            Self::UniformV0 => 1,
+            Self::ModeratedBatonV1 => 2,
+            Self::ModeratedBoardV2 => 3,
         }
     }
 
@@ -65,6 +77,7 @@ impl MeetingProtocol {
         match (schema_version, floor_policy_version) {
             (1, buzz_db::meeting_floor::FLOOR_POLICY_VERSION) => Ok(Self::UniformV0),
             (2, MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
+            (3, MEETING_V2_POLICY) => Ok(Self::ModeratedBoardV2),
             _ => Err(IngestError::Internal(format!(
                 "error: meeting has unsupported persisted protocol v={schema_version}, policy={floor_policy_version}"
             ))),
@@ -369,13 +382,21 @@ async fn handle_meeting_create(
             "restricted: meeting creation requires a global token".into(),
         ));
     }
-    if !event.content.is_empty() {
-        return Err(IngestError::Rejected(
-            "invalid: meeting create content must be empty".into(),
-        ));
-    }
-
     let protocol = meeting_create_protocol(event)?;
+    let initial_board = match protocol {
+        MeetingProtocol::ModeratedBoardV2 => Some(
+            buzz_sdk::parse_meeting_v2_board_content(&event.content)
+                .map_err(|error| IngestError::Rejected(error.to_string()))?,
+        ),
+        MeetingProtocol::UniformV0 | MeetingProtocol::ModeratedBatonV1 => {
+            if !event.content.is_empty() {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting V0/V1 create content must be empty".into(),
+                ));
+            }
+            None
+        }
+    };
 
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
     if session_id.is_nil() {
@@ -439,16 +460,18 @@ async fn handle_meeting_create(
             "invalid: meeting requires 2-{MAX_MEETING_PARTICIPANTS} participants"
         )));
     }
-    let moderator_pubkey = if protocol == MeetingProtocol::ModeratedBatonV1 {
-        let moderator = decode_pubkey(&require_single_tag(event, "moderator")?)?;
-        if !participant_pubkeys.contains(&moderator) {
-            return Err(IngestError::Rejected(
-                "invalid: meeting moderator must be in the frozen participant roster".into(),
-            ));
+    let moderator_pubkey = match protocol {
+        MeetingProtocol::ModeratedBatonV1 => {
+            let moderator = decode_pubkey(&require_single_tag(event, "moderator")?)?;
+            if !participant_pubkeys.contains(&moderator) {
+                return Err(IngestError::Rejected(
+                    "invalid: meeting moderator must be in the frozen participant roster".into(),
+                ));
+            }
+            Some(moderator)
         }
-        Some(moderator)
-    } else {
-        None
+        MeetingProtocol::ModeratedBoardV2 => Some(host_pubkey.clone()),
+        MeetingProtocol::UniformV0 => None,
     };
 
     let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
@@ -462,12 +485,17 @@ async fn handle_meeting_create(
         PersistResult::Inserted(tx) => tx,
     };
     // Apply the rollout gate only after the idempotency guard: replaying the
-    // exact Create of an existing V1 remains a successful duplicate even when
-    // operators later disable creation of *new* V1 sessions. For a new event,
-    // returning here drops and rolls back the still-open transaction.
-    ensure_meeting_create_enabled(protocol, state.config.meeting_v1_create_enabled)?;
+    // exact Create of an existing gated session remains a successful duplicate
+    // even when operators later disable creation of new sessions for that
+    // protocol. For a new event, returning here drops and rolls back the
+    // still-open transaction.
+    ensure_meeting_create_enabled(
+        protocol,
+        state.config.meeting_v1_create_enabled,
+        state.config.meeting_v2_create_enabled,
+    )?;
 
-    let created_participant_pubkeys = match protocol {
+    let (created_participant_pubkeys, board_event_id) = match protocol {
         MeetingProtocol::UniformV0 => {
             let (_, participants) = buzz_db::meeting::create_meeting_tx(
                 &mut tx,
@@ -500,10 +528,13 @@ async fn handle_meeting_create(
             )
             .await
             .map_err(map_meeting_db_error)?;
-            participants
-                .into_iter()
-                .map(|participant| participant.pubkey)
-                .collect::<Vec<_>>()
+            (
+                participants
+                    .into_iter()
+                    .map(|participant| participant.pubkey)
+                    .collect::<Vec<_>>(),
+                None,
+            )
         }
         MeetingProtocol::ModeratedBatonV1 => {
             let moderator_pubkey = moderator_pubkey.as_deref().ok_or_else(|| {
@@ -527,11 +558,44 @@ async fn handle_meeting_create(
             )
             .await
             .map_err(map_meeting_db_error)?;
-            snapshot
-                .participants
-                .into_iter()
-                .map(|participant| participant.pubkey)
-                .collect::<Vec<_>>()
+            (
+                snapshot
+                    .participants
+                    .into_iter()
+                    .map(|participant| participant.pubkey)
+                    .collect::<Vec<_>>(),
+                None,
+            )
+        }
+        MeetingProtocol::ModeratedBoardV2 => {
+            let initial_board = initial_board.as_ref().ok_or_else(|| {
+                IngestError::Internal("error: missing validated V2 initial board".into())
+            })?;
+            let snapshot = buzz_db::meeting_v2::create_meeting_v2_tx(
+                &mut tx,
+                buzz_db::meeting_v2::CreateMeetingV2Params {
+                    community_id: tenant.community(),
+                    session_id,
+                    title: &title,
+                    description: description.as_deref(),
+                    source_channel_id,
+                    host_pubkey: &host_pubkey,
+                    create_event_id: event.id.as_bytes(),
+                    participant_pubkeys: &participant_pubkeys,
+                    initial_board,
+                    relay_keys: &state.relay_keypair,
+                },
+            )
+            .await
+            .map_err(map_meeting_db_error)?;
+            (
+                snapshot
+                    .participants
+                    .into_iter()
+                    .map(|participant| participant.pubkey)
+                    .collect::<Vec<_>>(),
+                Some(hex::encode(snapshot.board_event_id)),
+            )
         }
     };
 
@@ -585,12 +649,10 @@ async fn handle_meeting_create(
                 "room_kind": "meeting",
                 "status": "active",
                 "participant_count": created_participant_pubkeys.len(),
-                "schema_version": match protocol {
-                    MeetingProtocol::UniformV0 => 1,
-                    MeetingProtocol::ModeratedBatonV1 => 2,
-                },
+                "schema_version": protocol.schema_version(),
                 "floor_policy_version": protocol.policy(),
                 "moderator": moderator_pubkey.as_deref().map(hex::encode),
+                "board_event_id": board_event_id,
             })
         ),
     })
@@ -649,7 +711,9 @@ async fn handle_meeting_end(
         &persisted_policy.floor_policy_version,
     )?;
     match (protocol, persisted_policy.moderator_pubkey.as_ref()) {
-        (MeetingProtocol::UniformV0, None) | (MeetingProtocol::ModeratedBatonV1, Some(_)) => {}
+        (MeetingProtocol::UniformV0, None)
+        | (MeetingProtocol::ModeratedBatonV1, Some(_))
+        | (MeetingProtocol::ModeratedBoardV2, Some(_)) => {}
         _ => {
             return Err(IngestError::Internal(
                 "error: meeting persisted protocol has an invalid moderator shape".into(),
@@ -761,6 +825,11 @@ async fn handle_meeting_end(
                 }
             }
         }
+        MeetingProtocol::ModeratedBoardV2 => {
+            return Err(IngestError::Rejected(
+                "restricted: Meeting V2 End is unavailable during stage one".into(),
+            ));
+        }
     };
 
     match end_result {
@@ -839,6 +908,7 @@ async fn handle_meeting_floor_claim(
             "restricted: token not authorized for this meeting".into(),
         ));
     }
+    ensure_uniform_v0_protocol(tenant, state, session_id).await?;
     let round_number = parse_positive_round(event)?;
     let config = crate::meeting_runtime::floor_config_from_env();
     let outcome = buzz_db::meeting_floor::claim_floor(
@@ -939,6 +1009,7 @@ async fn handle_meeting_floor_signal(
             "restricted: token not authorized for this meeting".into(),
         ));
     }
+    ensure_uniform_v0_protocol(tenant, state, session_id).await?;
     let round_number = parse_positive_round(event)?;
     let config = crate::meeting_runtime::floor_config_from_env();
 
@@ -1180,6 +1251,21 @@ fn meeting_create_protocol(event: &Event) -> Result<MeetingProtocol, IngestError
             }
             Ok(MeetingProtocol::ModeratedBatonV1)
         }
+        "3" => {
+            validate_meeting_tag_schema(
+                event,
+                &["h", "name", "v", "policy"],
+                &["about", "source"],
+                &["p"],
+            )?;
+            let policy = require_single_tag(event, "policy")?;
+            if policy != MEETING_V2_POLICY {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: Meeting V2 policy must be {MEETING_V2_POLICY}"
+                )));
+            }
+            Ok(MeetingProtocol::ModeratedBoardV2)
+        }
         version => Err(IngestError::Rejected(format!(
             "invalid: unsupported meeting schema version {version}"
         ))),
@@ -1189,10 +1275,34 @@ fn meeting_create_protocol(event: &Event) -> Result<MeetingProtocol, IngestError
 fn ensure_meeting_create_enabled(
     protocol: MeetingProtocol,
     meeting_v1_create_enabled: bool,
+    meeting_v2_create_enabled: bool,
 ) -> Result<(), IngestError> {
     if protocol == MeetingProtocol::ModeratedBatonV1 && !meeting_v1_create_enabled {
         return Err(IngestError::Rejected(
             "restricted: Meeting V1 creation is disabled".into(),
+        ));
+    }
+    if protocol == MeetingProtocol::ModeratedBoardV2 && !meeting_v2_create_enabled {
+        return Err(IngestError::Rejected(
+            "restricted: Meeting V2 creation is disabled".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_uniform_v0_protocol(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    session_id: Uuid,
+) -> Result<(), IngestError> {
+    let persisted = buzz_db::meeting::get_meeting_policy(&state.db, tenant.community(), session_id)
+        .await
+        .map_err(map_meeting_db_error)?;
+    let protocol =
+        MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
+    if protocol != MeetingProtocol::UniformV0 {
+        return Err(IngestError::Rejected(
+            "restricted: this floor command is only available for Meeting V0".into(),
         ));
     }
     Ok(())
@@ -1224,6 +1334,9 @@ fn validate_meeting_end_protocol(
             }
             Ok(())
         }
+        MeetingProtocol::ModeratedBoardV2 => Err(IngestError::Rejected(
+            "restricted: Meeting V2 End is unavailable during stage one".into(),
+        )),
     }
 }
 
@@ -2326,7 +2439,11 @@ mod meeting_protocol_tests {
     use super::*;
 
     fn meeting_create(tags: Vec<Tag>) -> Event {
-        EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), "")
+        meeting_create_with_content(tags, "")
+    }
+
+    fn meeting_create_with_content(tags: Vec<Tag>, content: &str) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), content)
             .tags(tags)
             .sign_with_keys(&Keys::generate())
             .expect("test meeting event")
@@ -2401,6 +2518,46 @@ mod meeting_protocol_tests {
     }
 
     #[test]
+    fn v2_create_requires_host_moderation_and_exact_protocol_tags() {
+        let session = Uuid::new_v4().to_string();
+        let participant = "22".repeat(32);
+        let canonical = meeting_create_with_content(
+            vec![
+                tag(&["h", &session]),
+                tag(&["name", "Protocol review"]),
+                tag(&["v", "3"]),
+                tag(&["policy", MEETING_V2_POLICY]),
+                tag(&["p", &participant]),
+            ],
+            r##"{"format":"markdown","body":"# Goal"}"##,
+        );
+        assert_eq!(
+            meeting_create_protocol(&canonical).expect("valid V2 create"),
+            MeetingProtocol::ModeratedBoardV2
+        );
+        assert!(buzz_sdk::parse_meeting_v2_board_content(&canonical.content).is_ok());
+
+        let smuggled_moderator = meeting_create(vec![
+            tag(&["h", &session]),
+            tag(&["name", "Protocol review"]),
+            tag(&["v", "3"]),
+            tag(&["policy", MEETING_V2_POLICY]),
+            tag(&["moderator", &"11".repeat(32)]),
+            tag(&["p", &participant]),
+        ]);
+        assert!(meeting_create_protocol(&smuggled_moderator).is_err());
+
+        let wrong_policy = meeting_create(vec![
+            tag(&["h", &session]),
+            tag(&["name", "Protocol review"]),
+            tag(&["v", "3"]),
+            tag(&["policy", MEETING_V1_POLICY]),
+            tag(&["p", &participant]),
+        ]);
+        assert!(meeting_create_protocol(&wrong_policy).is_err());
+    }
+
+    #[test]
     fn end_shape_is_selected_by_persisted_protocol() {
         let session = Uuid::new_v4().to_string();
         let create_event_id = "11".repeat(32);
@@ -2425,6 +2582,7 @@ mod meeting_protocol_tests {
         ]);
         assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::UniformV0).is_ok());
         assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::ModeratedBatonV1).is_err());
+        assert!(validate_meeting_end_protocol(&v0, MeetingProtocol::ModeratedBoardV2).is_err());
     }
 
     #[test]
@@ -2438,6 +2596,10 @@ mod meeting_protocol_tests {
             MeetingProtocol::from_persisted(2, MEETING_V1_POLICY).expect("V1 mapping"),
             MeetingProtocol::ModeratedBatonV1
         );
+        assert_eq!(
+            MeetingProtocol::from_persisted(3, MEETING_V2_POLICY).expect("V2 mapping"),
+            MeetingProtocol::ModeratedBoardV2
+        );
         assert!(MeetingProtocol::from_persisted(1, MEETING_V1_POLICY).is_err());
         assert!(
             MeetingProtocol::from_persisted(2, buzz_db::meeting_floor::FLOOR_POLICY_VERSION)
@@ -2446,10 +2608,20 @@ mod meeting_protocol_tests {
     }
 
     #[test]
-    fn create_gate_only_controls_new_v1_sessions() {
-        assert!(ensure_meeting_create_enabled(MeetingProtocol::UniformV0, false).is_ok());
-        assert!(ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, true).is_ok());
-        assert!(ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, false).is_err());
+    fn create_gates_only_control_their_new_protocol_sessions() {
+        assert!(ensure_meeting_create_enabled(MeetingProtocol::UniformV0, false, false).is_ok());
+        assert!(
+            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, true, false).is_ok()
+        );
+        assert!(
+            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, false, true).is_err()
+        );
+        assert!(
+            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBoardV2, false, true).is_ok()
+        );
+        assert!(
+            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBoardV2, true, false).is_err()
+        );
     }
 
     #[test]

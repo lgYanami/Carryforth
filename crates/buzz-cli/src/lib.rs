@@ -181,6 +181,9 @@ pub enum MeetingPolicy {
     /// Meeting V1 moderator-controlled baton passing.
     #[value(name = "moderated-baton-v1")]
     ModeratedBatonV1,
+    /// Meeting V2 moderator-maintained shared board.
+    #[value(name = "moderated-board-v1")]
+    ModeratedBoardV2,
 }
 
 /// Meeting V1 moderator intent-rejection reason.
@@ -1372,7 +1375,7 @@ pub enum ChannelsCmd {
 pub enum MeetingsCmd {
     /// Create a private meeting with a frozen initial roster
     #[command(
-        after_help = "Examples:\n  buzz meetings create --title \"Design review\" --participant <PUBKEY>\n  buzz meetings create --policy moderated-baton-v1 --moderator <PUBKEY> --title \"Design review\" --participant <PUBKEY>"
+        after_help = "Examples:\n  buzz meetings create --title \"Design review\" --participant <PUBKEY>\n  buzz meetings create --policy moderated-baton-v1 --moderator <PUBKEY> --title \"Design review\" --participant <PUBKEY>\n  buzz meetings create --policy moderated-board-v1 --title \"Design review\" --board - --participant <PUBKEY>"
     )]
     Create {
         /// Meeting title
@@ -1387,9 +1390,12 @@ pub enum MeetingsCmd {
         /// Floor-allocation protocol; defaults to the existing V0 behavior
         #[arg(long, value_enum, default_value = "uniform-v0")]
         policy: MeetingPolicy,
-        /// V1 moderator pubkey; defaults to the creator and is invalid for V0
+        /// V1 moderator pubkey; defaults to the creator and is invalid for V0/V2
         #[arg(long)]
         moderator: Option<String>,
+        /// Initial Meeting V2 Markdown board; use '-' to read from stdin
+        #[arg(long)]
+        board: Option<String>,
         /// Other participant pubkeys (repeat once per participant; the creator is implicit)
         #[arg(long = "participant", required = true)]
         participants: Vec<String>,
@@ -1408,6 +1414,11 @@ pub enum MeetingsCmd {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
+    },
+    /// Read the current Meeting V2 board
+    Board {
+        #[command(subcommand)]
+        command: MeetingBoardCmd,
     },
     /// List the meeting's complete participant roster
     Participants {
@@ -1472,6 +1483,17 @@ pub enum MeetingsCmd {
     },
     /// End a meeting and make its room read-only
     End {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+}
+
+/// Meeting V2 current-board operations.
+#[derive(Subcommand)]
+pub enum MeetingBoardCmd {
+    /// Get the complete current board document
+    Get {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
@@ -2986,6 +3008,47 @@ mod tests {
     }
 
     #[test]
+    fn meeting_create_and_board_get_parse_v2_surface() {
+        let participant = "aa".repeat(32);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "create",
+            "--policy",
+            "moderated-board-v1",
+            "--title",
+            "Review",
+            "--board",
+            "# Goal",
+            "--participant",
+            &participant,
+        ])
+        .expect("parse Meeting V2 Create");
+        let Cmd::Meetings(MeetingsCmd::Create {
+            policy,
+            moderator,
+            board,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Meeting Create");
+        };
+        assert_eq!(policy, MeetingPolicy::ModeratedBoardV2);
+        assert!(moderator.is_none());
+        assert_eq!(board.as_deref(), Some("# Goal"));
+
+        Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "board",
+            "get",
+            "--meeting",
+            "00000000-0000-4000-8000-000000000001",
+        ])
+        .expect("parse Meeting V2 board get");
+    }
+
+    #[test]
     fn meeting_v1_baton_command_surface_is_parseable() {
         let id = "aa".repeat(32);
         let participant = "bb".repeat(32);
@@ -3332,6 +3395,7 @@ mod tests {
         assert_eq!(
             names(&cmd, "meetings"),
             vec![
+                "board",
                 "create",
                 "end",
                 "floor",
@@ -3436,7 +3500,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
-            ("meetings", 12),
+            ("meetings", 13),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

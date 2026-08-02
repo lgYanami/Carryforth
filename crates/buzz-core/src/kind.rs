@@ -485,6 +485,8 @@ pub const KIND_MEETING_HUMAN_FLOOR_REQUEST: u32 = 42107;
 pub const KIND_MEETING_OFFER_RESPONSE: u32 = 42108;
 /// Grant holder-signed Meeting V1 progress or yield signal.
 pub const KIND_MEETING_GRANT_SIGNAL: u32 = 42109;
+/// Relay-signed current Meeting V2 board projection.
+pub const KIND_MEETING_BOARD: u32 = 42110;
 
 // Agent job protocol (43000–43999)
 // Not using NIP-90 kinds (5000–6999) — Buzz requires auth chains (depth ≤ 3, breadth ≤ 10).
@@ -694,6 +696,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEETING_HUMAN_FLOOR_REQUEST,
     KIND_MEETING_OFFER_RESPONSE,
     KIND_MEETING_GRANT_SIGNAL,
+    KIND_MEETING_BOARD,
     KIND_JOB_REQUEST,
     KIND_JOB_ACCEPTED,
     KIND_JOB_PROGRESS,
@@ -856,6 +859,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
             | KIND_MEETING_ROUND_STATE
+            | KIND_MEETING_BOARD
     )
 }
 
@@ -942,9 +946,11 @@ mod tests {
     }
 
     #[test]
-    fn meeting_v1_kinds_have_expected_registry_roles() {
+    fn meeting_kinds_have_expected_registry_roles() {
         assert_eq!(KIND_MEETING_STATE, KIND_MEETING_ROUND_STATE);
         assert!(is_relay_only_kind(KIND_MEETING_STATE));
+        assert!(is_relay_only_kind(KIND_MEETING_BOARD));
+        assert!(!is_command_kind(KIND_MEETING_BOARD));
         for kind in [
             KIND_MEETING_SPEECH_INTENT,
             KIND_MEETING_MODERATOR_COMMAND,

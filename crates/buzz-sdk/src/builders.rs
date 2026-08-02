@@ -23,6 +23,7 @@ use buzz_core::{
     },
 };
 use nostr::{EventBuilder, Kind, Tag};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -33,6 +34,45 @@ use crate::{
 pub const MEETING_V1_SCHEMA_VERSION: &str = "2";
 /// Floor policy emitted by Meeting V1 builders.
 pub const MEETING_V1_POLICY: &str = "moderated-baton-v1";
+/// Wire schema version emitted by Meeting V2 builders.
+pub const MEETING_V2_SCHEMA_VERSION: &str = "3";
+/// Floor policy emitted by Meeting V2 builders.
+pub const MEETING_V2_POLICY: &str = "moderated-board-v1";
+/// Initial/current Meeting V2 board format.
+pub const MEETING_V2_BOARD_FORMAT: &str = "markdown";
+/// Maximum UTF-8 byte size of a Meeting V2 board body.
+pub const MAX_MEETING_V2_BOARD_BYTES: usize = 65_536;
+
+/// Strict content envelope for a Meeting V2 current board projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeetingV2BoardContent {
+    /// Versioned presentation format. Stage one accepts only `markdown`.
+    pub format: String,
+    /// Complete current board document.
+    pub body: String,
+}
+
+/// Inputs for a strict Meeting V2 Create command.
+///
+/// `participant_pubkeys` contains every participant except `author_pubkey`.
+/// The event author becomes the immutable Meeting owner and moderator.
+pub struct MeetingV2CreateParams<'a> {
+    /// Stable Meeting UUID; also the private backing Channel UUID.
+    pub session_id: Uuid,
+    /// Human-readable Meeting title.
+    pub title: &'a str,
+    /// Optional Meeting description.
+    pub description: Option<&'a str>,
+    /// Optional source Channel used only as a context/navigation reference.
+    pub source_channel_id: Option<Uuid>,
+    /// Pubkey that will sign the returned event and become moderator.
+    pub author_pubkey: &'a str,
+    /// Frozen participants other than the event author.
+    pub participant_pubkeys: &'a [&'a str],
+    /// Complete initial Markdown board body.
+    pub initial_board: &'a str,
+}
 
 /// Inputs for a strict Meeting V1 Create command.
 ///
@@ -2272,6 +2312,120 @@ pub fn build_meeting_v1_create(
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), "").tags(tags))
 }
 
+/// Parse and strictly validate a Meeting V2 board JSON envelope.
+pub fn parse_meeting_v2_board_content(content: &str) -> Result<MeetingV2BoardContent, SdkError> {
+    let board: MeetingV2BoardContent = serde_json::from_str(content).map_err(|error| {
+        SdkError::InvalidInput(format!("invalid Meeting V2 board JSON: {error}"))
+    })?;
+    validate_meeting_v2_board_content(&board)?;
+    Ok(board)
+}
+
+/// Build a strict Meeting V2 create command (kind 42100).
+///
+/// The returned event always carries `v=3` and
+/// `policy=moderated-board-v1`. Its signer becomes the immutable owner and
+/// moderator; V2 deliberately has no `moderator` tag.
+pub fn build_meeting_v2_create(
+    params: MeetingV2CreateParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.session_id.is_nil() {
+        return Err(SdkError::InvalidInput(
+            "meeting session id must not be nil".into(),
+        ));
+    }
+    let title = buzz_core::channel::canonical_channel_name(params.title);
+    if title.is_empty() {
+        return Err(SdkError::InvalidInput("meeting title is required".into()));
+    }
+    if title.chars().count() > 255 {
+        return Err(SdkError::InvalidInput(
+            "meeting title exceeds 255 characters".into(),
+        ));
+    }
+    if params.participant_pubkeys.is_empty() || params.participant_pubkeys.len() > 11 {
+        return Err(SdkError::InvalidInput(
+            "meeting create requires 1-11 other participant pubkeys".into(),
+        ));
+    }
+    if params.source_channel_id == Some(params.session_id) {
+        return Err(SdkError::InvalidInput(
+            "meeting cannot use itself as its source channel".into(),
+        ));
+    }
+
+    let author_pubkey = check_pubkey_hex(params.author_pubkey, "meeting author pubkey")?;
+    let mut seen = std::collections::HashSet::with_capacity(params.participant_pubkeys.len() + 1);
+    seen.insert(author_pubkey);
+    let mut participant_pubkeys = Vec::with_capacity(params.participant_pubkeys.len());
+    for pubkey in params.participant_pubkeys {
+        let normalized = check_pubkey_hex(pubkey, "participant pubkey")?;
+        if !seen.insert(normalized.clone()) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate meeting participant: {normalized}"
+            )));
+        }
+        participant_pubkeys.push(normalized);
+    }
+
+    let board = MeetingV2BoardContent {
+        format: MEETING_V2_BOARD_FORMAT.to_string(),
+        body: params.initial_board.to_string(),
+    };
+    validate_meeting_v2_board_content(&board)?;
+    let content = serde_json::to_string(&board)
+        .map_err(|error| SdkError::InvalidInput(format!("serialize Meeting V2 board: {error}")))?;
+
+    let mut tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["name", title])?,
+        tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V2_POLICY])?,
+    ];
+    if let Some(description) = params.description {
+        tags.push(tag(&["about", description])?);
+    }
+    if let Some(source_channel_id) = params.source_channel_id {
+        if source_channel_id.is_nil() {
+            return Err(SdkError::InvalidInput(
+                "source channel id must not be nil".into(),
+            ));
+        }
+        tags.push(tag(&["source", &source_channel_id.to_string()])?);
+    }
+    for participant_pubkey in &participant_pubkeys {
+        tags.push(tag(&["p", participant_pubkey])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_CREATE as u16), content).tags(tags))
+}
+
+/// Validate an already-decoded Meeting V2 board envelope.
+pub fn validate_meeting_v2_board_content(board: &MeetingV2BoardContent) -> Result<(), SdkError> {
+    if board.format != MEETING_V2_BOARD_FORMAT {
+        return Err(SdkError::InvalidInput(format!(
+            "Meeting V2 board format must be {MEETING_V2_BOARD_FORMAT}"
+        )));
+    }
+    if board.body.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 board body is required".into(),
+        ));
+    }
+    if board.body.contains('\0') {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 board body must not contain NUL".into(),
+        ));
+    }
+    if board.body.len() > MAX_MEETING_V2_BOARD_BYTES {
+        return Err(SdkError::ContentTooLarge {
+            max: MAX_MEETING_V2_BOARD_BYTES,
+            got: board.body.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Build a strict manual Meeting V1 end command (kind 42101).
 ///
 /// The reason is fixed to `manual`; Relay-authored security termination uses a
@@ -4090,6 +4244,69 @@ mod tests {
             build_meeting_create(uuid(), "review", None, None, &[&participant, &participant])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn meeting_v2_create_emits_implicit_moderator_and_strict_board() {
+        let session_id = uuid();
+        let author = "11".repeat(32);
+        let participant = "22".repeat(32);
+        let event = sign(
+            build_meeting_v2_create(MeetingV2CreateParams {
+                session_id,
+                title: "# Design review",
+                description: None,
+                source_channel_id: None,
+                author_pubkey: &author,
+                participant_pubkeys: &[&participant],
+                initial_board: "# Goal\nAgree on the API.",
+            })
+            .unwrap(),
+        );
+
+        assert_eq!(event.kind.as_u16(), KIND_MEETING_CREATE as u16);
+        assert!(has_tag(&event, "h", &session_id.to_string()));
+        assert!(has_tag(&event, "name", "Design review"));
+        assert!(has_tag(&event, "v", MEETING_V2_SCHEMA_VERSION));
+        assert!(has_tag(&event, "policy", MEETING_V2_POLICY));
+        assert!(tag_values(&event, "moderator").is_empty());
+        assert_eq!(tag_values(&event, "p"), vec![participant]);
+        assert_eq!(
+            parse_meeting_v2_board_content(&event.content).unwrap(),
+            MeetingV2BoardContent {
+                format: MEETING_V2_BOARD_FORMAT.to_string(),
+                body: "# Goal\nAgree on the API.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn meeting_v2_board_rejects_empty_oversized_nul_and_unknown_fields() {
+        let author = "11".repeat(32);
+        let participant = "22".repeat(32);
+        let build = |body: &str| {
+            build_meeting_v2_create(MeetingV2CreateParams {
+                session_id: uuid(),
+                title: "Review",
+                description: None,
+                source_channel_id: None,
+                author_pubkey: &author,
+                participant_pubkeys: &[&participant],
+                initial_board: body,
+            })
+        };
+
+        assert!(build(" \n ").is_err());
+        assert!(build("bad\0board").is_err());
+        assert!(matches!(
+            build(&"x".repeat(MAX_MEETING_V2_BOARD_BYTES + 1)),
+            Err(SdkError::ContentTooLarge { .. })
+        ));
+        assert!(parse_meeting_v2_board_content(
+            r#"{"format":"markdown","body":"ok","revision":1}"#
+        )
+        .is_err());
+        assert!(parse_meeting_v2_board_content(r#"{"format":"html","body":"ok"}"#).is_err());
     }
 
     #[test]

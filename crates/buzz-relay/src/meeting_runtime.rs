@@ -156,6 +156,7 @@ pub async fn run(state: Arc<AppState>) {
         revocation_lease_ms = revocation_lease.as_millis(),
         revocation_session_batch,
         meeting_v1_create_enabled = state.config.meeting_v1_create_enabled,
+        meeting_v2_create_enabled = state.config.meeting_v2_create_enabled,
         "Meeting runtime started"
     );
 

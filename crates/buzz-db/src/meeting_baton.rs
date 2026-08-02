@@ -241,6 +241,25 @@ pub struct CreateMeetingV1Params<'a> {
     pub config: BatonConfig,
 }
 
+pub(crate) struct CreateModeratedMeetingBaseParams<'a> {
+    pub community_id: CommunityId,
+    pub session_id: Uuid,
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub source_channel_id: Option<Uuid>,
+    pub host_pubkey: &'a [u8],
+    pub moderator_pubkey: &'a [u8],
+    pub create_event_id: &'a [u8],
+    pub participant_pubkeys: &'a [Vec<u8>],
+    pub schema_version: i32,
+    pub policy_version: &'a str,
+}
+
+pub(crate) struct ModeratedMeetingBase {
+    pub participants: Vec<BatonParticipant>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Parameters for atomically ending a Meeting V1 session.
 pub struct EndMeetingV1Params<'a> {
     /// Community that owns the meeting.
@@ -317,102 +336,25 @@ pub async fn create_meeting_v1_tx(
 ) -> Result<BatonSnapshot> {
     validate_create_shape(&params)?;
     validate_config(&params.config)?;
-    ensure_existing_command_event_tx(
+    let base = create_moderated_meeting_base_tx(
         tx,
-        params.community_id,
-        params.session_id,
-        params.create_event_id,
-        buzz_core::kind::KIND_MEETING_CREATE as i32,
-        params.host_pubkey,
+        CreateModeratedMeetingBaseParams {
+            community_id: params.community_id,
+            session_id: params.session_id,
+            title: params.title,
+            description: params.description,
+            source_channel_id: params.source_channel_id,
+            host_pubkey: params.host_pubkey,
+            moderator_pubkey: params.moderator_pubkey,
+            create_event_id: params.create_event_id,
+            participant_pubkeys: params.participant_pubkeys,
+            schema_version: SCHEMA_VERSION,
+            policy_version: BATON_POLICY_VERSION,
+        },
     )
     .await?;
-    validate_source_access_tx(
-        tx,
-        params.community_id,
-        params.source_channel_id,
-        params.participant_pubkeys,
-    )
-    .await?;
-
-    let mut participants = resolve_participants_tx(
-        tx,
-        params.community_id,
-        params.host_pubkey,
-        params.participant_pubkeys,
-    )
-    .await?;
-    participants.sort_by(|left, right| left.pubkey.cmp(&right.pubkey));
-
-    let title = buzz_core::channel::canonical_channel_name(params.title);
-    let channel_insert = sqlx::query(
-        "INSERT INTO channels \
-             (id, community_id, name, channel_type, visibility, description, \
-              created_by, max_members, room_kind) \
-         VALUES ($1, $2, $3, 'stream', 'private', $4, $5, $6, 'meeting') \
-         ON CONFLICT (community_id, id) DO NOTHING",
-    )
-    .bind(params.session_id)
-    .bind(params.community_id.as_uuid())
-    .bind(title)
-    .bind(params.description)
-    .bind(params.host_pubkey)
-    .bind(MAX_MEETING_PARTICIPANTS as i32)
-    .execute(tx.as_mut())
-    .await?;
-    if channel_insert.rows_affected() != 1 {
-        return Err(DbError::InvalidData(format!(
-            "meeting session already exists: {}",
-            params.session_id
-        )));
-    }
-
-    for participant in &participants {
-        sqlx::query(
-            "INSERT INTO channel_members \
-                 (community_id, channel_id, pubkey, role, invited_by) \
-             VALUES ($1, $2, $3, $4::member_role, $5)",
-        )
-        .bind(params.community_id.as_uuid())
-        .bind(params.session_id)
-        .bind(&participant.pubkey)
-        .bind(&participant.channel_role)
-        .bind(params.host_pubkey)
-        .execute(tx.as_mut())
-        .await?;
-    }
-
-    let now: DateTime<Utc> = sqlx::query_scalar(
-        "INSERT INTO meeting_sessions \
-             (community_id, session_id, create_event_id, host_pubkey, \
-              source_channel_id, schema_version, status, floor_policy_version, \
-              moderator_pubkey, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 2, 'active', $6, $7, clock_timestamp()) \
-         RETURNING created_at",
-    )
-    .bind(params.community_id.as_uuid())
-    .bind(params.session_id)
-    .bind(params.create_event_id)
-    .bind(params.host_pubkey)
-    .bind(params.source_channel_id)
-    .bind(BATON_POLICY_VERSION)
-    .bind(params.moderator_pubkey)
-    .fetch_one(tx.as_mut())
-    .await?;
-
-    for participant in &participants {
-        sqlx::query(
-            "INSERT INTO meeting_participants \
-                 (community_id, session_id, pubkey, participant_type, channel_role) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(params.community_id.as_uuid())
-        .bind(params.session_id)
-        .bind(&participant.pubkey)
-        .bind(participant.participant_type.as_str())
-        .bind(&participant.channel_role)
-        .execute(tx.as_mut())
-        .await?;
-    }
+    let participants = base.participants;
+    let now = base.created_at;
     insert_config_tx(tx, params.community_id, params.session_id, &params.config).await?;
 
     let transition = meeting_transition(
@@ -522,6 +464,114 @@ pub async fn create_meeting_v1_tx(
         participants,
         created_at: now,
         updated_at: now,
+    })
+}
+
+pub(crate) async fn create_moderated_meeting_base_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    params: CreateModeratedMeetingBaseParams<'_>,
+) -> Result<ModeratedMeetingBase> {
+    ensure_existing_command_event_tx(
+        tx,
+        params.community_id,
+        params.session_id,
+        params.create_event_id,
+        buzz_core::kind::KIND_MEETING_CREATE as i32,
+        params.host_pubkey,
+    )
+    .await?;
+    validate_source_access_tx(
+        tx,
+        params.community_id,
+        params.source_channel_id,
+        params.participant_pubkeys,
+    )
+    .await?;
+
+    let mut participants = resolve_participants_tx(
+        tx,
+        params.community_id,
+        params.host_pubkey,
+        params.participant_pubkeys,
+    )
+    .await?;
+    participants.sort_by(|left, right| left.pubkey.cmp(&right.pubkey));
+
+    let title = buzz_core::channel::canonical_channel_name(params.title);
+    let channel_insert = sqlx::query(
+        "INSERT INTO channels \
+             (id, community_id, name, channel_type, visibility, description, \
+              created_by, max_members, room_kind) \
+         VALUES ($1, $2, $3, 'stream', 'private', $4, $5, $6, 'meeting') \
+         ON CONFLICT (community_id, id) DO NOTHING",
+    )
+    .bind(params.session_id)
+    .bind(params.community_id.as_uuid())
+    .bind(title)
+    .bind(params.description)
+    .bind(params.host_pubkey)
+    .bind(MAX_MEETING_PARTICIPANTS as i32)
+    .execute(tx.as_mut())
+    .await?;
+    if channel_insert.rows_affected() != 1 {
+        return Err(DbError::InvalidData(format!(
+            "meeting session already exists: {}",
+            params.session_id
+        )));
+    }
+
+    for participant in &participants {
+        sqlx::query(
+            "INSERT INTO channel_members \
+                 (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, $4::member_role, $5)",
+        )
+        .bind(params.community_id.as_uuid())
+        .bind(params.session_id)
+        .bind(&participant.pubkey)
+        .bind(&participant.channel_role)
+        .bind(params.host_pubkey)
+        .execute(tx.as_mut())
+        .await?;
+    }
+
+    let now: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO meeting_sessions \
+             (community_id, session_id, create_event_id, host_pubkey, \
+              source_channel_id, schema_version, status, floor_policy_version, \
+              moderator_pubkey, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, clock_timestamp()) \
+         RETURNING created_at",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(params.create_event_id)
+    .bind(params.host_pubkey)
+    .bind(params.source_channel_id)
+    .bind(params.schema_version)
+    .bind(params.policy_version)
+    .bind(params.moderator_pubkey)
+    .fetch_one(tx.as_mut())
+    .await?;
+
+    for participant in &participants {
+        sqlx::query(
+            "INSERT INTO meeting_participants \
+                 (community_id, session_id, pubkey, participant_type, channel_role) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(params.community_id.as_uuid())
+        .bind(params.session_id)
+        .bind(&participant.pubkey)
+        .bind(participant.participant_type.as_str())
+        .bind(&participant.channel_role)
+        .execute(tx.as_mut())
+        .await?;
+    }
+
+    Ok(ModeratedMeetingBase {
+        participants,
+        created_at: now,
     })
 }
 

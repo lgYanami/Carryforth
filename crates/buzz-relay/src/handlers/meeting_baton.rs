@@ -142,7 +142,7 @@ async fn authorize_participant_command(
         != MeetingProtocol::ModeratedBatonV1
     {
         return Err(IngestError::Rejected(
-            "invalid: Meeting V1 command targets a V0 session".into(),
+            "invalid: Meeting V1 command targets a non-V1 session".into(),
         ));
     }
     let restriction = state

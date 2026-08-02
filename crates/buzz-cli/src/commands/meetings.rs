@@ -17,6 +17,7 @@ const KIND_MEETING_SPEECH: u32 = 9;
 const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
 const KIND_MEETING_ROUND_STATE: u32 = 42103;
 const KIND_MEETING_FLOOR_SIGNAL: u32 = 42104;
+const KIND_MEETING_BOARD: u32 = buzz_sdk::kind::KIND_MEETING_BOARD;
 
 #[derive(Debug, Serialize)]
 struct MeetingSummary {
@@ -28,10 +29,31 @@ struct MeetingSummary {
     updated_at: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct MeetingBoardOutput {
+    meeting_id: String,
+    format: String,
+    body: String,
+    moderator: String,
+    event_id: String,
+    created_at: u64,
+}
+
+struct CreateMeetingInput<'a> {
+    title: &'a str,
+    description: Option<&'a str>,
+    source: Option<&'a str>,
+    policy: crate::MeetingPolicy,
+    moderator: Option<&'a str>,
+    board: Option<&'a str>,
+    participant_pubkeys: &'a [String],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeetingProtocol {
     UniformV0,
     ModeratedBatonV1,
+    ModeratedBoardV2,
 }
 
 impl MeetingProtocol {
@@ -41,6 +63,7 @@ impl MeetingProtocol {
         match (version.as_str(), policy.as_str()) {
             ("1", "" | "uniform-v0") => Ok(Self::UniformV0),
             ("2", buzz_sdk::MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
+            ("3", buzz_sdk::MEETING_V2_POLICY) => Ok(Self::ModeratedBoardV2),
             ("2", "") => Err(CliError::Other(
                 "invalid Meeting V1 Create: missing policy tag".into(),
             )),
@@ -54,6 +77,7 @@ impl MeetingProtocol {
         match self {
             Self::UniformV0 => "uniform-v0",
             Self::ModeratedBatonV1 => buzz_sdk::MEETING_V1_POLICY,
+            Self::ModeratedBoardV2 => buzz_sdk::MEETING_V2_POLICY,
         }
     }
 }
@@ -466,6 +490,23 @@ async fn fetch_meeting_protocol(
     MeetingProtocol::from_create_event(&create)
 }
 
+fn v2_stage_one_unavailable(operation: &str) -> CliError {
+    CliError::Usage(format!(
+        "Meeting V2 {operation} is unavailable during stage one"
+    ))
+}
+
+async fn require_uniform_v0(client: &BuzzClient, meeting_id: Uuid) -> Result<(), CliError> {
+    match fetch_meeting_protocol(client, &meeting_id.to_string()).await? {
+        MeetingProtocol::UniformV0 => Ok(()),
+        MeetingProtocol::ModeratedBatonV1 => Err(CliError::Usage(format!(
+            "meeting {meeting_id} uses {}; use the Meeting V1 command surface",
+            buzz_sdk::MEETING_V1_POLICY
+        ))),
+        MeetingProtocol::ModeratedBoardV2 => Err(v2_stage_one_unavailable("floor control")),
+    }
+}
+
 fn is_meeting_metadata(event: &serde_json::Value) -> bool {
     extract_tag_value(event, "room_kind") == "meeting"
 }
@@ -508,15 +549,19 @@ async fn fetch_meeting_metadata(
     Ok(events.into_iter().find(is_meeting_metadata))
 }
 
-pub async fn cmd_create_meeting(
+async fn cmd_create_meeting(
     client: &BuzzClient,
-    title: &str,
-    description: Option<&str>,
-    source: Option<&str>,
-    policy: crate::MeetingPolicy,
-    moderator: Option<&str>,
-    participant_pubkeys: &[String],
+    input: CreateMeetingInput<'_>,
 ) -> Result<(), CliError> {
+    let CreateMeetingInput {
+        title,
+        description,
+        source,
+        policy,
+        moderator,
+        board,
+        participant_pubkeys,
+    } = input;
     if participant_pubkeys.is_empty() || participant_pubkeys.len() > 11 {
         return Err(CliError::Usage(
             "--participant must provide 1-11 other participant pubkeys".into(),
@@ -550,6 +595,11 @@ pub async fn cmd_create_meeting(
                     "--moderator requires --policy moderated-baton-v1".into(),
                 ));
             }
+            if board.is_some() {
+                return Err(CliError::Usage(
+                    "--board requires --policy moderated-board-v1".into(),
+                ));
+            }
             buzz_sdk::build_meeting_create(
                 meeting_id,
                 title,
@@ -559,6 +609,11 @@ pub async fn cmd_create_meeting(
             )
         }
         crate::MeetingPolicy::ModeratedBatonV1 => {
+            if board.is_some() {
+                return Err(CliError::Usage(
+                    "--board requires --policy moderated-board-v1".into(),
+                ));
+            }
             let moderator_pubkey = moderator.unwrap_or(&self_pubkey);
             validate_hex64(moderator_pubkey)?;
             let normalized_moderator = moderator_pubkey.to_ascii_lowercase();
@@ -576,6 +631,26 @@ pub async fn cmd_create_meeting(
                 author_pubkey: &self_pubkey,
                 moderator_pubkey,
                 participant_pubkeys: &participant_refs,
+            })
+        }
+        crate::MeetingPolicy::ModeratedBoardV2 => {
+            if moderator.is_some() {
+                return Err(CliError::Usage(
+                    "Meeting V2 fixes the creator as moderator; do not pass --moderator".into(),
+                ));
+            }
+            let board = board.ok_or_else(|| {
+                CliError::Usage("--board is required with --policy moderated-board-v1".into())
+            })?;
+            let board = read_or_stdin(board)?;
+            buzz_sdk::build_meeting_v2_create(buzz_sdk::MeetingV2CreateParams {
+                session_id: meeting_id,
+                title,
+                description,
+                source_channel_id,
+                author_pubkey: &self_pubkey,
+                participant_pubkeys: &participant_refs,
+                initial_board: &board,
             })
         }
     }
@@ -686,6 +761,15 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
     } else {
         None
     };
+    let moderator_pubkey = match protocol {
+        Some(MeetingProtocol::ModeratedBoardV2) => create
+            .and_then(|event| event.get("pubkey"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => create
+            .map(|event| extract_tag_value(event, "moderator"))
+            .filter(|value| !value.is_empty()),
+    };
 
     let output = serde_json::json!({
         "meeting_id": metadata.meeting_id,
@@ -703,9 +787,7 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
             .map(|event| extract_tag_value(event, "v"))
             .filter(|value| !value.is_empty()),
         "floor_policy_version": protocol.map(MeetingProtocol::policy),
-        "moderator_pubkey": create
-            .map(|event| extract_tag_value(event, "moderator"))
-            .filter(|value| !value.is_empty()),
+        "moderator_pubkey": moderator_pubkey,
         "create_event_id": create
             .and_then(|event| event.get("id"))
             .and_then(serde_json::Value::as_str),
@@ -725,6 +807,80 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
         "baton": baton,
     });
     println!("{output}");
+    Ok(())
+}
+
+pub async fn cmd_get_meeting_board(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?.to_string();
+    if fetch_meeting_protocol(client, &meeting_id).await? != MeetingProtocol::ModeratedBoardV2 {
+        return Err(CliError::Usage(format!(
+            "meeting {meeting_id} does not use {}",
+            buzz_sdk::MEETING_V2_POLICY
+        )));
+    }
+
+    let filter = serde_json::json!({
+        "kinds": [KIND_MEETING_BOARD],
+        "#h": [&meeting_id],
+        "limit": 10,
+    });
+    let response = client.query(&filter).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap_or_default();
+    let event = events
+        .into_iter()
+        .filter(|event| {
+            event.get("kind").and_then(serde_json::Value::as_u64) == Some(KIND_MEETING_BOARD as u64)
+                && extract_tag_value(event, "h") == meeting_id
+        })
+        .max_by(|left, right| {
+            left.get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .cmp(&right.get("created_at").and_then(serde_json::Value::as_u64))
+                .then_with(|| event_id(left).cmp(event_id(right)))
+        })
+        .ok_or_else(|| CliError::NotFound(format!("meeting board not found: {meeting_id}")))?;
+
+    if extract_tag_value(&event, "v") != buzz_sdk::MEETING_V2_SCHEMA_VERSION
+        || extract_tag_value(&event, "policy") != buzz_sdk::MEETING_V2_POLICY
+        || extract_tag_value(&event, "format") != buzz_sdk::MEETING_V2_BOARD_FORMAT
+    {
+        return Err(CliError::Other(format!(
+            "invalid Meeting V2 board projection: {meeting_id}"
+        )));
+    }
+    let moderator = extract_tag_value(&event, "moderator");
+    validate_hex64(&moderator).map_err(|_| {
+        CliError::Other(format!("invalid Meeting V2 board moderator: {meeting_id}"))
+    })?;
+    let content = event
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Other(format!("invalid Meeting V2 board content: {meeting_id}"))
+        })?;
+    let board = buzz_sdk::parse_meeting_v2_board_content(content).map_err(|error| {
+        CliError::Other(format!(
+            "invalid Meeting V2 board content for {meeting_id}: {error}"
+        ))
+    })?;
+    let event_id = event_id(&event);
+    validate_hex64(event_id)
+        .map_err(|_| CliError::Other(format!("invalid Meeting V2 board event ID: {meeting_id}")))?;
+    let output = MeetingBoardOutput {
+        meeting_id,
+        format: board.format,
+        body: board.body,
+        moderator,
+        event_id: event_id.to_string(),
+        created_at: event
+            .get("created_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string())
+    );
     Ok(())
 }
 
@@ -758,6 +914,9 @@ pub async fn cmd_meeting_history(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
     let protocol = fetch_meeting_protocol(client, &meeting_id).await?;
+    if protocol == MeetingProtocol::ModeratedBoardV2 {
+        return Err(v2_stage_one_unavailable("speech history"));
+    }
     let filter = serde_json::json!({
         "kinds": [KIND_MEETING_SPEECH],
         "#h": [&meeting_id],
@@ -767,10 +926,12 @@ pub async fn cmd_meeting_history(
         let left_revision = match protocol {
             MeetingProtocol::UniformV0 => event_round(left),
             MeetingProtocol::ModeratedBatonV1 => event_speech_revision(left),
+            MeetingProtocol::ModeratedBoardV2 => 0,
         };
         let right_revision = match protocol {
             MeetingProtocol::UniformV0 => event_round(right),
             MeetingProtocol::ModeratedBatonV1 => event_speech_revision(right),
+            MeetingProtocol::ModeratedBoardV2 => 0,
         };
         left_revision
             .cmp(&right_revision)
@@ -822,6 +983,9 @@ pub async fn cmd_floor_status(client: &BuzzClient, meeting_id: &str) -> Result<(
                 None => println!("null"),
             }
         }
+        MeetingProtocol::ModeratedBoardV2 => {
+            return Err(v2_stage_one_unavailable("floor status"));
+        }
     }
     Ok(())
 }
@@ -833,30 +997,36 @@ pub async fn cmd_floor_history(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
-    if fetch_meeting_protocol(client, &meeting_id).await? == MeetingProtocol::ModeratedBatonV1 {
-        let states = fetch_baton_states(client, &meeting_id, limit).await?;
-        let output = match format {
-            OutputFormat::Json => serde_json::to_value(states)
-                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
-            OutputFormat::Compact => serde_json::Value::Array(
-                states
-                    .iter()
-                    .map(|state| {
-                        serde_json::json!({
-                            "event_id": state.state_event_id,
-                            "state_revision": state.state_revision,
-                            "floor_revision": state.floor_revision,
-                            "intent_revision": state.intent_revision,
-                            "speech_revision": state.speech_revision,
-                            "phase": state.phase,
-                            "moderator_pubkey": state.moderator_pubkey,
+    match fetch_meeting_protocol(client, &meeting_id).await? {
+        MeetingProtocol::ModeratedBatonV1 => {
+            let states = fetch_baton_states(client, &meeting_id, limit).await?;
+            let output = match format {
+                OutputFormat::Json => serde_json::to_value(states)
+                    .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+                OutputFormat::Compact => serde_json::Value::Array(
+                    states
+                        .iter()
+                        .map(|state| {
+                            serde_json::json!({
+                                "event_id": state.state_event_id,
+                                "state_revision": state.state_revision,
+                                "floor_revision": state.floor_revision,
+                                "intent_revision": state.intent_revision,
+                                "speech_revision": state.speech_revision,
+                                "phase": state.phase,
+                                "moderator_pubkey": state.moderator_pubkey,
+                            })
                         })
-                    })
-                    .collect(),
-            ),
-        };
-        println!("{output}");
-        return Ok(());
+                        .collect(),
+                ),
+            };
+            println!("{output}");
+            return Ok(());
+        }
+        MeetingProtocol::ModeratedBoardV2 => {
+            return Err(v2_stage_one_unavailable("floor history"));
+        }
+        MeetingProtocol::UniformV0 => {}
     }
 
     let filter = serde_json::json!({
@@ -1759,6 +1929,7 @@ async fn current_open_floor(
     meeting_id: Uuid,
     operation: &str,
 ) -> Result<FloorState, CliError> {
+    require_uniform_v0(client, meeting_id).await?;
     let state = fetch_current_floor(client, &meeting_id.to_string())
         .await?
         .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
@@ -1803,6 +1974,7 @@ pub async fn cmd_floor_pass(
 
 pub async fn cmd_floor_yield(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
+    require_uniform_v0(client, meeting_id).await?;
     let state = fetch_current_floor(client, &meeting_id.to_string())
         .await?
         .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
@@ -1840,6 +2012,7 @@ pub async fn cmd_claim_floor(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
     let meeting_id_text = meeting_id.to_string();
+    require_uniform_v0(client, meeting_id).await?;
     let state = fetch_current_floor(client, &meeting_id_text)
         .await?
         .ok_or_else(|| CliError::NotFound(format!("meeting floor not found: {meeting_id}")))?;
@@ -2048,6 +2221,7 @@ pub async fn cmd_say_meeting(
             print_v1_write_response(&response, "speech_event_id", &speech_event_id);
             Ok(())
         }
+        MeetingProtocol::ModeratedBoardV2 => Err(v2_stage_one_unavailable("speech")),
     }
 }
 
@@ -2068,6 +2242,9 @@ pub async fn cmd_end_meeting(client: &BuzzClient, meeting_id: &str) -> Result<()
                 session_id: meeting_id,
                 create_event_id,
             })
+        }
+        MeetingProtocol::ModeratedBoardV2 => {
+            return Err(v2_stage_one_unavailable("End"));
         }
     }
     .map_err(sdk_err)?;
@@ -2115,16 +2292,20 @@ pub async fn dispatch(
             source,
             policy,
             moderator,
+            board,
             participants,
         } => {
             cmd_create_meeting(
                 client,
-                &title,
-                description.as_deref(),
-                source.as_deref(),
-                policy,
-                moderator.as_deref(),
-                &participants,
+                CreateMeetingInput {
+                    title: &title,
+                    description: description.as_deref(),
+                    source: source.as_deref(),
+                    policy,
+                    moderator: moderator.as_deref(),
+                    board: board.as_deref(),
+                    participant_pubkeys: &participants,
+                },
             )
             .await
         }
@@ -2133,6 +2314,12 @@ pub async fn dispatch(
             limit,
         } => cmd_list_meetings(client, include_ended, limit, format).await,
         MeetingsCmd::Show { meeting } => cmd_show_meeting(client, &meeting).await,
+        MeetingsCmd::Board { command } => {
+            use crate::MeetingBoardCmd;
+            match command {
+                MeetingBoardCmd::Get { meeting } => cmd_get_meeting_board(client, &meeting).await,
+            }
+        }
         MeetingsCmd::Participants { meeting } => cmd_list_participants(client, &meeting).await,
         MeetingsCmd::History { meeting, limit } => {
             cmd_meeting_history(client, &meeting, limit, format).await
@@ -2354,7 +2541,122 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use nostr::{Event, EventBuilder, Keys, Kind, Tag};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct StageOneCliServerState {
+        create: Arc<Mutex<Option<Event>>>,
+        query_kinds: Arc<Mutex<Vec<u32>>>,
+        relay_keys: Arc<Keys>,
+    }
+
+    async fn stage_one_cli_events(
+        State(state): State<StageOneCliServerState>,
+        Json(event): Json<Event>,
+    ) -> Json<serde_json::Value> {
+        assert_eq!(
+            event.kind.as_u16() as u32,
+            buzz_sdk::kind::KIND_MEETING_CREATE
+        );
+        assert_eq!(extract_tag_value(&serde_json::json!(event), "v"), "3");
+        assert_eq!(
+            extract_tag_value(&serde_json::json!(event), "policy"),
+            buzz_sdk::MEETING_V2_POLICY
+        );
+        assert!(extract_tag_value(&serde_json::json!(event), "moderator").is_empty());
+        buzz_sdk::parse_meeting_v2_board_content(&event.content)
+            .expect("CLI submits strict Meeting V2 board content");
+
+        let event_id = event.id.to_hex();
+        *state.create.lock().await = Some(event);
+        Json(serde_json::json!({
+            "event_id": event_id,
+            "accepted": true,
+            "message": "accepted"
+        }))
+    }
+
+    async fn stage_one_cli_query(
+        State(state): State<StageOneCliServerState>,
+        Json(filters): Json<Vec<serde_json::Value>>,
+    ) -> Json<serde_json::Value> {
+        let kind = filters
+            .first()
+            .and_then(|filter| filter.get("kinds"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|kinds| kinds.first())
+            .and_then(serde_json::Value::as_u64)
+            .map(|kind| kind as u32)
+            .expect("CLI query carries an explicit kind");
+        state.query_kinds.lock().await.push(kind);
+        let create = state
+            .create
+            .lock()
+            .await
+            .clone()
+            .expect("CLI Create precedes board reads");
+
+        let events = if kind == buzz_sdk::kind::KIND_MEETING_CREATE {
+            vec![create]
+        } else if kind == KIND_MEETING_BOARD {
+            let create_json = serde_json::json!(create);
+            let session_id = extract_tag_value(&create_json, "h");
+            let moderator = create_json["pubkey"]
+                .as_str()
+                .expect("Create author pubkey");
+            let board = EventBuilder::new(
+                Kind::Custom(KIND_MEETING_BOARD as u16),
+                create_json["content"]
+                    .as_str()
+                    .expect("Create board content"),
+            )
+            .tags([
+                Tag::parse(["h", session_id.as_str()]).expect("board h tag"),
+                Tag::parse(["v", buzz_sdk::MEETING_V2_SCHEMA_VERSION]).expect("board version tag"),
+                Tag::parse(["policy", buzz_sdk::MEETING_V2_POLICY]).expect("board policy tag"),
+                Tag::parse(["format", buzz_sdk::MEETING_V2_BOARD_FORMAT])
+                    .expect("board format tag"),
+                Tag::parse(["moderator", moderator]).expect("board moderator tag"),
+            ])
+            .sign_with_keys(&state.relay_keys)
+            .expect("sign board fixture");
+            vec![board]
+        } else {
+            Vec::new()
+        };
+        Json(serde_json::to_value(events).expect("serialize CLI query fixture"))
+    }
+
+    async fn spawn_stage_one_cli_server() -> (String, StageOneCliServerState) {
+        let state = StageOneCliServerState {
+            create: Arc::new(Mutex::new(None)),
+            query_kinds: Arc::new(Mutex::new(Vec::new())),
+            relay_keys: Arc::new(Keys::generate()),
+        };
+        let app = Router::new()
+            .route("/events", post(stage_one_cli_events))
+            .route("/query", post(stage_one_cli_query))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Meeting V2 CLI test server");
+        let address = listener.local_addr().expect("CLI test server address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Meeting V2 CLI fixture");
+        });
+        (format!("http://{address}"), state)
+    }
 
     fn create_event(version: &str, policy: Option<&str>) -> serde_json::Value {
         let mut tags = vec![
@@ -2372,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn create_protocol_is_strict_for_v1_and_compatible_for_v0() {
+    fn create_protocol_is_strict_for_v1_v2_and_compatible_for_v0() {
         assert_eq!(
             MeetingProtocol::from_create_event(&create_event("1", None)).unwrap(),
             MeetingProtocol::UniformV0
@@ -2388,6 +2690,76 @@ mod tests {
         assert!(MeetingProtocol::from_create_event(&create_event("2", None)).is_err());
         assert!(
             MeetingProtocol::from_create_event(&create_event("2", Some("uniform-v0"))).is_err()
+        );
+        assert_eq!(
+            MeetingProtocol::from_create_event(&create_event(
+                "3",
+                Some(buzz_sdk::MEETING_V2_POLICY)
+            ))
+            .unwrap(),
+            MeetingProtocol::ModeratedBoardV2
+        );
+        assert!(MeetingProtocol::from_create_event(&create_event("3", None)).is_err());
+        assert!(MeetingProtocol::from_create_event(&create_event(
+            "3",
+            Some(buzz_sdk::MEETING_V1_POLICY)
+        ))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn full_cli_create_then_get_board_uses_the_stage_one_wire_contract() {
+        let (relay, state) = spawn_stage_one_cli_server().await;
+        let private_key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let participant = Keys::generate().public_key().to_hex();
+        let create_exit = crate::run_from_args(vec![
+            "buzz".to_string(),
+            "--relay".to_string(),
+            relay.clone(),
+            "--private-key".to_string(),
+            private_key.to_string(),
+            "--auth-tag".to_string(),
+            String::new(),
+            "meetings".to_string(),
+            "create".to_string(),
+            "--policy".to_string(),
+            buzz_sdk::MEETING_V2_POLICY.to_string(),
+            "--title".to_string(),
+            "CLI stage one".to_string(),
+            "--board".to_string(),
+            "# Goal\nVerify the CLI path.".to_string(),
+            "--participant".to_string(),
+            participant,
+        ])
+        .await;
+        assert_eq!(create_exit, 0);
+
+        let create = state
+            .create
+            .lock()
+            .await
+            .clone()
+            .expect("CLI submitted Meeting V2 Create");
+        let meeting_id = extract_tag_value(&serde_json::json!(create), "h");
+        let board_exit = crate::run_from_args(vec![
+            "buzz".to_string(),
+            "--relay".to_string(),
+            relay,
+            "--private-key".to_string(),
+            private_key.to_string(),
+            "--auth-tag".to_string(),
+            String::new(),
+            "meetings".to_string(),
+            "board".to_string(),
+            "get".to_string(),
+            "--meeting".to_string(),
+            meeting_id,
+        ])
+        .await;
+        assert_eq!(board_exit, 0);
+        assert_eq!(
+            *state.query_kinds.lock().await,
+            vec![buzz_sdk::kind::KIND_MEETING_CREATE, KIND_MEETING_BOARD]
         );
     }
 

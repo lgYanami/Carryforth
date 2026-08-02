@@ -3875,6 +3875,32 @@ mod tests {
     }
 
     #[test]
+    fn protocol_detection_keeps_stage_one_v2_bootstrap_fail_closed() {
+        let session_id = Uuid::new_v4();
+        let session = session_id.to_string();
+        let relay = Keys::generate();
+        let moderator = relay.public_key().to_hex();
+        let board = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_BOARD as u16),
+            r##"{"format":"markdown","body":"# Goal"}"##,
+        )
+        .tags([
+            Tag::parse(["h", session.as_str()]).expect("board h tag"),
+            Tag::parse(["v", "3"]).expect("board version tag"),
+            Tag::parse(["policy", "moderated-board-v1"]).expect("board policy tag"),
+            Tag::parse(["format", "markdown"]).expect("board format tag"),
+            Tag::parse(["moderator", moderator.as_str()]).expect("board moderator tag"),
+        ])
+        .sign_with_keys(&relay)
+        .expect("sign Meeting V2 board");
+        let events = vec![signed_meeting_metadata(&relay, session_id), board];
+
+        let error = classify_meeting_protocol(&events, session_id)
+            .expect_err("stage-one V2 must not register a V0/V1 controller");
+        assert!(error.to_string().contains("no authoritative State event"));
+    }
+
+    #[test]
     fn protocol_detection_ignores_wrong_signer_v1_and_selects_authoritative_v0() {
         let session_id = Uuid::new_v4();
         let relay = Keys::generate();

@@ -191,13 +191,17 @@ CREATE TABLE meeting_sessions (
         CHECK (end_event_id IS NULL OR LENGTH(end_event_id) = 32),
     CONSTRAINT chk_meeting_ended_by_len
         CHECK (ended_by IS NULL OR LENGTH(ended_by) = 32),
-    CONSTRAINT chk_meeting_schema_version CHECK (schema_version IN (1, 2)),
+    CONSTRAINT chk_meeting_schema_version CHECK (schema_version IN (1, 2, 3)),
     CONSTRAINT chk_meeting_moderator_pubkey_len
         CHECK (moderator_pubkey IS NULL OR LENGTH(moderator_pubkey) = 32),
     CONSTRAINT chk_meeting_current_round_positive CHECK (current_round > 0),
     CONSTRAINT chk_meeting_floor_revision_nonnegative CHECK (floor_revision >= 0),
     CONSTRAINT chk_meeting_floor_policy
-        CHECK (floor_policy_version IN ('uniform-v0', 'moderated-baton-v1')),
+        CHECK (floor_policy_version IN (
+            'uniform-v0',
+            'moderated-baton-v1',
+            'moderated-board-v1'
+        )),
     CONSTRAINT chk_meeting_protocol_shape
         CHECK (
             (schema_version = 1
@@ -207,6 +211,10 @@ CREATE TABLE meeting_sessions (
             (schema_version = 2
                 AND floor_policy_version = 'moderated-baton-v1'
                 AND moderator_pubkey IS NOT NULL)
+            OR
+            (schema_version = 3
+                AND floor_policy_version = 'moderated-board-v1'
+                AND moderator_pubkey = host_pubkey)
         ),
     CONSTRAINT chk_meeting_terminal_shape
         CHECK (
@@ -471,6 +479,46 @@ CREATE TABLE meeting_participants (
 
 CREATE INDEX idx_meeting_participants_identity
     ON meeting_participants (community_id, pubkey, session_id);
+
+-- Meeting V2 exposes one relay-managed current Markdown board and remains
+-- fail-closed behind a bootstrap runtime marker until its control cycle lands.
+
+CREATE TABLE meeting_current_boards (
+    community_id    UUID NOT NULL REFERENCES communities(id),
+    session_id      UUID NOT NULL,
+    board_event_id  BYTEA NOT NULL,
+    board_format    TEXT NOT NULL,
+    board_content   TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (community_id, session_id),
+    UNIQUE (community_id, board_event_id),
+    FOREIGN KEY (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id),
+    CONSTRAINT chk_meeting_current_board_event_id_len
+        CHECK (LENGTH(board_event_id) = 32),
+    CONSTRAINT chk_meeting_current_board_format
+        CHECK (board_format = 'markdown'),
+    CONSTRAINT chk_meeting_current_board_content
+        CHECK (
+            OCTET_LENGTH(BTRIM(board_content)) > 0
+            AND OCTET_LENGTH(board_content) <= 65536
+        )
+);
+
+CREATE TABLE meeting_v2_bootstrap_state (
+    community_id   UUID NOT NULL REFERENCES communities(id),
+    session_id     UUID NOT NULL,
+    runtime_phase  TEXT NOT NULL DEFAULT 'bootstrap_locked'
+        CHECK (runtime_phase = 'bootstrap_locked'),
+    control_epoch  BIGINT NOT NULL DEFAULT 1
+        CHECK (control_epoch = 1),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (community_id, session_id),
+    FOREIGN KEY (community_id, session_id)
+        REFERENCES meeting_sessions (community_id, session_id)
+);
 
 CREATE TABLE meeting_baton_config (
     community_id              UUID NOT NULL REFERENCES communities(id),

@@ -36,6 +36,8 @@ pub mod meeting_baton;
 pub mod meeting_floor;
 /// Durable cleanup for meetings affected by a real security revocation.
 pub mod meeting_revocation;
+/// Meeting V2 current-board and stage-one bootstrap persistence.
+pub mod meeting_v2;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.

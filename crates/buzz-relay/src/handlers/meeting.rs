@@ -29,11 +29,15 @@ pub async fn handle_speech(
         .map_err(map_meeting_db_error)?;
     let protocol =
         MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
-    if protocol == MeetingProtocol::ModeratedBatonV1 {
-        return super::meeting_baton::handle_speech(tenant, state, event).await;
+    match protocol {
+        MeetingProtocol::UniformV0 => handle_v0_speech(tenant, state, event, session_id).await,
+        MeetingProtocol::ModeratedBatonV1 => {
+            super::meeting_baton::handle_speech(tenant, state, event).await
+        }
+        MeetingProtocol::ModeratedBoardV2 => Err(IngestError::Rejected(
+            "restricted: Meeting V2 speech is unavailable during stage one".into(),
+        )),
     }
-
-    handle_v0_speech(tenant, state, event, session_id).await
 }
 
 async fn handle_v0_speech(

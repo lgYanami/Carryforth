@@ -28,6 +28,7 @@ fi
 export REDIS_URL="redis://localhost:6379"
 export RELAY_URL="ws://localhost:3000"
 export BUZZ_MEETING_V1_CREATE_ENABLED=true
+export BUZZ_MEETING_V2_CREATE_ENABLED=true
 export BUZZ_MEETING_ROLLOUT_FIXTURE="${ROLLOUT_FIXTURE_FILE}"
 export BUZZ_TEST_RELAY_PID_FILE="${RELAY_PID_FILE}"
 export BUZZ_TEST_RELAY_LOG_FILE="${RELAY_LOG_FILE}"
@@ -129,13 +130,17 @@ export DATABASE_URL="postgres://buzz:buzz_dev@localhost:5432/${MEETING_RELAY_DB}
 export BUZZ_TEST_PGDATABASE="${MEETING_RELAY_DB}"
 export BUZZ_TEST_DATABASE_URL="${DATABASE_URL}"
 
-echo "Starting Relay with Meeting V1 creation enabled..."
+echo "Starting Relay with Meeting V1/V2 creation enabled..."
 BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
   "${SCRIPT_DIR}/start-relay-for-tests.sh"
 
-echo "Running Meeting V0/V1 Relay end-to-end tests serially..."
+echo "Running Meeting V0/V1/V2 Relay end-to-end tests serially..."
 cargo test -p buzz-test-client --test e2e_meeting -- --ignored --test-threads=1 --nocapture
 cargo test -p buzz-test-client --test e2e_meeting_floor -- --ignored --test-threads=1 --nocapture
+cargo test -p buzz-test-client --test e2e_meeting_v2_stage1 -- \
+  --ignored \
+  --test-threads=1 \
+  --nocapture
 cargo test -p buzz-test-client --test e2e_meeting_baton -- \
   --ignored \
   --test-threads=1 \
