@@ -115,6 +115,48 @@ run_unit_tests() {
   run_test_step "Project View CLI tests" \
     cargo test -p buzz-cli --lib project_view -- --nocapture
 
+  run_test_step "Project View ACP tests" \
+    cargo test -p buzz-acp --lib project_view -- --nocapture
+
+  run_test_step "Project View admin tests" \
+    cargo test -p buzz-admin project_view -- --nocapture
+
+  # Keep the fallback path equivalent to `just project-document-test-unit`.
+  # Keep the Stage 2 domain, private Relay adapter, CLI, and operator surface in
+  # the ordinary no-infrastructure unit gate.
+  run_test_step "Project Document domain tests" \
+    cargo test -p buzz-project-document -- --nocapture
+
+  run_test_step "Project Document SDK tests" \
+    cargo test -p buzz-sdk --test project_document -- --nocapture
+
+  run_test_step "Project Document core protocol tests" \
+    cargo test -p buzz-core --lib project_document -- --nocapture
+
+  run_test_step "Project Document Relay tests" \
+    cargo test -p buzz-relay --lib project_document -- --nocapture
+
+  run_test_step "Project Document Relay private-read tests" \
+    cargo test -p buzz-relay --lib community_private -- --nocapture
+
+  run_test_step "Project Document CLI boundary tests" \
+    cargo test -p buzz-cli --lib project_document -- --nocapture
+
+  run_test_step "Project Document CLI vertical tests" \
+    cargo test -p buzz-cli --lib documents -- --nocapture
+
+  run_test_step "Project Document delivery policy tests" \
+    cargo test -p buzz-cli --lib project_command -- --nocapture
+
+  run_test_step "Project Document ACP boundary tests" \
+    cargo test -p buzz-acp --lib project_document -- --nocapture
+
+  run_test_step "Project Document database unit tests" \
+    cargo test -p buzz-db --lib project_document -- --nocapture
+
+  run_test_step "Project Document admin tests" \
+    cargo test -p buzz-admin project_document -- --nocapture
+
   run_test_step "buzz-push-gateway tests" \
     cargo test -p buzz-push-gateway -- --nocapture
 }

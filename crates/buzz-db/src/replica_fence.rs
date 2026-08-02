@@ -522,11 +522,13 @@ mod tests {
         assert!(!fence.covers(Utc::now() - chrono::Duration::days(365)));
 
         let ts = Utc::now();
+        let stored_ts = DateTime::from_timestamp_micros(ts.timestamp_micros())
+            .expect("current timestamp fits in microseconds");
         fence.advance(ts);
-        assert_eq!(fence.verified_through(), Some(ts));
-        assert!(fence.covers(ts - chrono::Duration::seconds(1)));
-        assert!(fence.covers(ts), "boundary is inclusive");
-        assert!(!fence.covers(ts + chrono::Duration::seconds(1)));
+        assert_eq!(fence.verified_through(), Some(stored_ts));
+        assert!(fence.covers(stored_ts - chrono::Duration::seconds(1)));
+        assert!(fence.covers(stored_ts), "boundary is inclusive");
+        assert!(!fence.covers(stored_ts + chrono::Duration::seconds(1)));
 
         fence.close();
         assert!(fence.verified_through().is_none(), "close() must close");

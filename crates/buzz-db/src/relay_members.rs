@@ -83,8 +83,14 @@ pub async fn project_view_schema_version(pool: &PgPool, community: CommunityId) 
         .ok_or_else(|| DbError::NotFound(format!("community {community}")))
 }
 
-async fn is_v2_in_tx(tx: &mut Transaction<'_, Postgres>, community: CommunityId) -> Result<bool> {
-    Ok(project_view_schema_version_in_tx(tx, community).await? == 2)
+async fn is_governed_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+) -> Result<bool> {
+    Ok(matches!(
+        project_view_schema_version_in_tx(tx, community).await?,
+        2 | 3
+    ))
 }
 
 fn v2_membership_coordinator_unavailable() -> DbError {
@@ -406,7 +412,7 @@ pub async fn add_relay_member(
     added_by: Option<&str>,
 ) -> Result<bool> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_v2_in_tx(&mut tx, community).await? {
+    if is_governed_in_tx(&mut tx, community).await? {
         if matches!(role, "admin" | "owner") {
             return Err(DbError::AccessDenied(
                 "forbidden:membership:role_requires_governance".to_owned(),
@@ -432,7 +438,7 @@ pub async fn claim_relay_membership(
     policy_version: Option<&str>,
 ) -> Result<bool> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_v2_in_tx(&mut tx, community).await? {
+    if is_governed_in_tx(&mut tx, community).await? {
         if role != "member" {
             return Err(DbError::AccessDenied(
                 "forbidden:membership:invite_cannot_grant_role".to_owned(),
@@ -506,7 +512,7 @@ pub async fn remove_relay_member(
     pubkey: &str,
 ) -> Result<RemoveResult> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_v2_in_tx(&mut tx, community).await? {
+    if is_governed_in_tx(&mut tx, community).await? {
         if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
             return Ok(RemoveResult::AssignmentActive);
         }
@@ -567,7 +573,7 @@ pub async fn remove_relay_member_if_role(
     expected_role: &str,
 ) -> Result<RemoveResult> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_v2_in_tx(&mut tx, community).await? {
+    if is_governed_in_tx(&mut tx, community).await? {
         if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
             return Ok(RemoveResult::AssignmentActive);
         }
@@ -626,7 +632,7 @@ pub async fn update_relay_member_role(
     new_role: &str,
 ) -> Result<bool> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_v2_in_tx(&mut tx, community).await? {
+    if is_governed_in_tx(&mut tx, community).await? {
         let current_role: Option<String> = sqlx::query_scalar(
             "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2 FOR UPDATE",
         )
@@ -685,7 +691,7 @@ pub async fn bootstrap_owner(
 ) -> Result<()> {
     let pubkey = owner_pubkey.to_ascii_lowercase();
     let mut tx = begin_membership_write(pool, community).await?;
-    let is_v2 = is_v2_in_tx(&mut tx, community).await?;
+    let is_v2 = is_governed_in_tx(&mut tx, community).await?;
     if is_v2 && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
         return Err(DbError::AccessDenied(
             "forbidden:managed_agent:owner_ineligible".to_owned(),
@@ -802,7 +808,7 @@ pub async fn transfer_ownership(
     let pubkey = new_owner_pubkey.to_ascii_lowercase();
     let expected_owner = expected_owner_pubkey.to_ascii_lowercase();
     let mut tx = begin_membership_write(pool, community).await?;
-    let is_v2 = is_v2_in_tx(&mut tx, community).await?;
+    let is_v2 = is_governed_in_tx(&mut tx, community).await?;
     if is_v2 && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
         return Ok(TransferResult::ManagedAgentIneligible);
     }
@@ -900,8 +906,8 @@ pub async fn transfer_ownership(
 /// Converts BYTEA pubkeys to lowercase hex text and inserts them as members of
 /// `community`. Returns the number of rows inserted, or 0 if:
 /// - the `pubkey_allowlist` table doesn't exist, or
-/// - the Community already uses Project View v2, where membership is governed
-///   by Role continuity and legacy allowlist backfill must not run, or
+/// - the Community already uses a Role-governed Project View schema, where
+///   legacy allowlist backfill must not run, or
 /// - `relay_members` already has rows for this community (migration ran in a
 ///   prior v1 startup).
 ///
@@ -921,7 +927,7 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
     }
 
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_v2_in_tx(&mut tx, community).await? {
+    if is_governed_in_tx(&mut tx, community).await? {
         tx.rollback().await?;
         return Ok(0);
     }

@@ -8,8 +8,11 @@ use buzz_project_view::v2::{
     RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity, RoleDefinition,
     RoleHandoffContent,
 };
+use buzz_project_view::v3::RoleCommandV3;
 use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
+use buzz_sdk::project_view_v3::build_role_command as build_v3_role_command;
 use buzz_sdk::role_brief::render_role_brief_markdown;
+use buzz_sdk::role_brief_v3::render_role_brief_markdown_v3;
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -17,10 +20,11 @@ use uuid::Uuid;
 
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_current_v2_snapshot, read_role_history_page,
-    read_verified_v2_snapshot, require_v2_identity, runtime_fence_from_env, ProjectViewIdentity,
-    RoleHistoryRequest,
+    is_managed_runtime, read_current_v2_snapshot, read_identity, read_role_history_page,
+    read_verified_v2_snapshot, read_verified_v3_snapshot, require_v2_identity,
+    runtime_fence_from_env, ProjectViewIdentity, ProjectViewSchema, RoleHistoryRequest,
 };
+use crate::commands::project_view_v3_context::resolve_v3_role_brief;
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
 use crate::{
@@ -125,19 +129,42 @@ async fn show_brief(
         .map(parse_pubkey)
         .transpose()?
         .unwrap_or_else(|| client.public_key());
-    let snapshot = read_current_v2_snapshot(client).await?;
-    let brief = snapshot
-        .brief_for(member, Utc::now())
-        .map_err(|error| integrity_error(error.to_string()))?;
-    if markdown {
-        print!("{}", render_role_brief_markdown(&brief));
-        return Ok(());
+    let identity = require_role_identity(client).await?;
+    match identity.schema {
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let brief = snapshot
+                .brief_for(member, Utc::now())
+                .map_err(|error| integrity_error(error.to_string()))?;
+            if markdown {
+                print!("{}", render_role_brief_markdown(&brief));
+                return Ok(());
+            }
+            print_json(
+                &serde_json::to_value(brief)
+                    .map_err(|error| CliError::Other(format!("serialize Role Brief: {error}")))?,
+                format,
+            )
+        }
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            let brief =
+                resolve_v3_role_brief(client, identity, &snapshot, member, Utc::now()).await?;
+            if markdown {
+                print!("{}", render_role_brief_markdown_v3(&brief));
+                return Ok(());
+            }
+            print_json(
+                &serde_json::to_value(brief).map_err(|error| {
+                    CliError::Other(format!("serialize Role Brief v3: {error}"))
+                })?,
+                format,
+            )
+        }
+        ProjectViewSchema::V1 => Err(CliError::Other(
+            "unsupported: Role Brief requires Project View schema v2 or v3".to_owned(),
+        )),
     }
-    print_json(
-        &serde_json::to_value(brief)
-            .map_err(|error| CliError::Other(format!("serialize Role Brief: {error}")))?,
-        format,
-    )
 }
 
 async fn list_roles(client: &BuzzClient, format: &OutputFormat) -> Result<(), CliError> {
@@ -287,27 +314,55 @@ async fn current_assignment(
         .map(parse_pubkey)
         .transpose()?
         .unwrap_or_else(|| client.public_key());
-    let snapshot = read_snapshot(client).await?;
-    let assignment = snapshot
-        .assignments
-        .iter()
-        .find(|assignment| assignment.member_pubkey == member && assignment.is_active());
-    let role = assignment.and_then(|assignment| {
-        snapshot
-            .roles
-            .iter()
-            .find(|role| role.role_id == assignment.role_id)
-    });
-    print_json(
-        &json!({
-            "project_revision": snapshot.meta.project_revision,
-            "member_pubkey": member,
-            "assigned": assignment.is_some(),
-            "assignment": assignment,
-            "role": role,
-        }),
-        format,
-    )
+    let identity = require_role_identity(client).await?;
+    match identity.schema {
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let assignment = snapshot
+                .assignments()
+                .find(|assignment| assignment.member_pubkey == member && assignment.is_active());
+            let role = assignment.and_then(|assignment| {
+                snapshot
+                    .roles()
+                    .find(|role| role.role_id == assignment.role_id)
+            });
+            print_json(
+                &json!({
+                    "project_revision": snapshot.meta().project_revision,
+                    "member_pubkey": member,
+                    "assigned": assignment.is_some(),
+                    "assignment": assignment,
+                    "role": role,
+                }),
+                format,
+            )
+        }
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            let assignment = snapshot
+                .assignments()
+                .find(|assignment| assignment.member_pubkey == member && assignment.is_active());
+            let role = assignment.and_then(|assignment| {
+                snapshot
+                    .roles()
+                    .find(|role| role.role_id == assignment.role_id)
+            });
+            print_json(
+                &json!({
+                    "project_view_schema_version": 3,
+                    "project_revision": snapshot.meta().project_revision,
+                    "member_pubkey": member,
+                    "assigned": assignment.is_some(),
+                    "assignment": assignment,
+                    "role": role,
+                }),
+                format,
+            )
+        }
+        ProjectViewSchema::V1 => Err(CliError::Other(
+            "unsupported: current Assignment requires Project View schema v2 or v3".to_owned(),
+        )),
+    }
 }
 
 async fn list_proposals(
@@ -819,21 +874,27 @@ async fn dispatch_handoff(
 }
 
 async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), CliError> {
-    let identity = require_v2_identity(client).await?;
+    let identity = require_role_identity(client).await?;
     if is_managed_runtime() {
-        let snapshot = read_verified_v2_snapshot(client, identity)
-            .await
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "assignment_unavailable: current Assignment could not be verified: {error}"
-                ))
-            })?;
-        let current_assignment = snapshot
-            .assignments()
-            .find(|assignment| {
-                assignment.member_pubkey == client.public_key() && assignment.is_active()
-            })
-            .map(|assignment| assignment.assignment_id);
+        let current_assignment = match identity.schema {
+            ProjectViewSchema::V2 => read_verified_v2_snapshot(client, identity)
+                .await
+                .map_err(assignment_read_error)?
+                .assignments()
+                .find(|assignment| {
+                    assignment.member_pubkey == client.public_key() && assignment.is_active()
+                })
+                .map(|assignment| assignment.assignment_id),
+            ProjectViewSchema::V3 => read_verified_v3_snapshot(client, identity)
+                .await
+                .map_err(assignment_read_error)?
+                .assignments()
+                .find(|assignment| {
+                    assignment.member_pubkey == client.public_key() && assignment.is_active()
+                })
+                .map(|assignment| assignment.assignment_id),
+            ProjectViewSchema::V1 => None,
+        };
         if command
             .acting_assignment_id
             .is_some_and(|provided| Some(provided) != current_assignment)
@@ -856,10 +917,40 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
         command.acting_assignment_id = current_assignment;
         command.runtime_fence = runtime_fence_from_env()?;
     }
-    let event = client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?;
+    let event = match identity.schema {
+        ProjectViewSchema::V2 => {
+            client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?
+        }
+        ProjectViewSchema::V3 => {
+            let mut v3 = RoleCommandV3::new(
+                command.expected_project_revision,
+                command.acting_assignment_id,
+                command.request,
+            );
+            v3.runtime_fence = command.runtime_fence;
+            client.sign_event_exact(build_v3_role_command(v3).map_err(sdk_err)?)?
+        }
+        ProjectViewSchema::V1 => {
+            return Err(CliError::Other(
+                "unsupported: Role continuity requires Project View schema v2 or v3".to_owned(),
+            ));
+        }
+    };
     let response = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&response));
     Ok(())
+}
+
+async fn require_role_identity(client: &BuzzClient) -> Result<ProjectViewIdentity, CliError> {
+    read_identity(client).await?.ok_or_else(|| {
+        CliError::Other("unsupported: relay does not advertise Project View v2 or v3".to_owned())
+    })
+}
+
+fn assignment_read_error(error: CliError) -> CliError {
+    CliError::Other(format!(
+        "assignment_unavailable: current Assignment could not be verified: {error}"
+    ))
 }
 
 async fn read_snapshot(client: &BuzzClient) -> Result<RoleSnapshot, CliError> {

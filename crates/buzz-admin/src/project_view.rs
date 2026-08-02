@@ -1,5 +1,6 @@
 //! Operator control plane for the centralized Project View feature flag.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -11,6 +12,11 @@ use buzz_db::project_view::{
 use buzz_db::project_view_v2::{ProjectViewV2AdminAssignment, ProjectViewV2CutoverPlan};
 use buzz_db::Db;
 use buzz_project_view::v2::idempotency_key_hash;
+use buzz_project_view::v3::{
+    CanonicalMaintenanceRepairPlanEnvelopeV1, CanonicalMaintenanceRepairPlanV1,
+    ResourceMappingManifestEnvelopeV1, MAX_MAINTENANCE_REPAIR_PLAN_JSON_BYTES,
+    MAX_MANIFEST_JSON_BYTES,
+};
 use buzz_project_view::ProjectionPlan;
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Args, Subcommand};
@@ -69,6 +75,243 @@ pub(crate) enum ProjectViewCommand {
         #[arg(long)]
         expected_pubkey: String,
     },
+    /// Prepare an empty, disabled Community for owner-signed schema-v3 initialization.
+    PrepareV3 {
+        /// Normalized Community host.
+        #[arg(long)]
+        community: String,
+        /// Caller-stable idempotency key.
+        #[arg(long)]
+        idempotency_key: String,
+        /// Current Human owner/admin public key; defaults to BUZZ_PRIVATE_KEY.
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+    },
+    /// Control the durable Project View v3 maintenance state machine.
+    Maintenance {
+        #[command(subcommand)]
+        command: ProjectViewMaintenanceCommand,
+    },
+    /// Inspect or transition the staged Project Context sub-capability.
+    Context {
+        #[command(subcommand)]
+        command: ProjectViewContextCommand,
+    },
+    /// Operate the capability-off Project View schema-v3 migration surface.
+    V3 {
+        #[command(subcommand)]
+        command: ProjectViewV3Command,
+    },
+}
+
+/// Project Context capability control commands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProjectViewContextCommand {
+    /// Show flags, structural parity, Document readiness, and reference counts.
+    Status {
+        #[arg(long)]
+        community: String,
+    },
+    /// Enable only after all server, client, closure, and storage gates pass.
+    Enable {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+    },
+    /// Fail closed without deleting canonical Context coordinates.
+    Disable {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+    },
+}
+
+/// Project View v3 operator commands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProjectViewV3Command {
+    /// Export or validate reviewed legacy Resource mappings.
+    Resources {
+        #[command(subcommand)]
+        command: ProjectViewV3ResourcesCommand,
+    },
+    /// Execute one replay-first frozen schema-v2-to-v3 cutover.
+    Cutover {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        maintenance_epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        #[arg(long)]
+        relay_key_file: Option<PathBuf>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+}
+
+/// Reviewed legacy Resource migration commands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProjectViewV3ResourcesCommand {
+    /// Export a deterministic local review draft from the exact schema-v2 base.
+    Export {
+        #[arg(long)]
+        community: String,
+        /// Owner-only directory that receives `resource-mapping-draft.json`.
+        #[arg(long)]
+        out: PathBuf,
+        /// Current Human owner/admin public key; defaults to BUZZ_PRIVATE_KEY.
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+    },
+    /// Recompute and persist all canonical mapping/signature evidence.
+    Validate {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+}
+
+/// Durable Project View maintenance operations.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProjectViewMaintenanceCommand {
+    /// Disable ordinary writes and capture the exact Assignment/Runtime baseline.
+    Begin {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        /// Minimum ordered ACP maintenance protocol version accepted by freeze.
+        #[arg(long)]
+        required_client_protocol_version: u64,
+        /// Expected stable Relay projection signer (hex or npub).
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Inspect current or historical durable maintenance state.
+    Status {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: Option<u64>,
+    },
+    /// Inspect ordered ACP fleet compatibility and exact drain blockers.
+    Readiness {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        /// A non-ACKed supervisor poll older than this is reported stale.
+        #[arg(long, default_value_t = 30)]
+        max_poll_age_seconds: u64,
+    },
+    /// Exit successfully only when the exact epoch is safe to freeze.
+    AckProbe {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long, default_value_t = 30)]
+        max_poll_age_seconds: u64,
+    },
+    /// Freeze an exact fully acknowledged drain epoch.
+    Freeze {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+    },
+    /// Abort an exact pre-cutover epoch without reviving old Runtime fences.
+    Abort {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Record exact structural verification while remaining frozen.
+    Verify {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Apply one bounded typed forward repair while remaining frozen.
+    Repair {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        /// Closed repair-plan JSON envelope.
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        /// Validate the plan and print its canonical digest without writing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        relay_key_file: Option<PathBuf>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Re-sign every canonical v3 head at the next generation while frozen.
+    Reproject {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        #[arg(long)]
+        relay_key_file: Option<PathBuf>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Resume a verified committed v3 epoch and re-enable eligible Communities.
+    Resume {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
 }
 
 /// Exactly one Community target for a feature-flag mutation.
@@ -122,8 +365,587 @@ pub(crate) async fn run(command: ProjectViewCommand) -> Result<i32> {
             )
             .await?;
         }
+        ProjectViewCommand::PrepareV3 {
+            community,
+            idempotency_key,
+            operator_pubkey,
+        } => {
+            prepare_v3(
+                &db,
+                &community,
+                &idempotency_key,
+                operator_pubkey.as_deref(),
+            )
+            .await?;
+        }
+        ProjectViewCommand::Maintenance { command } => {
+            run_maintenance(&db, command).await?;
+        }
+        ProjectViewCommand::Context { command } => {
+            run_context(&db, command).await?;
+        }
+        ProjectViewCommand::V3 { command } => {
+            run_v3(&db, command).await?;
+        }
     }
     Ok(0)
+}
+
+async fn run_context(db: &Db, command: ProjectViewContextCommand) -> Result<()> {
+    match command {
+        ProjectViewContextCommand::Status { community } => {
+            let status = required_status(db, &community).await?;
+            let context = db
+                .project_context_feature_status(status.community_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Community '{}' was not found", status.host))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "community_id": context.community_id.to_string(),
+                    "host": context.host,
+                    "archived": context.archived,
+                    "project_view_schema_version": context.project_view_schema_version,
+                    "project_view_enabled": context.project_view_enabled,
+                    "context_enabled": context.context_enabled,
+                    "document_enabled": context.document_enabled,
+                    "maintenance_state": context.maintenance_state,
+                    "project_revision": context.project_revision,
+                    "projection_generation": context.projection_generation,
+                    "projection_pubkey": context.projection_pubkey.map(|key| key.to_hex()),
+                    "document_catalog_revision": context.document_catalog_revision,
+                    "resource_reference_count": context.resource_reference_count,
+                    "document_reference_count": context.document_reference_count,
+                    "project_view_ready": context.project_view_ready,
+                    "document_ready": context.document_ready,
+                    "advertised_ready": context.advertised_ready,
+                }))?
+            );
+        }
+        ProjectViewContextCommand::Enable {
+            community,
+            idempotency_key,
+            operator_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let receipt = db
+                .set_project_context_enabled_checked(
+                    status.community_id,
+                    true,
+                    operator,
+                    &idempotency_key,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ProjectViewContextCommand::Disable {
+            community,
+            idempotency_key,
+            operator_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let receipt = db
+                .set_project_context_enabled_checked(
+                    status.community_id,
+                    false,
+                    operator,
+                    &idempotency_key,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+    }
+    Ok(())
+}
+
+async fn run_v3(db: &Db, command: ProjectViewV3Command) -> Result<()> {
+    match command {
+        ProjectViewV3Command::Resources { command } => match command {
+            ProjectViewV3ResourcesCommand::Export {
+                community,
+                out,
+                operator_pubkey,
+            } => {
+                let status = required_status(db, &community).await?;
+                let relay = required_projection_pubkey(&status)?;
+                let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+                let draft = db
+                    .export_project_view_v3_resource_draft(status.community_id, operator, &relay)
+                    .await?;
+                let bytes = serde_json::to_vec_pretty(&draft)?;
+                let path = write_owner_only_json_dir(&out, "resource-mapping-draft.json", &bytes)?;
+                println!("{}", path.display());
+            }
+            ProjectViewV3ResourcesCommand::Validate {
+                community,
+                manifest,
+            } => {
+                let status = required_status(db, &community).await?;
+                let relay = required_projection_pubkey(&status)?;
+                let manifest = read_resource_manifest(&manifest)?;
+                if Uuid::from_bytes(manifest.community_id) != *status.community_id.as_uuid() {
+                    bail!("manifest Community does not match --community");
+                }
+                let receipt = db
+                    .validate_project_view_v3_resource_manifest(
+                        status.community_id,
+                        &manifest,
+                        &relay,
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
+        },
+        ProjectViewV3Command::Cutover {
+            community,
+            manifest,
+            maintenance_epoch,
+            idempotency_key,
+            operator_pubkey,
+            relay_key_file,
+            expected_pubkey,
+        } => {
+            if idempotency_key.trim().is_empty() {
+                bail!("--idempotency-key cannot be empty");
+            }
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let keys = load_relay_keys(relay_key_file.as_deref())?;
+            let expected = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            if keys.public_key() != expected {
+                bail!(
+                    "relay signer mismatch: expected {}, supplied key resolves to {}",
+                    expected.to_hex(),
+                    keys.public_key().to_hex()
+                );
+            }
+            let manifest = read_resource_manifest(&manifest)?;
+            if Uuid::from_bytes(manifest.community_id) != *status.community_id.as_uuid() {
+                bail!("manifest Community does not match --community");
+            }
+
+            // Catch an absent Redis before committing. A later fan-out fault is
+            // reported but leaves the durable Community frozen for repair.
+            let pubsub = super::connect_pubsub().await?;
+            let outcome = db
+                .cutover_project_view_v3(
+                    status.community_id,
+                    maintenance_epoch,
+                    operator,
+                    &idempotency_key,
+                    &manifest,
+                    &keys,
+                )
+                .await?;
+            let tenant = TenantContext::resolved(status.community_id, status.host);
+            let mut publish_failures = Vec::new();
+            for event in &outcome.events {
+                if let Err(error) = pubsub
+                    .publish_event(&tenant, EventTopic::Global, event)
+                    .await
+                {
+                    warn!(
+                        community_id = %status.community_id,
+                        event_id = %event.id,
+                        "Project View v3 cutover Redis fan-out failed: {error}"
+                    );
+                    publish_failures.push(event.id.to_hex());
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&outcome.result)?);
+            if !publish_failures.is_empty() {
+                bail!(
+                    "cutover committed and remains frozen, but Redis fan-out failed for: {}",
+                    publish_failures.join(",")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn required_projection_pubkey(status: &ProjectViewFeatureStatus) -> Result<PublicKey> {
+    status.projection_pubkey.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Project View for '{}' has no stable projection signer",
+            status.host
+        )
+    })
+}
+
+fn read_resource_manifest(path: &Path) -> Result<buzz_project_view::v3::ResourceMappingManifestV1> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("read manifest metadata: {error}"))?;
+    if !metadata.is_file() {
+        bail!("--manifest must name a regular file");
+    }
+    if metadata.len() > MAX_MANIFEST_JSON_BYTES as u64 {
+        bail!("manifest exceeds {MAX_MANIFEST_JSON_BYTES} bytes");
+    }
+    let bytes = std::fs::read(path).map_err(|error| anyhow::anyhow!("read --manifest: {error}"))?;
+    ResourceMappingManifestEnvelopeV1::parse_json(&bytes).map_err(Into::into)
+}
+
+fn read_repair_plan(path: &Path) -> Result<CanonicalMaintenanceRepairPlanV1> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("read repair-plan metadata: {error}"))?;
+    if !metadata.is_file() {
+        bail!("--plan must name a regular file");
+    }
+    if metadata.len() > MAX_MAINTENANCE_REPAIR_PLAN_JSON_BYTES as u64 {
+        bail!("repair plan exceeds {MAX_MAINTENANCE_REPAIR_PLAN_JSON_BYTES} bytes");
+    }
+    let bytes = std::fs::read(path).map_err(|error| anyhow::anyhow!("read --plan: {error}"))?;
+    CanonicalMaintenanceRepairPlanEnvelopeV1::parse_json(&bytes).map_err(Into::into)
+}
+
+async fn publish_recovery_events(
+    pubsub: &PubSubManager,
+    status: &ProjectViewFeatureStatus,
+    events: &[nostr::Event],
+    operation: &str,
+) -> Result<()> {
+    let tenant = TenantContext::resolved(status.community_id, status.host.clone());
+    let mut failures = Vec::new();
+    for event in events {
+        if let Err(error) = pubsub
+            .publish_event(&tenant, EventTopic::Global, event)
+            .await
+        {
+            warn!(
+                community_id = %status.community_id,
+                event_id = %event.id,
+                operation,
+                "Project View v3 recovery Redis fan-out failed: {error}"
+            );
+            failures.push(event.id.to_hex());
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{operation} committed and remains frozen, but Redis fan-out failed for: {}",
+            failures.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn write_owner_only_json_dir(directory: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    if directory.exists() {
+        let metadata = std::fs::symlink_metadata(directory)
+            .map_err(|error| anyhow::anyhow!("read --out metadata: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("--out must name a real directory, not a file or symlink");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!("--out permissions are too broad; remove all group/world access");
+            }
+        }
+    } else {
+        std::fs::create_dir(directory)
+            .map_err(|error| anyhow::anyhow!("create --out directory: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+
+    let path = directory.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| anyhow::anyhow!("create {}: {error}", path.display()))?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+async fn prepare_v3(
+    db: &Db,
+    community: &str,
+    idempotency_key: &str,
+    operator_pubkey: Option<&str>,
+) -> Result<()> {
+    let status = required_status(db, community).await?;
+    let operator = resolve_operator_pubkey(operator_pubkey)?;
+    let receipt = db
+        .prepare_project_view_v3(status.community_id, operator, idempotency_key)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
+}
+
+async fn run_maintenance(db: &Db, command: ProjectViewMaintenanceCommand) -> Result<()> {
+    match command {
+        ProjectViewMaintenanceCommand::Status { community, epoch } => {
+            let status = required_status(db, &community).await?;
+            let result = db
+                .project_view_maintenance_status(status.community_id, epoch)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ProjectViewMaintenanceCommand::Readiness {
+            community,
+            epoch,
+            max_poll_age_seconds,
+        } => {
+            let status = required_status(db, &community).await?;
+            let result = db
+                .project_view_maintenance_readiness(
+                    status.community_id,
+                    epoch,
+                    max_poll_age_seconds,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ProjectViewMaintenanceCommand::AckProbe {
+            community,
+            epoch,
+            max_poll_age_seconds,
+        } => {
+            let status = required_status(db, &community).await?;
+            let result = db
+                .project_view_maintenance_readiness(
+                    status.community_id,
+                    epoch,
+                    max_poll_age_seconds,
+                )
+                .await?;
+            let ready = result
+                .get("ready_to_freeze")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!("readiness response omitted ready_to_freeze"))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if !ready {
+                bail!("maintenance epoch {epoch} is not ready to freeze");
+            }
+        }
+        ProjectViewMaintenanceCommand::Begin {
+            community,
+            idempotency_key,
+            operator_pubkey,
+            required_client_protocol_version,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let relay = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            let receipt = db
+                .begin_project_view_v3_maintenance(
+                    status.community_id,
+                    operator,
+                    required_client_protocol_version,
+                    &idempotency_key,
+                    &relay,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ProjectViewMaintenanceCommand::Freeze {
+            community,
+            epoch,
+            idempotency_key,
+            operator_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let receipt = db
+                .freeze_project_view_v3_maintenance(
+                    status.community_id,
+                    epoch,
+                    operator,
+                    &idempotency_key,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ProjectViewMaintenanceCommand::Abort {
+            community,
+            epoch,
+            idempotency_key,
+            operator_pubkey,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let relay = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            let receipt = db
+                .abort_project_view_v3_maintenance(
+                    status.community_id,
+                    epoch,
+                    operator,
+                    &idempotency_key,
+                    &relay,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ProjectViewMaintenanceCommand::Verify {
+            community,
+            epoch,
+            idempotency_key,
+            operator_pubkey,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let relay = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            let receipt = db
+                .verify_project_view_v3_maintenance(
+                    status.community_id,
+                    epoch,
+                    operator,
+                    &idempotency_key,
+                    &relay,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        ProjectViewMaintenanceCommand::Repair {
+            community,
+            epoch,
+            plan,
+            idempotency_key,
+            operator_pubkey,
+            dry_run,
+            relay_key_file,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let relay = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            let plan = read_repair_plan(&plan)?;
+            if plan.maintenance_epoch != epoch {
+                bail!("repair plan maintenance_epoch differs from --epoch");
+            }
+            if Uuid::from_bytes(plan.community_id) != *status.community_id.as_uuid() {
+                bail!("repair plan Community differs from --community");
+            }
+            if dry_run {
+                let receipt = db
+                    .validate_project_view_v3_repair_plan(
+                        status.community_id,
+                        operator,
+                        &plan,
+                        &relay,
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            } else {
+                let keys = load_relay_keys(relay_key_file.as_deref())?;
+                if keys.public_key() != relay {
+                    bail!(
+                        "relay signer mismatch: expected {}, supplied key resolves to {}",
+                        relay.to_hex(),
+                        keys.public_key().to_hex()
+                    );
+                }
+                let pubsub = super::connect_pubsub().await?;
+                let outcome = db
+                    .repair_project_view_v3(
+                        status.community_id,
+                        epoch,
+                        operator,
+                        &idempotency_key,
+                        &plan,
+                        &keys,
+                    )
+                    .await?;
+                publish_recovery_events(&pubsub, &status, &outcome.events, "repair").await?;
+                println!("{}", serde_json::to_string_pretty(&outcome.receipt)?);
+            }
+        }
+        ProjectViewMaintenanceCommand::Reproject {
+            community,
+            epoch,
+            idempotency_key,
+            operator_pubkey,
+            relay_key_file,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let keys = load_relay_keys(relay_key_file.as_deref())?;
+            let expected = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            if keys.public_key() != expected {
+                bail!(
+                    "relay signer mismatch: expected {}, supplied key resolves to {}",
+                    expected.to_hex(),
+                    keys.public_key().to_hex()
+                );
+            }
+            let pubsub = super::connect_pubsub().await?;
+            let outcome = db
+                .reproject_project_view_v3(
+                    status.community_id,
+                    epoch,
+                    operator,
+                    &idempotency_key,
+                    &keys,
+                )
+                .await?;
+            publish_recovery_events(&pubsub, &status, &outcome.events, "reproject").await?;
+            println!("{}", serde_json::to_string_pretty(&outcome.receipt)?);
+        }
+        ProjectViewMaintenanceCommand::Resume {
+            community,
+            epoch,
+            idempotency_key,
+            operator_pubkey,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let relay = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            let receipt = db
+                .resume_project_view_v3_maintenance(
+                    status.community_id,
+                    epoch,
+                    operator,
+                    &idempotency_key,
+                    &relay,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+    }
+    Ok(())
+}
+
+async fn required_status(db: &Db, community: &str) -> Result<ProjectViewFeatureStatus> {
+    let host = normalize_required_host(community)?;
+    db.project_view_status_by_host(&host)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Community host '{host}' was not found"))
+}
+
+fn resolve_operator_pubkey(value: Option<&str>) -> Result<PublicKey> {
+    if let Some(value) = value {
+        return parse_pubkey_argument(value, "--operator-pubkey");
+    }
+    let private_key = std::env::var("BUZZ_PRIVATE_KEY")
+        .map_err(|_| anyhow::anyhow!("--operator-pubkey or BUZZ_PRIVATE_KEY is required"))?;
+    Keys::parse(private_key.trim())
+        .map(|keys| keys.public_key())
+        .map_err(|error| anyhow::anyhow!("invalid BUZZ_PRIVATE_KEY: {error}"))
+}
+
+fn parse_pubkey_argument(value: &str, argument: &str) -> Result<PublicKey> {
+    PublicKey::parse(value).map_err(|error| anyhow::anyhow!("invalid {argument}: {error}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -462,7 +1284,7 @@ fn load_relay_keys_from_env() -> Result<Keys> {
     load_relay_keys(None)
 }
 
-fn load_relay_keys(relay_key_file: Option<&Path>) -> Result<Keys> {
+pub(crate) fn load_relay_keys(relay_key_file: Option<&Path>) -> Result<Keys> {
     let secret = if let Some(path) = relay_key_file {
         let metadata = std::fs::metadata(path)
             .map_err(|error| anyhow::anyhow!("read relay key metadata: {error}"))?;
@@ -530,5 +1352,71 @@ mod tests {
             "relay.example"
         );
         assert!(normalize_required_host("   ").is_err());
+    }
+
+    #[test]
+    fn context_control_cli_has_closed_status_enable_and_disable_shapes() {
+        let status = <crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "project-view",
+            "context",
+            "status",
+            "--community",
+            "relay.example",
+        ])
+        .expect("parse context status");
+        assert!(matches!(
+            status.command,
+            crate::Command::ProjectView {
+                command: ProjectViewCommand::Context {
+                    command: ProjectViewContextCommand::Status { community }
+                }
+            } if community == "relay.example"
+        ));
+
+        for operation in ["enable", "disable"] {
+            let parsed = <crate::Cli as clap::Parser>::try_parse_from([
+                "buzz-admin",
+                "project-view",
+                "context",
+                operation,
+                "--community",
+                "relay.example",
+                "--idempotency-key",
+                "stage6-canary",
+                "--operator-pubkey",
+                "00",
+            ])
+            .unwrap_or_else(|error| panic!("parse context {operation}: {error}"));
+            assert!(matches!(
+                parsed.command,
+                crate::Command::ProjectView {
+                    command: ProjectViewCommand::Context { .. }
+                }
+            ));
+
+            let missing_key = <crate::Cli as clap::Parser>::try_parse_from([
+                "buzz-admin",
+                "project-view",
+                "context",
+                operation,
+                "--community",
+                "relay.example",
+            ]);
+            assert!(missing_key.is_err(), "{operation} must require idempotency");
+        }
+
+        assert!(<crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "project-view",
+            "context",
+            "enable",
+            "--community",
+            "relay.example",
+            "--idempotency-key",
+            "stage6-canary",
+            "--force",
+        ])
+        .is_err());
     }
 }

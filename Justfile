@@ -305,6 +305,10 @@ test-unit:
         # and agent CLI. Keep that complete no-infra slice in the ordinary unit
         # gate so adding a new package cannot silently drop coverage.
         just project-view-test-unit
+        # Project Document Stage 2 spans the domain, protocol adapters, Relay
+        # private read/write surface, agent CLI, ACP guidance, and admin control
+        # plane. Keep its complete no-infrastructure slice in the ordinary gate.
+        just project-document-test-unit
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
@@ -324,14 +328,19 @@ project-view-test-unit:
           -p buzz-sdk \
           -p buzz-relay \
           -p buzz-cli \
+          -p buzz-acp \
           --lib \
           -E 'test(project_view)'
+        # buzz-admin has only a binary target; do not pass --lib here.
+        cargo nextest run -p buzz-admin -E 'test(project_view)'
     else
         cargo test -p buzz-project-view
         cargo test -p buzz-core --lib project_view
         cargo test -p buzz-sdk --lib project_view
         cargo test -p buzz-relay --lib project_view
         cargo test -p buzz-cli --lib project_view
+        cargo test -p buzz-acp --lib project_view
+        cargo test -p buzz-admin project_view
     fi
 
 # Run isolated Postgres-backed Project View transaction tests.
@@ -348,6 +357,80 @@ project-view-test-e2e:
 
 # Run every Project View quality gate, including infrastructure-backed tests.
 project-view-test: project-view-test-unit project-view-test-db test-migrations project-view-test-e2e
+
+# Run the complete no-infrastructure Project Document Stage 2 contract.
+project-document-test-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        # The domain crate includes frozen wire fixtures and reducer/property
+        # tests; SDK golden coverage is an integration target.
+        cargo nextest run -p buzz-project-document
+        cargo nextest run -p buzz-sdk --test project_document
+        cargo nextest run \
+          -p buzz-core \
+          -p buzz-relay \
+          -p buzz-cli \
+          -p buzz-acp \
+          --lib \
+          -E 'test(project_document) or test(project_command) or test(community_private) or test(documents) or test(bounded_file_reader)'
+        cargo nextest run -p buzz-db --lib -E 'test(project_document)'
+        # buzz-admin has only a binary target; do not pass --lib here.
+        cargo nextest run -p buzz-admin -E 'test(project_document)'
+    else
+        cargo test -p buzz-project-document
+        cargo test -p buzz-sdk --test project_document
+        cargo test -p buzz-core --lib project_document
+        cargo test -p buzz-relay --lib project_document
+        cargo test -p buzz-relay --lib community_private
+        cargo test -p buzz-cli --lib project_document
+        cargo test -p buzz-cli --lib documents
+        cargo test -p buzz-cli --lib project_command
+        cargo test -p buzz-cli --lib bounded_file_reader
+        cargo test -p buzz-acp --lib project_document
+        cargo test -p buzz-db --lib project_document
+        cargo test -p buzz-admin project_document
+    fi
+
+# Run isolated PostgreSQL-backed Project Document transaction and race tests.
+project-document-test-db:
+    ./scripts/test-project-document-db.sh
+
+# Run the real Relay disabled/enabled security, CLI, and incident-drill E2E.
+project-document-test-e2e:
+    ./scripts/test-project-document-e2e.sh
+
+# Run every Project Document Stage 2 quality gate.
+project-document-test: project-document-test-unit project-document-test-db test-migrations project-document-test-e2e
+
+# Run the real local signer-rotation, backup/restore, Secret incident, and
+# bounded admission-burst drill against an exact scratch database.
+project-document-stage7-recovery:
+    PROJECT_DOCUMENT_STAGE7_RECOVERY=1 ./scripts/test-project-document-e2e.sh
+
+# Run the single-machine disk-preflight + 100k revision capacity acceptance.
+project-document-stage7-capacity:
+    ./scripts/test-project-document-stage7-capacity.sh
+
+# Complete Stage 7 local gate. Stage 5/6 canaries are intentionally rerun on
+# the final code rather than treated as historical evidence.
+project-document-stage7-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_INCREMENTAL=0
+    stage7_repo_root="$(pwd -P)"
+    cleanup_incremental() {
+        find "${stage7_repo_root}/target" "${stage7_repo_root}/desktop/src-tauri/target" \
+          -type d -name incremental -prune -exec rm -rf -- {} + 2>/dev/null || true
+    }
+    trap cleanup_incremental EXIT
+    just project-document-test-unit
+    just project-document-test-db
+    just test-migrations
+    just project-document-stage7-recovery
+    just project-document-stage7-capacity
+    ./scripts/test-project-view-stage5-canary.sh
+    ./scripts/test-project-view-stage6-canary.sh
 
 # Run integration tests only (starts services if needed)
 test-integration:

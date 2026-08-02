@@ -25,6 +25,7 @@ import {
 import {
   countProjectViewFocus,
   formatProjectViewTerm,
+  projectViewObjectDescription,
   projectViewObjectPriority,
   projectViewObjectStatus,
   projectViewObjectTitle,
@@ -45,7 +46,10 @@ import type {
   ProjectViewObjectOf,
   ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
-import { isProjectViewIntegrityError } from "@/shared/api/tauriProjectView";
+import {
+  isProjectResourceDataV3,
+  isProjectViewIntegrityError,
+} from "@/shared/api/tauriProjectView";
 import {
   isRelayConnectionDegraded,
   useRelayConnection,
@@ -664,13 +668,17 @@ function ReadyCommunityOverview({
                   type="button"
                 >
                   <Badge variant="outline">
-                    {formatProjectViewTerm(resource.data.resourceType)}
+                    {formatProjectViewTerm(
+                      isProjectResourceDataV3(resource.data)
+                        ? resource.data.resourceKind
+                        : resource.data.resourceType,
+                    )}
                   </Badge>
                   <h3 className="mt-2 text-sm font-semibold">
                     {resource.data.name}
                   </h3>
                   <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-                    {resource.data.description}
+                    {projectViewObjectDescription(resource)}
                   </p>
                 </button>
               ))}

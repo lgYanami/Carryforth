@@ -2,6 +2,7 @@ import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
 import { deriveShellRoute } from "@/app/AppShell.helpers";
+import { LazySettingsScreen } from "@/app/AppShell.lazy";
 import { AppShellProvider } from "@/app/AppShellContext";
 import * as BuzzTheme from "@/app/BuzzThemeSurfaces";
 import { AppShellOverlays } from "@/app/AppShellOverlays";
@@ -96,10 +97,6 @@ import { useMessageDeepLinks } from "@/shared/useMessageDeepLinks";
 import { SidebarInset, SidebarProvider } from "@/shared/ui/sidebar";
 import { RelayConnectionOverlay } from "@/app/RelayConnectionOverlay";
 import { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
-const LazySettingsScreen = React.lazy(async () => {
-  const module = await import("@/features/settings/ui/SettingsScreen");
-  return { default: module.SettingsScreen };
-});
 
 export function AppShell() {
   useWebviewZoomShortcuts();
@@ -126,6 +123,7 @@ export function AppShell() {
     goAgents,
     goChannel,
     goCommunity,
+    goDocuments,
     goHome,
     goNewMessage,
     goProjects,
@@ -876,6 +874,7 @@ export function AppShell() {
                           }}
                           onSelectAgents={() => void goAgents()}
                           onSelectCommunity={() => void openCommunityOverview()}
+                          onSelectDocuments={() => void goDocuments()}
                           onSelectChannel={(channelId) =>
                             void goChannel(channelId)
                           }

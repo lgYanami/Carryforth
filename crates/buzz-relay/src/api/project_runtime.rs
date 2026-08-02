@@ -12,6 +12,7 @@ use axum::{
     response::Json,
 };
 use buzz_project_view::v2::RuntimeEvidenceRequest;
+use buzz_project_view::v3::MaintenanceAckCommand;
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -25,6 +26,15 @@ use super::{api_error, bridge, internal_error};
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStatusQuery {
     assignment_id: Uuid,
+}
+
+/// Optional exact-epoch selector and monotonic supervisor poll diagnostics.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceStatusQuery {
+    epoch: Option<u64>,
+    client_protocol_version: Option<u64>,
+    client_build: Option<String>,
 }
 
 /// Record one immutable observation from an operator-registered supervisor.
@@ -103,6 +113,66 @@ pub async fn assignment_status(
     })?))
 }
 
+/// Return this authenticated supervisor's exact durable drain baselines and
+/// ACK receipts. Project View capability availability is intentionally not a
+/// prerequisite: supervisors must be able to drain while it is hidden.
+pub async fn maintenance_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<MaintenanceStatusQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const PATH: &str = "/api/project-runtime/maintenance";
+    let (tenant, supervisor, _) =
+        authenticate_tenant_request(&state, &headers, "GET", PATH, raw_query.as_deref(), None)
+            .await?;
+    let status = state
+        .db
+        .project_view_maintenance_supervisor_status(
+            tenant.community(),
+            supervisor,
+            query.epoch,
+            query.client_protocol_version,
+            query.client_build.as_deref(),
+        )
+        .await
+        .map_err(map_maintenance_error)?;
+    Ok(Json(status))
+}
+
+/// Commit one exact Assignment or Runtime maintenance ACK from its registered
+/// supervisor. The NIP-98 auth event ID is retained as immutable provenance.
+pub async fn acknowledge_maintenance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const PATH: &str = "/api/project-runtime/maintenance/ack";
+    let (tenant, supervisor, auth_event_id) =
+        authenticate_tenant_request(&state, &headers, "POST", PATH, None, Some(&body)).await?;
+    let content = std::str::from_utf8(&body).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "maintenance ACK body must be UTF-8",
+        )
+    })?;
+    let command = MaintenanceAckCommand::from_json(content)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error.to_string()))?;
+    let receipt = state
+        .db
+        .acknowledge_project_view_maintenance(
+            tenant.community(),
+            supervisor,
+            auth_event_id,
+            &command,
+        )
+        .await
+        .map_err(map_maintenance_error)?;
+    Ok(Json(serde_json::to_value(receipt).map_err(|error| {
+        internal_error(&format!("serialize maintenance ACK receipt: {error}"))
+    })?))
+}
+
 async fn authenticate_tenant_request(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -156,6 +226,27 @@ fn map_runtime_error(
         | RuntimeSupervisionError::Sqlx(_)
         | RuntimeSupervisionError::Audit(_) => {
             internal_error(&format!("runtime supervision: {message}"))
+        }
+    }
+}
+
+fn map_maintenance_error(
+    error: buzz_db::project_view_maintenance::ProjectViewMaintenanceError,
+) -> (StatusCode, Json<Value>) {
+    use buzz_db::project_view_maintenance::ProjectViewMaintenanceError;
+
+    let message = error.to_string();
+    match error {
+        ProjectViewMaintenanceError::Invalid(_) => api_error(StatusCode::BAD_REQUEST, &message),
+        ProjectViewMaintenanceError::Forbidden(_) => api_error(StatusCode::FORBIDDEN, &message),
+        ProjectViewMaintenanceError::Conflict(_) => api_error(StatusCode::CONFLICT, &message),
+        ProjectViewMaintenanceError::Unavailable(_) => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, &message)
+        }
+        ProjectViewMaintenanceError::Database(_)
+        | ProjectViewMaintenanceError::Sqlx(_)
+        | ProjectViewMaintenanceError::Audit(_) => {
+            internal_error(&format!("Project View maintenance: {message}"))
         }
     }
 }

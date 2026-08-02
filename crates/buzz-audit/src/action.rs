@@ -30,6 +30,16 @@ pub enum AuditAction {
     MediaUploaded,
     /// One Community was explicitly cut over to Project View schema v2.
     ProjectViewCutover,
+    /// One durable Project View maintenance epoch or operation changed state.
+    ProjectViewMaintenance,
+    /// One disabled, empty Community was explicitly prepared for schema v3.
+    ProjectViewProvisioning,
+    /// A security-critical Community change invalidated maintenance preflight.
+    ProjectViewSecurityInvalidation,
+    /// The staged Project Context sub-capability was enabled or disabled.
+    ProjectContextControl,
+    /// A controlled Project Document bootstrap or capability transition.
+    ProjectDocumentControl,
     /// A trusted runtime supervisor was bound to an exact Assignment.
     RuntimeSupervisorRegistered,
     /// An Assignment-scoped runtime supervisor binding was revoked.
@@ -54,6 +64,11 @@ impl AuditAction {
             Self::RateLimitExceeded => "rate_limit_exceeded",
             Self::MediaUploaded => "media_uploaded",
             Self::ProjectViewCutover => "project_view_cutover",
+            Self::ProjectViewMaintenance => "project_view_maintenance",
+            Self::ProjectViewProvisioning => "project_view_provisioning",
+            Self::ProjectViewSecurityInvalidation => "project_view_security_invalidation",
+            Self::ProjectContextControl => "project_context_control",
+            Self::ProjectDocumentControl => "project_document_control",
             Self::RuntimeSupervisorRegistered => "runtime_supervisor_registered",
             Self::RuntimeSupervisorRevoked => "runtime_supervisor_revoked",
             Self::RuntimeAssignmentUnrecoverable => "runtime_assignment_unrecoverable",
@@ -73,6 +88,11 @@ impl AuditAction {
         Self::RateLimitExceeded,
         Self::MediaUploaded,
         Self::ProjectViewCutover,
+        Self::ProjectViewMaintenance,
+        Self::ProjectViewProvisioning,
+        Self::ProjectViewSecurityInvalidation,
+        Self::ProjectContextControl,
+        Self::ProjectDocumentControl,
         Self::RuntimeSupervisorRegistered,
         Self::RuntimeSupervisorRevoked,
         Self::RuntimeAssignmentUnrecoverable,

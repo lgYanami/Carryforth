@@ -40,6 +40,8 @@ pub enum SchemaVersion {
     V1,
     /// Role continuity and membership-coupled Project View schema.
     V2,
+    /// Resource Guides, Context References, and mandatory supervision.
+    V3,
 }
 
 impl SchemaVersion {
@@ -49,6 +51,7 @@ impl SchemaVersion {
         match self {
             Self::V1 => 1,
             Self::V2 => 2,
+            Self::V3 => 3,
         }
     }
 }
@@ -60,6 +63,7 @@ impl TryFrom<u16> for SchemaVersion {
         match value {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
             _ => Err(UnsupportedSchemaVersion(value)),
         }
     }
@@ -336,7 +340,8 @@ mod tests {
     fn schema_version_is_closed() {
         assert_eq!(SchemaVersion::try_from(1), Ok(SchemaVersion::V1));
         assert_eq!(SchemaVersion::try_from(2), Ok(SchemaVersion::V2));
-        assert_eq!(SchemaVersion::try_from(3), Err(UnsupportedSchemaVersion(3)));
+        assert_eq!(SchemaVersion::try_from(3), Ok(SchemaVersion::V3));
+        assert_eq!(SchemaVersion::try_from(4), Err(UnsupportedSchemaVersion(4)));
     }
 
     #[test]

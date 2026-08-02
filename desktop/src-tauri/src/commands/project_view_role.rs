@@ -5,8 +5,14 @@ use buzz_core_pkg::PublicKey;
 use buzz_project_view_pkg::v2::{
     HandoffCause, RoleCheckpointContent, RoleCommand, RoleCommandRequest, RoleHandoffContent,
 };
+use buzz_project_view_pkg::v3::RoleCommandV3;
 use buzz_sdk_pkg::project_view_v2::{
-    build_role_command, parse_meta_projection, V2ProjectionSource,
+    build_role_command, parse_meta_projection as parse_v2_meta_projection, V2MetaProjection,
+    V2ProjectionSource,
+};
+use buzz_sdk_pkg::project_view_v3::{
+    build_role_command as build_v3_role_command, parse_meta_projection as parse_v3_meta_projection,
+    V3MetaProjection, V3ProjectionSource,
 };
 use chrono::{Duration, Utc};
 use nostr::{Event, Keys};
@@ -261,7 +267,40 @@ struct RoleMutationContext {
     keys: Keys,
 }
 
-/// Validate, sign, submit, and confirm one Project View v2 Role intent.
+enum RoleMutationMeta {
+    V2(V2MetaProjection),
+    V3(V3MetaProjection),
+}
+
+impl RoleMutationMeta {
+    const fn project_revision(&self) -> u64 {
+        match self {
+            Self::V2(meta) => meta.project_revision,
+            Self::V3(meta) => meta.project_revision,
+        }
+    }
+
+    fn identifies_source(&self, event: &Event) -> bool {
+        match self {
+            Self::V2(meta) => matches!(
+                meta.source,
+                V2ProjectionSource::NostrEvent {
+                    event_id,
+                    change_id,
+                } if event_id == event.id && change_id == event.id
+            ),
+            Self::V3(meta) => matches!(
+                meta.source,
+                V3ProjectionSource::NostrEvent {
+                    event_id,
+                    change_id,
+                } if event_id == event.id && change_id == event.id
+            ),
+        }
+    }
+}
+
+/// Validate, sign, submit, and confirm one Project View v2/v3 Role intent.
 #[tauri::command]
 pub async fn mutate_project_view_role(
     input: ProjectViewRoleMutationInput,
@@ -280,16 +319,28 @@ async fn execute_role_mutation(
     let identity = read_identity_at(state, &api_base_url)
         .await?
         .ok_or_else(|| "unsupported: Relay does not advertise Project View".to_owned())?;
-    if identity.schema != ProjectViewSchema::V2 {
-        return Err("unsupported: Role continuity requires Project View schema v2".to_owned());
-    }
     let context = RoleMutationContext {
         api_base_url,
         identity,
         keys,
     };
-    let event = build_role_command(command)
-        .map_err(|error| format!("invalid Role intent: {error}"))?
+    let builder = match context.identity.schema {
+        ProjectViewSchema::V1 => {
+            return Err(
+                "unsupported: Role continuity requires Project View schema v2 or v3".to_owned(),
+            )
+        }
+        ProjectViewSchema::V2 => {
+            build_role_command(command).map_err(|error| format!("invalid Role intent: {error}"))?
+        }
+        ProjectViewSchema::V3 => build_v3_role_command(RoleCommandV3::new(
+            command.expected_project_revision,
+            command.acting_assignment_id,
+            command.request,
+        ))
+        .map_err(|error| format!("invalid Role v3 intent: {error}"))?,
+    };
+    let event = builder
         .sign_with_keys(&context.keys)
         .map_err(|error| format!("failed to sign Role intent: {error}"))?;
     let response =
@@ -298,11 +349,11 @@ async fn execute_role_mutation(
         {
             Ok(response) => response,
             Err(message) if message.starts_with("relay returned 409") => {
-                let current_project_revision = read_v2_meta(state, &context)
+                let current_project_revision = read_role_meta(state, &context)
                     .await
                     .ok()
                     .flatten()
-                    .map(|meta| meta.project_revision);
+                    .map(|meta| meta.project_revision());
                 return Ok(ProjectViewRoleMutationResult::Conflict {
                     expected_project_revision,
                     current_project_revision,
@@ -556,35 +607,27 @@ async fn confirm_role_meta(
     event: &Event,
     receipt_revision: u64,
 ) -> Result<(), String> {
-    let meta = read_v2_meta(state, context).await?.ok_or_else(|| {
-        "Project View integrity error: successful Role command has no v2 metadata".to_owned()
+    let meta = read_role_meta(state, context).await?.ok_or_else(|| {
+        "Project View integrity error: successful Role command has no metadata".to_owned()
     })?;
-    if meta.project_revision < receipt_revision {
+    if meta.project_revision() < receipt_revision {
         return Err(
-            "Project View integrity error: v2 metadata is older than the Role receipt".to_owned(),
+            "Project View integrity error: metadata is older than the Role receipt".to_owned(),
         );
     }
-    if meta.project_revision == receipt_revision
-        && !matches!(
-            meta.source,
-            V2ProjectionSource::NostrEvent {
-                event_id,
-                change_id,
-            } if event_id == event.id && change_id == event.id
-        )
-    {
+    if meta.project_revision() == receipt_revision && !meta.identifies_source(event) {
         return Err(
-            "Project View integrity error: v2 metadata does not identify the submitted Role command"
+            "Project View integrity error: metadata does not identify the submitted Role command"
                 .to_owned(),
         );
     }
     Ok(())
 }
 
-async fn read_v2_meta(
+async fn read_role_meta(
     state: &AppState,
     context: &RoleMutationContext,
-) -> Result<Option<buzz_sdk_pkg::project_view_v2::V2MetaProjection>, String> {
+) -> Result<Option<RoleMutationMeta>, String> {
     let events = query_relay_at_with_keys(
         state,
         &context.api_base_url,
@@ -599,11 +642,26 @@ async fn read_v2_meta(
     .await?;
     match events.as_slice() {
         [] => Ok(None),
-        [event] => parse_meta_projection(event, &context.identity.relay_pubkey)
-            .map(Some)
-            .map_err(|error| format!("Project View integrity error: {error}")),
+        [event] => match context.identity.schema {
+            ProjectViewSchema::V1 => Err(
+                "Project View integrity error: Role continuity is unavailable in schema v1"
+                    .to_owned(),
+            ),
+            ProjectViewSchema::V2 => {
+                parse_v2_meta_projection(event, &context.identity.relay_pubkey)
+                    .map(RoleMutationMeta::V2)
+                    .map(Some)
+                    .map_err(|error| format!("Project View integrity error: {error}"))
+            }
+            ProjectViewSchema::V3 => {
+                parse_v3_meta_projection(event, &context.identity.relay_pubkey)
+                    .map(RoleMutationMeta::V3)
+                    .map(Some)
+                    .map_err(|error| format!("Project View integrity error: {error}"))
+            }
+        },
         _ => Err(
-            "Project View integrity error: v2 metadata query returned multiple current heads"
+            "Project View integrity error: metadata query returned multiple current heads"
                 .to_owned(),
         ),
     }

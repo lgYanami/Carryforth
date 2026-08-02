@@ -7,6 +7,7 @@ import {
   X,
 } from "lucide-react";
 import * as React from "react";
+import { Link } from "@tanstack/react-router";
 
 import {
   formatProjectViewTerm,
@@ -18,13 +19,15 @@ import {
 } from "@/features/project-view/model";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
+import { ProjectViewContextSection } from "@/features/project-view/ui/ProjectViewContextSection";
 import { ProjectRoleInspector } from "@/features/project-view/ui/ProjectRoleInspector";
 import { ProjectWorkContinuity } from "@/features/project-view/ui/ProjectWorkContinuity";
-import type {
-  ProjectRoleDefinition,
-  ProjectView,
-  ProjectViewObject,
-  ProjectViewRoleContinuity,
+import {
+  isProjectResourceDataV3,
+  type ProjectRoleDefinition,
+  type ProjectView,
+  type ProjectViewObject,
+  type ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
 import { useIsAuxiliaryPanelOverlay } from "@/shared/hooks/use-mobile";
 import { Badge } from "@/shared/ui/badge";
@@ -40,14 +43,17 @@ import {
 type ProjectViewInspectorProps = {
   actorProfiles?: UserProfileLookup;
   currentPubkey?: string;
+  contextCapability: boolean;
   object: ProjectViewObject;
   objectsById: ReadonlyMap<string, ProjectViewObject>;
   onClose: () => void;
   onDelete: (object: ProjectViewObject) => void;
   onEdit: (object: ProjectViewObject) => void;
+  onRefresh: () => Promise<unknown>;
   onSelectObject: (objectId: string) => void;
   projectionGeneration: number;
   projectRevision: number;
+  schemaVersion: 1 | 2 | 3;
   roleContinuity?: ProjectViewRoleContinuity;
   roleDefinition?: ProjectRoleDefinition;
   view: ProjectView;
@@ -129,6 +135,29 @@ function ObjectDetails({ object }: { object: ProjectViewObject }) {
         </>
       );
     case "resource":
+      if (isProjectResourceDataV3(object.data)) {
+        return (
+          <>
+            {object.data.summary ? (
+              <Detail label="Summary">{object.data.summary}</Detail>
+            ) : null}
+            <Detail label="Resource kind">
+              {formatProjectViewTerm(object.data.resourceKind)}
+            </Detail>
+            <Detail label="Guide">
+              <Button asChild size="sm" variant="outline">
+                <Link
+                  search={{ document: object.data.guideDocumentId }}
+                  to="/documents"
+                >
+                  Open verified Guide
+                  <ArrowRight />
+                </Link>
+              </Button>
+            </Detail>
+          </>
+        );
+      }
       return (
         <>
           <Detail label="Description">{object.data.description}</Detail>
@@ -188,14 +217,17 @@ function RelationLink({
 function ProjectViewInspectorContent({
   actorProfiles,
   currentPubkey,
+  contextCapability,
   object,
   objectsById,
   onClose,
   onDelete,
   onEdit,
+  onRefresh,
   onSelectObject,
   projectionGeneration,
   projectRevision,
+  schemaVersion,
   roleContinuity,
   roleDefinition,
   view,
@@ -331,6 +363,17 @@ function ProjectViewInspectorContent({
             currentPubkey={currentPubkey}
             projectRevision={projectRevision}
             workId={object.id}
+          />
+        ) : null}
+
+        {schemaVersion === 3 ? (
+          <ProjectViewContextSection
+            contextCapability={contextCapability}
+            object={object}
+            objectsById={objectsById}
+            onRefresh={onRefresh}
+            onSelectObject={onSelectObject}
+            projectRevision={projectRevision}
           />
         ) : null}
 

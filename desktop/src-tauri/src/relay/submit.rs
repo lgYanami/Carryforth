@@ -33,13 +33,29 @@ pub async fn submit_signed_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
+    submit_signed_event_at_with_keys_typed(event, state, api_base_url, keys)
+        .await
+        .map_err(|error| error.message)
+}
+
+/// Submit an already-signed event while retaining whether a failure may have
+/// happened after the Relay accepted the request.
+pub(crate) async fn submit_signed_event_at_with_keys_typed(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+) -> Result<SubmitEventResponse, RelayHttpError> {
     if event.pubkey != keys.public_key() {
-        return Err("signed event does not match the publishing identity".to_string());
+        return Err(RelayHttpError::internal(
+            "signed event does not match the publishing identity",
+        ));
     }
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let body_bytes = event.as_json().into_bytes();
-    let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
+    let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)
+        .map_err(RelayHttpError::internal)?;
 
     let response = state
         .http_client
@@ -49,15 +65,21 @@ pub async fn submit_signed_event_at_with_keys(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| classify_request_error(&e))?;
+        .map_err(|error| typed_request_error(&error, true))?;
 
     if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        return Err(typed_response_error(response, true).await);
     }
 
-    let result: SubmitEventResponse = parse_json_response(response).await?;
+    let result: SubmitEventResponse = parse_json_response_typed(response, true).await?;
     if !result.accepted {
-        return Err(format!("relay rejected event: {}", result.message));
+        return Err(RelayHttpError {
+            status: None,
+            category: RelayHttpErrorCategory::Http,
+            message: format!("relay rejected event: {}", result.message),
+            retry_after_seconds: None,
+            request_may_have_reached_relay: false,
+        });
     }
 
     Ok(result)

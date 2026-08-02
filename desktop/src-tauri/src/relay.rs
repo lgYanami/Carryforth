@@ -144,6 +144,12 @@ pub fn build_nip98_auth_header_for_keys(
 
 // ── Error handling ──────────────────────────────────────────────────────────
 
+mod typed_http;
+pub(crate) use typed_http::{
+    parse_json_response_typed, typed_request_error, typed_response_error, RelayHttpError,
+    RelayHttpErrorCategory,
+};
+
 /// Classify a `send()` failure into a stable, URL-free error string.
 ///
 /// The returned string always starts with `"relay unreachable:"` so the
@@ -347,11 +353,25 @@ pub async fn query_relay_at_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<Vec<nostr::Event>, String> {
+    query_relay_at_with_keys_typed(state, api_base_url, filters, keys, auth_tag)
+        .await
+        .map_err(|error| error.message)
+}
+
+/// Query an explicit Relay while preserving stable HTTP failure metadata.
+pub(crate) async fn query_relay_at_with_keys_typed(
+    state: &AppState,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+    keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<Vec<nostr::Event>, RelayHttpError> {
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
+    let body_bytes = serde_json::to_vec(filters)
+        .map_err(|e| RelayHttpError::internal(format!("filter serialization failed: {e}")))?;
+    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)
+        .map_err(RelayHttpError::internal)?;
     let mut request = state
         .http_client
         .post(&url)
@@ -364,11 +384,11 @@ pub async fn query_relay_at_with_keys(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| classify_request_error(&e))?;
+        .map_err(|error| typed_request_error(&error, false))?;
     if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        return Err(typed_response_error(response, false).await);
     }
-    parse_json_response(response).await
+    parse_json_response_typed(response, false).await
 }
 
 // ── Command response parsing ────────────────────────────────────────────────
@@ -532,6 +552,7 @@ pub struct AgentProfileInfo {
 // ── Signed-event submission ─────────────────────────────────────────────────
 
 mod submit;
+pub(crate) use submit::submit_signed_event_at_with_keys_typed;
 pub use submit::{
     submit_event, submit_event_at_with_keys, submit_signed_event_at_with_keys, SubmitEventResponse,
 };

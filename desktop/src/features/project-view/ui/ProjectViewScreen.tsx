@@ -389,6 +389,8 @@ function ReadyProjectView({
   projectionGeneration,
   relayPubkey,
   roleContinuity,
+  schemaVersion,
+  contextCapability,
   onRefresh,
   selectedObjectId,
   syncMessage,
@@ -576,14 +578,17 @@ function ReadyProjectView({
         <ProjectViewInspector
           actorProfiles={actorProfiles}
           currentPubkey={currentPubkey}
+          contextCapability={contextCapability}
           object={selectedObject}
           objectsById={objectsById}
           onClose={closeInspector}
           onDelete={setDeleteTarget}
           onEdit={(object) => setEditor({ mode: "edit", object })}
+          onRefresh={onRefresh}
           onSelectObject={selectObject}
           projectionGeneration={projectionGeneration}
           projectRevision={projectRevision}
+          schemaVersion={schemaVersion}
           roleContinuity={roleContinuity}
           roleDefinition={selectedRoleDefinition}
           view={view}
@@ -616,6 +621,7 @@ function ReadyProjectView({
               ),
             )
           }
+          schemaVersion={schemaVersion}
           view={view}
         />
       ) : null}

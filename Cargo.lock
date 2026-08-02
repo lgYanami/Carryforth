@@ -779,6 +779,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "chrono",
@@ -794,6 +795,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sysinfo 0.37.2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -816,6 +818,7 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-pubsub",
  "buzz-sdk",
@@ -903,6 +906,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",
@@ -964,6 +968,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-audit",
  "buzz-core",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "chrono",
@@ -1084,11 +1089,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-document"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "buzz-project-view",
+ "chrono",
+ "hex",
+ "nostr",
+ "postcard",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-project-view"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
  "chrono",
+ "hex",
+ "postcard",
  "proptest",
  "serde",
  "serde_json",
@@ -1167,6 +1191,7 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-pubsub",
  "buzz-relay-mesh",
@@ -1248,6 +1273,7 @@ name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-project-document",
  "buzz-project-view",
  "chrono",
  "hex",
@@ -1276,6 +1302,8 @@ dependencies = [
  "anyhow",
  "base64",
  "buzz-core",
+ "buzz-db",
+ "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",

@@ -6,6 +6,7 @@ export const routes = rootRoute("root.tsx", [
   route("/community", "community.tsx"),
   route("/pulse", "pulse.tsx"),
   route("/view", "view.tsx"),
+  route("/documents", "documents.tsx"),
   route("/reminders", "reminders.tsx"),
   route("/settings", "settings.tsx"),
   route("/workflows", "workflows.tsx"),

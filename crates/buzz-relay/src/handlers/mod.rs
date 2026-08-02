@@ -4,6 +4,8 @@ pub mod auth;
 pub mod close;
 /// Command executor — transactional processing for command kinds.
 pub mod command_executor;
+/// Shared Community-private protocol read/fan-out gates.
+pub mod community_private;
 /// Relay-operator community provisioning HTTP support.
 pub mod community_provisioning;
 /// NIP-45 COUNT handler.
@@ -24,6 +26,8 @@ pub mod moderation_commands;
 pub mod moderation_notices;
 /// Product-feedback validation + deployment sidecar persistence.
 pub mod product_feedback;
+/// Project Document v1 command adapter.
+pub mod project_document;
 /// Project View mutation, authorization, and projection protocol helpers.
 pub mod project_view;
 #[allow(dead_code, missing_docs)]

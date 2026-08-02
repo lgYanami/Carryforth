@@ -146,6 +146,10 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Durable process-group coordinate retained until an explicit wait proves
+    /// the child was reaped. An uncertain Drop intentionally leaves it behind
+    /// for the next managed harness generation.
+    registered_process_group: Option<u32>,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -417,10 +421,31 @@ impl AcpClient {
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
-            Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+        let reaped = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.child.wait(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                tracing::debug!("child wait error after kill: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("child did not exit within 5s after SIGKILL — abandoning");
+                false
+            }
+        };
+        if reaped {
+            if let Some(process_group) = self.registered_process_group.take() {
+                if let Err(error) = crate::child_registry::unregister_reaped(process_group) {
+                    tracing::warn!(
+                        process_group,
+                        "failed to retire child registry entry: {error}"
+                    );
+                }
+            }
         }
     }
 
@@ -514,6 +539,11 @@ impl AcpClient {
         if let Some(merged) = codex_config_value {
             cmd.env("CODEX_CONFIG", merged);
         }
+        let child_registry_token = uuid::Uuid::new_v4().simple().to_string();
+        cmd.env(
+            crate::child_registry::CHILD_REGISTRY_TOKEN_ENV,
+            &child_registry_token,
+        );
 
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
@@ -526,6 +556,20 @@ impl AcpClient {
         configure_no_window(&mut cmd);
 
         let mut child = cmd.spawn()?;
+        let process_group = child
+            .id()
+            .ok_or_else(|| AcpError::Protocol("spawned Agent has no process ID".into()))?;
+        if let Err(error) =
+            crate::child_registry::register(process_group, &child_registry_token).await
+        {
+            if !kill_process_group(process_group) {
+                let _ = child.start_kill();
+            }
+            let _ = child.wait().await;
+            return Err(AcpError::Protocol(format!(
+                "register Agent process group: {error}"
+            )));
+        }
 
         let stdin = child
             .stdin
@@ -538,6 +582,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            registered_process_group: Some(process_group),
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -2049,6 +2094,12 @@ pub fn model_in_catalog(
 
 impl Drop for AcpClient {
     fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Some(process_group) = self.registered_process_group.take() {
+                let _ = crate::child_registry::unregister_reaped(process_group);
+            }
+            return;
+        }
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
@@ -2060,7 +2111,11 @@ impl Drop for AcpClient {
         }
         // Non-blocking reap attempt — prevents zombie accumulation in the
         // common case where SIGKILL takes effect before Drop returns.
-        let _ = self.child.try_wait();
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Some(process_group) = self.registered_process_group.take() {
+                let _ = crate::child_registry::unregister_reaped(process_group);
+            }
+        }
     }
 }
 

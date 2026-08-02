@@ -468,6 +468,58 @@ buzz notes get --name dco-check   # exits non-zero: not found
 buzz notes rm --name does-not-exist   # exits non-zero
 ```
 
+### 6.13 Project Documents
+
+Project Document 必须先由 operator 在 Project View v2/v3 Community 上 bootstrap、verify 并
+enable；Relay 需要稳定 signer。不要把 Secret、token 或 private key 写入测试正文。
+
+```bash
+export COMMUNITY_HOST="localhost:3000"
+export RELAY_PUBKEY="$(curl -fsS "http://${COMMUNITY_HOST}/info" | jq -er '.self')"
+
+DATABASE_URL="${DATABASE_URL:?}" buzz-admin project-document bootstrap \
+  --community "$COMMUNITY_HOST" --expected-pubkey "$RELAY_PUBKEY"
+DATABASE_URL="${DATABASE_URL:?}" buzz-admin project-document verify \
+  --community "$COMMUNITY_HOST" --expected-pubkey "$RELAY_PUBKEY"
+DATABASE_URL="${DATABASE_URL:?}" buzz-admin project-document enable \
+  --community "$COMMUNITY_HOST" --expected-pubkey "$RELAY_PUBKEY"
+
+# create performs receipt validation plus exact immutable-revision read-back
+CREATE=$(buzz documents create --title "CLI runbook" \
+  --summary "safe test fixture" --content "# Runbook" | jq .)
+DOCUMENT_ID=$(jq -er '.document_id' <<<"$CREATE")
+jq -e '.accepted and .document_revision == 1' <<<"$CREATE"
+
+# list/history are metadata-only; body is fetched explicitly
+buzz documents list | jq .
+buzz documents get "$DOCUMENT_ID" | jq .
+buzz documents get "$DOCUMENT_ID" --content-only
+buzz --format compact documents history "$DOCUMENT_ID" | jq .
+
+buzz documents update "$DOCUMENT_ID" --expected-revision 1 \
+  --title "CLI runbook v2" --clear-summary --content $'# Runbook\n\nRevision 2' | jq .
+
+# Patch must match revision 2 at its declared line positions: no fuzz, offset,
+# automatic rebase, or silent temporary output.
+buzz documents patch "$DOCUMENT_ID" --expected-revision 2 \
+  --patch-file ./document.patch --output ./merged.md | jq .
+
+# A stale expected revision is conflict exit 5 and does not discard local input.
+buzz documents update "$DOCUMENT_ID" --expected-revision 2 \
+  --title stale --clear-summary --content "must not commit"; test "$?" -eq 5
+
+buzz documents get "$DOCUMENT_ID" --revision 1 | jq .
+buzz documents delete "$DOCUMENT_ID" --expected-revision 3 | jq .
+buzz documents history "$DOCUMENT_ID" | jq .
+buzz documents get "$DOCUMENT_ID" --revision 1 | jq .
+```
+
+`--format compact` 是 global flag，必须放在 `documents` 之前。Managed Agent 不手工伪造
+Assignment / Runtime tag：在 ACP 管理的环境中，CLI 从 verified Project View v2 identity 和
+注入的 runtime fence 自动绑定 active Assignment。运输结果不明确时，CLI 只在 exact revision 的
+`source_event_id` 证明同一 signed command 已提交后报告成功；否则返回 exit 2
+`delivery_unknown`，调用者不得自动重签重发。
+
 ---
 
 ## 7. Error Path Testing
@@ -606,3 +658,10 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 59 | `notes get` | ☐ | By name, by naddr, --content-only, cross-author, ambiguous → exit 1 |
 | 60 | `notes ls` | ☐ | Own, --author all, --tag, --limit |
 | 61 | `notes rm` | ☐ | Delete→get 404, double-delete idempotent, missing slug → NotFound |
+| 62 | `documents list` | ☐ | Metadata only; bounded catalog snapshot |
+| 63 | `documents get` | ☐ | Current, pinned, and content-only |
+| 64 | `documents history` | ☐ | Metadata only; complete immutable history |
+| 65 | `documents create` | ☐ | Receipt + exact read-back |
+| 66 | `documents update` | ☐ | Complete snapshot; stale revision exits 5 |
+| 67 | `documents patch` | ☐ | Exact position, zero fuzz/offset |
+| 68 | `documents delete` | ☐ | Tombstone plus pinned historical read |

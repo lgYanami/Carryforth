@@ -10,9 +10,10 @@ use tracing::{debug, error, info, warn};
 
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
-    event_kind_u32, is_ephemeral, is_project_view_protocol_kind, is_unshared_persona_event,
-    AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
-    KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
+    event_kind_u32, is_ephemeral, is_project_document_protocol_kind, is_project_view_protocol_kind,
+    is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP,
+    KIND_PRESENCE_UPDATE, KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
+    KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -44,11 +45,11 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         20000..=29999 => kind.to_string(),
         30023 | 30315 | 39000..=39003 => kind.to_string(),
         40002..=40100 => kind.to_string(),
-        40903..=40904 => kind.to_string(),
+        40903..=40907 => kind.to_string(),
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
-        44200 | 44300 => kind.to_string(),
+        44200 | 44300..=44301 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
@@ -65,9 +66,22 @@ fn event_frame_bytes_for_sub(sub_id: &str, event_json: &str) -> Arc<Bytes> {
     Arc::new(Bytes::from(event_frame_for_sub(sub_id, event_json)))
 }
 
-fn record_project_view_projection_dispatch_error(kind: u32) {
+fn record_private_projection_dispatch_error(kind: u32) {
     if matches!(kind, KIND_PROJECT_VIEW_OBJECT | KIND_PROJECT_VIEW_META) {
         metrics::counter!("buzz_project_view_projection_dispatch_errors_total").increment(1);
+    }
+    let document_projection_type = match kind {
+        KIND_PROJECT_DOCUMENT_HEAD => Some("head"),
+        KIND_PROJECT_DOCUMENT_REVISION => Some("revision"),
+        KIND_PROJECT_DOCUMENT_META => Some("meta"),
+        _ => None,
+    };
+    if let Some(projection_type) = document_projection_type {
+        metrics::counter!(
+            "buzz_project_document_projection_dispatch_errors_total",
+            "projection_type" => projection_type,
+        )
+        .increment(1);
     }
 }
 
@@ -130,6 +144,7 @@ pub async fn filter_fanout_by_access(
     matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
+    let kind = event_kind_u32(&stored_event.event);
     // First enforce the receiver-side tenant label. Subscription indexes are
     // community-scoped, but stale/injected matches and future fan-out helpers
     // must still fail closed at the send chokepoint: a connection bound to
@@ -145,10 +160,10 @@ pub async fn filter_fanout_by_access(
     // halves of its read gate at the final send chokepoint: the connection's
     // immutable credential scope and current DB member/agent-owner + ban state.
     // One set-based lookup covers every candidate recipient on this pod.
-    let matches = if is_project_view_protocol_kind(event_kind_u32(&stored_event.event)) {
+    let matches = if is_project_view_protocol_kind(kind) {
         let credential_eligible: Vec<_> = matches
             .into_iter()
-            .filter(|(conn_id, _)| state.conn_manager.project_view_read_eligible(*conn_id))
+            .filter(|(conn_id, _)| state.conn_manager.community_private_read_eligible(*conn_id))
             .collect();
         let pubkeys: HashSet<Vec<u8>> = credential_eligible
             .iter()
@@ -165,6 +180,65 @@ pub async fn filter_fanout_by_access(
                 warn!(
                     community_id = %community_id,
                     "Project View fan-out authorization failed closed: {error}"
+                );
+                return Vec::new();
+            }
+        };
+        credential_eligible
+            .into_iter()
+            .filter(|(conn_id, _)| {
+                state
+                    .conn_manager
+                    .pubkey_for_conn(*conn_id)
+                    .is_some_and(|pubkey| authorized.contains(&pubkey))
+            })
+            .collect()
+    } else {
+        matches
+    };
+
+    // Project Document is Community-global and private. Capability readiness
+    // is revalidated before recipient existence, then the same credential and
+    // current Human/managed-owner membership + ban policy used by pull reads is
+    // applied in one set-based lookup. This is shared by local and Redis paths.
+    let matches = if is_project_document_protocol_kind(kind) {
+        if state.config.relay_private_key.is_none() {
+            return Vec::new();
+        }
+        match state
+            .db
+            .project_document_capability_ready(community_id, &state.relay_keypair.public_key())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Vec::new(),
+            Err(error) => {
+                warn!(
+                    community_id = %community_id,
+                    "Project Document fan-out readiness failed closed: {error}"
+                );
+                return Vec::new();
+            }
+        }
+        let credential_eligible: Vec<_> = matches
+            .into_iter()
+            .filter(|(conn_id, _)| state.conn_manager.community_private_read_eligible(*conn_id))
+            .collect();
+        let pubkeys: HashSet<Vec<u8>> = credential_eligible
+            .iter()
+            .filter_map(|(conn_id, _)| state.conn_manager.pubkey_for_conn(*conn_id))
+            .collect();
+        let pubkeys: Vec<Vec<u8>> = pubkeys.into_iter().collect();
+        let authorized = match state
+            .db
+            .project_document_authorized_pubkeys(community_id, &pubkeys)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                warn!(
+                    community_id = %community_id,
+                    "Project Document fan-out authorization failed closed: {error}"
                 );
                 return Vec::new();
             }
@@ -524,7 +598,7 @@ async fn dispatch_persistent_event_inner(
         state
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
-        record_project_view_projection_dispatch_error(kind_u32);
+        record_private_projection_dispatch_error(kind_u32);
         warn!(event_id = %event_id_hex, "Redis publish failed: {e}");
     }
 
@@ -553,7 +627,7 @@ async fn dispatch_persistent_event_inner(
             error!(event_id = %event_id_hex, "Failed to serialize event for fan-out: {e}");
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
-            record_project_view_projection_dispatch_error(kind_u32);
+            record_private_projection_dispatch_error(kind_u32);
             return 0;
         }
     };

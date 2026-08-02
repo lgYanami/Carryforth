@@ -2,6 +2,10 @@
 
 use buzz_core_pkg::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
 use buzz_project_view_pkg::v2::{ProjectObjectCommand, RoleContinuityChange};
+use buzz_project_view_pkg::v3::{
+    CreateProjectObjectV3, DeleteProjectObjectV3, NewProjectViewObjectV3, ProjectContextReference,
+    ProjectObjectCommandV3, ProjectObjectRequestV3, UpdateProjectObjectV3,
+};
 use buzz_project_view_pkg::{
     CreateMutation, DeleteMutation, InitializeGoal, InitializeMutation, MutationRequest,
     NewProjectViewObject, ProjectProfile, ProjectViewObjectType, UpdateMutation,
@@ -16,6 +20,13 @@ use buzz_sdk_pkg::project_view_v2::{
     parse_meta_projection as parse_v2_meta_projection,
     parse_project_object_projection as parse_v2_object_projection, V2MetaProjection,
     V2ProjectedObject, V2ProjectionSource,
+};
+use buzz_sdk_pkg::project_view_v3::{
+    build_project_object_command as build_v3_project_object_command,
+    parse_entity_projection as parse_v3_entity_projection,
+    parse_meta_projection as parse_v3_meta_projection,
+    parse_project_object_projection as parse_v3_object_projection, V3EntityChange,
+    V3MetaProjection, V3ProjectedObject, V3ProjectionSource,
 };
 use nostr::{Event, EventBuilder, Keys};
 use serde::{Deserialize, Serialize};
@@ -83,6 +94,17 @@ pub enum ProjectViewMutationInput {
         /// Stable object identifier.
         object_id: Uuid,
     },
+    /// Replace the complete canonical Context Reference set on one v3 object.
+    Context {
+        /// Exact Project revision on which the replacement was based.
+        expected_project_revision: u64,
+        /// Immutable source object type.
+        object_type: ProjectViewObjectType,
+        /// Stable source object identifier.
+        object_id: Uuid,
+        /// Complete canonical replacement set.
+        context_references: Vec<ProjectContextReference>,
+    },
 }
 
 /// Result of submitting one revision-checked Human mutation.
@@ -120,7 +142,7 @@ pub enum ProjectViewMutationResult {
 #[derive(Debug)]
 struct PreparedMutation {
     builder: EventBuilder,
-    request: MutationRequest,
+    request: Option<MutationRequest>,
     expected_project_revision: u64,
     target: Option<MutationTarget>,
 }
@@ -149,6 +171,7 @@ struct MutationContext {
 enum MutationMeta {
     V1(MetaProjection),
     V2(V2MetaProjection),
+    V3(V3MetaProjection),
 }
 
 impl MutationMeta {
@@ -156,6 +179,7 @@ impl MutationMeta {
         match self {
             Self::V1(meta) => meta.project_revision,
             Self::V2(meta) => meta.project_revision,
+            Self::V3(meta) => meta.project_revision,
         }
     }
 
@@ -163,6 +187,7 @@ impl MutationMeta {
         match self {
             Self::V1(meta) => meta.projection_generation,
             Self::V2(meta) => meta.projection_generation,
+            Self::V3(meta) => meta.projection_generation,
         }
     }
 
@@ -170,6 +195,7 @@ impl MutationMeta {
         match self {
             Self::V1(meta) => meta.project_id,
             Self::V2(meta) => meta.project_id,
+            Self::V3(meta) => meta.project_id,
         }
     }
 
@@ -179,6 +205,13 @@ impl MutationMeta {
             Self::V2(meta) => matches!(
                 &meta.source,
                 V2ProjectionSource::NostrEvent {
+                    event_id,
+                    change_id,
+                } if *event_id == event.id && *change_id == event.id
+            ),
+            Self::V3(meta) => matches!(
+                &meta.source,
+                V3ProjectionSource::NostrEvent {
                     event_id,
                     change_id,
                 } if *event_id == event.id && *change_id == event.id
@@ -209,7 +242,6 @@ async fn execute_mutation(
     input: ProjectViewMutationInput,
     state: &AppState,
 ) -> Result<ProjectViewMutationResult, String> {
-    let prepared = prepare_mutation(input)?;
     // Capture the workspace target and member identity before the first await.
     // A later Community switch must not retarget this already-started intent.
     let api_base_url = relay_api_base_url_with_override(state);
@@ -222,14 +254,22 @@ async fn execute_mutation(
         identity,
         keys,
     };
+    let prepared = if context.identity.schema == ProjectViewSchema::V3 {
+        prepare_v3_mutation(input)?
+    } else {
+        prepare_mutation(input)?
+    };
     let builder = match context.identity.schema {
         ProjectViewSchema::V1 => prepared.builder,
         ProjectViewSchema::V2 => build_project_object_command(ProjectObjectCommand::new(
             prepared.expected_project_revision,
             None,
-            prepared.request,
+            prepared.request.ok_or_else(|| {
+                "Project View integrity error: missing legacy mutation request".to_owned()
+            })?,
         ))
         .map_err(|error| format!("invalid Project View v2 mutation: {error}"))?,
+        ProjectViewSchema::V3 => prepared.builder,
     };
     let event = builder
         .sign_with_keys(&context.keys)
@@ -270,6 +310,9 @@ async fn execute_mutation(
 
 fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation, String> {
     match input {
+        ProjectViewMutationInput::Context { .. } => {
+            Err("unsupported: Context Reference mutations require Project View v3".to_owned())
+        }
         ProjectViewMutationInput::Initialize { profile, goals } => {
             let goals: Vec<InitializeGoal> = goals
                 .into_iter()
@@ -287,7 +330,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             Ok(PreparedMutation {
                 builder: build_initialize(profile, goals)
                     .map_err(|error| format!("invalid Project View initialization: {error}"))?,
-                request,
+                request: Some(request),
                 expected_project_revision: 0,
                 target: None,
             })
@@ -308,7 +351,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             Ok(PreparedMutation {
                 builder: build_create(expected_project_revision, object)
                     .map_err(|error| format!("invalid Project View create: {error}"))?,
-                request,
+                request: Some(request),
                 expected_project_revision,
                 target: Some(MutationTarget {
                     object_type,
@@ -328,7 +371,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             Ok(PreparedMutation {
                 builder: build_update(expected_project_revision, update)
                     .map_err(|error| format!("invalid Project View update: {error}"))?,
-                request,
+                request: Some(request),
                 expected_project_revision,
                 target: Some(MutationTarget {
                     object_type,
@@ -349,7 +392,7 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             Ok(PreparedMutation {
                 builder: build_delete(expected_project_revision, object_type, object_id)
                     .map_err(|error| format!("invalid Project View delete: {error}"))?,
-                request,
+                request: Some(request),
                 expected_project_revision,
                 target: Some(MutationTarget {
                     object_type,
@@ -359,6 +402,94 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             })
         }
     }
+}
+
+fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation, String> {
+    let (expected_project_revision, target, request) = match input {
+        ProjectViewMutationInput::Initialize { .. } => {
+            return Err(
+                "unsupported: Project View v3 initialization requires the prepared owner bootstrap command"
+                    .to_owned(),
+            )
+        }
+        ProjectViewMutationInput::Create {
+            expected_project_revision,
+            object_type,
+            data,
+        } => {
+            if object_type == ProjectViewObjectType::ProjectProfile {
+                return Err("the Project Profile can only be created by initialization".to_owned());
+            }
+            let object_id = Uuid::new_v4();
+            let object = create_input_v3(object_type, object_id, data)?;
+            (
+                expected_project_revision,
+                MutationTarget {
+                    object_type,
+                    object_id,
+                    deleted: false,
+                },
+                ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
+            )
+        }
+        ProjectViewMutationInput::Update {
+            expected_project_revision,
+            object_type,
+            object_id,
+            patch,
+        } => (
+            expected_project_revision,
+            MutationTarget {
+                object_type,
+                object_id,
+                deleted: false,
+            },
+            ProjectObjectRequestV3::Update(update_input_v3(object_type, object_id, patch)?),
+        ),
+        ProjectViewMutationInput::Delete {
+            expected_project_revision,
+            object_type,
+            object_id,
+        } => (
+            expected_project_revision,
+            MutationTarget {
+                object_type,
+                object_id,
+                deleted: true,
+            },
+            ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
+                object_type,
+                object_id,
+            }),
+        ),
+        ProjectViewMutationInput::Context {
+            expected_project_revision,
+            object_type,
+            object_id,
+            context_references,
+        } => (
+            expected_project_revision,
+            MutationTarget {
+                object_type,
+                object_id,
+                deleted: false,
+            },
+            ProjectObjectRequestV3::Update(update_input_v3(
+                object_type,
+                object_id,
+                json!({ "context_references": context_references }),
+            )?),
+        ),
+    };
+    let command = ProjectObjectCommandV3::new(expected_project_revision, None, request);
+    let builder = build_v3_project_object_command(command)
+        .map_err(|error| format!("invalid Project View v3 mutation: {error}"))?;
+    Ok(PreparedMutation {
+        builder,
+        request: None,
+        expected_project_revision,
+        target: Some(target),
+    })
 }
 
 fn create_input(
@@ -382,6 +513,27 @@ fn create_input(
         .map_err(|error| format!("invalid typed Project View create data: {error}"))
 }
 
+fn create_input_v3(
+    object_type: ProjectViewObjectType,
+    object_id: Uuid,
+    data: Value,
+) -> Result<NewProjectViewObjectV3, String> {
+    let mut object = data
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Project View v3 create data must be an object".to_owned())?;
+    if object.contains_key("id") || object.contains_key("object_type") {
+        return Err("Project View v3 create data must omit id and object_type".to_owned());
+    }
+    object.insert("id".to_owned(), Value::String(object_id.to_string()));
+    object.insert(
+        "object_type".to_owned(),
+        Value::String(object_type.as_str().to_owned()),
+    );
+    serde_json::from_value(Value::Object(object))
+        .map_err(|error| format!("invalid typed Project View v3 create data: {error}"))
+}
+
 fn update_input(
     object_type: ProjectViewObjectType,
     object_id: Uuid,
@@ -396,6 +548,22 @@ fn update_input(
         "patch": patch,
     }))
     .map_err(|error| format!("invalid typed Project View update patch: {error}"))
+}
+
+fn update_input_v3(
+    object_type: ProjectViewObjectType,
+    object_id: Uuid,
+    patch: Value,
+) -> Result<UpdateProjectObjectV3, String> {
+    if !patch.is_object() {
+        return Err("Project View v3 update patch must be an object".to_owned());
+    }
+    serde_json::from_value(json!({
+        "object_type": object_type.as_str(),
+        "object_id": object_id,
+        "patch": patch,
+    }))
+    .map_err(|error| format!("invalid typed Project View v3 update patch: {error}"))
 }
 
 fn parse_receipt(
@@ -524,6 +692,12 @@ async fn read_meta(
                     .map(Some)
                     .map_err(|error| format!("Project View integrity error: {error}"))
             }
+            ProjectViewSchema::V3 => {
+                parse_v3_meta_projection(event, &context.identity.relay_pubkey)
+                    .map(MutationMeta::V3)
+                    .map(Some)
+                    .map_err(|error| format!("Project View integrity error: {error}"))
+            }
         },
         _ => Err(
             "Project View integrity error: metadata query returned multiple current heads"
@@ -581,6 +755,7 @@ async fn read_object(
             }
         }
         ProjectViewSchema::V2 => parse_v2_confirmed_object(event, context, meta)?,
+        ProjectViewSchema::V3 => parse_v3_confirmed_object(event, context, meta)?,
     };
     if projection.object_type != target.object_type || projection.object_id != target.object_id {
         return Err(
@@ -665,6 +840,76 @@ fn parse_v2_confirmed_object(
             })
         }
         _ => Err("Project View integrity error: unsupported v2 object projection type".to_owned()),
+    }
+}
+
+fn parse_v3_confirmed_object(
+    event: &Event,
+    context: &MutationContext,
+    meta: &MutationMeta,
+) -> Result<MutationObjectProjection, String> {
+    let projection_type = serde_json::from_str::<Value>(&event.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("projection_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            "Project View integrity error: v3 object head has no projection_type".to_owned()
+        })?;
+    match projection_type.as_str() {
+        "entity" => {
+            let projection = parse_v3_entity_projection(
+                event,
+                &context.identity.relay_pubkey,
+                meta.project_id(),
+            )
+            .map_err(|error| format!("Project View integrity error: {error}"))?;
+            let V3EntityChange::Role(role) = projection.entity else {
+                return Err(
+                    "Project View integrity error: object coordinate resolved to a non-Role v3 entity"
+                        .to_owned(),
+                );
+            };
+            Ok(MutationObjectProjection {
+                object_id: role.role_id,
+                object_type: ProjectViewObjectType::Role,
+                object_revision: role.object_revision,
+                project_revision: projection.project_revision,
+                projection_generation: projection.projection_generation,
+                deleted: false,
+            })
+        }
+        "object" => {
+            let projection = parse_v3_object_projection(
+                event,
+                &context.identity.relay_pubkey,
+                meta.project_id(),
+            )
+            .map_err(|error| format!("Project View integrity error: {error}"))?;
+            let (object_id, object_type, object_revision, deleted) = match projection.object {
+                V3ProjectedObject::Active(object) => {
+                    (object.id, object.object_type, object.object_revision, false)
+                }
+                V3ProjectedObject::Tombstone(tombstone) => (
+                    tombstone.id,
+                    tombstone.object_type,
+                    tombstone.object_revision,
+                    true,
+                ),
+            };
+            Ok(MutationObjectProjection {
+                object_id,
+                object_type,
+                object_revision,
+                project_revision: projection.project_revision,
+                projection_generation: projection.projection_generation,
+                deleted,
+            })
+        }
+        _ => Err("Project View integrity error: unsupported v3 object projection type".to_owned()),
     }
 }
 

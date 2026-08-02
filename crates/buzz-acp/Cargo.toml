@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal
 buzz-core = { workspace = true }
+buzz-project-document = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
@@ -64,6 +65,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 atomic-write-file = "0.3"
 zeroize = { workspace = true }
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

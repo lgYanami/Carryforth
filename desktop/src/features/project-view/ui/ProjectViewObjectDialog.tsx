@@ -2,6 +2,12 @@ import { LoaderCircle, Plus, Save } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
+import {
+  identityFromMeta,
+  useProjectDocumentMeta,
+  useProjectDocumentMutation,
+  useProjectDocuments,
+} from "@/features/project-documents/hooks";
 import { useProjectViewMutation } from "@/features/project-view/hooks";
 import {
   indexProjectViewObjects,
@@ -12,38 +18,32 @@ import {
 } from "@/features/project-view/model";
 import {
   PROJECT_VIEW_SELECT_CLASS,
-  ProjectViewEnumSelect,
   ProjectViewField,
-  ProjectViewListField,
-  ProjectViewSelect,
 } from "@/features/project-view/ui/ProjectViewFormFields";
 import { ProjectViewObjectConflict } from "@/features/project-view/ui/ProjectViewObjectConflict";
 import {
-  CREATE_TYPES,
-  ISSUE_STATUSES,
-  LOCATOR_TYPES,
-  PLAN_STATUSES,
-  PRIORITIES,
-  REQUIREMENT_STATUSES,
-  RESOURCE_TYPES,
-  STAGE_STATUSES,
-  WORK_STATUSES,
-} from "@/features/project-view/ui/projectViewObjectFormOptions";
-import type {
-  ProjectView,
-  ProjectViewIssueStatus,
-  ProjectViewLocatorType,
-  ProjectViewMutationResult,
-  ProjectViewObject,
-  ProjectViewObjectRef,
-  ProjectViewObjectType,
-  ProjectViewPlanStatus,
-  ProjectViewPriority,
-  ProjectViewRequirementStatus,
-  ProjectViewResourceType,
-  ProjectViewStageStatus,
-  ProjectViewWorkStatus,
-  ProjectViewWritableObject,
+  ProjectViewObjectLifecycleFields,
+  ProjectViewObjectRelationFields,
+  ProjectViewObjectTextFields,
+} from "@/features/project-view/ui/ProjectViewObjectDialogFields";
+import { CREATE_TYPES } from "@/features/project-view/ui/projectViewObjectFormOptions";
+import {
+  CREATE_GUIDE_VALUE,
+  type ProjectViewObjectFormState as FormState,
+} from "@/features/project-view/ui/projectViewObjectDialogState";
+import {
+  isProjectResourceDataV3,
+  type ProjectView,
+  type ProjectViewIssueStatus,
+  type ProjectViewMutationResult,
+  type ProjectViewObject,
+  type ProjectViewObjectRef,
+  type ProjectViewObjectType,
+  type ProjectViewPlanStatus,
+  type ProjectViewRequirementStatus,
+  type ProjectViewStageStatus,
+  type ProjectViewWorkStatus,
+  type ProjectViewWritableObject,
 } from "@/shared/api/tauriProjectView";
 import { Button } from "@/shared/ui/button";
 import {
@@ -54,36 +54,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/ui/dialog";
-import { Input } from "@/shared/ui/input";
-import { Switch } from "@/shared/ui/switch";
-import { Textarea } from "@/shared/ui/textarea";
 
 type CreatableObjectType = (typeof CREATE_TYPES)[number];
-
-type FormState = {
-  name: string;
-  title: string;
-  positioning: string;
-  purpose: string;
-  problem: string;
-  scope: string;
-  description: string;
-  desiredOutcome: string;
-  directions: string;
-  responsibilities: string;
-  boundaries: string;
-  active: boolean;
-  status: string;
-  priority: ProjectViewPriority;
-  underGoalId: string;
-  underPlanId: string;
-  plannedInStageId: string;
-  aboutId: string;
-  handlesId: string;
-  resourceType: ProjectViewResourceType;
-  locatorType: ProjectViewLocatorType;
-  locatorValue: string;
-};
 
 const BASE_FORM: FormState = {
   name: "",
@@ -108,6 +80,12 @@ const BASE_FORM: FormState = {
   resourceType: "repository",
   locatorType: "url",
   locatorValue: "",
+  resourceKind: "repository",
+  summary: "",
+  guideDocumentId: "",
+  guideTitle: "",
+  guideSummary: "",
+  guideContentMarkdown: "",
 };
 
 function defaultStatus(type: ProjectViewObjectType) {
@@ -207,14 +185,22 @@ function formFromObject(object: ProjectViewObject): FormState {
         handlesId: object.relations.handles?.objectId ?? "",
       };
     case "resource":
-      return {
-        ...form,
-        name: object.data.name,
-        description: object.data.description,
-        resourceType: object.data.resourceType,
-        locatorType: object.data.locator.locatorType,
-        locatorValue: object.data.locator.value,
-      };
+      return isProjectResourceDataV3(object.data)
+        ? {
+            ...form,
+            name: object.data.name,
+            resourceKind: object.data.resourceKind,
+            summary: object.data.summary ?? "",
+            guideDocumentId: object.data.guideDocumentId,
+          }
+        : {
+            ...form,
+            name: object.data.name,
+            description: object.data.description,
+            resourceType: object.data.resourceType,
+            locatorType: object.data.locator.locatorType,
+            locatorValue: object.data.locator.value,
+          };
   }
 }
 
@@ -245,6 +231,8 @@ function writableFromForm(
   type: ProjectViewObjectType,
   form: FormState,
   objects: ReadonlyMap<string, ProjectViewObject>,
+  schemaVersion: 1 | 2 | 3,
+  createdGuideDocumentId?: string,
 ): ProjectViewWritableObject {
   switch (type) {
     case "project_profile":
@@ -335,336 +323,31 @@ function writableFromForm(
         handles: referenceFor(form.handlesId, objects, "Handles"),
       };
     case "resource":
-      return {
-        objectType: type,
-        data: {
-          name: required(form.name, "Name"),
-          resourceType: form.resourceType,
-          locator: {
-            locatorType: form.locatorType,
-            value: required(form.locatorValue, "Locator"),
-          },
-          description: required(form.description, "Description"),
-        },
-      };
-  }
-}
-
-function TextFields({
-  form,
-  roleHasActiveAssignment,
-  set,
-  type,
-}: {
-  form: FormState;
-  roleHasActiveAssignment?: boolean;
-  set: <K extends keyof FormState>(field: K, value: FormState[K]) => void;
-  type: ProjectViewObjectType;
-}) {
-  if (type === "project_profile") {
-    return (
-      <>
-        <ProjectViewField label="Project name" required>
-          <Input
-            autoFocus
-            onChange={(event) => set("name", event.target.value)}
-            value={form.name}
-          />
-        </ProjectViewField>
-        {[
-          ["Positioning", "positioning"],
-          ["Purpose", "purpose"],
-          ["Problem", "problem"],
-          ["Scope", "scope"],
-        ].map(([label, field]) => (
-          <ProjectViewField key={field} label={label} required>
-            <Textarea
-              onChange={(event) =>
-                set(
-                  field as "positioning" | "purpose" | "problem" | "scope",
-                  event.target.value,
-                )
-              }
-              value={
-                form[field as "positioning" | "purpose" | "problem" | "scope"]
-              }
-            />
-          </ProjectViewField>
-        ))}
-      </>
-    );
-  }
-  if (type === "goal") {
-    return (
-      <>
-        <ProjectViewField label="Title" required>
-          <Input
-            autoFocus
-            onChange={(event) => set("title", event.target.value)}
-            value={form.title}
-          />
-        </ProjectViewField>
-        <ProjectViewField label="Desired outcome" required>
-          <Textarea
-            onChange={(event) => set("desiredOutcome", event.target.value)}
-            value={form.desiredOutcome}
-          />
-        </ProjectViewField>
-        <ProjectViewListField
-          label="Directions"
-          onChange={(value) => set("directions", value)}
-          value={form.directions}
-        />
-      </>
-    );
-  }
-  if (type === "role") {
-    return (
-      <>
-        <ProjectViewField label="Name" required>
-          <Input
-            autoFocus
-            onChange={(event) => set("name", event.target.value)}
-            value={form.name}
-          />
-        </ProjectViewField>
-        <ProjectViewField label="Purpose" required>
-          <Textarea
-            onChange={(event) => set("purpose", event.target.value)}
-            value={form.purpose}
-          />
-        </ProjectViewField>
-        <ProjectViewListField
-          label="Responsibilities"
-          onChange={(value) => set("responsibilities", value)}
-          value={form.responsibilities}
-        />
-        <ProjectViewListField
-          label="Boundaries"
-          onChange={(value) => set("boundaries", value)}
-          value={form.boundaries}
-        />
-        <div className="flex items-center justify-between rounded-lg border border-border/70 p-3">
-          <div>
-            <div className="text-sm font-medium">Active role</div>
-            <div className="text-xs text-muted-foreground">
-              {roleHasActiveAssignment
-                ? "End or replace the active Assignment before deactivating this Role."
-                : "This is semantic project state, not Buzz authorization."}
-            </div>
-          </div>
-          <Switch
-            aria-label="Active role"
-            checked={form.active}
-            disabled={roleHasActiveAssignment}
-            onCheckedChange={(value) => set("active", value)}
-          />
-        </div>
-      </>
-    );
-  }
-  if (type === "resource") {
-    return (
-      <>
-        <ProjectViewField label="Name" required>
-          <Input
-            autoFocus
-            onChange={(event) => set("name", event.target.value)}
-            value={form.name}
-          />
-        </ProjectViewField>
-        <ProjectViewEnumSelect
-          label="Resource type"
-          onChange={(value) =>
-            set("resourceType", value as ProjectViewResourceType)
+      return schemaVersion === 3
+        ? {
+            objectType: type,
+            data: {
+              name: required(form.name, "Name"),
+              resourceKind: required(form.resourceKind, "Resource kind"),
+              summary: form.summary.trim() || undefined,
+              guideDocumentId: required(
+                createdGuideDocumentId ?? form.guideDocumentId,
+                "Guide",
+              ),
+            },
           }
-          value={form.resourceType}
-          values={RESOURCE_TYPES}
-        />
-        <ProjectViewEnumSelect
-          label="Locator type"
-          onChange={(value) =>
-            set("locatorType", value as ProjectViewLocatorType)
-          }
-          value={form.locatorType}
-          values={LOCATOR_TYPES}
-        />
-        <ProjectViewField label="Locator" required>
-          <Input
-            onChange={(event) => set("locatorValue", event.target.value)}
-            value={form.locatorValue}
-          />
-        </ProjectViewField>
-        <ProjectViewField label="Description" required>
-          <Textarea
-            onChange={(event) => set("description", event.target.value)}
-            value={form.description}
-          />
-        </ProjectViewField>
-      </>
-    );
-  }
-  return (
-    <>
-      <ProjectViewField label="Title" required>
-        <Input
-          autoFocus
-          onChange={(event) => set("title", event.target.value)}
-          value={form.title}
-        />
-      </ProjectViewField>
-      <ProjectViewField label="Description" required>
-        <Textarea
-          onChange={(event) => set("description", event.target.value)}
-          value={form.description}
-        />
-      </ProjectViewField>
-    </>
-  );
-}
-
-function LifecycleFields({
-  form,
-  set,
-  type,
-}: {
-  form: FormState;
-  set: <K extends keyof FormState>(field: K, value: FormState[K]) => void;
-  type: ProjectViewObjectType;
-}) {
-  const statuses =
-    type === "plan"
-      ? PLAN_STATUSES
-      : type === "stage"
-        ? STAGE_STATUSES
-        : type === "requirement"
-          ? REQUIREMENT_STATUSES
-          : type === "issue"
-            ? ISSUE_STATUSES
-            : type === "work"
-              ? WORK_STATUSES
-              : undefined;
-  if (!statuses) return null;
-  return (
-    <div className="grid gap-4 sm:grid-cols-2">
-      <ProjectViewEnumSelect
-        label="Status"
-        onChange={(value) => set("status", value)}
-        value={form.status}
-        values={statuses}
-      />
-      {type === "requirement" || type === "issue" || type === "work" ? (
-        <ProjectViewEnumSelect
-          label="Priority"
-          onChange={(value) => set("priority", value as ProjectViewPriority)}
-          value={form.priority}
-          values={PRIORITIES}
-        />
-      ) : null}
-    </div>
-  );
-}
-
-function RelationFields({
-  editingId,
-  form,
-  paths,
-  objects,
-  set,
-  type,
-}: {
-  editingId?: string;
-  form: FormState;
-  paths: ReadonlyMap<string, string>;
-  objects: ReadonlyMap<string, ProjectViewObject>;
-  set: <K extends keyof FormState>(field: K, value: FormState[K]) => void;
-  type: ProjectViewObjectType;
-}) {
-  const options = (targetTypes: ProjectViewObjectType[], optional: boolean) => [
-    ...(optional ? [{ value: "", label: "None" }] : []),
-    ...Array.from(objects.values())
-      .filter(
-        (object) =>
-          object.id !== editingId && targetTypes.includes(object.objectType),
-      )
-      .map((object) => ({
-        value: object.id,
-        label:
-          paths.get(object.id) ?? projectViewObjectTypeLabel(object.objectType),
-      }))
-      .sort((left, right) => left.label.localeCompare(right.label)),
-  ];
-  switch (type) {
-    case "plan":
-      return (
-        <ProjectViewSelect
-          label="Goal"
-          onChange={(value) => set("underGoalId", value)}
-          options={options(["goal"], true)}
-          value={form.underGoalId}
-        />
-      );
-    case "stage":
-      return (
-        <ProjectViewSelect
-          label="Parent Plan"
-          onChange={(value) => set("underPlanId", value)}
-          options={options(["plan"], false)}
-          required
-          value={form.underPlanId}
-        />
-      );
-    case "requirement":
-      return (
-        <ProjectViewSelect
-          label="Planned in Stage"
-          onChange={(value) => set("plannedInStageId", value)}
-          options={options(["stage"], true)}
-          value={form.plannedInStageId}
-        />
-      );
-    case "issue":
-      return (
-        <div className="grid gap-4 sm:grid-cols-2">
-          <ProjectViewSelect
-            label="Planned in Stage"
-            onChange={(value) => set("plannedInStageId", value)}
-            options={options(["stage"], true)}
-            value={form.plannedInStageId}
-          />
-          <ProjectViewSelect
-            label="About"
-            onChange={(value) => set("aboutId", value)}
-            options={options(
-              [
-                "project_profile",
-                "goal",
-                "role",
-                "plan",
-                "stage",
-                "requirement",
-                "issue",
-                "work",
-                "resource",
-              ],
-              true,
-            )}
-            value={form.aboutId}
-          />
-        </div>
-      );
-    case "work":
-      return (
-        <ProjectViewSelect
-          label="Handles"
-          onChange={(value) => set("handlesId", value)}
-          options={options(["requirement", "issue"], false)}
-          required
-          value={form.handlesId}
-        />
-      );
-    default:
-      return null;
+        : {
+            objectType: type,
+            data: {
+              name: required(form.name, "Name"),
+              resourceType: form.resourceType,
+              locator: {
+                locatorType: form.locatorType,
+                value: required(form.locatorValue, "Locator"),
+              },
+              description: required(form.description, "Description"),
+            },
+          };
   }
 }
 
@@ -679,6 +362,7 @@ export function ProjectViewObjectDialog({
   open,
   projectRevision,
   roleHasActiveAssignment,
+  schemaVersion,
   view,
 }: {
   context?: ProjectViewCreateContext;
@@ -691,15 +375,23 @@ export function ProjectViewObjectDialog({
   open: boolean;
   projectRevision: number;
   roleHasActiveAssignment?: boolean;
+  schemaVersion: 1 | 2 | 3;
   view: ProjectView;
 }) {
-  const mutation = useProjectViewMutation();
-  const objects = React.useMemo(() => indexProjectViewObjects(view), [view]);
-  const paths = React.useMemo(() => projectViewObjectPaths(view), [view]);
   const initialObjectType =
     mode === "edit" && object ? object.objectType : (initialType ?? "goal");
   const [objectType, setObjectType] =
     React.useState<ProjectViewObjectType>(initialObjectType);
+  const mutation = useProjectViewMutation();
+  const guideDocumentsEnabled =
+    open && schemaVersion === 3 && objectType === "resource";
+  const documentMeta = useProjectDocumentMeta(guideDocumentsEnabled);
+  const documents = useProjectDocuments(
+    guideDocumentsEnabled ? documentMeta.data : undefined,
+  );
+  const documentMutation = useProjectDocumentMutation();
+  const objects = React.useMemo(() => indexProjectViewObjects(view), [view]);
+  const paths = React.useMemo(() => projectViewObjectPaths(view), [view]);
   const [form, setForm] = React.useState<FormState>(() =>
     object ? formFromObject(object) : emptyForm(initialObjectType, context),
   );
@@ -712,6 +404,40 @@ export function ProjectViewObjectDialog({
   >();
   const wasOpen = React.useRef(false);
   const resetMutation = mutation.reset;
+  const resetDocumentMutation = documentMutation.reset;
+  const guideOptions = React.useMemo(() => {
+    const options = [
+      {
+        value: "",
+        label: documents.isPending
+          ? "Loading active Guides…"
+          : documents.isError
+            ? "Guides unavailable"
+            : "Select an active Guide",
+      },
+      ...(documents.data?.documents.map((document) => ({
+        value: document.documentId,
+        label: `${document.title} · r${document.documentRevision}`,
+      })) ?? []),
+    ];
+    if (
+      form.guideDocumentId &&
+      form.guideDocumentId !== CREATE_GUIDE_VALUE &&
+      !options.some((option) => option.value === form.guideDocumentId)
+    ) {
+      options.push({
+        value: form.guideDocumentId,
+        label: `Current Guide · ${form.guideDocumentId}`,
+      });
+    }
+    options.push({ value: CREATE_GUIDE_VALUE, label: "Create a new Guide…" });
+    return options;
+  }, [
+    documents.data?.documents,
+    documents.isError,
+    documents.isPending,
+    form.guideDocumentId,
+  ]);
 
   React.useEffect(() => {
     if (open && !wasOpen.current) {
@@ -725,6 +451,7 @@ export function ProjectViewObjectDialog({
       setReviewingLatest(false);
       setConflict(undefined);
       resetMutation();
+      resetDocumentMutation();
     }
     wasOpen.current = open;
   }, [
@@ -735,6 +462,7 @@ export function ProjectViewObjectDialog({
     open,
     projectRevision,
     resetMutation,
+    resetDocumentMutation,
   ]);
 
   const set = React.useCallback(
@@ -772,10 +500,11 @@ export function ProjectViewObjectDialog({
   };
 
   const submit = async () => {
-    if (mutation.isPending) return;
+    if (mutation.isPending || documentMutation.isPending) return;
     setError(undefined);
     setRebasedRevision(undefined);
     setConflict(undefined);
+    let createdGuideForRetry: string | undefined;
     try {
       if (roleHasActiveAssignment && objectType === "role" && !form.active) {
         setError(
@@ -783,7 +512,42 @@ export function ProjectViewObjectDialog({
         );
         return;
       }
-      const writable = writableFromForm(objectType, form, objects);
+      if (
+        schemaVersion === 3 &&
+        objectType === "resource" &&
+        form.guideDocumentId === CREATE_GUIDE_VALUE
+      ) {
+        const meta = documentMeta.data;
+        if (!meta) {
+          throw new Error(
+            "Project Documents must be available before creating a Resource Guide.",
+          );
+        }
+        const guideResult = await documentMutation.mutateAsync({
+          identity: identityFromMeta(meta),
+          mutation: {
+            type: "create",
+            title: required(form.guideTitle, "Guide title"),
+            summary: form.guideSummary.trim() || undefined,
+            contentMarkdown: required(
+              form.guideContentMarkdown,
+              "Guide Markdown",
+            ),
+          },
+        });
+        if (guideResult.status === "conflict") {
+          throw new Error("The Guide could not be created due to a conflict.");
+        }
+        createdGuideForRetry = guideResult.documentId;
+        set("guideDocumentId", createdGuideForRetry);
+      }
+      const writable = writableFromForm(
+        objectType,
+        form,
+        objects,
+        schemaVersion,
+        createdGuideForRetry,
+      );
       if (
         mode === "edit" &&
         object &&
@@ -811,6 +575,11 @@ export function ProjectViewObjectDialog({
             },
       );
       if (result.status === "conflict") {
+        if (createdGuideForRetry) {
+          toast.info(
+            "Guide created and preserved; review the latest View, then retry the Resource.",
+          );
+        }
         setConflict(result);
         void reviewLatest();
         return;
@@ -824,9 +593,15 @@ export function ProjectViewObjectDialog({
       onApplied(result.objectId);
     } catch (caught) {
       setError(
-        caught instanceof Error
-          ? caught.message
-          : "The Project View change could not be submitted.",
+        `${
+          caught instanceof Error
+            ? caught.message
+            : "The Project View change could not be submitted."
+        }${
+          createdGuideForRetry
+            ? ` Guide ${createdGuideForRetry} was created and preserved for retry.`
+            : ""
+        }`,
       );
     }
   };
@@ -834,7 +609,11 @@ export function ProjectViewObjectDialog({
   return (
     <Dialog
       onOpenChange={(nextOpen) => {
-        if (!mutation.isPending && (nextOpen || !conflict)) {
+        if (
+          !mutation.isPending &&
+          !documentMutation.isPending &&
+          (nextOpen || !conflict)
+        ) {
           onOpenChange(nextOpen);
         }
       }}
@@ -900,14 +679,20 @@ export function ProjectViewObjectDialog({
           ) : null}
 
           <div className="space-y-4">
-            <TextFields
+            <ProjectViewObjectTextFields
               form={form}
+              guideOptions={guideOptions}
               roleHasActiveAssignment={roleHasActiveAssignment}
+              schemaVersion={schemaVersion}
               set={set}
               type={objectType}
             />
-            <LifecycleFields form={form} set={set} type={objectType} />
-            <RelationFields
+            <ProjectViewObjectLifecycleFields
+              form={form}
+              set={set}
+              type={objectType}
+            />
+            <ProjectViewObjectRelationFields
               editingId={object?.id}
               form={form}
               objects={objects}
@@ -928,7 +713,7 @@ export function ProjectViewObjectDialog({
 
           <DialogFooter>
             <Button
-              disabled={mutation.isPending}
+              disabled={mutation.isPending || documentMutation.isPending}
               onClick={conflict ? discardDraft : () => onOpenChange(false)}
               type="button"
               variant="outline"
@@ -936,17 +721,21 @@ export function ProjectViewObjectDialog({
               {conflict ? "Discard draft" : "Cancel"}
             </Button>
             <Button
-              disabled={mutation.isPending || Boolean(conflict)}
+              disabled={
+                mutation.isPending ||
+                documentMutation.isPending ||
+                Boolean(conflict)
+              }
               type="submit"
             >
-              {mutation.isPending ? (
+              {mutation.isPending || documentMutation.isPending ? (
                 <LoaderCircle className="animate-spin" />
               ) : mode === "create" ? (
                 <Plus />
               ) : (
                 <Save />
               )}
-              {mutation.isPending
+              {mutation.isPending || documentMutation.isPending
                 ? "Submitting…"
                 : mode === "create"
                   ? `Create ${projectViewObjectTypeLabel(objectType)}`

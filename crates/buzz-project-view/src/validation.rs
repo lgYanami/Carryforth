@@ -514,7 +514,7 @@ pub(crate) fn validate_state(state: &ProjectViewState) -> DomainResult<()> {
     Ok(())
 }
 
-fn validate_relation_shape(
+pub(crate) fn validate_relation_shape(
     object_type: ProjectViewObjectType,
     relations: &crate::ProjectViewRelations,
 ) -> DomainResult<()> {

@@ -1,0 +1,53 @@
+{
+  "content": "{\"state\":\"active\",\"schema_version\":1,\"projection_type\":\"document_head\",\"project_id\":\"3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77\",\"projection_generation\":1,\"catalog_revision\":31,\"document_id\":\"9c23f672-a397-42d1-b933-104ba2674f26\",\"document_revision\":8,\"title\":\"Buzz repository guide\",\"summary\":\"Clone, initialize, and verify this repository.\",\"created_at\":\"2026-07-27T10:00:00Z\",\"created_by\":\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"updated_at\":\"2026-07-27T10:05:00Z\",\"updated_by\":\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"revision_coordinate\":\"project-document:3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77:9c23f672-a397-42d1-b933-104ba2674f26:revision:8\",\"revision_event_id\":\"d518537232de41cf43e7e770ddf4f445da325b392ce09a58483e025f0f12e670\",\"source_event_id\":\"c9c2a166554b139afe8d782425fc900b6d7af45faa1cbfe613445326d2d1178d\"}",
+  "created_at": 1785146700,
+  "id": "9fe56c45dbd4a17c71cfb963ecf0b5105a7adc609ac47eea00acbca4818bcc4e",
+  "kind": 40905,
+  "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "sig": "fdf5bc790e6b7047fa599b8ed843883c0e5e5f911540a84f77a6ed3c4bb34ab8dda523153e8946960d91c9520f99a2fc6f4c3c0f9bf4045a08dd33c92b43a8d8",
+  "tags": [
+    [
+      "-"
+    ],
+    [
+      "d",
+      "project-document:3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77:9c23f672-a397-42d1-b933-104ba2674f26"
+    ],
+    [
+      "t",
+      "buzz-project-document"
+    ],
+    [
+      "t",
+      "buzz-project-document-head"
+    ],
+    [
+      "t",
+      "buzz-project-document-active"
+    ],
+    [
+      "projection_generation",
+      "1"
+    ],
+    [
+      "catalog_revision",
+      "31"
+    ],
+    [
+      "document_revision",
+      "8"
+    ],
+    [
+      "e",
+      "d518537232de41cf43e7e770ddf4f445da325b392ce09a58483e025f0f12e670",
+      "",
+      "revision"
+    ],
+    [
+      "e",
+      "c9c2a166554b139afe8d782425fc900b6d7af45faa1cbfe613445326d2d1178d",
+      "",
+      "source"
+    ]
+  ]
+}

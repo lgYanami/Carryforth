@@ -1,0 +1,17 @@
+{
+  "content": "{\"schema_version\":1,\"expected_document_revision\":8,\"request\":{\"type\":\"delete\",\"document_id\":\"9c23f672-a397-42d1-b933-104ba2674f26\"}}",
+  "created_at": 1785147000,
+  "id": "33363bd3527deaf73827b62355ae2bb206dce534ea2c96379b4aa7a85522e371",
+  "kind": 44301,
+  "pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+  "sig": "4e8a6bd944f833dd4c45374efe16f342bf338b3e48d0655ae50b2f6c23d428dc0befadb912443157a39d438eb03f3890afaebf657778d6135c51b81a1bcf62cb",
+  "tags": [
+    [
+      "-"
+    ],
+    [
+      "t",
+      "buzz-project-document-command"
+    ]
+  ]
+}

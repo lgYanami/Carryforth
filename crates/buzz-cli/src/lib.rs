@@ -233,6 +233,12 @@ enum Cmd {
     /// Read and mutate the Community's canonical Project View
     #[command(subcommand, name = "project-view")]
     ProjectView(ProjectViewCmd),
+    /// Read and maintain independent versioned Project Documents
+    #[command(subcommand)]
+    Documents(DocumentsCmd),
+    /// Resolve Project View Resources and their mandatory Guides
+    #[command(subcommand)]
+    Resources(ResourcesCmd),
     /// Read and govern Project View v2 Roles and Assignments
     #[command(subcommand)]
     Roles(RolesCmd),
@@ -309,6 +315,22 @@ pub enum ProjectViewCmd {
         #[arg(long, required = true)]
         goal: Vec<String>,
     },
+    /// Initialize one prepared empty schema-v3 Community from a closed command
+    InitV3 {
+        /// JSON file containing the complete ProjectViewInitializeV3 command.
+        #[arg(long)]
+        command: String,
+    },
+    /// Local schema-v3 review operations (does not submit a mutation)
+    V3 {
+        #[command(subcommand)]
+        command: ProjectViewV3ClientCmd,
+    },
+    /// Discover and edit schema-v3 Context Reference coordinates
+    Context {
+        #[command(subcommand)]
+        command: ProjectViewContextCmd,
+    },
     /// Create one typed object with a CLI-generated UUID v4
     Create {
         /// Object type to create (the project profile is not creatable here).
@@ -345,6 +367,195 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
+    },
+}
+
+/// Context Reference operations for one active Project View object.
+#[derive(Subcommand)]
+pub enum ProjectViewContextCmd {
+    /// List the object's canonical Context Reference set
+    List {
+        /// Stable source object UUID.
+        object_id: Uuid,
+    },
+    /// Add one Resource, live Document, or pinned Document coordinate
+    Add {
+        /// Stable source object UUID.
+        object_id: Uuid,
+        /// Stable target Resource UUID.
+        #[arg(
+            long,
+            conflicts_with = "document",
+            required_unless_present = "document"
+        )]
+        resource: Option<Uuid>,
+        /// Stable target Document UUID.
+        #[arg(
+            long,
+            conflicts_with = "resource",
+            required_unless_present = "resource"
+        )]
+        document: Option<Uuid>,
+        /// Exact pinned Document revision; omission means a live reference.
+        #[arg(long, requires = "document")]
+        revision: Option<u64>,
+    },
+    /// Remove one exact Resource, live Document, or pinned Document coordinate
+    Remove {
+        /// Stable source object UUID.
+        object_id: Uuid,
+        /// Stable target Resource UUID.
+        #[arg(
+            long,
+            conflicts_with = "document",
+            required_unless_present = "document"
+        )]
+        resource: Option<Uuid>,
+        /// Stable target Document UUID.
+        #[arg(
+            long,
+            conflicts_with = "resource",
+            required_unless_present = "resource"
+        )]
+        document: Option<Uuid>,
+        /// Exact pinned Document revision; omission means a live reference.
+        #[arg(long, requires = "document")]
+        revision: Option<u64>,
+    },
+}
+
+/// Member-side schema-v3 workflows.
+#[derive(Subcommand)]
+pub enum ProjectViewV3ClientCmd {
+    /// Review legacy Resource mappings.
+    Resources {
+        #[command(subcommand)]
+        command: ProjectViewV3ResourcesClientCmd,
+    },
+}
+
+/// Human Resource review commands.
+#[derive(Subcommand)]
+pub enum ProjectViewV3ResourcesClientCmd {
+    /// Verify current v2 Resource/Guide pins and create detached approvals
+    Approve {
+        /// Operator-exported draft JSON completed by the Human reviewer.
+        #[arg(long)]
+        manifest: String,
+        /// Destination for the closed reviewed manifest JSON.
+        #[arg(long)]
+        out: String,
+    },
+}
+
+/// Commands for the Community-global Project Document catalog.
+#[derive(Subcommand)]
+pub enum DocumentsCmd {
+    /// List active Document metadata without fetching Markdown bodies
+    List,
+    /// Read the current or one pinned immutable Document revision
+    Get {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact immutable revision; omit for current.
+        #[arg(long)]
+        revision: Option<u64>,
+        /// Print only raw Markdown to stdout.
+        #[arg(long)]
+        content_only: bool,
+    },
+    /// List immutable revision metadata without printing Markdown bodies
+    History {
+        /// Stable Document UUID.
+        document_id: Uuid,
+    },
+    /// Create a complete revision-one Document snapshot
+    Create {
+        /// Canonical non-empty title.
+        #[arg(long)]
+        title: String,
+        /// Optional non-empty summary.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Literal Markdown, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content_file")]
+        content: Option<String>,
+        /// Markdown file path, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
+        /// Client-selected UUID v4; generated when omitted.
+        #[arg(long)]
+        document_id: Option<Uuid>,
+    },
+    /// Replace the complete active Document snapshot
+    Update {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact current revision observed by the caller.
+        #[arg(long)]
+        expected_revision: u64,
+        /// Complete next title.
+        #[arg(long)]
+        title: String,
+        /// Complete next non-empty summary.
+        #[arg(long, conflicts_with = "clear_summary")]
+        summary: Option<String>,
+        /// Explicitly omit the summary in the next snapshot.
+        #[arg(long, conflicts_with = "summary")]
+        clear_summary: bool,
+        /// Literal Markdown, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content_file")]
+        content: Option<String>,
+        /// Markdown file path, or `-` for bounded stdin.
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
+    },
+    /// Apply one exact-position unified diff and submit a full update
+    Patch {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact base revision to fetch and patch.
+        #[arg(long)]
+        expected_revision: u64,
+        /// Unified diff file, or `-` for bounded stdin.
+        #[arg(long)]
+        patch_file: String,
+        /// Optional file in which to save the exact merged Markdown.
+        #[arg(long)]
+        output: Option<String>,
+        /// Replace the title; omitted preserves the base title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Replace the summary; omitted preserves the base summary.
+        #[arg(long, conflicts_with = "clear_summary")]
+        summary: Option<String>,
+        /// Explicitly clear the base summary.
+        #[arg(long, conflicts_with = "summary")]
+        clear_summary: bool,
+    },
+    /// Append a bodyless tombstone revision
+    Delete {
+        /// Stable Document UUID.
+        document_id: Uuid,
+        /// Exact current revision observed by the caller.
+        #[arg(long)]
+        expected_revision: u64,
+    },
+}
+
+/// Commands for locator-free schema-v3 Resources.
+#[derive(Subcommand)]
+pub enum ResourcesCmd {
+    /// Resolve one current Resource and read its mandatory Guide Document
+    Guide {
+        /// Stable Resource UUID.
+        resource_id: Uuid,
+        /// Exact Guide Document revision; omit for current.
+        #[arg(long)]
+        revision: Option<u64>,
+        /// Print only raw Guide Markdown to stdout.
+        #[arg(long)]
+        content_only: bool,
     },
 }
 
@@ -2371,6 +2582,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
+        Cmd::Documents(sub) => commands::documents::dispatch(sub, &client, &cli.format).await,
+        Cmd::Resources(sub) => commands::resources::dispatch(sub, &client, &cli.format).await,
         Cmd::Roles(sub) => commands::roles::dispatch(sub, &client, &cli.format).await,
         Cmd::Runtime(sub) => commands::runtime::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
@@ -2396,6 +2609,7 @@ mod tests {
             "canvas",
             "channels",
             "dms",
+            "documents",
             "emoji",
             "feed",
             "issues",
@@ -2410,6 +2624,7 @@ mod tests {
             "project-view",
             "reactions",
             "repos",
+            "resources",
             "roles",
             "runtime",
             "social",
@@ -2482,8 +2697,38 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "project-view"),
-            vec!["create", "delete", "get", "get-object", "init", "update"]
+            vec![
+                "context",
+                "create",
+                "delete",
+                "get",
+                "get-object",
+                "init",
+                "init-v3",
+                "update",
+                "v3"
+            ]
         );
+        assert_eq!(names(&cmd, "resources"), vec!["guide"]);
+        let project_view = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "project-view")
+            .expect("project-view command");
+        let v3 = project_view
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "v3")
+            .expect("project-view v3 command");
+        let resources = v3
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "resources")
+            .expect("project-view v3 resources command");
+        let mut resource_review_names = resources
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_owned())
+            .filter(|name| name != "help")
+            .collect::<Vec<_>>();
+        resource_review_names.sort();
+        assert_eq!(resource_review_names, vec!["approve"]);
         assert_eq!(
             names(&cmd, "roles"),
             vec![
@@ -2648,9 +2893,10 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
-            ("project-view", 6),
+            ("project-view", 9),
             ("reactions", 3),
             ("repos", 4),
+            ("resources", 1),
             ("roles", 12),
             ("social", 7),
             ("upload", 1),

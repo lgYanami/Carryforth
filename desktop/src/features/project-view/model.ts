@@ -1,9 +1,10 @@
-import type {
-  ProjectView,
-  ProjectViewObjectRef,
-  ProjectViewObject,
-  ProjectViewObjectType,
-  ProjectViewWritableObject,
+import {
+  isProjectResourceDataV3,
+  type ProjectView,
+  type ProjectViewObjectRef,
+  type ProjectViewObject,
+  type ProjectViewObjectType,
+  type ProjectViewWritableObject,
 } from "@/shared/api/tauriProjectView";
 
 export type ProjectViewCreateContext = {
@@ -70,8 +71,11 @@ export function projectViewObjectDescription(
     case "requirement":
     case "issue":
     case "work":
-    case "resource":
       return object.data.description;
+    case "resource":
+      return isProjectResourceDataV3(object.data)
+        ? (object.data.summary ?? object.data.resourceKind)
+        : object.data.description;
   }
 }
 

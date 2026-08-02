@@ -52,6 +52,66 @@ pub async fn handle_count(
         }
     };
 
+    let project_document_can_match = filters
+        .iter()
+        .any(super::community_private::filter_can_match_project_document);
+    let project_document_exclusive =
+        super::community_private::filters_are_exclusively_project_document(&filters);
+    let project_document_decision = if project_document_can_match {
+        match super::community_private::project_document_read_decision(
+            &state,
+            conn.tenant.community(),
+            &pubkey_bytes,
+            &auth_scopes,
+            token_channel_ids.as_deref(),
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(sub_id = %sub_id, "Project Document COUNT authorization failed: {error}");
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "error:project_document:database",
+                ));
+                return;
+            }
+        }
+    } else {
+        super::community_private::ProjectDocumentReadDecision::Restricted
+    };
+    if project_document_exclusive {
+        match project_document_decision {
+            super::community_private::ProjectDocumentReadDecision::Allowed => {}
+            super::community_private::ProjectDocumentReadDecision::Restricted => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted:project_document:membership_required",
+                ));
+                return;
+            }
+            super::community_private::ProjectDocumentReadDecision::Unavailable(reason) => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    &format!("unavailable:project_document:{reason}"),
+                ));
+                return;
+            }
+        }
+    }
+    let project_document_read_allowed = project_document_decision.allowed();
+    if project_document_read_allowed
+        && filters
+            .iter()
+            .any(super::community_private::filter_is_project_document_search)
+    {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_document:search",
+        ));
+        return;
+    }
+
     let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
     let project_view_exclusive = !filters.is_empty()
         && filters
@@ -143,6 +203,8 @@ pub async fn handle_count(
     // For each filter, count matching events with channel access enforcement.
     let mut total: u64 = 0;
     for filter in &filters {
+        // NIP-50 is not a Document read surface, including kindless search.
+        let document_visible_for_filter = project_document_read_allowed && filter.search.is_none();
         // Determine if this filter can match author-only kinds — if so, the
         // fast-path count_events() cannot be used because it doesn't do
         // per-event author filtering.
@@ -201,7 +263,12 @@ pub async fn handle_count(
                 conn.tenant.community(),
             )
             .await;
-            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
+            exclude_private_protocols_if_unauthorized(
+                &mut query,
+                filter,
+                project_view_read_allowed,
+                document_visible_for_filter,
+            );
             // Persona visibility pushdown: pre-filter the fallback query_events
             // candidate page before ORDER/LIMIT.
             if needs_persona_filtering {
@@ -254,6 +321,12 @@ pub async fn handle_count(
                             {
                                 continue;
                             }
+                            if !super::community_private::event_is_visible(
+                                se.event.kind.as_u16() as u32,
+                                document_visible_for_filter,
+                            ) {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -277,7 +350,12 @@ pub async fn handle_count(
                 conn.tenant.community(),
             )
             .await;
-            exclude_project_view_if_unauthorized(&mut query, filter, project_view_read_allowed);
+            exclude_private_protocols_if_unauthorized(
+                &mut query,
+                filter,
+                project_view_read_allowed,
+                document_visible_for_filter,
+            );
             query.channel_ids = Some(accessible_channels.to_vec());
             // Persona visibility pushdown for the fallback query_events path.
             if needs_persona_filtering {
@@ -331,6 +409,12 @@ pub async fn handle_count(
                             {
                                 continue;
                             }
+                            if !super::community_private::event_is_visible(
+                                se.event.kind.as_u16() as u32,
+                                document_visible_for_filter,
+                            ) {
+                                continue;
+                            }
                             total += 1;
                         }
                     }
@@ -345,10 +429,11 @@ pub async fn handle_count(
     conn.send(RelayMessage::count(&sub_id, total));
 }
 
-fn exclude_project_view_if_unauthorized(
+fn exclude_private_protocols_if_unauthorized(
     query: &mut buzz_db::EventQuery,
     filter: &Filter,
     project_view_read_allowed: bool,
+    project_document_read_allowed: bool,
 ) {
     if !project_view_read_allowed && super::project_view::filter_can_match(filter) {
         query.excluded_kinds = Some(vec![
@@ -357,4 +442,9 @@ fn exclude_project_view_if_unauthorized(
             buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
         ]);
     }
+    super::community_private::exclude_project_document_kinds(
+        query,
+        filter,
+        project_document_read_allowed,
+    );
 }

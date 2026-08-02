@@ -129,6 +129,27 @@ const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
 /// Defensive cap against pathological hints; real relay hints observed up to ~24 s.
 const RETRY_IN_MAX_SECS: u64 = 30;
 
+/// Result of the Project-command transport policy. An ambiguous outcome must
+/// be resolved by an exact immutable revision read-back before it is reported
+/// as success; it is never safe to infer rejection from a later error.
+#[derive(Debug)]
+pub(crate) enum ProjectCommandDelivery {
+    Accepted {
+        raw: String,
+        receipt: buzz_project_document::ProjectDocumentReceipt,
+    },
+    Ambiguous {
+        reason: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectCommandHttpResponse {
+    event_id: String,
+    accepted: bool,
+    message: String,
+}
+
 /// Returns a full-jitter delay for attempt `i`: a random duration in `[0, RETRY_BASE_SECS[i])`.
 fn jitter_delay(attempt: u32) -> Duration {
     Duration::from_secs_f64(RETRY_BASE_SECS[attempt as usize] * rand::random::<f64>())
@@ -195,6 +216,50 @@ fn extract_relay_message_field(body: &str) -> Option<String> {
                 .or_else(|| v.get("message"))
                 .and_then(|m| m.as_str().map(str::to_string))
         })
+}
+
+fn parse_project_command_success(
+    raw: &str,
+    expected_event_id: &str,
+    expected_change_id: nostr::EventId,
+) -> Result<buzz_project_document::ProjectDocumentReceipt, String> {
+    let response: ProjectCommandHttpResponse = serde_json::from_str(raw)
+        .map_err(|_| "successful Project command returned invalid JSON".to_owned())?;
+    if !response.accepted || response.event_id != expected_event_id {
+        return Err("successful Project command response has the wrong event identity".to_owned());
+    }
+    let receipt_json = response
+        .message
+        .strip_prefix("response:")
+        .ok_or_else(|| "successful Project command response has no canonical receipt".to_owned())?;
+    let receipt: buzz_project_document::ProjectDocumentReceipt = serde_json::from_str(receipt_json)
+        .map_err(|_| "successful Project command receipt is invalid".to_owned())?;
+    if receipt.change_id != expected_change_id {
+        return Err("successful Project command receipt names another command".to_owned());
+    }
+    Ok(receipt)
+}
+
+fn map_project_command_response(status: u16, message: String) -> CliError {
+    if status == 409 && message.starts_with("conflict:project_document:") {
+        return CliError::Conflict(message);
+    }
+    if status == 401 || status == 403 {
+        return CliError::Auth(message);
+    }
+    if status == 400 && message.starts_with("invalid:project_document:") {
+        return CliError::Usage(message);
+    }
+    if (status == 503 && message.starts_with("unavailable:project_document:"))
+        || message.starts_with("error:project_document:")
+        || message.starts_with("unsupported:project_document:")
+    {
+        return CliError::Other(message);
+    }
+    CliError::Relay {
+        status,
+        body: message,
+    }
 }
 
 fn should_retry_legacy_upload(status: reqwest::StatusCode) -> bool {
@@ -918,6 +983,161 @@ impl BuzzClient {
         } else {
             self.submit_stored_event(event).await
         }
+    }
+
+    /// Submit one idempotent Project command using stable event bytes and an
+    /// ambiguity-preserving policy. Canonical Project Document 409, 503, and
+    /// internal responses are definitive only before any attempt may have
+    /// reached the Relay.
+    pub(crate) async fn submit_project_command(
+        &self,
+        event: &nostr::Event,
+    ) -> Result<ProjectCommandDelivery, CliError> {
+        let url = format!("{}/events", self.relay_url);
+        let body =
+            bytes::Bytes::from(serde_json::to_vec(event).map_err(|error| {
+                CliError::Other(format!("event serialization failed: {error}"))
+            })?);
+        let expected_event_id = event.id.to_hex();
+        let mut delivery_may_have_occurred = false;
+        let mut ambiguous_reason = String::new();
+
+        for attempt in 0..RETRY_MAX_ATTEMPTS {
+            let is_last = attempt == RETRY_MAX_ATTEMPTS - 1;
+            let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+            let response = self
+                .with_auth_tag(
+                    self.http
+                        .post(&url)
+                        .header("Authorization", auth)
+                        .header("Content-Type", "application/json")
+                        .body(body.clone()),
+                )
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if error.is_connect() => {
+                    if !is_last {
+                        tokio::time::sleep(jitter_delay(attempt)).await;
+                        continue;
+                    }
+                    if delivery_may_have_occurred {
+                        return Ok(ProjectCommandDelivery::Ambiguous {
+                            reason: ambiguous_reason,
+                        });
+                    }
+                    return Err(CliError::Network(error));
+                }
+                Err(error)
+                    if error.is_timeout()
+                        || error.is_request()
+                        || error.is_body()
+                        || error.is_decode() =>
+                {
+                    delivery_may_have_occurred = true;
+                    ambiguous_reason = format!("transport response unavailable: {error}");
+                    if !is_last {
+                        tokio::time::sleep(jitter_delay(attempt)).await;
+                        continue;
+                    }
+                    return Ok(ProjectCommandDelivery::Ambiguous {
+                        reason: ambiguous_reason,
+                    });
+                }
+                Err(error) => return Err(CliError::Network(error)),
+            };
+
+            let status = response.status().as_u16();
+            if matches!(status, 502 | 504) {
+                delivery_may_have_occurred = true;
+                ambiguous_reason = format!("proxy returned HTTP {status}");
+                if !is_last {
+                    tokio::time::sleep(jitter_delay(attempt)).await;
+                    continue;
+                }
+                return Ok(ProjectCommandDelivery::Ambiguous {
+                    reason: ambiguous_reason,
+                });
+            }
+
+            let response_body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    delivery_may_have_occurred = true;
+                    ambiguous_reason = format!("response body unavailable: {error}");
+                    if !is_last {
+                        tokio::time::sleep(jitter_delay(attempt)).await;
+                        continue;
+                    }
+                    return Ok(ProjectCommandDelivery::Ambiguous {
+                        reason: ambiguous_reason,
+                    });
+                }
+            };
+
+            if resp_was_success(status) {
+                match parse_project_command_success(&response_body, &expected_event_id, event.id) {
+                    Ok(receipt) => {
+                        return Ok(ProjectCommandDelivery::Accepted {
+                            raw: response_body,
+                            receipt,
+                        });
+                    }
+                    Err(reason) => {
+                        delivery_may_have_occurred = true;
+                        ambiguous_reason = reason;
+                        if !is_last {
+                            tokio::time::sleep(jitter_delay(attempt)).await;
+                            continue;
+                        }
+                        return Ok(ProjectCommandDelivery::Ambiguous {
+                            reason: ambiguous_reason,
+                        });
+                    }
+                }
+            }
+
+            let message = extract_relay_message_field(&response_body)
+                .unwrap_or_else(|| response_body.clone());
+            if status == 429 && message.starts_with("rate-limited:") {
+                if delivery_may_have_occurred {
+                    return Ok(ProjectCommandDelivery::Ambiguous {
+                        reason: ambiguous_reason,
+                    });
+                }
+                if !is_last {
+                    let delay = parse_retry_hint_text(&message)
+                        .map(|seconds| Duration::from_secs(seconds.min(RETRY_IN_MAX_SECS)))
+                        .unwrap_or_else(|| jitter_delay(attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(CliError::Relay {
+                    status,
+                    body: message,
+                });
+            }
+            if status == 429 {
+                delivery_may_have_occurred = true;
+                ambiguous_reason = "non-canonical HTTP 429".to_owned();
+                if !is_last {
+                    tokio::time::sleep(jitter_delay(attempt)).await;
+                    continue;
+                }
+                return Ok(ProjectCommandDelivery::Ambiguous {
+                    reason: ambiguous_reason,
+                });
+            }
+            if delivery_may_have_occurred {
+                return Ok(ProjectCommandDelivery::Ambiguous {
+                    reason: ambiguous_reason,
+                });
+            }
+            return Err(map_project_command_response(status, message));
+        }
+        unreachable!("loop exhausts all RETRY_MAX_ATTEMPTS")
     }
 
     /// Submit a moderation command (kinds 9040–9044) with non-idempotent retry policy.
@@ -1645,7 +1865,7 @@ mod retry_policy_tests {
     use tokio::net::TcpListener;
 
     use super::super::error::CliError;
-    use super::BuzzClient;
+    use super::{BuzzClient, ProjectCommandDelivery};
 
     /// Spawn a one-shot axum server on a random port.  The handler `f` receives the
     /// attempt counter (incremented before every call) and returns a `(StatusCode,
@@ -1701,6 +1921,48 @@ mod retry_policy_tests {
         EventBuilder::new(Kind::TextNote, "hi")
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_command_definitive_conflict_is_not_retried() {
+        let (url, attempts) = test_server(|_| {
+            (
+                StatusCode::CONFLICT,
+                r#"{"error":"conflict:project_document:revision_conflict"}"#.to_owned(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_stored_event(client.keys());
+        let error = client.submit_project_command(&event).await.unwrap_err();
+        assert!(matches!(error, CliError::Conflict(_)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn project_command_never_downgrades_ambiguity_to_definitive_rejection() {
+        let (url, attempts) = test_server(|attempt| {
+            if attempt == 1 {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    r#"{"error":"gateway timeout"}"#.to_owned(),
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"unavailable:project_document:disabled"}"#.to_owned(),
+                )
+            }
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_stored_event(client.keys());
+        let delivery = client
+            .submit_project_command(&event)
+            .await
+            .expect("ambiguous delivery is a typed outcome");
+        assert!(matches!(delivery, ProjectCommandDelivery::Ambiguous { .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     /// A moderation command (kind 9040) that fails the first attempt with HTTP 429

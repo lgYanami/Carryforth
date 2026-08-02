@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Exercise migrations against a disposable database, then ask pgschema whether
-# migration-built Project View objects differ from schema/schema.sql.
+# migration-built Project View / Project Document objects differ from the
+# checked-in desired schema.
 
 set -euo pipefail
 
@@ -43,9 +44,10 @@ database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 export BUZZ_TEST_DATABASE_URL="${database_url}"
 export DATABASE_URL="${database_url}"
 
-if [[ -n "${PROJECT_VIEW_TEST_ARCHIVE:-}" ]]; then
+test_archive="${PROJECT_DOCUMENT_TEST_ARCHIVE:-${PROJECT_VIEW_TEST_ARCHIVE:-}}"
+if [[ -n "${test_archive}" ]]; then
   cargo nextest run \
-    --archive-file "${PROJECT_VIEW_TEST_ARCHIVE}" \
+    --archive-file "${test_archive}" \
     -E 'package(buzz-db) and test(migration::tests)' \
     --run-ignored ignored-only \
     --test-threads 1
@@ -65,11 +67,12 @@ fi
 
 # Every ignored migration test leaves the disposable base database at the
 # latest migration. Verify the ledger and an old, pre-Project-View query before
-# comparing only the Project View portion of desired state. Other legacy
-# trigger differences are tracked independently and must not weaken this gate.
+# comparing the Project View / Project Document portion of desired state. Other
+# legacy trigger differences are tracked independently and must not weaken this
+# gate.
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 -qtA \
-  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 31 AND success" \
+  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 35 AND success" \
   | grep -qx ok
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
@@ -90,19 +93,19 @@ PGSCHEMA_PLAN_PASSWORD=buzz_dev \
     --output-json "${plan_file}" \
     --no-color >/dev/null
 
-project_view_drift="$(
+project_protocol_drift="$(
   jq '[
     .groups[].steps[]?
     | select(
-        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime"; "i"))
-        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime"; "i"))
+        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document"; "i"))
+        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document"; "i"))
       )
   ]' "${plan_file}"
 )"
-if [[ "$(jq 'length' <<<"${project_view_drift}")" != "0" ]]; then
-  echo "Project View migration/schema drift detected:" >&2
-  jq . <<<"${project_view_drift}" >&2
+if [[ "$(jq 'length' <<<"${project_protocol_drift}")" != "0" ]]; then
+  echo "Project View / Project Document migration/schema drift detected:" >&2
+  jq . <<<"${project_protocol_drift}" >&2
   exit 1
 fi
 
-echo "Project View migration and schema-drift gates passed."
+echo "Project View / Project Document migration and schema-drift gates passed."

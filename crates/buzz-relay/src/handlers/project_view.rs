@@ -21,8 +21,16 @@ use buzz_db::project_view_v2::{
     PreparedV2RoleCommit, ProjectViewV2PrepareOutcome, ProjectViewV2ProjectObjectPrepareOutcome,
     ProjectViewV2WriteError, V2MembershipEntry,
 };
+use buzz_db::project_view_v3::{
+    PreparedV3ProjectObjectCommit, PreparedV3ProjectObjectHead, PreparedV3RoleCommit,
+    ProjectViewV3PrepareOutcome, ProjectViewV3ProjectObjectPrepareOutcome, ProjectViewV3WriteError,
+};
 use buzz_project_view::v2::{
     ProjectObjectCommand, RoleCommand, RoleContinuityChange, RoleContinuityError,
+};
+use buzz_project_view::v3::{
+    ProjectObjectCommandV3, ProjectViewInitializeV3, RoleCommandV3, V3ContractError,
+    V3ProjectObjectError, V3ReferenceError,
 };
 use buzz_project_view::{
     DomainError, Mutation, ProjectViewEntry, ProjectionPlan, MAX_MUTATION_CONTENT_BYTES,
@@ -43,7 +51,7 @@ const MUTATION_TAG: &str = "buzz-project-view-mutation";
 /// events, before the current member/ban lookup.
 #[must_use]
 pub(crate) fn credential_can_read(scopes: &[Scope], channel_ids: Option<&[uuid::Uuid]>) -> bool {
-    channel_ids.is_none() && (scopes.is_empty() || scopes.contains(&Scope::MessagesRead))
+    super::community_private::credential_can_read_community_private(scopes, channel_ids)
 }
 
 /// Return whether a Nostr filter can match at least one Project View kind.
@@ -184,11 +192,6 @@ async fn handle_mutation_inner(
             IngestError::Internal(format!("error: Project View status check failed: {error}"))
         })?
         .ok_or_else(|| IngestError::Unavailable("unavailable:project_view:community".to_owned()))?;
-    if !status.enabled {
-        return Err(IngestError::Unavailable(
-            "unavailable:project_view:disabled".to_owned(),
-        ));
-    }
     let relay_pubkey = state.relay_keypair.public_key();
     let schema_version = state
         .db
@@ -197,6 +200,42 @@ async fn handle_mutation_inner(
         .map_err(|error| {
             IngestError::Internal(format!("error: Project View schema lookup failed: {error}"))
         })?;
+    if schema_version == 3 {
+        if is_initialize_command(&event.content) {
+            let command = ProjectViewInitializeV3::from_json(&event.content)
+                .map_err(map_v3_contract_error)?;
+            return handle_v3_initialize(tenant, state, event, &command).await;
+        }
+        if !status.enabled {
+            return Err(IngestError::Unavailable(
+                "unavailable:project_view:disabled".to_owned(),
+            ));
+        }
+        if !state
+            .db
+            .project_view_v3_advertised_write_ready(tenant.community(), &relay_pubkey)
+            .await
+            .map_err(|error| {
+                IngestError::Internal(format!(
+                    "error: Project View v3 readiness check failed: {error}"
+                ))
+            })?
+        {
+            return Err(IngestError::Unavailable(
+                "unavailable:project_view:not_ready".to_owned(),
+            ));
+        }
+        return if is_project_object_command(&event.content) {
+            handle_v3_project_object_mutation(tenant, state, event).await
+        } else {
+            handle_v3_role_mutation(tenant, state, event).await
+        };
+    }
+    if !status.enabled {
+        return Err(IngestError::Unavailable(
+            "unavailable:project_view:disabled".to_owned(),
+        ));
+    }
     if schema_version == 2 {
         if !state
             .db
@@ -212,7 +251,7 @@ async fn handle_mutation_inner(
                 "unavailable:project_view:not_ready".to_owned(),
             ));
         }
-        return if is_v2_project_object_command(&event.content) {
+        return if is_project_object_command(&event.content) {
             handle_v2_project_object_mutation(tenant, state, event).await
         } else {
             handle_v2_role_mutation(tenant, state, event).await
@@ -347,7 +386,7 @@ async fn handle_mutation_inner(
     })
 }
 
-fn is_v2_project_object_command(content: &str) -> bool {
+fn is_project_object_command(content: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(content)
         .ok()
         .and_then(|value| {
@@ -363,6 +402,40 @@ fn is_v2_project_object_command(content: &str) -> bool {
                 "initialize" | "create" | "update" | "delete"
             )
         })
+}
+
+fn is_initialize_command(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("request")
+                .and_then(|request| request.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("initialize")
+}
+
+async fn handle_v3_initialize(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: Event,
+    command: &ProjectViewInitializeV3,
+) -> Result<IngestResult, IngestError> {
+    let outcome = state
+        .db
+        .initialize_project_view_v3(tenant.community(), &event, command, &state.relay_keypair)
+        .await
+        .map_err(map_v3_write_error)?;
+    let message = response_message(&outcome.result)?;
+    dispatch_v2_committed_events(tenant, state, &outcome.events).await;
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message,
+    })
 }
 
 async fn handle_v2_project_object_mutation(
@@ -708,6 +781,336 @@ async fn handle_v2_role_mutation(
         accepted: true,
         message,
     })
+}
+
+async fn handle_v3_project_object_mutation(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: Event,
+) -> Result<IngestResult, IngestError> {
+    let command = ProjectObjectCommandV3::from_json(&event.content).map_err(map_v3_object_error)?;
+    let mut write = state
+        .db
+        .begin_project_view_v3_write(tenant.community())
+        .await
+        .map_err(map_v3_write_error)?;
+    let prepared = match write
+        .prepare_project_object_command(&event, &command)
+        .await
+        .map_err(map_v3_write_error)?
+    {
+        ProjectViewV3ProjectObjectPrepareOutcome::Replayed(receipt) => {
+            write.rollback().await.map_err(map_v3_write_error)?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: response_message(&receipt.result)?,
+            });
+        }
+        ProjectViewV3ProjectObjectPrepareOutcome::Prepared(prepared) => prepared,
+    };
+    if prepared.projection_pubkey != state.relay_keypair.public_key() {
+        write.rollback().await.map_err(map_v3_write_error)?;
+        return Err(IngestError::Unavailable(
+            "unavailable:project_view:signer_rotation".to_owned(),
+        ));
+    }
+
+    let context = v3_projection_context(&prepared, event.id);
+    let mut object_projections = Vec::with_capacity(prepared.heads.len());
+    let mut entity_projections = Vec::with_capacity(prepared.entity_changes.len());
+    let mut changed_heads =
+        Vec::with_capacity(prepared.heads.len() + prepared.entity_changes.len());
+    for head in &prepared.heads {
+        let (object_id, projection, changed_head) = match head {
+            PreparedV3ProjectObjectHead::Role(role) => {
+                let entity = buzz_sdk::project_view_v3::V3EntityChange::Role(role.clone());
+                let projection =
+                    buzz_sdk::project_view_v3::build_entity_projection(&context, &entity)
+                        .map_err(v3_projection_build_error)?
+                        .sign_with_keys(&state.relay_keypair)
+                        .map_err(v3_projection_sign_error)?;
+                let changed = buzz_sdk::project_view_v3::changed_head_for_entity(
+                    &context,
+                    &entity,
+                    &projection,
+                )
+                .map_err(v3_projection_bind_error)?;
+                (role.role_id, projection, changed)
+            }
+            PreparedV3ProjectObjectHead::Object {
+                entry,
+                responsible_role_id,
+            } => {
+                let projection = buzz_sdk::project_view_v3::build_project_object_projection(
+                    &context,
+                    entry,
+                    *responsible_role_id,
+                )
+                .map_err(v3_projection_build_error)?
+                .sign_with_keys(&state.relay_keypair)
+                .map_err(v3_projection_sign_error)?;
+                let changed = buzz_sdk::project_view_v3::changed_head_for_project_object(
+                    &context,
+                    entry,
+                    &projection,
+                )
+                .map_err(v3_projection_bind_error)?;
+                (entry.id(), projection, changed)
+            }
+        };
+        object_projections.push(PreparedObjectProjection::new(object_id, projection));
+        changed_heads.push(changed_head);
+    }
+    for change in &prepared.entity_changes {
+        let entity = v3_entity_change(change)?;
+        let projection = buzz_sdk::project_view_v3::build_entity_projection(&context, &entity)
+            .map_err(v3_projection_build_error)?
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(v3_projection_sign_error)?;
+        changed_heads.push(
+            buzz_sdk::project_view_v3::changed_head_for_entity(&context, &entity, &projection)
+                .map_err(v3_projection_bind_error)?,
+        );
+        entity_projections.push(PreparedV2EntityProjection {
+            entity_type: change.entity_type(),
+            entity_id: change.entity_id(),
+            event: projection,
+        });
+    }
+    let meta_projection = buzz_sdk::project_view_v3::build_meta_projection(
+        &context,
+        v3_counts(prepared.counts),
+        prepared.membership_snapshot_event_id,
+        false,
+        &changed_heads,
+    )
+    .map_err(v3_projection_build_error)?
+    .sign_with_keys(&state.relay_keypair)
+    .map_err(v3_projection_sign_error)?;
+    let committed = write
+        .commit_project_object_command(PreparedV3ProjectObjectCommit {
+            command_event: event,
+            object_projections,
+            entity_projections,
+            meta_projection,
+        })
+        .await
+        .map_err(map_v3_write_error)?;
+    let message = response_message(&committed.receipt.result)?;
+    dispatch_v2_committed_events(tenant, state, &committed.events).await;
+    Ok(IngestResult {
+        event_id: nostr::EventId::from_byte_array(committed.receipt.change_id).to_hex(),
+        accepted: true,
+        message,
+    })
+}
+
+async fn handle_v3_role_mutation(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: Event,
+) -> Result<IngestResult, IngestError> {
+    let command = RoleCommandV3::from_json(&event.content).map_err(map_v2_domain_error)?;
+    let mut write = state
+        .db
+        .begin_project_view_v3_write(tenant.community())
+        .await
+        .map_err(map_v3_write_error)?;
+    let prepared = match write
+        .prepare_role_command(&event, &command)
+        .await
+        .map_err(map_v3_write_error)?
+    {
+        ProjectViewV3PrepareOutcome::Replayed(receipt) => {
+            write.rollback().await.map_err(map_v3_write_error)?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: response_message(&receipt.result)?,
+            });
+        }
+        ProjectViewV3PrepareOutcome::Prepared(prepared) => prepared,
+    };
+    if prepared.projection_pubkey != state.relay_keypair.public_key() {
+        write.rollback().await.map_err(map_v3_write_error)?;
+        return Err(IngestError::Unavailable(
+            "unavailable:project_view:signer_rotation".to_owned(),
+        ));
+    }
+
+    let membership_projection = if prepared.membership_changed() {
+        Some(
+            build_membership_projection(&prepared.membership_after, prepared.canonical_time)?
+                .sign_with_keys(&state.relay_keypair)
+                .map_err(|error| {
+                    IngestError::Internal(format!(
+                        "error: sign atomic v3 membership projection: {error}"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+    let membership_event_id = membership_projection
+        .as_ref()
+        .map(|projection| projection.id)
+        .or(prepared.membership_snapshot_event_id)
+        .ok_or_else(|| {
+            IngestError::Internal("error: prepared v3 change has no membership snapshot".to_owned())
+        })?;
+    let context = buzz_sdk::project_view_v3::V3ProjectionContext {
+        project_id: prepared.community_id,
+        projection_generation: prepared.projection_generation,
+        project_revision: prepared.project_revision,
+        source: buzz_sdk::project_view_v3::V3ProjectionSource::NostrEvent {
+            change_id: event.id,
+            event_id: event.id,
+        },
+        updated_at: prepared.canonical_time,
+    };
+    let mut entity_projections = Vec::with_capacity(prepared.changes.len());
+    let mut object_projections = Vec::with_capacity(prepared.work_heads.len());
+    let mut changed_heads = Vec::with_capacity(prepared.changes.len() + prepared.work_heads.len());
+    for change in &prepared.changes {
+        let entity = v3_entity_change(change)?;
+        let projection = buzz_sdk::project_view_v3::build_entity_projection(&context, &entity)
+            .map_err(v3_projection_build_error)?
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(v3_projection_sign_error)?;
+        changed_heads.push(
+            buzz_sdk::project_view_v3::changed_head_for_entity(&context, &entity, &projection)
+                .map_err(v3_projection_bind_error)?,
+        );
+        entity_projections.push(PreparedV2EntityProjection {
+            entity_type: change.entity_type(),
+            entity_id: change.entity_id(),
+            event: projection,
+        });
+    }
+    for head in &prepared.work_heads {
+        let PreparedV3ProjectObjectHead::Object {
+            entry,
+            responsible_role_id,
+        } = head
+        else {
+            return Err(IngestError::Internal(
+                "error: v3 Role command prepared a non-Work object head".to_owned(),
+            ));
+        };
+        let projection = buzz_sdk::project_view_v3::build_project_object_projection(
+            &context,
+            entry,
+            *responsible_role_id,
+        )
+        .map_err(v3_projection_build_error)?
+        .sign_with_keys(&state.relay_keypair)
+        .map_err(v3_projection_sign_error)?;
+        changed_heads.push(
+            buzz_sdk::project_view_v3::changed_head_for_project_object(
+                &context,
+                entry,
+                &projection,
+            )
+            .map_err(v3_projection_bind_error)?,
+        );
+        object_projections.push(PreparedObjectProjection::new(entry.id(), projection));
+    }
+    let meta_projection = buzz_sdk::project_view_v3::build_meta_projection(
+        &context,
+        v3_counts(prepared.counts),
+        membership_event_id,
+        false,
+        &changed_heads,
+    )
+    .map_err(v3_projection_build_error)?
+    .sign_with_keys(&state.relay_keypair)
+    .map_err(v3_projection_sign_error)?;
+    let committed = write
+        .commit_role_command(PreparedV3RoleCommit {
+            command_event: event,
+            entity_projections,
+            object_projections,
+            meta_projection,
+            membership_projection,
+        })
+        .await
+        .map_err(map_v3_write_error)?;
+    let message = response_message(&committed.receipt.result)?;
+    dispatch_v2_committed_events(tenant, state, &committed.events).await;
+    Ok(IngestResult {
+        event_id: nostr::EventId::from_byte_array(committed.receipt.change_id).to_hex(),
+        accepted: true,
+        message,
+    })
+}
+
+fn v3_projection_context(
+    prepared: &buzz_db::project_view_v3::PreparedV3ProjectObjectChange,
+    source_event_id: nostr::EventId,
+) -> buzz_sdk::project_view_v3::V3ProjectionContext {
+    buzz_sdk::project_view_v3::V3ProjectionContext {
+        project_id: prepared.community_id,
+        projection_generation: prepared.projection_generation,
+        project_revision: prepared.project_revision,
+        source: buzz_sdk::project_view_v3::V3ProjectionSource::NostrEvent {
+            change_id: source_event_id,
+            event_id: source_event_id,
+        },
+        updated_at: prepared.canonical_time,
+    }
+}
+
+fn v3_counts(
+    counts: buzz_db::project_view_v2::V2CanonicalCounts,
+) -> buzz_sdk::project_view_v3::V3EntityCounts {
+    buzz_sdk::project_view_v3::V3EntityCounts {
+        active_objects: counts.active_objects,
+        open_proposals: counts.open_proposals,
+        active_assignments: counts.active_assignments,
+        active_commitments: counts.active_commitments,
+        checkpoints: counts.checkpoints,
+        handoffs: counts.handoffs,
+    }
+}
+
+fn v3_entity_change(
+    change: &RoleContinuityChange,
+) -> Result<buzz_sdk::project_view_v3::V3EntityChange, IngestError> {
+    Ok(match change {
+        RoleContinuityChange::Role(_) => {
+            return Err(IngestError::Internal(
+                "error: continuity-only v3 change produced a legacy Role head".to_owned(),
+            ));
+        }
+        RoleContinuityChange::Proposal(value) => {
+            buzz_sdk::project_view_v3::V3EntityChange::Proposal(value.clone())
+        }
+        RoleContinuityChange::Assignment(value) => {
+            buzz_sdk::project_view_v3::V3EntityChange::Assignment(value.clone())
+        }
+        RoleContinuityChange::Commitment(value) => {
+            buzz_sdk::project_view_v3::V3EntityChange::Commitment(value.clone())
+        }
+        RoleContinuityChange::Checkpoint(value) => {
+            buzz_sdk::project_view_v3::V3EntityChange::Checkpoint(value.clone())
+        }
+        RoleContinuityChange::Handoff(value) => {
+            buzz_sdk::project_view_v3::V3EntityChange::Handoff(value.clone())
+        }
+    })
+}
+
+fn v3_projection_build_error(error: buzz_sdk::SdkError) -> IngestError {
+    IngestError::Internal(format!("error: build Project View v3 projection: {error}"))
+}
+
+fn v3_projection_sign_error(error: nostr::event::builder::Error) -> IngestError {
+    IngestError::Internal(format!("error: sign Project View v3 projection: {error}"))
+}
+
+fn v3_projection_bind_error(error: buzz_sdk::SdkError) -> IngestError {
+    IngestError::Internal(format!("error: bind Project View v3 projection: {error}"))
 }
 
 fn build_membership_projection(
@@ -1078,6 +1481,94 @@ fn map_v2_write_error(error: ProjectViewV2WriteError) -> IngestError {
         }
         ProjectViewV2WriteError::InvalidCommit(reason) => {
             IngestError::Internal(format!("error: invalid Project View v2 commit: {reason}"))
+        }
+    }
+}
+
+fn map_v3_object_error(error: V3ProjectObjectError) -> IngestError {
+    match error {
+        V3ProjectObjectError::Object(error) => map_domain_error(error),
+        V3ProjectObjectError::Reference(V3ReferenceError::ContextCapabilityUnavailable) => {
+            IngestError::Unavailable("unavailable:project_view:context_capability".to_owned())
+        }
+        V3ProjectObjectError::Reference(V3ReferenceError::DocumentCapabilityUnavailable) => {
+            IngestError::Unavailable("unavailable:project_view:document_capability".to_owned())
+        }
+        V3ProjectObjectError::Reference(
+            V3ReferenceError::MissingDocumentProof { .. }
+            | V3ReferenceError::InactiveDocumentTarget { .. },
+        )
+        | V3ProjectObjectError::InvalidResourceTarget { .. } => {
+            IngestError::Conflict("conflict:project_view:reference_target".to_owned())
+        }
+        V3ProjectObjectError::ResourceStillContextReferenced { .. } => {
+            IngestError::Conflict("conflict:project_view:object_still_referenced".to_owned())
+        }
+        V3ProjectObjectError::Contract(_)
+        | V3ProjectObjectError::Reference(
+            V3ReferenceError::Contract(_) | V3ReferenceError::DuplicateProof { .. },
+        )
+        | V3ProjectObjectError::ResourceSourceReferenceForbidden => {
+            IngestError::Rejected("invalid:project_view:context_reference".to_owned())
+        }
+        V3ProjectObjectError::InvalidRoleLevels(reason) => IngestError::Internal(format!(
+            "error: invalid Project View v3 Role state: {reason}"
+        )),
+    }
+}
+
+fn map_v3_contract_error(error: V3ContractError) -> IngestError {
+    IngestError::Rejected(format!("invalid:project_view:initialize:{error}"))
+}
+
+fn map_v3_write_error(error: ProjectViewV3WriteError) -> IngestError {
+    match error {
+        ProjectViewV3WriteError::Unavailable { .. } => {
+            IngestError::Unavailable("unavailable:project_view:not_ready".to_owned())
+        }
+        ProjectViewV3WriteError::ObjectDomain(error) => map_v3_object_error(error),
+        ProjectViewV3WriteError::Contract(error) => map_v3_contract_error(error),
+        ProjectViewV3WriteError::RoleDomain(error) => map_v2_domain_error(error),
+        ProjectViewV3WriteError::ContinuityStorage(error) => map_v2_write_error(error),
+        ProjectViewV3WriteError::RuntimeSupervision(error) => match error {
+            buzz_db::project_runtime::RuntimeSupervisionError::CommandFence
+            | buzz_db::project_runtime::RuntimeSupervisionError::StaleEpoch
+            | buzz_db::project_runtime::RuntimeSupervisionError::AssignmentEnded
+            | buzz_db::project_runtime::RuntimeSupervisionError::BindingConflict => {
+                IngestError::Conflict("conflict:project_view:runtime_fence".to_owned())
+            }
+            buzz_db::project_runtime::RuntimeSupervisionError::Invalid(reason) => {
+                IngestError::Rejected(format!("invalid:project_view:runtime_supervision:{reason}"))
+            }
+            buzz_db::project_runtime::RuntimeSupervisionError::NotRegistered => {
+                IngestError::Rejected(
+                    "invalid:project_view:runtime_supervision:not_registered".to_owned(),
+                )
+            }
+            buzz_db::project_runtime::RuntimeSupervisionError::Database(error) => {
+                IngestError::Internal(format!(
+                    "error: Project View v3 runtime database failure: {error}"
+                ))
+            }
+            buzz_db::project_runtime::RuntimeSupervisionError::Sqlx(error) => {
+                IngestError::Internal(format!(
+                    "error: Project View v3 runtime SQL failure: {error}"
+                ))
+            }
+            buzz_db::project_runtime::RuntimeSupervisionError::Audit(error) => {
+                IngestError::Internal(format!(
+                    "error: Project View v3 runtime audit failure: {error}"
+                ))
+            }
+        },
+        ProjectViewV3WriteError::Database(error) => {
+            IngestError::Internal(format!("error: Project View v3 database failure: {error}"))
+        }
+        ProjectViewV3WriteError::Sqlx(error) => {
+            IngestError::Internal(format!("error: Project View v3 SQL failure: {error}"))
+        }
+        ProjectViewV3WriteError::InvalidCommit(reason) => {
+            IngestError::Internal(format!("error: invalid Project View v3 commit: {reason}"))
         }
     }
 }

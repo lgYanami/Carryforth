@@ -30,7 +30,7 @@ use crate::project_view_v2::{
 };
 use crate::SdkError;
 
-const ROLE_DIRECTORY_MAX_ENTRIES: usize = 32;
+pub(crate) const ROLE_DIRECTORY_MAX_ENTRIES: usize = 32;
 const ROLE_DIRECTORY_PURPOSE_MAX_CHARS: usize = 160;
 
 /// Stable source reference for one object or Role-continuity entity in a Brief.
@@ -661,6 +661,18 @@ impl VerifiedRoleBriefSnapshot {
         self.entries.get(&object_id)
     }
 
+    /// Exact signed source for one active ordinary object.
+    #[must_use]
+    pub fn object_source(&self, object_id: Uuid) -> Option<&RoleBriefSourceReference> {
+        self.objects.get(&object_id).map(|head| &head.source)
+    }
+
+    /// Exact signed source for one active Role.
+    #[must_use]
+    pub fn role_source(&self, role_id: Uuid) -> Option<&RoleBriefSourceReference> {
+        self.roles.get(&role_id).map(|head| &head.source)
+    }
+
     /// Iterate over canonical Role definitions by stable Role ID.
     pub fn roles(&self) -> impl Iterator<Item = &RoleDefinition> {
         self.roles.values().map(|head| &head.entity)
@@ -817,7 +829,7 @@ impl VerifiedRoleBriefSnapshot {
             .filter(|head| head.entity.is_active())
             .map(|head| (head.entity.role_id, head))
             .collect::<BTreeMap<_, _>>();
-        let mut entries = self
+        let entries = self
             .roles
             .values()
             .filter(|head| head.entity.active)
@@ -842,26 +854,7 @@ impl VerifiedRoleBriefSnapshot {
                 }
             })
             .collect::<Vec<_>>();
-        entries.sort_by_cached_key(|entry| {
-            (
-                !entry.is_current_member_role,
-                role_level_order(entry.level),
-                entry.name.to_lowercase(),
-                entry.role_id,
-            )
-        });
-
-        let total_active_roles = u32::try_from(entries.len())
-            .map_err(|_| invalid("active Role count exceeds Role Directory range"))?;
-        entries.truncate(ROLE_DIRECTORY_MAX_ENTRIES);
-        let shown_roles = u32::try_from(entries.len())
-            .map_err(|_| invalid("shown Role count exceeds Role Directory range"))?;
-
-        Ok(RoleBriefRoleDirectory {
-            total_active_roles,
-            entries,
-            omitted_active_roles: total_active_roles - shown_roles,
-        })
+        finalize_role_directory(entries)
     }
 
     fn responsible_work(&self, role_id: Uuid) -> Vec<RoleBriefResponsibleWork> {
@@ -1218,7 +1211,7 @@ pub fn render_role_brief_markdown(brief: &RoleBrief) -> String {
     output
 }
 
-fn render_role_directory(output: &mut String, directory: &RoleBriefRoleDirectory) {
+pub(crate) fn render_role_directory(output: &mut String, directory: &RoleBriefRoleDirectory) {
     if directory.total_active_roles == 0 {
         output.push_str("Role Directory: none (0 active)\n");
         return;
@@ -1839,7 +1832,7 @@ fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn role_directory_purpose_summary(value: &str) -> String {
+pub(crate) fn role_directory_purpose_summary(value: &str) -> String {
     let line = one_line(value);
     if line.chars().count() <= ROLE_DIRECTORY_PURPOSE_MAX_CHARS {
         return line;
@@ -1858,6 +1851,31 @@ const fn role_level_order(level: RoleLevel) -> u8 {
         RoleLevel::Admin => 0,
         RoleLevel::Member => 1,
     }
+}
+
+pub(crate) fn finalize_role_directory(
+    mut entries: Vec<RoleBriefRoleDirectoryEntry>,
+) -> Result<RoleBriefRoleDirectory, SdkError> {
+    entries.sort_by_cached_key(|entry| {
+        (
+            !entry.is_current_member_role,
+            role_level_order(entry.level),
+            entry.name.to_lowercase(),
+            entry.role_id,
+        )
+    });
+
+    let total_active_roles = u32::try_from(entries.len())
+        .map_err(|_| invalid("active Role count exceeds Role Directory range"))?;
+    entries.truncate(ROLE_DIRECTORY_MAX_ENTRIES);
+    let shown_roles = u32::try_from(entries.len())
+        .map_err(|_| invalid("shown Role count exceeds Role Directory range"))?;
+
+    Ok(RoleBriefRoleDirectory {
+        total_active_roles,
+        entries,
+        omitted_active_roles: total_active_roles - shown_roles,
+    })
 }
 
 fn unavailable_markdown(detail: &str) -> String {

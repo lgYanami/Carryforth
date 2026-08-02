@@ -1,6 +1,7 @@
 import {
   Activity,
   Bot,
+  FileText,
   FolderGit2,
   Inbox,
   LayoutDashboard,
@@ -19,9 +20,10 @@ import {
 } from "@/shared/ui/sidebar";
 import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
 
-type SidebarSelectedView =
+export type SidebarSelectedView =
   | "home"
   | "channel"
+  | "documents"
   | "messages"
   | "agents"
   | "workflows"
@@ -41,6 +43,7 @@ type AppSidebarPinnedHeaderProps = {
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
   onOpenSearchResult: (hit: SearchHit) => void;
   onSelectCommunity: () => void;
+  onSelectDocuments: () => void;
   onSelectChannel: (channelId: string) => void;
   searchChannels: Channel[];
   searchFocusRequest: number;
@@ -68,6 +71,7 @@ export function AppSidebarPinnedHeader({
   onOpenDm,
   onOpenSearchResult,
   onSelectCommunity,
+  onSelectDocuments,
   onSelectChannel,
   searchChannels,
   searchFocusRequest,
@@ -101,6 +105,20 @@ export function AppSidebarPinnedHeader({
             </span>
           </SidebarMenuButton>
         </SidebarMenuItem>
+        <FeatureGate feature="projectView">
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              data-testid="open-documents"
+              isActive={selectedView === "documents"}
+              onClick={onSelectDocuments}
+              tooltip={`${activeCommunityName} documents`}
+              type="button"
+            >
+              <FileText className="h-4 w-4" />
+              <SidebarMenuLabel>Documents</SidebarMenuLabel>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </FeatureGate>
       </SidebarMenu>
       <TopbarSearch
         channelLabels={channelLabels}
