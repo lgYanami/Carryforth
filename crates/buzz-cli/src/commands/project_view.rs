@@ -35,8 +35,8 @@ use uuid::Uuid;
 
 use crate::client::{create_response_with_id, normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_identity, read_verified_v2_snapshot, read_verified_v3_snapshot,
-    runtime_fence_from_env, ProjectViewIdentity, ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
+    read_identity, read_verified_v2_snapshot, read_verified_v3_snapshot, ProjectViewIdentity,
+    ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
 };
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
@@ -390,13 +390,11 @@ async fn submit_context_replacement(
         object.id,
         json!({ "context_references": context_references }),
     )?;
-    let acting_assignment = v3_acting_assignment_from_snapshot(client, snapshot)?;
-    let mut command = ProjectObjectCommandV3::new(
+    let command = ProjectObjectCommandV3::new(
         snapshot.meta().project_revision,
-        acting_assignment,
+        None,
         ProjectObjectRequestV3::Update(update),
     );
-    command.runtime_fence = runtime_fence_from_env()?;
     let event =
         client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?;
     let raw = submit_mutation(client, event.clone()).await?;
@@ -405,26 +403,6 @@ async fn submit_context_replacement(
     confirm_object_receipt(client, identity, object.object_type, object.id, &receipt).await?;
     println!("{}", normalize_write_response(&raw));
     Ok(())
-}
-
-fn v3_acting_assignment_from_snapshot(
-    client: &BuzzClient,
-    snapshot: &VerifiedRoleBriefSnapshotV3,
-) -> Result<Option<Uuid>, CliError> {
-    if !is_managed_runtime() {
-        return Ok(None);
-    }
-    snapshot
-        .assignments()
-        .find(|assignment| {
-            assignment.member_pubkey == client.public_key() && assignment.is_active()
-        })
-        .map(|assignment| Some(assignment.assignment_id))
-        .ok_or_else(|| {
-            CliError::Auth(
-                "assignment_unavailable: managed Agent has no active Assignment".to_owned(),
-            )
-        })
 }
 
 async fn cmd_get(client: &BuzzClient, format: &OutputFormat) -> Result<(), CliError> {
@@ -579,24 +557,20 @@ async fn cmd_create(
         }
         ProjectViewSchema::V2 => {
             let object = create_input(object_type, object_id, data)?;
-            let acting_assignment = v2_acting_assignment(client, identity).await?;
-            let mut command = ProjectObjectCommand::new(
+            let command = ProjectObjectCommand::new(
                 expected_project_revision,
-                acting_assignment,
+                None,
                 MutationRequest::Create(CreateMutation { object }),
             );
-            command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
         ProjectViewSchema::V3 => {
             let object = create_input_v3(object_type, object_id, data)?;
-            let acting_assignment = v2_acting_assignment(client, identity).await?;
-            let mut command = ProjectObjectCommandV3::new(
+            let command = ProjectObjectCommandV3::new(
                 expected_project_revision,
-                acting_assignment,
+                None,
                 ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
             );
-            command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
         }
     };
@@ -632,24 +606,20 @@ async fn cmd_update(
         }
         ProjectViewSchema::V2 => {
             let update = update_input(object_type, object_id, patch)?;
-            let acting_assignment = v2_acting_assignment(client, identity).await?;
-            let mut command = ProjectObjectCommand::new(
+            let command = ProjectObjectCommand::new(
                 expected_project_revision,
-                acting_assignment,
+                None,
                 MutationRequest::Update(update),
             );
-            command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
         ProjectViewSchema::V3 => {
             let update = update_input_v3(object_type, object_id, patch)?;
-            let acting_assignment = v2_acting_assignment(client, identity).await?;
-            let mut command = ProjectObjectCommandV3::new(
+            let command = ProjectObjectCommandV3::new(
                 expected_project_revision,
-                acting_assignment,
+                None,
                 ProjectObjectRequestV3::Update(update),
             );
-            command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
         }
     };
@@ -672,29 +642,25 @@ async fn cmd_delete(
             build_delete(expected_project_revision, object_type, object_id).map_err(sdk_err)?,
         )?,
         ProjectViewSchema::V2 => {
-            let acting_assignment = v2_acting_assignment(client, identity).await?;
-            let mut command = ProjectObjectCommand::new(
+            let command = ProjectObjectCommand::new(
                 expected_project_revision,
-                acting_assignment,
+                None,
                 MutationRequest::Delete(DeleteMutation {
                     object_type,
                     object_id,
                 }),
             );
-            command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
         ProjectViewSchema::V3 => {
-            let acting_assignment = v2_acting_assignment(client, identity).await?;
-            let mut command = ProjectObjectCommandV3::new(
+            let command = ProjectObjectCommandV3::new(
                 expected_project_revision,
-                acting_assignment,
+                None,
                 ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
                     object_type,
                     object_id,
                 }),
             );
-            command.runtime_fence = runtime_fence_from_env()?;
             client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
         }
     };
@@ -997,44 +963,6 @@ fn v3_object_output(entry: &ProjectViewEntryV3, snapshot: &VerifiedRoleBriefSnap
             "tombstone": tombstone,
         }),
     }
-}
-
-pub(crate) async fn v2_acting_assignment(
-    client: &BuzzClient,
-    identity: ProjectViewIdentity,
-) -> Result<Option<Uuid>, CliError> {
-    if !is_managed_runtime() {
-        return Ok(None);
-    }
-    let assignment_id = match identity.schema {
-        ProjectViewSchema::V2 => read_verified_v2_snapshot(client, identity)
-            .await
-            .map_err(assignment_read_error)?
-            .assignments()
-            .find(|assignment| {
-                assignment.member_pubkey == client.public_key() && assignment.is_active()
-            })
-            .map(|assignment| assignment.assignment_id),
-        ProjectViewSchema::V3 => read_verified_v3_snapshot(client, identity)
-            .await
-            .map_err(assignment_read_error)?
-            .assignments()
-            .find(|assignment| {
-                assignment.member_pubkey == client.public_key() && assignment.is_active()
-            })
-            .map(|assignment| assignment.assignment_id),
-        ProjectViewSchema::V1 => None,
-    }
-    .ok_or_else(|| {
-        CliError::Auth("assignment_unavailable: managed Agent has no active Assignment".to_owned())
-    })?;
-    Ok(Some(assignment_id))
-}
-
-fn assignment_read_error(error: CliError) -> CliError {
-    CliError::Auth(format!(
-        "assignment_unavailable: current Assignment could not be verified: {error}"
-    ))
 }
 
 fn create_input(

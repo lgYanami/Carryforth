@@ -1,5 +1,45 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-03 — 修复 Desktop Document mutation 字段命名不一致
+
+- 修复 Desktop 前端以camelCase提交`contentMarkdown`、`documentId`与
+  `expectedDocumentRevision`，而Tauri Rust嵌套mutation仍按snake_case反序列化的问题。
+- `ProjectDocumentMutation`现在保持`create/update/delete`的既有variant名称，同时统一按
+  camelCase接收variant字段；不改变Relay协议、Document revision或数据库数据。
+- 增加真实JSON边界回归，覆盖Desktop的create、update与delete payload，避免TypeScript
+  mock bridge绕过Rust Serde后再次掩盖契约漂移。
+
+## 2026-08-03 — 修复 managed Agent 普通 Document 写入授权边界
+
+- 修复 `buzz documents` 将所有 managed Agent create/update/delete 误判为 Role-bearing
+  command 的问题。第一方 CLI 现在默认同时省略 `acting_assignment_id` 与 `runtime_fence`，
+  不再要求 Project View v2、active Assignment 或 Runtime supervisor。
+- DB writer 将 Community eligibility 与可选 Role/Runtime 归因拆开：Human direct member或
+  owner仍合格的verified managed Agent均可执行普通Document CRUD；Project Role不建立第二套
+  Document ACL。
+- wire 中已有的Assignment/Runtime成对字段保持兼容。managed caller显式携带时仍严格验证
+  active Assignment与exact supervised Runtime；stale/ended/wrong claim拒绝且不能静默降级。
+- Relay不再把全部授权失败误报为`runtime_fence`，现可区分Community未授权、显式Assignment
+  冲突和Runtime fence失败。
+- 新增真实PostgreSQL回归，覆盖无Assignment/Runtime的managed Community writer、显式无效
+  Assignment、Human伪造归因、owner撤权，以及现有stale Runtime拒绝路径。
+- 详细事故与方案见
+  [`../bug/project-document-managed-agent-community-write-fix-design.md`](../bug/project-document-managed-agent-community-write-fix-design.md)。
+
+## 2026-08-03 — 澄清 Document strict writer 与 Project View Community writer 边界（已被后续修复覆盖）
+
+> 本节记录修复前的阶段性边界。上方同日决策已确认普通 Document CRUD 应与普通 Project
+> View对象一致地使用Community ACL；Runtime仅在显式Assignment-bearing command中强制。
+
+- Project View 修复了把 Assignment 当作 managed Agent 普通 CRUD 前置权限的错误；Resource
+  等普通 Project View 对象现在遵循 Community member授权，只有显式 Assignment-bearing
+  command才校验对应 Runtime。
+- 当时 Project Document 尚未随之放宽；managed Document create/update/delete仍被要求携带
+  active Assignment与exact current Runtime fence。该限制随后被上方缺陷修复取代。
+- 实现设计中原先“Document v1与Project View v3使用完全相同 managed write gate”的表述已
+  修正为：两者共享Community eligibility和wire-neutral RuntimeFence，但各自决定何时必须
+  进入Assignment/Runtime gate。本条仅澄清边界，不改变Document wire、数据或权限。
+
 ## 2026-08-02 — Project Context 最小核心语义完成
 
 阶段目标：在不扩张Role Brief v3、Context closure、协议、权限或客户端范围的前提下，让所有Buzz

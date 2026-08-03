@@ -693,12 +693,15 @@ kind `44300` v2 content：
 规则：
 
 - `schema_version`、`expected_project_revision` 必填；
-- `acting_assignment_id` 在角色身份动作中必填；
-- owner 治理、普通 Human Project View 编辑和候选 Proposal 操作可以为空；
-- known managed Agent 对普通 Project View 对象的修改必须携带 active Assignment；
-- 尚未分配的 managed Agent 只能执行读取、`request_role`、处理发给自己的 Proposal
-  等明确的 candidate operation，不能借此修改其他 Project 状态；
+- `acting_assignment_id` 在 Role-bearing 和非 owner Leader 治理动作中必填；
+- owner 治理、Human 或 managed Agent 的普通 Project View 编辑，以及候选 Proposal 操作
+  可以为空；
+- Community `owner/admin/member`（或 owner 仍合格的 verified managed Agent）是普通
+  Project View 读写权限来源；Project Role 不建立第二套 Project ACL；
+- 尚未分配的 managed Agent 不能执行 Role-bearing 或 Leader 行为，但可按 Community
+  资格执行普通 Project View CRUD、`request_role` 和自己的 candidate/creator operation；
 - `acting_assignment_id` 必须属于 event signer，且在事务内仍 active；
+- 普通写入若显式携带 Assignment，Relay 仍严格验证，失败时不能静默删除字段并降级重试；
 - operation、Role、Member 和 Assignment 只从签名 content 取得，不相信 display name；
 - payload 使用 closed typed schema，未知字段、枚举和 operation 拒绝；
 - 一个成功 command 只增加一次 project revision，即使它改变多个实体；
@@ -1246,7 +1249,8 @@ assignment belongs to current Community
 1. ACP 使用 Agent 自己的 pubkey 和精确 Relay URL；
 2. 读取 NIP-11，确认 `buzz-project-view-v2`；
 3. 查询自己的 active Assignment；
-4. 未分配时进入 candidate 状态，只能读取、处理 Proposal 或请求角色；
+4. 未分配时进入 candidate 状态：可读取、按 Community 资格执行普通 Project View CRUD、
+   处理自己的 Proposal 或请求角色，但不能执行 Role-bearing / Leader 行为；
 5. 已分配时读取 Role Brief；
 6. 每次 turn 前确认 meta/Assignment 未变化；
 7. 将最新 Brief 作为动态 `[Role Brief]` section 注入；
@@ -1262,7 +1266,7 @@ Role 不写入长期固定的 `BUZZ_ACP_SYSTEM_PROMPT`。该 prompt 可能跨 tu
 
 - 不使用旧 Assignment 继续角色写入；
 - 不把缓存 Brief 当作当前授权；
-- 可以保留不产生项目修改的诊断能力；
+- 可以保留诊断能力，以及经 Relay 重新验证的 Community-only 普通 Project View 操作；
 - 向 Human 明确报告 `assignment_unavailable` 或 `project_view_unavailable`。
 
 这是 fail closed，不是把一次网络失败解释为 Agent 已卸任。

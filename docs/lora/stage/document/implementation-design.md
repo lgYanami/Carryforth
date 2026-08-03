@@ -211,7 +211,7 @@ shape 增加字段会导致旧客户端误接收或误拒绝数据。
 - exact tags 和 closed content 解析；
 - credential scope、Community-global credential、current membership、ban / timeout；
 - capability enabled、schema version 与 stable signer readiness；
-- managed actor Assignment / Runtime fence；
+- 显式 Assignment-bearing managed actor 的 Runtime fence；
 - Relay projection 构造与签名；
 - 错误映射、metrics 和 commit 后 fan-out。
 
@@ -234,22 +234,23 @@ PostgreSQL 是 canonical truth。kind `40903 / 40904` 是可重建、Relay 签�
 投影；它们不采用 NIP-33 `created_at` last-write-wins，而由领域 revision 和数据库精确
 event pointer 管理 current。
 
-当前 managed ordinary-object fence 校验仍是 `project_view_v2.rs` 内部 helper，而且在
-active Assignment 没有 runtime supervisor binding 时会返回成功；它实际表达的是
-“已注册 supervision 才强制 fence”，不是无条件 managed fence。
+Project View ordinary-object write 以 Community membership 为权限来源，默认不携带
+Assignment。若调用者显式选择以 Assignment 归因，v2 仍使用 legacy optional-supervision
+policy 校验该 Assignment；它不是 managed ordinary write 的前置 ACL。
 
-Document 实施时把“actor 是否 managed → active Assignment ownership → supervisor
-binding → current leased Runtime fence”事务校验提取为 `buzz-db` 内部共用模块，并显式
-传 policy：
+Document 与 Project View 普通写入都以 Community eligibility 为基础权限。显式
+Assignment-bearing command 再通过 `buzz-db` 内部 Runtime 模块校验 Assignment ownership、
+supervisor binding 与 current leased Runtime fence，并显式传 policy：
 
 ```text
-LegacyOptionalSupervision   # 仅供 v2 兼容
-RequireSupervisedRuntime    # Document v1 与 Project View v3
+LegacyOptionalSupervision   # 仅供显式携带 Assignment 的 v2 command兼容
+RequireSupervisedRuntime    # Document v1 与 v3 Assignment-bearing command
 ```
 
-Document v1 和 v3 下，managed actor 没有 active binding、没有 current leased runtime
-coordinate 或 fence 不匹配都拒绝。v2 旧行为在 cutover 前保持兼容，不能复制两份 SQL 后
-分别演进，也不能把当前 helper 原样复用后声称已经强制 fence。
+Document v1 与 Project View v3 都只在命令显式以 Assignment 行动时使用 strict runtime
+policy；Community-only ordinary write和candidate command不携带两者。没有active binding、
+current leased runtime coordinate或fence不匹配的Assignment-bearing command都拒绝且不能
+静默降级。不能复制两份SQL后分别演进，也不能把Runtime fence误作Community ACL。
 
 ### 3.5 现有内容对象不能直接复用
 
@@ -386,13 +387,15 @@ parser 从一开始就认识 `context_references`，但 Community column
 Resource + mandatory Guide，而不会形成“Context 已可写、CLI / UI / Role Brief 却看不见”
 的半开放状态。
 
-由于 Document 写入需要复用 v2 的 managed Assignment / Runtime fence，本设计规定：
+Document capability依赖Project View提供稳定的Community / Project身份和跨域引用基础，但
+普通Document写入不依赖Role Continuity的Assignment / Runtime state。本设计规定：
 
 - Project View v1 Community 可以先部署 Document 表和 reader 代码，但不能 enable 或
   广告 Document capability；
 - `project_document_enabled = true` 的前置条件是该 Community 已经在 Project View
   v2 或 v3；
-- Human 与 managed Agent 因此始终使用同一套当前 actor / runtime 安全边界。
+- Human 与 managed Agent 共享当前 Community eligibility；仅显式携带Assignment的managed
+  writer额外要求active Assignment + exact Runtime，普通writer同时省略两者。
 
 这不把 Document revision 合并进 Project View；它只是部署 readiness 的安全依赖。
 
@@ -649,10 +652,13 @@ delete {
 - deleted ID 上的 create / update / delete 都失败；
 - title、summary、Markdown 完全相同的 update 是 `no_change`，不产生空 revision；
 - Human actor 必须同时省略 `acting_assignment_id / runtime_fence`；
-- managed Agent 必须同时提供当前 active Assignment ID 和 exact Runtime fence，不能只提供
-  其中一个；
-- Document managed write 使用 `RequireSupervisedRuntime`；NoBinding、无 current lease、
-  stale runtime ID / epoch 都返回 `restricted:project_document:runtime_fence`；
+- managed Agent 的普通 Community-authority write同样省略两者，不要求active Assignment或
+  Runtime supervisor；
+- managed Agent若显式归因到Assignment，必须成对提供当前active Assignment ID和exact
+  Runtime fence；该路径使用`RequireSupervisedRuntime`，NoBinding、无current lease、stale
+  runtime ID / epoch都返回`restricted:project_document:runtime_fence`；
+- 显式stale/ended/wrong Assignment返回`conflict:project_document:acting_assignment`，不能
+  删除归因字段后重试；
 - 一个 command 只修改一份 Document；v1 不提供 batch。
 
 ### 7.4 Identity 与 canonical time
@@ -1292,7 +1298,8 @@ Relay 处理一次 command：
 2. 检查 stable signer、capability enabled 和初步 current membership；
 3. begin Document write transaction 并取得 Community lock；
 4. transaction 内再次检查 Community 未 archived、capability 仍 enabled、actor / owner
-   仍合格、ban / timeout 和 managed Assignment / Runtime fence；
+   仍合格和ban / timeout；显式Assignment-bearing managed command再检查Assignment / Runtime
+   fence；
 5. 上述 gate 通过后才查 receipt；
 6. receipt 存在则验证其 canonical shape，rollback read transaction 并返回原结果；
 7. load current Document 和 `project_document_state`；
@@ -1498,7 +1505,7 @@ v1 不实现：
 | Actor | list / get / history | create / update / delete |
 |---|---:|---:|
 | current Human Community member | 允许 | 允许 |
-| current managed Agent + owner 合格 | 允许 | 需要 active Assignment + Runtime fence |
+| current managed Agent + owner 合格 | 允许 | 允许；普通写入不需要 Assignment / Runtime |
 | 已认证但不是 current member | 拒绝 | 拒绝 |
 | channel-restricted credential | 拒绝 | 拒绝 |
 | banned actor 或 managed owner | 拒绝 | 拒绝 |
@@ -3719,9 +3726,10 @@ frozen   --resume(post-commit, verified v3)--> normal
   只随 ack记录为诊断。`has_runtime`
   baseline 还必须逐条提交 runtime ack。NoBinding、duplicate binding、旧版 / 离线 ACP
   或“运行但没有 lease”的旧 host 因无法完成 assignment ack 都会阻止 freeze；
-- v3 把 `RequireSupervisedRuntime` 变成 managed write / admission invariant；无 binding
-  的 v2 legacy Assignment 必须在 cutover 前补齐，切到 v3 后不能继续依赖当前
-  `validate_runtime_command_fence_in_tx` 的 optional-supervision行为；
+- v3 把 `RequireSupervisedRuntime` 变成 managed Assignment-bearing Role command 的
+  admission invariant；无 binding 的 v2 legacy active Assignment 必须在 cutover 前补齐，
+  切到 v3 后不能继续用 optional-supervision执行 Leader 或 Role-bearing 行为。普通
+  Community-only Project View write不声称 Assignment，因此不经过该 Runtime gate；
 - `draining` 立即阻止新的 ACP turn admission、Runtime `Start` /
   `RecoveryAttempt` / `RecoverySucceeded` 和 scheduler claim，但允许 baseline runtime
   上报 `GracefulStop`、terminal failure 或 maintenance `suspended` ack；
@@ -5298,7 +5306,7 @@ Documents         │
 ```text
 没有 strict SDK parser → 不做 Tauri / ACP raw event接入
 没有 private read gate → 不 enable Document capability
-没有 managed fence → 不允许 managed Agent write
+没有 Community writer gate → 不允许 Human或managed Agent write
 没有 dual ACP reader + strict base RoleBriefV3 → 不切 v3 Community
 没有 reviewer-signed Guide mapping → 不切含 legacy Resource 的 Community
 没有 durable Assignment + Runtime baseline / ack / frozen fence → 不执行 v3 cutover
@@ -5319,7 +5327,8 @@ Documents         │
 6. Document ID 删除后不复用，普通 delete不是擦除。
 7. non-member、channel-restricted credential 和 wildcard query不能读取任何 Document
    protocol event。
-8. managed Agent 旧 Assignment /旧 Runtime不能写 Document。
+8. managed Agent 的普通Document写入不依赖Assignment / Runtime；显式声称的旧Assignment /
+   旧Runtime不能写Document且不能降级。
 9. list / Project View / Role Brief不携 Markdown 正文。
 10. Resource v3 使用开放 `resource_kind` 和 mandatory Guide，不再以 locator 为权威。
 11. 所有 Guide / Context target同 Project且符合 active / pinned规则。

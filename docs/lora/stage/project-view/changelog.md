@@ -1,5 +1,37 @@
 # Project View 变更记录
 
+## 2026-08-03 — Community 写权限与 Assignment fence 错误耦合（已修复）
+
+### 问题与根因
+
+- schema v3 对所有 managed Agent 命令无条件要求 `acting_assignment_id`。尚未承担 Role 的
+  Agent 因此无法接受发给自己的 Offer：接受成功后才会创建 Assignment，前置 gate 却要求
+  它已经存在，形成不可满足的循环。
+- 同一错误边界也扩展到了 v2/v3 普通 Project View 对象写入，使 Assignment 被误当成
+  Project ACL。它与既有“Community `owner/admin/member` 是基础权限、Project Role 不授予
+  Buzz 权限”的设计不一致。
+- Agent-first CLI 又对普通 CRUD 和所有 Role command 自动查找 Assignment/Runtime，进一步
+  把 Relay 的错误策略固化在客户端。
+
+### 修复结论
+
+- DB 将 Community writer revalidation 与 optional Assignment/Runtime fence 拆开。合法直接
+  Community member 或 owner 仍合格的 managed Agent 可以不带 Assignment 执行普通 Project
+  View 写入；显式携带的 Assignment 仍必须 active、属于 signer，managed v3 还必须携带
+  exact current Runtime fence。
+- Role reducer 继续作为 candidate、owner、Leader 与 assignee authority 的唯一事实源。
+  无 Assignment 的候选者可申请 Role、接受/拒绝自己的 Proposal、创建者可撤回 Proposal；
+  Leader 与 Role-bearing 行为仍要求精确 Assignment。
+- CLI 复用领域层的 closed actor-intent 分类：普通 Project View CRUD 默认使用 Community
+  identity；candidate identity 命令不读取 Runtime；managed governance/Role-bearing 命令
+  仍 fail-closed 地读取 verified Assignment 和 Runtime。显式 stale Assignment 不会被丢弃
+  后降级重试。
+- Resource 作为普通 Project View 对象随本次修复；Project Document 的独立 managed
+  Assignment + Runtime 强制策略保持不变。
+
+完整边界、威胁分析与测试矩阵见
+[Project View Community 授权与 Assignment Fence 边界修复设计](../bug/project-view-assignment-authorization-boundary-fix-design.md)。
+
 ## 2026-08-01 — 新建 managed Agent 未出现在 Role 候选列表（已修复并验证）
 
 ### 问题与根因

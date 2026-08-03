@@ -16,7 +16,7 @@ mod runtime_supervision;
 pub use project_object::ProjectObjectCommand;
 pub use role_continuity::{
     AssignmentEndReason, CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds,
-    HandoffCause, MemberGovernance, ProposalStatus, ProposalType, RoleAssignment,
+    HandoffCause, MemberGovernance, ProposalStatus, ProposalType, RoleActorIntent, RoleAssignment,
     RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent, RoleCommand, RoleCommandRequest,
     RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityOutcome,
     RoleContinuityReference, RoleContinuityState, RoleDefinition, RoleHandoff, RoleHandoffContent,

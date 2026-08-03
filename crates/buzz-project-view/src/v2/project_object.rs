@@ -23,10 +23,8 @@ pub struct ProjectObjectCommand {
     pub schema_version: u16,
     /// Project revision on which the caller based this intent.
     pub expected_project_revision: u64,
-    /// Active tenure from which a managed actor performs the write.
-    ///
-    /// Human Community members may omit this field. The Relay decides whether
-    /// a signer is a managed actor and therefore requires the fence.
+    /// Optional active tenure from which the actor attributes this write.
+    /// Community-authorized ordinary writes may omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting_assignment_id: Option<Uuid>,
     /// Current runtime epoch when the acting Assignment is supervised.

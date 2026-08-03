@@ -286,7 +286,13 @@ fn map_write_error(error: ProjectDocumentWriteError) -> IngestError {
         ProjectDocumentWriteError::Unavailable { .. } => {
             IngestError::Unavailable("unavailable:project_document:not_ready".to_owned())
         }
-        ProjectDocumentWriteError::Unauthorized => {
+        ProjectDocumentWriteError::NotAuthorized => {
+            IngestError::AuthFailed("restricted:project_document:not_authorized".to_owned())
+        }
+        ProjectDocumentWriteError::ActingAssignmentInvalid => {
+            IngestError::Conflict("conflict:project_document:acting_assignment".to_owned())
+        }
+        ProjectDocumentWriteError::RuntimeFence => {
             IngestError::AuthFailed("restricted:project_document:runtime_fence".to_owned())
         }
         ProjectDocumentWriteError::Domain(error) => map_domain_error(error),
@@ -405,6 +411,25 @@ mod tests {
         assert!(matches!(
             map_domain_error(DocumentError::NoChange),
             IngestError::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn writer_authority_failures_keep_distinct_stable_classes() {
+        assert!(matches!(
+            map_write_error(ProjectDocumentWriteError::NotAuthorized),
+            IngestError::AuthFailed(message)
+                if message == "restricted:project_document:not_authorized"
+        ));
+        assert!(matches!(
+            map_write_error(ProjectDocumentWriteError::ActingAssignmentInvalid),
+            IngestError::Conflict(message)
+                if message == "conflict:project_document:acting_assignment"
+        ));
+        assert!(matches!(
+            map_write_error(ProjectDocumentWriteError::RuntimeFence),
+            IngestError::AuthFailed(message)
+                if message == "restricted:project_document:runtime_fence"
         ));
     }
 

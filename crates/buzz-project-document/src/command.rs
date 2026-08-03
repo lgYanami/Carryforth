@@ -22,14 +22,15 @@ pub struct ProjectDocumentCommand {
     pub schema_version: u16,
     /// Revision observed by the caller: zero for create, positive for update or delete.
     pub expected_document_revision: u64,
-    /// Active Assignment used by a managed Agent. Human commands omit it.
+    /// Optional active Assignment explicitly claimed by a managed Agent.
+    /// Human and ordinary Community-authority commands omit it.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_non_null"
     )]
     pub acting_assignment_id: Option<Uuid>,
-    /// Exact supervised runtime paired with `acting_assignment_id`.
+    /// Exact supervised runtime paired with an explicitly claimed Assignment.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

@@ -24,10 +24,14 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::relay::{
     query_relay_at_with_keys, relay_api_base_url_with_override, submit_signed_event_at_with_keys,
-    SubmitEventResponse,
 };
 
 use super::project_view::{read_identity_at, ProjectViewIdentity, ProjectViewSchema};
+
+#[path = "project_view_role_receipt.rs"]
+mod receipt;
+
+use receipt::parse_role_receipt;
 
 /// A closed Human Role-governance intent.
 #[derive(Debug, Deserialize)]
@@ -246,21 +250,6 @@ pub struct RoleChangedEntity {
     entity_revision: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct RoleReceipt {
-    project_revision: u64,
-    operation: String,
-    changed_entities: Vec<RoleChangedEntity>,
-    proposal_id: Option<Uuid>,
-    assignment_id: Option<Uuid>,
-    target_assignment_id: Option<Uuid>,
-    work_id: Option<Uuid>,
-    responsible_role_id: Option<Uuid>,
-    commitment_id: Option<Uuid>,
-    checkpoint_id: Option<Uuid>,
-    handoff_id: Option<Uuid>,
-}
-
 struct RoleMutationContext {
     api_base_url: String,
     identity: ProjectViewIdentity,
@@ -330,13 +319,12 @@ async fn execute_role_mutation(
                 "unsupported: Role continuity requires Project View schema v2 or v3".to_owned(),
             )
         }
-        ProjectViewSchema::V2 => {
-            build_role_command(command).map_err(|error| format!("invalid Role intent: {error}"))?
-        }
+        ProjectViewSchema::V2 => build_role_command(command.clone())
+            .map_err(|error| format!("invalid Role intent: {error}"))?,
         ProjectViewSchema::V3 => build_v3_role_command(RoleCommandV3::new(
             command.expected_project_revision,
             command.acting_assignment_id,
-            command.request,
+            command.request.clone(),
         ))
         .map_err(|error| format!("invalid Role v3 intent: {error}"))?,
     };
@@ -362,7 +350,7 @@ async fn execute_role_mutation(
             }
             Err(message) => return Err(message),
         };
-    let receipt = parse_role_receipt(&response, &event)?;
+    let receipt = parse_role_receipt(&response, &event, &command)?;
     confirm_role_meta(state, &context, &event, receipt.project_revision).await?;
     Ok(ProjectViewRoleMutationResult::Applied {
         event_id: event.id.to_hex(),
@@ -583,24 +571,6 @@ fn parse_candidate_pubkey(value: &str) -> Result<PublicKey, String> {
     Ok(candidate)
 }
 
-fn parse_role_receipt(
-    response: &SubmitEventResponse,
-    event: &Event,
-) -> Result<RoleReceipt, String> {
-    if response.event_id != event.id.to_hex() {
-        return Err(
-            "Project View integrity error: Role response event_id differs from the submitted event"
-                .to_owned(),
-        );
-    }
-    let payload = response.message.strip_prefix("response:").ok_or_else(|| {
-        "Project View integrity error: Role receipt is missing the canonical `response:` prefix"
-            .to_owned()
-    })?;
-    serde_json::from_str(payload)
-        .map_err(|error| format!("Project View integrity error: invalid Role receipt: {error}"))
-}
-
 async fn confirm_role_meta(
     state: &AppState,
     context: &RoleMutationContext,
@@ -670,6 +640,7 @@ async fn read_role_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::SubmitEventResponse;
 
     #[test]
     fn offer_is_closed_and_generates_a_fresh_proposal() {
@@ -703,6 +674,111 @@ mod tests {
         assert!(proposal_deadline(0).is_err());
         assert!(proposal_deadline(721).is_err());
         assert!(proposal_deadline(72).is_ok());
+    }
+
+    #[test]
+    fn v3_offer_receipt_is_normalized_for_role_confirmation() {
+        let candidate =
+            PublicKey::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("candidate");
+        let (command, _) = prepare_role_command(ProjectViewRoleMutationInput::OfferRole {
+            expected_project_revision: 10,
+            role_id: Uuid::new_v4(),
+            candidate_pubkey: candidate.to_hex(),
+            expires_in_hours: 72,
+            reason: None,
+            acting_assignment_id: None,
+        })
+        .expect("prepare offer");
+        let proposal_id = match &command.request {
+            RoleCommandRequest::OfferRole { proposal_id, .. } => *proposal_id,
+            _ => panic!("expected offer"),
+        };
+        let event = build_v3_role_command(RoleCommandV3::new(
+            command.expected_project_revision,
+            command.acting_assignment_id,
+            command.request.clone(),
+        ))
+        .expect("build v3 Role command")
+        .sign_with_keys(&Keys::generate())
+        .expect("sign v3 Role command");
+        let response = SubmitEventResponse {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                json!({
+                    "schema_version": 3,
+                    "operation": "offer_role",
+                    "project_revision": 11,
+                    "entities": [{
+                        "entity_type": "role_assignment_proposal",
+                        "entity_id": proposal_id,
+                        "entity_revision": 1,
+                    }],
+                    "work_objects": [],
+                })
+            ),
+        };
+
+        let receipt =
+            parse_role_receipt(&response, &event, &command).expect("normalize v3 receipt");
+
+        assert_eq!(receipt.project_revision, 11);
+        assert_eq!(receipt.operation, "offer_role");
+        assert_eq!(receipt.proposal_id, Some(proposal_id));
+        assert_eq!(receipt.changed_entities.len(), 1);
+    }
+
+    #[test]
+    fn v3_role_receipt_rejects_a_different_operation() {
+        let candidate =
+            PublicKey::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("candidate");
+        let (command, _) = prepare_role_command(ProjectViewRoleMutationInput::OfferRole {
+            expected_project_revision: 10,
+            role_id: Uuid::new_v4(),
+            candidate_pubkey: candidate.to_hex(),
+            expires_in_hours: 72,
+            reason: None,
+            acting_assignment_id: None,
+        })
+        .expect("prepare offer");
+        let proposal_id = match &command.request {
+            RoleCommandRequest::OfferRole { proposal_id, .. } => *proposal_id,
+            _ => panic!("expected offer"),
+        };
+        let event = build_v3_role_command(RoleCommandV3::new(
+            command.expected_project_revision,
+            command.acting_assignment_id,
+            command.request.clone(),
+        ))
+        .expect("build v3 Role command")
+        .sign_with_keys(&Keys::generate())
+        .expect("sign v3 Role command");
+        let response = SubmitEventResponse {
+            event_id: event.id.to_hex(),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                json!({
+                    "schema_version": 3,
+                    "operation": "request_role",
+                    "project_revision": 11,
+                    "entities": [{
+                        "entity_type": "role_assignment_proposal",
+                        "entity_id": proposal_id,
+                        "entity_revision": 1,
+                    }],
+                    "work_objects": [],
+                })
+            ),
+        };
+
+        let error = parse_role_receipt(&response, &event, &command)
+            .expect_err("receipt operation must match the signed Role command");
+
+        assert!(error.contains("v3 Role receipt does not match"));
     }
 
     #[test]

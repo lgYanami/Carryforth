@@ -3261,6 +3261,151 @@ mod tests {
         community_id
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn managed_community_writer_does_not_require_role_assignment() {
+        let scratch = ScratchDatabase::create("buzz_pv_community_writer").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap Community owner");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+             VALUES ($1, $2, NULL), ($1, $3, $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .bind(agent.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("register owner-backed managed Agent");
+
+        let mut tx = scratch.pool.begin().await.expect("begin writer gate check");
+        let actor_access = crate::project_view_v3::validate_v3_community_writer_in_tx(
+            &mut tx,
+            community_id,
+            agent.public_key(),
+        )
+        .await
+        .expect("owner-backed Agent is a Community Project View writer");
+        crate::project_view_v3::validate_v3_optional_assignment_fence_in_tx(
+            &mut tx,
+            community_id,
+            agent.public_key(),
+            actor_access,
+            None,
+            None,
+        )
+        .await
+        .expect("schema-v3 Community-only write omits Assignment and Runtime");
+        crate::project_view_v2::validate_project_object_actor_fence(
+            &mut tx,
+            community_id,
+            agent.public_key(),
+            None,
+            None,
+            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+        )
+        .await
+        .expect("schema-v2 Community-only write omits Assignment and Runtime");
+
+        let stale_assignment = Uuid::new_v4();
+        assert!(matches!(
+            crate::project_view_v3::validate_v3_optional_assignment_fence_in_tx(
+                &mut tx,
+                community_id,
+                agent.public_key(),
+                actor_access,
+                Some(stale_assignment),
+                None,
+            )
+            .await,
+            Err(crate::project_view_v3::ProjectViewV3WriteError::RoleDomain(
+                RoleContinuityError::ActingAssignmentInvalid
+            ))
+        ));
+        assert!(matches!(
+            crate::project_view_v2::validate_project_object_actor_fence(
+                &mut tx,
+                community_id,
+                agent.public_key(),
+                Some(stale_assignment),
+                None,
+                crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+            )
+            .await,
+            Err(ProjectViewV2WriteError::Domain(
+                RoleContinuityError::ActingAssignmentInvalid
+            ))
+        ));
+
+        let moderator = Keys::generate();
+        sqlx::query(
+            "INSERT INTO community_bans \
+                (community_id, pubkey, banned, actor_pubkey) \
+             VALUES ($1, $2, true, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(agent.public_key().as_bytes())
+        .bind(moderator.public_key().as_bytes())
+        .execute(&mut *tx)
+        .await
+        .expect("ban managed Agent");
+        assert!(matches!(
+            crate::project_view_v3::validate_v3_community_writer_in_tx(
+                &mut tx,
+                community_id,
+                agent.public_key(),
+            )
+            .await,
+            Err(crate::project_view_v3::ProjectViewV3WriteError::RoleDomain(
+                RoleContinuityError::NotAuthorized
+            ))
+        ));
+        sqlx::query("DELETE FROM community_bans WHERE community_id = $1 AND pubkey = $2")
+            .bind(community_id.as_uuid())
+            .bind(agent.public_key().as_bytes())
+            .execute(&mut *tx)
+            .await
+            .expect("clear managed Agent ban");
+
+        let ineligible_owner = Keys::generate();
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community_id.as_uuid())
+            .bind(ineligible_owner.public_key().as_bytes())
+            .execute(&mut *tx)
+            .await
+            .expect("register owner identity without Community membership");
+        sqlx::query(
+            "UPDATE users SET agent_owner_pubkey = $3 \
+             WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(agent.public_key().as_bytes())
+        .bind(ineligible_owner.public_key().as_bytes())
+        .execute(&mut *tx)
+        .await
+        .expect("replace owner with an ineligible identity");
+        assert!(matches!(
+            crate::project_view_v3::validate_v3_community_writer_in_tx(
+                &mut tx,
+                community_id,
+                agent.public_key(),
+            )
+            .await,
+            Err(crate::project_view_v3::ProjectViewV3WriteError::RoleDomain(
+                RoleContinuityError::NotAuthorized
+            ))
+        ));
+        tx.rollback().await.expect("release writer gate check");
+
+        scratch.cleanup().await;
+    }
+
     fn initialize_mutation() -> Mutation {
         Mutation::new(
             0,
@@ -6768,7 +6913,7 @@ mod tests {
             stale_write
                 .prepare_command(&stale_event, &stale_update)
                 .await,
-            Err(ProjectDocumentWriteError::Unauthorized)
+            Err(ProjectDocumentWriteError::RuntimeFence)
         ));
         stale_write
             .rollback()

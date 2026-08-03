@@ -139,6 +139,78 @@ async fn read_context_with_revision(revision: Event) -> (Arc<AppState>, Document
     (state, context)
 }
 
+fn mutation_input(mutation: Value) -> Value {
+    json!({
+        "communityKey": "community-a",
+        "projectId": "00000000-0000-4000-8000-000000000001",
+        "relayPubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "projectionGeneration": 3,
+        "mutation": mutation,
+    })
+}
+
+#[test]
+fn desktop_mutation_payload_deserializes_camel_case_variant_fields() {
+    let create_id = Uuid::new_v4();
+    let create: MutateProjectDocumentInput = serde_json::from_value(mutation_input(json!({
+        "type": "create",
+        "documentId": create_id,
+        "title": "Decision",
+        "summary": "Accepted decision",
+        "contentMarkdown": "# Decision\n",
+    })))
+    .expect("deserialize frontend create payload");
+    assert!(matches!(
+        create.mutation,
+        ProjectDocumentMutation::Create {
+            document_id: Some(document_id),
+            title,
+            summary: Some(summary),
+            content_markdown,
+        } if document_id == create_id
+            && title == "Decision"
+            && summary == "Accepted decision"
+            && content_markdown == "# Decision\n"
+    ));
+
+    let document_id = Uuid::new_v4();
+    let update: MutateProjectDocumentInput = serde_json::from_value(mutation_input(json!({
+        "type": "update",
+        "documentId": document_id,
+        "expectedDocumentRevision": 7,
+        "title": "Runbook",
+        "summary": null,
+        "contentMarkdown": "# Recover\n",
+    })))
+    .expect("deserialize frontend update payload");
+    assert!(matches!(
+        update.mutation,
+        ProjectDocumentMutation::Update {
+            document_id: parsed_id,
+            expected_document_revision: 7,
+            title,
+            summary: None,
+            content_markdown,
+        } if parsed_id == document_id
+            && title == "Runbook"
+            && content_markdown == "# Recover\n"
+    ));
+
+    let delete: MutateProjectDocumentInput = serde_json::from_value(mutation_input(json!({
+        "type": "delete",
+        "documentId": document_id,
+        "expectedDocumentRevision": 8,
+    })))
+    .expect("deserialize frontend delete payload");
+    assert!(matches!(
+        delete.mutation,
+        ProjectDocumentMutation::Delete {
+            document_id: parsed_id,
+            expected_document_revision: 8,
+        } if parsed_id == document_id
+    ));
+}
+
 #[test]
 fn desktop_mutations_are_closed_full_snapshots() {
     let document_id = Uuid::new_v4();

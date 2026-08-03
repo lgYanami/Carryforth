@@ -996,7 +996,51 @@ pub enum RoleCommandRequest {
     },
 }
 
+/// Assignment-fence intent shared by Role command producers and the reducer.
+///
+/// This is only a routing classification. Current Project state still decides
+/// whether the signer is the candidate, creator, Community owner, Leader, or
+/// assignee authorized for the concrete command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleActorIntent {
+    /// A stable Community identity action that does not act through a Role.
+    CommunityIdentity,
+    /// Candidate identity when the signer matches, otherwise governance.
+    CandidateOrGovernor,
+    /// Community-owner or Leader governance.
+    Governor,
+    /// An action performed through the signer's active Assignment.
+    RoleBearing,
+}
+
 impl RoleCommandRequest {
+    /// Classify whether command assembly needs Assignment-bearing context.
+    ///
+    /// Actor-dependent authorization remains a reducer responsibility. In
+    /// particular, [`Self::RejectProposal`] is identity-scoped for the
+    /// candidate and governance-scoped for every other signer.
+    #[must_use]
+    pub const fn actor_intent(&self) -> RoleActorIntent {
+        match self {
+            Self::RequestRole { .. }
+            | Self::AcceptProposal { .. }
+            | Self::WithdrawProposal { .. }
+            | Self::ExpireProposal { .. } => RoleActorIntent::CommunityIdentity,
+            Self::RejectProposal { .. } => RoleActorIntent::CandidateOrGovernor,
+            Self::OfferRole { .. }
+            | Self::AuthorizeProposal { .. }
+            | Self::EndAssignment { .. }
+            | Self::SetWorkResponsibility { .. } => RoleActorIntent::Governor,
+            Self::RequestReplacement { .. }
+            | Self::ReportUnableToContinue { .. }
+            | Self::AcceptWork { .. }
+            | Self::EndCommitment { .. }
+            | Self::ReplaceCommitment { .. }
+            | Self::AppendCheckpoint { .. }
+            | Self::AppendHandoff { .. } => RoleActorIntent::RoleBearing,
+        }
+    }
+
     /// Stable operation spelling.
     #[must_use]
     pub const fn operation(&self) -> &'static str {
@@ -1898,27 +1942,16 @@ impl RoleContinuityState {
         }
 
         let active = self.active_assignment_for_member(actor);
-        let role_action_requires_fence = matches!(
-            &command.request,
-            RoleCommandRequest::RequestReplacement { .. }
-                | RoleCommandRequest::ReportUnableToContinue { .. }
-                | RoleCommandRequest::AcceptWork { .. }
-                | RoleCommandRequest::EndCommitment { .. }
-                | RoleCommandRequest::ReplaceCommitment { .. }
-                | RoleCommandRequest::AppendCheckpoint { .. }
-                | RoleCommandRequest::AppendHandoff { .. }
-        );
-        if role_action_requires_fence && command.acting_assignment_id.is_none() {
+        let actor_intent = command.request.actor_intent();
+        if actor_intent == RoleActorIntent::RoleBearing && command.acting_assignment_id.is_none() {
             return Err(RoleContinuityError::ActingAssignmentRequired);
         }
         if member.is_managed_agent()
             && active.is_some()
             && command.acting_assignment_id.is_none()
-            && !matches!(
-                &command.request,
-                RoleCommandRequest::AcceptProposal { .. }
-                    | RoleCommandRequest::RejectProposal { .. }
-                    | RoleCommandRequest::WithdrawProposal { .. }
+            && matches!(
+                actor_intent,
+                RoleActorIntent::Governor | RoleActorIntent::RoleBearing
             )
         {
             return Err(RoleContinuityError::ActingAssignmentRequired);
@@ -3648,6 +3681,59 @@ mod tests {
             .assignments
             .get(&assignment_id)
             .is_some_and(RoleAssignment::is_active));
+    }
+
+    #[test]
+    fn assigned_managed_member_requests_another_role_as_community_identity() {
+        let owner = pubkey();
+        let agent = pubkey();
+        let current_role = Uuid::new_v4();
+        let requested_role = Uuid::new_v4();
+        let current_assignment = Uuid::new_v4();
+        let current = state(
+            vec![
+                RoleSlot {
+                    role_id: current_role,
+                    level: RoleLevel::Member,
+                    active: true,
+                },
+                RoleSlot {
+                    role_id: requested_role,
+                    level: RoleLevel::Member,
+                    active: true,
+                },
+            ],
+            vec![
+                member(owner, Some(CommunityMemberRole::Owner)),
+                managed_member(agent, owner, CommunityMemberRole::Member),
+            ],
+            vec![assignment(current_assignment, current_role, agent)],
+        );
+        let proposal_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let request = RoleCommand::new(
+            7,
+            None,
+            RoleCommandRequest::RequestRole {
+                proposal_id,
+                role_id: requested_role,
+                expires_at: now + Duration::days(2),
+                reason: None,
+            },
+        );
+
+        let (next, _) = current
+            .reduce(&request, agent, now, &ids(0))
+            .expect("candidate request does not claim the current Role");
+        let proposal = next
+            .proposals()
+            .find(|proposal| proposal.proposal_id == proposal_id)
+            .expect("open role request");
+        assert_eq!(
+            proposal.expected_candidate_assignment_id,
+            Some(current_assignment)
+        );
+        assert!(proposal.authorized_at.is_none());
     }
 
     #[test]

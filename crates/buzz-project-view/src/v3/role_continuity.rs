@@ -28,7 +28,7 @@ pub struct RoleCommandV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting_assignment_id: Option<Uuid>,
     /// Current supervised runtime epoch. DB coordination makes this mandatory
-    /// for every managed Agent in schema 3.
+    /// for managed Assignment-bearing commands in schema 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_fence: Option<RuntimeFence>,
     /// Closed continuity operation inherited byte-for-byte from v2.
@@ -137,6 +137,9 @@ pub fn validate_role_actor_for_v3_replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::{CommunityMemberRole, MemberGovernance, RoleLevel, RoleSlot};
+    use buzz_core::Keys;
+    use chrono::Duration;
 
     #[test]
     fn v2_and_v3_envelopes_are_fail_closed() {
@@ -157,5 +160,87 @@ mod tests {
             wrong.validate_for_submission(),
             Err(RoleContinuityError::UnsupportedSchema)
         );
+    }
+
+    #[test]
+    fn unassigned_managed_candidate_accepts_v3_offer_without_assignment_or_runtime() {
+        let owner = Keys::generate().public_key();
+        let candidate = Keys::generate().public_key();
+        let role_id = Uuid::new_v4();
+        let proposal_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture timestamp");
+        let state = RoleContinuityState::from_snapshot(
+            1,
+            vec![RoleSlot {
+                role_id,
+                level: RoleLevel::Member,
+                active: true,
+            }],
+            vec![
+                MemberGovernance {
+                    pubkey: owner,
+                    community_role: Some(CommunityMemberRole::Owner),
+                    eligible: true,
+                    managed_agent_owner: None,
+                },
+                MemberGovernance {
+                    pubkey: candidate,
+                    community_role: None,
+                    eligible: true,
+                    managed_agent_owner: Some(owner),
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid candidate state");
+        let offer = RoleCommandV3::new(
+            1,
+            None,
+            RoleCommandRequest::OfferRole {
+                proposal_id,
+                role_id,
+                candidate_pubkey: candidate,
+                expires_at: now + Duration::days(1),
+                reason: None,
+            },
+        );
+        let (offered, _) = reduce_role_command_v3(
+            &state,
+            &offer,
+            owner,
+            now,
+            &GeneratedRoleContinuityIds {
+                assignment_id: Uuid::new_v4(),
+                handoff_ids: Vec::new(),
+            },
+        )
+        .expect("owner offer");
+        let assignment_id = Uuid::new_v4();
+        let accept =
+            RoleCommandV3::new(2, None, RoleCommandRequest::AcceptProposal { proposal_id });
+
+        validate_role_actor_for_v3_replay(&offered, &accept, candidate)
+            .expect("candidate replay authorization");
+        let (accepted, _) = reduce_role_command_v3(
+            &offered,
+            &accept,
+            candidate,
+            now + Duration::seconds(1),
+            &GeneratedRoleContinuityIds {
+                assignment_id,
+                handoff_ids: Vec::new(),
+            },
+        )
+        .expect("candidate acceptance without a pre-existing Assignment");
+
+        let assignment = accepted
+            .assignments()
+            .find(|assignment| assignment.assignment_id == assignment_id)
+            .expect("new active Assignment");
+        assert_eq!(assignment.member_pubkey, candidate);
+        assert_eq!(assignment.role_id, role_id);
+        assert!(assignment.is_active());
     }
 }

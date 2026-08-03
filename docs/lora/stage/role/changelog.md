@@ -1,5 +1,25 @@
 # 角色连续性变更记录
 
+## 2026-08-03 — Role Assignment 恢复为行为 fence，而非 Project ACL
+
+- 修复 schema v3 通用 actor gate 对 managed Agent 无条件要求 Assignment 的逻辑错误。
+  Candidate 在接受 Offer 前没有目标 Assignment；现在其稳定 Member identity 可直接申请、
+  接受/拒绝自己的 Proposal或撤回自己创建的 Proposal，Relay 仍在事务内验证 Proposal
+  candidate/creator、Community 资格、revision 与 compound replacement fence。
+- `RoleActorIntent` 成为领域 crate 对 CLI 和 reducer 共享的 closed 分类，区分 Community
+  identity、candidate-or-governor、governor 与 Role-bearing command；actor-dependent 的
+  `reject_proposal` 最终权限仍由当前 verified state 判断，不把客户端分类当作授权。
+- managed Leader、Work Commitment、Checkpoint、Handoff、replacement/unable report 等
+  Role-bearing 行为继续要求当前 Assignment；schema v3 下还继续要求 exact supervised
+  Runtime。Role level 与 Community `admin/member` 的原子同步、active Role/Assignment
+  不变量均未改变。
+- Assignment 结束只撤销 Role identity。若 actor 的 Community member/owner-backed 资格仍
+  有效，它仍可执行普通 Project View CRUD；要撤销全部 Project View 权限必须使用
+  Community remove、owner 关系撤销、ban 或 timeout。
+
+实现依据见
+[Project View Community 授权与 Assignment Fence 边界修复设计](../bug/project-view-assignment-authorization-boundary-fix-design.md)。
+
 ## 2026-07-30 — 上下文完善阶段 D：真实 Agent 行为验收
 
 ### 真实 Project Space 行为

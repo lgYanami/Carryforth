@@ -52,9 +52,16 @@ pub enum ProjectDocumentWriteError {
         /// Host-derived Community identity.
         community_id: CommunityId,
     },
-    /// Actor membership, Assignment, or Runtime authority changed.
-    #[error("Project Document actor is no longer authorized")]
-    Unauthorized,
+    /// The actor or managed-Agent owner no longer passes the Community writer
+    /// gate.
+    #[error("Project Document actor is no longer authorized by the Community")]
+    NotAuthorized,
+    /// An explicitly claimed Assignment is not active for the signing actor.
+    #[error("Project Document acting Assignment is no longer valid")]
+    ActingAssignmentInvalid,
+    /// An explicitly claimed managed Runtime fence is missing or stale.
+    #[error("Project Document Runtime fence is missing or stale")]
+    RuntimeFence,
     /// A signed commit bundle does not exactly represent the locked basis.
     #[error("invalid prepared Project Document commit: {0}")]
     InvalidCommit(String),
@@ -2542,7 +2549,10 @@ async fn validate_actor_in_tx(
     .fetch_one(&mut **tx)
     .await?;
     if active_write_restriction_in_tx(tx, community_id, actor_bytes.as_slice()).await? {
-        return Err(ProjectDocumentWriteError::Unauthorized);
+        return Err(ProjectDocumentWriteError::NotAuthorized);
+    }
+    if acting_assignment_id.is_none() && runtime_fence.is_some() {
+        return Err(ProjectDocumentWriteError::RuntimeFence);
     }
 
     if let Some(owner) = owner {
@@ -2556,20 +2566,17 @@ async fn validate_actor_in_tx(
         .fetch_one(&mut **tx)
         .await?;
         if !owner_is_member || active_write_restriction_in_tx(tx, community_id, &owner).await? {
-            return Err(ProjectDocumentWriteError::Unauthorized);
-        }
-        if acting_assignment_id.is_none() {
-            return Err(ProjectDocumentWriteError::Unauthorized);
+            return Err(ProjectDocumentWriteError::NotAuthorized);
         }
     } else {
         if !direct_member {
-            return Err(ProjectDocumentWriteError::Unauthorized);
+            return Err(ProjectDocumentWriteError::NotAuthorized);
         }
         // Human Document commands never borrow Role/Runtime authority. This
         // keeps attribution unambiguous and prevents a stale optional v2 fence
         // from changing the meaning of a direct-member write.
         if acting_assignment_id.is_some() || runtime_fence.is_some() {
-            return Err(ProjectDocumentWriteError::Unauthorized);
+            return Err(ProjectDocumentWriteError::ActingAssignmentInvalid);
         }
     }
 
@@ -2585,10 +2592,14 @@ async fn validate_actor_in_tx(
         .fetch_one(&mut **tx)
         .await?;
         if !assignment_valid {
-            return Err(ProjectDocumentWriteError::Unauthorized);
+            return Err(ProjectDocumentWriteError::ActingAssignmentInvalid);
         }
     }
-    if managed {
+    // Ordinary managed-Agent Document writes use Community authority and carry
+    // no Role/Runtime attribution. When a managed caller explicitly claims an
+    // Assignment, preserve the existing strict supervised-Runtime guarantee;
+    // an invalid claim must never be silently downgraded to a Community write.
+    if managed && acting_assignment_id.is_some() {
         crate::project_runtime::validate_runtime_command_fence_in_tx(
             tx,
             community_id,
@@ -2597,7 +2608,7 @@ async fn validate_actor_in_tx(
             crate::project_runtime::RuntimeCommandFencePolicy::RequireSupervisedRuntime,
         )
         .await
-        .map_err(|_| ProjectDocumentWriteError::Unauthorized)?;
+        .map_err(|_| ProjectDocumentWriteError::RuntimeFence)?;
     }
     Ok(())
 }
@@ -3404,6 +3415,31 @@ mod tests {
         community_id
     }
 
+    async fn seed_managed_agent(
+        pool: &PgPool,
+        community_id: CommunityId,
+        owner: &Keys,
+        agent: &Keys,
+    ) {
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.public_key().as_bytes())
+        .execute(pool)
+        .await
+        .expect("seed managed Agent owner");
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) VALUES ($1, $2, $3)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(agent.public_key().as_bytes())
+        .bind(owner.public_key().as_bytes())
+        .execute(pool)
+        .await
+        .expect("seed managed Agent");
+    }
+
     fn whole_second_now() -> DateTime<Utc> {
         DateTime::from_timestamp(Utc::now().timestamp(), 0).expect("current timestamp")
     }
@@ -3605,6 +3641,105 @@ mod tests {
                 source_event_id: source.source_event_id,
             },
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn managed_community_writer_does_not_require_assignment_or_runtime() {
+        let scratch = ScratchDatabase::create("buzz_pd_managed_community_writer").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &owner).await;
+        seed_managed_agent(&scratch.pool, community_id, &owner, &agent).await;
+        bootstrap(&db, community_id, &relay).await;
+        enable_for_storage_test(&scratch.pool, community_id).await;
+
+        let document_id = Uuid::new_v4();
+        let create = create_command(document_id);
+        assert_eq!(create.acting_assignment_id, None);
+        assert_eq!(create.runtime_fence, None);
+        let create_event = command_event(&create, &agent);
+        let mut write = begin_storage_test_write(&db, community_id, relay.public_key())
+            .await
+            .expect("begin ordinary managed Document create");
+        assert_eq!(
+            write
+                .prepare_command(&create_event, &create)
+                .await
+                .expect("authorize ordinary managed Document create"),
+            ProjectDocumentPrepareOutcome::New
+        );
+        let context = write
+            .load_current(document_id)
+            .await
+            .expect("load ordinary managed Document target");
+        let prepared =
+            prepare(&context, create, create_event, &relay).expect("prepare managed projections");
+        let committed = write
+            .commit(prepared)
+            .await
+            .expect("commit ordinary managed Document create");
+        assert_eq!(committed.receipt.actor, agent.public_key());
+        assert_eq!(committed.receipt.acting_assignment_id, None);
+        assert_eq!(committed.receipt.document_revision, 1);
+
+        let explicit_assignment = Uuid::new_v4();
+        let explicit_runtime = buzz_core::RuntimeFence {
+            runtime_id: Uuid::new_v4(),
+            runtime_epoch: 1,
+        };
+        let claimed = update_command(document_id, 1, "claimed")
+            .with_runtime_fence(explicit_assignment, explicit_runtime);
+        let claimed_event = command_event(&claimed, &agent);
+        let mut claimed_write = begin_storage_test_write(&db, community_id, relay.public_key())
+            .await
+            .expect("begin explicit managed attribution check");
+        assert!(matches!(
+            claimed_write
+                .prepare_command(&claimed_event, &claimed)
+                .await,
+            Err(ProjectDocumentWriteError::ActingAssignmentInvalid)
+        ));
+        claimed_write
+            .rollback()
+            .await
+            .expect("release explicit managed attribution check");
+
+        let human_claim = update_command(document_id, 1, "human claim")
+            .with_runtime_fence(explicit_assignment, explicit_runtime);
+        let human_claim_event = command_event(&human_claim, &owner);
+        let mut human_claim_write = begin_storage_test_write(&db, community_id, relay.public_key())
+            .await
+            .expect("begin Human attribution check");
+        assert!(matches!(
+            human_claim_write
+                .prepare_command(&human_claim_event, &human_claim)
+                .await,
+            Err(ProjectDocumentWriteError::ActingAssignmentInvalid)
+        ));
+        human_claim_write
+            .rollback()
+            .await
+            .expect("release Human attribution check");
+
+        sqlx::query("DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2")
+            .bind(community_id.as_uuid())
+            .bind(owner.public_key().to_hex())
+            .execute(&scratch.pool)
+            .await
+            .expect("remove managed Agent owner from Community");
+        let update = update_command(document_id, 1, "after owner removal");
+        let (write, prepared) = prepare_for_commit(&db, community_id, update, &agent, &relay)
+            .await
+            .expect("prepare update after owner removal");
+        assert!(matches!(
+            write.commit(prepared).await,
+            Err(ProjectDocumentWriteError::NotAuthorized)
+        ));
+
+        scratch.cleanup().await;
     }
 
     #[tokio::test]
@@ -3933,7 +4068,7 @@ mod tests {
             .expect("load current before revoked replay");
         assert!(matches!(
             revoked_replay_tx.commit(prepared_create.clone()).await,
-            Err(ProjectDocumentWriteError::Unauthorized)
+            Err(ProjectDocumentWriteError::NotAuthorized)
         ));
         sqlx::query(
             "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'member')",
@@ -3965,7 +4100,7 @@ mod tests {
             .expect("load current before timed-out replay");
         assert!(matches!(
             timed_out_replay_tx.commit(prepared_create).await,
-            Err(ProjectDocumentWriteError::Unauthorized)
+            Err(ProjectDocumentWriteError::NotAuthorized)
         ));
         sqlx::query("DELETE FROM community_bans WHERE community_id = $1 AND pubkey = $2")
             .bind(community_id.as_uuid())

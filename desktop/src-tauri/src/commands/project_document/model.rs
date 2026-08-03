@@ -268,7 +268,12 @@ pub struct ProjectDocumentHistoryResult {
 
 /// Closed full-snapshot mutation accepted from the desktop editor.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ProjectDocumentMutation {
     Create {
         document_id: Option<Uuid>,

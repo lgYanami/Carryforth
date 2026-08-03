@@ -86,11 +86,11 @@ pub struct ProjectObjectCommandV3 {
     pub schema_version: u16,
     /// Exact canonical Project revision observed by the caller.
     pub expected_project_revision: u64,
-    /// Active Assignment used by a role-bearing or managed actor.
+    /// Optional active Assignment used to attribute and fence this write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting_assignment_id: Option<Uuid>,
-    /// Current supervised runtime epoch. A v3 managed actor is required by the
-    /// DB coordinator to supply both Assignment and fence.
+    /// Current supervised runtime epoch when a managed actor explicitly writes
+    /// through an Assignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_fence: Option<RuntimeFence>,
     /// Closed ordinary-object operation.

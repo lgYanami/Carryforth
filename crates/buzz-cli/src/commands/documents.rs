@@ -24,11 +24,6 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::{BuzzClient, ProjectCommandDelivery};
-use crate::commands::project_view::v2_acting_assignment;
-use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_identity as read_project_view_identity, runtime_fence_from_env,
-    ProjectViewSchema,
-};
 use crate::error::CliError;
 use crate::validate::{read_bounded_file_or_stdin, sdk_err};
 use crate::{DocumentsCmd, OutputFormat};
@@ -757,7 +752,6 @@ async fn submit_write(
         eprintln!("{SECRET_BOUNDARY_WARNING}");
     }
     let identity = require_identity(client).await?;
-    let command = attach_managed_runtime(client, command).await?;
     command
         .validate_for_submission()
         .map_err(|error| CliError::Usage(error.to_string()))?;
@@ -831,38 +825,6 @@ async fn submit_write(
             print_write_output(&raw, document_id, committed_revision, "readback")
         }
     }
-}
-
-async fn attach_managed_runtime(
-    client: &BuzzClient,
-    command: ProjectDocumentCommand,
-) -> Result<ProjectDocumentCommand, CliError> {
-    if !is_managed_runtime() {
-        return Ok(command);
-    }
-    let identity = read_project_view_identity(client)
-        .await?
-        .filter(|identity| identity.schema == ProjectViewSchema::V2)
-        .ok_or_else(|| {
-            CliError::Auth(
-                "assignment_unavailable: managed Document writes require Project View v2"
-                    .to_owned(),
-            )
-        })?;
-    let assignment_id = v2_acting_assignment(client, identity)
-        .await?
-        .ok_or_else(|| {
-            CliError::Auth(
-                "assignment_unavailable: managed Agent has no active Assignment".to_owned(),
-            )
-        })?;
-    let runtime_fence = runtime_fence_from_env()?.ok_or_else(|| {
-        CliError::Auth(
-            "runtime_unavailable: managed Document writes require an active Runtime fence"
-                .to_owned(),
-        )
-    })?;
-    Ok(command.with_runtime_fence(assignment_id, runtime_fence))
 }
 
 async fn confirm_write_revision(

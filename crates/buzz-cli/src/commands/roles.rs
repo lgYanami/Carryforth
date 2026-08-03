@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use buzz_core::PublicKey;
 use buzz_project_view::v2::{
-    HandoffCause, ProposalStatus, RoleAssignment, RoleAssignmentProposal, RoleCheckpointContent,
-    RoleCommand, RoleCommandRequest, RoleContinuityChange, RoleContinuityEntity, RoleDefinition,
-    RoleHandoffContent,
+    HandoffCause, ProposalStatus, RoleActorIntent, RoleAssignment, RoleAssignmentProposal,
+    RoleCheckpointContent, RoleCommand, RoleCommandRequest, RoleContinuityChange,
+    RoleContinuityEntity, RoleDefinition, RoleHandoffContent,
 };
 use buzz_project_view::v3::RoleCommandV3;
 use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
@@ -37,6 +37,12 @@ struct RoleSnapshot {
     meta: V2MetaProjection,
     roles: Vec<RoleDefinition>,
     assignments: Vec<RoleAssignment>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ManagedRoleState {
+    current_assignment: Option<Uuid>,
+    actor_is_proposal_candidate: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -876,28 +882,22 @@ async fn dispatch_handoff(
 async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), CliError> {
     let identity = require_role_identity(client).await?;
     if is_managed_runtime() {
-        let current_assignment = match identity.schema {
-            ProjectViewSchema::V2 => read_verified_v2_snapshot(client, identity)
-                .await
-                .map_err(assignment_read_error)?
-                .assignments()
-                .find(|assignment| {
-                    assignment.member_pubkey == client.public_key() && assignment.is_active()
-                })
-                .map(|assignment| assignment.assignment_id),
-            ProjectViewSchema::V3 => read_verified_v3_snapshot(client, identity)
-                .await
-                .map_err(assignment_read_error)?
-                .assignments()
-                .find(|assignment| {
-                    assignment.member_pubkey == client.public_key() && assignment.is_active()
-                })
-                .map(|assignment| assignment.assignment_id),
-            ProjectViewSchema::V1 => None,
+        let actor_intent = command.request.actor_intent();
+        let proposal_id = match &command.request {
+            RoleCommandRequest::RejectProposal { proposal_id, .. } => Some(*proposal_id),
+            _ => None,
+        };
+        let supplied_assignment = command.acting_assignment_id;
+        let needs_state =
+            supplied_assignment.is_some() || actor_intent != RoleActorIntent::CommunityIdentity;
+        let managed_state = if needs_state {
+            read_managed_role_state(client, identity, proposal_id).await?
+        } else {
+            ManagedRoleState::default()
         };
         if command
             .acting_assignment_id
-            .is_some_and(|provided| Some(provided) != current_assignment)
+            .is_some_and(|provided| Some(provided) != managed_state.current_assignment)
         {
             return Err(CliError::Conflict(
                 "provided acting Assignment is not the verified current Assignment".to_owned(),
@@ -906,7 +906,7 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
         match &command.request {
             RoleCommandRequest::RequestReplacement { assignment_id, .. }
             | RoleCommandRequest::ReportUnableToContinue { assignment_id, .. }
-                if Some(*assignment_id) != current_assignment =>
+                if Some(*assignment_id) != managed_state.current_assignment =>
             {
                 return Err(CliError::Conflict(
                     "target Assignment is not the verified current Assignment".to_owned(),
@@ -914,8 +914,30 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
             }
             _ => {}
         }
-        command.acting_assignment_id = current_assignment;
-        command.runtime_fence = runtime_fence_from_env()?;
+        if supplied_assignment.is_some()
+            || managed_command_requires_assignment(
+                actor_intent,
+                managed_state.actor_is_proposal_candidate,
+            )
+        {
+            let assignment_id = managed_state.current_assignment.ok_or_else(|| {
+                CliError::Auth(
+                    "assignment_unavailable: managed Role action has no active Assignment"
+                        .to_owned(),
+                )
+            })?;
+            let runtime_fence = runtime_fence_from_env()?.ok_or_else(|| {
+                CliError::Auth(
+                    "runtime_unavailable: managed Assignment-bearing Role action requires an active Runtime fence"
+                        .to_owned(),
+                )
+            })?;
+            command.acting_assignment_id = Some(assignment_id);
+            command.runtime_fence = Some(runtime_fence);
+        } else {
+            command.acting_assignment_id = None;
+            command.runtime_fence = None;
+        }
     }
     let event = match identity.schema {
         ProjectViewSchema::V2 => {
@@ -939,6 +961,71 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
     let response = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&response));
     Ok(())
+}
+
+async fn read_managed_role_state(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    proposal_id: Option<Uuid>,
+) -> Result<ManagedRoleState, CliError> {
+    let actor = client.public_key();
+    match identity.schema {
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity)
+                .await
+                .map_err(assignment_read_error)?;
+            Ok(managed_role_state(
+                actor,
+                proposal_id,
+                snapshot.assignments(),
+                snapshot.proposals(),
+            ))
+        }
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity)
+                .await
+                .map_err(assignment_read_error)?;
+            Ok(managed_role_state(
+                actor,
+                proposal_id,
+                snapshot.assignments(),
+                snapshot.proposals(),
+            ))
+        }
+        ProjectViewSchema::V1 => Ok(ManagedRoleState::default()),
+    }
+}
+
+fn managed_role_state<'a>(
+    actor: PublicKey,
+    proposal_id: Option<Uuid>,
+    assignments: impl Iterator<Item = &'a RoleAssignment>,
+    mut proposals: impl Iterator<Item = &'a RoleAssignmentProposal>,
+) -> ManagedRoleState {
+    ManagedRoleState {
+        current_assignment: assignments
+            .filter(|assignment| assignment.member_pubkey == actor && assignment.is_active())
+            .map(|assignment| assignment.assignment_id)
+            .next(),
+        actor_is_proposal_candidate: proposal_id.and_then(|proposal_id| {
+            proposals
+                .find(|proposal| proposal.proposal_id == proposal_id)
+                .map(|proposal| proposal.candidate_pubkey == actor)
+        }),
+    }
+}
+
+const fn managed_command_requires_assignment(
+    actor_intent: RoleActorIntent,
+    actor_is_proposal_candidate: Option<bool>,
+) -> bool {
+    match actor_intent {
+        RoleActorIntent::CommunityIdentity => false,
+        RoleActorIntent::CandidateOrGovernor => {
+            matches!(actor_is_proposal_candidate, Some(false))
+        }
+        RoleActorIntent::Governor | RoleActorIntent::RoleBearing => true,
+    }
 }
 
 async fn require_role_identity(client: &BuzzClient) -> Result<ProjectViewIdentity, CliError> {
@@ -1003,4 +1090,76 @@ fn integrity_error(message: impl Into<String>) -> CliError {
         "Project View v2 integrity error: {}",
         message.into()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buzz_core::Keys;
+
+    #[test]
+    fn managed_role_fences_follow_shared_operation_intent() {
+        let proposal_id = Uuid::new_v4();
+        let role_id = Uuid::new_v4();
+        let identity_requests = [
+            RoleCommandRequest::RequestRole {
+                proposal_id,
+                role_id,
+                expires_at: Utc::now() + Duration::hours(1),
+                reason: None,
+            },
+            RoleCommandRequest::AcceptProposal { proposal_id },
+            RoleCommandRequest::WithdrawProposal {
+                proposal_id,
+                reason: None,
+            },
+            RoleCommandRequest::ExpireProposal { proposal_id },
+        ];
+        for request in identity_requests {
+            assert_eq!(request.actor_intent(), RoleActorIntent::CommunityIdentity);
+            assert!(!managed_command_requires_assignment(
+                request.actor_intent(),
+                None
+            ));
+        }
+
+        let reject = RoleCommandRequest::RejectProposal {
+            proposal_id,
+            reason: None,
+        };
+        assert_eq!(reject.actor_intent(), RoleActorIntent::CandidateOrGovernor);
+        assert!(!managed_command_requires_assignment(
+            reject.actor_intent(),
+            Some(true)
+        ));
+        assert!(managed_command_requires_assignment(
+            reject.actor_intent(),
+            Some(false)
+        ));
+        assert!(!managed_command_requires_assignment(
+            reject.actor_intent(),
+            None
+        ));
+
+        let offer = RoleCommandRequest::OfferRole {
+            proposal_id,
+            role_id,
+            candidate_pubkey: Keys::generate().public_key(),
+            expires_at: Utc::now() + Duration::hours(1),
+            reason: None,
+        };
+        assert!(managed_command_requires_assignment(
+            offer.actor_intent(),
+            None
+        ));
+
+        let replacement = RoleCommandRequest::RequestReplacement {
+            assignment_id: Uuid::new_v4(),
+            reason: None,
+        };
+        assert!(managed_command_requires_assignment(
+            replacement.actor_intent(),
+            None
+        ));
+    }
 }

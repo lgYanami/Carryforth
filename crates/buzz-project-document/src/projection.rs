@@ -569,7 +569,8 @@ pub struct ProjectDocumentReceipt {
     pub change_id: EventId,
     /// Verified command signer.
     pub actor: PublicKey,
-    /// Managed Assignment, omitted for Human commands.
+    /// Explicit managed Assignment attribution, omitted for Human and ordinary
+    /// Community-authority commands.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

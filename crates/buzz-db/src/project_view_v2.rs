@@ -3049,23 +3049,6 @@ pub(crate) async fn validate_project_object_actor_fence(
     runtime_fence: Option<buzz_project_view::v2::RuntimeFence>,
     policy: crate::project_runtime::RuntimeCommandFencePolicy,
 ) -> ProjectViewV2WriteResult<()> {
-    let actor_bytes = actor.to_bytes();
-    let managed: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM users \
-             WHERE community_id = $1 AND pubkey = $2 \
-               AND agent_owner_pubkey IS NOT NULL \
-         )",
-    )
-    .bind(community_id.as_uuid())
-    .bind(actor_bytes.as_slice())
-    .fetch_one(&mut **tx)
-    .await?;
-    if managed && acting_assignment_id.is_none() {
-        return Err(ProjectViewV2WriteError::Domain(
-            RoleContinuityError::ActingAssignmentRequired,
-        ));
-    }
     let Some(assignment_id) = acting_assignment_id else {
         return Ok(());
     };

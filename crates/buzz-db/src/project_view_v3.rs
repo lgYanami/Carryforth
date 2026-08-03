@@ -1252,6 +1252,12 @@ impl ProjectViewV3WriteTx {
             .bind(self.community_id.as_uuid())
             .execute(&mut *self.tx)
             .await?;
+        let actor_access = validate_v3_community_writer_in_tx(
+            &mut self.tx,
+            self.community_id,
+            command_event.pubkey,
+        )
+        .await?;
         let loaded =
             crate::project_view_v2::load_continuity_state(&mut self.tx, self.community_id, 3)
                 .await?;
@@ -1260,10 +1266,11 @@ impl ProjectViewV3WriteTx {
             command,
             command_event.pubkey,
         )?;
-        validate_v3_actor_in_tx(
+        validate_v3_optional_assignment_fence_in_tx(
             &mut self.tx,
             self.community_id,
             command_event.pubkey,
+            actor_access,
             command.acting_assignment_id,
             command.runtime_fence,
         )
@@ -1392,11 +1399,18 @@ impl ProjectViewV3WriteTx {
             ));
         }
 
-        let loaded = load_v3_project_object_state(&mut self.tx, self.community_id).await?;
-        validate_v3_actor_in_tx(
+        let actor_access = validate_v3_community_writer_in_tx(
             &mut self.tx,
             self.community_id,
             command_event.pubkey,
+        )
+        .await?;
+        let loaded = load_v3_project_object_state(&mut self.tx, self.community_id).await?;
+        validate_v3_optional_assignment_fence_in_tx(
+            &mut self.tx,
+            self.community_id,
+            command_event.pubkey,
+            actor_access,
             command.acting_assignment_id,
             command.runtime_fence,
         )
@@ -2454,13 +2468,20 @@ async fn load_v3_project_object_state(
     })
 }
 
-async fn validate_v3_actor_in_tx(
+/// Transaction-local Community authorization for one Project View v3 writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectViewV3ActorAccess {
+    managed: bool,
+}
+
+/// Revalidate Community membership and moderation without consulting Role
+/// Assignment state. Assignment is not the source of ordinary Project View
+/// authority.
+pub(crate) async fn validate_v3_community_writer_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     actor: PublicKey,
-    acting_assignment_id: Option<Uuid>,
-    runtime_fence: Option<buzz_core::RuntimeFence>,
-) -> ProjectViewV3WriteResult<()> {
+) -> ProjectViewV3WriteResult<ProjectViewV3ActorAccess> {
     let actor_bytes = actor.to_bytes();
     let owner: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT agent_owner_pubkey FROM users \
@@ -2500,38 +2521,48 @@ async fn validate_v3_actor_in_tx(
                 RoleContinuityError::NotAuthorized,
             ));
         }
-        if acting_assignment_id.is_none() {
-            return Err(ProjectViewV3WriteError::RoleDomain(
-                RoleContinuityError::ActingAssignmentRequired,
-            ));
-        }
     } else if !direct_member {
         return Err(ProjectViewV3WriteError::RoleDomain(
             RoleContinuityError::NotAuthorized,
         ));
     }
-    if let Some(assignment_id) = acting_assignment_id {
-        let valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM project_role_assignments \
-             WHERE community_id = $1 AND assignment_id = $2 \
-               AND member_pubkey = $3 AND ended_at IS NULL)",
-        )
-        .bind(community_id.as_uuid())
-        .bind(assignment_id)
-        .bind(actor.to_hex())
-        .fetch_one(&mut **tx)
-        .await?;
-        if !valid {
-            return Err(ProjectViewV3WriteError::RoleDomain(
-                RoleContinuityError::ActingAssignmentInvalid,
-            ));
-        }
+    Ok(ProjectViewV3ActorAccess { managed })
+}
+
+/// Validate an Assignment only when the signed command claims one. A managed
+/// Assignment-bearing v3 command additionally requires its exact supervised
+/// Runtime; Community-only and candidate commands carry neither coordinate.
+pub(crate) async fn validate_v3_optional_assignment_fence_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    actor: PublicKey,
+    actor_access: ProjectViewV3ActorAccess,
+    acting_assignment_id: Option<Uuid>,
+    runtime_fence: Option<buzz_core::RuntimeFence>,
+) -> ProjectViewV3WriteResult<()> {
+    let Some(assignment_id) = acting_assignment_id else {
+        return Ok(());
+    };
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM project_role_assignments \
+         WHERE community_id = $1 AND assignment_id = $2 \
+           AND member_pubkey = $3 AND ended_at IS NULL)",
+    )
+    .bind(community_id.as_uuid())
+    .bind(assignment_id)
+    .bind(actor.to_hex())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !valid {
+        return Err(ProjectViewV3WriteError::RoleDomain(
+            RoleContinuityError::ActingAssignmentInvalid,
+        ));
     }
-    if managed {
+    if actor_access.managed {
         crate::project_runtime::validate_runtime_command_fence_in_tx(
             tx,
             community_id,
-            acting_assignment_id,
+            Some(assignment_id),
             runtime_fence,
             crate::project_runtime::RuntimeCommandFencePolicy::RequireSupervisedRuntime,
         )
