@@ -4,17 +4,18 @@
 //! controller owns synchronization, intent scheduling, floor reconciliation,
 //! durable idempotency state, and the only Agent-side meeting sender.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use buzz_core::kind::{
-    KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
-    KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND,
-    KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_ROUND_STATE, KIND_MEETING_SPEECH_INTENT,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_STREAM_MESSAGE,
+    KIND_MEETING_ACTION_COMMAND, KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM,
+    KIND_MEETING_FLOOR_SIGNAL, KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST,
+    KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_ROUND_STATE,
+    KIND_MEETING_SPEECH_INTENT, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
+    KIND_STREAM_MESSAGE,
 };
 use futures_util::FutureExt;
 use nostr::{Alphabet, Event, EventBuilder, Filter, Keys, Kind, PublicKey, SingleLetterTag};
@@ -53,6 +54,9 @@ pub(crate) const V1_SYSTEM_PROMPT: &str = include_str!("meeting_v1_prompt.md");
 pub(crate) const V2_SYSTEM_PROMPT: &str = include_str!("meeting_v2_participant_prompt.md");
 /// Meeting V2 moderator policy installed for Board/Floor control turns.
 pub(crate) const V2_MODERATOR_SYSTEM_PROMPT: &str = include_str!("meeting_v2_moderator_prompt.md");
+/// Unified Meeting V2 action-capable policy installed for every Turn in the
+/// same channel ACP Session.
+pub(crate) const V2_ACTIONS_SYSTEM_PROMPT: &str = include_str!("meeting_v2_actions_prompt.md");
 
 /// The dedicated room subscription used independently of ordinary ACP rules.
 pub(crate) fn subscription_filter() -> ChannelFilter {
@@ -69,6 +73,7 @@ pub(crate) fn subscription_filter() -> ChannelFilter {
             KIND_MEETING_HUMAN_FLOOR_REQUEST,
             KIND_MEETING_OFFER_RESPONSE,
             KIND_MEETING_GRANT_SIGNAL,
+            KIND_MEETING_ACTION_COMMAND,
         ]),
         require_mention: false,
     }
@@ -107,13 +112,14 @@ pub(super) enum MeetingBatonProtocol {
     #[default]
     V1,
     V2,
+    V2Actions,
 }
 
 impl MeetingBatonProtocol {
     pub(super) const fn schema_version(self) -> &'static str {
         match self {
             Self::V1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
-            Self::V2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+            Self::V2 | Self::V2Actions => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
         }
     }
 
@@ -121,6 +127,7 @@ impl MeetingBatonProtocol {
         match self {
             Self::V1 => buzz_sdk::MEETING_V1_POLICY,
             Self::V2 => buzz_sdk::MEETING_V2_POLICY,
+            Self::V2Actions => buzz_sdk::MEETING_V2_ACTIONS_POLICY,
         }
     }
 
@@ -128,7 +135,16 @@ impl MeetingBatonProtocol {
         match self {
             Self::V1 => "v1",
             Self::V2 => "v2",
+            Self::V2Actions => "v2-actions",
         }
+    }
+
+    pub(super) const fn is_v2(self) -> bool {
+        matches!(self, Self::V2 | Self::V2Actions)
+    }
+
+    pub(super) const fn has_action_finalization(self) -> bool {
+        matches!(self, Self::V2Actions)
     }
 }
 
@@ -141,6 +157,7 @@ pub(super) enum MeetingTurnKind {
     V1Granted,
     V2ModeratorBoard,
     V2ModeratorFloor,
+    V2ActionFinalization,
 }
 
 impl MeetingTurnKind {
@@ -152,11 +169,15 @@ impl MeetingTurnKind {
                 | Self::V1Granted
                 | Self::V2ModeratorBoard
                 | Self::V2ModeratorFloor
+                | Self::V2ActionFinalization
         )
     }
 
     pub(super) const fn is_v2_moderator(self) -> bool {
-        matches!(self, Self::V2ModeratorBoard | Self::V2ModeratorFloor)
+        matches!(
+            self,
+            Self::V2ModeratorBoard | Self::V2ModeratorFloor | Self::V2ActionFinalization
+        )
     }
 }
 
@@ -350,6 +371,7 @@ enum RegisteredMeetingProtocol {
     UniformV0,
     ModeratedBatonV1,
     ModeratedBoardV2,
+    ModeratedBoardActionsV2,
 }
 
 struct PendingV0TurnCompletion {
@@ -380,6 +402,22 @@ struct RunningMeetingTurn {
     v0_grant_capacity_credit: bool,
 }
 
+/// Continuity-sensitive identity of one in-flight action-capable moderator
+/// Turn. The main loop reads this before returning the physical Agent slot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MeetingTurnContinuityInfo {
+    pub(crate) session_id: Uuid,
+    pub(crate) kind: MeetingTurnKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeetingContinuityDirective {
+    Release { session_id: Uuid },
+    ReleaseFinalControl { session_id: Uuid },
+    PromoteAction { session_id: Uuid },
+    PromoteModeratorMeeting { session_id: Uuid },
+}
+
 /// Per-process protocol-neutral coordinator for every visible Meeting room.
 ///
 /// Registration probes the Relay-signed State once, then delegates the room to
@@ -392,6 +430,7 @@ pub(crate) struct MeetingCoordinator {
     v0_observer: Option<ObserverHandle>,
     running_turns: HashMap<String, RunningMeetingTurn>,
     available_agent_slots: usize,
+    exact_meeting_slots: HashSet<Uuid>,
     v0_completion_queue: VecDeque<PendingV0TurnCompletion>,
     v0_completion_task: Option<tokio::task::JoinHandle<FinishedV0TurnCompletion>>,
     v0_deferred_requeues: VecDeque<MeetingTurnRequest>,
@@ -429,6 +468,7 @@ impl MeetingCoordinator {
             v0_observer: observer.clone(),
             running_turns: HashMap::new(),
             available_agent_slots: agent_capacity,
+            exact_meeting_slots: HashSet::new(),
             v0_completion_queue: VecDeque::new(),
             v0_completion_task: None,
             v0_deferred_requeues: VecDeque::new(),
@@ -458,7 +498,9 @@ impl MeetingCoordinator {
     }
 
     pub(crate) fn pop_pending(&mut self) -> Option<MeetingTurnRequest> {
-        if self.available_agent_slots == 0 {
+        if self.available_agent_slots == 0
+            && !self.v1.front_uses_exact_slot(&self.exact_meeting_slots)
+        {
             return None;
         }
         if self.v1.front_kind() == Some(MeetingTurnKind::V1Granted) {
@@ -525,6 +567,50 @@ impl MeetingCoordinator {
         self.running_turns.contains_key(turn_id)
     }
 
+    pub(crate) fn turn_continuity_info(&self, turn_id: &str) -> Option<MeetingTurnContinuityInfo> {
+        let request = &self.running_turns.get(turn_id)?.request;
+        let protocol = request.baton_protocol?;
+        (protocol.has_action_finalization() && request.kind.is_v2_moderator()).then_some(
+            MeetingTurnContinuityInfo {
+                session_id: request.session_id,
+                kind: request.kind,
+            },
+        )
+    }
+
+    pub(crate) fn record_continuity_binding(
+        &mut self,
+        session_id: Uuid,
+        agent_index: usize,
+        acp_session_id: &str,
+        phase: &str,
+    ) {
+        self.v1
+            .record_continuity_binding(session_id, agent_index, acp_session_id, phase);
+    }
+
+    pub(crate) fn clear_continuity_binding(&mut self, session_id: Uuid) {
+        self.v1.clear_continuity_binding(session_id);
+    }
+
+    pub(crate) fn mark_continuity_lost(&mut self, request: &MeetingTurnRequest, reason: &str) {
+        self.v1.mark_continuity_lost(request, reason);
+    }
+
+    pub(crate) fn mark_turn_continuity_lost(&mut self, turn_id: &str, reason: &str) {
+        if let Some(request) = self
+            .running_turns
+            .get(turn_id)
+            .map(|running| running.request.clone())
+        {
+            self.v1.mark_continuity_lost(&request, reason);
+        }
+    }
+
+    pub(crate) fn take_continuity_directives(&mut self) -> Vec<MeetingContinuityDirective> {
+        self.v1.take_continuity_directives()
+    }
+
     pub(crate) async fn register(&mut self, session_id: Uuid) {
         if self.protocols.contains_key(&session_id)
             || self.detection_in_flight.contains_key(&session_id)
@@ -554,7 +640,8 @@ impl MeetingCoordinator {
             }
             Some(
                 RegisteredMeetingProtocol::ModeratedBatonV1
-                | RegisteredMeetingProtocol::ModeratedBoardV2,
+                | RegisteredMeetingProtocol::ModeratedBoardV2
+                | RegisteredMeetingProtocol::ModeratedBoardActionsV2,
             ) => self.v1.remove(session_id),
             None => {}
         }
@@ -609,7 +696,8 @@ impl MeetingCoordinator {
             }
             Some(
                 RegisteredMeetingProtocol::ModeratedBatonV1
-                | RegisteredMeetingProtocol::ModeratedBoardV2,
+                | RegisteredMeetingProtocol::ModeratedBoardV2
+                | RegisteredMeetingProtocol::ModeratedBoardActionsV2,
             ) => self.v1.handle_event(event).await,
             None => {}
         }
@@ -740,6 +828,11 @@ impl MeetingCoordinator {
         self.available_agent_slots = available;
         self.refresh_v1_external_reclaimable_turns();
         self.v1.set_available_agent_slots(available);
+    }
+
+    pub(crate) fn set_exact_meeting_slots(&mut self, sessions: HashSet<Uuid>) {
+        self.exact_meeting_slots = sessions.clone();
+        self.v1.set_exact_meeting_slots(sessions);
     }
 
     fn refresh_v1_external_reclaimable_turns(&mut self) {
@@ -946,6 +1039,19 @@ impl MeetingCoordinator {
                 )
                 .await;
             }
+            Ok(RegisteredMeetingProtocol::ModeratedBoardActionsV2) => {
+                self.detection_retry_at.remove(&session_id);
+                self.protocols.insert(
+                    session_id,
+                    RegisteredMeetingProtocol::ModeratedBoardActionsV2,
+                );
+                let _ = tokio::time::timeout(
+                    MAIN_LOOP_IO_BUDGET,
+                    self.v1
+                        .register(session_id, MeetingBatonProtocol::V2Actions),
+                )
+                .await;
+            }
             Err(error) => {
                 tracing::warn!(
                     meeting = %session_id,
@@ -1074,6 +1180,7 @@ fn classify_meeting_protocol(
     let mut saw_v0 = false;
     let mut saw_v1 = false;
     let mut saw_v2 = false;
+    let mut saw_v2_actions = false;
     for event in events {
         if event.kind.as_u16() as u32 != KIND_MEETING_ROUND_STATE
             || event.pubkey != relay_pubkey
@@ -1089,6 +1196,10 @@ fn classify_meeting_protocol(
             && tag_value(event, "policy") == Some("moderated-board-v1")
         {
             saw_v2 = true;
+        } else if tag_value(event, "v") == Some("3")
+            && tag_value(event, "policy") == Some(buzz_sdk::MEETING_V2_ACTIONS_POLICY)
+        {
+            saw_v2_actions = true;
         } else if tag_value(event, "v").is_none()
             && tag_value(event, "policy") == Some("uniform-v0")
         {
@@ -1099,11 +1210,12 @@ fn classify_meeting_protocol(
             ));
         }
     }
-    match (saw_v0, saw_v1, saw_v2) {
-        (true, false, false) => Ok(RegisteredMeetingProtocol::UniformV0),
-        (false, true, false) => Ok(RegisteredMeetingProtocol::ModeratedBatonV1),
-        (false, false, true) => Ok(RegisteredMeetingProtocol::ModeratedBoardV2),
-        (false, false, false) => Err(anyhow!("Meeting has no authoritative State event")),
+    match (saw_v0, saw_v1, saw_v2, saw_v2_actions) {
+        (true, false, false, false) => Ok(RegisteredMeetingProtocol::UniformV0),
+        (false, true, false, false) => Ok(RegisteredMeetingProtocol::ModeratedBatonV1),
+        (false, false, true, false) => Ok(RegisteredMeetingProtocol::ModeratedBoardV2),
+        (false, false, false, true) => Ok(RegisteredMeetingProtocol::ModeratedBoardActionsV2),
+        (false, false, false, false) => Err(anyhow!("Meeting has no authoritative State event")),
         _ => Err(anyhow!(
             "Meeting contains conflicting authoritative protocol States"
         )),
@@ -1304,7 +1416,8 @@ impl V0MeetingCoordinator {
             | MeetingTurnKind::V1ModeratorControl
             | MeetingTurnKind::V1Granted
             | MeetingTurnKind::V2ModeratorBoard
-            | MeetingTurnKind::V2ModeratorFloor => {
+            | MeetingTurnKind::V2ModeratorFloor
+            | MeetingTurnKind::V2ActionFinalization => {
                 tracing::error!("V1 Meeting turn was routed to the V0 controller");
             }
         }
@@ -1847,7 +1960,8 @@ impl V0MeetingCoordinator {
             | MeetingTurnKind::V1ModeratorControl
             | MeetingTurnKind::V1Granted
             | MeetingTurnKind::V2ModeratorBoard
-            | MeetingTurnKind::V2ModeratorFloor => {
+            | MeetingTurnKind::V2ModeratorFloor
+            | MeetingTurnKind::V2ActionFinalization => {
                 tracing::error!("V1 Meeting turn was queued in the V0 controller");
             }
         }
@@ -3044,7 +3158,8 @@ fn format_correction_prompt(kind: MeetingTurnKind) -> String {
         | MeetingTurnKind::V1ModeratorControl
         | MeetingTurnKind::V1Granted
         | MeetingTurnKind::V2ModeratorBoard
-        | MeetingTurnKind::V2ModeratorFloor => {
+        | MeetingTurnKind::V2ModeratorFloor
+        | MeetingTurnKind::V2ActionFinalization => {
             "V1 Meeting format correction is owned by the V1 controller.".to_string()
         }
     }
@@ -3568,6 +3683,13 @@ mod tests {
                 tags.push(Tag::parse(["v", "3"]).expect("V2 version tag"));
                 tags.push(Tag::parse(["policy", "moderated-board-v1"]).expect("V2 policy tag"));
             }
+            RegisteredMeetingProtocol::ModeratedBoardActionsV2 => {
+                tags.push(Tag::parse(["v", "3"]).expect("V2 actions version tag"));
+                tags.push(
+                    Tag::parse(["policy", buzz_sdk::MEETING_V2_ACTIONS_POLICY])
+                        .expect("V2 actions policy tag"),
+                );
+            }
         }
         let event = EventBuilder::new(Kind::Custom(KIND_MEETING_ROUND_STATE as u16), "{}")
             .tags(tags)
@@ -3584,7 +3706,7 @@ mod tests {
         assert_eq!(
             filter.kinds,
             Some(vec![
-                9, 42100, 42101, 42102, 42103, 42104, 42105, 42106, 42107, 42108, 42109
+                9, 42100, 42101, 42102, 42103, 42104, 42105, 42106, 42107, 42108, 42109, 42112
             ])
         );
     }

@@ -3381,6 +3381,7 @@ pub(crate) async fn publish_v2_action_transition_tx(
     caused_by_event_id: &[u8],
     from: &str,
     to: &str,
+    consumed_decision_attempt_id: Option<&[u8]>,
     now: DateTime<Utc>,
 ) -> Result<BatonTransitionResult> {
     let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
@@ -3390,30 +3391,52 @@ pub(crate) async fn publish_v2_action_transition_tx(
         )));
     }
     let state = load_state_tx(tx, community_id, session_id, true).await?;
-    if state.phase != BatonPhase::ModeratorIdle
-        || state.active_offer_id.is_some()
-        || state.active_grant_id.is_some()
-    {
+    let control_is_valid = match consumed_decision_attempt_id {
+        Some(attempt_id) => {
+            matches!(
+                state.phase,
+                BatonPhase::ModeratorControl | BatonPhase::ModeratorIdle
+            ) && state.active_decision_attempt_id.as_deref() == Some(attempt_id)
+        }
+        None => {
+            state.phase == BatonPhase::ModeratorIdle && state.active_decision_attempt_id.is_none()
+        }
+    };
+    if !control_is_valid || state.active_offer_id.is_some() || state.active_grant_id.is_some() {
         return Err(DbError::InvalidData(
             "Meeting V2 action transition requires idle moderator control".to_string(),
         ));
     }
     let mut target = StateTarget::from_state(&state);
+    target.phase = BatonPhase::ModeratorIdle;
     target.moderator_decision_started_at = None;
     target.moderator_decision_deadline = None;
     target.next_action_at = None;
     target.active_decision_attempt_id = None;
+    let mut effects = vec![json!({
+        "type": transition_type,
+        "object_type": "meeting_action_run",
+        "object_id": action_run_id,
+        "from": from,
+        "to": to,
+    })];
+    if let Some(attempt_id) = consumed_decision_attempt_id {
+        effects.push(effect(
+            "moderator_decision_attempt_completed",
+            "moderator_decision_attempt",
+            attempt_id,
+            Some("running"),
+            Some("completed"),
+        ));
+        if state.phase != target.phase {
+            effects.push(phase_effect(session_id, state.phase, target.phase));
+        }
+    }
     let transition = TransitionSpec::command(
         transition_type,
         Some(action_run_id.as_bytes().to_vec()),
         caused_by_event_id,
-        vec![json!({
-            "type": transition_type,
-            "object_type": "meeting_action_run",
-            "object_id": action_run_id,
-            "from": from,
-            "to": to,
-        })],
+        effects,
     );
     let (_, result) = commit_transition_tx(
         tx,
@@ -3422,7 +3445,13 @@ pub(crate) async fn publish_v2_action_transition_tx(
         relay_keys,
         &state,
         target,
-        RevisionDelta::NONE,
+        if consumed_decision_attempt_id.is_some() {
+            RevisionDelta::FLOOR_INTENT
+        } else if transition_type == "action_finalization_began" {
+            RevisionDelta::FLOOR
+        } else {
+            RevisionDelta::NONE
+        },
         transition,
         now,
     )

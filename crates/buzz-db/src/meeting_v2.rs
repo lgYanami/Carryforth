@@ -2715,6 +2715,76 @@ mod tests {
             .await
             .expect("roll back no-action close probe");
 
+        // An Agent moderator's Candidate Floor binds FINALIZE_ACTIONS to the
+        // exact running DecisionAttempt. Begin must consume that attempt and
+        // freeze every still-pending discussion source in the same transaction.
+        let decision_attempt_id = vec![77_u8; 32];
+        let pending_intent_id = vec![78_u8; 32];
+        let pending_intent_event_id = vec![79_u8; 32];
+        let attempt_started_event_id = vec![80_u8; 32];
+        let attempt_started_at = Utc::now();
+        let attempt_deadline = attempt_started_at + Duration::minutes(5);
+        sqlx::query(
+            "INSERT INTO meeting_speech_intents \
+                 (community_id, session_id, intent_id, author_pubkey, current_event_id, \
+                  basis_speech_revision, summary, state, eligible_decision_epoch) \
+             VALUES ($1, $2, $3, $4, $5, 0, 'candidate discussion remains', 'pending', 1)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&pending_intent_id)
+        .bind(&roster[1])
+        .bind(&pending_intent_event_id)
+        .execute(&pool)
+        .await
+        .expect("seed pending Candidate Intent");
+        let candidate_snapshot = json!({
+            "candidate_refs": [{
+                "source_type": "intent",
+                "source_id": hex::encode(&pending_intent_id),
+                "current_event_id": hex::encode(&pending_intent_event_id),
+                "author_pubkey": participant_hex.clone(),
+            }]
+        });
+        sqlx::query(
+            "INSERT INTO meeting_moderator_decision_attempts \
+                 (community_id, session_id, attempt_id, moderator_pubkey, control_epoch, \
+                  decision_epoch, attempt_number, speech_revision, snapshot_intent_revision, \
+                  snapshot_state_event_id, candidate_snapshot_json, candidate_snapshot_hash, \
+                  state, started_by_event_id, started_at, deadline_at) \
+             SELECT $1, $2, $3, $4, 1, 1, 1, 0, 1, state_event_id, $5, $6, \
+                    'running', $7, $8, $9 \
+             FROM meeting_baton_state WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&decision_attempt_id)
+        .bind(&host)
+        .bind(&candidate_snapshot)
+        .bind(vec![81_u8; 32])
+        .bind(&attempt_started_event_id)
+        .bind(attempt_started_at)
+        .bind(attempt_deadline)
+        .execute(&pool)
+        .await
+        .expect("seed running moderator DecisionAttempt");
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET phase = 'moderator_control', decision_epoch = 1, decision_attempt = 1, \
+                 intent_revision = 1, active_decision_attempt_id = $3, \
+                 moderator_decision_started_at = $4, moderator_decision_deadline = $5, \
+                 next_action_at = $5 \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&decision_attempt_id)
+        .bind(attempt_started_at)
+        .bind(attempt_deadline)
+        .execute(&pool)
+        .await
+        .expect("activate moderator DecisionAttempt");
+
         let state_event_id: Vec<u8> = sqlx::query_scalar(
             "SELECT state_event_id FROM meeting_baton_state \
              WHERE community_id = $1 AND session_id = $2",
@@ -2731,7 +2801,7 @@ mod tests {
                 board_window: 1,
                 expected_state_event_id: &hex::encode(&state_event_id),
                 board_event_id: &hex::encode(&created.board_event_id),
-                expected_decision_attempt_id: None,
+                expected_decision_attempt_id: Some(&hex::encode(&decision_attempt_id)),
             })
             .expect("build first action begin")
             .sign_with_keys(&host_keys)
@@ -2747,7 +2817,7 @@ mod tests {
                     board_window: 1,
                     expected_state_event_id: state_event_id,
                     board_event_id: created.board_event_id.clone(),
-                    expected_decision_attempt_id: None,
+                    expected_decision_attempt_id: Some(decision_attempt_id.clone()),
                 },
                 relay_keys: &relay_keys,
             },
@@ -2755,6 +2825,35 @@ mod tests {
         .await
         .expect("begin first action run");
         assert!(began_one.accepted);
+        let consumed_attempt: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, terminal_reason FROM meeting_moderator_decision_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&decision_attempt_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read consumed moderator DecisionAttempt");
+        assert_eq!(
+            consumed_attempt,
+            (
+                "completed".to_string(),
+                Some("action_finalization".to_string())
+            )
+        );
+        let frozen_intent_state: String = sqlx::query_scalar(
+            "SELECT state FROM meeting_speech_intents \
+             WHERE community_id = $1 AND session_id = $2 AND intent_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&pending_intent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read frozen Candidate Intent");
+        assert_eq!(frozen_intent_state, "ended");
+        assert_eq!(began_one.response["details"]["frozen_intent_count"], 1);
         let action_state_event_id: Vec<u8> = sqlx::query_scalar(
             "SELECT state_event_id FROM meeting_baton_state \
              WHERE community_id = $1 AND session_id = $2",

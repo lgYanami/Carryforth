@@ -104,6 +104,9 @@ pub struct SessionState {
     pub turn_counts: HashMap<Uuid, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
+    /// Channel sessions whose proactive rotation was deferred by a
+    /// continuity-sensitive Meeting control/action Turn.
+    deferred_channel_rotations: HashSet<Uuid>,
     /// channel_id → rendered NIP-AE core prompt section, populated once at
     /// session creation per Tyler's spec (no mid-session refresh).
     pub core_sections: HashMap<Uuid, String>,
@@ -189,6 +192,7 @@ impl SessionState {
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
         self.project_space_contract_ids.remove(channel_id);
+        self.deferred_channel_rotations.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -199,6 +203,7 @@ impl SessionState {
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
         self.project_space_contract_ids.clear();
+        self.deferred_channel_rotations.clear();
         self.heartbeat_project_space_contract_id = None;
         self.core_sections.clear();
         self.canvas_sections.clear();
@@ -255,6 +260,21 @@ impl SessionState {
                 debug_assert!(self.heartbeat_session.is_some());
                 self.heartbeat_project_space_contract_id = Some(current_id);
             }
+        }
+    }
+
+    fn defer_rotation(&mut self, source: &PromptSource) {
+        if let PromptSource::Channel(channel_id) = source {
+            self.deferred_channel_rotations.insert(*channel_id);
+        }
+    }
+
+    fn rotation_deferred(&self, source: &PromptSource) -> bool {
+        match source {
+            PromptSource::Channel(channel_id) => {
+                self.deferred_channel_rotations.contains(channel_id)
+            }
+            PromptSource::Heartbeat => false,
         }
     }
 
@@ -338,6 +358,10 @@ pub struct AgentPool {
     /// Additional idle slots held briefly while a Meeting V2 participant Turn
     /// reads its current Board or waits for immediate model dispatch.
     reserved_meeting_board_slots: usize,
+    /// Exclusive Agent-slot bindings owned by action-capable Meeting V2
+    /// moderator control cycles. Ordinary work and every other Meeting must
+    /// treat these slots as unavailable even while the process is idle.
+    meeting_slot_bindings: HashMap<Uuid, MeetingSlotBinding>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
@@ -354,8 +378,48 @@ pub struct PromptResult {
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
+    /// Channel ACP Session retained after this Turn. A missing value on a
+    /// continuity-sensitive Meeting result is an affinity failure.
+    pub resolved_session_id: Option<String>,
+    /// Proactive rotation was requested but intentionally held until the
+    /// Meeting continuity chain is released.
+    pub rotation_deferred: bool,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
+}
+
+/// Local continuity phase for an action-capable Meeting moderator slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeetingSlotBindingPhase {
+    /// A successful Board Turn is waiting for its matching Floor Turn.
+    FinalControlCycle,
+    /// A Floor result selected FINALIZE_ACTIONS but Relay authority has not
+    /// yet confirmed the action run.
+    PendingAction,
+    /// Relay authority confirmed the active action-finalization run.
+    Action,
+    /// RETURN_TO_BOARD kept the same moderator slot for the next control cycle.
+    ModeratorMeeting,
+}
+
+/// Exact local identity retained for one Meeting moderator continuity chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeetingSlotBinding {
+    pub(crate) meeting_id: Uuid,
+    pub(crate) agent_index: usize,
+    pub(crate) acp_session_id: String,
+    pub(crate) phase: MeetingSlotBindingPhase,
+    /// A provider/session rotation requested by the completed Turn but delayed
+    /// until the continuity chain is definitively released.
+    pub(crate) deferred_rotation: bool,
+}
+
+/// Why an exact Meeting claim could not return its bound slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactMeetingClaimError {
+    MissingBinding,
+    Busy,
+    AffinityLost,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -746,6 +810,7 @@ impl AgentPool {
             agents: slots,
             reserved_meeting_slots: 0,
             reserved_meeting_board_slots: 0,
+            meeting_slot_bindings: HashMap::new(),
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -762,7 +827,7 @@ impl AgentPool {
     /// Returns `None` when no idle agent remains above the Meeting reservation
     /// floor, even if a reserved idle slot still exists.
     pub fn try_claim(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
-        if self.idle_count()
+        if self.claimable_unleased_count()
             <= self
                 .reserved_meeting_slots
                 .saturating_add(self.reserved_meeting_board_slots)
@@ -775,7 +840,7 @@ impl AgentPool {
     /// Claim a slot protected for a Board-backed participant Turn while still
     /// honoring the stronger Offer/Grant reservation floor.
     pub fn try_claim_meeting_board(&mut self, channel_id: Uuid) -> Option<OwnedAgent> {
-        if self.idle_count() <= self.reserved_meeting_slots {
+        if self.claimable_unleased_count() <= self.reserved_meeting_slots {
             return None;
         }
         self.try_claim_inner(Some(channel_id))
@@ -790,10 +855,12 @@ impl AgentPool {
     fn try_claim_inner(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this channel.
         if let Some(cid) = channel_id {
-            let idx = self.agents.iter().position(|slot| {
-                slot.as_ref()
-                    .map(|a| a.state.sessions.contains_key(&cid))
-                    .unwrap_or(false)
+            let idx = self.agents.iter().enumerate().position(|(index, slot)| {
+                !self.slot_is_meeting_bound(index)
+                    && slot
+                        .as_ref()
+                        .map(|a| a.state.sessions.contains_key(&cid))
+                        .unwrap_or(false)
             });
             if let Some(i) = idx {
                 return self.agents[i].take();
@@ -801,18 +868,161 @@ impl AgentPool {
         }
 
         // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
+        let idx = self
+            .agents
+            .iter()
+            .enumerate()
+            .position(|(index, slot)| !self.slot_is_meeting_bound(index) && slot.is_some());
         idx.map(|i| self.agents[i].take().unwrap())
+    }
+
+    /// Install the exclusive continuity identity captured from a completed
+    /// action-capable moderator Board Turn. The slot may still be checked out;
+    /// binding therefore happens before the `OwnedAgent` is returned.
+    pub(crate) fn bind_meeting_slot(
+        &mut self,
+        meeting_id: Uuid,
+        agent_index: usize,
+        acp_session_id: String,
+        phase: MeetingSlotBindingPhase,
+        deferred_rotation: bool,
+    ) -> Result<(), &'static str> {
+        if acp_session_id.is_empty() || agent_index >= self.agents.len() {
+            return Err("invalid_binding_identity");
+        }
+        if let Some(existing) = self.meeting_slot_bindings.get_mut(&meeting_id) {
+            if existing.agent_index != agent_index || existing.acp_session_id != acp_session_id {
+                return Err("meeting_binding_conflict");
+            }
+            existing.phase = phase;
+            existing.deferred_rotation |= deferred_rotation;
+            return Ok(());
+        }
+        if self
+            .meeting_slot_bindings
+            .values()
+            .any(|binding| binding.agent_index == agent_index)
+        {
+            return Err("slot_already_bound");
+        }
+        self.meeting_slot_bindings.insert(
+            meeting_id,
+            MeetingSlotBinding {
+                meeting_id,
+                agent_index,
+                acp_session_id,
+                phase,
+                deferred_rotation,
+            },
+        );
+        Ok(())
+    }
+
+    /// Claim only the slot/session previously bound to this Meeting.
+    pub(crate) fn claim_exact_meeting(
+        &mut self,
+        meeting_id: Uuid,
+    ) -> Result<OwnedAgent, ExactMeetingClaimError> {
+        let Some(binding) = self.meeting_slot_bindings.get(&meeting_id).cloned() else {
+            return Err(ExactMeetingClaimError::MissingBinding);
+        };
+        let Some(slot) = self.agents.get_mut(binding.agent_index) else {
+            return Err(ExactMeetingClaimError::AffinityLost);
+        };
+        let Some(agent) = slot.as_ref() else {
+            return Err(
+                if self
+                    .task_map
+                    .values()
+                    .any(|task| task.agent_index == binding.agent_index)
+                {
+                    ExactMeetingClaimError::Busy
+                } else {
+                    ExactMeetingClaimError::AffinityLost
+                },
+            );
+        };
+        if agent.state.sessions.get(&meeting_id) != Some(&binding.acp_session_id) {
+            return Err(ExactMeetingClaimError::AffinityLost);
+        }
+        slot.take().ok_or(ExactMeetingClaimError::Busy)
+    }
+
+    pub(crate) fn meeting_slot_binding(&self, meeting_id: Uuid) -> Option<&MeetingSlotBinding> {
+        self.meeting_slot_bindings.get(&meeting_id)
+    }
+
+    pub(crate) fn idle_bound_meeting_ids(&self) -> HashSet<Uuid> {
+        self.meeting_slot_bindings
+            .iter()
+            .filter_map(|(meeting_id, binding)| {
+                self.agents
+                    .get(binding.agent_index)
+                    .is_some_and(Option::is_some)
+                    .then_some(*meeting_id)
+            })
+            .collect()
+    }
+
+    pub(crate) fn promote_meeting_slot_binding(
+        &mut self,
+        meeting_id: Uuid,
+        phase: MeetingSlotBindingPhase,
+    ) -> bool {
+        let Some(binding) = self.meeting_slot_bindings.get_mut(&meeting_id) else {
+            return false;
+        };
+        binding.phase = phase;
+        true
+    }
+
+    /// Release a Meeting binding. Deferred proactive rotation is applied only
+    /// now, after the continuity-sensitive chain is known not to need it.
+    pub(crate) fn release_meeting_slot_binding(&mut self, meeting_id: Uuid) -> bool {
+        let Some(binding) = self.meeting_slot_bindings.remove(&meeting_id) else {
+            return false;
+        };
+        if binding.deferred_rotation {
+            if let Some(agent) = self
+                .agents
+                .get_mut(binding.agent_index)
+                .and_then(Option::as_mut)
+            {
+                agent.state.invalidate_channel(&meeting_id);
+            }
+        }
+        true
+    }
+
+    /// Drop every binding owned by a failed/replaced physical Agent slot.
+    pub(crate) fn lose_meeting_slot_bindings_for_agent(&mut self, agent_index: usize) -> Vec<Uuid> {
+        let lost: Vec<_> = self
+            .meeting_slot_bindings
+            .iter()
+            .filter_map(|(meeting_id, binding)| {
+                (binding.agent_index == agent_index).then_some(*meeting_id)
+            })
+            .collect();
+        for meeting_id in &lost {
+            self.meeting_slot_bindings.remove(meeting_id);
+        }
+        lost
+    }
+
+    fn slot_is_meeting_bound(&self, agent_index: usize) -> bool {
+        self.meeting_slot_bindings
+            .values()
+            .any(|binding| binding.agent_index == agent_index)
     }
 
     /// Hold this many live slots for accepted moderated Meeting Offers/Grants.
     pub fn set_reserved_meeting_slots(&mut self, reserved: usize) {
-        self.reserved_meeting_slots = reserved.min(self.live_count());
+        self.reserved_meeting_slots = reserved.min(self.claimable_unleased_live_count());
     }
 
     /// Hold spare capacity between a V2 current-Board read and model dispatch.
     pub fn set_reserved_meeting_board_slots(&mut self, reserved: usize) {
-        self.reserved_meeting_board_slots = reserved.min(self.live_count());
+        self.reserved_meeting_board_slots = reserved.min(self.claimable_unleased_live_count());
     }
 
     /// Return an agent to its slot after a task completes.
@@ -833,22 +1043,33 @@ impl AgentPool {
 
     /// Whether any agent is currently idle (sitting in its slot).
     pub fn any_idle(&self) -> bool {
-        self.agents.iter().any(|slot| slot.is_some())
+        self.claimable_unleased_count() > 0
     }
 
-    /// Number of live Agent subprocesses that are not currently executing a
-    /// turn. Meeting V1 uses this snapshot when atomically reserving an Offer.
+    /// Number of live Agent subprocesses not currently executing a turn.
+    #[cfg(test)]
     pub fn idle_count(&self) -> usize {
         self.agents.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// Idle physical slots available to ordinary work or another Meeting.
+    pub(crate) fn claimable_unleased_count(&self) -> usize {
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| slot.is_some() && !self.slot_is_meeting_bound(*index))
+            .count()
     }
 
     /// Whether any idle agent already has a session for `channel_id`.
     /// Used to compute `affinity_hit` before calling `try_claim`.
     pub fn has_session_for(&self, channel_id: Uuid) -> bool {
-        self.agents.iter().any(|slot| {
-            slot.as_ref()
-                .map(|a| a.state.sessions.contains_key(&channel_id))
-                .unwrap_or(false)
+        self.agents.iter().enumerate().any(|(index, slot)| {
+            !self.slot_is_meeting_bound(index)
+                && slot
+                    .as_ref()
+                    .map(|a| a.state.sessions.contains_key(&channel_id))
+                    .unwrap_or(false)
         })
     }
 
@@ -859,6 +1080,11 @@ impl AgentPool {
         let idle = self.agents.iter().filter(|s| s.is_some()).count();
         let checked_out = self.task_map.len();
         idle + checked_out
+    }
+
+    pub(crate) fn claimable_unleased_live_count(&self) -> usize {
+        self.live_count()
+            .saturating_sub(self.meeting_slot_bindings.len())
     }
 
     pub fn task_map(&self) -> &HashMap<tokio::task::Id, TaskMeta> {
@@ -1601,11 +1827,15 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    let resolved_session_id = agent.state.session_id(&source).map(str::to_owned);
+    let rotation_deferred = agent.state.rotation_deferred(&source);
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
+        resolved_session_id,
+        rotation_deferred,
         batch,
     });
 }
@@ -1639,6 +1869,9 @@ pub(crate) struct PromptExecution {
     pub(crate) control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     pub(crate) absolute_hard_deadline: Option<tokio::time::Instant>,
     pub(crate) turn_id: String,
+    /// Keep an otherwise-rotatable successful channel Session alive until the
+    /// main loop has installed/released its Meeting continuity binding.
+    pub(crate) defer_session_rotation: bool,
 }
 
 pub async fn run_prompt_task(
@@ -1653,6 +1886,7 @@ pub async fn run_prompt_task(
         mut control_rx,
         absolute_hard_deadline,
         turn_id,
+        defer_session_rotation,
     } = execution;
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
@@ -2576,11 +2810,19 @@ pub async fn run_prompt_task(
             };
 
             if should_rotate {
-                tracing::info!(
-                    target: "pool::session",
-                    "rotating session for {source:?} after {stop_reason:?}",
-                );
-                agent.state.invalidate(&source);
+                if defer_session_rotation && matches!(source, PromptSource::Channel(_)) {
+                    tracing::info!(
+                        target: "pool::session",
+                        "deferring Meeting session rotation for {source:?} after {stop_reason:?}",
+                    );
+                    agent.state.defer_rotation(&source);
+                } else {
+                    tracing::info!(
+                        target: "pool::session",
+                        "rotating session for {source:?} after {stop_reason:?}",
+                    );
+                    agent.state.invalidate(&source);
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -4408,6 +4650,7 @@ mod tests {
                     control_rx: None,
                     absolute_hard_deadline: None,
                     turn_id: "meeting-granted-turn-test".into(),
+                    defer_session_rotation: false,
                 },
             ),
         )
@@ -4473,6 +4716,7 @@ mod tests {
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: None,
                     turn_id: "pre-prompt-cancel-test".into(),
+                    defer_session_rotation: false,
                 },
             ),
         )
@@ -4531,6 +4775,116 @@ mod tests {
             .try_claim_meeting(meeting_id)
             .expect("Meeting can reclaim its reserved slot");
         agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn action_meeting_binding_keeps_board_floor_and_action_on_one_slot_and_session() {
+        let meeting_id = Uuid::new_v4();
+        let mut moderator = meeting_pool_test_agent(0).await;
+        moderator
+            .state
+            .sessions
+            .insert(meeting_id, "moderator-meeting-session".into());
+        let ordinary = meeting_pool_test_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(moderator), Some(ordinary)]);
+
+        pool.bind_meeting_slot(
+            meeting_id,
+            0,
+            "moderator-meeting-session".into(),
+            MeetingSlotBindingPhase::FinalControlCycle,
+            false,
+        )
+        .expect("bind final Board control slot");
+        let ordinary_claim = pool
+            .try_claim(Some(meeting_id))
+            .expect("ordinary work may use only the unbound slot");
+        assert_eq!(ordinary_claim.index, 1);
+
+        let floor_claim = pool
+            .claim_exact_meeting(meeting_id)
+            .expect("Floor must exact-claim the Board slot");
+        assert_eq!(floor_claim.index, 0);
+        assert_eq!(
+            floor_claim
+                .state
+                .sessions
+                .get(&meeting_id)
+                .map(String::as_str),
+            Some("moderator-meeting-session")
+        );
+        pool.return_agent(floor_claim);
+        assert!(
+            pool.promote_meeting_slot_binding(meeting_id, MeetingSlotBindingPhase::PendingAction)
+        );
+
+        let action_claim = pool
+            .claim_exact_meeting(meeting_id)
+            .expect("Action Finalization must exact-claim the same slot");
+        assert_eq!(action_claim.index, 0);
+        assert_eq!(
+            action_claim
+                .state
+                .sessions
+                .get(&meeting_id)
+                .map(String::as_str),
+            Some("moderator-meeting-session")
+        );
+        pool.return_agent(action_claim);
+        pool.bind_meeting_slot(
+            meeting_id,
+            0,
+            "moderator-meeting-session".into(),
+            MeetingSlotBindingPhase::Action,
+            true,
+        )
+        .expect("promote the exact binding and defer rotation");
+        assert!(pool.release_meeting_slot_binding(meeting_id));
+        assert!(pool.agents[0]
+            .as_ref()
+            .is_some_and(|agent| !agent.state.sessions.contains_key(&meeting_id)));
+
+        pool.return_agent(ordinary_claim);
+        for agent in pool.agents.iter_mut().flatten() {
+            agent.acp.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_action_meeting_claim_fails_closed_when_the_session_changes() {
+        let meeting_id = Uuid::new_v4();
+        let mut moderator = meeting_pool_test_agent(0).await;
+        moderator
+            .state
+            .sessions
+            .insert(meeting_id, "original-session".into());
+        let mut pool = AgentPool::from_slots(vec![Some(moderator)]);
+        pool.bind_meeting_slot(
+            meeting_id,
+            0,
+            "original-session".into(),
+            MeetingSlotBindingPhase::Action,
+            false,
+        )
+        .expect("bind action slot");
+        pool.agents[0]
+            .as_mut()
+            .expect("idle moderator slot")
+            .state
+            .sessions
+            .insert(meeting_id, "replacement-session".into());
+
+        assert!(matches!(
+            pool.claim_exact_meeting(meeting_id),
+            Err(ExactMeetingClaimError::AffinityLost)
+        ));
+        assert!(pool.try_claim(Some(meeting_id)).is_none());
+
+        pool.release_meeting_slot_binding(meeting_id);
+        let mut moderator = pool
+            .try_claim(Some(meeting_id))
+            .expect("released slot returns to ordinary capacity");
+        moderator.acp.shutdown().await;
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
 //! Authoritative Meeting V2 action-finalization state and command ledger.
 //!
-//! Stage one deliberately stops at the Meeting boundary: plans and required
-//! steps are persisted and gate normal close, but no Project View mutation is
-//! executed from this module.
+//! Stage two deliberately stops at the Meeting boundary: the same moderator
+//! slot compiles and freezes plans, and required steps gate normal close, but
+//! no Project View mutation is executed from this module yet.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,7 +40,7 @@ pub enum ActionCommand {
         expected_state_event_id: Vec<u8>,
         /// Exact frozen current Board event.
         board_event_id: Vec<u8>,
-        /// Optional attempt binding, reserved for the same-session ACP stage.
+        /// Exact running moderator DecisionAttempt for a candidate Floor result.
         expected_decision_attempt_id: Option<Vec<u8>>,
     },
     /// Freeze the first valid Harness-compiled plan.
@@ -326,15 +326,10 @@ async fn apply_begin_tx(
         || board_window <= 0
         || expected_state_event_id.len() != 32
         || board_event_id.len() != 32
+        || expected_decision_attempt_id.is_some_and(|attempt_id| attempt_id.len() != 32)
     {
         return Err(DbError::InvalidData(
             "Meeting V2 action begin has malformed fences".to_string(),
-        ));
-    }
-    if expected_decision_attempt_id.is_some() {
-        return Ok(AppliedCommand::rejected(
-            "decision_attempt_binding_unavailable",
-            None,
         ));
     }
     let runtime =
@@ -368,7 +363,8 @@ async fn apply_begin_tx(
     }
 
     let baton = sqlx::query(
-        "SELECT phase, state_event_id, control_epoch, active_offer_id, active_grant_id, \
+        "SELECT phase, state_event_id, control_epoch, decision_epoch, intent_revision, \
+                speech_revision, active_offer_id, active_grant_id, \
                 active_decision_attempt_id, next_action_at \
          FROM meeting_baton_state \
          WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
@@ -380,16 +376,14 @@ async fn apply_begin_tx(
     let phase: String = baton.try_get("phase")?;
     let state_event_id: Vec<u8> = baton.try_get("state_event_id")?;
     let control_epoch: i64 = baton.try_get("control_epoch")?;
+    let decision_epoch: i64 = baton.try_get("decision_epoch")?;
+    let intent_revision: i64 = baton.try_get("intent_revision")?;
+    let speech_revision: i64 = baton.try_get("speech_revision")?;
     let active_offer_id: Option<Vec<u8>> = baton.try_get("active_offer_id")?;
     let active_grant_id: Option<Vec<u8>> = baton.try_get("active_grant_id")?;
     let active_attempt_id: Option<Vec<u8>> = baton.try_get("active_decision_attempt_id")?;
     let next_action_at: Option<DateTime<Utc>> = baton.try_get("next_action_at")?;
-    if phase != "moderator_idle"
-        || active_offer_id.is_some()
-        || active_grant_id.is_some()
-        || active_attempt_id.is_some()
-        || next_action_at.is_some()
-    {
+    if active_offer_id.is_some() || active_grant_id.is_some() {
         return Ok(AppliedCommand::rejected("moderator_floor_not_idle", None));
     }
     if state_event_id != expected_state_event_id {
@@ -398,8 +392,64 @@ async fn apply_begin_tx(
     if control_epoch != expected_control_epoch {
         return Ok(AppliedCommand::rejected("stale_control_epoch", None));
     }
-    if has_unresolved_floor_work_tx(tx, params.community_id, params.session_id).await? {
-        return Ok(AppliedCommand::rejected("floor_work_pending", None));
+    match expected_decision_attempt_id {
+        Some(attempt_id) => {
+            if !matches!(phase.as_str(), "moderator_control" | "moderator_idle")
+                || active_attempt_id.as_deref() != Some(attempt_id)
+            {
+                return Ok(AppliedCommand::rejected("stale_decision_attempt", None));
+            }
+            let attempt = sqlx::query(
+                "SELECT moderator_pubkey, control_epoch, decision_epoch, speech_revision, \
+                        snapshot_intent_revision, state, deadline_at \
+                 FROM meeting_moderator_decision_attempts \
+                 WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+                 FOR UPDATE",
+            )
+            .bind(params.community_id.as_uuid())
+            .bind(params.session_id)
+            .bind(attempt_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            let Some(attempt) = attempt else {
+                return Ok(AppliedCommand::rejected("stale_decision_attempt", None));
+            };
+            let moderator_pubkey: Vec<u8> = attempt.try_get("moderator_pubkey")?;
+            let attempt_control_epoch: i64 = attempt.try_get("control_epoch")?;
+            let attempt_decision_epoch: i64 = attempt.try_get("decision_epoch")?;
+            let attempt_speech_revision: i64 = attempt.try_get("speech_revision")?;
+            let attempt_intent_revision: i64 = attempt.try_get("snapshot_intent_revision")?;
+            let attempt_state: String = attempt.try_get("state")?;
+            let attempt_deadline: DateTime<Utc> = attempt.try_get("deadline_at")?;
+            if moderator_pubkey != params.event.pubkey.as_bytes()
+                || attempt_state != "running"
+                || attempt_control_epoch != control_epoch
+                || attempt_decision_epoch != decision_epoch
+                || attempt_speech_revision != speech_revision
+                || attempt_intent_revision != intent_revision
+                || next_action_at != Some(attempt_deadline)
+            {
+                return Ok(AppliedCommand::rejected(
+                    "decision_attempt_prerequisite_changed",
+                    None,
+                ));
+            }
+            if now >= attempt_deadline {
+                return Ok(AppliedCommand::rejected("moderator_attempt_expired", None));
+            }
+            if has_human_floor_work_tx(tx, params.community_id, params.session_id).await? {
+                return Ok(AppliedCommand::rejected("human_request_has_priority", None));
+            }
+        }
+        None => {
+            if phase != "moderator_idle" || active_attempt_id.is_some() || next_action_at.is_some()
+            {
+                return Ok(AppliedCommand::rejected("moderator_floor_not_idle", None));
+            }
+            if has_unresolved_floor_work_tx(tx, params.community_id, params.session_id).await? {
+                return Ok(AppliedCommand::rejected("floor_work_pending", None));
+            }
+        }
     }
     if load_active_run_tx(tx, params.community_id, params.session_id, true)
         .await?
@@ -407,6 +457,41 @@ async fn apply_begin_tx(
     {
         return Ok(AppliedCommand::rejected("action_run_already_active", None));
     }
+
+    let frozen_floor = if let Some(attempt_id) = expected_decision_attempt_id {
+        let completed = sqlx::query(
+            "UPDATE meeting_moderator_decision_attempts \
+             SET state = 'completed', terminal_event_id = $4, \
+                 terminal_reason = 'action_finalization', terminal_at = $5 \
+             WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3 \
+               AND state = 'running'",
+        )
+        .bind(params.community_id.as_uuid())
+        .bind(params.session_id)
+        .bind(attempt_id)
+        .bind(params.event.id.as_bytes().as_slice())
+        .bind(now)
+        .execute(tx.as_mut())
+        .await?;
+        if completed.rows_affected() != 1 {
+            return Err(DbError::InvalidData(
+                "Meeting moderator DecisionAttempt changed while beginning action finalization"
+                    .to_string(),
+            ));
+        }
+        Some(
+            freeze_floor_work_for_actions_tx(
+                tx,
+                params.community_id,
+                params.session_id,
+                params.event.id.as_bytes(),
+                now,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let duration_ms = action_duration_ms_tx(tx, params.community_id, params.session_id).await?;
     let deadline = now + Duration::milliseconds(duration_ms);
@@ -457,6 +542,7 @@ async fn apply_begin_tx(
         params.event.id.as_bytes(),
         "floor_ready",
         "planning/runnable",
+        expected_decision_attempt_id,
         now,
     )
     .await?;
@@ -468,6 +554,9 @@ async fn apply_begin_tx(
         json!({
             "board_event_id": hex::encode(board_event_id),
             "action_deadline_at_ms": deadline.timestamp_millis(),
+            "decision_attempt_id": expected_decision_attempt_id.map(hex::encode),
+            "frozen_intent_count": frozen_floor.map(|counts| counts.0).unwrap_or(0),
+            "frozen_handoff_count": frozen_floor.map(|counts| counts.1).unwrap_or(0),
         }),
     ))
 }
@@ -538,6 +627,7 @@ async fn apply_plan_tx(
         params.event.id.as_bytes(),
         "planning/runnable",
         "applying/runnable",
+        None,
         now,
     )
     .await?;
@@ -602,6 +692,7 @@ async fn apply_block_tx(
         params.event.id.as_bytes(),
         &format!("{}/runnable", run.action_phase),
         &format!("{}/blocked", run.action_phase),
+        None,
         now,
     )
     .await?;
@@ -663,6 +754,7 @@ async fn apply_retry_tx(
         params.event.id.as_bytes(),
         &format!("{}/blocked", run.action_phase),
         &format!("{}/runnable", run.action_phase),
+        None,
         now,
     )
     .await?;
@@ -733,6 +825,7 @@ async fn apply_complete_tx(
         params.event.id.as_bytes(),
         "applying/runnable",
         "ready_to_close/runnable",
+        None,
         now,
     )
     .await?;
@@ -812,6 +905,7 @@ async fn apply_return_to_board_tx(
         params.event.id.as_bytes(),
         &format!("{}/{}", run.action_phase, run.action_condition),
         "board_pending",
+        None,
         now,
     )
     .await?;
@@ -902,6 +996,57 @@ async fn has_unresolved_floor_work_tx(
     .fetch_one(tx.as_mut())
     .await
     .map_err(Into::into)
+}
+
+async fn has_human_floor_work_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meeting_human_floor_requests \
+                        WHERE community_id = $1 AND session_id = $2 \
+                          AND state IN ('queued', 'offered'))",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(Into::into)
+}
+
+async fn freeze_floor_work_for_actions_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    terminal_event_id: &[u8],
+    now: DateTime<Utc>,
+) -> Result<(u64, u64)> {
+    let intents = sqlx::query(
+        "UPDATE meeting_speech_intents \
+         SET state = 'ended', terminal_event_id = $3, terminal_at = $4, \
+             updated_at = $4, last_attempt_outcome = 'ended', \
+             deferred_by_offer_id = NULL, defer_event_id = NULL, defer_reason = NULL \
+         WHERE community_id = $1 AND session_id = $2 AND state = 'pending'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(terminal_event_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    let handoffs = sqlx::query(
+        "UPDATE meeting_directed_handoffs \
+         SET question_state = 'ended', last_attempt_outcome = 'ended', terminal_at = $3 \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND question_state IN ('open', 'blocked')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    Ok((intents.rows_affected(), handoffs.rows_affected()))
 }
 
 async fn action_duration_ms_tx(

@@ -37,6 +37,7 @@ pub(super) async fn fetch_current_board(
     session_id: Uuid,
     relay_pubkey: &str,
     moderator_pubkey: &str,
+    policy: &str,
     body_limit: usize,
 ) -> Result<CurrentBoardPrompt> {
     let session = session_id.to_string();
@@ -53,6 +54,7 @@ pub(super) async fn fetch_current_board(
         session_id,
         relay_pubkey,
         moderator_pubkey,
+        policy,
         crate::meeting::now_ms(),
         body_limit,
     )
@@ -63,6 +65,7 @@ fn select_current_board(
     session_id: Uuid,
     relay_pubkey: &str,
     moderator_pubkey: &str,
+    policy: &str,
     read_at_unix_ms: i64,
     body_limit: usize,
 ) -> Result<CurrentBoardPrompt> {
@@ -94,7 +97,7 @@ fn select_current_board(
             ));
         }
         if single_tag(&event, "v")? != Some(buzz_sdk::MEETING_V2_SCHEMA_VERSION)
-            || single_tag(&event, "policy")? != Some(buzz_sdk::MEETING_V2_POLICY)
+            || single_tag(&event, "policy")? != Some(policy)
             || single_tag(&event, "format")? != Some(buzz_sdk::MEETING_V2_BOARD_FORMAT)
             || single_tag(&event, "moderator")?.map(str::to_ascii_lowercase)
                 != Some(expected_moderator.clone())
@@ -249,6 +252,7 @@ mod tests {
             session_id,
             &relay.public_key().to_hex(),
             &moderator,
+            buzz_sdk::MEETING_V2_POLICY,
             1234,
             PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
         )
@@ -274,6 +278,7 @@ mod tests {
             session_id,
             &relay.public_key().to_hex(),
             &moderator,
+            buzz_sdk::MEETING_V2_POLICY,
             1234,
             PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
         )
@@ -312,6 +317,7 @@ mod tests {
             session_id,
             &relay.public_key().to_hex(),
             &moderator,
+            buzz_sdk::MEETING_V2_POLICY,
             1234,
             PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
         )

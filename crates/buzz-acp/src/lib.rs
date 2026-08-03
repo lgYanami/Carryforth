@@ -97,6 +97,21 @@ fn meeting_capabilities() -> serde_json::Value {
                     ],
                     "currentBoard": "authoritative_read_before_each_semantic_turn",
                     "boardFloorDeadlines": "independent"
+                },
+                {
+                    "schemaVersion": buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+                    "policy": buzz_sdk::MEETING_V2_ACTIONS_POLICY,
+                    "roles": ["participant", "moderator"],
+                    "turns": [
+                        "intent",
+                        "granted_speech",
+                        "board_maintenance",
+                        "floor_decision",
+                        "action_finalization"
+                    ],
+                    "currentBoard": "exact_authoritative_read_before_each_semantic_turn",
+                    "boardFloorActionDeadlines": "independent",
+                    "moderatorContinuity": "exact_agent_slot_and_acp_session"
                 }
             ]
         }
@@ -141,6 +156,29 @@ mod meeting_capability_tests {
         assert_eq!(
             v2["currentBoard"],
             "authoritative_read_before_each_semantic_turn"
+        );
+        let actions = capabilities["meeting"]["protocols"]
+            .as_array()
+            .and_then(|protocols| {
+                protocols.iter().find(|protocol| {
+                    protocol["schemaVersion"] == buzz_sdk::MEETING_V2_SCHEMA_VERSION
+                        && protocol["policy"] == buzz_sdk::MEETING_V2_ACTIONS_POLICY
+                })
+            })
+            .expect("action-capable Meeting V2 capability");
+        assert_eq!(
+            actions["turns"],
+            serde_json::json!([
+                "intent",
+                "granted_speech",
+                "board_maintenance",
+                "floor_decision",
+                "action_finalization"
+            ])
+        );
+        assert_eq!(
+            actions["moderatorContinuity"],
+            "exact_agent_slot_and_acp_session"
         );
         assert_eq!(
             capabilities["meeting"]["ledgerVersion"],
@@ -1913,6 +1951,34 @@ async fn tokio_main(
         harness_name: ctx.harness_name.clone(),
         relay_url: ctx.relay_url.clone(),
     });
+    let meeting_v2_actions_ctx = Arc::new(PromptContext {
+        // The action-capable policy is deliberately uniform across
+        // participant, Board, Floor, and Action turns so one channel ACP
+        // Session never changes its authority boundary mid-meeting.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V2_ACTIONS_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
     let mut meeting_controller = meeting::MeetingCoordinator::new(
         ctx.rest_client.clone(),
         config.keys.clone(),
@@ -1921,7 +1987,12 @@ async fn tokio_main(
     );
     pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
     pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
-    meeting_controller.set_available_agent_slots(if pool_ready { pool.idle_count() } else { 0 });
+    meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+    meeting_controller.set_available_agent_slots(if pool_ready {
+        pool.claimable_unleased_count()
+    } else {
+        0
+    });
     for channel_id in meeting_channel_ids {
         meeting_controller.register(channel_id).await;
     }
@@ -2079,10 +2150,12 @@ async fn tokio_main(
     }
 
     let main_loop_exit = loop {
+        apply_meeting_continuity_directives(&mut pool, &mut meeting_controller);
         pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
         pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
+        meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
         meeting_controller.set_available_agent_slots(if pool_ready {
-            pool.idle_count()
+            pool.claimable_unleased_count()
         } else {
             0
         });
@@ -2097,12 +2170,14 @@ async fn tokio_main(
                 &meeting_v1_ctx,
                 &meeting_v2_ctx,
                 &meeting_v2_moderator_ctx,
+                &meeting_v2_actions_ctx,
             );
             pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
             pool.set_reserved_meeting_board_slots(
                 meeting_controller.board_dispatch_reserved_slots(),
             );
-            meeting_controller.set_available_agent_slots(pool.idle_count());
+            meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+            meeting_controller.set_available_agent_slots(pool.claimable_unleased_count());
         }
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -2250,6 +2325,7 @@ async fn tokio_main(
                 &meeting_v1_ctx,
                 &meeting_v2_ctx,
                 &meeting_v2_moderator_ctx,
+                &meeting_v2_actions_ctx,
             );
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                 typing_channels.insert(channel_id, thread_tags);
@@ -2847,8 +2923,112 @@ async fn tokio_main(
                 }
                 let meeting_turn = meeting_controller.owns_turn(&result.turn_id);
                 let meeting_turn_id = result.turn_id.clone();
+                let continuity_info = meeting_controller.turn_continuity_info(&result.turn_id);
                 let meeting_output = meeting_turn.then(|| result.agent.acp.take_agent_message());
-                let meeting_succeeded = matches!(&result.outcome, PromptOutcome::Ok(_));
+                let mut meeting_succeeded = matches!(&result.outcome, PromptOutcome::Ok(_));
+                if let Some(info) = continuity_info {
+                    let agent_index = result.agent.index;
+                    let resolved_session_id = result.resolved_session_id.as_deref();
+                    let process_will_be_replaced = prompt_outcome_replaces_agent(&result.outcome);
+                    let mut affinity_lost = process_will_be_replaced;
+                    let output = meeting_output.as_deref().unwrap_or_default();
+                    let binding_existed = pool.meeting_slot_binding(info.session_id).is_some();
+                    match info.kind {
+                        meeting::MeetingTurnKind::V2ModeratorBoard
+                            if meeting_succeeded && v2_actions_board_output_is_holdable(output) =>
+                        {
+                            if let Some(acp_session_id) = resolved_session_id {
+                                let phase = pool.meeting_slot_binding(info.session_id).map_or(
+                                    pool::MeetingSlotBindingPhase::FinalControlCycle,
+                                    |binding| binding.phase,
+                                );
+                                if pool
+                                    .bind_meeting_slot(
+                                        info.session_id,
+                                        agent_index,
+                                        acp_session_id.to_string(),
+                                        phase,
+                                        result.rotation_deferred,
+                                    )
+                                    .is_err()
+                                {
+                                    affinity_lost = true;
+                                    meeting_succeeded = false;
+                                } else {
+                                    meeting_controller.record_continuity_binding(
+                                        info.session_id,
+                                        agent_index,
+                                        acp_session_id,
+                                        continuity_phase_name(phase),
+                                    );
+                                }
+                            } else {
+                                affinity_lost = true;
+                                meeting_succeeded = false;
+                            }
+                        }
+                        meeting::MeetingTurnKind::V2ModeratorBoard => {}
+                        meeting::MeetingTurnKind::V2ModeratorFloor
+                        | meeting::MeetingTurnKind::V2ActionFinalization => {
+                            let binding_matches = pool
+                                .meeting_slot_binding(info.session_id)
+                                .is_some_and(|binding| {
+                                    binding.agent_index == agent_index
+                                        && resolved_session_id
+                                            == Some(binding.acp_session_id.as_str())
+                                });
+                            if !binding_matches {
+                                affinity_lost = true;
+                                meeting_succeeded = false;
+                            } else if let Some(acp_session_id) = resolved_session_id {
+                                let current_phase = pool
+                                    .meeting_slot_binding(info.session_id)
+                                    .map(|binding| binding.phase)
+                                    .unwrap_or(pool::MeetingSlotBindingPhase::FinalControlCycle);
+                                let phase = if info.kind
+                                    == meeting::MeetingTurnKind::V2ActionFinalization
+                                {
+                                    pool::MeetingSlotBindingPhase::Action
+                                } else if meeting_succeeded
+                                    && v2_actions_floor_selects_finalization(output)
+                                    && current_phase
+                                        != pool::MeetingSlotBindingPhase::ModeratorMeeting
+                                {
+                                    pool::MeetingSlotBindingPhase::PendingAction
+                                } else {
+                                    current_phase
+                                };
+                                let _ = pool.bind_meeting_slot(
+                                    info.session_id,
+                                    agent_index,
+                                    acp_session_id.to_string(),
+                                    phase,
+                                    result.rotation_deferred,
+                                );
+                                meeting_controller.record_continuity_binding(
+                                    info.session_id,
+                                    agent_index,
+                                    acp_session_id,
+                                    continuity_phase_name(phase),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    if affinity_lost
+                        && !(info.kind == meeting::MeetingTurnKind::V2ModeratorBoard
+                            && !binding_existed
+                            && !v2_actions_board_output_is_holdable(output))
+                    {
+                        continue_meeting_continuity_failure(
+                            &mut pool,
+                            &mut meeting_controller,
+                            &meeting_turn_id,
+                            info.session_id,
+                            "Agent slot or ACP Session continuity was lost",
+                        );
+                    }
+                }
                 let loop_action = handle_prompt_result(
                     &mut pool,
                     &mut queue,
@@ -2886,6 +3066,7 @@ async fn tokio_main(
                     &meeting_controller,
                 );
                 for turn_id in failed_meeting_turns {
+                    meeting_controller.mark_turn_continuity_lost(&turn_id, "Agent task panicked");
                     meeting_controller.handle_turn_failure(&turn_id).await;
                 }
                 if drain_action == LoopAction::Exit {
@@ -2900,6 +3081,7 @@ async fn tokio_main(
                     &meeting_v1_ctx,
                     &meeting_v2_ctx,
                     &meeting_v2_moderator_ctx,
+                    &meeting_v2_actions_ctx,
                 );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -2912,6 +3094,9 @@ async fn tokio_main(
                     .get(&join_error.id())
                     .map(|meta| meta.turn_id.clone())
                     .filter(|turn_id| meeting_controller.owns_turn(turn_id));
+                if let Some(turn_id) = failed_meeting_turn.as_deref() {
+                    meeting_controller.mark_turn_continuity_lost(turn_id, "Agent task panicked");
+                }
                 recover_panicked_agent(
                     &mut pool,
                     &mut queue,
@@ -2939,6 +3124,7 @@ async fn tokio_main(
                     &meeting_v1_ctx,
                     &meeting_v2_ctx,
                     &meeting_v2_moderator_ctx,
+                    &meeting_v2_actions_ctx,
                 );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
@@ -3093,6 +3279,7 @@ async fn tokio_main(
                             &meeting_v1_ctx,
                             &meeting_v2_ctx,
                             &meeting_v2_moderator_ctx,
+                            &meeting_v2_actions_ctx,
                         );
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
@@ -3468,6 +3655,128 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+fn prompt_outcome_replaces_agent(outcome: &PromptOutcome) -> bool {
+    match outcome {
+        PromptOutcome::AgentExited
+        | PromptOutcome::Timeout(_)
+        | PromptOutcome::CancelDrainTimeout(_) => true,
+        PromptOutcome::Error(error) => matches!(
+            error,
+            acp::AcpError::Io(_)
+                | acp::AcpError::WriteTimeout(_)
+                | acp::AcpError::Timeout(_)
+                | acp::AcpError::Protocol(_)
+        ),
+        PromptOutcome::Ok(_) | PromptOutcome::Cancelled => false,
+    }
+}
+
+fn v2_actions_board_output_is_holdable(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 3
+        || object
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    match object.get("action").and_then(serde_json::Value::as_str) {
+        Some("UNCHANGED") => object.get("board").is_some_and(serde_json::Value::is_null),
+        Some("UPDATE") => object
+            .get("board")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|body| {
+                buzz_sdk::validate_meeting_v2_board_content(&buzz_sdk::MeetingV2BoardContent {
+                    format: buzz_sdk::MEETING_V2_BOARD_FORMAT.to_string(),
+                    body: body.to_string(),
+                })
+                .is_ok()
+            }),
+        _ => false,
+    }
+}
+
+fn v2_actions_floor_selects_finalization(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return false;
+    };
+    value.get("action").and_then(serde_json::Value::as_str) == Some("FINALIZE_ACTIONS")
+        || value
+            .get("next_action")
+            .and_then(|next| next.get("action"))
+            .and_then(serde_json::Value::as_str)
+            == Some("finalize_actions")
+}
+
+fn continuity_phase_name(phase: pool::MeetingSlotBindingPhase) -> &'static str {
+    match phase {
+        pool::MeetingSlotBindingPhase::FinalControlCycle => "final_control_cycle",
+        pool::MeetingSlotBindingPhase::PendingAction => "pending_action",
+        pool::MeetingSlotBindingPhase::Action => "action",
+        pool::MeetingSlotBindingPhase::ModeratorMeeting => "moderator_meeting",
+    }
+}
+
+fn continue_meeting_continuity_failure(
+    pool: &mut AgentPool,
+    controller: &mut meeting::MeetingCoordinator,
+    turn_id: &str,
+    session_id: Uuid,
+    reason: &str,
+) {
+    pool.release_meeting_slot_binding(session_id);
+    controller.mark_turn_continuity_lost(turn_id, reason);
+}
+
+fn apply_meeting_continuity_directives(
+    pool: &mut AgentPool,
+    controller: &mut meeting::MeetingCoordinator,
+) {
+    for directive in controller.take_continuity_directives() {
+        match directive {
+            meeting::MeetingContinuityDirective::Release { session_id } => {
+                if pool.release_meeting_slot_binding(session_id) {
+                    controller.clear_continuity_binding(session_id);
+                }
+            }
+            meeting::MeetingContinuityDirective::ReleaseFinalControl { session_id } => {
+                if pool
+                    .meeting_slot_binding(session_id)
+                    .is_some_and(|binding| {
+                        matches!(
+                            binding.phase,
+                            pool::MeetingSlotBindingPhase::FinalControlCycle
+                                | pool::MeetingSlotBindingPhase::PendingAction
+                        )
+                    })
+                    && pool.release_meeting_slot_binding(session_id)
+                {
+                    controller.clear_continuity_binding(session_id);
+                }
+            }
+            meeting::MeetingContinuityDirective::PromoteAction { session_id } => {
+                pool.promote_meeting_slot_binding(
+                    session_id,
+                    pool::MeetingSlotBindingPhase::Action,
+                );
+            }
+            meeting::MeetingContinuityDirective::PromoteModeratorMeeting { session_id } => {
+                pool.promote_meeting_slot_binding(
+                    session_id,
+                    pool::MeetingSlotBindingPhase::ModeratorMeeting,
+                );
+            }
+        }
+    }
+    controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+}
+
 /// Dispatch controller-owned Meeting turns before ordinary channel work.
 ///
 /// The empty batch supplies channel/session affinity without leaking meeting
@@ -3480,7 +3789,9 @@ fn dispatch_meeting_pending(
     v1_ctx: &Arc<PromptContext>,
     v2_ctx: &Arc<PromptContext>,
     v2_moderator_ctx: &Arc<PromptContext>,
+    v2_actions_ctx: &Arc<PromptContext>,
 ) {
+    apply_meeting_continuity_directives(pool, controller);
     while let Some(request) = controller.pop_pending() {
         let channel_id = request.session_id;
         let ctx = match request.baton_protocol {
@@ -3489,14 +3800,39 @@ fn dispatch_meeting_pending(
                 Arc::clone(v2_moderator_ctx)
             }
             Some(meeting::MeetingBatonProtocol::V2) => Arc::clone(v2_ctx),
+            Some(meeting::MeetingBatonProtocol::V2Actions) => Arc::clone(v2_actions_ctx),
             None => Arc::clone(v0_ctx),
         };
+        let action_host_turn = request.baton_protocol
+            == Some(meeting::MeetingBatonProtocol::V2Actions)
+            && request.kind.is_v2_moderator();
         // Granted turns may consume their Offer reservation. A Board-backed V2
         // participant Turn may consume only its short-lived Board reservation,
         // while still respecting every stronger Offer/Grant reservation.
-        let claimed = if request.kind == meeting::MeetingTurnKind::V1Granted {
+        let claimed = if action_host_turn && pool.meeting_slot_binding(channel_id).is_some() {
+            match pool.claim_exact_meeting(channel_id) {
+                Ok(agent) => Some(agent),
+                Err(pool::ExactMeetingClaimError::Busy) => {
+                    controller.requeue_front(request);
+                    break;
+                }
+                Err(
+                    pool::ExactMeetingClaimError::MissingBinding
+                    | pool::ExactMeetingClaimError::AffinityLost,
+                ) => {
+                    pool.release_meeting_slot_binding(channel_id);
+                    controller.mark_continuity_lost(&request, "exact slot/session affinity lost");
+                    continue;
+                }
+            }
+        } else if action_host_turn && request.kind != meeting::MeetingTurnKind::V2ModeratorBoard {
+            controller.mark_continuity_lost(&request, "required continuity binding is missing");
+            continue;
+        } else if request.kind == meeting::MeetingTurnKind::V1Granted {
             pool.try_claim_meeting(channel_id)
-        } else if request.baton_protocol == Some(meeting::MeetingBatonProtocol::V2)
+        } else if request
+            .baton_protocol
+            .is_some_and(meeting::MeetingBatonProtocol::is_v2)
             && request.board_event_id.is_some()
         {
             pool.try_claim_meeting_board(channel_id)
@@ -3537,6 +3873,7 @@ fn dispatch_meeting_pending(
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: Some(absolute_hard_deadline),
                     turn_id: task_turn_id,
+                    defer_session_rotation: action_host_turn,
                 },
             )
             .await;
@@ -3553,7 +3890,8 @@ fn dispatch_meeting_pending(
             },
         );
         controller.mark_dispatched(turn_id, request);
-        controller.set_available_agent_slots(pool.idle_count());
+        controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+        controller.set_available_agent_slots(pool.claimable_unleased_count());
         tracing::info!(
             agent = agent_index,
             meeting = %channel_id,
@@ -3565,7 +3903,8 @@ fn dispatch_meeting_pending(
     // caller proceeds to ordinary channel work in the same main-loop branch.
     pool.set_reserved_meeting_slots(controller.unassigned_reserved_slots());
     pool.set_reserved_meeting_board_slots(controller.board_dispatch_reserved_slots());
-    controller.set_available_agent_slots(pool.idle_count());
+    controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+    controller.set_available_agent_slots(pool.claimable_unleased_count());
 }
 
 /// Flush queued work to available agents.
@@ -3638,6 +3977,7 @@ fn dispatch_pending(
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: None,
                     turn_id: task_turn_id,
+                    defer_session_rotation: false,
                 },
             )
             .await;
@@ -3864,10 +4204,16 @@ fn handle_prompt_result(
     for ch in removed_channels {
         result.agent.state.invalidate_channel(ch);
     }
+    let continuity_bound = match &result.source {
+        PromptSource::Channel(channel_id) => pool
+            .meeting_slot_binding(*channel_id)
+            .is_some_and(|binding| binding.agent_index == result.agent.index),
+        PromptSource::Heartbeat => false,
+    };
     if let PromptSource::Channel(channel_id) = &result.source {
         if removed_channels.contains(channel_id) {
             pool.discard_pending_role_context_refresh(*channel_id);
-        } else {
+        } else if !continuity_bound {
             pool.apply_pending_role_context_refresh(&mut result.agent.state, &result.source);
         }
     }
@@ -3901,6 +4247,9 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
+    if prompt_outcome_replaces_agent(&result.outcome) {
+        pool.lose_meeting_slot_bindings_for_agent(agent_index);
+    }
     if let Some(ref observer) = observer {
         observer.emit(
             "prompt_terminal",
@@ -4130,6 +4479,7 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    pool.lose_meeting_slot_bindings_for_agent(i);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -4304,6 +4654,7 @@ fn dispatch_heartbeat(
                 control_rx: None,
                 absolute_hard_deadline: None,
                 turn_id: task_turn_id,
+                defer_session_rotation: false,
             },
         )
         .await;
@@ -6218,6 +6569,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
             outcome,
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: None,
         };
 
@@ -6384,6 +6737,8 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(Uuid::new_v4()),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                resolved_session_id: None,
+                rotation_deferred: false,
                 batch: None,
             };
             handle_prompt_result(
@@ -6474,6 +6829,8 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                resolved_session_id: None,
+                rotation_deferred: false,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -6579,6 +6936,8 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                resolved_session_id: None,
+                rotation_deferred: false,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -6670,6 +7029,8 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -6763,6 +7124,8 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -6877,6 +7240,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
 
@@ -7006,6 +7371,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
+            resolved_session_id: None,
+            rotation_deferred: false,
             // Explicit Stop already dropped the batch upstream in
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
@@ -7192,6 +7559,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7277,6 +7646,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
