@@ -23,6 +23,7 @@ pub mod error;
 pub mod handlers;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).
 pub mod invite_token;
+mod meeting_observability;
 /// Meeting V0 deadline recovery and transactional outbox delivery.
 pub mod meeting_runtime;
 /// Inter-relay mesh startup wiring (`BUZZ_MESH` seam).

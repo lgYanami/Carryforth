@@ -1464,6 +1464,8 @@ pub async fn query_events(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut board_read_observation =
+        crate::meeting_observability::MeetingV2BoardReadObservation::for_raw_filters("http", &body);
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped read, identical to the WS door in `router.rs`.
     // An unmapped host or lookup failure fails closed with a generic 404 — never
@@ -1500,6 +1502,7 @@ pub async fn query_events(
         query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
     match &result {
         Ok(Json(Value::Array(events))) => {
+            board_read_observation.completed(events.len());
             tracing::info!(
                 pubkey = %pubkey_hex,
                 route = "/query",
@@ -1509,9 +1512,15 @@ pub async fn query_events(
             );
         }
         Ok(_) => {
+            board_read_observation.failed();
             tracing::info!(pubkey = %pubkey_hex, route = "/query", status = 200u16, "HTTP bridge request");
         }
         Err((status, _)) => {
+            if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                board_read_observation.denied();
+            } else {
+                board_read_observation.failed();
+            }
             tracing::warn!(
                 pubkey = %pubkey_hex,
                 route = "/query",

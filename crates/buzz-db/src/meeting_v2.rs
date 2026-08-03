@@ -1457,6 +1457,95 @@ pub async fn create_meeting_v2_tx(
     })
 }
 
+impl Db {
+    /// Return whether the complete Meeting V2 runtime catalog is present.
+    ///
+    /// This is a deployment probe, not a per-Session authorization check. It
+    /// deliberately verifies the stage-two columns and receipt table rather
+    /// than treating the stage-one bootstrap schema as a runnable lifecycle.
+    pub async fn meeting_v2_schema_ready(&self) -> Result<bool> {
+        let ready = sqlx::query_scalar(
+            "SELECT \
+                to_regclass('meeting_current_boards') IS NOT NULL \
+                AND to_regclass('meeting_v2_config') IS NOT NULL \
+                AND to_regclass('meeting_v2_bootstrap_state') IS NOT NULL \
+                AND to_regclass('meeting_v2_board_command_receipts') IS NOT NULL \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_sessions') \
+                      AND attname = 'terminal_outcome' AND NOT attisdropped \
+                ) \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_v2_bootstrap_state') \
+                      AND attname = 'board_deadline_at' AND NOT attisdropped \
+                ) \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_v2_bootstrap_state') \
+                      AND attname = 'terminal_outcome' AND NOT attisdropped \
+                )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ready)
+    }
+
+    /// Return whether this Relay pod may serve traffic while Meeting V2 is in
+    /// use or creation is enabled.
+    ///
+    /// A pre-migration deployment with Create disabled and no possible V2 rows
+    /// stays ready, allowing the binary-before-migration rollout order. Once an
+    /// active V2 exists—or Create is enabled—the complete schema and a stable
+    /// Relay signer are mandatory even if operators later close Create.
+    pub async fn meeting_v2_deployment_ready(
+        &self,
+        stable_signer_configured: bool,
+        create_enabled: bool,
+    ) -> Result<bool> {
+        let protocol_columns_ready: bool = sqlx::query_scalar(
+            "SELECT \
+                to_regclass('meeting_sessions') IS NOT NULL \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_sessions') \
+                      AND attname = 'schema_version' AND NOT attisdropped \
+                ) \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_sessions') \
+                      AND attname = 'floor_policy_version' AND NOT attisdropped \
+                )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let active_v2 = if protocol_columns_ready {
+            sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                    SELECT 1 FROM meeting_sessions \
+                    WHERE status = 'active' \
+                      AND schema_version = $1 \
+                      AND floor_policy_version = $2 \
+                )",
+            )
+            .bind(SCHEMA_VERSION)
+            .bind(BOARD_POLICY_VERSION)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            false
+        };
+        if !meeting_v2_runtime_required(create_enabled, active_v2) {
+            return Ok(true);
+        }
+        Ok(stable_signer_configured && self.meeting_v2_schema_ready().await?)
+    }
+}
+
+const fn meeting_v2_runtime_required(create_enabled: bool, active_v2: bool) -> bool {
+    create_enabled || active_v2
+}
+
 /// Load the current board without applying a caller authorization decision.
 ///
 /// Relay query paths should normally use their existing Meeting reader fence;
@@ -1672,6 +1761,30 @@ mod tests {
         pool
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn deployment_probe_requires_a_stable_signer_when_create_is_enabled() {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool);
+        assert!(db.meeting_v2_schema_ready().await.expect("schema probe"));
+        assert!(!db
+            .meeting_v2_deployment_ready(false, true)
+            .await
+            .expect("enabled Create without signer"));
+        assert!(db
+            .meeting_v2_deployment_ready(true, true)
+            .await
+            .expect("enabled Create with signer"));
+    }
+
+    #[test]
+    fn deployment_probe_only_requires_v2_runtime_when_create_or_drain_needs_it() {
+        assert!(!meeting_v2_runtime_required(false, false));
+        assert!(meeting_v2_runtime_required(true, false));
+        assert!(meeting_v2_runtime_required(false, true));
+        assert!(meeting_v2_runtime_required(true, true));
+    }
+
     async fn make_community(pool: &PgPool) -> CommunityId {
         let id = Uuid::new_v4();
         sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
@@ -1868,6 +1981,14 @@ mod tests {
         assert_eq!(snapshot.session_id, session_id);
         assert_eq!(snapshot.moderator_pubkey, host);
         assert_eq!(snapshot.participants.len(), 2);
+        assert!(!db
+            .meeting_v2_deployment_ready(false, false)
+            .await
+            .expect("active V2 without a stable signer must fail readiness"));
+        assert!(db
+            .meeting_v2_deployment_ready(true, false)
+            .await
+            .expect("closed Create can drain active V2 with a stable signer"));
         let host_board = get_current_board_for_reader(&db, community_id, session_id, &host)
             .await
             .expect("host reads current board")

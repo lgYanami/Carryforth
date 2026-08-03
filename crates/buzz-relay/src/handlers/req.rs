@@ -108,11 +108,17 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
+    let mut board_read_observation =
+        crate::meeting_observability::MeetingV2BoardReadObservation::for_filters(
+            "websocket",
+            &filters,
+        );
     let (conn_id, pubkey_bytes, token_channel_ids, auth_scopes) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => {
                 if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
+                    board_read_observation.denied();
                     conn.send(RelayMessage::notice("restricted: insufficient scope"));
                     conn.send(RelayMessage::closed(
                         &sub_id,
@@ -140,6 +146,7 @@ pub async fn handle_req(
                 )
             }
             _ => {
+                board_read_observation.denied();
                 conn.send(RelayMessage::notice(
                     "auth-required: authenticate before subscribing",
                 ));
@@ -271,6 +278,7 @@ pub async fn handle_req(
             token_allows,
             db_is_member,
         ) {
+            board_read_observation.denied();
             conn.send(RelayMessage::closed(
                 &sub_id,
                 "restricted: not a channel member",
@@ -298,6 +306,7 @@ pub async fn handle_req(
         }
     };
     if channel_id.is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id)) {
+        board_read_observation.denied();
         conn.send(RelayMessage::closed(
             &sub_id,
             "restricted: meeting access revoked",
@@ -554,6 +563,7 @@ pub async fn handle_req(
     }
 
     conn.send(RelayMessage::eose(&sub_id));
+    board_read_observation.completed(total_sent);
 
     debug!(
         conn_id = %conn_id,

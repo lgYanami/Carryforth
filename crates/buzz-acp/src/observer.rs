@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-#[cfg(feature = "meeting-v1-acceptance")]
+#[cfg(feature = "meeting-acceptance")]
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
@@ -47,16 +47,16 @@ struct ObserverInner {
     tx: broadcast::Sender<ObserverEvent>,
     buffer: Mutex<VecDeque<ObserverEvent>>,
     seq: AtomicU64,
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     acceptance_sink: Option<Mutex<BufWriter<File>>>,
 }
 
 fn new_observer_handle() -> ObserverHandle {
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     {
         new_observer_handle_with_sink(None)
     }
-    #[cfg(not(feature = "meeting-v1-acceptance"))]
+    #[cfg(not(feature = "meeting-acceptance"))]
     {
         let (tx, _) = broadcast::channel(OBSERVER_BUFFER_CAP);
         ObserverHandle {
@@ -69,7 +69,7 @@ fn new_observer_handle() -> ObserverHandle {
     }
 }
 
-#[cfg(feature = "meeting-v1-acceptance")]
+#[cfg(feature = "meeting-acceptance")]
 fn new_observer_handle_with_sink(acceptance_sink: Option<BufWriter<File>>) -> ObserverHandle {
     let (tx, _) = broadcast::channel(OBSERVER_BUFFER_CAP);
     ObserverHandle {
@@ -115,7 +115,7 @@ impl ObserverHandle {
 
     /// Create an in-process feed that also writes a privacy-filtered,
     /// flush-on-every-event acceptance NDJSON file.
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     pub(crate) fn in_process_with_acceptance_sink(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().create_new(true).write(true).open(path)?;
         Ok(new_observer_handle_with_sink(Some(BufWriter::new(file))))
@@ -169,7 +169,7 @@ impl ObserverHandle {
             }
         }
 
-        #[cfg(feature = "meeting-v1-acceptance")]
+        #[cfg(feature = "meeting-acceptance")]
         if acceptance_safe_kind(&event.kind) {
             match self
                 .inner
@@ -203,7 +203,7 @@ impl ObserverHandle {
     }
 }
 
-#[cfg(feature = "meeting-v1-acceptance")]
+#[cfg(feature = "meeting-acceptance")]
 fn acceptance_safe_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -224,8 +224,10 @@ fn acceptance_safe_kind(kind: &str) -> bool {
             | "respawn_failed"
             | "model_applied"
             | "meeting_v1_ended"
+            | "meeting_v1_grant_received"
             | "meeting_v1_grant_yielded"
             | "meeting_v1_intent_completed"
+            | "meeting_v1_intent_started"
             | "meeting_v1_moderator_action_submitted"
             | "meeting_v1_moderator_attempt_registered"
             | "meeting_v1_moderator_decision_committed"
@@ -243,6 +245,15 @@ fn acceptance_safe_kind(kind: &str) -> bool {
             | "meeting_v1_state_applied"
             | "meeting_v1_sync_completed"
             | "meeting_v1_turn_started"
+            | "meeting_v2_board_load_completed"
+            | "meeting_v2_board_load_discarded"
+            | "meeting_v2_board_load_failed"
+            | "meeting_v2_board_load_started"
+            | "meeting_v2_board_turn_completed"
+            | "meeting_v2_board_turn_queued"
+            | "meeting_v2_floor_turn_completed"
+            | "meeting_v2_floor_turn_queued"
+            | "meeting_v2_host_turn_discarded"
     )
 }
 
@@ -275,7 +286,7 @@ pub fn context_for_turn(
     }
 }
 
-#[cfg(all(test, feature = "meeting-v1-acceptance"))]
+#[cfg(all(test, feature = "meeting-acceptance"))]
 mod acceptance_tests {
     use super::*;
 
@@ -308,6 +319,16 @@ mod acceptance_tests {
             &ObserverContext::default(),
             serde_json::json!({"reason": "explicit_cancel"}),
         );
+        observer.emit(
+            "meeting_v2_board_turn_completed",
+            Some(0),
+            &ObserverContext::default(),
+            serde_json::json!({
+                "action": "UPDATE",
+                "control_epoch": 7,
+                "board_window": 3
+            }),
+        );
 
         let contents = std::fs::read_to_string(path).unwrap();
         assert!(!contents.contains("do-not-persist"));
@@ -316,5 +337,7 @@ mod acceptance_tests {
         assert!(contents.contains("attempt-1"));
         assert!(contents.contains("prompt_cancelled_before_request"));
         assert!(contents.contains("explicit_cancel"));
+        assert!(contents.contains("meeting_v2_board_turn_completed"));
+        assert!(contents.contains("\"board_window\":3"));
     }
 }

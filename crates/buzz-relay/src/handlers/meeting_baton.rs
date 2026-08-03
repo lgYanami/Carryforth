@@ -91,7 +91,7 @@ pub(crate) async fn handle_command(
     let protocol = authorize_participant_command(tenant, state, session_id, auth).await?;
     let (parsed_session_id, command) = parse_control_command(event, protocol)?;
     debug_assert_eq!(parsed_session_id, session_id);
-    execute(tenant, state, session_id, event, command).await
+    execute(tenant, state, session_id, event, protocol, command).await
 }
 
 /// Parse and execute one moderator-authored Meeting V2 Board Maintenance result.
@@ -115,7 +115,12 @@ pub(crate) async fn handle_board_action(
     let (parsed_session_id, expected_control_epoch, board_window, action) =
         parse_board_action(event)?;
     debug_assert_eq!(parsed_session_id, session_id);
-    let commit = buzz_db::meeting_v2::execute_board_action(
+    let action_label = match &action {
+        BoardAction::Update(_) => "update",
+        BoardAction::Unchanged => "unchanged",
+    };
+    let started_at = Instant::now();
+    let commit = match buzz_db::meeting_v2::execute_board_action(
         &state.db,
         BoardActionTxParams {
             community_id: tenant.community(),
@@ -128,63 +133,134 @@ pub(crate) async fn handle_board_action(
         },
     )
     .await
-    .map_err(map_baton_db_error)?;
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            record_board_command_metrics(
+                action_label,
+                "error",
+                false,
+                0,
+                started_at.elapsed().as_secs_f64(),
+            );
+            return Err(map_baton_db_error(error));
+        }
+    };
     let recovery = usize::from(commit.recovery_transition.is_some());
     match commit.outcome {
         BoardActionOutcome::Accepted {
             state_revision,
             board_event_id,
-        } => Ok(board_success_result(
-            event,
-            session_id,
-            false,
-            "accepted",
-            Some(state_revision),
-            Some(&board_event_id),
-            recovery,
-        )),
+        } => {
+            record_board_command_metrics(
+                action_label,
+                "accepted",
+                false,
+                recovery,
+                started_at.elapsed().as_secs_f64(),
+            );
+            Ok(board_success_result(
+                event,
+                session_id,
+                false,
+                "accepted",
+                Some(state_revision),
+                Some(&board_event_id),
+                recovery,
+            ))
+        }
         BoardActionOutcome::Duplicate {
             accepted: true,
             outcome_code,
             state_revision,
             board_event_id,
             ..
-        } => Ok(board_success_result(
-            event,
-            session_id,
-            true,
-            &outcome_code,
-            state_revision,
-            board_event_id.as_deref(),
-            recovery,
-        )),
+        } => {
+            record_board_command_metrics(
+                action_label,
+                "accepted",
+                true,
+                recovery,
+                started_at.elapsed().as_secs_f64(),
+            );
+            Ok(board_success_result(
+                event,
+                session_id,
+                true,
+                &outcome_code,
+                state_revision,
+                board_event_id.as_deref(),
+                recovery,
+            ))
+        }
         BoardActionOutcome::Duplicate {
             accepted: false,
             outcome_class,
             outcome_code,
             ..
-        } => Err(board_rejection(
-            if outcome_class == "rejected_after_recovery" {
+        } => {
+            let outcome = if outcome_class == "rejected_after_recovery" {
                 "expired"
             } else {
                 "conflict"
-            },
-            &outcome_code,
-            recovery,
-        )),
+            };
+            record_board_command_metrics(
+                action_label,
+                outcome,
+                true,
+                recovery,
+                started_at.elapsed().as_secs_f64(),
+            );
+            Err(board_rejection(outcome, &outcome_code, recovery))
+        }
         BoardActionOutcome::Rejected {
             code,
             after_recovery,
-        } => Err(board_rejection(
-            if after_recovery {
+        } => {
+            let outcome = if after_recovery {
                 "expired"
             } else {
                 "conflict"
-            },
-            &code,
-            recovery,
-        )),
+            };
+            record_board_command_metrics(
+                action_label,
+                outcome,
+                false,
+                recovery,
+                started_at.elapsed().as_secs_f64(),
+            );
+            Err(board_rejection(outcome, &code, recovery))
+        }
     }
+}
+
+fn record_board_command_metrics(
+    action: &'static str,
+    outcome: &'static str,
+    duplicate: bool,
+    recovery_count: usize,
+    latency_seconds: f64,
+) {
+    let duplicate = if duplicate { "true" } else { "false" };
+    metrics::counter!(
+        "meeting_v2_board_command_total",
+        "action" => action,
+        "outcome" => outcome,
+        "duplicate" => duplicate
+    )
+    .increment(1);
+    metrics::histogram!(
+        "meeting_v2_board_command_latency_seconds",
+        "action" => action,
+        "outcome" => outcome
+    )
+    .record(latency_seconds);
+    metrics::histogram!(
+        "meeting_v2_board_command_recovery_transitions",
+        "action" => action,
+        "outcome" => outcome
+    )
+    .record(recovery_count as f64);
 }
 
 fn parse_board_action(event: &Event) -> Result<(Uuid, i64, i64, BoardAction), IngestError> {
@@ -280,7 +356,7 @@ pub(crate) async fn handle_speech(
     protocol: MeetingProtocol,
 ) -> Result<IngestResult, IngestError> {
     let (session_id, command) = parse_speech(event, protocol)?;
-    execute(tenant, state, session_id, event, command).await
+    execute(tenant, state, session_id, event, protocol, command).await
 }
 
 async fn authorize_participant_command(
@@ -354,6 +430,7 @@ async fn execute(
     state: &Arc<AppState>,
     session_id: Uuid,
     event: &Event,
+    protocol: MeetingProtocol,
     command: BatonCommand,
 ) -> Result<IngestResult, IngestError> {
     let action = command_metric_action(&command);
@@ -372,6 +449,7 @@ async fn execute(
     let result = match result {
         Ok(result) => {
             record_command_metrics(
+                protocol,
                 action,
                 classify_command_outcome(&result.command_outcome),
                 result.recovery_transitions.len(),
@@ -381,6 +459,7 @@ async fn execute(
         }
         Err(error) => {
             record_command_metrics(
+                protocol,
                 action,
                 CommandMetricOutcome {
                     outcome: "error",
@@ -530,6 +609,7 @@ fn classify_command_outcome(outcome: &BatonCommandOutcome) -> CommandMetricOutco
 }
 
 fn record_command_metrics(
+    protocol: MeetingProtocol,
     action: &'static str,
     classified: CommandMetricOutcome,
     recovery_count: usize,
@@ -540,15 +620,33 @@ fn record_command_metrics(
     } else {
         "false"
     };
+    let protocol = match protocol {
+        MeetingProtocol::ModeratedBatonV1 => "v1",
+        MeetingProtocol::ModeratedBoardV2 => "v2",
+        MeetingProtocol::UniformV0 => "v0",
+    };
     let labels = [
+        ("protocol", protocol),
         ("action", action),
         ("outcome", classified.outcome),
         ("duplicate", duplicate),
     ];
-    metrics::counter!("meeting_v1_command_total", &labels).increment(1);
-    metrics::histogram!("meeting_v1_command_latency_seconds", &labels).record(latency_seconds);
-    metrics::histogram!("meeting_v1_command_recovery_transitions", &labels)
+    metrics::counter!("meeting_baton_command_total", &labels).increment(1);
+    metrics::histogram!("meeting_baton_command_latency_seconds", &labels).record(latency_seconds);
+    metrics::histogram!("meeting_baton_command_recovery_transitions", &labels)
         .record(recovery_count as f64);
+    if protocol == "v1" {
+        let legacy_labels = [
+            ("action", action),
+            ("outcome", classified.outcome),
+            ("duplicate", duplicate),
+        ];
+        metrics::counter!("meeting_v1_command_total", &legacy_labels).increment(1);
+        metrics::histogram!("meeting_v1_command_latency_seconds", &legacy_labels)
+            .record(latency_seconds);
+        metrics::histogram!("meeting_v1_command_recovery_transitions", &legacy_labels)
+            .record(recovery_count as f64);
+    }
 }
 
 fn map_baton_db_error(error: DbError) -> IngestError {

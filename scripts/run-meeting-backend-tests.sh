@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RELAY_PID_FILE="/tmp/buzz-meeting-gate-relay-$$.pid"
 RELAY_LOG_FILE="/tmp/buzz-meeting-gate-relay-$$.log"
 ROLLOUT_FIXTURE_FILE="/tmp/buzz-meeting-v1-rollout-$$.json"
+ACP_CAPABILITY_FILE="/tmp/buzz-meeting-v2-acp-capability-$$.json"
 MEETING_CONTRACT_DB="buzz_meeting_gate_$$_contracts"
 MEETING_RELAY_DB="buzz_meeting_gate_$$_relay"
 MEETING_CONTRACT_DB_CREATED=false
@@ -96,14 +97,30 @@ drop_test_databases() {
 cleanup() {
   stop_relay
   drop_test_databases
-  rm -f "${ROLLOUT_FIXTURE_FILE}" "${RELAY_LOG_FILE}"
+  rm -f \
+    "${ROLLOUT_FIXTURE_FILE}" \
+    "${RELAY_LOG_FILE}" \
+    "${ACP_CAPABILITY_FILE}"
 }
 
 trap cleanup EXIT
 
 echo "Running infrastructure-free ACP and Relay Meeting contracts..."
 cargo test -p buzz-acp --lib -- --nocapture
+cargo test -p buzz-acp --features meeting-acceptance --lib acceptance -- --nocapture
 cargo test -p buzz-relay --lib meeting -- --nocapture
+./scripts/meeting-v2-qualification-gates-test.sh
+
+echo "Verifying the production ACP artifact declares complete Meeting V2 roles..."
+cargo run --quiet -p buzz-acp --bin buzz-acp -- capabilities --json >"${ACP_CAPABILITY_FILE}"
+jq -e '
+  .meeting.protocols[]
+  | select(.schemaVersion == "3" and .policy == "moderated-board-v1")
+  | (.roles == ["participant", "moderator"])
+    and (.turns | index("board_maintenance") != null)
+    and (.turns | index("floor_decision") != null)
+    and (.currentBoard == "authoritative_read_before_each_semantic_turn")
+' "${ACP_CAPABILITY_FILE}" >/dev/null
 
 echo "Creating isolated Meeting contract and Relay databases..."
 docker compose up -d postgres redis minio minio-init
@@ -134,6 +151,17 @@ export BUZZ_TEST_DATABASE_URL="${DATABASE_URL}"
 echo "Running Postgres-backed Meeting state-machine contracts serially..."
 cargo test -p buzz-db --lib meeting -- --ignored --test-threads=1 --nocapture
 
+echo "Running fresh, upgrade, and concurrent migration contracts..."
+cargo test -p buzz-db --lib migration::tests -- --ignored --test-threads=1 --nocapture
+
+echo "Checking Meeting migration/schema desired-state drift..."
+PGHOST=localhost \
+PGPORT=5432 \
+PGUSER=buzz \
+PGPASSWORD=buzz_dev \
+PGDATABASE="${MEETING_CONTRACT_DB}" \
+  ./scripts/meeting-v2-schema-drift.sh
+
 echo "Building the real agent-facing CLI for Meeting V2 lifecycle coverage..."
 cargo build -p buzz-cli
 export MEETING_E2E_BUZZ_BIN="${REPO_ROOT}/target/debug/buzz"
@@ -146,6 +174,19 @@ export BUZZ_TEST_DATABASE_URL="${DATABASE_URL}"
 echo "Starting Relay with Meeting V1/V2 creation enabled..."
 BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
   "${SCRIPT_DIR}/start-relay-for-tests.sh"
+
+echo "Verifying Relay Meeting V2 runtime and Create capabilities..."
+curl --silent --show-error --fail \
+  -H 'Accept: application/nostr+json' \
+  -H "Host: localhost:${MEETING_RELAY_PORT}" \
+  "http://127.0.0.1:${MEETING_RELAY_PORT}/" \
+  | jq -e '
+      (.supported_extensions | index("buzz-meeting-v2") != null)
+      and (.supported_extensions | index("buzz-meeting-v2-create") != null)
+    ' >/dev/null
+curl --silent --show-error --fail \
+  "http://127.0.0.1:${MEETING_RELAY_PORT}/_readiness" \
+  | jq -e '.status == "ready" and .meeting_v2 == true' >/dev/null
 
 echo "Running Meeting V0/V1/V2 Relay end-to-end tests serially..."
 cargo test -p buzz-test-client --test e2e_meeting -- --ignored --test-threads=1 --nocapture
@@ -173,6 +214,19 @@ BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
   BUZZ_MEETING_V1_CREATE_ENABLED=false \
   BUZZ_MEETING_V2_CREATE_ENABLED=false \
   "${SCRIPT_DIR}/start-relay-for-tests.sh" --no-build --no-schema
+
+echo "Verifying closed Create retains the Meeting V2 drain capability..."
+curl --silent --show-error --fail \
+  -H 'Accept: application/nostr+json' \
+  -H "Host: localhost:${MEETING_RELAY_PORT}" \
+  "http://127.0.0.1:${MEETING_RELAY_PORT}/" \
+  | jq -e '
+      (.supported_extensions | index("buzz-meeting-v2") != null)
+      and (.supported_extensions | index("buzz-meeting-v2-create") == null)
+    ' >/dev/null
+curl --silent --show-error --fail \
+  "http://127.0.0.1:${MEETING_RELAY_PORT}/_readiness" \
+  | jq -e '.status == "ready" and .meeting_v2 == true' >/dev/null
 
 cargo test -p buzz-test-client --test e2e_meeting_rollout \
   existing_v1_and_v2_survive_closed_gates_and_v0_still_works -- \

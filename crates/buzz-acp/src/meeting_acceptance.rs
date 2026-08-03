@@ -1,6 +1,6 @@
-//! Acceptance-only Meeting V1 evidence and timing hooks.
+//! Acceptance-only Meeting evidence and timing hooks.
 //!
-//! This module is compiled only with the `meeting-v1-acceptance` feature. It
+//! This module is compiled only with the `meeting-acceptance` feature. It
 //! deliberately stays out of production binaries: the local Unix-socket
 //! barrier exists solely to make real-provider race acceptance reproducible.
 
@@ -12,9 +12,10 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const ACCEPTANCE_EVENTS_PATH_ENV: &str = "BUZZ_ACP_MEETING_V1_ACCEPTANCE_EVENTS_PATH";
-pub(crate) const PRE_SUBMIT_BARRIER_SOCKET_ENV: &str =
-    "BUZZ_ACP_MEETING_V1_PRE_SUBMIT_BARRIER_SOCKET";
+pub(crate) const ACCEPTANCE_EVENTS_PATH_ENV: &str = "BUZZ_ACP_MEETING_ACCEPTANCE_EVENTS_PATH";
+pub(crate) const PRE_SUBMIT_BARRIER_SOCKET_ENV: &str = "BUZZ_ACP_MEETING_PRE_SUBMIT_BARRIER_SOCKET";
+const LEGACY_ACCEPTANCE_EVENTS_PATH_ENV: &str = "BUZZ_ACP_MEETING_V1_ACCEPTANCE_EVENTS_PATH";
+const LEGACY_PRE_SUBMIT_BARRIER_SOCKET_ENV: &str = "BUZZ_ACP_MEETING_V1_PRE_SUBMIT_BARRIER_SOCKET";
 
 const MAX_BARRIER_FRAME_BYTES: usize = 128 * 1024;
 
@@ -64,7 +65,8 @@ pub(crate) struct PreSubmitAcceptanceBarrier {
 impl PreSubmitAcceptanceBarrier {
     pub(crate) fn from_env() -> Self {
         Self {
-            socket_path: nonempty_env_path(PRE_SUBMIT_BARRIER_SOCKET_ENV),
+            socket_path: nonempty_env_path(PRE_SUBMIT_BARRIER_SOCKET_ENV)
+                .or_else(|| nonempty_env_path(LEGACY_PRE_SUBMIT_BARRIER_SOCKET_ENV)),
             claimed: false,
         }
     }
@@ -82,6 +84,7 @@ impl PreSubmitAcceptanceBarrier {
 
 pub(crate) fn acceptance_events_path() -> Option<PathBuf> {
     nonempty_env_path(ACCEPTANCE_EVENTS_PATH_ENV)
+        .or_else(|| nonempty_env_path(LEGACY_ACCEPTANCE_EVENTS_PATH_ENV))
 }
 
 fn nonempty_env_path(name: &str) -> Option<PathBuf> {
@@ -125,16 +128,16 @@ async fn await_pre_submit_release_inner(
     let started = std::time::Instant::now();
     let stream = UnixStream::connect(socket_path).await.with_context(|| {
         format!(
-            "connect Meeting V1 acceptance barrier {}",
+            "connect Meeting acceptance barrier {}",
             socket_path.display()
         )
     })?;
     let mut stream = BufReader::new(stream);
     let mut serialized =
-        serde_json::to_vec(frame).context("serialize Meeting V1 acceptance barrier frame")?;
+        serde_json::to_vec(frame).context("serialize Meeting acceptance barrier frame")?;
     if serialized.len() > MAX_BARRIER_FRAME_BYTES {
         return Err(anyhow!(
-            "Meeting V1 acceptance barrier frame exceeds {MAX_BARRIER_FRAME_BYTES} bytes"
+            "Meeting acceptance barrier frame exceeds {MAX_BARRIER_FRAME_BYTES} bytes"
         ));
     }
     serialized.push(b'\n');
@@ -142,22 +145,20 @@ async fn await_pre_submit_release_inner(
         .get_mut()
         .write_all(&serialized)
         .await
-        .context("write Meeting V1 acceptance barrier frame")?;
+        .context("write Meeting acceptance barrier frame")?;
     stream
         .get_mut()
         .flush()
         .await
-        .context("flush Meeting V1 acceptance barrier frame")?;
+        .context("flush Meeting acceptance barrier frame")?;
 
     let mut response = String::new();
     stream
         .read_line(&mut response)
         .await
-        .context("read Meeting V1 acceptance barrier release")?;
+        .context("read Meeting acceptance barrier release")?;
     if response.len() > MAX_BARRIER_FRAME_BYTES {
-        return Err(anyhow!(
-            "Meeting V1 acceptance barrier response is too large"
-        ));
+        return Err(anyhow!("Meeting acceptance barrier response is too large"));
     }
     let release: BarrierRelease =
         serde_json::from_str(response.trim()).context("parse acceptance barrier release")?;
@@ -175,7 +176,7 @@ async fn await_pre_submit_release_inner(
     _frame: &PreSubmitBarrierFrame,
 ) -> Result<Duration> {
     Err(anyhow!(
-        "Meeting V1 acceptance barrier requires a Unix-domain socket"
+        "Meeting acceptance barrier requires a Unix-domain socket"
     ))
 }
 

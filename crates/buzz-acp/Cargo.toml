@@ -12,10 +12,12 @@ name = "buzz_acp"
 path = "src/lib.rs"
 
 [features]
-# Test-only timing and evidence hooks for the Meeting V1 real-Codex acceptance
-# runner. Production builds do not include the Unix-socket barrier or local
-# acceptance NDJSON sink.
-meeting-v1-acceptance = []
+# Test-only timing and privacy-filtered evidence hooks shared by Meeting V1 and
+# V2 real-provider qualification. Production builds do not include the local
+# acceptance NDJSON sink or Unix-socket race barrier.
+meeting-acceptance = []
+# Compatibility alias for the existing Meeting V1 qualification scripts.
+meeting-v1-acceptance = ["meeting-acceptance"]
 
 [[bin]]
 name = "buzz-acp"

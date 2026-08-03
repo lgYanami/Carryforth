@@ -5,7 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod meeting;
-#[cfg(feature = "meeting-v1-acceptance")]
+#[cfg(feature = "meeting-acceptance")]
 mod meeting_acceptance;
 mod meeting_v1;
 mod meeting_v2;
@@ -62,12 +62,95 @@ use uuid::Uuid;
 ///
 /// This avoids clap rejecting harness flags (like `--private-key`) that aren't
 /// declared on the subcommand's `Parser`. The `models` path has its own
-/// dedicated parser; the default path uses the existing `CliArgs`.
+/// dedicated parser; the default path uses the existing `CliArgs`. The static
+/// `capabilities` probe intentionally needs no provider process or credentials.
 ///
 /// **Constraint**: subcommand must be argv[1] — flags before the subcommand
 /// name (e.g., `buzz-acp --verbose models`) are not supported.
 fn is_subcommand(name: &str) -> bool {
     std::env::args().nth(1).map(|a| a == name).unwrap_or(false)
+}
+
+fn meeting_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "component": "buzz-acp",
+        "version": env!("CARGO_PKG_VERSION"),
+        "meeting": {
+            "ledgerVersion": meeting_v1::capability_ledger_version(),
+            "qualificationEvidenceCompiled": cfg!(feature = "meeting-acceptance"),
+            "protocols": [
+                {
+                    "schemaVersion": buzz_sdk::MEETING_V1_SCHEMA_VERSION,
+                    "policy": buzz_sdk::MEETING_V1_POLICY,
+                    "roles": ["participant", "moderator"],
+                    "turns": ["intent", "granted_speech", "floor_decision"]
+                },
+                {
+                    "schemaVersion": buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+                    "policy": buzz_sdk::MEETING_V2_POLICY,
+                    "roles": ["participant", "moderator"],
+                    "turns": [
+                        "intent",
+                        "granted_speech",
+                        "board_maintenance",
+                        "floor_decision"
+                    ],
+                    "currentBoard": "authoritative_read_before_each_semantic_turn",
+                    "boardFloorDeadlines": "independent"
+                }
+            ]
+        }
+    })
+}
+
+fn run_capabilities() -> Result<()> {
+    let trailing = std::env::args().skip(2).collect::<Vec<_>>();
+    if !trailing.is_empty() && trailing != ["--json"] {
+        anyhow::bail!("usage: buzz-acp capabilities [--json]");
+    }
+    println!("{}", serde_json::to_string_pretty(&meeting_capabilities())?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod meeting_capability_tests {
+    use super::*;
+
+    #[test]
+    fn static_probe_declares_the_complete_v2_turn_surface() {
+        let capabilities = meeting_capabilities();
+        let v2 = capabilities["meeting"]["protocols"]
+            .as_array()
+            .and_then(|protocols| {
+                protocols.iter().find(|protocol| {
+                    protocol["schemaVersion"] == buzz_sdk::MEETING_V2_SCHEMA_VERSION
+                        && protocol["policy"] == buzz_sdk::MEETING_V2_POLICY
+                })
+            })
+            .expect("Meeting V2 capability");
+        assert_eq!(v2["roles"], serde_json::json!(["participant", "moderator"]));
+        assert_eq!(
+            v2["turns"],
+            serde_json::json!([
+                "intent",
+                "granted_speech",
+                "board_maintenance",
+                "floor_decision"
+            ])
+        );
+        assert_eq!(
+            v2["currentBoard"],
+            "authoritative_read_before_each_semantic_turn"
+        );
+        assert_eq!(
+            capabilities["meeting"]["ledgerVersion"],
+            meeting_v1::capability_ledger_version()
+        );
+        assert_eq!(
+            capabilities["meeting"]["qualificationEvidenceCompiled"],
+            cfg!(feature = "meeting-acceptance")
+        );
+    }
 }
 
 /// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
@@ -1287,6 +1370,9 @@ impl Drop for RespawnGuard {
 // worker threads (Rust 2024 edition safety requirement).
 
 pub fn run() -> Result<()> {
+    if is_subcommand("capabilities") {
+        return run_capabilities();
+    }
     config::propagate_legacy_env_vars();
     let runtime_supervisor = runtime_supervisor::RuntimeSupervisorConfig::take_from_env()
         .map_err(|error| anyhow::anyhow!("runtime supervisor configuration error: {error}"))?;
@@ -1356,14 +1442,14 @@ async fn tokio_main(
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     let acceptance_events_path = meeting_acceptance::acceptance_events_path();
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     let observer = match acceptance_events_path.as_deref() {
         Some(path) => Some(
             observer::ObserverHandle::in_process_with_acceptance_sink(path).map_err(|error| {
                 anyhow::anyhow!(
-                    "create Meeting V1 acceptance evidence {}: {error}",
+                    "create Meeting acceptance evidence {}: {error}",
                     path.display()
                 )
             })?,
@@ -1372,7 +1458,7 @@ async fn tokio_main(
             .relay_observer
             .then(observer::ObserverHandle::in_process),
     };
-    #[cfg(not(feature = "meeting-v1-acceptance"))]
+    #[cfg(not(feature = "meeting-acceptance"))]
     let observer = config
         .relay_observer
         .then(observer::ObserverHandle::in_process);
@@ -1387,7 +1473,9 @@ async fn tokio_main(
                 "agentArgs": config.agent_args,
                 "parallelism": config.agents,
                 "relayObserver": config.relay_observer,
-                "meetingV1Acceptance": cfg!(feature = "meeting-v1-acceptance"),
+                "meetingAcceptance": cfg!(feature = "meeting-acceptance"),
+                "meetingV1Acceptance": cfg!(feature = "meeting-acceptance"),
+                "meetingCapabilities": meeting_capabilities()["meeting"].clone(),
             }),
         );
     }

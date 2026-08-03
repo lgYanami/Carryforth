@@ -1,6 +1,6 @@
 # Meeting V2 后端分阶段实现计划
 
-> 状态：阶段一至阶段四已完成；下一阶段为后端综合验收与发布准备
+> 状态：阶段一至阶段五已完成；Meeting V2 后端发布候选已形成
 >
 > 产品语义基线：
 > [Meeting V2：主持人维护的共享会议看板](./meeting-v2.md)
@@ -953,7 +953,7 @@ V1，也不能跳过 Board gate。
 | 2. Relay 权威主持控制周期与终态 | 已完成（2026-08-02） | CLI-only 生命周期、双 deadline、竞态、重启与恢复测试 |
 | 3. 普通参会 Agent | 已完成（2026-08-02） | Intent/Grant 独立按需读板、read failure、无订阅与 V2 wire 测试 |
 | 4. 主持 Agent | 已完成（2026-08-02） | Board/Floor 双 Turn、Human preemption、全 Agent 闭会与主动 abort 证据 |
-| 5. 后端综合验收与发布准备 | 未开始 | 专项 gate、真实 qualification、运维与发布候选 |
+| 5. 后端综合验收与发布准备 | 已完成（2026-08-03） | 专项 gate、真实 qualification、运维与发布候选 |
 
 每个阶段开始时把状态更新为“进行中”；对应交付物、测试门槛和完成标志全部满足后更新为
 “已完成”，并补充 PR、测试命令、报告或运行证据链接。
@@ -1118,6 +1118,44 @@ cargo fmt --all -- --check
 阶段四完成的是 ACP Agent 主持控制器及确定性后端证据。它没有增加前端、模板、Project
 View 绑定或外部效果，也不把确定性 wire trace 冒充真实模型 qualification。真实 Agent
 矩阵、混合场景、fleet capability、SLO、灰度与发布候选仍属于阶段五。
+
+### 14.5 阶段五交付记录（已完成，2026-08-03）
+
+阶段五已经完成发布级确定性门禁、真实 provider qualification 与运维收口：
+
+- V0/V1/V2 统一 Meeting backend gate，包括真实 Relay + CLI E2E、fresh/upgrade/concurrent
+  migration、Meeting schema drift、Create 关闭排空、安全撤权和 qualification verifier
+  正反 fixture；
+- Relay NIP-11 runtime/create capability、与 active V2 和稳定 signer 联动的 readiness；
+- ACP 机器可读 capability，明确 V2 participant/moderator Turn、每 Turn 权威读板、双 deadline
+  与 ledger generation；
+- V2 current Board read、Board command、End，以及共享 Baton command/recovery/outbox/worker
+  的低基数可区分指标；
+- 真实 provider 证据契约与硬门禁：核心证据必须完整纳入哈希，workspace 快照必须由 verifier
+  独立比对；
+- 真实 `@agentclientprotocol/codex-acp 1.1.7` qualification runner，使用模型目录确认的
+  `gpt-5.6-sol`，主持 Agent 使用 `max`、参会 Agent 使用 `high`，共实际运行八个 Agent
+  Session；
+- Create 开启时原子创建四场会议，随后重启同一 Relay 并关闭 Create；存量 mixed、all-agent、
+  moderator abort 与 admin/security abort 场景均在 runtime capability 保留时完成；
+- mixed 场景覆盖两名 Human、两名 Agent、Human 抢占 Board、Directed Handoff、主持人 self
+  Speech、三次 Board 更新与四名不同 speaker，最终正常 closed；
+- all-agent 场景覆盖三名 Agent、多轮 Board/Floor、Directed Handoff、主持人 self Speech、三次
+  Board 更新与三名不同 speaker，最终正常 closed；
+- 主持 Agent 以 `unable_to_form_conclusion` 主动 aborted；安全撤权以
+  `participant_revoked` 独立 aborted；
+- verifier 的十八项 gate 全部 PASS，十项硬不变量全部为零，非参会者读写、关闭 Create 后
+  新建以及 End 后写入均被拒绝；observer 证据不包含 Board、Speech、Prompt、模型原始输出或
+  原始错误正文；
+- qualification 期间补齐权威状态抢占迟到 Board 结果时的单次
+  `meeting_v2_host_turn_discarded` 证据，并增加 Human preemption 的确定性端到端测试；
+- 发布顺序、SLO、最小查询、故障处置、关闭新建、排空和前向兼容回滚手册。
+
+真实运行与复核结果见
+[Meeting V2 阶段五真实 Agent Qualification 报告](./meeting-v2-qualification-report.md)。阶段
+收口通过 `just test-meeting-backend`、`RUST_TEST_THREADS=1 just ci`，以及一次性隔离数据库下
+的 `just test`。初次直接运行 `just test` 遇到共享开发库已有 migration 32 校验和来自另一
+代码状态；没有改写该数据库，而是在全新数据库重跑并通过。
 
 ## 15. 后端完成定义
 

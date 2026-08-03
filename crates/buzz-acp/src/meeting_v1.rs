@@ -40,7 +40,7 @@ use crate::meeting::{
     fetch_meeting_history, now_ms, remaining_before, sign_builder, tag_value,
     validate_bounded_text, MeetingBatonProtocol, MeetingTurnKind, MeetingTurnRequest,
 };
-#[cfg(feature = "meeting-v1-acceptance")]
+#[cfg(feature = "meeting-acceptance")]
 use crate::meeting_acceptance::{
     self, AcceptanceCandidateRef, PreSubmitAcceptanceBarrier, PreSubmitBarrierFrame,
 };
@@ -54,6 +54,10 @@ use crate::relay::{BuzzEvent, ProtocolSubmitOutcome, ProtocolSubmitRejected, Res
 const LEDGER_VERSION: u32 = 6;
 const PREVIOUS_LEDGER_VERSION: u32 = 5;
 const LEGACY_LEDGER_VERSION: u32 = 4;
+
+pub(super) const fn capability_ledger_version() -> u32 {
+    LEDGER_VERSION
+}
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const SYNC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -890,7 +894,7 @@ enum ProtocolSubmissionContext {
         observer_snapshot: Option<Value>,
         turn_id: Option<String>,
         queued_at_ms: Option<i64>,
-        #[cfg(feature = "meeting-v1-acceptance")]
+        #[cfg(feature = "meeting-acceptance")]
         barrier: Option<Box<(PathBuf, PreSubmitBarrierFrame)>>,
     },
 }
@@ -949,7 +953,7 @@ pub(super) struct MeetingV1Coordinator {
     progress_waiting_for_state: HashMap<(Uuid, String), u64>,
     progress_result_tx: tokio::sync::mpsc::UnboundedSender<ProgressTaskResult>,
     progress_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProgressTaskResult>,
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     acceptance_barrier: PreSubmitAcceptanceBarrier,
 }
 
@@ -1023,7 +1027,7 @@ impl MeetingV1Coordinator {
             progress_waiting_for_state: HashMap::new(),
             progress_result_tx,
             progress_result_rx,
-            #[cfg(feature = "meeting-v1-acceptance")]
+            #[cfg(feature = "meeting-acceptance")]
             acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
         }
     }
@@ -2231,7 +2235,7 @@ impl MeetingV1Coordinator {
         let result_tx = self.protocol_result_tx.clone();
         let _task = tokio::spawn(async move {
             let attempt = AssertUnwindSafe(async {
-                #[cfg(feature = "meeting-v1-acceptance")]
+                #[cfg(feature = "meeting-acceptance")]
                 if let ProtocolSubmissionContext::Moderator {
                     barrier: Some(barrier),
                     ..
@@ -3309,6 +3313,31 @@ impl MeetingV1Coordinator {
             .is_none_or(|runtime| runtime.epoch != pending.session_epoch)
         {
             self.discard_deferred_turn_result(pending, None);
+            return;
+        }
+        let superseded_v2_host_turn = pending.request.kind.is_v2_moderator()
+            && self
+                .meetings
+                .get(&session_id)
+                .and_then(|runtime| runtime.view.as_ref())
+                .is_some_and(|view| {
+                    !v2_host_request_matches_view(&pending.request, view, &self.agent_pubkey)
+                        || (pending.request.kind == MeetingTurnKind::V2ModeratorFloor
+                            && pending.request.basis_id.starts_with("floor:")
+                            && (moderator_has_startable_candidate(&view.baton)
+                                || view.baton.active_decision_attempt.is_some()))
+                });
+        if superseded_v2_host_turn {
+            self.emit(
+                "meeting_v2_host_turn_discarded",
+                session_id,
+                Some(pending.turn_id),
+                json!({
+                    "reason": "board_or_floor_authority_changed",
+                    "turn_type": board_turn_type(pending.request.kind),
+                }),
+            );
+            self.reconcile(session_id).await;
             return;
         }
         match pending.request.kind {
@@ -5054,7 +5083,7 @@ impl MeetingV1Coordinator {
                 observer_snapshot: prepared.observer_snapshot,
                 turn_id,
                 queued_at_ms: Some(prepared.created_at_ms),
-                #[cfg(feature = "meeting-v1-acceptance")]
+                #[cfg(feature = "meeting-acceptance")]
                 barrier: None,
             },
             event,
@@ -5420,7 +5449,7 @@ impl MeetingV1Coordinator {
             .ledger_for(session_id)
             .and_then(|ledger| ledger.moderator_decision.as_ref())
             .map(|decision| decision.attempt.started_at_ms);
-        #[cfg(feature = "meeting-v1-acceptance")]
+        #[cfg(feature = "meeting-acceptance")]
         let barrier = self.acceptance_barrier_for_moderator_action(
             session_id,
             &action_kind,
@@ -5458,7 +5487,7 @@ impl MeetingV1Coordinator {
                 observer_snapshot,
                 turn_id,
                 queued_at_ms,
-                #[cfg(feature = "meeting-v1-acceptance")]
+                #[cfg(feature = "meeting-acceptance")]
                 barrier,
             },
             event,
@@ -5501,7 +5530,7 @@ impl MeetingV1Coordinator {
         Some(payload)
     }
 
-    #[cfg(feature = "meeting-v1-acceptance")]
+    #[cfg(feature = "meeting-acceptance")]
     fn acceptance_barrier_for_moderator_action(
         &mut self,
         session_id: Uuid,
@@ -10583,7 +10612,7 @@ mod tests {
             progress_waiting_for_state: HashMap::new(),
             progress_result_tx,
             progress_result_rx,
-            #[cfg(feature = "meeting-v1-acceptance")]
+            #[cfg(feature = "meeting-acceptance")]
             acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
         }
     }
@@ -14475,7 +14504,7 @@ mod tests {
                         observer_snapshot: Some(snapshot),
                         turn_id: Some(turn_id.clone()),
                         queued_at_ms: Some(now_ms()),
-                        #[cfg(feature = "meeting-v1-acceptance")]
+                        #[cfg(feature = "meeting-acceptance")]
                         barrier: None,
                     },
                     result: Ok(json!({ "accepted": true })),
@@ -16959,10 +16988,11 @@ mod tests {
         let other_pubkey = Keys::generate().public_key().to_hex();
         let relay = Keys::generate();
         let session_id = Uuid::new_v4();
+        let observer = ObserverHandle::in_process();
         let mut coordinator = test_coordinator(
             agent_keys,
             directory.path().join("meeting-v2-stage4-preemption.json"),
-            None,
+            Some(observer.clone()),
         );
         coordinator
             .meetings
@@ -16998,18 +17028,36 @@ mod tests {
         coordinator.reconcile(session_id).await;
         assert!(coordinator.preemptions.contains(&session_id));
 
-        coordinator.handle_v2_board_result(
-            "preempted-board",
-            &request,
-            r#"{"action":"UNCHANGED","board":null,"reason":"late"}"#,
-            true,
-        );
+        coordinator
+            .process_deferred_turn_result(DeferredTurnResult {
+                request_id: 1,
+                session_epoch: 1,
+                turn_id: "preempted-board".to_string(),
+                request,
+                raw_output: r#"{"action":"UNCHANGED","board":null,"reason":"late"}"#.to_string(),
+                succeeded: true,
+            })
+            .await;
         assert!(
             coordinator
                 .ledger_for(session_id)
                 .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
                 .is_none(),
             "a late Board result cannot cross the Relay phase fence"
+        );
+        let discarded = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "meeting_v2_host_turn_discarded")
+            .collect::<Vec<_>>();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(
+            discarded[0].payload["turn_type"].as_str(),
+            Some("moderator_board")
+        );
+        assert_eq!(
+            discarded[0].payload["reason"].as_str(),
+            Some("board_or_floor_authority_changed")
         );
     }
 

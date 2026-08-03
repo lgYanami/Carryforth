@@ -291,6 +291,18 @@ pub async fn run(state: Arc<AppState>) {
 async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buzz_db::DbError> {
     let sessions = match buzz_db::meeting_baton::claim_due_baton_sessions(&state.db, limit).await {
         Ok(sessions) => {
+            metrics::counter!("meeting_baton_recovery_scan_total", "outcome" => "success")
+                .increment(1);
+            metrics::histogram!("meeting_baton_recovery_scan_sessions")
+                .record(sessions.len() as f64);
+            metrics::gauge!("meeting_baton_recovery_scan_last_sessions").set(sessions.len() as f64);
+            metrics::gauge!("meeting_baton_recovery_scan_saturated").set(
+                if sessions.len() as i64 >= limit {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
             metrics::counter!("meeting_v1_recovery_scan_total", "outcome" => "success")
                 .increment(1);
             metrics::histogram!("meeting_v1_recovery_scan_sessions").record(sessions.len() as f64);
@@ -305,14 +317,19 @@ async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buz
             sessions
         }
         Err(error) => {
+            metrics::counter!("meeting_baton_recovery_scan_total", "outcome" => "error")
+                .increment(1);
+            metrics::gauge!("meeting_baton_recovery_scan_last_sessions").set(0.0);
+            metrics::gauge!("meeting_baton_recovery_scan_saturated").set(0.0);
             metrics::counter!("meeting_v1_recovery_scan_total", "outcome" => "error").increment(1);
             metrics::gauge!("meeting_v1_recovery_scan_last_sessions").set(0.0);
             metrics::gauge!("meeting_v1_recovery_scan_saturated").set(0.0);
-            record_worker_error("recovery_scan");
+            record_worker_error("recovery_scan", None);
             return Err(error);
         }
     };
     for session in sessions {
+        let protocol = baton_protocol_label(session.schema_version);
         match buzz_db::meeting_baton::recover_meeting_v1(
             &state.db,
             session.community_id,
@@ -324,20 +341,43 @@ async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buz
             Ok(transitions) => {
                 let outcome = recovery_result_outcome(transitions.len());
                 let recovery_lag_seconds = elapsed_since(session.next_action_at);
-                metrics::counter!("meeting_v1_recovery_result_total", "outcome" => outcome)
-                    .increment(1);
+                metrics::counter!(
+                    "meeting_baton_recovery_result_total",
+                    "protocol" => protocol,
+                    "outcome" => outcome
+                )
+                .increment(1);
                 for transition in &transitions {
                     let deadline_type = classify_recovery_deadline(&transition.primary_type);
                     metrics::counter!(
-                        "meeting_v1_recovery_transition_total",
+                        "meeting_baton_recovery_transition_total",
+                        "protocol" => protocol,
                         "transition" => classify_recovery_transition(&transition.primary_type)
                     )
                     .increment(1);
                     metrics::histogram!(
-                        "meeting_v1_recovery_lag_seconds",
+                        "meeting_baton_recovery_lag_seconds",
+                        "protocol" => protocol,
                         "deadline_type" => deadline_type
                     )
                     .record(recovery_lag_seconds);
+                }
+                if protocol == "v1" {
+                    metrics::counter!("meeting_v1_recovery_result_total", "outcome" => outcome)
+                        .increment(1);
+                    for transition in &transitions {
+                        let deadline_type = classify_recovery_deadline(&transition.primary_type);
+                        metrics::counter!(
+                            "meeting_v1_recovery_transition_total",
+                            "transition" => classify_recovery_transition(&transition.primary_type)
+                        )
+                        .increment(1);
+                        metrics::histogram!(
+                            "meeting_v1_recovery_lag_seconds",
+                            "deadline_type" => deadline_type
+                        )
+                        .record(recovery_lag_seconds);
+                    }
                 }
                 if !transitions.is_empty() {
                     info!(
@@ -355,9 +395,17 @@ async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buz
                     community = %session.community_id,
                     "Meeting V1 session recovery failed: {error}"
                 );
-                metrics::counter!("meeting_v1_recovery_result_total", "outcome" => "error")
-                    .increment(1);
-                record_worker_error("recovery_session");
+                metrics::counter!(
+                    "meeting_baton_recovery_result_total",
+                    "protocol" => protocol,
+                    "outcome" => "error"
+                )
+                .increment(1);
+                if protocol == "v1" {
+                    metrics::counter!("meeting_v1_recovery_result_total", "outcome" => "error")
+                        .increment(1);
+                }
+                record_worker_error("recovery_session", Some(protocol));
             }
         }
     }
@@ -429,6 +477,22 @@ async fn process_revocation_job(
             &state.relay_keypair,
         )
         .await?;
+        if session.schema_version == buzz_db::meeting_v2::SCHEMA_VERSION {
+            metrics::counter!(
+                "meeting_v2_end_total",
+                "outcome" => "aborted",
+                "reason_code" => "participant_revoked",
+                "duplicate" => if matches!(
+                    outcome,
+                    buzz_db::meeting_revocation::RevocationEndOutcome::AlreadyEnded
+                ) {
+                    "true"
+                } else {
+                    "false"
+                }
+            )
+            .increment(1);
+        }
         last_session_id = Some(session.session_id);
         info!(
             community = %job.community_id,
@@ -503,12 +567,12 @@ async fn dispatch_outbox_batch(
     {
         Ok(events) => events,
         Err(error) => {
-            record_worker_error("outbox_claim");
+            record_worker_error("outbox_claim", None);
             return Err(error);
         }
     };
     for item in events {
-        let observe_v1 = is_meeting_v1_outbox_event(&item.stored_event.event);
+        let meeting_protocol = meeting_baton_protocol(&item.stored_event.event);
         let delivery_latency_seconds = elapsed_since(item.stored_event.received_at);
         let tenant = TenantContext::resolved(item.community_id, item.host);
         let kind = item.stored_event.event.kind.as_u16() as u32;
@@ -526,14 +590,22 @@ async fn dispatch_outbox_batch(
                 .await;
                 match delivered {
                     Ok(true) => {
-                        if observe_v1 {
-                            record_v1_outbox_delivery("delivered", delivery_latency_seconds);
+                        if let Some(protocol) = meeting_protocol {
+                            record_baton_outbox_delivery(
+                                protocol,
+                                "delivered",
+                                delivery_latency_seconds,
+                            );
                         }
                     }
                     Ok(false) => {
-                        if observe_v1 {
-                            record_v1_outbox_delivery("claim_lost", delivery_latency_seconds);
-                            record_worker_error("outbox_claim_lost");
+                        if let Some(protocol) = meeting_protocol {
+                            record_baton_outbox_delivery(
+                                protocol,
+                                "claim_lost",
+                                delivery_latency_seconds,
+                            );
+                            record_worker_error("outbox_claim_lost", Some(protocol));
                         }
                         warn!(
                             meeting = %item.session_id,
@@ -542,17 +614,21 @@ async fn dispatch_outbox_batch(
                         );
                     }
                     Err(error) => {
-                        if observe_v1 {
-                            record_v1_outbox_delivery("worker_error", delivery_latency_seconds);
-                            record_worker_error("outbox_ack");
+                        if let Some(protocol) = meeting_protocol {
+                            record_baton_outbox_delivery(
+                                protocol,
+                                "worker_error",
+                                delivery_latency_seconds,
+                            );
+                            record_worker_error("outbox_ack", Some(protocol));
                         }
                         return Err(error);
                     }
                 }
             }
             Err(error) => {
-                if observe_v1 {
-                    record_worker_error("outbox_dispatch");
+                if let Some(protocol) = meeting_protocol {
+                    record_worker_error("outbox_dispatch", Some(protocol));
                 }
                 let released = buzz_db::meeting_floor::release_outbox(
                     &state.db,
@@ -564,14 +640,22 @@ async fn dispatch_outbox_batch(
                 .await;
                 match released {
                     Ok(true) => {
-                        if observe_v1 {
-                            record_v1_outbox_delivery("dispatch_failed", delivery_latency_seconds);
+                        if let Some(protocol) = meeting_protocol {
+                            record_baton_outbox_delivery(
+                                protocol,
+                                "dispatch_failed",
+                                delivery_latency_seconds,
+                            );
                         }
                     }
                     Ok(false) => {
-                        if observe_v1 {
-                            record_v1_outbox_delivery("claim_lost", delivery_latency_seconds);
-                            record_worker_error("outbox_claim_lost");
+                        if let Some(protocol) = meeting_protocol {
+                            record_baton_outbox_delivery(
+                                protocol,
+                                "claim_lost",
+                                delivery_latency_seconds,
+                            );
+                            record_worker_error("outbox_claim_lost", Some(protocol));
                         }
                         warn!(
                             meeting = %item.session_id,
@@ -580,9 +664,13 @@ async fn dispatch_outbox_batch(
                         );
                     }
                     Err(release_error) => {
-                        if observe_v1 {
-                            record_v1_outbox_delivery("worker_error", delivery_latency_seconds);
-                            record_worker_error("outbox_release");
+                        if let Some(protocol) = meeting_protocol {
+                            record_baton_outbox_delivery(
+                                protocol,
+                                "worker_error",
+                                delivery_latency_seconds,
+                            );
+                            record_worker_error("outbox_release", Some(protocol));
                         }
                         return Err(release_error);
                     }
@@ -598,6 +686,14 @@ fn recovery_result_outcome(transition_count: usize) -> &'static str {
         "noop"
     } else {
         "recovered"
+    }
+}
+
+fn baton_protocol_label(schema_version: i32) -> &'static str {
+    match schema_version {
+        buzz_db::meeting_baton::SCHEMA_VERSION => "v1",
+        buzz_db::meeting_v2::SCHEMA_VERSION => "v2",
+        _ => "unknown",
     }
 }
 
@@ -631,7 +727,7 @@ fn elapsed_since(timestamp: chrono::DateTime<Utc>) -> f64 {
         / 1_000.0
 }
 
-fn is_meeting_v1_outbox_event(event: &Event) -> bool {
+fn meeting_baton_protocol(event: &Event) -> Option<&'static str> {
     let kind = event.kind.as_u16() as u32;
     if !matches!(
         kind,
@@ -645,31 +741,63 @@ fn is_meeting_v1_outbox_event(event: &Event) -> bool {
             | KIND_MEETING_OFFER_RESPONSE
             | KIND_MEETING_GRANT_SIGNAL
     ) {
-        return false;
+        return None;
     }
 
     let mut versions = event
         .tags
         .iter()
         .filter(|tag| tag.kind().to_string() == "v");
-    versions
+    let version = versions
         .next()
         .and_then(|tag| tag.content())
-        .is_some_and(|version| version == "2")
-        && versions.next().is_none()
+        .filter(|_| versions.next().is_none())?;
+    match version {
+        "2" => Some("v1"),
+        "3" => Some("v2"),
+        _ => None,
+    }
 }
 
-fn record_v1_outbox_delivery(outcome: &'static str, latency_seconds: f64) {
-    metrics::counter!("meeting_v1_outbox_delivery_total", "outcome" => outcome).increment(1);
+fn record_baton_outbox_delivery(
+    protocol: &'static str,
+    outcome: &'static str,
+    latency_seconds: f64,
+) {
+    metrics::counter!(
+        "meeting_baton_outbox_delivery_total",
+        "protocol" => protocol,
+        "outcome" => outcome
+    )
+    .increment(1);
     metrics::histogram!(
-        "meeting_v1_outbox_delivery_latency_seconds",
+        "meeting_baton_outbox_delivery_latency_seconds",
+        "protocol" => protocol,
         "outcome" => outcome
     )
     .record(latency_seconds);
+    if protocol == "v1" {
+        metrics::counter!("meeting_v1_outbox_delivery_total", "outcome" => outcome).increment(1);
+        metrics::histogram!(
+            "meeting_v1_outbox_delivery_latency_seconds",
+            "outcome" => outcome
+        )
+        .record(latency_seconds);
+    }
 }
 
-fn record_worker_error(worker: &'static str) {
-    metrics::counter!("meeting_v1_worker_errors_total", "worker" => worker).increment(1);
+fn record_worker_error(worker: &'static str, protocol: Option<&'static str>) {
+    metrics::counter!("meeting_baton_worker_errors_total", "worker" => worker).increment(1);
+    // Scan/claim failures predate protocol classification and retain the
+    // legacy aggregate. Item/session failures only enter the V1 series when
+    // the affected object is actually V1.
+    if records_legacy_v1_worker_error(protocol) {
+        metrics::counter!("meeting_v1_worker_errors_total", "worker" => worker).increment(1);
+    }
+}
+
+fn records_legacy_v1_worker_error(protocol: Option<&str>) -> bool {
+    protocol.is_none() || matches!(protocol, Some("v1"))
 }
 
 fn env_duration_ms(name: &str, default: Duration) -> Duration {
@@ -772,26 +900,38 @@ mod tests {
     }
 
     #[test]
-    fn outbox_protocol_detection_requires_one_v2_tag_on_a_v1_kind() {
+    fn outbox_protocol_detection_requires_one_supported_version_tag() {
         let v2 = || Tag::parse(["v", "2"]).expect("v2");
+        let v3 = || Tag::parse(["v", "3"]).expect("v3");
         let v1 = || Tag::parse(["v", "1"]).expect("v1");
 
         let state = signed_event(KIND_MEETING_STATE, vec![v2()]);
-        assert!(is_meeting_v1_outbox_event(&state));
+        assert_eq!(meeting_baton_protocol(&state), Some("v1"));
 
         let speech = signed_event(KIND_STREAM_MESSAGE, vec![v2()]);
-        assert!(is_meeting_v1_outbox_event(&speech));
+        assert_eq!(meeting_baton_protocol(&speech), Some("v1"));
+
+        let board_state = signed_event(KIND_MEETING_STATE, vec![v3()]);
+        assert_eq!(meeting_baton_protocol(&board_state), Some("v2"));
 
         let missing_version = signed_event(KIND_MEETING_STATE, Vec::new());
-        assert!(!is_meeting_v1_outbox_event(&missing_version));
+        assert_eq!(meeting_baton_protocol(&missing_version), None);
 
         let old_protocol = signed_event(KIND_MEETING_STATE, vec![v1()]);
-        assert!(!is_meeting_v1_outbox_event(&old_protocol));
+        assert_eq!(meeting_baton_protocol(&old_protocol), None);
 
         let duplicate_version = signed_event(KIND_MEETING_STATE, vec![v2(), v2()]);
-        assert!(!is_meeting_v1_outbox_event(&duplicate_version));
+        assert_eq!(meeting_baton_protocol(&duplicate_version), None);
 
         let unrelated = signed_event(42_199, vec![v2()]);
-        assert!(!is_meeting_v1_outbox_event(&unrelated));
+        assert_eq!(meeting_baton_protocol(&unrelated), None);
+
+        assert_eq!(baton_protocol_label(2), "v1");
+        assert_eq!(baton_protocol_label(3), "v2");
+        assert_eq!(baton_protocol_label(99), "unknown");
+        assert!(records_legacy_v1_worker_error(None));
+        assert!(records_legacy_v1_worker_error(Some("v1")));
+        assert!(!records_legacy_v1_worker_error(Some("v2")));
+        assert!(!records_legacy_v1_worker_error(Some("unknown")));
     }
 }

@@ -808,6 +808,7 @@ async fn handle_meeting_end(
                     buzz_db::meeting_v2::TerminalOutcome::Closed => "closed",
                     buzz_db::meeting_v2::TerminalOutcome::Aborted => "aborted",
                 };
+                record_meeting_v2_end(v2_terminal.0, v2_terminal.1.as_deref(), true);
                 return Ok(IngestResult {
                     event_id: event.id.to_hex(),
                     accepted: true,
@@ -934,6 +935,9 @@ async fn handle_meeting_end(
             tx.rollback().await.map_err(|e| {
                 IngestError::Internal(format!("error: rollback duplicate end: {e}"))
             })?;
+            if let Some(terminal_outcome) = terminal_outcome {
+                record_meeting_v2_end(terminal_outcome, None, true);
+            }
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
@@ -957,6 +961,15 @@ async fn handle_meeting_end(
             tx.commit().await.map_err(|e| {
                 IngestError::Internal(format!("error: commit meeting revocation recovery: {e}"))
             })?;
+            if protocol == MeetingProtocol::ModeratedBoardV2 {
+                metrics::counter!(
+                    "meeting_v2_end_total",
+                    "outcome" => "aborted",
+                    "reason_code" => "participant_revoked",
+                    "duplicate" => "false"
+                )
+                .increment(1);
+            }
             return Err(IngestError::AuthFailed(
                 "restricted: meeting ended because a participant was revoked".into(),
             ));
@@ -966,6 +979,10 @@ async fn handle_meeting_end(
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit meeting end: {e}")))?;
+
+    if protocol == MeetingProtocol::ModeratedBoardV2 {
+        record_meeting_v2_end(v2_terminal.0, v2_terminal.1.as_deref(), false);
+    }
 
     // Discovery metadata remains a best-effort projection. The canonical End
     // and terminal State are delivered in causal order by the meeting outbox.
@@ -995,6 +1012,42 @@ async fn handle_meeting_end(
             })
         ),
     })
+}
+
+fn record_meeting_v2_end(
+    outcome: buzz_db::meeting_v2::TerminalOutcome,
+    reason_code: Option<&str>,
+    duplicate: bool,
+) {
+    let (outcome, reason_code) = meeting_v2_end_metric_labels(outcome, reason_code);
+    metrics::counter!(
+        "meeting_v2_end_total",
+        "outcome" => outcome,
+        "reason_code" => reason_code,
+        "duplicate" => if duplicate { "true" } else { "false" }
+    )
+    .increment(1);
+}
+
+fn meeting_v2_end_metric_labels(
+    outcome: buzz_db::meeting_v2::TerminalOutcome,
+    reason_code: Option<&str>,
+) -> (&'static str, &'static str) {
+    match outcome {
+        buzz_db::meeting_v2::TerminalOutcome::Closed => ("closed", "none"),
+        buzz_db::meeting_v2::TerminalOutcome::Aborted => {
+            let reason_code = match reason_code {
+                Some("goal_unreachable") => "goal_unreachable",
+                Some("insufficient_information") => "insufficient_information",
+                Some("discussion_blocked") => "discussion_blocked",
+                Some("unable_to_form_conclusion") => "unable_to_form_conclusion",
+                Some("moderator_unable_to_continue") => "moderator_unable_to_continue",
+                Some("participant_revoked") => "participant_revoked",
+                Some(_) | None => "other",
+            };
+            ("aborted", reason_code)
+        }
+    }
 }
 
 async fn handle_meeting_floor_claim(
@@ -2842,5 +2895,30 @@ mod meeting_protocol_tests {
         assert!(meeting_end_preflight_allowed(false, Some("admin")));
         assert!(!meeting_end_preflight_allowed(false, Some("member")));
         assert!(!meeting_end_preflight_allowed(false, None));
+    }
+
+    #[test]
+    fn v2_end_metrics_collapse_unbounded_abort_reasons() {
+        assert_eq!(
+            meeting_v2_end_metric_labels(
+                buzz_db::meeting_v2::TerminalOutcome::Closed,
+                Some("ignored")
+            ),
+            ("closed", "none")
+        );
+        assert_eq!(
+            meeting_v2_end_metric_labels(
+                buzz_db::meeting_v2::TerminalOutcome::Aborted,
+                Some("goal_unreachable")
+            ),
+            ("aborted", "goal_unreachable")
+        );
+        assert_eq!(
+            meeting_v2_end_metric_labels(
+                buzz_db::meeting_v2::TerminalOutcome::Aborted,
+                Some("attacker-controlled-high-cardinality-value")
+            ),
+            ("aborted", "other")
+        );
     }
 }

@@ -50,6 +50,8 @@ jobs:
               - '.github/workflows/sprig.yml'
               - 'scripts/run-tests.sh'
               - 'scripts/run-meeting-backend-tests.sh'
+              - 'scripts/meeting-v2-*.sh'
+              - 'scripts/meeting-v2-*.jq'
               - 'scripts/start-relay-for-tests.sh'
               - 'scripts/test-project-view-*.sh'
               - 'scripts/build-sprig.sh'
@@ -149,6 +151,10 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Unit tests
         run: just test-unit
+      - name: Meeting V2 qualification evidence contracts
+        run: |
+          cargo test -p buzz-acp --features meeting-acceptance --lib acceptance
+          ./scripts/meeting-v2-qualification-gates-test.sh
 
   desktop-core:
     name: Desktop Core
@@ -351,7 +357,7 @@ jobs:
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'scripts/meeting-v2-*', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -380,6 +386,7 @@ jobs:
             --test e2e_meeting \
             --test e2e_meeting_floor \
             --test e2e_meeting_baton \
+            --test e2e_meeting_v2_stage1 \
             --test e2e_meeting_rollout \
             --test e2e_project_view \
             --archive-file target/ci/backend-integration-tests.tar.zst
@@ -393,7 +400,7 @@ jobs:
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'scripts/meeting-v2-*', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - name: Upload relay artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -671,6 +678,19 @@ jobs:
         env:
           BUZZ_TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_meeting_contracts
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_meeting_contracts
+      - name: Meeting migration and schema drift
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: buzz
+          PGPASSWORD: buzz_dev
+          PGDATABASE: buzz_meeting_contracts
+          PGSCHEMA_PLAN_HOST: localhost
+          PGSCHEMA_PLAN_PORT: "5432"
+          PGSCHEMA_PLAN_DB: postgres
+          PGSCHEMA_PLAN_USER: buzz
+          PGSCHEMA_PLAN_PASSWORD: buzz_dev
+        run: ./scripts/meeting-v2-schema-drift.sh
       - name: Apply schema and seed deployment community
         # MT: the relay resolves each request's tenant from the communities host
         # map and fails closed on an unmapped host. The reminder scheduler binds
@@ -715,6 +735,8 @@ jobs:
             BUZZ_BIND_ADDR=0.0.0.0:3000 \
             BUZZ_REQUIRE_AUTH_TOKEN=false \
             BUZZ_MEETING_V1_CREATE_ENABLED=true \
+            BUZZ_MEETING_V2_CREATE_ENABLED=true \
+            BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
             BUZZ_RECONCILE_CHANNELS=true \
             BUZZ_GIT_PROBE_WRITERS=8 \
             SPROUT_REMINDER_SCHEDULER_INTERVAL_SECS=1 \
@@ -753,17 +775,17 @@ jobs:
             --run-ignored ignored-only
         env:
           RELAY_URL: ws://localhost:3000
-      - name: Meeting V0 and V1 relay e2e
+      - name: Meeting V0, V1, and V2 relay e2e
         run: |
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E '(binary(e2e_meeting) | binary(e2e_meeting_floor) | binary(e2e_meeting_baton)) and not test(relay_member_removal_disconnects_live_meeting_reader_and_blocks_reentry)' \
+            -E '(binary(e2e_meeting) | binary(e2e_meeting_floor) | binary(e2e_meeting_baton) | binary(e2e_meeting_v2_stage1)) and not test(relay_member_removal_disconnects_live_meeting_reader_and_blocks_reentry)' \
             --run-ignored ignored-only \
             --test-threads 1
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           RELAY_URL: ws://localhost:3000
-      - name: Meeting V1 rollout phase one
+      - name: Meeting V1 and V2 rollout phase one
         run: |
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
@@ -774,7 +796,7 @@ jobs:
           BUZZ_MEETING_ROLLOUT_FIXTURE: /tmp/buzz-meeting-v1-rollout.json
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           RELAY_URL: ws://localhost:3000
-      - name: Restart relay with V1 creation disabled
+      - name: Restart relay with V1 and V2 creation disabled
         run: |
           kill "$(cat /tmp/buzz-relay.pid)"
           for attempt in $(seq 1 30); do
@@ -794,6 +816,8 @@ jobs:
             BUZZ_REQUIRE_AUTH_TOKEN=false \
             BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
             BUZZ_MEETING_V1_CREATE_ENABLED=false \
+            BUZZ_MEETING_V2_CREATE_ENABLED=false \
+            BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
             BUZZ_RECONCILE_CHANNELS=true \
             BUZZ_GIT_PROBE_WRITERS=8 \
             ./target/ci/buzz-relay > /tmp/buzz-relay.log 2>&1 &
@@ -811,11 +835,11 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
-      - name: Meeting V1 rollout phase two
+      - name: Meeting V1 and V2 rollout phase two
         run: |
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'binary(e2e_meeting_rollout) and test(existing_v1_survives_closed_gate_and_v0_still_works)' \
+            -E 'binary(e2e_meeting_rollout) and test(existing_v1_and_v2_survive_closed_gates_and_v0_still_works)' \
             --run-ignored ignored-only \
             --test-threads 1
         env:
@@ -842,6 +866,8 @@ jobs:
             BUZZ_REQUIRE_AUTH_TOKEN=false \
             BUZZ_REQUIRE_RELAY_MEMBERSHIP=true \
             BUZZ_MEETING_V1_CREATE_ENABLED=true \
+            BUZZ_MEETING_V2_CREATE_ENABLED=false \
+            BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
             RELAY_OWNER_PUBKEY=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 \
             BUZZ_RECONCILE_CHANNELS=true \
             BUZZ_GIT_PROBE_WRITERS=8 \

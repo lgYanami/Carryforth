@@ -170,6 +170,7 @@ CREATE TABLE meeting_sessions (
         CHECK (status IN ('active', 'ended')),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     security_order    BIGINT NOT NULL DEFAULT nextval('meeting_security_order_seq')
+        CONSTRAINT chk_meeting_session_security_order
         CHECK (security_order > 0),
     ended_at          TIMESTAMPTZ,
     ended_by          BYTEA,
@@ -532,23 +533,26 @@ CREATE TABLE meeting_v2_bootstrap_state (
     community_id   UUID NOT NULL REFERENCES communities(id),
     session_id     UUID NOT NULL,
     runtime_phase  TEXT NOT NULL DEFAULT 'bootstrap_locked'
+        CONSTRAINT chk_meeting_v2_runtime_phase
         CHECK (runtime_phase IN (
             'bootstrap_locked', 'board_pending', 'floor_ready', 'ended'
         )),
     control_epoch  BIGINT NOT NULL DEFAULT 1
+        CONSTRAINT chk_meeting_v2_control_epoch
         CHECK (control_epoch > 0),
-    board_window   BIGINT NOT NULL DEFAULT 0 CHECK (board_window >= 0),
+    board_window   BIGINT NOT NULL DEFAULT 0
+        CONSTRAINT chk_meeting_v2_board_window CHECK (board_window >= 0),
     board_started_at TIMESTAMPTZ,
     board_deadline_at TIMESTAMPTZ,
     board_completed_at TIMESTAMPTZ,
-    board_outcome TEXT CHECK (
+    board_outcome TEXT CONSTRAINT chk_meeting_v2_board_outcome CHECK (
         board_outcome IS NULL
         OR board_outcome IN ('updated', 'unchanged', 'timed_out', 'preempted')
     ),
-    terminal_outcome TEXT CHECK (
+    terminal_outcome TEXT CONSTRAINT chk_meeting_v2_terminal_outcome CHECK (
         terminal_outcome IS NULL OR terminal_outcome IN ('closed', 'aborted')
     ),
-    terminal_reason_code TEXT CHECK (
+    terminal_reason_code TEXT CONSTRAINT chk_meeting_v2_terminal_reason CHECK (
         terminal_reason_code IS NULL
         OR OCTET_LENGTH(terminal_reason_code) BETWEEN 1 AND 128
     ),
@@ -1879,6 +1883,7 @@ CREATE TABLE meeting_revocation_jobs (
     last_error          TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     security_order      BIGINT NOT NULL DEFAULT nextval('meeting_security_order_seq')
+        CONSTRAINT chk_meeting_revocation_security_order
         CHECK (security_order > 0),
     completed_at        TIMESTAMPTZ,
     PRIMARY KEY (community_id, job_id),

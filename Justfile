@@ -360,7 +360,7 @@ project-view-test: project-view-test-unit project-view-test-db test-migrations p
 test-integration:
     ./scripts/run-tests.sh integration
 
-# Run the complete Meeting V0/V1 backend gate with a locally managed Relay.
+# Run the complete Meeting V0/V1/V2 backend release gate, including Meeting schema drift.
 # Port 3000 must be free; Postgres/Redis/MinIO are started automatically.
 test-meeting-backend:
     ./scripts/run-meeting-backend-tests.sh

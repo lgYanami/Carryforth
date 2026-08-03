@@ -438,6 +438,8 @@ pub struct BatonDueSession {
     pub community_id: CommunityId,
     /// Meeting Session UUID.
     pub session_id: Uuid,
+    /// Persisted wire schema used for protocol-aware runtime observation.
+    pub schema_version: i32,
     /// Database deadline that made this Session eligible for recovery.
     pub next_action_at: DateTime<Utc>,
 }
@@ -4058,7 +4060,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
         return Ok(Vec::new());
     }
     let bootstrap_rows = sqlx::query(
-        "SELECT runtime.community_id, runtime.session_id, \
+        "SELECT runtime.community_id, runtime.session_id, session.schema_version, \
                 runtime.created_at AS next_action_at \
          FROM meeting_v2_bootstrap_state runtime \
          JOIN meeting_sessions session \
@@ -4081,6 +4083,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
             Ok(BatonDueSession {
                 community_id: CommunityId::from_uuid(row.try_get("community_id")?),
                 session_id: row.try_get("session_id")?,
+                schema_version: row.try_get("schema_version")?,
                 next_action_at: row.try_get("next_action_at")?,
             })
         })
@@ -4091,7 +4094,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
     }
     let rows = sqlx::query(
         "WITH due AS ( \
-             SELECT s.community_id, s.session_id, \
+             SELECT s.community_id, s.session_id, m.schema_version, \
                     COALESCE(LEAST(s.next_action_at, v2.board_deadline_at), \
                              s.next_action_at, v2.board_deadline_at) AS effective_deadline \
              FROM meeting_baton_state s \
@@ -4119,7 +4122,8 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
                AND s.session_id = due.session_id \
              RETURNING s.community_id, s.session_id \
          ) \
-         SELECT claimed.community_id, claimed.session_id, due.effective_deadline AS next_action_at \
+         SELECT claimed.community_id, claimed.session_id, due.schema_version, \
+                due.effective_deadline AS next_action_at \
          FROM claimed \
          JOIN due USING (community_id, session_id) \
          ORDER BY next_action_at, community_id, session_id",
@@ -4135,6 +4139,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
             Ok(BatonDueSession {
                 community_id: CommunityId::from_uuid(row.try_get("community_id")?),
                 session_id: row.try_get("session_id")?,
+                schema_version: row.try_get("schema_version")?,
                 next_action_at: row.try_get("next_action_at")?,
             })
         })
