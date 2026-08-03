@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 39);
+        assert_eq!(migrations.len(), 40);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1075,6 +1075,16 @@ mod tests {
         assert!(meeting_v2_stage_two.contains("floor_ready"));
         assert!(meeting_v2_stage_two.contains("CREATE TABLE meeting_v2_board_command_receipts"));
         assert!(meeting_v2_stage_two.contains("terminal_outcome"));
+
+        // Action finalization is an additive, policy-discriminated Meeting V2
+        // lifecycle stage with its own durable saga ledger.
+        assert_eq!(migrations[39].version, 40);
+        let meeting_v2_actions = migrations[39].sql.as_str();
+        assert!(meeting_v2_actions.contains("moderated-board-actions-v1"));
+        assert!(meeting_v2_actions.contains("finalizing_actions"));
+        assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_runs"));
+        assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_steps"));
+        assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_command_receipts"));
     }
 
     #[test]
@@ -1132,6 +1142,26 @@ mod tests {
             assert!(
                 schema.contains(required),
                 "schema/schema.sql must include migration 0039 object {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_schema_contains_meeting_v2_action_finalization_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "moderated-board-actions-v1",
+            "finalizing_actions",
+            "action_finalization_ms",
+            "CREATE TABLE meeting_v2_action_runs",
+            "CREATE TABLE meeting_v2_action_steps",
+            "CREATE TABLE meeting_v2_action_step_attempts",
+            "CREATE TABLE meeting_v2_action_command_receipts",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0040 object {required}"
             );
         }
     }
@@ -1543,7 +1573,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(39));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -1648,8 +1678,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0039");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(39));
+            .expect("upgrade scratch database through 0040");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1781,7 +1811,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(39));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(40));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version IN (25, 26, 27, 28, 29, 30, 31) AND success",
@@ -1869,7 +1899,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(39));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
     }
 
     #[tokio::test]

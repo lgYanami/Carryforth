@@ -107,13 +107,13 @@ pub(crate) async fn handle_board_action(
 ) -> Result<IngestResult, IngestError> {
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
     let protocol = authorize_participant_command(tenant, state, session_id, auth).await?;
-    if protocol != MeetingProtocol::ModeratedBoardV2 {
+    if !protocol.is_v2() {
         return Err(IngestError::Rejected(
             "invalid: Board Maintenance command targets a non-V2 Meeting".into(),
         ));
     }
     let (parsed_session_id, expected_control_epoch, board_window, action) =
-        parse_board_action(event)?;
+        parse_board_action(event, protocol)?;
     debug_assert_eq!(parsed_session_id, session_id);
     let action_label = match &action {
         BoardAction::Update(_) => "update",
@@ -234,6 +234,216 @@ pub(crate) async fn handle_board_action(
     }
 }
 
+/// Parse and execute one moderator-authored Meeting V2 action-finalization command.
+pub(crate) async fn handle_action_command(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    let protocol = authorize_participant_command(tenant, state, session_id, auth).await?;
+    if !protocol.has_action_finalization() {
+        return Err(IngestError::Rejected(
+            "invalid: action command targets a Meeting without action finalization".into(),
+        ));
+    }
+    let (parsed_session_id, command) = parse_action_command(event)?;
+    debug_assert_eq!(parsed_session_id, session_id);
+    let commit = buzz_db::meeting_v2_actions::execute_action_command(
+        &state.db,
+        buzz_db::meeting_v2_actions::ActionCommandTxParams {
+            community_id: tenant.community(),
+            session_id,
+            event,
+            command,
+            relay_keys: &state.relay_keypair,
+        },
+    )
+    .await
+    .map_err(map_baton_db_error)?;
+    let mut response = commit.response;
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "duplicate".to_string(),
+            serde_json::Value::Bool(commit.duplicate),
+        );
+    }
+    if !commit.accepted {
+        return Err(IngestError::Rejected(format!("conflict: {response}")));
+    }
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!("response:{response}"),
+    })
+}
+
+fn parse_action_command(
+    event: &Event,
+) -> Result<(Uuid, buzz_db::meeting_v2_actions::ActionCommand), IngestError> {
+    let action = require_single_tag(event, "action")?;
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if require_single_tag(event, "v")? != buzz_sdk::MEETING_V2_SCHEMA_VERSION {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting V2 action command must use schema version 3".into(),
+        ));
+    }
+    if require_single_tag(event, "policy")? != buzz_sdk::MEETING_V2_ACTIONS_POLICY {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Meeting V2 action command policy must be {}",
+            buzz_sdk::MEETING_V2_ACTIONS_POLICY
+        )));
+    }
+    let command = match action.as_str() {
+        "begin" => {
+            validate_meeting_tag_schema(
+                event,
+                &[
+                    "h",
+                    "v",
+                    "policy",
+                    "action",
+                    "expected-control-epoch",
+                    "board-window",
+                    "expected-state",
+                    "board",
+                ],
+                &["decision-attempt"],
+                &[],
+            )?;
+            require_empty_content(event, "Meeting V2 action begin")?;
+            buzz_db::meeting_v2_actions::ActionCommand::Begin {
+                expected_control_epoch: parse_positive_i64_tag(event, "expected-control-epoch")?,
+                board_window: parse_positive_i64_tag(event, "board-window")?,
+                expected_state_event_id: decode_event_id(
+                    &require_single_tag(event, "expected-state")?,
+                    "Meeting expected State event id",
+                )?,
+                board_event_id: decode_event_id(
+                    &require_single_tag(event, "board")?,
+                    "Meeting final Board event id",
+                )?,
+                expected_decision_attempt_id: optional_single_tag(event, "decision-attempt")?
+                    .map(|value| decode_event_id(&value, "Meeting decision attempt id"))
+                    .transpose()?,
+            }
+        }
+        "plan" => {
+            validate_action_run_tag_schema(event, &[])?;
+            let fence = parse_action_run_fence(event)?;
+            if fence.plan_event_id.is_some() {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting action plan must use action-plan=none".into(),
+                ));
+            }
+            let plan: buzz_sdk::MeetingV2ActionPlan = serde_json::from_str(&event.content)
+                .map_err(|error| {
+                    IngestError::Rejected(format!(
+                        "invalid: malformed Meeting V2 action plan JSON: {error}"
+                    ))
+                })?;
+            buzz_sdk::validate_meeting_v2_action_plan(&plan)
+                .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+            buzz_db::meeting_v2_actions::ActionCommand::Plan { fence, plan }
+        }
+        "block" => {
+            validate_action_run_tag_schema(event, &["reason-code"])?;
+            validate_clean_action_text(&event.content, 1_024, true, "block reason")?;
+            let reason_code = require_single_tag(event, "reason-code")?;
+            validate_clean_action_text(&reason_code, 128, false, "block reason code")?;
+            buzz_db::meeting_v2_actions::ActionCommand::Block {
+                fence: parse_action_run_fence(event)?,
+                reason_code,
+            }
+        }
+        "retry" | "complete" | "return-to-board" => {
+            validate_action_run_tag_schema(event, &[])?;
+            require_empty_content(event, "Meeting V2 action command")?;
+            let fence = parse_action_run_fence(event)?;
+            match action.as_str() {
+                "retry" => buzz_db::meeting_v2_actions::ActionCommand::Retry { fence },
+                "complete" => buzz_db::meeting_v2_actions::ActionCommand::Complete { fence },
+                _ => buzz_db::meeting_v2_actions::ActionCommand::ReturnToBoard { fence },
+            }
+        }
+        "step-prepared" | "step-applied" => {
+            return Err(IngestError::Rejected(
+                "unsupported: Project View action step receipts are not enabled in stage one"
+                    .into(),
+            ));
+        }
+        _ => {
+            return Err(IngestError::Rejected(format!(
+                "invalid: unsupported Meeting V2 action command {action}"
+            )));
+        }
+    };
+    Ok((session_id, command))
+}
+
+fn validate_action_run_tag_schema(
+    event: &Event,
+    additional_required: &[&str],
+) -> Result<(), IngestError> {
+    let mut required = vec![
+        "h",
+        "v",
+        "policy",
+        "action",
+        "action-run",
+        "action-window",
+        "action-plan",
+    ];
+    required.extend_from_slice(additional_required);
+    validate_meeting_tag_schema(event, &required, &[], &[])
+}
+
+fn parse_action_run_fence(
+    event: &Event,
+) -> Result<buzz_db::meeting_v2_actions::ActionRunFence, IngestError> {
+    let action_run_id = Uuid::parse_str(&require_single_tag(event, "action-run")?)
+        .map_err(|_| IngestError::Rejected("invalid: bad Meeting action run id".into()))?;
+    if action_run_id.is_nil() {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting action run id must not be nil".into(),
+        ));
+    }
+    let action_window_epoch = parse_positive_i64_tag(event, "action-window")?;
+    let plan = require_single_tag(event, "action-plan")?;
+    let plan_event_id = if plan == "none" {
+        None
+    } else {
+        Some(decode_event_id(&plan, "Meeting action plan event id")?)
+    };
+    Ok(buzz_db::meeting_v2_actions::ActionRunFence {
+        action_run_id,
+        action_window_epoch,
+        plan_event_id,
+    })
+}
+
+fn validate_clean_action_text(
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+    field: &str,
+) -> Result<(), IngestError> {
+    if value.is_empty() && allow_empty {
+        return Ok(());
+    }
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Meeting action {field} must be clean and at most {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn record_board_command_metrics(
     action: &'static str,
     outcome: &'static str,
@@ -263,7 +473,10 @@ fn record_board_command_metrics(
     .record(recovery_count as f64);
 }
 
-fn parse_board_action(event: &Event) -> Result<(Uuid, i64, i64, BoardAction), IngestError> {
+fn parse_board_action(
+    event: &Event,
+    protocol: MeetingProtocol,
+) -> Result<(Uuid, i64, i64, BoardAction), IngestError> {
     validate_meeting_tag_schema(
         event,
         &[
@@ -282,10 +495,10 @@ fn parse_board_action(event: &Event) -> Result<(Uuid, i64, i64, BoardAction), In
             "invalid: Meeting V2 Board command must use schema version 3".into(),
         ));
     }
-    if require_single_tag(event, "policy")? != buzz_sdk::MEETING_V2_POLICY {
+    if require_single_tag(event, "policy")? != protocol.policy() {
         return Err(IngestError::Rejected(format!(
             "invalid: Meeting V2 Board command policy must be {}",
-            buzz_sdk::MEETING_V2_POLICY
+            protocol.policy()
         )));
     }
     let action = match require_single_tag(event, "action")?.as_str() {
@@ -394,7 +607,9 @@ async fn authorize_participant_command(
         MeetingProtocol::from_persisted(persisted.schema_version, &persisted.floor_policy_version)?;
     if !matches!(
         protocol,
-        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2
+        MeetingProtocol::ModeratedBatonV1
+            | MeetingProtocol::ModeratedBoardV2
+            | MeetingProtocol::ModeratedBoardActionsV2
     ) {
         return Err(IngestError::Rejected(
             "invalid: moderated Baton command targets an unsupported Session".into(),
@@ -623,6 +838,7 @@ fn record_command_metrics(
     let protocol = match protocol {
         MeetingProtocol::ModeratedBatonV1 => "v1",
         MeetingProtocol::ModeratedBoardV2 => "v2",
+        MeetingProtocol::ModeratedBoardActionsV2 => "v2-actions",
         MeetingProtocol::UniformV0 => "v0",
     };
     let labels = [
@@ -1267,7 +1483,9 @@ fn parse_speech(
 fn parse_baton_session(event: &Event, protocol: MeetingProtocol) -> Result<Uuid, IngestError> {
     let expected_version = match protocol {
         MeetingProtocol::ModeratedBatonV1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
-        MeetingProtocol::ModeratedBoardV2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
+            buzz_sdk::MEETING_V2_SCHEMA_VERSION
+        }
         MeetingProtocol::UniformV0 => {
             return Err(IngestError::Rejected(
                 "invalid: uniform Meeting does not accept Baton commands".into(),
@@ -1614,7 +1832,7 @@ mod tests {
             .sign_with_keys(&Keys::generate())
             .expect("sign Board update");
         assert!(matches!(
-            parse_board_action(&update),
+            parse_board_action(&update, MeetingProtocol::ModeratedBoardV2),
             Ok((parsed, 3, 2, BoardAction::Update(_))) if parsed == session_id
         ));
 
@@ -1629,8 +1847,98 @@ mod tests {
             .sign_with_keys(&Keys::generate())
             .expect("sign Board unchanged");
         assert!(matches!(
-            parse_board_action(&unchanged),
+            parse_board_action(&unchanged, MeetingProtocol::ModeratedBoardV2),
             Ok((parsed, 3, 2, BoardAction::Unchanged)) if parsed == session_id
+        ));
+    }
+
+    #[test]
+    fn v2_action_commands_parse_with_the_actions_policy_only() {
+        let session_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
+        let state_event_id = "aa".repeat(32);
+        let board_event_id = "bb".repeat(32);
+        let moderator = Keys::generate();
+        let assignee = Keys::generate().public_key().to_hex();
+
+        let board =
+            buzz_sdk::build_meeting_v2_actions_board_action(buzz_sdk::MeetingV2BoardActionParams {
+                session_id,
+                expected_control_epoch: 3,
+                board_window: 2,
+                board: None,
+            })
+            .expect("build actions Board command")
+            .sign_with_keys(&moderator)
+            .expect("sign actions Board command");
+        assert!(matches!(
+            parse_board_action(&board, MeetingProtocol::ModeratedBoardActionsV2),
+            Ok((parsed, 3, 2, BoardAction::Unchanged)) if parsed == session_id
+        ));
+        assert!(parse_board_action(&board, MeetingProtocol::ModeratedBoardV2).is_err());
+
+        let begin = buzz_sdk::build_meeting_v2_action_begin(buzz_sdk::MeetingV2ActionBeginParams {
+            session_id,
+            expected_control_epoch: 3,
+            board_window: 2,
+            expected_state_event_id: &state_event_id,
+            board_event_id: &board_event_id,
+            expected_decision_attempt_id: None,
+        })
+        .expect("build action begin")
+        .sign_with_keys(&moderator)
+        .expect("sign action begin");
+        assert!(matches!(
+            parse_action_command(&begin),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Begin {
+                expected_control_epoch: 3,
+                board_window: 2,
+                expected_decision_attempt_id: None,
+                ..
+            })) if parsed == session_id
+        ));
+
+        let action_id = Uuid::new_v4();
+        let plan = buzz_sdk::MeetingV2ActionPlan {
+            version: buzz_sdk::MEETING_V2_ACTION_PLAN_VERSION,
+            action_run_id,
+            board_event_id,
+            items: vec![buzz_sdk::MeetingV2ActionItem {
+                action_id,
+                summary: "Implement the accepted design".to_string(),
+                assignee_pubkey: assignee,
+            }],
+            steps: vec![buzz_sdk::MeetingV2ActionStep {
+                step_id: Uuid::new_v4(),
+                action_id: Some(action_id),
+                kind: buzz_sdk::MeetingV2ActionStepKind::ProjectViewCreateWork,
+                target_object_id: Uuid::new_v4(),
+                payload: serde_json::json!({"title": "Implement"}),
+            }],
+        };
+        let plan_event =
+            buzz_sdk::build_meeting_v2_action_plan(buzz_sdk::MeetingV2ActionPlanParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id,
+                    action_window: 1,
+                    plan_event_id: None,
+                },
+                plan: &plan,
+            })
+            .expect("build action plan")
+            .sign_with_keys(&moderator)
+            .expect("sign action plan");
+        assert!(matches!(
+            parse_action_command(&plan_event),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Plan {
+                fence,
+                plan: parsed_plan,
+            })) if parsed == session_id
+                && fence.action_run_id == action_run_id
+                && fence.action_window_epoch == 1
+                && fence.plan_event_id.is_none()
+                && parsed_plan == plan
         ));
     }
 

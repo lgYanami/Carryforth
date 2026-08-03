@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::meeting_baton::{BATON_POLICY_VERSION, SCHEMA_VERSION};
 use crate::meeting_floor::FLOOR_POLICY_VERSION;
-use crate::meeting_v2::{BOARD_POLICY_VERSION, SCHEMA_VERSION as BOARD_SCHEMA_VERSION};
+use crate::meeting_v2::{
+    ACTIONS_POLICY_VERSION, BOARD_POLICY_VERSION, SCHEMA_VERSION as BOARD_SCHEMA_VERSION,
+};
 use crate::{Db, DbError, Result};
 
 /// One active Meeting whose frozen roster contains a revoked identity.
@@ -75,13 +77,13 @@ pub async fn list_revoked_participant_sessions(
            AND ( \
              (( \
                 (ms.schema_version = $6 AND ms.floor_policy_version = $7) \
-                OR (ms.schema_version = $8 AND ms.floor_policy_version = $9) \
+                OR (ms.schema_version = $8 AND ms.floor_policy_version IN ($9, $10)) \
               ) AND EXISTS( \
                SELECT 1 FROM meeting_participants mp \
                WHERE mp.community_id = ms.community_id \
                  AND mp.session_id = ms.session_id AND mp.pubkey = $2 \
              )) \
-             OR (ms.schema_version = $10 AND ms.floor_policy_version = $11 AND EXISTS( \
+             OR (ms.schema_version = $11 AND ms.floor_policy_version = $12 AND EXISTS( \
                SELECT 1 FROM channel_members cm \
                WHERE cm.community_id = ms.community_id \
                  AND cm.channel_id = ms.session_id AND cm.pubkey = $2 \
@@ -101,6 +103,7 @@ pub async fn list_revoked_participant_sessions(
     .bind(BATON_POLICY_VERSION)
     .bind(BOARD_SCHEMA_VERSION)
     .bind(BOARD_POLICY_VERSION)
+    .bind(ACTIONS_POLICY_VERSION)
     .bind(1_i32)
     .bind(FLOOR_POLICY_VERSION)
     .fetch_all(&db.pool)
@@ -206,7 +209,9 @@ async fn revoked_identity_belongs_to_roster_tx(
     protocol: RevocationProtocol,
 ) -> Result<bool> {
     let query = match protocol {
-        RevocationProtocol::ModeratedBatonV1 | RevocationProtocol::ModeratedBoardV2 => {
+        RevocationProtocol::ModeratedBatonV1
+        | RevocationProtocol::ModeratedBoardV2
+        | RevocationProtocol::ModeratedBoardV2Actions => {
             "SELECT EXISTS( \
                  SELECT 1 FROM meeting_participants \
                  WHERE community_id = $1 AND session_id = $2 AND pubkey = $3 \
@@ -238,7 +243,9 @@ async fn lock_roster_security_tx(
     protocol: RevocationProtocol,
 ) -> Result<()> {
     let roster_query = match protocol {
-        RevocationProtocol::ModeratedBatonV1 | RevocationProtocol::ModeratedBoardV2 => {
+        RevocationProtocol::ModeratedBatonV1
+        | RevocationProtocol::ModeratedBoardV2
+        | RevocationProtocol::ModeratedBoardV2Actions => {
             "SELECT pubkey FROM meeting_participants \
              WHERE community_id = $1 AND session_id = $2 \
              ORDER BY pubkey"
@@ -354,7 +361,9 @@ pub async fn recover_revoked_roster_v1_tx(
     }
     if !matches!(
         session.protocol,
-        RevocationProtocol::ModeratedBatonV1 | RevocationProtocol::ModeratedBoardV2
+        RevocationProtocol::ModeratedBatonV1
+            | RevocationProtocol::ModeratedBoardV2
+            | RevocationProtocol::ModeratedBoardV2Actions
     ) {
         return Err(DbError::InvalidData(format!(
             "meeting {session_id} is not a moderated Meeting session"
@@ -633,7 +642,7 @@ async fn end_meeting_for_revocation_locked_tx(
     session: &LockedMeetingSession,
     now: DateTime<Utc>,
 ) -> Result<LockedRevocationEnd> {
-    if matches!(session.protocol, RevocationProtocol::ModeratedBoardV2) {
+    if session.protocol.is_v2() {
         crate::meeting_v2::ensure_runtime_initialized_tx(
             tx,
             community_id,
@@ -696,8 +705,10 @@ async fn end_meeting_for_revocation_locked_tx(
                 .state_event_id,
             None,
         ),
-        RevocationProtocol::ModeratedBatonV1 | RevocationProtocol::ModeratedBoardV2 => {
-            if matches!(session.protocol, RevocationProtocol::ModeratedBoardV2) {
+        RevocationProtocol::ModeratedBatonV1
+        | RevocationProtocol::ModeratedBoardV2
+        | RevocationProtocol::ModeratedBoardV2Actions => {
+            if session.protocol.is_v2() {
                 sqlx::query(
                     "UPDATE meeting_v2_bootstrap_state \
                      SET runtime_phase = 'ended', board_deadline_at = NULL, \
@@ -714,6 +725,19 @@ async fn end_meeting_for_revocation_locked_tx(
                 .bind(ended_at)
                 .execute(tx.as_mut())
                 .await?;
+                if matches!(
+                    session.protocol,
+                    RevocationProtocol::ModeratedBoardV2Actions
+                ) {
+                    crate::meeting_v2_actions::mark_active_run_terminal_tx(
+                        tx,
+                        community_id,
+                        session_id,
+                        "completed_aborted",
+                        ended_at,
+                    )
+                    .await?;
+                }
             }
             let snapshot = crate::meeting_baton::close_baton_for_security_revocation_tx(
                 tx,
@@ -746,6 +770,7 @@ enum RevocationProtocol {
     UniformV0,
     ModeratedBatonV1,
     ModeratedBoardV2,
+    ModeratedBoardV2Actions,
 }
 
 impl RevocationProtocol {
@@ -754,10 +779,17 @@ impl RevocationProtocol {
             (1, FLOOR_POLICY_VERSION) => Ok(Self::UniformV0),
             (SCHEMA_VERSION, BATON_POLICY_VERSION) => Ok(Self::ModeratedBatonV1),
             (BOARD_SCHEMA_VERSION, BOARD_POLICY_VERSION) => Ok(Self::ModeratedBoardV2),
+            (BOARD_SCHEMA_VERSION, buzz_sdk::MEETING_V2_ACTIONS_POLICY) => {
+                Ok(Self::ModeratedBoardV2Actions)
+            }
             _ => Err(DbError::InvalidData(format!(
                 "meeting {session_id} has unsupported protocol {schema_version}/{policy}"
             ))),
         }
+    }
+
+    const fn is_v2(self) -> bool {
+        matches!(self, Self::ModeratedBoardV2 | Self::ModeratedBoardV2Actions)
     }
 }
 
@@ -784,11 +816,16 @@ fn build_revocation_end_event(
             tags.insert(1, parse_tag(["v", "2"])?);
             tags.insert(2, parse_tag(["policy", BATON_POLICY_VERSION])?);
         }
-        RevocationProtocol::ModeratedBoardV2 => {
+        RevocationProtocol::ModeratedBoardV2 | RevocationProtocol::ModeratedBoardV2Actions => {
+            let policy = if matches!(protocol, RevocationProtocol::ModeratedBoardV2Actions) {
+                buzz_sdk::MEETING_V2_ACTIONS_POLICY
+            } else {
+                BOARD_POLICY_VERSION
+            };
             tags = vec![
                 parse_tag(["h", session_id.as_str()])?,
                 parse_tag(["v", buzz_sdk::MEETING_V2_SCHEMA_VERSION])?,
-                parse_tag(["policy", BOARD_POLICY_VERSION])?,
+                parse_tag(["policy", policy])?,
                 parse_tag(["e", create_event_id.as_str()])?,
                 parse_tag(["outcome", "aborted"])?,
                 parse_tag(["reason-code", "participant_revoked"])?,
@@ -891,6 +928,10 @@ mod tests {
             RevocationProtocol::parse(BOARD_SCHEMA_VERSION, BOARD_POLICY_VERSION, session_id),
             Ok(RevocationProtocol::ModeratedBoardV2)
         ));
+        assert!(matches!(
+            RevocationProtocol::parse(BOARD_SCHEMA_VERSION, ACTIONS_POLICY_VERSION, session_id),
+            Ok(RevocationProtocol::ModeratedBoardV2Actions)
+        ));
         assert!(RevocationProtocol::parse(2, FLOOR_POLICY_VERSION, session_id).is_err());
     }
 
@@ -942,6 +983,27 @@ mod tests {
             .iter()
             .any(|tag| tag.as_slice() == ["reason-code", "participant_revoked"]));
         assert!(v2_event.content.is_empty());
+
+        let v2_actions_event = build_revocation_end_event(
+            &keys,
+            RevocationProtocol::ModeratedBoardV2Actions,
+            session_id,
+            &create_event_id,
+            &revoked_pubkey,
+            Utc::now(),
+        )
+        .expect("build action-capable Meeting V2 security-revocation End");
+        let v2_actions_tags = v2_actions_event.tags.to_vec();
+        assert!(v2_actions_tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["v", "3"]));
+        assert!(v2_actions_tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["policy", ACTIONS_POLICY_VERSION]));
+        assert!(v2_actions_tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["outcome", "aborted"]));
+        assert!(v2_actions_event.content.is_empty());
     }
 
     #[tokio::test]

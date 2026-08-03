@@ -40,6 +40,7 @@ use super::side_effects::{
 
 const MEETING_V1_POLICY: &str = buzz_sdk::MEETING_V1_POLICY;
 const MEETING_V2_POLICY: &str = buzz_sdk::MEETING_V2_POLICY;
+const MEETING_V2_ACTIONS_POLICY: &str = buzz_sdk::MEETING_V2_ACTIONS_POLICY;
 
 /// Frozen Meeting floor-control protocol selected by the persisted Session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,22 +51,25 @@ pub(crate) enum MeetingProtocol {
     ModeratedBatonV1,
     /// Meeting V2 moderator-maintained current board.
     ModeratedBoardV2,
+    /// Meeting V2 with optional action finalization before normal close.
+    ModeratedBoardActionsV2,
 }
 
 impl MeetingProtocol {
-    fn policy(self) -> &'static str {
+    pub(crate) fn policy(self) -> &'static str {
         match self {
             Self::UniformV0 => buzz_db::meeting_floor::FLOOR_POLICY_VERSION,
             Self::ModeratedBatonV1 => MEETING_V1_POLICY,
             Self::ModeratedBoardV2 => MEETING_V2_POLICY,
+            Self::ModeratedBoardActionsV2 => MEETING_V2_ACTIONS_POLICY,
         }
     }
 
-    fn schema_version(self) -> i32 {
+    pub(crate) fn schema_version(self) -> i32 {
         match self {
             Self::UniformV0 => 1,
             Self::ModeratedBatonV1 => 2,
-            Self::ModeratedBoardV2 => 3,
+            Self::ModeratedBoardV2 | Self::ModeratedBoardActionsV2 => 3,
         }
     }
 
@@ -78,10 +82,19 @@ impl MeetingProtocol {
             (1, buzz_db::meeting_floor::FLOOR_POLICY_VERSION) => Ok(Self::UniformV0),
             (2, MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
             (3, MEETING_V2_POLICY) => Ok(Self::ModeratedBoardV2),
+            (3, MEETING_V2_ACTIONS_POLICY) => Ok(Self::ModeratedBoardActionsV2),
             _ => Err(IngestError::Internal(format!(
                 "error: meeting has unsupported persisted protocol v={schema_version}, policy={floor_policy_version}"
             ))),
         }
+    }
+
+    pub(crate) const fn is_v2(self) -> bool {
+        matches!(self, Self::ModeratedBoardV2 | Self::ModeratedBoardActionsV2)
+    }
+
+    pub(crate) const fn has_action_finalization(self) -> bool {
+        matches!(self, Self::ModeratedBoardActionsV2)
     }
 }
 
@@ -133,6 +146,9 @@ pub async fn handle_command(
         }
         KIND_MEETING_BOARD_COMMAND => {
             super::meeting_baton::handle_board_action(tenant, state, &event, &auth).await
+        }
+        KIND_MEETING_ACTION_COMMAND => {
+            super::meeting_baton::handle_action_command(tenant, state, &event, &auth).await
         }
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
@@ -387,7 +403,7 @@ async fn handle_meeting_create(
     }
     let protocol = meeting_create_protocol(event)?;
     let initial_board = match protocol {
-        MeetingProtocol::ModeratedBoardV2 => Some(
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => Some(
             buzz_sdk::parse_meeting_v2_board_content(&event.content)
                 .map_err(|error| IngestError::Rejected(error.to_string()))?,
         ),
@@ -473,7 +489,9 @@ async fn handle_meeting_create(
             }
             Some(moderator)
         }
-        MeetingProtocol::ModeratedBoardV2 => Some(host_pubkey.clone()),
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
+            Some(host_pubkey.clone())
+        }
         MeetingProtocol::UniformV0 => None,
     };
 
@@ -570,7 +588,7 @@ async fn handle_meeting_create(
                 None,
             )
         }
-        MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
             let initial_board = initial_board.as_ref().ok_or_else(|| {
                 IngestError::Internal("error: missing validated V2 initial board".into())
             })?;
@@ -579,6 +597,11 @@ async fn handle_meeting_create(
                 buzz_db::meeting_v2::CreateMeetingV2Params {
                     community_id: tenant.community(),
                     session_id,
+                    policy: if protocol.has_action_finalization() {
+                        buzz_db::meeting_v2::MeetingV2Policy::Actions
+                    } else {
+                        buzz_db::meeting_v2::MeetingV2Policy::Board
+                    },
                     title: &title,
                     description: description.as_deref(),
                     source_channel_id,
@@ -714,7 +737,8 @@ async fn handle_meeting_end(
     match (protocol, persisted_policy.moderator_pubkey.as_ref()) {
         (MeetingProtocol::UniformV0, None)
         | (MeetingProtocol::ModeratedBatonV1, Some(_))
-        | (MeetingProtocol::ModeratedBoardV2, Some(_)) => {}
+        | (MeetingProtocol::ModeratedBoardV2, Some(_))
+        | (MeetingProtocol::ModeratedBoardActionsV2, Some(_)) => {}
         _ => {
             return Err(IngestError::Internal(
                 "error: meeting persisted protocol has an invalid moderator shape".into(),
@@ -725,7 +749,7 @@ async fn handle_meeting_end(
 
     let create_event_id_hex = require_single_tag(event, "e")?;
     let create_event_id = decode_event_id(&create_event_id_hex, "meeting create event id")?;
-    let v2_terminal = if protocol == MeetingProtocol::ModeratedBoardV2 {
+    let v2_terminal = if protocol.is_v2() {
         let outcome = match require_single_tag(event, "outcome")?.as_str() {
             "closed" => buzz_db::meeting_v2::TerminalOutcome::Closed,
             "aborted" => buzz_db::meeting_v2::TerminalOutcome::Aborted,
@@ -750,12 +774,56 @@ async fn handle_meeting_end(
         }
         (buzz_db::meeting_v2::TerminalOutcome::Closed, None)
     };
+    struct ParsedActionEndFence {
+        action_run_id: Uuid,
+        action_window_epoch: i64,
+        plan_event_id: Vec<u8>,
+    }
+    let action_end_fence = if protocol.has_action_finalization()
+        && v2_terminal.0 == buzz_db::meeting_v2::TerminalOutcome::Closed
+    {
+        optional_single_tag(event, "action-run")?
+            .map(|run_id| {
+                let action_run_id = Uuid::parse_str(&run_id).map_err(|_| {
+                    IngestError::Rejected("invalid: bad Meeting action run id".into())
+                })?;
+                if action_run_id.is_nil() {
+                    return Err(IngestError::Rejected(
+                        "invalid: Meeting action run id must not be nil".into(),
+                    ));
+                }
+                let action_window_epoch = require_single_tag(event, "action-window")?
+                    .parse::<i64>()
+                    .map_err(|_| {
+                        IngestError::Rejected(
+                            "invalid: Meeting action window must be a positive integer".into(),
+                        )
+                    })?;
+                if action_window_epoch <= 0 {
+                    return Err(IngestError::Rejected(
+                        "invalid: Meeting action window must be positive".into(),
+                    ));
+                }
+                let plan_event_id = decode_event_id(
+                    &require_single_tag(event, "action-plan")?,
+                    "Meeting action plan event id",
+                )?;
+                Ok(ParsedActionEndFence {
+                    action_run_id,
+                    action_window_epoch,
+                    plan_event_id,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
     let actor_pubkey = auth.pubkey().to_bytes().to_vec();
     // A normal close is a Floor Decision, so a due Board/Floor deadline must
     // linearize first. The DB End transaction fences the deadline again under
     // the Session lock in case it becomes due between these transactions.
-    if protocol == MeetingProtocol::ModeratedBoardV2
+    if protocol.is_v2()
         && v2_terminal.0 == buzz_db::meeting_v2::TerminalOutcome::Closed
         && persisted_policy.moderator_pubkey.as_deref() == Some(actor_pubkey.as_slice())
     {
@@ -791,7 +859,7 @@ async fn handle_meeting_end(
                     "restricted: meeting End author is no longer active".into(),
                 ));
             }
-            if protocol == MeetingProtocol::ModeratedBoardV2 {
+            if protocol.is_v2() {
                 let terminal_outcome = buzz_db::meeting_v2::get_terminal_outcome(
                     &state.db,
                     tenant.community(),
@@ -901,7 +969,14 @@ async fn handle_meeting_end(
                 }
             }
         }
-        MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
+            let action_fence = action_end_fence.as_ref().map(|fence| {
+                buzz_db::meeting_v2::EndMeetingV2ActionFence {
+                    action_run_id: fence.action_run_id,
+                    action_window_epoch: fence.action_window_epoch,
+                    plan_event_id: &fence.plan_event_id,
+                }
+            });
             match buzz_db::meeting_v2::end_meeting_v2_tx(
                 &mut tx,
                 buzz_db::meeting_v2::EndMeetingV2Params {
@@ -912,6 +987,7 @@ async fn handle_meeting_end(
                     end_event_id: event.id.as_bytes(),
                     outcome: v2_terminal.0,
                     reason_code: v2_terminal.1.as_deref(),
+                    action_fence,
                     relay_keys: &state.relay_keypair,
                 },
             )
@@ -961,7 +1037,7 @@ async fn handle_meeting_end(
             tx.commit().await.map_err(|e| {
                 IngestError::Internal(format!("error: commit meeting revocation recovery: {e}"))
             })?;
-            if protocol == MeetingProtocol::ModeratedBoardV2 {
+            if protocol.is_v2() {
                 metrics::counter!(
                     "meeting_v2_end_total",
                     "outcome" => "aborted",
@@ -980,7 +1056,7 @@ async fn handle_meeting_end(
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit meeting end: {e}")))?;
 
-    if protocol == MeetingProtocol::ModeratedBoardV2 {
+    if protocol.is_v2() {
         record_meeting_v2_end(v2_terminal.0, v2_terminal.1.as_deref(), false);
     }
 
@@ -1001,7 +1077,7 @@ async fn handle_meeting_end(
                 "already_ended": false,
                 "schema_version": persisted_policy.schema_version,
                 "floor_policy_version": persisted_policy.floor_policy_version,
-                "terminal_outcome": if protocol == MeetingProtocol::ModeratedBoardV2 {
+                "terminal_outcome": if protocol.is_v2() {
                     Some(match v2_terminal.0 {
                         buzz_db::meeting_v2::TerminalOutcome::Closed => "closed",
                         buzz_db::meeting_v2::TerminalOutcome::Aborted => "aborted",
@@ -1422,12 +1498,13 @@ fn meeting_create_protocol(event: &Event) -> Result<MeetingProtocol, IngestError
                 &["p"],
             )?;
             let policy = require_single_tag(event, "policy")?;
-            if policy != MEETING_V2_POLICY {
-                return Err(IngestError::Rejected(format!(
-                    "invalid: Meeting V2 policy must be {MEETING_V2_POLICY}"
-                )));
+            match policy.as_str() {
+                MEETING_V2_POLICY => Ok(MeetingProtocol::ModeratedBoardV2),
+                MEETING_V2_ACTIONS_POLICY => Ok(MeetingProtocol::ModeratedBoardActionsV2),
+                _ => Err(IngestError::Rejected(format!(
+                    "invalid: unsupported Meeting V2 policy {policy}"
+                ))),
             }
-            Ok(MeetingProtocol::ModeratedBoardV2)
         }
         version => Err(IngestError::Rejected(format!(
             "invalid: unsupported meeting schema version {version}"
@@ -1445,7 +1522,7 @@ fn ensure_meeting_create_enabled(
             "restricted: Meeting V1 creation is disabled".into(),
         ));
     }
-    if protocol == MeetingProtocol::ModeratedBoardV2 && !meeting_v2_create_enabled {
+    if protocol.is_v2() && !meeting_v2_create_enabled {
         return Err(IngestError::Rejected(
             "restricted: Meeting V2 creation is disabled".into(),
         ));
@@ -1497,25 +1574,45 @@ fn validate_meeting_end_protocol(
             }
             Ok(())
         }
-        MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
             if require_single_tag(event, "v")? != buzz_sdk::MEETING_V2_SCHEMA_VERSION {
                 return Err(IngestError::Rejected(
                     "invalid: Meeting V2 End must use schema version 3".into(),
                 ));
             }
-            if require_single_tag(event, "policy")? != MEETING_V2_POLICY {
+            if require_single_tag(event, "policy")? != protocol.policy() {
                 return Err(IngestError::Rejected(format!(
-                    "invalid: Meeting V2 End policy must be {MEETING_V2_POLICY}"
+                    "invalid: Meeting V2 End policy must be {}",
+                    protocol.policy()
                 )));
             }
             match require_single_tag(event, "outcome")?.as_str() {
                 "closed" => {
-                    validate_meeting_tag_schema(
-                        event,
-                        &["h", "v", "policy", "e", "outcome"],
-                        &[],
-                        &[],
-                    )?;
+                    let has_action_fence = optional_single_tag(event, "action-run")?.is_some();
+                    if protocol.has_action_finalization() && has_action_fence {
+                        validate_meeting_tag_schema(
+                            event,
+                            &[
+                                "h",
+                                "v",
+                                "policy",
+                                "e",
+                                "outcome",
+                                "action-run",
+                                "action-window",
+                                "action-plan",
+                            ],
+                            &[],
+                            &[],
+                        )?;
+                    } else {
+                        validate_meeting_tag_schema(
+                            event,
+                            &["h", "v", "policy", "e", "outcome"],
+                            &[],
+                            &[],
+                        )?;
+                    }
                     if !event.content.is_empty() {
                         return Err(IngestError::Rejected(
                             "invalid: Meeting V2 close content must be empty".into(),
@@ -2772,6 +2869,21 @@ mod meeting_protocol_tests {
         );
         assert!(buzz_sdk::parse_meeting_v2_board_content(&canonical.content).is_ok());
 
+        let action_capable = meeting_create_with_content(
+            vec![
+                tag(&["h", &session]),
+                tag(&["name", "Action review"]),
+                tag(&["v", "3"]),
+                tag(&["policy", MEETING_V2_ACTIONS_POLICY]),
+                tag(&["p", &participant]),
+            ],
+            r##"{"format":"markdown","body":"# Goal"}"##,
+        );
+        assert_eq!(
+            meeting_create_protocol(&action_capable).expect("valid action-capable V2 create"),
+            MeetingProtocol::ModeratedBoardActionsV2
+        );
+
         let smuggled_moderator = meeting_create(vec![
             tag(&["h", &session]),
             tag(&["name", "Protocol review"]),
@@ -2847,6 +2959,42 @@ mod meeting_protocol_tests {
         assert!(
             validate_meeting_end_protocol(&v2_abort, MeetingProtocol::ModeratedBoardV2).is_ok()
         );
+
+        let v2_actions_direct_close = meeting_end(vec![
+            tag(&["h", &session]),
+            tag(&["v", "3"]),
+            tag(&["policy", MEETING_V2_ACTIONS_POLICY]),
+            tag(&["e", &create_event_id]),
+            tag(&["outcome", "closed"]),
+        ]);
+        assert!(validate_meeting_end_protocol(
+            &v2_actions_direct_close,
+            MeetingProtocol::ModeratedBoardActionsV2,
+        )
+        .is_ok());
+
+        let action_run_id = Uuid::new_v4().to_string();
+        let plan_event_id = "22".repeat(32);
+        let v2_actions_gated_close = meeting_end(vec![
+            tag(&["h", &session]),
+            tag(&["v", "3"]),
+            tag(&["policy", MEETING_V2_ACTIONS_POLICY]),
+            tag(&["e", &create_event_id]),
+            tag(&["outcome", "closed"]),
+            tag(&["action-run", &action_run_id]),
+            tag(&["action-window", "2"]),
+            tag(&["action-plan", &plan_event_id]),
+        ]);
+        assert!(validate_meeting_end_protocol(
+            &v2_actions_gated_close,
+            MeetingProtocol::ModeratedBoardActionsV2,
+        )
+        .is_ok());
+        assert!(validate_meeting_end_protocol(
+            &v2_actions_gated_close,
+            MeetingProtocol::ModeratedBoardV2,
+        )
+        .is_err());
     }
 
     #[test]
@@ -2863,6 +3011,11 @@ mod meeting_protocol_tests {
         assert_eq!(
             MeetingProtocol::from_persisted(3, MEETING_V2_POLICY).expect("V2 mapping"),
             MeetingProtocol::ModeratedBoardV2
+        );
+        assert_eq!(
+            MeetingProtocol::from_persisted(3, MEETING_V2_ACTIONS_POLICY)
+                .expect("action-capable V2 mapping"),
+            MeetingProtocol::ModeratedBoardActionsV2
         );
         assert!(MeetingProtocol::from_persisted(1, MEETING_V1_POLICY).is_err());
         assert!(
@@ -2886,6 +3039,18 @@ mod meeting_protocol_tests {
         assert!(
             ensure_meeting_create_enabled(MeetingProtocol::ModeratedBoardV2, true, false).is_err()
         );
+        assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBoardActionsV2,
+            false,
+            true,
+        )
+        .is_ok());
+        assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBoardActionsV2,
+            true,
+            false,
+        )
+        .is_err());
     }
 
     #[test]

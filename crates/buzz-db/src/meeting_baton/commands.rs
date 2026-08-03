@@ -459,6 +459,11 @@ struct RevisionDelta {
 }
 
 impl RevisionDelta {
+    const NONE: Self = Self {
+        floor: false,
+        intent: false,
+        speech: false,
+    };
     const FLOOR: Self = Self {
         floor: true,
         intent: false,
@@ -2596,7 +2601,7 @@ async fn build_dynamic_state_event_tx(
         "grant": grant,
         "transition": transition_json,
     });
-    if protocol == BatonProtocol::V2 {
+    if protocol.is_v2() {
         let program =
             crate::meeting_v2::runtime_state_json_tx(tx, community_id, session_id).await?;
         let object = content.as_object_mut().ok_or_else(|| {
@@ -3110,7 +3115,7 @@ async fn return_control_to_moderator_tx(
     let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
     let unblocked_handoff_ids =
         release_human_request_handoff_blocks_tx(tx, community_id, session_id).await?;
-    if protocol == BatonProtocol::V2 {
+    if protocol.is_v2() {
         let mut target = StateTarget::from_state(state);
         target.active_offer_id = None;
         target.active_grant_id = None;
@@ -3222,7 +3227,9 @@ async fn ensure_moderator_window_tx(
     };
     let candidate =
         fallback_candidate_tx(tx, community_id, session_id, state, eligible_through_epoch).await?;
-    if load_baton_protocol_tx(tx, community_id, session_id).await? == BatonProtocol::V2
+    if load_baton_protocol_tx(tx, community_id, session_id)
+        .await?
+        .is_v2()
         && state.phase == BatonPhase::ModeratorIdle
         && candidate.is_some()
     {
@@ -3247,6 +3254,9 @@ async fn ensure_moderator_window_tx(
                 return Err(DbError::InvalidData(
                     "Meeting V2 Baton command reached an uninitialized runtime".to_string(),
                 ));
+            }
+            crate::meeting_v2::RuntimePhase::FinalizingActions => {
+                return Ok(StateTarget::from_state(state));
             }
             crate::meeting_v2::RuntimePhase::Ended => {
                 return Ok(StateTarget::from_state(state));
@@ -3288,7 +3298,10 @@ pub(crate) async fn complete_v2_board_window_state_tx(
     board_window: i64,
     now: DateTime<Utc>,
 ) -> Result<BatonTransitionResult> {
-    if load_baton_protocol_tx(tx, community_id, session_id).await? != BatonProtocol::V2 {
+    if !load_baton_protocol_tx(tx, community_id, session_id)
+        .await?
+        .is_v2()
+    {
         return Err(DbError::InvalidData(format!(
             "meeting {session_id} is not a Meeting V2 session"
         )));
@@ -3350,6 +3363,66 @@ pub(crate) async fn complete_v2_board_window_state_tx(
         &state,
         target,
         RevisionDelta::FLOOR,
+        transition,
+        now,
+    )
+    .await?;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_v2_action_transition_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    action_run_id: Uuid,
+    relay_keys: &Keys,
+    transition_type: &'static str,
+    caused_by_event_id: &[u8],
+    from: &str,
+    to: &str,
+    now: DateTime<Utc>,
+) -> Result<BatonTransitionResult> {
+    let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
+    if !protocol.has_action_finalization() {
+        return Err(DbError::InvalidData(format!(
+            "meeting {session_id} does not support action finalization"
+        )));
+    }
+    let state = load_state_tx(tx, community_id, session_id, true).await?;
+    if state.phase != BatonPhase::ModeratorIdle
+        || state.active_offer_id.is_some()
+        || state.active_grant_id.is_some()
+    {
+        return Err(DbError::InvalidData(
+            "Meeting V2 action transition requires idle moderator control".to_string(),
+        ));
+    }
+    let mut target = StateTarget::from_state(&state);
+    target.moderator_decision_started_at = None;
+    target.moderator_decision_deadline = None;
+    target.next_action_at = None;
+    target.active_decision_attempt_id = None;
+    let transition = TransitionSpec::command(
+        transition_type,
+        Some(action_run_id.as_bytes().to_vec()),
+        caused_by_event_id,
+        vec![json!({
+            "type": transition_type,
+            "object_type": "meeting_action_run",
+            "object_id": action_run_id,
+            "from": from,
+            "to": to,
+        })],
+    );
+    let (_, result) = commit_transition_tx(
+        tx,
+        community_id,
+        session_id,
+        relay_keys,
+        &state,
+        target,
+        RevisionDelta::NONE,
         transition,
         now,
     )
@@ -3764,7 +3837,10 @@ async fn advance_due_locked_tx(
 ) -> Result<(StateRow, Vec<BatonTransitionResult>)> {
     let config = load_config_tx(tx, community_id, session_id).await?;
     let mut transitions = Vec::new();
-    if load_baton_protocol_tx(tx, community_id, session_id).await? == BatonProtocol::V2 {
+    if load_baton_protocol_tx(tx, community_id, session_id)
+        .await?
+        .is_v2()
+    {
         if let Some(transition) = crate::meeting_v2::recover_due_board_locked_tx(
             tx,
             community_id,
@@ -4069,11 +4145,12 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
          WHERE runtime.runtime_phase = 'bootstrap_locked' \
            AND session.status = 'active' \
            AND session.schema_version = 3 \
-           AND session.floor_policy_version = $1 \
+           AND session.floor_policy_version IN ($1, $2) \
          ORDER BY runtime.created_at, runtime.community_id, runtime.session_id \
-         LIMIT $2",
+         LIMIT $3",
     )
     .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(crate::meeting_v2::ACTIONS_POLICY_VERSION)
     .bind(limit)
     .fetch_all(&db.pool)
     .await?;
@@ -4107,10 +4184,10 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
                AND s.recovery_retry_at <= clock_timestamp() \
                AND m.status = 'active' \
                AND ((m.schema_version = 2 AND m.floor_policy_version = $1) \
-                 OR (m.schema_version = 3 AND m.floor_policy_version = $2)) \
+                 OR (m.schema_version = 3 AND m.floor_policy_version IN ($2, $3))) \
              ORDER BY effective_deadline, s.community_id, s.session_id \
              FOR UPDATE OF s SKIP LOCKED \
-             LIMIT $3 \
+             LIMIT $4 \
          ), claimed AS ( \
              UPDATE meeting_baton_state s \
              SET recovery_retry_at = clock_timestamp() \
@@ -4130,6 +4207,7 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
     )
     .bind(BATON_POLICY_VERSION)
     .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(crate::meeting_v2::ACTIONS_POLICY_VERSION)
     .bind(remaining)
     .fetch_all(&db.pool)
     .await?;
@@ -4176,7 +4254,7 @@ pub async fn recover_meeting_v1(
         return Ok(Vec::new());
     }
     let now = database_now(&mut tx).await?;
-    if session.protocol == BatonProtocol::V2 {
+    if session.protocol.is_v2() {
         crate::meeting_v2::ensure_runtime_initialized_tx(
             &mut tx,
             community_id,
@@ -4186,7 +4264,10 @@ pub async fn recover_meeting_v1(
         )
         .await?;
     }
-    if matches!(session.protocol, BatonProtocol::V1 | BatonProtocol::V2) {
+    if matches!(
+        session.protocol,
+        BatonProtocol::V1 | BatonProtocol::V2 | BatonProtocol::V2Actions
+    ) {
         if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
             &mut tx,
             community_id,
@@ -4315,7 +4396,7 @@ pub async fn execute_baton_command(
     let mut tx = db.begin_transaction().await?;
     let session = lock_baton_session_tx(&mut tx, params.community_id, params.session_id).await?;
     let now = database_now(&mut tx).await?;
-    if session.protocol == BatonProtocol::V2 && session.status == "active" {
+    if session.protocol.is_v2() && session.status == "active" {
         crate::meeting_v2::ensure_runtime_initialized_tx(
             &mut tx,
             params.community_id,
@@ -4337,7 +4418,10 @@ pub async fn execute_baton_command(
     )
     .await?;
     if session.status == "active"
-        && matches!(session.protocol, BatonProtocol::V1 | BatonProtocol::V2)
+        && matches!(
+            session.protocol,
+            BatonProtocol::V1 | BatonProtocol::V2 | BatonProtocol::V2Actions
+        )
     {
         if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
             &mut tx,
@@ -4431,7 +4515,10 @@ pub async fn execute_baton_command(
     }
     if !actor_security_active_tx(&mut tx, params.community_id, &actor.pubkey).await? {
         if session.status == "active"
-            && matches!(session.protocol, BatonProtocol::V1 | BatonProtocol::V2)
+            && matches!(
+                session.protocol,
+                BatonProtocol::V1 | BatonProtocol::V2 | BatonProtocol::V2Actions
+            )
         {
             if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
                 &mut tx,
@@ -4461,6 +4548,65 @@ pub async fn execute_baton_command(
         return Err(DbError::AccessDenied(
             "meeting access has been revoked".to_string(),
         ));
+    }
+    if session.protocol.has_action_finalization() {
+        if let Some(receipt) = load_receipt_tx(&mut tx, params.community_id, &event_id).await? {
+            if receipt.author_pubkey != actor.pubkey {
+                return Err(DbError::AccessDenied(
+                    "not authorized for this private meeting receipt".to_string(),
+                ));
+            }
+            let snapshot =
+                load_snapshot_tx(&mut tx, params.community_id, params.session_id).await?;
+            tx.commit().await?;
+            return Ok(BatonCommitResult {
+                recovery_transitions: Vec::new(),
+                command_outcome: BatonCommandOutcome::Duplicate {
+                    accepted: receipt.accepted,
+                    outcome_class: receipt.outcome_class,
+                    canonical_object_id: receipt.canonical_object_id,
+                    state_revision: receipt.state_revision,
+                    outcome_code: receipt.outcome_code,
+                    retry_ticket_id: receipt.retry_ticket_id,
+                },
+                snapshot,
+            });
+        }
+        let runtime = crate::meeting_v2::load_runtime_tx(
+            &mut tx,
+            params.community_id,
+            params.session_id,
+            true,
+        )
+        .await?;
+        if runtime.phase == crate::meeting_v2::RuntimePhase::FinalizingActions {
+            insert_receipt_tx(
+                &mut tx,
+                params.community_id,
+                params.session_id,
+                params.event,
+                action,
+                false,
+                "rejected_terminal",
+                "meeting_finalizing_actions",
+                None,
+                Some(state.state_revision),
+                None,
+            )
+            .await?;
+            let snapshot =
+                load_snapshot_tx(&mut tx, params.community_id, params.session_id).await?;
+            tx.commit().await?;
+            return Ok(BatonCommitResult {
+                recovery_transitions: Vec::new(),
+                command_outcome: BatonCommandOutcome::RejectedTerminal {
+                    code: "meeting_finalizing_actions".to_string(),
+                    canonical_object_id: None,
+                    retry_ticket_id: None,
+                },
+                snapshot,
+            });
+        }
     }
     // Stable capability checks must observe the command's referenced object
     // before deadline recovery can replace or terminalize it. If recovery is
@@ -7783,7 +7929,10 @@ async fn apply_human_command_tx(
             .bind(now)
             .execute(tx.as_mut())
             .await?;
-            if load_baton_protocol_tx(tx, community_id, session_id).await? == BatonProtocol::V2 {
+            if load_baton_protocol_tx(tx, community_id, session_id)
+                .await?
+                .is_v2()
+            {
                 crate::meeting_v2::preempt_board_window_tx(tx, community_id, session_id, now)
                     .await?;
             }

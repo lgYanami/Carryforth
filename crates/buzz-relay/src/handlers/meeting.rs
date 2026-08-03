@@ -34,7 +34,7 @@ pub async fn handle_speech(
         MeetingProtocol::ModeratedBatonV1 => {
             super::meeting_baton::handle_speech(tenant, state, event, protocol).await
         }
-        MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
             super::meeting_baton::handle_speech(tenant, state, event, protocol).await
         }
     }

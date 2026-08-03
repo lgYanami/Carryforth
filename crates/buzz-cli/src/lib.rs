@@ -184,6 +184,9 @@ pub enum MeetingPolicy {
     /// Meeting V2 moderator-maintained shared board.
     #[value(name = "moderated-board-v1")]
     ModeratedBoardV2,
+    /// Meeting V2 with optional action finalization before normal close.
+    #[value(name = "moderated-board-actions-v1")]
+    ModeratedBoardActionsV2,
 }
 
 /// Meeting V1 moderator intent-rejection reason.
@@ -1420,6 +1423,11 @@ pub enum MeetingsCmd {
         #[command(subcommand)]
         command: MeetingBoardCmd,
     },
+    /// Inspect Meeting V2 action-finalization state
+    Actions {
+        #[command(subcommand)]
+        command: MeetingActionsCmd,
+    },
     /// List the meeting's complete participant roster
     Participants {
         /// Meeting UUID
@@ -1504,6 +1512,17 @@ pub enum MeetingsCmd {
         /// Optional short explanation
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+/// Meeting V2 action-finalization operations available in stage one.
+#[derive(Subcommand)]
+pub enum MeetingActionsCmd {
+    /// Read the Relay-authoritative action run and close-gate progress
+    Status {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
     },
 }
 
@@ -3139,6 +3158,39 @@ mod tests {
     }
 
     #[test]
+    fn meeting_actions_policy_and_status_parse_for_staged_delivery() {
+        let participant = "aa".repeat(32);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "create",
+            "--policy",
+            "moderated-board-actions-v1",
+            "--title",
+            "Action review",
+            "--board",
+            "# Goal",
+            "--participant",
+            &participant,
+        ])
+        .expect("parse action-capable Meeting V2 Create");
+        let Cmd::Meetings(MeetingsCmd::Create { policy, .. }) = cli.command else {
+            panic!("expected Meeting Create");
+        };
+        assert_eq!(policy, MeetingPolicy::ModeratedBoardActionsV2);
+
+        Cli::try_parse_from([
+            "buzz",
+            "meetings",
+            "actions",
+            "status",
+            "--meeting",
+            "00000000-0000-4000-8000-000000000001",
+        ])
+        .expect("parse Meeting V2 action status");
+    }
+
+    #[test]
     fn meeting_v1_baton_command_surface_is_parseable() {
         let id = "aa".repeat(32);
         let participant = "bb".repeat(32);
@@ -3486,6 +3538,7 @@ mod tests {
             names(&cmd, "meetings"),
             vec![
                 "abort",
+                "actions",
                 "board",
                 "close",
                 "create",
@@ -3592,7 +3645,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
-            ("meetings", 15),
+            ("meetings", 16),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

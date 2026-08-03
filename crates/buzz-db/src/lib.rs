@@ -38,6 +38,8 @@ pub mod meeting_floor;
 pub mod meeting_revocation;
 /// Meeting V2 current-board and stage-one bootstrap persistence.
 pub mod meeting_v2;
+/// Meeting V2 action-finalization ledger and authoritative state machine.
+pub mod meeting_v2_actions;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.

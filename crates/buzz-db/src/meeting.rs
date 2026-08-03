@@ -1021,14 +1021,14 @@ pub async fn meeting_channel_ids_for_frozen_reader(
            ) \
            AND ( \
              (((ms.schema_version = $4 AND ms.floor_policy_version = $5) \
-               OR (ms.schema_version = $6 AND ms.floor_policy_version = $7)) \
+               OR (ms.schema_version = $6 AND ms.floor_policy_version IN ($7, $8))) \
               AND EXISTS( \
                 SELECT 1 FROM meeting_participants mp \
                 WHERE mp.community_id = ms.community_id \
                   AND mp.session_id = ms.session_id AND mp.pubkey = $2 \
               )) \
              OR \
-             (ms.schema_version = 1 AND ms.floor_policy_version = $8 \
+             (ms.schema_version = 1 AND ms.floor_policy_version = $9 \
               AND EXISTS( \
                 SELECT 1 FROM channel_members cm \
                 WHERE cm.community_id = ms.community_id \
@@ -1043,6 +1043,7 @@ pub async fn meeting_channel_ids_for_frozen_reader(
     .bind(crate::meeting_baton::BATON_POLICY_VERSION)
     .bind(crate::meeting_v2::SCHEMA_VERSION)
     .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(crate::meeting_v2::ACTIONS_POLICY_VERSION)
     .bind(crate::meeting_floor::FLOOR_POLICY_VERSION)
     .fetch_all(&db.pool)
     .await?)
@@ -1108,7 +1109,7 @@ async fn frozen_meeting_reader_pubkeys_for_channel(
            ON mp.community_id = ms.community_id AND mp.session_id = ms.session_id \
          WHERE ms.community_id = $1 AND ms.session_id = $2 \
            AND ((ms.schema_version = $4 AND ms.floor_policy_version = $5) \
-                OR (ms.schema_version = $6 AND ms.floor_policy_version = $7)) \
+                OR (ms.schema_version = $6 AND ms.floor_policy_version IN ($7, $8))) \
            AND NOT EXISTS( \
              SELECT 1 FROM meeting_revocation_jobs revocation \
              WHERE revocation.community_id = ms.community_id \
@@ -1122,7 +1123,7 @@ async fn frozen_meeting_reader_pubkeys_for_channel(
          JOIN channel_members cm \
            ON cm.community_id = ms.community_id AND cm.channel_id = ms.session_id \
          WHERE ms.community_id = $1 AND ms.session_id = $2 \
-           AND ms.schema_version = 1 AND ms.floor_policy_version = $8 \
+           AND ms.schema_version = 1 AND ms.floor_policy_version = $9 \
            AND NOT EXISTS( \
              SELECT 1 FROM meeting_revocation_jobs revocation \
              WHERE revocation.community_id = ms.community_id \
@@ -1138,6 +1139,7 @@ async fn frozen_meeting_reader_pubkeys_for_channel(
     .bind(crate::meeting_baton::BATON_POLICY_VERSION)
     .bind(crate::meeting_v2::SCHEMA_VERSION)
     .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(crate::meeting_v2::ACTIONS_POLICY_VERSION)
     .bind(crate::meeting_floor::FLOOR_POLICY_VERSION)
     .fetch_all(&db.pool)
     .await?)

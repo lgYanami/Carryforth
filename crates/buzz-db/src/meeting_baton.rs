@@ -35,6 +35,7 @@ pub const MAX_BATON_DURATION_MS: i64 = 86_400_000;
 pub(crate) enum BatonProtocol {
     V1,
     V2,
+    V2Actions,
 }
 
 impl BatonProtocol {
@@ -43,6 +44,9 @@ impl BatonProtocol {
             (SCHEMA_VERSION, BATON_POLICY_VERSION) => Ok(Self::V1),
             (crate::meeting_v2::SCHEMA_VERSION, crate::meeting_v2::BOARD_POLICY_VERSION) => {
                 Ok(Self::V2)
+            }
+            (crate::meeting_v2::SCHEMA_VERSION, crate::meeting_v2::ACTIONS_POLICY_VERSION) => {
+                Ok(Self::V2Actions)
             }
             _ => Err(DbError::InvalidData(format!(
                 "meeting {session_id} is not a supported moderated Baton session"
@@ -53,7 +57,7 @@ impl BatonProtocol {
     pub(crate) const fn schema_tag(self) -> &'static str {
         match self {
             Self::V1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
-            Self::V2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+            Self::V2 | Self::V2Actions => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
         }
     }
 
@@ -61,7 +65,16 @@ impl BatonProtocol {
         match self {
             Self::V1 => BATON_POLICY_VERSION,
             Self::V2 => crate::meeting_v2::BOARD_POLICY_VERSION,
+            Self::V2Actions => crate::meeting_v2::ACTIONS_POLICY_VERSION,
         }
+    }
+
+    pub(crate) const fn is_v2(self) -> bool {
+        matches!(self, Self::V2 | Self::V2Actions)
+    }
+
+    pub(crate) const fn has_action_finalization(self) -> bool {
+        matches!(self, Self::V2Actions)
     }
 }
 
@@ -639,7 +652,7 @@ pub(crate) async fn initialize_baton_runtime_tx(
         None,
         Some(BatonPhase::ModeratorIdle.as_str()),
     );
-    let board_control = if protocol == BatonProtocol::V2 {
+    let board_control = if protocol.is_v2() {
         Some(crate::meeting_v2::runtime_state_json_tx(tx, community_id, session_id).await?)
     } else {
         None
@@ -1418,7 +1431,7 @@ pub(crate) async fn close_baton_locked_tx(
         "at_ms": now.timestamp_millis(),
         "effects": effects,
     });
-    let board_control = if protocol == BatonProtocol::V2 {
+    let board_control = if protocol.is_v2() {
         Some(crate::meeting_v2::runtime_state_json_tx(tx, community_id, session_id).await?)
     } else {
         None
@@ -1793,12 +1806,13 @@ async fn load_moderator_pool(
         "SELECT moderator_pubkey FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 \
            AND ((schema_version = 2 AND floor_policy_version = $3) \
-             OR (schema_version = 3 AND floor_policy_version = $4))",
+             OR (schema_version = 3 AND floor_policy_version IN ($4, $5)))",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(BATON_POLICY_VERSION)
     .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(crate::meeting_v2::ACTIONS_POLICY_VERSION)
     .fetch_optional(pool)
     .await?
     .flatten();
@@ -1814,12 +1828,13 @@ pub(crate) async fn load_moderator_tx(
         "SELECT moderator_pubkey FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 \
            AND ((schema_version = 2 AND floor_policy_version = $3) \
-             OR (schema_version = 3 AND floor_policy_version = $4))",
+             OR (schema_version = 3 AND floor_policy_version IN ($4, $5)))",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(BATON_POLICY_VERSION)
     .bind(crate::meeting_v2::BOARD_POLICY_VERSION)
+    .bind(crate::meeting_v2::ACTIONS_POLICY_VERSION)
     .fetch_optional(tx.as_mut())
     .await?
     .flatten();

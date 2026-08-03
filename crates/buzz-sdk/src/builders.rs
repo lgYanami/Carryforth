@@ -10,13 +10,13 @@ use buzz_core::{
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MEETING_BOARD_COMMAND, KIND_MEETING_CREATE, KIND_MEETING_END,
-        KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL, KIND_MEETING_GRANT_SIGNAL,
-        KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND,
-        KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT, KIND_MODERATION_BAN,
-        KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
-        KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF,
-        KIND_WORKFLOW_TRIGGER,
+        KIND_MEETING_ACTION_COMMAND, KIND_MEETING_BOARD_COMMAND, KIND_MEETING_CREATE,
+        KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
+        KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST,
+        KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT,
+        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
+        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
+        KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -39,10 +39,22 @@ pub const MEETING_V1_POLICY: &str = "moderated-baton-v1";
 pub const MEETING_V2_SCHEMA_VERSION: &str = "3";
 /// Floor policy emitted by Meeting V2 builders.
 pub const MEETING_V2_POLICY: &str = "moderated-board-v1";
+/// Action-capable Meeting V2 floor policy.
+pub const MEETING_V2_ACTIONS_POLICY: &str = "moderated-board-actions-v1";
+/// Runtime capability required for action-capable Meeting V2 sessions.
+pub const MEETING_V2_ACTIONS_CAPABILITY: &str = "meeting-v2-action-finalization-v1";
 /// Initial/current Meeting V2 board format.
 pub const MEETING_V2_BOARD_FORMAT: &str = "markdown";
 /// Maximum UTF-8 byte size of a Meeting V2 board body.
 pub const MAX_MEETING_V2_BOARD_BYTES: usize = 65_536;
+/// Wire schema version for Meeting V2 action plans.
+pub const MEETING_V2_ACTION_PLAN_VERSION: u32 = 1;
+/// Maximum number of semantic action items in one action plan.
+pub const MAX_MEETING_V2_ACTION_ITEMS: usize = 64;
+/// Maximum number of required technical steps in one action plan.
+pub const MAX_MEETING_V2_ACTION_STEPS: usize = 256;
+/// Maximum serialized byte size of one Meeting V2 action plan.
+pub const MAX_MEETING_V2_ACTION_PLAN_BYTES: usize = 65_536;
 
 /// Strict content envelope for a Meeting V2 current board projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +129,180 @@ pub struct MeetingV2EndParams<'a> {
     pub reason_code: Option<&'a str>,
     /// Optional short explanation for abort; absent for close.
     pub reason: Option<&'a str>,
+}
+
+/// Semantic action item carried by a compiled Meeting V2 action plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeetingV2ActionItem {
+    /// Stable item identifier within one action run.
+    pub action_id: Uuid,
+    /// Short human-readable responsibility summary.
+    pub summary: String,
+    /// Frozen-roster participant responsible for the resulting Work.
+    pub assignee_pubkey: String,
+}
+
+/// Closed set of technical operations supported by the first action materializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeetingV2ActionStepKind {
+    /// Create one Project View v2 Requirement.
+    #[serde(rename = "project_view.create_requirement")]
+    ProjectViewCreateRequirement,
+    /// Create one Project View v2 Work under the Requirement.
+    #[serde(rename = "project_view.create_work")]
+    ProjectViewCreateWork,
+    /// Assign one Work to the assignee's resolved active Role.
+    #[serde(rename = "project_view.set_work_responsibility")]
+    ProjectViewSetWorkResponsibility,
+}
+
+/// One required technical operation in a compiled Meeting V2 action plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeetingV2ActionStep {
+    /// Stable step identifier within one action run.
+    pub step_id: Uuid,
+    /// Semantic action item implemented by this step, when applicable.
+    pub action_id: Option<Uuid>,
+    /// Typed target operation.
+    pub kind: MeetingV2ActionStepKind,
+    /// Preallocated Project View object UUID-v4.
+    pub target_object_id: Uuid,
+    /// Operation-specific typed payload, represented as a bounded JSON object on wire.
+    pub payload: serde_json::Value,
+}
+
+/// Immutable technical execution plan compiled by the ACP Harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeetingV2ActionPlan {
+    /// Action-plan schema version; currently `1`.
+    pub version: u32,
+    /// Relay-issued action run identifier.
+    pub action_run_id: Uuid,
+    /// Exact frozen Board event interpreted by the moderator Agent.
+    pub board_event_id: String,
+    /// Semantic responsibilities approved for materialization.
+    pub items: Vec<MeetingV2ActionItem>,
+    /// Required technical operations in deterministic execution order.
+    pub steps: Vec<MeetingV2ActionStep>,
+}
+
+/// Fences shared by commands targeting an active Meeting V2 action run.
+#[derive(Debug, Clone, Copy)]
+pub struct MeetingV2ActionRunFence<'a> {
+    /// Relay-issued action run identifier.
+    pub action_run_id: Uuid,
+    /// Current action retry-window epoch.
+    pub action_window: u64,
+    /// Frozen plan event ID, or `None` while the run is still planning.
+    pub plan_event_id: Option<&'a str>,
+}
+
+/// Inputs for entering Meeting V2 action finalization.
+pub struct MeetingV2ActionBeginParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current control-token epoch observed in authoritative State.
+    pub expected_control_epoch: u64,
+    /// Final completed Board window.
+    pub board_window: u64,
+    /// Exact authoritative State event on which the decision was made.
+    pub expected_state_event_id: &'a str,
+    /// Exact final Board projection interpreted by the moderator.
+    pub board_event_id: &'a str,
+    /// Optional registered moderator decision attempt consumed by a later stage.
+    pub expected_decision_attempt_id: Option<&'a str>,
+}
+
+/// Inputs for freezing a compiled Meeting V2 action plan.
+pub struct MeetingV2ActionPlanParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current action-run fences; its plan fence must be `None`.
+    pub fence: MeetingV2ActionRunFence<'a>,
+    /// Harness-compiled immutable plan.
+    pub plan: &'a MeetingV2ActionPlan,
+}
+
+/// Inputs for durably blocking a Meeting V2 action run.
+pub struct MeetingV2ActionBlockParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current action-run fences.
+    pub fence: MeetingV2ActionRunFence<'a>,
+    /// Closed machine-readable failure category.
+    pub reason_code: &'a str,
+    /// Optional short diagnostic safe for the private command receipt.
+    pub reason: Option<&'a str>,
+}
+
+/// Inputs for a no-content action command such as retry, complete, or return-to-board.
+pub struct MeetingV2ActionCommandParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current action-run fences.
+    pub fence: MeetingV2ActionRunFence<'a>,
+}
+
+/// Inputs for write-ahead registration of one signed Project View event.
+pub struct MeetingV2ActionStepPreparedParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current action-run fences.
+    pub fence: MeetingV2ActionRunFence<'a>,
+    /// Planned step identifier.
+    pub step_id: Uuid,
+    /// One-based attempt number for this step.
+    pub attempt: u32,
+    /// Exact signed Project View command event ID.
+    pub project_event_id: &'a str,
+    /// Project revision expected by the signed command.
+    pub expected_project_revision: u64,
+    /// Complete signed Nostr event JSON retained for exact replay.
+    pub signed_project_event: &'a serde_json::Value,
+}
+
+/// Inputs for binding an accepted Project View receipt to one plan step.
+pub struct MeetingV2ActionStepAppliedParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current action-run fences.
+    pub fence: MeetingV2ActionRunFence<'a>,
+    /// Planned step identifier.
+    pub step_id: Uuid,
+    /// Exact accepted Project View command event ID.
+    pub project_event_id: &'a str,
+    /// Relay-verified resulting Project revision.
+    pub accepted_project_revision: u64,
+}
+
+/// Action-run fence carried by a normal End after successful materialization.
+#[derive(Debug, Clone, Copy)]
+pub struct MeetingV2ActionsEndFence<'a> {
+    /// Relay-issued action run identifier.
+    pub action_run_id: Uuid,
+    /// Current action retry-window epoch.
+    pub action_window: u64,
+    /// Frozen action plan event ID.
+    pub plan_event_id: &'a str,
+}
+
+/// Inputs for closing or aborting an action-capable Meeting V2 session.
+pub struct MeetingV2ActionsEndParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Event ID of the corresponding Create command.
+    pub create_event_id: &'a str,
+    /// Successful close or abnormal abort.
+    pub outcome: MeetingV2EndOutcome,
+    /// Required reason category for abort; absent for close.
+    pub reason_code: Option<&'a str>,
+    /// Optional short abort explanation.
+    pub reason: Option<&'a str>,
+    /// Required only when closing from a completed action-finalization run.
+    pub action_fence: Option<MeetingV2ActionsEndFence<'a>>,
 }
 
 /// Inputs for a strict Meeting V1 Create command.
@@ -2378,6 +2564,24 @@ pub fn parse_meeting_v2_board_content(content: &str) -> Result<MeetingV2BoardCon
 pub fn build_meeting_v2_create(
     params: MeetingV2CreateParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_create_for_policy(params, MEETING_V2_POLICY)
+}
+
+/// Build an action-capable Meeting V2 create command (kind 42100).
+///
+/// The Board and roster semantics are identical to [`build_meeting_v2_create`],
+/// but the persisted policy is independently discriminated so old V2 sessions
+/// retain their original close behavior.
+pub fn build_meeting_v2_actions_create(
+    params: MeetingV2CreateParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_create_for_policy(params, MEETING_V2_ACTIONS_POLICY)
+}
+
+fn build_meeting_v2_create_for_policy(
+    params: MeetingV2CreateParams<'_>,
+    policy: &str,
+) -> Result<EventBuilder, SdkError> {
     if params.session_id.is_nil() {
         return Err(SdkError::InvalidInput(
             "meeting session id must not be nil".into(),
@@ -2429,7 +2633,7 @@ pub fn build_meeting_v2_create(
         tag(&["h", &params.session_id.to_string()])?,
         tag(&["name", title])?,
         tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
-        tag(&["policy", MEETING_V2_POLICY])?,
+        tag(&["policy", policy])?,
     ];
     if let Some(description) = params.description {
         tags.push(tag(&["about", description])?);
@@ -2479,6 +2683,20 @@ pub fn validate_meeting_v2_board_content(board: &MeetingV2BoardContent) -> Resul
 pub fn build_meeting_v2_board_action(
     params: MeetingV2BoardActionParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_board_action_for_policy(params, MEETING_V2_POLICY)
+}
+
+/// Build an action-capable Meeting V2 Board update or unchanged command.
+pub fn build_meeting_v2_actions_board_action(
+    params: MeetingV2BoardActionParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_board_action_for_policy(params, MEETING_V2_ACTIONS_POLICY)
+}
+
+fn build_meeting_v2_board_action_for_policy(
+    params: MeetingV2BoardActionParams<'_>,
+    policy: &str,
+) -> Result<EventBuilder, SdkError> {
     check_meeting_v1_session(params.session_id)?;
     if params.expected_control_epoch == 0 || params.board_window == 0 {
         return Err(SdkError::InvalidInput(
@@ -2503,7 +2721,7 @@ pub fn build_meeting_v2_board_action(
     let tags = vec![
         tag(&["h", &params.session_id.to_string()])?,
         tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
-        tag(&["policy", MEETING_V2_POLICY])?,
+        tag(&["policy", policy])?,
         tag(&["action", action])?,
         tag(&[
             "expected-control-epoch",
@@ -2516,26 +2734,81 @@ pub fn build_meeting_v2_board_action(
 
 /// Build a strict Meeting V2 normal close or abnormal abort (kind 42101).
 pub fn build_meeting_v2_end(params: MeetingV2EndParams<'_>) -> Result<EventBuilder, SdkError> {
-    check_meeting_v1_session(params.session_id)?;
-    let create_event_id = check_hex_exact(params.create_event_id, 64, "meeting create event id")?;
-    let reason = check_meeting_v1_optional_text(params.reason, "Meeting V2 abort reason", 1024)?;
+    build_meeting_v2_end_for_policy(
+        params.session_id,
+        params.create_event_id,
+        params.outcome,
+        params.reason_code,
+        params.reason,
+        MEETING_V2_POLICY,
+        None,
+    )
+}
+
+/// Build a strict action-capable Meeting V2 normal close or abnormal abort.
+pub fn build_meeting_v2_actions_end(
+    params: MeetingV2ActionsEndParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.outcome == MeetingV2EndOutcome::Aborted && params.action_fence.is_some() {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 abort must not carry an action completion fence".into(),
+        ));
+    }
+    build_meeting_v2_end_for_policy(
+        params.session_id,
+        params.create_event_id,
+        params.outcome,
+        params.reason_code,
+        params.reason,
+        MEETING_V2_ACTIONS_POLICY,
+        params.action_fence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_meeting_v2_end_for_policy(
+    session_id: Uuid,
+    create_event_id: &str,
+    outcome: MeetingV2EndOutcome,
+    reason_code: Option<&str>,
+    reason: Option<&str>,
+    policy: &str,
+    action_fence: Option<MeetingV2ActionsEndFence<'_>>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_session(session_id)?;
+    let create_event_id = check_hex_exact(create_event_id, 64, "meeting create event id")?;
+    let reason = check_meeting_v1_optional_text(reason, "Meeting V2 abort reason", 1024)?;
     let mut tags = vec![
-        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["h", &session_id.to_string()])?,
         tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
-        tag(&["policy", MEETING_V2_POLICY])?,
+        tag(&["policy", policy])?,
         tag(&["e", &create_event_id])?,
-        tag(&["outcome", params.outcome.as_str()])?,
+        tag(&["outcome", outcome.as_str()])?,
     ];
-    match params.outcome {
+    match outcome {
         MeetingV2EndOutcome::Closed => {
-            if params.reason_code.is_some() || reason.is_some() {
+            if reason_code.is_some() || reason.is_some() {
                 return Err(SdkError::InvalidInput(
                     "Meeting V2 close cannot carry an abort reason".into(),
                 ));
             }
+            if let Some(fence) = action_fence {
+                check_meeting_v1_session(fence.action_run_id)?;
+                if fence.action_window == 0 {
+                    return Err(SdkError::InvalidInput(
+                        "Meeting V2 action window must be positive".into(),
+                    ));
+                }
+                check_meeting_v1_i64(fence.action_window, "action window")?;
+                let plan_event_id =
+                    check_hex_exact(fence.plan_event_id, 64, "Meeting V2 action plan event id")?;
+                tags.push(tag(&["action-run", &fence.action_run_id.to_string()])?);
+                tags.push(tag(&["action-window", &fence.action_window.to_string()])?);
+                tags.push(tag(&["action-plan", &plan_event_id])?);
+            }
         }
         MeetingV2EndOutcome::Aborted => {
-            let reason_code = params.reason_code.ok_or_else(|| {
+            let reason_code = reason_code.ok_or_else(|| {
                 SdkError::InvalidInput("Meeting V2 abort requires a reason code".into())
             })?;
             let reason_code =
@@ -2544,6 +2817,353 @@ pub fn build_meeting_v2_end(params: MeetingV2EndParams<'_>) -> Result<EventBuild
         }
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_END as u16), reason.unwrap_or("")).tags(tags))
+}
+
+/// Strictly validate a Harness-compiled Meeting V2 action plan.
+pub fn validate_meeting_v2_action_plan(plan: &MeetingV2ActionPlan) -> Result<(), SdkError> {
+    if plan.version != MEETING_V2_ACTION_PLAN_VERSION {
+        return Err(SdkError::InvalidInput(format!(
+            "Meeting V2 action plan version must be {MEETING_V2_ACTION_PLAN_VERSION}"
+        )));
+    }
+    check_meeting_v1_session(plan.action_run_id)?;
+    check_hex_exact(
+        &plan.board_event_id,
+        64,
+        "Meeting V2 action plan Board event id",
+    )?;
+    if plan.items.is_empty() || plan.items.len() > MAX_MEETING_V2_ACTION_ITEMS {
+        return Err(SdkError::InvalidInput(format!(
+            "Meeting V2 action plan requires 1..={MAX_MEETING_V2_ACTION_ITEMS} items"
+        )));
+    }
+    if plan.steps.is_empty() || plan.steps.len() > MAX_MEETING_V2_ACTION_STEPS {
+        return Err(SdkError::InvalidInput(format!(
+            "Meeting V2 action plan requires 1..={MAX_MEETING_V2_ACTION_STEPS} steps"
+        )));
+    }
+
+    let mut action_ids = std::collections::HashSet::with_capacity(plan.items.len());
+    for item in &plan.items {
+        check_meeting_v1_session(item.action_id)?;
+        if !action_ids.insert(item.action_id) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate Meeting V2 action id: {}",
+                item.action_id
+            )));
+        }
+        check_meeting_v1_text(&item.summary, "Meeting V2 action summary", 1_024)?;
+        check_pubkey_hex(&item.assignee_pubkey, "Meeting V2 action assignee")?;
+    }
+
+    let mut step_ids = std::collections::HashSet::with_capacity(plan.steps.len());
+    let mut created_object_ids = std::collections::HashSet::new();
+    for step in &plan.steps {
+        check_meeting_v1_session(step.step_id)?;
+        if !step_ids.insert(step.step_id) {
+            return Err(SdkError::InvalidInput(format!(
+                "duplicate Meeting V2 action step id: {}",
+                step.step_id
+            )));
+        }
+        if step.target_object_id.get_version_num() != 4 {
+            return Err(SdkError::InvalidInput(format!(
+                "Meeting V2 action target object id must be UUID-v4: {}",
+                step.target_object_id
+            )));
+        }
+        if !step.payload.is_object() {
+            return Err(SdkError::InvalidInput(format!(
+                "Meeting V2 action step {} payload must be a JSON object",
+                step.step_id
+            )));
+        }
+        match step.kind {
+            MeetingV2ActionStepKind::ProjectViewCreateRequirement => {
+                if step.action_id.is_some() {
+                    return Err(SdkError::InvalidInput(
+                        "Requirement creation must not be bound to one action item".into(),
+                    ));
+                }
+                if !created_object_ids.insert(step.target_object_id) {
+                    return Err(SdkError::InvalidInput(format!(
+                        "duplicate Meeting V2 create target object id: {}",
+                        step.target_object_id
+                    )));
+                }
+            }
+            MeetingV2ActionStepKind::ProjectViewCreateWork => {
+                let action_id = step.action_id.ok_or_else(|| {
+                    SdkError::InvalidInput("Work creation requires an action id".into())
+                })?;
+                if !action_ids.contains(&action_id) {
+                    return Err(SdkError::InvalidInput(format!(
+                        "Meeting V2 action step references unknown action id: {action_id}"
+                    )));
+                }
+                if !created_object_ids.insert(step.target_object_id) {
+                    return Err(SdkError::InvalidInput(format!(
+                        "duplicate Meeting V2 create target object id: {}",
+                        step.target_object_id
+                    )));
+                }
+            }
+            MeetingV2ActionStepKind::ProjectViewSetWorkResponsibility => {
+                let action_id = step.action_id.ok_or_else(|| {
+                    SdkError::InvalidInput("Work responsibility requires an action id".into())
+                })?;
+                if !action_ids.contains(&action_id) {
+                    return Err(SdkError::InvalidInput(format!(
+                        "Meeting V2 action step references unknown action id: {action_id}"
+                    )));
+                }
+            }
+        }
+    }
+
+    let encoded = serde_json::to_vec(plan).map_err(|error| {
+        SdkError::InvalidInput(format!("serialize Meeting V2 action plan: {error}"))
+    })?;
+    if encoded.len() > MAX_MEETING_V2_ACTION_PLAN_BYTES {
+        return Err(SdkError::ContentTooLarge {
+            max: MAX_MEETING_V2_ACTION_PLAN_BYTES,
+            got: encoded.len(),
+        });
+    }
+    Ok(())
+}
+
+fn meeting_v2_action_run_tags(
+    session_id: Uuid,
+    action: &str,
+    fence: MeetingV2ActionRunFence<'_>,
+) -> Result<Vec<Tag>, SdkError> {
+    check_meeting_v1_session(session_id)?;
+    check_meeting_v1_session(fence.action_run_id)?;
+    if fence.action_window == 0 {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 action window must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(fence.action_window, "Meeting V2 action window")?;
+    let plan = fence
+        .plan_event_id
+        .map(|event_id| check_hex_exact(event_id, 64, "Meeting V2 action plan event id"))
+        .transpose()?
+        .unwrap_or_else(|| "none".to_string());
+    Ok(vec![
+        tag(&["h", &session_id.to_string()])?,
+        tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V2_ACTIONS_POLICY])?,
+        tag(&["action", action])?,
+        tag(&["action-run", &fence.action_run_id.to_string()])?,
+        tag(&["action-window", &fence.action_window.to_string()])?,
+        tag(&["action-plan", &plan])?,
+    ])
+}
+
+/// Build the `FINALIZE_ACTIONS`/`begin` command for an action-capable Meeting V2.
+pub fn build_meeting_v2_action_begin(
+    params: MeetingV2ActionBeginParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_meeting_v1_session(params.session_id)?;
+    if params.expected_control_epoch == 0 || params.board_window == 0 {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 action begin fencing values must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.expected_control_epoch, "expected control epoch")?;
+    check_meeting_v1_i64(params.board_window, "Board window")?;
+    let state_event_id = check_hex_exact(
+        params.expected_state_event_id,
+        64,
+        "Meeting V2 expected State event id",
+    )?;
+    let board_event_id =
+        check_hex_exact(params.board_event_id, 64, "Meeting V2 final Board event id")?;
+    let mut tags = vec![
+        tag(&["h", &params.session_id.to_string()])?,
+        tag(&["v", MEETING_V2_SCHEMA_VERSION])?,
+        tag(&["policy", MEETING_V2_ACTIONS_POLICY])?,
+        tag(&["action", "begin"])?,
+        tag(&[
+            "expected-control-epoch",
+            &params.expected_control_epoch.to_string(),
+        ])?,
+        tag(&["board-window", &params.board_window.to_string()])?,
+        tag(&["expected-state", &state_event_id])?,
+        tag(&["board", &board_event_id])?,
+    ];
+    if let Some(attempt_id) = params.expected_decision_attempt_id {
+        let attempt_id =
+            check_hex_exact(attempt_id, 64, "Meeting V2 moderator decision attempt id")?;
+        tags.push(tag(&["decision-attempt", &attempt_id])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16), "").tags(tags))
+}
+
+/// Build a command that submits and freezes one compiled Meeting V2 action plan.
+pub fn build_meeting_v2_action_plan(
+    params: MeetingV2ActionPlanParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.fence.plan_event_id.is_some() {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 plan submission must use an empty plan fence".into(),
+        ));
+    }
+    validate_meeting_v2_action_plan(params.plan)?;
+    if params.plan.action_run_id != params.fence.action_run_id {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 action plan targets a different action run".into(),
+        ));
+    }
+    let tags = meeting_v2_action_run_tags(params.session_id, "plan", params.fence)?;
+    let content = serde_json::to_string(params.plan).map_err(|error| {
+        SdkError::InvalidInput(format!("serialize Meeting V2 action plan: {error}"))
+    })?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16), content).tags(tags))
+}
+
+/// Build a durable `block` command for an active Meeting V2 action run.
+pub fn build_meeting_v2_action_block(
+    params: MeetingV2ActionBlockParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let reason_code = check_meeting_v1_text(
+        params.reason_code,
+        "Meeting V2 action block reason code",
+        128,
+    )?;
+    if !matches!(
+        reason_code,
+        "project_view_v2_unavailable"
+            | "assignee_unresolved"
+            | "object_id_conflict"
+            | "responsibility_conflict"
+            | "provider_failure"
+            | "affinity_lost"
+            | "action_deadline_exceeded"
+    ) {
+        return Err(SdkError::InvalidInput(format!(
+            "unsupported Meeting V2 action block reason code: {reason_code}"
+        )));
+    }
+    let reason =
+        check_meeting_v1_optional_text(params.reason, "Meeting V2 action block reason", 1_024)?;
+    let mut tags = meeting_v2_action_run_tags(params.session_id, "block", params.fence)?;
+    tags.push(tag(&["reason-code", reason_code])?);
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16),
+        reason.unwrap_or(""),
+    )
+    .tags(tags))
+}
+
+fn build_meeting_v2_empty_action_command(
+    params: MeetingV2ActionCommandParams<'_>,
+    action: &str,
+    require_plan: bool,
+) -> Result<EventBuilder, SdkError> {
+    if require_plan && params.fence.plan_event_id.is_none() {
+        return Err(SdkError::InvalidInput(format!(
+            "Meeting V2 action {action} requires a frozen plan fence"
+        )));
+    }
+    let tags = meeting_v2_action_run_tags(params.session_id, action, params.fence)?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16), "").tags(tags))
+}
+
+/// Build a `retry` command for a blocked Meeting V2 action run.
+pub fn build_meeting_v2_action_retry(
+    params: MeetingV2ActionCommandParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_empty_action_command(params, "retry", false)
+}
+
+/// Build a `complete` command after all required plan steps are verified.
+pub fn build_meeting_v2_action_complete(
+    params: MeetingV2ActionCommandParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_empty_action_command(params, "complete", true)
+}
+
+/// Build a zero-effect `return-to-board` command.
+pub fn build_meeting_v2_action_return_to_board(
+    params: MeetingV2ActionCommandParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    build_meeting_v2_empty_action_command(params, "return-to-board", false)
+}
+
+/// Build write-ahead registration for one signed Project View command.
+pub fn build_meeting_v2_action_step_prepared(
+    params: MeetingV2ActionStepPreparedParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.fence.plan_event_id.is_none() || params.attempt == 0 {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 prepared step requires a plan and positive attempt".into(),
+        ));
+    }
+    check_meeting_v1_session(params.step_id)?;
+    check_meeting_v1_i64(
+        params.expected_project_revision,
+        "expected Project revision",
+    )?;
+    let project_event_id = check_hex_exact(
+        params.project_event_id,
+        64,
+        "Meeting V2 prepared Project event id",
+    )?;
+    if !params.signed_project_event.is_object() {
+        return Err(SdkError::InvalidInput(
+            "signed Project event must be a JSON object".into(),
+        ));
+    }
+    let mut tags = meeting_v2_action_run_tags(params.session_id, "step-prepared", params.fence)?;
+    tags.push(tag(&["step", &params.step_id.to_string()])?);
+    tags.push(tag(&["attempt", &params.attempt.to_string()])?);
+    tags.push(tag(&["project-event", &project_event_id])?);
+    tags.push(tag(&[
+        "expected-project-revision",
+        &params.expected_project_revision.to_string(),
+    ])?);
+    let content = serde_json::to_string(params.signed_project_event).map_err(|error| {
+        SdkError::InvalidInput(format!("serialize signed Project event: {error}"))
+    })?;
+    if content.len() > MAX_MEETING_V2_ACTION_PLAN_BYTES {
+        return Err(SdkError::ContentTooLarge {
+            max: MAX_MEETING_V2_ACTION_PLAN_BYTES,
+            got: content.len(),
+        });
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16), content).tags(tags))
+}
+
+/// Build receipt registration for one accepted Project View command.
+pub fn build_meeting_v2_action_step_applied(
+    params: MeetingV2ActionStepAppliedParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.fence.plan_event_id.is_none() || params.accepted_project_revision == 0 {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 applied step requires a plan and positive accepted revision".into(),
+        ));
+    }
+    check_meeting_v1_session(params.step_id)?;
+    check_meeting_v1_i64(
+        params.accepted_project_revision,
+        "accepted Project revision",
+    )?;
+    let project_event_id = check_hex_exact(
+        params.project_event_id,
+        64,
+        "Meeting V2 applied Project event id",
+    )?;
+    let mut tags = meeting_v2_action_run_tags(params.session_id, "step-applied", params.fence)?;
+    tags.push(tag(&["step", &params.step_id.to_string()])?);
+    tags.push(tag(&["project-event", &project_event_id])?);
+    tags.push(tag(&[
+        "accepted-project-revision",
+        &params.accepted_project_revision.to_string(),
+    ])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16), "").tags(tags))
 }
 
 /// Build a strict manual Meeting V1 end command (kind 42101).
@@ -4713,6 +5333,163 @@ mod tests {
         )
         .is_err());
         assert!(parse_meeting_v2_board_content(r#"{"format":"html","body":"ok"}"#).is_err());
+    }
+
+    fn meeting_v2_action_plan_fixture(
+        action_run_id: Uuid,
+        board_event_id: &str,
+        assignee_pubkey: &str,
+    ) -> MeetingV2ActionPlan {
+        let action_id = uuid();
+        let requirement_id = uuid();
+        let work_id = uuid();
+        MeetingV2ActionPlan {
+            version: MEETING_V2_ACTION_PLAN_VERSION,
+            action_run_id,
+            board_event_id: board_event_id.to_string(),
+            items: vec![MeetingV2ActionItem {
+                action_id,
+                summary: "Implement the accepted API".to_string(),
+                assignee_pubkey: assignee_pubkey.to_string(),
+            }],
+            steps: vec![
+                MeetingV2ActionStep {
+                    step_id: uuid(),
+                    action_id: None,
+                    kind: MeetingV2ActionStepKind::ProjectViewCreateRequirement,
+                    target_object_id: requirement_id,
+                    payload: serde_json::json!({"title": "Accepted API"}),
+                },
+                MeetingV2ActionStep {
+                    step_id: uuid(),
+                    action_id: Some(action_id),
+                    kind: MeetingV2ActionStepKind::ProjectViewCreateWork,
+                    target_object_id: work_id,
+                    payload: serde_json::json!({
+                        "title": "Implement the API",
+                        "requirement_id": requirement_id,
+                    }),
+                },
+                MeetingV2ActionStep {
+                    step_id: uuid(),
+                    action_id: Some(action_id),
+                    kind: MeetingV2ActionStepKind::ProjectViewSetWorkResponsibility,
+                    target_object_id: work_id,
+                    payload: serde_json::json!({}),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn meeting_v2_actions_wire_is_policy_discriminated_and_fenced() {
+        let session_id = uuid();
+        let action_run_id = uuid();
+        let author = "11".repeat(32);
+        let participant = "22".repeat(32);
+        let create = sign(
+            build_meeting_v2_actions_create(MeetingV2CreateParams {
+                session_id,
+                title: "Action review",
+                description: None,
+                source_channel_id: None,
+                author_pubkey: &author,
+                participant_pubkeys: &[&participant],
+                initial_board: "# Goal\nAgree and assign the implementation.",
+            })
+            .unwrap(),
+        );
+        assert!(has_tag(&create, "v", MEETING_V2_SCHEMA_VERSION));
+        assert!(has_tag(&create, "policy", MEETING_V2_ACTIONS_POLICY));
+        assert!(!has_tag(&create, "policy", MEETING_V2_POLICY));
+
+        let state_event_id = "aa".repeat(32);
+        let board_event_id = "bb".repeat(32);
+        let begin = sign(
+            build_meeting_v2_action_begin(MeetingV2ActionBeginParams {
+                session_id,
+                expected_control_epoch: 4,
+                board_window: 7,
+                expected_state_event_id: &state_event_id,
+                board_event_id: &board_event_id,
+                expected_decision_attempt_id: None,
+            })
+            .unwrap(),
+        );
+        assert_eq!(begin.kind.as_u16() as u32, KIND_MEETING_ACTION_COMMAND);
+        assert!(has_tag(&begin, "policy", MEETING_V2_ACTIONS_POLICY));
+        assert!(has_tag(&begin, "action", "begin"));
+        assert!(has_tag(&begin, "expected-control-epoch", "4"));
+        assert!(has_tag(&begin, "board-window", "7"));
+        assert!(has_tag(&begin, "expected-state", &state_event_id));
+        assert!(has_tag(&begin, "board", &board_event_id));
+
+        let plan = meeting_v2_action_plan_fixture(action_run_id, &board_event_id, &participant);
+        let plan_event = sign(
+            build_meeting_v2_action_plan(MeetingV2ActionPlanParams {
+                session_id,
+                fence: MeetingV2ActionRunFence {
+                    action_run_id,
+                    action_window: 1,
+                    plan_event_id: None,
+                },
+                plan: &plan,
+            })
+            .unwrap(),
+        );
+        assert!(has_tag(&plan_event, "action", "plan"));
+        assert!(has_tag(
+            &plan_event,
+            "action-run",
+            &action_run_id.to_string()
+        ));
+        assert!(has_tag(&plan_event, "action-window", "1"));
+        assert!(has_tag(&plan_event, "action-plan", "none"));
+        assert_eq!(
+            serde_json::from_str::<MeetingV2ActionPlan>(&plan_event.content).unwrap(),
+            plan
+        );
+
+        let close = sign(
+            build_meeting_v2_actions_end(MeetingV2ActionsEndParams {
+                session_id,
+                create_event_id: &create.id.to_hex(),
+                outcome: MeetingV2EndOutcome::Closed,
+                reason_code: None,
+                reason: None,
+                action_fence: Some(MeetingV2ActionsEndFence {
+                    action_run_id,
+                    action_window: 1,
+                    plan_event_id: &plan_event.id.to_hex(),
+                }),
+            })
+            .unwrap(),
+        );
+        assert!(has_tag(&close, "policy", MEETING_V2_ACTIONS_POLICY));
+        assert!(has_tag(&close, "action-run", &action_run_id.to_string()));
+        assert!(has_tag(&close, "action-window", "1"));
+        assert!(has_tag(&close, "action-plan", &plan_event.id.to_hex()));
+    }
+
+    #[test]
+    fn meeting_v2_action_plan_validation_rejects_ambiguous_or_stale_shapes() {
+        let run_id = uuid();
+        let board_event_id = "ab".repeat(32);
+        let assignee = "22".repeat(32);
+        let mut plan = meeting_v2_action_plan_fixture(run_id, &board_event_id, &assignee);
+        assert!(validate_meeting_v2_action_plan(&plan).is_ok());
+
+        plan.steps[1].action_id = Some(uuid());
+        assert!(validate_meeting_v2_action_plan(&plan).is_err());
+
+        let empty = MeetingV2ActionPlan {
+            version: MEETING_V2_ACTION_PLAN_VERSION,
+            action_run_id: run_id,
+            board_event_id,
+            items: Vec::new(),
+            steps: Vec::new(),
+        };
+        assert!(validate_meeting_v2_action_plan(&empty).is_err());
     }
 
     #[test]

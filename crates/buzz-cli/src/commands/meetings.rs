@@ -54,6 +54,7 @@ enum MeetingProtocol {
     UniformV0,
     ModeratedBatonV1,
     ModeratedBoardV2,
+    ModeratedBoardActionsV2,
 }
 
 impl MeetingProtocol {
@@ -64,6 +65,7 @@ impl MeetingProtocol {
             ("1", "" | "uniform-v0") => Ok(Self::UniformV0),
             ("2", buzz_sdk::MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
             ("3", buzz_sdk::MEETING_V2_POLICY) => Ok(Self::ModeratedBoardV2),
+            ("3", buzz_sdk::MEETING_V2_ACTIONS_POLICY) => Ok(Self::ModeratedBoardActionsV2),
             ("2", "") => Err(CliError::Other(
                 "invalid Meeting V1 Create: missing policy tag".into(),
             )),
@@ -78,7 +80,16 @@ impl MeetingProtocol {
             Self::UniformV0 => "uniform-v0",
             Self::ModeratedBatonV1 => buzz_sdk::MEETING_V1_POLICY,
             Self::ModeratedBoardV2 => buzz_sdk::MEETING_V2_POLICY,
+            Self::ModeratedBoardActionsV2 => buzz_sdk::MEETING_V2_ACTIONS_POLICY,
         }
+    }
+
+    const fn is_v2(self) -> bool {
+        matches!(self, Self::ModeratedBoardV2 | Self::ModeratedBoardActionsV2)
+    }
+
+    const fn has_action_finalization(self) -> bool {
+        matches!(self, Self::ModeratedBoardActionsV2)
     }
 }
 
@@ -139,6 +150,9 @@ fn parse_baton_state(event: &serde_json::Value) -> Option<BatonState> {
         ) | (
             buzz_sdk::MEETING_V2_SCHEMA_VERSION,
             buzz_sdk::MEETING_V2_POLICY
+        ) | (
+            buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+            buzz_sdk::MEETING_V2_ACTIONS_POLICY
         )
     ) {
         return None;
@@ -341,7 +355,9 @@ async fn fetch_required_v1_baton(
     let protocol = fetch_meeting_protocol(client, &meeting_id_text).await?;
     if !matches!(
         protocol,
-        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2
+        MeetingProtocol::ModeratedBatonV1
+            | MeetingProtocol::ModeratedBoardV2
+            | MeetingProtocol::ModeratedBoardActionsV2
     ) {
         return Err(CliError::Usage(format!(
             "meeting {meeting_id} does not use a moderated Meeting protocol"
@@ -353,7 +369,10 @@ async fn fetch_required_v1_baton(
 }
 
 fn baton_is_v2(state: &BatonState) -> bool {
-    state.policy_version == buzz_sdk::MEETING_V2_POLICY
+    matches!(
+        state.policy_version.as_str(),
+        buzz_sdk::MEETING_V2_POLICY | buzz_sdk::MEETING_V2_ACTIONS_POLICY
+    )
 }
 
 macro_rules! build_moderated {
@@ -525,9 +544,10 @@ async fn require_uniform_v0(client: &BuzzClient, meeting_id: Uuid) -> Result<(),
             "meeting {meeting_id} uses {}; use the Meeting V1 command surface",
             buzz_sdk::MEETING_V1_POLICY
         ))),
-        MeetingProtocol::ModeratedBoardV2 => Err(CliError::Usage(format!(
+        protocol @ (MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2) => Err(CliError::Usage(format!(
             "meeting {meeting_id} uses {}; use the moderated Meeting command surface",
-            buzz_sdk::MEETING_V2_POLICY
+            protocol.policy()
         ))),
     }
 }
@@ -622,7 +642,7 @@ async fn cmd_create_meeting(
             }
             if board.is_some() {
                 return Err(CliError::Usage(
-                    "--board requires --policy moderated-board-v1".into(),
+                    "--board requires a moderated-board policy".into(),
                 ));
             }
             buzz_sdk::build_meeting_create(
@@ -636,7 +656,7 @@ async fn cmd_create_meeting(
         crate::MeetingPolicy::ModeratedBatonV1 => {
             if board.is_some() {
                 return Err(CliError::Usage(
-                    "--board requires --policy moderated-board-v1".into(),
+                    "--board requires a moderated-board policy".into(),
                 ));
             }
             let moderator_pubkey = moderator.unwrap_or(&self_pubkey);
@@ -658,17 +678,18 @@ async fn cmd_create_meeting(
                 participant_pubkeys: &participant_refs,
             })
         }
-        crate::MeetingPolicy::ModeratedBoardV2 => {
+        v2_policy @ (crate::MeetingPolicy::ModeratedBoardV2
+        | crate::MeetingPolicy::ModeratedBoardActionsV2) => {
             if moderator.is_some() {
                 return Err(CliError::Usage(
                     "Meeting V2 fixes the creator as moderator; do not pass --moderator".into(),
                 ));
             }
             let board = board.ok_or_else(|| {
-                CliError::Usage("--board is required with --policy moderated-board-v1".into())
+                CliError::Usage("--board is required with a moderated-board policy".into())
             })?;
             let board = read_or_stdin(board)?;
-            buzz_sdk::build_meeting_v2_create(buzz_sdk::MeetingV2CreateParams {
+            let params = buzz_sdk::MeetingV2CreateParams {
                 session_id: meeting_id,
                 title,
                 description,
@@ -676,7 +697,12 @@ async fn cmd_create_meeting(
                 author_pubkey: &self_pubkey,
                 participant_pubkeys: &participant_refs,
                 initial_board: &board,
-            })
+            };
+            if v2_policy == crate::MeetingPolicy::ModeratedBoardActionsV2 {
+                buzz_sdk::build_meeting_v2_actions_create(params)
+            } else {
+                buzz_sdk::build_meeting_v2_create(params)
+            }
         }
     }
     .map_err(sdk_err)?;
@@ -783,17 +809,23 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
         });
     let baton = if matches!(
         protocol,
-        Some(MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2)
+        Some(
+            MeetingProtocol::ModeratedBatonV1
+                | MeetingProtocol::ModeratedBoardV2
+                | MeetingProtocol::ModeratedBoardActionsV2
+        )
     ) {
         fetch_current_baton(client, &meeting_id).await?
     } else {
         None
     };
     let moderator_pubkey = match protocol {
-        Some(MeetingProtocol::ModeratedBoardV2) => create
-            .and_then(|event| event.get("pubkey"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
+        Some(MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2) => {
+            create
+                .and_then(|event| event.get("pubkey"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }
         _ => create
             .map(|event| extract_tag_value(event, "moderator"))
             .filter(|value| !value.is_empty()),
@@ -850,7 +882,8 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
 
 pub async fn cmd_get_meeting_board(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
-    if fetch_meeting_protocol(client, &meeting_id).await? != MeetingProtocol::ModeratedBoardV2 {
+    let protocol = fetch_meeting_protocol(client, &meeting_id).await?;
+    if !protocol.is_v2() {
         return Err(CliError::Usage(format!(
             "meeting {meeting_id} does not use {}",
             buzz_sdk::MEETING_V2_POLICY
@@ -879,7 +912,7 @@ pub async fn cmd_get_meeting_board(client: &BuzzClient, meeting_id: &str) -> Res
         .ok_or_else(|| CliError::NotFound(format!("meeting board not found: {meeting_id}")))?;
 
     if extract_tag_value(&event, "v") != buzz_sdk::MEETING_V2_SCHEMA_VERSION
-        || extract_tag_value(&event, "policy") != buzz_sdk::MEETING_V2_POLICY
+        || extract_tag_value(&event, "policy") != protocol.policy()
         || extract_tag_value(&event, "format") != buzz_sdk::MEETING_V2_BOARD_FORMAT
     {
         return Err(CliError::Other(format!(
@@ -968,12 +1001,17 @@ async fn cmd_meeting_board_action(
     let (expected_control_epoch, board_window) =
         meeting_v2_board_fences(&state, control_epoch, board_window)?;
     let board = board.map(read_file_or_stdin).transpose()?;
-    let builder = buzz_sdk::build_meeting_v2_board_action(buzz_sdk::MeetingV2BoardActionParams {
+    let params = buzz_sdk::MeetingV2BoardActionParams {
         session_id: meeting_id,
         expected_control_epoch,
         board_window,
         board: board.as_deref(),
-    })
+    };
+    let builder = if state.policy_version == buzz_sdk::MEETING_V2_ACTIONS_POLICY {
+        buzz_sdk::build_meeting_v2_actions_board_action(params)
+    } else {
+        buzz_sdk::build_meeting_v2_board_action(params)
+    }
     .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
     let command_event_id = event.id.to_hex();
@@ -1020,15 +1058,15 @@ pub async fn cmd_meeting_history(
     events.sort_by(|left, right| {
         let left_revision = match protocol {
             MeetingProtocol::UniformV0 => event_round(left),
-            MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2 => {
-                event_speech_revision(left)
-            }
+            MeetingProtocol::ModeratedBatonV1
+            | MeetingProtocol::ModeratedBoardV2
+            | MeetingProtocol::ModeratedBoardActionsV2 => event_speech_revision(left),
         };
         let right_revision = match protocol {
             MeetingProtocol::UniformV0 => event_round(right),
-            MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2 => {
-                event_speech_revision(right)
-            }
+            MeetingProtocol::ModeratedBatonV1
+            | MeetingProtocol::ModeratedBoardV2
+            | MeetingProtocol::ModeratedBoardActionsV2 => event_speech_revision(right),
         };
         left_revision
             .cmp(&right_revision)
@@ -1047,7 +1085,9 @@ pub async fn cmd_meeting_history(
                         .then(|| event_round(event)),
                     "speech_revision": matches!(
                         protocol,
-                        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2
+                        MeetingProtocol::ModeratedBatonV1
+                            | MeetingProtocol::ModeratedBoardV2
+                            | MeetingProtocol::ModeratedBoardActionsV2
                     )
                         .then(|| event_speech_revision(event)),
                     "grant_id": (!grant.is_empty()).then_some(grant),
@@ -1074,7 +1114,9 @@ pub async fn cmd_floor_status(client: &BuzzClient, meeting_id: &str) -> Result<(
             ),
             None => println!("null"),
         },
-        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBatonV1
+        | MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2 => {
             match fetch_current_baton(client, &meeting_id).await? {
                 Some(state) => println!(
                     "{}",
@@ -1095,7 +1137,9 @@ pub async fn cmd_floor_history(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
     match fetch_meeting_protocol(client, &meeting_id).await? {
-        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBatonV1
+        | MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2 => {
             let states = fetch_baton_states(client, &meeting_id, limit).await?;
             let output = match format {
                 OutputFormat::Json => serde_json::to_value(states)
@@ -1163,6 +1207,36 @@ pub async fn cmd_floor_history(
         "{}",
         serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())
     );
+    Ok(())
+}
+
+pub async fn cmd_meeting_actions_status(
+    client: &BuzzClient,
+    meeting_id: &str,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let protocol = fetch_meeting_protocol(client, &meeting_id.to_string()).await?;
+    if !protocol.has_action_finalization() {
+        return Err(CliError::Usage(format!(
+            "meeting {meeting_id} does not use {}",
+            buzz_sdk::MEETING_V2_ACTIONS_POLICY
+        )));
+    }
+    let state = fetch_required_v1_baton(client, meeting_id).await?;
+    let board_control = state
+        .content
+        .get("board_control")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| CliError::Other("Meeting State has no board_control".into()))?;
+    let output = serde_json::json!({
+        "meeting_id": meeting_id,
+        "policy": state.policy_version,
+        "state_event_id": state.state_event_id,
+        "state_revision": state.state_revision,
+        "meeting_phase": board_control.get("phase"),
+        "action": board_control.get("action"),
+    });
+    println!("{output}");
     Ok(())
 }
 
@@ -2342,7 +2416,9 @@ pub async fn cmd_say_meeting(
             println!("{}", normalize_write_response(&response));
             Ok(())
         }
-        MeetingProtocol::ModeratedBatonV1 | MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBatonV1
+        | MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2 => {
             let handoff = match (handoff_to, handoff_type, handoff_reason) {
                 (None, None, None) => None,
                 (Some(target_pubkey), Some(handoff_type), Some(reason)) => {
@@ -2405,23 +2481,95 @@ async fn submit_meeting_v2_end(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
     let create = fetch_meeting_create(client, &meeting_id.to_string()).await?;
-    if MeetingProtocol::from_create_event(&create)? != MeetingProtocol::ModeratedBoardV2 {
+    let protocol = MeetingProtocol::from_create_event(&create)?;
+    if !protocol.is_v2() {
         return Err(CliError::Usage(format!(
-            "meeting {meeting_id} does not use {}",
-            buzz_sdk::MEETING_V2_POLICY
+            "meeting {meeting_id} does not use a Meeting V2 policy"
         )));
     }
     let create_event_id = create
         .get("id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| CliError::Other(format!("meeting not found: {meeting_id}")))?;
-    let builder = buzz_sdk::build_meeting_v2_end(buzz_sdk::MeetingV2EndParams {
-        session_id: meeting_id,
-        create_event_id,
-        outcome,
-        reason_code,
-        reason,
-    })
+    struct OwnedActionEndFence {
+        action_run_id: Uuid,
+        action_window: u64,
+        plan_event_id: String,
+    }
+    let action_fence = if protocol.has_action_finalization()
+        && outcome == buzz_sdk::MeetingV2EndOutcome::Closed
+    {
+        let state = fetch_required_v1_baton(client, meeting_id).await?;
+        let board_control = state
+            .content
+            .get("board_control")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| CliError::Other("Meeting State has no board_control".into()))?;
+        if board_control
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            == Some("finalizing_actions")
+        {
+            let action = board_control
+                .get("action")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| CliError::Conflict("Meeting has no active action run".into()))?;
+            if action.get("phase").and_then(serde_json::Value::as_str) != Some("ready_to_close")
+                || action.get("condition").and_then(serde_json::Value::as_str) != Some("runnable")
+            {
+                return Err(CliError::Conflict(
+                    "Meeting action run is not ready to close".into(),
+                ));
+            }
+            let action_run_id = action
+                .get("action_run_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| CliError::Other("action run has no valid ID".into()))?;
+            let action_run_id = parse_uuid(action_run_id)?;
+            let action_window = action
+                .get("action_window_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| CliError::Other("action run has no valid window".into()))?;
+            let plan_event_id = action
+                .get("plan_event_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| CliError::Other("action run has no frozen plan".into()))?;
+            validate_hex64(plan_event_id)?;
+            Some(OwnedActionEndFence {
+                action_run_id,
+                action_window,
+                plan_event_id: plan_event_id.to_string(),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let builder = if protocol.has_action_finalization() {
+        buzz_sdk::build_meeting_v2_actions_end(buzz_sdk::MeetingV2ActionsEndParams {
+            session_id: meeting_id,
+            create_event_id,
+            outcome,
+            reason_code,
+            reason,
+            action_fence: action_fence
+                .as_ref()
+                .map(|fence| buzz_sdk::MeetingV2ActionsEndFence {
+                    action_run_id: fence.action_run_id,
+                    action_window: fence.action_window,
+                    plan_event_id: &fence.plan_event_id,
+                }),
+        })
+    } else {
+        buzz_sdk::build_meeting_v2_end(buzz_sdk::MeetingV2EndParams {
+            session_id: meeting_id,
+            create_event_id,
+            outcome,
+            reason_code,
+            reason,
+        })
+    }
     .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
     let end_event_id = event.id.to_hex();
@@ -2475,7 +2623,7 @@ pub async fn cmd_end_meeting(client: &BuzzClient, meeting_id: &str) -> Result<()
                 create_event_id,
             })
         }
-        MeetingProtocol::ModeratedBoardV2 => {
+        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
             return cmd_close_meeting_v2(client, &meeting_id_text).await;
         }
     }
@@ -2572,6 +2720,14 @@ pub async fn dispatch(
                 } => {
                     cmd_meeting_board_action(client, &meeting, None, control_epoch, board_window)
                         .await
+                }
+            }
+        }
+        MeetingsCmd::Actions { command } => {
+            use crate::MeetingActionsCmd;
+            match command {
+                MeetingActionsCmd::Status { meeting } => {
+                    cmd_meeting_actions_status(client, &meeting).await
                 }
             }
         }
@@ -2960,6 +3116,14 @@ mod tests {
             .unwrap(),
             MeetingProtocol::ModeratedBoardV2
         );
+        assert_eq!(
+            MeetingProtocol::from_create_event(&create_event(
+                "3",
+                Some(buzz_sdk::MEETING_V2_ACTIONS_POLICY)
+            ))
+            .unwrap(),
+            MeetingProtocol::ModeratedBoardActionsV2
+        );
         assert!(MeetingProtocol::from_create_event(&create_event("3", None)).is_err());
         assert!(MeetingProtocol::from_create_event(&create_event(
             "3",
@@ -3086,6 +3250,44 @@ mod tests {
             meeting_v2_board_fences(&state, Some(3), Some(8)).unwrap(),
             (3, 8),
             "explicit fences remain available for CAS/race tests"
+        );
+
+        let action_event = serde_json::json!({
+            "id": "dd".repeat(32),
+            "kind": buzz_sdk::kind::KIND_MEETING_STATE,
+            "created_at": 124,
+            "tags": [
+                ["h", "00000000-0000-4000-8000-000000000001"],
+                ["v", "3"],
+                ["policy", buzz_sdk::MEETING_V2_ACTIONS_POLICY],
+                ["phase", "moderator_idle"],
+                ["floor-revision", "1"],
+                ["intent-revision", "0"],
+                ["speech-revision", "0"],
+                ["state-revision", "2"],
+                ["moderator", "cc".repeat(32)]
+            ],
+            "content": serde_json::json!({
+                "phase": "moderator_idle",
+                "state_revision": 2,
+                "board_control": {
+                    "phase": "finalizing_actions",
+                    "control_epoch": 4,
+                    "board_window": 9,
+                    "action": {
+                        "action_run_id": "00000000-0000-4000-8000-000000000001",
+                        "action_window_epoch": 1,
+                        "phase": "planning",
+                        "condition": "runnable"
+                    }
+                }
+            }).to_string(),
+        });
+        let action_state = parse_baton_state(&action_event).expect("valid action-capable State");
+        assert!(baton_is_v2(&action_state));
+        assert_eq!(
+            action_state.content["board_control"]["action"]["phase"],
+            "planning"
         );
     }
 
