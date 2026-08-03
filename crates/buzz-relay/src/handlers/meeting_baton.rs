@@ -367,11 +367,72 @@ fn parse_action_command(
                 _ => buzz_db::meeting_v2_actions::ActionCommand::ReturnToBoard { fence },
             }
         }
-        "step-prepared" | "step-applied" => {
-            return Err(IngestError::Rejected(
-                "unsupported: Project View action step receipts are not enabled in stage one"
-                    .into(),
-            ));
+        "step-prepared" => {
+            validate_action_run_tag_schema(
+                event,
+                &[
+                    "step",
+                    "attempt",
+                    "project-event",
+                    "expected-project-revision",
+                ],
+            )?;
+            let fence = parse_action_run_fence(event)?;
+            if fence.plan_event_id.is_none() {
+                return Err(IngestError::Rejected(
+                    "invalid: prepared action step requires a frozen plan".into(),
+                ));
+            }
+            let step_id = parse_non_nil_uuid_tag(event, "step", "Meeting action step id")?;
+            let attempt =
+                i32::try_from(parse_positive_i64_tag(event, "attempt")?).map_err(|_| {
+                    IngestError::Rejected("invalid: Meeting action attempt exceeds i32".into())
+                })?;
+            let project_event_id = decode_event_id(
+                &require_single_tag(event, "project-event")?,
+                "Meeting prepared Project event id",
+            )?;
+            let expected_project_revision =
+                parse_positive_i64_tag(event, "expected-project-revision")?;
+            let signed_project_event: Event =
+                serde_json::from_str(&event.content).map_err(|error| {
+                    IngestError::Rejected(format!(
+                        "invalid: malformed signed Project View event JSON: {error}"
+                    ))
+                })?;
+            buzz_db::meeting_v2_actions::ActionCommand::StepPrepared {
+                fence,
+                step_id,
+                attempt,
+                project_event_id,
+                expected_project_revision,
+                signed_project_event,
+            }
+        }
+        "step-applied" => {
+            validate_action_run_tag_schema(
+                event,
+                &["step", "project-event", "accepted-project-revision"],
+            )?;
+            require_empty_content(event, "Meeting V2 applied action step")?;
+            let fence = parse_action_run_fence(event)?;
+            if fence.plan_event_id.is_none() {
+                return Err(IngestError::Rejected(
+                    "invalid: applied action step requires a frozen plan".into(),
+                ));
+            }
+            buzz_db::meeting_v2_actions::ActionCommand::StepApplied {
+                fence,
+                step_id: parse_non_nil_uuid_tag(event, "step", "Meeting action step id")?,
+                project_event_id: decode_event_id(
+                    &require_single_tag(event, "project-event")?,
+                    "Meeting applied Project event id",
+                )?,
+                accepted_project_revision: parse_positive_i64_tag(
+                    event,
+                    "accepted-project-revision",
+                )?,
+            }
         }
         _ => {
             return Err(IngestError::Rejected(format!(
@@ -421,6 +482,17 @@ fn parse_action_run_fence(
         action_window_epoch,
         plan_event_id,
     })
+}
+
+fn parse_non_nil_uuid_tag(event: &Event, tag_name: &str, field: &str) -> Result<Uuid, IngestError> {
+    let value = Uuid::parse_str(&require_single_tag(event, tag_name)?)
+        .map_err(|_| IngestError::Rejected(format!("invalid: bad {field}")))?;
+    if value.is_nil() {
+        return Err(IngestError::Rejected(format!(
+            "invalid: {field} must not be nil"
+        )));
+    }
+    Ok(value)
 }
 
 fn validate_clean_action_text(
@@ -1939,6 +2011,90 @@ mod tests {
                 && fence.action_window_epoch == 1
                 && fence.plan_event_id.is_none()
                 && parsed_plan == plan
+        ));
+
+        let project_event = buzz_sdk::project_view_v2::build_project_object_command(
+            buzz_project_view::v2::ProjectObjectCommand::new(
+                7,
+                None,
+                buzz_project_view::MutationRequest::Create(buzz_project_view::CreateMutation {
+                    object: buzz_project_view::NewProjectViewObject::Work {
+                        id: plan.steps[0].target_object_id,
+                        title: "Implement".to_string(),
+                        description: "Apply the frozen Meeting plan".to_string(),
+                        status: buzz_project_view::WorkStatus::Pending,
+                        priority: buzz_project_view::Priority::Normal,
+                        handles: buzz_project_view::ObjectRef {
+                            object_type: buzz_project_view::ProjectViewObjectType::Requirement,
+                            object_id: Uuid::new_v4(),
+                        },
+                    },
+                }),
+            ),
+        )
+        .expect("build Project View command")
+        .sign_with_keys(&moderator)
+        .expect("sign Project View command");
+        let project_event_json = serde_json::to_value(&project_event).expect("serialize event");
+        let plan_event_id = plan_event.id.to_hex();
+        let project_event_id = project_event.id.to_hex();
+        let prepared = buzz_sdk::build_meeting_v2_action_step_prepared(
+            buzz_sdk::MeetingV2ActionStepPreparedParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id,
+                    action_window: 1,
+                    plan_event_id: Some(&plan_event_id),
+                },
+                step_id: plan.steps[0].step_id,
+                attempt: 1,
+                project_event_id: &project_event_id,
+                expected_project_revision: 7,
+                signed_project_event: &project_event_json,
+            },
+        )
+        .expect("build prepared step")
+        .sign_with_keys(&moderator)
+        .expect("sign prepared step");
+        assert!(matches!(
+            parse_action_command(&prepared),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::StepPrepared {
+                fence,
+                step_id,
+                attempt: 1,
+                expected_project_revision: 7,
+                signed_project_event,
+                ..
+            })) if parsed == session_id
+                && fence.action_run_id == action_run_id
+                && fence.plan_event_id.as_deref() == Some(plan_event.id.as_bytes())
+                && step_id == plan.steps[0].step_id
+                && signed_project_event == project_event
+        ));
+
+        let applied = buzz_sdk::build_meeting_v2_action_step_applied(
+            buzz_sdk::MeetingV2ActionStepAppliedParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id,
+                    action_window: 1,
+                    plan_event_id: Some(&plan_event_id),
+                },
+                step_id: plan.steps[0].step_id,
+                project_event_id: &project_event_id,
+                accepted_project_revision: 8,
+            },
+        )
+        .expect("build applied step")
+        .sign_with_keys(&moderator)
+        .expect("sign applied step");
+        assert!(matches!(
+            parse_action_command(&applied),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::StepApplied {
+                step_id,
+                accepted_project_revision: 8,
+                ..
+            })) if parsed == session_id && step_id == plan.steps[0].step_id
         ));
     }
 

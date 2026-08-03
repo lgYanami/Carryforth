@@ -2582,7 +2582,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
-    async fn action_finalization_gates_close_and_supports_return_retry_and_completion() {
+    async fn action_finalization_gates_close_and_supports_return_and_retry() {
         let (pool, admin, database_name) = setup_isolated_pool("buzz_meeting_actions").await;
         let db = Db::from_pool(pool.clone());
         let community_id = make_community(&pool).await;
@@ -3060,7 +3060,10 @@ mod tests {
                     action_id: Some(action_id),
                     kind: buzz_sdk::MeetingV2ActionStepKind::ProjectViewCreateWork,
                     target_object_id: work_id,
-                    payload: json!({"title": "Implement", "requirement_id": requirement_id}),
+                    payload: json!({
+                        "title": "Implement the accepted design",
+                        "requirement_id": requirement_id
+                    }),
                 },
                 buzz_sdk::MeetingV2ActionStep {
                     step_id: Uuid::new_v4(),
@@ -3207,8 +3210,9 @@ mod tests {
         assert!(retried.accepted);
         assert_eq!(retried.response["action_window_epoch"].as_i64(), Some(2));
 
-        // Stage three will obtain these statuses through verified Project View receipts.
-        // Stage one seeds the ledger result directly to exercise the completion and End gates.
+        // Directly changing step status is not sufficient proof of an external
+        // effect. Completion must still fail without exact accepted attempts
+        // and verified Project View projections.
         sqlx::query(
             "UPDATE meeting_v2_action_steps \
              SET status = 'applied', accepted_project_revision = 10, updated_at = clock_timestamp() \
@@ -3219,7 +3223,7 @@ mod tests {
         .bind(run_two)
         .execute(&pool)
         .await
-        .expect("simulate verified Project View receipts");
+        .expect("simulate unverified Project View statuses");
 
         let complete_event =
             buzz_sdk::build_meeting_v2_action_complete(buzz_sdk::MeetingV2ActionCommandParams {
@@ -3250,79 +3254,9 @@ mod tests {
             },
         )
         .await
-        .expect("complete action run");
-        assert!(completed.accepted);
-
-        let close = buzz_sdk::build_meeting_v2_actions_end(buzz_sdk::MeetingV2ActionsEndParams {
-            session_id,
-            create_event_id: &create.id.to_hex(),
-            outcome: buzz_sdk::MeetingV2EndOutcome::Closed,
-            reason_code: None,
-            reason: None,
-            action_fence: Some(buzz_sdk::MeetingV2ActionsEndFence {
-                action_run_id: run_two,
-                action_window: 2,
-                plan_event_id: &plan_event.id.to_hex(),
-            }),
-        })
-        .expect("build gated action close")
-        .sign_with_keys(&host_keys)
-        .expect("sign gated action close");
-        let mut tx = pool.begin().await.expect("begin gated action close");
-        insert_create_event_tx(&mut tx, community_id, session_id, &close).await;
-        assert!(matches!(
-            end_meeting_v2_tx(
-                &mut tx,
-                EndMeetingV2Params {
-                    community_id,
-                    session_id,
-                    actor_pubkey: &host,
-                    create_event_id: create.id.as_bytes(),
-                    end_event_id: close.id.as_bytes(),
-                    outcome: TerminalOutcome::Closed,
-                    reason_code: None,
-                    action_fence: Some(EndMeetingV2ActionFence {
-                        action_run_id: run_two,
-                        action_window_epoch: 2,
-                        plan_event_id: &plan_event_id,
-                    }),
-                    relay_keys: &relay_keys,
-                },
-            )
-            .await
-            .expect("close after action completion"),
-            EndMeetingV2Outcome::Ended(_)
-        ));
-        tx.commit().await.expect("commit action-gated close");
-
-        let terminal: (String, String, String, bool) = sqlx::query_as(
-            "SELECT session.status, session.terminal_outcome, run.terminal_status, \
-                    channel.archived_at IS NOT NULL \
-             FROM meeting_sessions session \
-             JOIN channels channel \
-               ON channel.community_id = session.community_id \
-              AND channel.id = session.session_id \
-             JOIN meeting_v2_action_runs run \
-               ON run.community_id = session.community_id \
-              AND run.session_id = session.session_id \
-             WHERE session.community_id = $1 AND session.session_id = $2 \
-               AND run.action_run_id = $3",
-        )
-        .bind(community_id.as_uuid())
-        .bind(session_id)
-        .bind(run_two)
-        .fetch_one(&pool)
-        .await
-        .expect("read action-gated terminal state");
-        assert_eq!(
-            terminal,
-            (
-                "ended".to_string(),
-                "closed".to_string(),
-                "completed_closed".to_string(),
-                true,
-            )
-        );
+        .expect("reject completion without Project evidence");
+        assert!(!completed.accepted);
+        assert_eq!(completed.outcome_code, "action_projection_mismatch");
 
         drop(db);
         pool.close().await;

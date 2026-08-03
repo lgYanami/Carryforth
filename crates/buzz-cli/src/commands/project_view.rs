@@ -23,7 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::client::{create_response_with_id, normalize_write_response, BuzzClient};
+use crate::client::{normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
     is_managed_runtime, read_identity, read_verified_v2_snapshot, runtime_fence_from_env,
     ProjectViewIdentity, ProjectViewSchema, PROJECT_VIEW_V1_EXTENSION,
@@ -131,6 +131,8 @@ struct RelayWriteResponse {
 #[derive(Debug, Deserialize)]
 struct ProjectViewReceipt {
     project_revision: u64,
+    #[serde(default)]
+    operation: Option<String>,
     object_id: Option<Uuid>,
     object_revision: Option<u64>,
     deleted: Option<bool>,
@@ -151,8 +153,18 @@ pub async fn dispatch(
         ProjectViewCmd::Create {
             object_type,
             expected_project_revision,
+            id,
             data,
-        } => cmd_create(client, object_type.into(), expected_project_revision, &data).await,
+        } => {
+            cmd_create(
+                client,
+                object_type.into(),
+                expected_project_revision,
+                id,
+                &data,
+            )
+            .await
+        }
         ProjectViewCmd::Update {
             object_type,
             id,
@@ -212,7 +224,11 @@ async fn cmd_get_object(
                 "point lookup found the object ID under a different type",
             ));
         }
-        return print_read_output(&v2_object_output(entry, snapshot.meta()), format);
+        let active = snapshot.active_object(object_id);
+        return print_read_output(
+            &v2_object_output(entry, snapshot.meta(), active.as_ref()),
+            format,
+        );
     }
     let meta = read_meta(client, identity)
         .await?
@@ -269,6 +285,7 @@ async fn cmd_create(
     client: &BuzzClient,
     object_type: ProjectViewObjectType,
     expected_project_revision: u64,
+    object_id: Option<Uuid>,
     data_path: &str,
 ) -> Result<(), CliError> {
     if object_type == ProjectViewObjectType::ProjectProfile {
@@ -277,7 +294,12 @@ async fn cmd_create(
         ));
     }
     let identity = require_capability(client).await?;
-    let object_id = Uuid::new_v4();
+    let object_id = object_id.unwrap_or_else(Uuid::new_v4);
+    if object_id.get_version_num() != 4 {
+        return Err(CliError::Usage(
+            "project-view create --id must be a UUID v4".to_owned(),
+        ));
+    }
     let object = create_input(object_type, object_id, read_json_value(data_path, "data")?)?;
     let event = match identity.schema {
         ProjectViewSchema::V1 => client
@@ -294,17 +316,20 @@ async fn cmd_create(
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
-    let receipt = parse_object_receipt(&raw, &event, object_id, false)?;
-    confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
-    println!(
-        "{}",
-        create_response_with_id(
-            &normalize_write_response(&raw),
-            "object_id",
-            &object_id.to_string()
-        )
-    );
-    Ok(())
+    let receipt = parse_object_receipt(&raw, &event, object_id, false, "create")?;
+    if identity.schema == ProjectViewSchema::V2 {
+        validate_v2_create_receipt(&receipt)?;
+    }
+    let projection = confirm_object_receipt(
+        client,
+        identity,
+        object_type,
+        object_id,
+        Some(&event),
+        &receipt,
+    )
+    .await?;
+    print_object_write_result(&event, "create", &receipt, projection.as_ref())
 }
 
 async fn cmd_update(
@@ -335,8 +360,8 @@ async fn cmd_update(
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
-    let receipt = parse_object_receipt(&raw, &event, object_id, false)?;
-    confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
+    let receipt = parse_object_receipt(&raw, &event, object_id, false, "update")?;
+    confirm_object_receipt(client, identity, object_type, object_id, None, &receipt).await?;
     println!("{}", normalize_write_response(&raw));
     Ok(())
 }
@@ -367,8 +392,8 @@ async fn cmd_delete(
         }
     };
     let raw = submit_mutation(client, event.clone()).await?;
-    let receipt = parse_object_receipt(&raw, &event, object_id, true)?;
-    confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
+    let receipt = parse_object_receipt(&raw, &event, object_id, true, "delete")?;
+    confirm_object_receipt(client, identity, object_type, object_id, None, &receipt).await?;
     println!("{}", normalize_write_response(&raw));
     Ok(())
 }
@@ -618,13 +643,19 @@ fn object_output(projection: &ObjectProjection, meta: &MetaProjection) -> Value 
     }
 }
 
-fn v2_object_output(entry: &ProjectViewEntry, meta: &V2MetaProjection) -> Value {
+fn v2_object_output(
+    entry: &ProjectViewEntry,
+    meta: &V2MetaProjection,
+    active: Option<&buzz_sdk::role_brief::RoleBriefObject>,
+) -> Value {
     match entry {
         ProjectViewEntry::Active(object) => json!({
             "project_revision": meta.project_revision,
             "projection_generation": meta.projection_generation,
             "deleted": false,
             "object": object,
+            "responsible_role_id": active.and_then(|value| value.responsible_role_id),
+            "projection_source": active.map(|value| &value.source),
         }),
         ProjectViewEntry::Tombstone(tombstone) => json!({
             "project_revision": meta.project_revision,
@@ -772,17 +803,38 @@ fn parse_object_receipt(
     event: &Event,
     expected_object_id: Uuid,
     expected_deleted: bool,
+    expected_operation: &str,
 ) -> Result<ProjectViewReceipt, CliError> {
     let receipt = parse_receipt(raw, event)?;
     if receipt.object_id != Some(expected_object_id)
-        || receipt.object_revision.is_none()
+        || receipt
+            .object_revision
+            .is_none_or(|object_revision| object_revision == 0)
         || receipt.deleted != Some(expected_deleted)
     {
         return Err(integrity_error(
             "mutation receipt does not match the requested object operation",
         ));
     }
+    if receipt
+        .operation
+        .as_deref()
+        .is_some_and(|value| value != expected_operation)
+    {
+        return Err(integrity_error(
+            "mutation receipt operation does not match the submitted command",
+        ));
+    }
     Ok(receipt)
+}
+
+fn validate_v2_create_receipt(receipt: &ProjectViewReceipt) -> Result<(), CliError> {
+    if receipt.project_revision == 0 || receipt.operation.as_deref() != Some("create") {
+        return Err(integrity_error(
+            "v2 create receipt has no canonical revision and create operation",
+        ));
+    }
+    Ok(())
 }
 
 async fn confirm_object_receipt(
@@ -790,8 +842,9 @@ async fn confirm_object_receipt(
     identity: ProjectViewIdentity,
     object_type: ProjectViewObjectType,
     object_id: Uuid,
+    expected_source: Option<&Event>,
     receipt: &ProjectViewReceipt,
-) -> Result<(), CliError> {
+) -> Result<Option<buzz_sdk::role_brief::RoleBriefObject>, CliError> {
     if identity.schema == ProjectViewSchema::V2 {
         let snapshot = read_verified_v2_snapshot(client, identity).await?;
         if snapshot.meta().project_revision < receipt.project_revision {
@@ -814,7 +867,18 @@ async fn confirm_object_receipt(
                 "v2 delete receipt was not confirmed by a tombstone projection",
             ));
         }
-        return Ok(());
+        let active = snapshot.active_object(object_id);
+        if let Some(event) = expected_source {
+            let active = active.as_ref().ok_or_else(|| {
+                integrity_error("successful v2 mutation has no active object source")
+            })?;
+            if active.source.change_id.to_hex() != event.id.to_hex() {
+                return Err(integrity_error(
+                    "v2 object projection source does not match the submitted event",
+                ));
+            }
+        }
+        return Ok(active);
     }
     let meta = read_meta(client, identity)
         .await?
@@ -839,7 +903,26 @@ async fn confirm_object_receipt(
             "delete receipt was not confirmed by a tombstone projection",
         ));
     }
-    Ok(())
+    Ok(None)
+}
+
+fn print_object_write_result(
+    event: &Event,
+    operation: &str,
+    receipt: &ProjectViewReceipt,
+    projection: Option<&buzz_sdk::role_brief::RoleBriefObject>,
+) -> Result<(), CliError> {
+    print_json(&json!({
+        "event_id": event.id.to_hex(),
+        "accepted": true,
+        "operation": receipt.operation.as_deref().unwrap_or(operation),
+        "object_id": receipt.object_id,
+        "object_revision": receipt.object_revision,
+        "deleted": receipt.deleted,
+        "accepted_project_revision": receipt.project_revision,
+        "responsible_role_id": projection.and_then(|value| value.responsible_role_id),
+        "projection_source": projection.map(|value| &value.source),
+    }))
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), CliError> {
@@ -924,6 +1007,38 @@ mod tests {
     use super::*;
 
     use crate::ProjectViewObjectTypeArg;
+
+    #[test]
+    fn v2_create_receipt_requires_exact_event_operation_and_revisions() {
+        let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "receipt fixture")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign receipt fixture");
+        let object_id = Uuid::new_v4();
+        let raw = json!({
+            "event_id": event.id.to_hex(),
+            "accepted": true,
+            "message": format!(
+                "response:{}",
+                json!({
+                    "project_revision": 7,
+                    "operation": "create",
+                    "object_id": object_id,
+                    "object_revision": 1,
+                    "deleted": false,
+                })
+            ),
+        })
+        .to_string();
+        let mut receipt = parse_object_receipt(&raw, &event, object_id, false, "create")
+            .expect("parse exact create receipt");
+        validate_v2_create_receipt(&receipt).expect("validate exact v2 create receipt");
+
+        receipt.project_revision = 0;
+        assert!(validate_v2_create_receipt(&receipt).is_err());
+        receipt.project_revision = 7;
+        receipt.operation = None;
+        assert!(validate_v2_create_receipt(&receipt).is_err());
+    }
 
     #[test]
     fn create_input_injects_cli_owned_identity() {

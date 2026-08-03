@@ -3037,8 +3037,11 @@ pub fn build_meeting_v2_action_block(
         reason_code,
         "project_view_v2_unavailable"
             | "assignee_unresolved"
+            | "assignee_mapping_changed"
             | "object_id_conflict"
             | "responsibility_conflict"
+            | "missing_dependency"
+            | "provenance_mismatch"
             | "provider_failure"
             | "affinity_lost"
             | "action_deadline_exceeded"

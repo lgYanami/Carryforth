@@ -497,6 +497,10 @@ impl MeetingCoordinator {
             || self.v1.has_pending()
     }
 
+    pub(crate) fn set_runtime_fence_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.v1.set_runtime_fence_path(path);
+    }
+
     pub(crate) fn pop_pending(&mut self) -> Option<MeetingTurnRequest> {
         if self.available_agent_slots == 0
             && !self.v1.front_uses_exact_slot(&self.exact_meeting_slots)

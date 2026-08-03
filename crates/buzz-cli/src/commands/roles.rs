@@ -11,7 +11,7 @@ use buzz_project_view::v2::{
 use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
 use buzz_sdk::role_brief::render_role_brief_markdown;
 use chrono::{Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -856,9 +856,117 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
         command.acting_assignment_id = current_assignment;
         command.runtime_fence = runtime_fence_from_env()?;
     }
+    let responsibility = match &command.request {
+        RoleCommandRequest::SetWorkResponsibility {
+            work_id,
+            responsible_role_id,
+        } => Some((*work_id, *responsible_role_id)),
+        _ => None,
+    };
     let event = client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?;
-    let response = client.submit_event(event).await?;
+    let response = client.submit_event(event.clone()).await?;
+    if let Some((work_id, responsible_role_id)) = responsibility {
+        return print_responsibility_write(
+            client,
+            identity,
+            &event,
+            &response,
+            work_id,
+            responsible_role_id,
+        )
+        .await;
+    }
     println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RoleWriteResponse {
+    event_id: String,
+    accepted: bool,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct ResponsibilityReceipt {
+    project_revision: u64,
+    operation: String,
+    changed_objects: Vec<ResponsibilityChangedObject>,
+}
+
+#[derive(Deserialize)]
+struct ResponsibilityChangedObject {
+    object_type: String,
+    object_id: Uuid,
+    object_revision: u64,
+    responsible_role_id: Option<Uuid>,
+}
+
+async fn print_responsibility_write(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    event: &nostr::Event,
+    raw: &str,
+    work_id: Uuid,
+    responsible_role_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    let response: RoleWriteResponse = serde_json::from_str(raw)
+        .map_err(|error| integrity_error(format!("invalid Role write response: {error}")))?;
+    if !response.accepted || response.event_id != event.id.to_hex() {
+        return Err(integrity_error(
+            "Role write response does not confirm the submitted event",
+        ));
+    }
+    let receipt: ResponsibilityReceipt = serde_json::from_str(
+        response
+            .message
+            .strip_prefix("response:")
+            .ok_or_else(|| integrity_error("Role write response has no canonical receipt"))?,
+    )
+    .map_err(|error| integrity_error(format!("invalid responsibility receipt: {error}")))?;
+    let changed = receipt
+        .changed_objects
+        .iter()
+        .find(|changed| changed.object_id == work_id)
+        .ok_or_else(|| {
+            integrity_error("responsibility receipt does not contain the target Work")
+        })?;
+    if receipt.project_revision == 0
+        || receipt.operation != "set_work_responsibility"
+        || receipt.changed_objects.len() != 1
+        || changed.object_type != "work"
+        || changed.responsible_role_id != responsible_role_id
+        || changed.object_revision == 0
+    {
+        return Err(integrity_error(
+            "responsibility receipt differs from the submitted operation",
+        ));
+    }
+    let snapshot = read_verified_v2_snapshot(client, identity).await?;
+    let work = snapshot.active_object(work_id).ok_or_else(|| {
+        integrity_error("accepted responsibility has no verified active Work projection")
+    })?;
+    if snapshot.meta().project_revision < receipt.project_revision
+        || work.responsible_role_id != responsible_role_id
+        || work.source.change_id.to_hex() != event.id.to_hex()
+    {
+        return Err(integrity_error(
+            "verified Work projection does not confirm the responsibility receipt",
+        ));
+    }
+    println!(
+        "{}",
+        json!({
+            "event_id": event.id.to_hex(),
+            "accepted": true,
+            "operation": receipt.operation,
+            "work_id": work_id,
+            "object_revision": changed.object_revision,
+            "responsible_role_id": responsible_role_id,
+            "accepted_project_revision": receipt.project_revision,
+            "projection_source": work.source,
+        })
+    );
     Ok(())
 }
 

@@ -88,8 +88,28 @@ pub(crate) async fn handle_mutation(
     let started = Instant::now();
     let telemetry = MutationTelemetry::from_content(&event.content);
     let event_id = event.id.to_hex();
+    let event_id_bytes = event.id.to_bytes();
     let actor_pubkey = event.pubkey.to_hex();
     let result = handle_mutation_inner(tenant, state, event, auth).await;
+    if let Some(error_code) = deterministic_meeting_attempt_error(&result) {
+        if let Err(error) = state
+            .db
+            .reject_meeting_action_project_event(
+                tenant.community(),
+                event_id_bytes.as_slice(),
+                error_code,
+                &state.relay_keypair,
+            )
+            .await
+        {
+            warn!(
+                community_host = %tenant.host(),
+                command_event_id = %event_id,
+                error = %error,
+                "could not persist deterministic Meeting action Project rejection"
+            );
+        }
+    }
     let result_code = mutation_result_code(&result);
     let committed_project_revision = committed_project_revision(&result);
 
@@ -141,6 +161,18 @@ pub(crate) async fn handle_mutation(
     }
 
     result
+}
+
+fn deterministic_meeting_attempt_error(
+    result: &Result<IngestResult, IngestError>,
+) -> Option<&'static str> {
+    match result {
+        Err(IngestError::Conflict(_)) => Some("revision_conflict"),
+        Err(IngestError::Rejected(_)) => Some("project_view_rejected"),
+        Err(IngestError::AuthFailed(_)) => Some("project_view_authorization"),
+        Err(IngestError::Unsupported(_)) => Some("project_view_unsupported"),
+        Ok(_) | Err(IngestError::Unavailable(_) | IngestError::Internal(_)) => None,
+    }
 }
 
 async fn handle_mutation_inner(
@@ -1040,6 +1072,9 @@ fn map_v2_write_error(error: ProjectViewV2WriteError) -> IngestError {
         }
         ProjectViewV2WriteError::Domain(error) => map_v2_domain_error(error),
         ProjectViewV2WriteError::ObjectDomain(error) => map_domain_error(error),
+        ProjectViewV2WriteError::Database(buzz_db::DbError::AccessDenied(_)) => {
+            IngestError::Conflict("conflict:project_view:meeting_action_fence".to_owned())
+        }
         ProjectViewV2WriteError::Database(error) => {
             IngestError::Internal(format!("error: Project View v2 database failure: {error}"))
         }
@@ -1204,9 +1239,17 @@ mod tests {
         });
         assert_eq!(mutation_result_code(&accepted), "accepted");
         assert_eq!(committed_project_revision(&accepted), Some(9));
+        assert_eq!(deterministic_meeting_attempt_error(&accepted), None);
 
         let conflict = Err(IngestError::Conflict("details".to_owned()));
         assert_eq!(mutation_result_code(&conflict), "conflict");
         assert_eq!(committed_project_revision(&conflict), None);
+        assert_eq!(
+            deterministic_meeting_attempt_error(&conflict),
+            Some("revision_conflict")
+        );
+
+        let unavailable = Err(IngestError::Unavailable("details".to_owned()));
+        assert_eq!(deterministic_meeting_attempt_error(&unavailable), None);
     }
 }

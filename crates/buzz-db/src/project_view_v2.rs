@@ -350,6 +350,7 @@ struct V2PreparedBasis {
     old_meta_projection_id: [u8; 32],
     old_projection_ids: BTreeMap<(RoleContinuityEntity, Uuid), [u8; 32]>,
     old_object_projection_ids: BTreeMap<Uuid, [u8; 32]>,
+    meeting_action: Option<crate::meeting_v2_actions::PreparedActionProjectEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +366,7 @@ struct V2PreparedProjectObjectBasis {
     old_meta_projection_id: [u8; 32],
     old_projection_ids: BTreeMap<Uuid, [u8; 32]>,
     old_entity_projection_ids: BTreeMap<(RoleContinuityEntity, Uuid), [u8; 32]>,
+    meeting_action: Option<crate::meeting_v2_actions::PreparedActionProjectEvent>,
 }
 
 impl std::fmt::Debug for ProjectViewV2WriteTx {
@@ -1865,6 +1867,13 @@ impl ProjectViewV2WriteTx {
         {
             return Ok(ProjectViewV2PrepareOutcome::Replayed(receipt));
         }
+        let meeting_action = crate::meeting_v2_actions::fence_prepared_project_event_tx(
+            &mut self.tx,
+            self.community_id,
+            command_event,
+            command.expected_project_revision,
+        )
+        .await?;
         let generated_ids = GeneratedRoleContinuityIds {
             assignment_id: Uuid::new_v4(),
             handoff_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
@@ -1950,6 +1959,7 @@ impl ProjectViewV2WriteTx {
             old_meta_projection_id: loaded.meta_projection_event_id,
             old_projection_ids,
             old_object_projection_ids,
+            meeting_action,
         });
         Ok(ProjectViewV2PrepareOutcome::Prepared(preparation))
     }
@@ -1988,6 +1998,13 @@ impl ProjectViewV2WriteTx {
         {
             return Ok(ProjectViewV2ProjectObjectPrepareOutcome::Replayed(receipt));
         }
+        let meeting_action = crate::meeting_v2_actions::fence_prepared_project_event_tx(
+            &mut self.tx,
+            self.community_id,
+            command_event,
+            command.expected_project_revision,
+        )
+        .await?;
 
         let mutation = command.as_reducer_mutation();
         let (next_state, outcome) =
@@ -2078,6 +2095,7 @@ impl ProjectViewV2WriteTx {
             load_old_projection_ids(&mut self.tx, self.community_id, &continuity_changes).await?;
 
         let receipt_result = project_object_receipt(
+            command,
             &outcome.changed_entries,
             &continuity_changes,
             outcome.project_revision,
@@ -2137,6 +2155,7 @@ impl ProjectViewV2WriteTx {
             old_meta_projection_id: loaded.meta_projection_event_id,
             old_projection_ids,
             old_entity_projection_ids,
+            meeting_action,
         });
         Ok(ProjectViewV2ProjectObjectPrepareOutcome::Prepared(
             preparation,
@@ -2361,6 +2380,15 @@ impl ProjectViewV2WriteTx {
             return Err(ProjectViewV2WriteError::InvalidCommit(
                 "active Commitment count differs from the prepared v2 state".to_owned(),
             ));
+        }
+        if let Some(meeting_action) = basis.meeting_action.as_ref() {
+            crate::meeting_v2_actions::accept_prepared_project_event_tx(
+                &mut self.tx,
+                meeting_action,
+                basis.preparation.project_revision,
+                basis.preparation.canonical_time,
+            )
+            .await?;
         }
 
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
@@ -2632,6 +2660,15 @@ impl ProjectViewV2WriteTx {
                     current: basis.preparation.project_revision.saturating_sub(1),
                 },
             ));
+        }
+        if let Some(meeting_action) = basis.meeting_action.as_ref() {
+            crate::meeting_v2_actions::accept_prepared_project_event_tx(
+                &mut self.tx,
+                meeting_action,
+                basis.preparation.project_revision,
+                basis.preparation.canonical_time,
+            )
+            .await?;
         }
 
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
@@ -3711,12 +3748,17 @@ async fn insert_change(
 }
 
 fn project_object_receipt(
+    command: &ProjectObjectCommand,
     entries: &[ProjectViewEntry],
     continuity_changes: &[RoleContinuityChange],
     project_revision: u64,
 ) -> Value {
     let mut result = serde_json::Map::new();
     result.insert("project_revision".to_owned(), Value::from(project_revision));
+    result.insert(
+        "operation".to_owned(),
+        Value::String(command.operation().to_owned()),
+    );
     if let [entry] = entries {
         result.insert(
             "object_id".to_owned(),

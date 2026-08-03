@@ -1985,6 +1985,7 @@ async fn tokio_main(
         observer.clone(),
         config.agents as usize,
     );
+    meeting_controller.set_runtime_fence_path(config.runtime_fence_path.clone());
     pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
     pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
     meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());

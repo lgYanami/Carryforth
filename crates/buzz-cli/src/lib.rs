@@ -425,7 +425,7 @@ pub enum ProjectViewCmd {
         #[arg(long, required = true)]
         goal: Vec<String>,
     },
-    /// Create one typed object with a CLI-generated UUID v4
+    /// Create one typed object
     Create {
         /// Object type to create (the project profile is not creatable here).
         #[arg(value_enum)]
@@ -433,6 +433,9 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
+        /// Explicit UUID v4; omitted to generate a fresh ID.
+        #[arg(long)]
+        id: Option<Uuid>,
         /// JSON file containing the typed object body and relations, or `-`.
         #[arg(long)]
         data: String,
@@ -1515,11 +1518,63 @@ pub enum MeetingsCmd {
     },
 }
 
-/// Meeting V2 action-finalization operations available in stage one.
+/// Meeting V2 action-finalization operations.
 #[derive(Subcommand)]
 pub enum MeetingActionsCmd {
     /// Read the Relay-authoritative action run and close-gate progress
     Status {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Enter action finalization from the completed final Board
+    Begin {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Freeze a validated technical action plan from a JSON file
+    Plan {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Path to a MeetingV2ActionPlan JSON document; use '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Execute and verify the next unapplied Project View step
+    Apply {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Durably block the current action run with a closed reason code
+    Block {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Stable materializer failure category
+        #[arg(long)]
+        reason_code: String,
+        /// Optional bounded diagnostic
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Open a fresh execution window for a blocked action run
+    Retry {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Verify all action projections and make the run ready to close
+    Complete {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+    },
+    /// Return a zero-effect action run to Board maintenance
+    #[command(name = "return-to-board")]
+    ReturnToBoard {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,

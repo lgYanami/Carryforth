@@ -3169,6 +3169,7 @@ mod tests {
     };
     use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+    use serde_json::json;
     use sqlx::PgPool;
 
     use crate::project_view_v2::{
@@ -3485,6 +3486,16 @@ mod tests {
             .expect("build v2 Role command")
             .sign_with_keys(actor)
             .expect("sign v2 Role command");
+        commit_v2_role_event_for_test(db, community_id, relay, command_event, command).await
+    }
+
+    async fn commit_v2_role_event_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        relay: &Keys,
+        command_event: Event,
+        command: RoleCommand,
+    ) -> ProjectViewV2CommitOutcome {
         let mut write = db
             .begin_project_view_v2_write(community_id)
             .await
@@ -3618,6 +3629,16 @@ mod tests {
             .expect("build v2 Project object command")
             .sign_with_keys(actor)
             .expect("sign v2 Project object command");
+        commit_v2_object_event_for_test(db, community_id, relay, command_event, command).await
+    }
+
+    async fn commit_v2_object_event_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        relay: &Keys,
+        command_event: Event,
+        command: ProjectObjectCommand,
+    ) -> ProjectViewV2CommitOutcome {
         let mut write = db
             .begin_project_view_v2_write(community_id)
             .await
@@ -3719,6 +3740,121 @@ mod tests {
             })
             .await
             .expect("commit v2 Project object command")
+    }
+
+    async fn seed_action_meeting_for_project_write(
+        pool: &PgPool,
+        community_id: CommunityId,
+        moderator: &Keys,
+        session_id: Uuid,
+        action_run_id: Uuid,
+        plan_event_id: &[u8],
+    ) {
+        sqlx::query(
+            "INSERT INTO channels \
+                 (id, community_id, name, channel_type, visibility, created_by, max_members, room_kind) \
+             VALUES ($1, $2, $3, 'stream', 'private', $4, 50, 'meeting')",
+        )
+        .bind(session_id)
+        .bind(community_id.as_uuid())
+        .bind(format!("meeting-{session_id}"))
+        .bind(moderator.public_key().as_bytes())
+        .execute(pool)
+        .await
+        .expect("seed action Meeting channel");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, schema_version, \
+                  status, floor_policy_version, moderator_pubkey) \
+             VALUES ($1, $2, $3, $4, 3, 'active', 'moderated-board-actions-v1', $4)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(vec![0x41_u8; 32])
+        .bind(moderator.public_key().as_bytes())
+        .execute(pool)
+        .await
+        .expect("seed action Meeting session");
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_runs \
+                 (community_id, session_id, action_run_id, begin_event_id, plan_event_id, \
+                  board_event_id, control_epoch, board_window, action_window_epoch, \
+                  action_phase, action_condition, action_deadline_at, plan_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, 1, 1, 1, \
+                     'applying', 'runnable', clock_timestamp() + interval '5 minutes', '{}'::jsonb)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(vec![0x42_u8; 32])
+        .bind(plan_event_id)
+        .bind(vec![0x43_u8; 32])
+        .execute(pool)
+        .await
+        .expect("seed active Meeting action run");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_prepared_action_project_event(
+        pool: &PgPool,
+        community_id: CommunityId,
+        session_id: Uuid,
+        action_run_id: Uuid,
+        step_id: Uuid,
+        step_order: i32,
+        step_kind: &str,
+        payload: Value,
+        action_id: Option<Uuid>,
+        assignee_pubkey: Option<&[u8]>,
+        resolved_role_id: Option<Uuid>,
+        resolved_assignment_id: Option<Uuid>,
+        target_object_id: Uuid,
+        expected_project_revision: u64,
+        event: &Event,
+    ) {
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_steps \
+                 (community_id, session_id, action_run_id, action_id, step_id, step_order, \
+                  step_kind, desired_payload, assignee_pubkey, resolved_role_id, \
+                  resolved_assignment_id, target_object_type, target_object_id, \
+                  status, attempt_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     CASE WHEN $7 = 'project_view.create_requirement' \
+                          THEN 'requirement' ELSE 'work' END, \
+                     $12, 'prepared', 1)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(action_id)
+        .bind(step_id)
+        .bind(step_order)
+        .bind(step_kind)
+        .bind(payload)
+        .bind(assignee_pubkey)
+        .bind(resolved_role_id)
+        .bind(resolved_assignment_id)
+        .bind(target_object_id)
+        .execute(pool)
+        .await
+        .expect("seed prepared Meeting action step");
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_step_attempts \
+                 (community_id, session_id, action_run_id, step_id, action_window_epoch, \
+                  attempt_number, project_command_event_id, signed_project_event, \
+                  expected_project_revision, status) \
+             VALUES ($1, $2, $3, $4, 1, 1, $5, $6, $7, 'prepared')",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(step_id)
+        .bind(event.id.as_bytes().as_slice())
+        .bind(serde_json::to_value(event).expect("serialize prepared Project event"))
+        .bind(i64::try_from(expected_project_revision).expect("test revision fits i64"))
+        .execute(pool)
+        .await
+        .expect("seed prepared Meeting action attempt");
     }
 
     async fn reject_v2_role_for_test(
@@ -6274,6 +6410,381 @@ mod tests {
         assert!(snapshot.membership().members.iter().any(|member| {
             member.pubkey == leader.public_key() && member.role == CommunityMemberRole::Admin
         }));
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn meeting_action_project_writes_accept_atomically_and_replay_after_terminal() {
+        let scratch = ScratchDatabase::create("buzz_meeting_action_project_write").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let moderator = Keys::generate();
+        let relay = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap Project owner");
+        db.add_relay_member(
+            community_id,
+            &moderator.public_key().to_hex(),
+            "admin",
+            Some(&owner.public_key().to_hex()),
+        )
+        .await
+        .expect("add moderator as existing admin");
+        initialize(&db, community_id, &owner, &relay).await;
+        let role_id = Uuid::new_v4();
+        commit_for_test(
+            &db,
+            community_id,
+            &owner,
+            &relay,
+            create_role_mutation(1, role_id, "Meeting action owner"),
+        )
+        .await;
+        db.set_project_view_enabled(community_id, false)
+            .await
+            .expect("pause Project View before v2 cutover");
+        let audit = buzz_audit::AuditService::new(scratch.pool.clone());
+        let cutover_audit = audit
+            .log(buzz_audit::NewAuditEntry {
+                community_id,
+                action: buzz_audit::AuditAction::ProjectViewCutover,
+                actor_pubkey: Some(owner.public_key().to_bytes().to_vec()),
+                object_id: Some(community_id.to_string()),
+                detail: json!({"test": "Meeting action atomic Project writes"}),
+            })
+            .await
+            .expect("append Project v2 cutover audit fact");
+        let cutover = db
+            .cutover_project_view_v2(
+                community_id,
+                &ProjectViewV2CutoverPlan {
+                    admin_assignments: vec![ProjectViewV2AdminAssignment {
+                        member_pubkey: moderator.public_key(),
+                        role_id,
+                    }],
+                    downgraded_admins: Vec::new(),
+                    audit_seq: cutover_audit.seq,
+                    idempotency_key_hash: [0x64; 32],
+                },
+                &relay,
+            )
+            .await
+            .expect("cut Project View over to v2");
+        db.set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()))
+            .await
+            .expect("enable Project View v2 after cutover");
+        let assignment_id: Uuid = sqlx::query_scalar(
+            "SELECT assignment_id FROM project_role_assignments \
+             WHERE community_id = $1 AND role_id = $2 \
+               AND member_pubkey = $3 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(role_id)
+        .bind(moderator.public_key().to_hex())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read moderator active Assignment");
+
+        let session_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
+        let plan_event_id = vec![0x44_u8; 32];
+        seed_action_meeting_for_project_write(
+            &scratch.pool,
+            community_id,
+            &moderator,
+            session_id,
+            action_run_id,
+            &plan_event_id,
+        )
+        .await;
+
+        let action_id = Uuid::new_v4();
+        let requirement_id = Uuid::new_v4();
+        let requirement_command = ProjectObjectCommand::new(
+            cutover.project_revision,
+            None,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Requirement {
+                    id: requirement_id,
+                    title: "Accepted Meeting design".to_owned(),
+                    description: "Accepted Meeting design".to_owned(),
+                    status: RequirementStatus::Ready,
+                    priority: Priority::Normal,
+                    planned_in_stage_id: None,
+                },
+            }),
+        );
+        let requirement_event = build_project_object_command(requirement_command.clone())
+            .expect("build Meeting Requirement command")
+            .sign_with_keys(&moderator)
+            .expect("sign Meeting Requirement command");
+        let requirement_step_id = Uuid::new_v4();
+        seed_prepared_action_project_event(
+            &scratch.pool,
+            community_id,
+            session_id,
+            action_run_id,
+            requirement_step_id,
+            1,
+            "project_view.create_requirement",
+            json!({"title": "Accepted Meeting design"}),
+            None,
+            None,
+            None,
+            None,
+            requirement_id,
+            cutover.project_revision,
+            &requirement_event,
+        )
+        .await;
+        let requirement_outcome = commit_v2_object_event_for_test(
+            &db,
+            community_id,
+            &relay,
+            requirement_event.clone(),
+            requirement_command.clone(),
+        )
+        .await;
+
+        let work_id = Uuid::new_v4();
+        let work_command = ProjectObjectCommand::new(
+            requirement_outcome.receipt.project_revision,
+            None,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Work {
+                    id: work_id,
+                    title: "Implement the Meeting design".to_owned(),
+                    description: "Implement the Meeting design".to_owned(),
+                    status: WorkStatus::Pending,
+                    priority: Priority::Normal,
+                    handles: ObjectRef {
+                        object_type: ProjectViewObjectType::Requirement,
+                        object_id: requirement_id,
+                    },
+                },
+            }),
+        );
+        let work_event = build_project_object_command(work_command.clone())
+            .expect("build Meeting Work command")
+            .sign_with_keys(&moderator)
+            .expect("sign Meeting Work command");
+        seed_prepared_action_project_event(
+            &scratch.pool,
+            community_id,
+            session_id,
+            action_run_id,
+            Uuid::new_v4(),
+            2,
+            "project_view.create_work",
+            json!({
+                "title": "Implement the Meeting design",
+                "requirement_id": requirement_id,
+            }),
+            Some(action_id),
+            Some(moderator.public_key().as_bytes()),
+            Some(role_id),
+            Some(assignment_id),
+            work_id,
+            requirement_outcome.receipt.project_revision,
+            &work_event,
+        )
+        .await;
+        let work_outcome = commit_v2_object_event_for_test(
+            &db,
+            community_id,
+            &relay,
+            work_event.clone(),
+            work_command,
+        )
+        .await;
+
+        let responsibility_command = RoleCommand::new(
+            work_outcome.receipt.project_revision,
+            Some(assignment_id),
+            RoleCommandRequest::SetWorkResponsibility {
+                work_id,
+                responsible_role_id: Some(role_id),
+            },
+        );
+        let responsibility_event = build_role_command(responsibility_command.clone())
+            .expect("build Meeting responsibility command")
+            .sign_with_keys(&moderator)
+            .expect("sign Meeting responsibility command");
+        seed_prepared_action_project_event(
+            &scratch.pool,
+            community_id,
+            session_id,
+            action_run_id,
+            Uuid::new_v4(),
+            3,
+            "project_view.set_work_responsibility",
+            json!({}),
+            Some(action_id),
+            Some(moderator.public_key().as_bytes()),
+            Some(role_id),
+            Some(assignment_id),
+            work_id,
+            work_outcome.receipt.project_revision,
+            &responsibility_event,
+        )
+        .await;
+        let responsibility_outcome = commit_v2_role_event_for_test(
+            &db,
+            community_id,
+            &relay,
+            responsibility_event.clone(),
+            responsibility_command,
+        )
+        .await;
+
+        let accepted_attempts: Vec<(Vec<u8>, String, Option<i64>)> = sqlx::query_as(
+            "SELECT project_command_event_id, status, accepted_project_revision \
+             FROM meeting_v2_action_step_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+             ORDER BY accepted_project_revision",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .fetch_all(&scratch.pool)
+        .await
+        .expect("read atomically accepted Meeting attempts");
+        assert_eq!(accepted_attempts.len(), 3);
+        assert!(accepted_attempts
+            .iter()
+            .all(|(_, status, revision)| { status == "accepted" && revision.is_some() }));
+        let work_projection: (Option<Uuid>, Vec<u8>, Option<Uuid>, Option<String>) =
+            sqlx::query_as(
+                "SELECT responsible_role_id, source_event_id, handles_object_id, \
+                        handles_object_type \
+                 FROM project_view_objects \
+                 WHERE community_id = $1 AND object_id = $2 AND deleted_at IS NULL",
+            )
+            .bind(community_id.as_uuid())
+            .bind(work_id)
+            .fetch_one(&scratch.pool)
+            .await
+            .expect("read materialized Work projection");
+        assert_eq!(work_projection.0, Some(role_id));
+        assert_eq!(work_projection.1, responsibility_event.id.as_bytes());
+        assert_eq!(work_projection.2, Some(requirement_id));
+        assert_eq!(work_projection.3.as_deref(), Some("requirement"));
+
+        sqlx::query(
+            "UPDATE meeting_v2_action_runs \
+             SET terminal_status = 'returned_to_board', terminal_at = clock_timestamp(), \
+                 action_deadline_at = NULL, updated_at = clock_timestamp() \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .execute(&scratch.pool)
+        .await
+        .expect("terminate Meeting action run");
+        let mut replay = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin accepted exact replay");
+        assert!(matches!(
+            replay
+                .prepare_project_object_command(&requirement_event, &requirement_command)
+                .await
+                .expect("accepted exact event still replays"),
+            ProjectViewV2ProjectObjectPrepareOutcome::Replayed(receipt)
+                if receipt.change_id == requirement_event.id.to_bytes()
+        ));
+        replay.rollback().await.expect("rollback replay read");
+
+        let late_requirement_id = Uuid::new_v4();
+        let late_command = ProjectObjectCommand::new(
+            responsibility_outcome.receipt.project_revision,
+            None,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Requirement {
+                    id: late_requirement_id,
+                    title: "Late Requirement".to_owned(),
+                    description: "Must not cross the terminal fence".to_owned(),
+                    status: RequirementStatus::Ready,
+                    priority: Priority::Normal,
+                    planned_in_stage_id: None,
+                },
+            }),
+        );
+        let late_event = build_project_object_command(late_command.clone())
+            .expect("build late Project command")
+            .sign_with_keys(&moderator)
+            .expect("sign late Project command");
+        let late_step_id = Uuid::new_v4();
+        seed_prepared_action_project_event(
+            &scratch.pool,
+            community_id,
+            session_id,
+            action_run_id,
+            late_step_id,
+            4,
+            "project_view.create_requirement",
+            json!({"title": "Late Requirement"}),
+            None,
+            None,
+            None,
+            None,
+            late_requirement_id,
+            responsibility_outcome.receipt.project_revision,
+            &late_event,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE meeting_v2_action_steps SET status = 'abandoned' \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 AND step_id = $4",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(late_step_id)
+        .execute(&scratch.pool)
+        .await
+        .expect("abandon late Meeting step");
+        sqlx::query(
+            "UPDATE meeting_v2_action_step_attempts SET status = 'abandoned' \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 AND step_id = $4",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(late_step_id)
+        .execute(&scratch.pool)
+        .await
+        .expect("abandon late Meeting attempt");
+        let mut late_write = db
+            .begin_project_view_v2_write(community_id)
+            .await
+            .expect("begin late Project command");
+        assert!(matches!(
+            late_write
+                .prepare_project_object_command(&late_event, &late_command)
+                .await,
+            Err(ProjectViewV2WriteError::Database(DbError::AccessDenied(_)))
+        ));
+        late_write
+            .rollback()
+            .await
+            .expect("rollback rejected late command");
+        let late_change_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM project_view_changes \
+             WHERE community_id = $1 AND change_id = $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(late_event.id.as_bytes().as_slice())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("check rejected late Project command");
+        assert!(!late_change_exists);
 
         scratch.cleanup().await;
     }
