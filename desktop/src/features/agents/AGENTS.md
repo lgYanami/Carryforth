@@ -102,6 +102,16 @@ with a TypeScript lookup table or an id comparison in a component.
    Edit. In Edit,
    selecting Custom command keeps its required command field beside the harness
    picker rather than hiding it in Advanced.
+10. **Runtime supervision is diagnostic, not Agent readiness.** Keep the
+    harness lifecycle (`ready`/`failed`/etc.) separate from the optional
+    Runtime-supervision state. Missing, locked, mismatched, expired, or
+    unavailable Supervisor configuration must remain visible as a degraded
+    supervision status without turning the Agent runtime into `failed` or
+    blocking chat/Role commands. Supervisor private keys stay in the native
+    Desktop → trusted ACP boundary; frontend state and observer payloads may
+    contain only public coordinates. When an operator action needs a relay
+    host, preserve the live connection URL (`localhost` included) rather than
+    substituting the canonical process-dedup URL.
 
 ## The tests that enforce this
 

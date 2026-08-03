@@ -1420,6 +1420,7 @@ async fn tokio_main(
 
     let role_brief_reader =
         role_brief::RoleBriefResolver::new(relay.rest_client(), config.keys.public_key());
+    let runtime_start_nonce = std::env::var(MANAGED_AGENT_START_NONCE_ENV).unwrap_or_default();
     let runtime_supervision_configured = runtime_supervisor_config.is_some();
     let mut runtime_supervisor = runtime_supervisor::RuntimeSupervisorCoordinator::new(
         runtime_supervisor_config,
@@ -1427,6 +1428,8 @@ async fn tokio_main(
         config.keys.public_key(),
         config.relay_url.clone(),
         role_brief_reader.lifecycle_gate(),
+        observer.clone(),
+        runtime_start_nonce.clone(),
     );
     config.runtime_fence_path = runtime_supervisor.fence_path();
     runtime_supervisor
@@ -1451,16 +1454,10 @@ async fn tokio_main(
             "managed Agent startup Role context resolved"
         ),
     }
-    if startup_role_context.error_code.is_some() && runtime_supervision_configured {
-        return Err(anyhow::anyhow!(
-            "Runtime supervision requires a verified startup Role context; \
-             persisted state was left untouched"
-        ));
-    }
     runtime_supervisor
         .prepare_startup(startup_role_context.assignment_id)
         .await
-        .map_err(|error| anyhow::anyhow!("Runtime supervision failed closed: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Runtime maintenance admission failed: {error}"))?;
     let (runtime_supervisor, runtime_supervisor_task) = runtime_supervisor.spawn();
     let mut maintenance_rx = runtime_supervisor.maintenance_receiver();
     let role_brief_resolver = role_brief_reader
@@ -1636,7 +1633,6 @@ async fn tokio_main(
         ));
     }
 
-    let runtime_start_nonce = std::env::var(MANAGED_AGENT_START_NONCE_ENV).unwrap_or_default();
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);

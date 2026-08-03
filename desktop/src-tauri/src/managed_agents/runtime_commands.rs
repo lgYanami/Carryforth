@@ -57,6 +57,16 @@ fn status_for_with(
     let metadata = super::known_acp_runtime(&command);
     let effective = resolve_effective_agent_env(record, personas, metadata, global);
     let local_setup = matches!(agent_readiness(&effective), AgentReadiness::Ready);
+    let supervision = app
+        .state::<AppState>()
+        .managed_agent_supervision_statuses
+        .lock()
+        .ok()
+        .and_then(|statuses| statuses.get(key).cloned())
+        .map(|mut status| {
+            status.stale = runtime.is_none();
+            status
+        });
     ManagedAgentRuntimeStatus {
         pubkey: key.pubkey.clone(),
         relay_url: key.relay_url.clone(),
@@ -70,6 +80,7 @@ fn status_for_with(
         log_path: managed_agent_runtime_log_path(app, key)
             .ok()
             .map(|path| path.display().to_string()),
+        supervision,
     }
 }
 
@@ -95,6 +106,16 @@ fn observer_lifecycle_key(
     }
     if payload.lifecycle != ManagedAgentRuntimeLifecycle::Failed && payload.error.is_some() {
         return Err("lifecycle error is only valid for failed".into());
+    }
+    ManagedAgentRuntimeKey::new(payload.pubkey.clone(), &payload.relay_url)
+}
+
+fn observer_supervision_key(
+    outer_pubkey: &str,
+    payload: &super::ManagedAgentRuntimeSupervisionObserverPayload,
+) -> Result<ManagedAgentRuntimeKey, String> {
+    if !outer_pubkey.eq_ignore_ascii_case(&payload.pubkey) {
+        return Err("observer signer does not match supervision payload pubkey".to_owned());
     }
     ManagedAgentRuntimeKey::new(payload.pubkey.clone(), &payload.relay_url)
 }
@@ -132,6 +153,91 @@ pub fn put_managed_agent_runtime_lifecycle(
     }
     runtime.lifecycle = payload.lifecycle;
     runtime.error = payload.error;
+    let status = status_for(&app, record, &key, Some(runtime), None);
+    emit_status(&app, &status);
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn put_managed_agent_runtime_supervision(
+    outer_pubkey: String,
+    payload: super::ManagedAgentRuntimeSupervisionObserverPayload,
+    app: AppHandle,
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    let key = observer_supervision_key(&outer_pubkey, &payload)?;
+    let state = app.state::<AppState>();
+    let records = load_managed_agents(&app)?;
+    let record = records
+        .iter()
+        .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
+        .ok_or_else(|| format!("agent {} not found", key.pubkey))?;
+    let mut runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let runtime = runtimes
+        .get_mut(&key)
+        .ok_or_else(|| "supervision frame does not match a tracked runtime pair".to_owned())?;
+    if runtime.start_nonce != payload.start_nonce {
+        return Err("supervision frame does not match the current harness generation".to_owned());
+    }
+    if runtime
+        .child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("supervision frame arrived after process exit".to_owned());
+    }
+
+    let observed_at = chrono::DateTime::parse_from_rfc3339(&payload.observed_at)
+        .map_err(|error| format!("invalid supervision observedAt: {error}"))?;
+    let mut supervision = state
+        .managed_agent_supervision_statuses
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(previous) = supervision.get(&key) {
+        if let Ok(previous_at) = chrono::DateTime::parse_from_rfc3339(&previous.observed_at) {
+            if previous_at > observed_at
+                && previous.detail_code.as_deref() != Some("awaiting_observer")
+            {
+                return Err("stale Runtime supervision frame".to_owned());
+            }
+        }
+    }
+    let local_supervisor_pubkey = supervision
+        .get(&key)
+        .and_then(|status| status.local_supervisor_pubkey.clone());
+    let identity_source = supervision
+        .get(&key)
+        .and_then(|status| status.identity_source);
+    let identity_availability = supervision
+        .get(&key)
+        .and_then(|status| status.identity_availability);
+    let identity_detail_code = supervision
+        .get(&key)
+        .and_then(|status| status.identity_detail_code.clone());
+    supervision.insert(
+        key.clone(),
+        super::ManagedAgentRuntimeSupervisionStatus {
+            state: payload.state,
+            connection_relay_url: Some(payload.relay_url),
+            assignment_id: payload.assignment_id,
+            binding_id: payload.binding_id,
+            supervisor_pubkey: payload.supervisor_pubkey,
+            local_supervisor_pubkey,
+            identity_availability,
+            identity_source,
+            identity_detail_code,
+            runtime_id: payload.runtime_id,
+            runtime_epoch: payload.runtime_epoch,
+            lease_expires_at: payload.lease_expires_at,
+            detail_code: payload.detail_code,
+            observed_at: payload.observed_at,
+            stale: false,
+        },
+    );
+    drop(supervision);
     let status = status_for(&app, record, &key, Some(runtime), None);
     emit_status(&app, &status);
     Ok(status)
@@ -443,6 +549,7 @@ fn unkeyable_failed_status(
         pid: None,
         error: Some(error),
         log_path: None,
+        supervision: None,
     }
 }
 
@@ -712,5 +819,28 @@ mod tests {
             Some("unexpected"),
         );
         assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
+    }
+
+    #[test]
+    fn observer_supervision_rejects_cross_agent_and_preserves_connection_url() {
+        let payload = super::super::ManagedAgentRuntimeSupervisionObserverPayload {
+            pubkey: "aa".repeat(32),
+            relay_url: "ws://localhost:3000".to_owned(),
+            start_nonce: "test-generation".to_owned(),
+            state: super::super::ManagedAgentRuntimeSupervisionState::Disabled,
+            assignment_id: None,
+            binding_id: None,
+            supervisor_pubkey: None,
+            runtime_id: None,
+            runtime_epoch: None,
+            lease_expires_at: None,
+            detail_code: None,
+            observed_at: "2026-08-03T00:00:00Z".to_owned(),
+        };
+        assert!(observer_supervision_key(&"bb".repeat(32), &payload).is_err());
+        let key = observer_supervision_key(&payload.pubkey, &payload)
+            .expect("matching observer supervision payload");
+        assert_eq!(key.relay_url, "ws://127.0.0.1:3000");
+        assert_eq!(payload.relay_url, "ws://localhost:3000");
     }
 }

@@ -324,20 +324,18 @@ fn cached_resolution(
 #[derive(Debug)]
 enum ResolutionFailure {
     Project(String),
-    Runtime(String),
 }
 
 impl ResolutionFailure {
     const fn code(&self) -> &'static str {
         match self {
             Self::Project(_) => "project_view_unavailable",
-            Self::Runtime(_) => "runtime_supervision_unavailable",
         }
     }
 
     fn detail(&self) -> &str {
         match self {
-            Self::Project(detail) | Self::Runtime(detail) => detail,
+            Self::Project(detail) => detail,
         }
     }
 }
@@ -450,12 +448,42 @@ impl RoleBriefResolver {
     pub async fn resolve_bounded(&self, refresh: RoleContextRefresh) -> RoleContextResolution {
         let deadline = tokio::time::Instant::now() + ROLE_BRIEF_TIMEOUT;
         match self.resolve_before(deadline, refresh).await {
-            Ok(resolution) => resolution,
+            Ok(mut resolution) => {
+                self.append_runtime_note(&mut resolution);
+                resolution
+            }
             Err(failure) => {
                 self.suspend_runtime().await;
                 RoleContextResolution::unavailable(failure.code(), failure.detail())
             }
         }
+    }
+
+    fn append_runtime_note(&self, resolution: &mut RoleContextResolution) {
+        let Some(supervisor) = &self.runtime_supervisor else {
+            return;
+        };
+        let status = supervisor.current_supervision_status();
+        let mut coordinates = Vec::new();
+        if let Some(assignment_id) = status.assignment_id {
+            coordinates.push(format!("Assignment `{assignment_id}`"));
+        }
+        if let Some(binding_id) = status.binding_id {
+            coordinates.push(format!("binding `{binding_id}`"));
+        }
+        if let (Some(runtime_id), Some(runtime_epoch)) = (status.runtime_id, status.runtime_epoch) {
+            coordinates.push(format!("Runtime `{runtime_id}` epoch `{runtime_epoch}`"));
+        }
+        let coordinates = if coordinates.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", coordinates.join(", "))
+        };
+        resolution.markdown.push_str(&format!(
+            "\n\n## Runtime supervision\n\nState: `{}`{}. Runtime supervision is operational telemetry; Community and active Assignment authority govern ordinary Project/Role writes.\n",
+            status.state.as_str(),
+            coordinates,
+        ));
     }
 
     async fn resolve_before(
@@ -613,14 +641,20 @@ impl RoleBriefResolver {
         let Some(supervisor) = &self.runtime_supervisor else {
             return Ok(());
         };
-        tokio::time::timeout_at(deadline, supervisor.reconcile(assignment_id))
-            .await
-            .map_err(|_| {
-                ResolutionFailure::Runtime(
-                    "Runtime supervision reconciliation timed out".to_owned(),
-                )
-            })?
-            .map_err(ResolutionFailure::Runtime)
+        match tokio::time::timeout_at(deadline, supervisor.reconcile(assignment_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    "Runtime supervision reconciliation failed without invalidating Role context: {error}"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Runtime supervision reconciliation timed out without invalidating Role context"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn suspend_runtime(&self) {

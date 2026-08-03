@@ -14,7 +14,13 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::huddle::HuddleState;
 use crate::managed_agents::config_bridge::SessionConfigCache;
-use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
+use crate::managed_agents::{
+    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeSupervisionStatus,
+};
+
+mod key_file;
+pub(crate) use key_file::save_key_file;
+
 pub struct AppState {
     pub keys: Mutex<Keys>,
     pub http_client: reqwest::Client,
@@ -47,6 +53,10 @@ pub struct AppState {
     pub managed_agents_store_lock: Mutex<()>,
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
+    /// Secret-free last-known Runtime supervision diagnostics per Agent/Relay
+    /// pair. The pair key prevents cross-Community status leakage.
+    pub managed_agent_supervision_statuses:
+        Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentRuntimeSupervisionStatus>>,
     pub huddle_state: Mutex<HuddleState>,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
@@ -209,6 +219,7 @@ pub fn build_app_state() -> AppState {
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
+        managed_agent_supervision_statuses: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         app_handle: Mutex::new(None),
@@ -1039,40 +1050,6 @@ fn load_key_file(path: &std::path::Path) -> Result<Keys, String> {
         return Err("empty identity.key".to_string());
     }
     Keys::parse(trimmed).map_err(|e| format!("parse identity.key: {e}"))
-}
-
-/// Atomically write the key to disk. Uses `atomic-write-file` which:
-/// 1. Writes to a temp file in the same directory
-/// 2. Calls fsync on the file
-/// 3. Renames temp → target (atomic on POSIX, best-effort on Windows)
-/// 4. Calls fsync on the parent directory
-///
-/// On Unix, the file is created with mode 0600 (owner read/write only).
-/// On Windows, default ACLs apply — the app data directory is already
-/// per-user, so the key is not world-readable in practice.
-pub(crate) fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), String> {
-    use atomic_write_file::AtomicWriteFile;
-
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .map_err(|e| format!("encode nsec: {e}"))?;
-
-    let mut file = AtomicWriteFile::open(path)
-        .map_err(|e| format!("open identity.key for atomic write: {e}"))?;
-
-    // Set owner-only permissions before writing the secret.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set identity.key permissions: {e}"))?;
-    }
-
-    file.write_all(nsec.as_bytes())
-        .map_err(|e| format!("write identity.key: {e}"))?;
-    file.commit()
-        .map_err(|e| format!("commit identity.key: {e}"))
 }
 
 #[cfg(test)]

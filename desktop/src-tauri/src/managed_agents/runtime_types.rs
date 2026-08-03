@@ -42,6 +42,67 @@ pub enum ManagedAgentRuntimeLifecycle {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedAgentRuntimeSupervisionState {
+    NotApplicable,
+    Disabled,
+    AwaitingBinding,
+    Starting,
+    Active,
+    Recovering,
+    DegradedMissingKey,
+    DegradedMismatch,
+    Expired,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedAgentRuntimeSupervisionStatus {
+    pub state: ManagedAgentRuntimeSupervisionState,
+    /// Exact relay URL used by the live harness. This stays separate from the
+    /// canonical process key so host-scoped operator commands do not silently
+    /// rewrite `localhost` to `127.0.0.1`.
+    pub connection_relay_url: Option<String>,
+    pub assignment_id: Option<uuid::Uuid>,
+    pub binding_id: Option<uuid::Uuid>,
+    pub supervisor_pubkey: Option<String>,
+    pub local_supervisor_pubkey: Option<String>,
+    pub identity_availability: Option<super::RuntimeSupervisorIdentityAvailability>,
+    pub identity_source: Option<super::RuntimeSupervisorIdentitySource>,
+    pub identity_detail_code: Option<String>,
+    pub runtime_id: Option<uuid::Uuid>,
+    pub runtime_epoch: Option<u64>,
+    pub lease_expires_at: Option<String>,
+    pub detail_code: Option<String>,
+    pub observed_at: String,
+    pub stale: bool,
+}
+
+impl ManagedAgentRuntimeSupervisionStatus {
+    pub fn awaiting_observer(identity: Option<&super::RuntimeSupervisorIdentityStatus>) -> Self {
+        Self {
+            state: ManagedAgentRuntimeSupervisionState::Unknown,
+            connection_relay_url: None,
+            assignment_id: None,
+            binding_id: None,
+            supervisor_pubkey: None,
+            local_supervisor_pubkey: identity.and_then(|status| status.public_key.clone()),
+            identity_availability: identity.map(|status| status.availability),
+            identity_source: identity.and_then(|status| status.source),
+            identity_detail_code: identity.and_then(|status| status.detail_code.clone()),
+            runtime_id: None,
+            runtime_epoch: None,
+            lease_expires_at: None,
+            detail_code: Some("awaiting_observer".to_owned()),
+            observed_at: crate::util::now_iso(),
+            stale: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ManagedAgentPairRuntime {
     pub process: ManagedAgentProcess,
@@ -92,6 +153,8 @@ pub struct ManagedAgentRuntimeStatus {
     pub pid: Option<u32>,
     pub error: Option<String>,
     pub log_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<ManagedAgentRuntimeSupervisionStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +165,23 @@ pub struct ManagedAgentRuntimeLifecycleObserverPayload {
     pub start_nonce: String,
     pub lifecycle: ManagedAgentRuntimeLifecycle,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedAgentRuntimeSupervisionObserverPayload {
+    pub pubkey: String,
+    pub relay_url: String,
+    pub start_nonce: String,
+    pub state: ManagedAgentRuntimeSupervisionState,
+    pub assignment_id: Option<uuid::Uuid>,
+    pub binding_id: Option<uuid::Uuid>,
+    pub supervisor_pubkey: Option<String>,
+    pub runtime_id: Option<uuid::Uuid>,
+    pub runtime_epoch: Option<u64>,
+    pub lease_expires_at: Option<String>,
+    pub detail_code: Option<String>,
+    pub observed_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

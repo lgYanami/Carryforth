@@ -3308,7 +3308,7 @@ mod tests {
             agent.public_key(),
             None,
             None,
-            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+            crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
         )
         .await
         .expect("schema-v2 Community-only write omits Assignment and Runtime");
@@ -3335,7 +3335,7 @@ mod tests {
                 agent.public_key(),
                 Some(stale_assignment),
                 None,
-                crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+                crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
             )
             .await,
             Err(ProjectViewV2WriteError::Domain(
@@ -6628,6 +6628,19 @@ mod tests {
             monitor_grace_seconds: 30,
             automatic_unrecoverable: true,
         };
+        for reused_identity in [owner.public_key(), agent.public_key(), relay.public_key()] {
+            assert!(matches!(
+                db.register_runtime_supervisor(
+                    community_id,
+                    assignment_id,
+                    reused_identity,
+                    owner.public_key(),
+                    policy,
+                )
+                .await,
+                Err(crate::project_runtime::RuntimeSupervisionError::Invalid(_))
+            ));
+        }
         let binding = db
             .register_runtime_supervisor(
                 community_id,
@@ -6639,6 +6652,37 @@ mod tests {
             .await
             .expect("register trusted runtime supervisor");
         assert_eq!(binding.assignment_id, assignment_id);
+
+        let checkpoint = commit_v2_role_for_test(
+            &db,
+            community_id,
+            &agent,
+            &relay,
+            RoleCommand::new(
+                accepted.receipt.project_revision,
+                Some(assignment_id),
+                RoleCommandRequest::AppendCheckpoint {
+                    checkpoint_id: Uuid::new_v4(),
+                    based_on_project_revision: accepted.receipt.project_revision,
+                    content: RoleCheckpointContent {
+                        summary: "binding does not change Role authority".to_owned(),
+                        current_focus: Vec::new(),
+                        progress: vec!["unfenced Role write accepted".to_owned()],
+                        blockers: Vec::new(),
+                        risks: Vec::new(),
+                        open_questions: Vec::new(),
+                        next_steps: Vec::new(),
+                        references: Vec::new(),
+                    },
+                    supersedes_checkpoint_id: None,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            checkpoint.receipt.project_revision,
+            accepted.receipt.project_revision + 1
+        );
 
         let runtime_one = Uuid::new_v4();
         let runtime_two = Uuid::new_v4();
@@ -6753,6 +6797,27 @@ mod tests {
         )
         .await
         .expect("current leased runtime fence");
+        crate::project_runtime::validate_runtime_command_fence_in_tx(
+            &mut fence_tx,
+            community_id,
+            Some(assignment_id),
+            None,
+            crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
+        )
+        .await
+        .expect("binding presence does not require optional Runtime attribution");
+        crate::project_runtime::validate_runtime_command_fence_in_tx(
+            &mut fence_tx,
+            community_id,
+            Some(assignment_id),
+            Some(RuntimeFence {
+                runtime_id: runtime_one,
+                runtime_epoch: 1,
+            }),
+            crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
+        )
+        .await
+        .expect("explicit current Runtime attribution remains valid");
         assert!(matches!(
             crate::project_runtime::validate_runtime_command_fence_in_tx(
                 &mut fence_tx,
@@ -6767,12 +6832,40 @@ mod tests {
             .await,
             Err(crate::project_runtime::RuntimeSupervisionError::CommandFence)
         ));
+        assert!(matches!(
+            crate::project_runtime::validate_runtime_command_fence_in_tx(
+                &mut fence_tx,
+                community_id,
+                Some(assignment_id),
+                Some(RuntimeFence {
+                    runtime_id: runtime_one,
+                    runtime_epoch: 2,
+                }),
+                crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
+            )
+            .await,
+            Err(crate::project_runtime::RuntimeSupervisionError::CommandFence)
+        ));
+        assert!(matches!(
+            crate::project_runtime::validate_runtime_command_fence_in_tx(
+                &mut fence_tx,
+                community_id,
+                None,
+                Some(RuntimeFence {
+                    runtime_id: runtime_one,
+                    runtime_epoch: 1,
+                }),
+                crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
+            )
+            .await,
+            Err(crate::project_runtime::RuntimeSupervisionError::CommandFence)
+        ));
         fence_tx.rollback().await.expect("release fence check");
 
-        // Project Document deliberately strengthens the shared v2 policy:
-        // every managed write requires an exact active Assignment + leased
-        // Runtime fence. Prove one valid write and reject the same Runtime at a
-        // stale epoch before any receipt lookup.
+        // Project Document ordinary writes use Community authority. Its
+        // explicit attribution wire deliberately remains stricter: when a
+        // caller supplies an Assignment + Runtime pair, prove one valid write
+        // and reject the same Runtime at a stale epoch before receipt lookup.
         let document_time = db
             .project_document_canonical_now()
             .await
@@ -7151,7 +7244,7 @@ mod tests {
             .end_unrecoverable_assignment(&claims[0], &relay)
             .await
             .expect("commit atomic unrecoverable system change");
-        assert_eq!(system.project_revision, 6);
+        assert_eq!(system.project_revision, 7);
         assert!(!system.replayed);
         assert_eq!(system.result["assignment_id"], assignment_id.to_string());
         assert!(system.events.iter().any(|event| {
@@ -7216,7 +7309,7 @@ mod tests {
             community_id,
             &agent,
             RoleCommand::new(
-                6,
+                7,
                 Some(assignment_id),
                 RoleCommandRequest::ReportUnableToContinue {
                     assignment_id,
@@ -7399,6 +7492,20 @@ mod tests {
                 .expect("readiness Assignment ID"),
         )
         .expect("valid readiness Assignment ID");
+        let unbound = db
+            .begin_project_view_v3_maintenance(
+                community_id,
+                owner.public_key(),
+                1,
+                "readiness-unbound-probe",
+                &relay.public_key(),
+            )
+            .await
+            .expect_err("unbound managed Assignment blocks maintenance begin");
+        assert!(unbound
+            .to_string()
+            .contains("maintenance:supervisor_not_ready"));
+        assert!(unbound.to_string().contains("assignment_unbound"));
         let binding = db
             .register_runtime_supervisor(
                 community_id,
@@ -7440,6 +7547,15 @@ mod tests {
         assert_eq!(readiness["ready_to_freeze"], false);
         assert_eq!(readiness["assignments"].as_array().map(Vec::len), Some(1));
         assert_eq!(readiness["runtimes"], serde_json::json!([]));
+        let blocker_codes: Vec<_> = readiness["supervision_blockers"]
+            .as_array()
+            .expect("structured maintenance blockers")
+            .iter()
+            .filter_map(|blocker| blocker["code"].as_str())
+            .collect();
+        assert!(blocker_codes.contains(&"supervisor_missing"));
+        assert!(blocker_codes.contains(&"lease_or_monitor_stale"));
+        assert!(blocker_codes.contains(&"pending_runtime_ack"));
 
         db.project_view_maintenance_supervisor_status(
             community_id,

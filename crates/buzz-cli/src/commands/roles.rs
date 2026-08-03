@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::commands::project_view_v2_snapshot::{
     is_managed_runtime, read_current_v2_snapshot, read_identity, read_role_history_page,
-    read_verified_v2_snapshot, read_verified_v3_snapshot, require_v2_identity,
-    runtime_fence_from_env, ProjectViewIdentity, ProjectViewSchema, RoleHistoryRequest,
+    read_verified_v2_snapshot, read_verified_v3_snapshot, require_v2_identity, ProjectViewIdentity,
+    ProjectViewSchema, RoleHistoryRequest,
 };
 use crate::commands::project_view_v3_context::resolve_v3_role_brief;
 use crate::error::CliError;
@@ -926,14 +926,8 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
                         .to_owned(),
                 )
             })?;
-            let runtime_fence = runtime_fence_from_env()?.ok_or_else(|| {
-                CliError::Auth(
-                    "runtime_unavailable: managed Assignment-bearing Role action requires an active Runtime fence"
-                        .to_owned(),
-                )
-            })?;
             command.acting_assignment_id = Some(assignment_id);
-            command.runtime_fence = Some(runtime_fence);
+            command.runtime_fence = None;
         } else {
             command.acting_assignment_id = None;
             command.runtime_fence = None;

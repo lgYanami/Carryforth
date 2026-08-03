@@ -35,6 +35,114 @@ export function agentCommunityStatusDetail(
   return null;
 }
 
+export function runtimeSupervisionLabel(
+  runtime: ManagedAgentRuntimeStatus,
+): string {
+  let label: string;
+  switch (runtime.supervision?.state) {
+    case "not_applicable":
+      label = "Supervisor not applicable";
+      break;
+    case "disabled":
+      label = "Supervisor off";
+      break;
+    case "awaiting_binding":
+      label = "Awaiting binding";
+      break;
+    case "starting":
+      label = "Supervisor starting";
+      break;
+    case "active":
+      label = "Supervisor active";
+      break;
+    case "recovering":
+      label = "Supervisor recovering";
+      break;
+    case "degraded_missing_key":
+    case "degraded_mismatch":
+      label = "Supervisor degraded";
+      break;
+    case "expired":
+      label = "Supervisor lease expired";
+      break;
+    case "unavailable":
+      label = "Supervisor unavailable";
+      break;
+    case "unknown":
+    case undefined:
+      label = "Supervisor status unknown";
+      break;
+  }
+  return runtime.supervision?.stale ? `${label} (last known)` : label;
+}
+
+export function runtimeSupervisionImpact(
+  runtime: ManagedAgentRuntimeStatus,
+): string {
+  const supervision = runtime.supervision;
+  if (!supervision) return "Waiting for runtime diagnostics.";
+  if (
+    supervision.identityAvailability === "locked" ||
+    supervision.identityAvailability === "lost" ||
+    supervision.identityAvailability === "invalid"
+  ) {
+    return `Local Supervisor identity is ${supervision.identityAvailability}. Ordinary chat and Role operations remain available.`;
+  }
+  const coordinates = [
+    supervision.assignmentId
+      ? `Assignment ${supervision.assignmentId.slice(0, 8)}`
+      : null,
+    supervision.bindingId
+      ? `binding ${supervision.bindingId.slice(0, 8)}`
+      : null,
+    supervision.leaseExpiresAt
+      ? `lease until ${new Date(supervision.leaseExpiresAt).toLocaleString()}`
+      : null,
+  ].filter(Boolean);
+  const suffix = coordinates.length > 0 ? ` ${coordinates.join(" · ")}.` : "";
+  if (
+    supervision.state === "degraded_missing_key" ||
+    supervision.state === "degraded_mismatch" ||
+    supervision.state === "expired" ||
+    supervision.state === "unavailable" ||
+    supervision.state === "unknown"
+  ) {
+    return `Ordinary chat and Role operations remain available.${suffix}`;
+  }
+  return suffix.trim() || "Runtime supervision does not change Role authority.";
+}
+
+/** Preserve the live relay authority for network and operator actions. The
+ * backend's canonical pair URL is only a process-dedup key. */
+export function managedAgentConnectionRelayUrl(
+  runtime: ManagedAgentRuntimeStatus,
+): string {
+  return (
+    runtime.supervision?.connectionRelayUrl ??
+    runtime.requestedRelayUrl ??
+    runtime.relayUrl
+  );
+}
+
+export function runtimeSupervisorOperatorCommand(
+  runtime: ManagedAgentRuntimeStatus,
+): string | null {
+  const supervision = runtime.supervision;
+  if (!supervision?.assignmentId || !supervision.localSupervisorPubkey)
+    return null;
+  let host: string;
+  try {
+    host = new URL(managedAgentConnectionRelayUrl(runtime)).host;
+  } catch {
+    return null;
+  }
+  const target = `--host ${host} --assignment ${supervision.assignmentId}`;
+  const bind = `buzz-admin project-runtime bind ${target} --supervisor-pubkey ${supervision.localSupervisorPubkey}`;
+  return supervision.state === "degraded_mismatch" && supervision.bindingId
+    ? `buzz-admin project-runtime revoke ${target} && ${bind}`
+    : bind;
+}
+
 export function managedAgentRuntimeKey(
   runtime: Pick<ManagedAgentRuntimeStatus, "pubkey" | "relayUrl">,
 ): string {

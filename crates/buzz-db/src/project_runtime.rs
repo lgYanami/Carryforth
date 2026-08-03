@@ -10,7 +10,7 @@ use buzz_core::{CommunityId, PublicKey};
 use buzz_project_view::v2::{
     AssignmentRuntimeStatus, RoleContinuityChange, RuntimeAvailability, RuntimeEvidence,
     RuntimeEvidenceReceipt, RuntimeEvidenceRequest, RuntimeFence, RuntimeLeaseStatus,
-    RuntimeRecoveryPolicy,
+    RuntimeRecoveryPolicy, RuntimeSupervisorBindingStatus,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -47,7 +47,8 @@ pub enum RuntimeSupervisionError {
     /// A different active binding already owns this Assignment.
     #[error("Assignment already has an active runtime supervisor")]
     BindingConflict,
-    /// A supervised command omitted or failed its runtime fence.
+    /// Explicit Runtime attribution was malformed/stale, or a strict
+    /// supervision-only protocol path omitted its required fence.
     #[error("supervised runtime command fence is missing or stale")]
     CommandFence,
 }
@@ -113,12 +114,14 @@ impl Db {
         crate::community_lock::acquire(&mut tx, community_id, false).await?;
         let assignment = sqlx::query(
             "SELECT assignment.member_pubkey, assignment.ended_at, \
-                    actor.agent_owner_pubkey IS NOT NULL AS managed_agent \
+                    actor.agent_owner_pubkey IS NOT NULL AS managed_agent, \
+                    state.projection_pubkey \
              FROM project_role_assignments assignment \
              LEFT JOIN users actor \
                ON actor.community_id = assignment.community_id \
               AND actor.pubkey = decode(assignment.member_pubkey, 'hex') \
              JOIN communities community ON community.id = assignment.community_id \
+             JOIN project_view_state state ON state.community_id = assignment.community_id \
              JOIN project_view_maintenance maintenance \
                ON maintenance.community_id = assignment.community_id \
              WHERE assignment.community_id = $1 AND assignment.assignment_id = $2 \
@@ -142,6 +145,27 @@ impl Db {
         if !assignment.try_get::<bool, _>("managed_agent")? {
             return Err(RuntimeSupervisionError::Invalid(
                 "only a known managed-Agent Assignment can be supervised".to_owned(),
+            ));
+        }
+        let supervisor_bytes = supervisor_pubkey.to_bytes();
+        let member_pubkey: String = assignment.try_get("member_pubkey")?;
+        let projection_pubkey: Vec<u8> = assignment.try_get("projection_pubkey")?;
+        let known_community_identity: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users \
+             WHERE community_id = $1 AND pubkey = $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(supervisor_bytes.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+        if supervisor_pubkey == registered_by
+            || member_pubkey.eq_ignore_ascii_case(&supervisor_pubkey.to_hex())
+            || projection_pubkey.as_slice() == supervisor_bytes.as_slice()
+            || known_community_identity
+        {
+            return Err(RuntimeSupervisionError::Invalid(
+                "supervisor must be a dedicated identity distinct from Relay, Human, and managed-Agent identities"
+                    .to_owned(),
             ));
         }
 
@@ -169,7 +193,6 @@ impl Db {
         }
 
         let binding_id = Uuid::new_v4();
-        let supervisor_bytes = supervisor_pubkey.to_bytes();
         let operator_bytes = registered_by.to_bytes();
         let registered_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
@@ -551,21 +574,34 @@ impl Db {
         community_id: CommunityId,
         assignment_id: Uuid,
     ) -> RuntimeSupervisionResult<AssignmentRuntimeStatus> {
-        let binding_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT binding_id FROM project_runtime_supervisor_bindings \
+        let binding_row = sqlx::query(
+            "SELECT binding_id, supervisor_pubkey, lease_seconds, \
+                    recovery_window_seconds, max_recovery_attempts, \
+                    recovery_backoff_seconds, monitor_timeout_seconds, \
+                    monitor_grace_seconds, automatic_unrecoverable, registered_at \
+             FROM project_runtime_supervisor_bindings \
              WHERE community_id = $1 AND assignment_id = $2 AND revoked_at IS NULL",
         )
         .bind(community_id.as_uuid())
         .bind(assignment_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(binding_id) = binding_id else {
+        let Some(binding_row) = binding_row else {
             return Ok(AssignmentRuntimeStatus {
                 assignment_id,
                 managed: false,
+                binding: None,
                 availability: None,
                 runtimes: Vec::new(),
             });
+        };
+        let binding = binding_from_row(community_id, assignment_id, &binding_row)?;
+        let binding_id = binding.binding_id;
+        let binding_status = RuntimeSupervisorBindingStatus {
+            binding_id,
+            supervisor_pubkey: binding.supervisor_pubkey.to_hex(),
+            policy: binding.policy,
+            registered_at: binding.registered_at,
         };
         let now = Utc::now();
         let rows = sqlx::query(
@@ -612,6 +648,7 @@ impl Db {
         Ok(AssignmentRuntimeStatus {
             assignment_id,
             managed: true,
+            binding: Some(binding_status),
             availability: Some(availability),
             runtimes,
         })
@@ -884,16 +921,21 @@ async fn validate_evidence_maintenance_fence(
 /// Runtime supervision requirement chosen by the calling protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeCommandFencePolicy {
-    /// Preserve Project View v2 behavior: only registered supervision is fenced.
+    /// Historical test-only policy: registered supervision implicitly fences a
+    /// command even when no explicit Runtime attribution was requested.
+    #[cfg(test)]
     LegacyOptionalSupervision,
+    /// Runtime provenance is optional, but any explicitly supplied fence must
+    /// name an exact current leased Runtime. Binding presence alone never
+    /// changes a command's authorization requirements.
+    ValidateExplicitRuntimeAttribution,
     /// Managed commands require a binding and an exact current leased Runtime.
     RequireSupervisedRuntime,
 }
 
-/// Reject a supervised managed command unless its signed runtime fence is
-/// current and leased. Called after the Community lock and canonical Assignment
-/// checks are held; the policy keeps legacy v2 and strict newer protocols
-/// explicit at every call site.
+/// Validate optional or required signed Runtime attribution after the Community
+/// lock and canonical Assignment checks are held. Binding presence alone only
+/// changes behavior under the explicitly strict supervision policy.
 pub(crate) async fn validate_runtime_command_fence_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -902,8 +944,17 @@ pub(crate) async fn validate_runtime_command_fence_in_tx(
     policy: RuntimeCommandFencePolicy,
 ) -> RuntimeSupervisionResult<()> {
     let Some(assignment_id) = assignment_id else {
-        return Ok(());
+        return if runtime_fence.is_none() {
+            Ok(())
+        } else {
+            Err(RuntimeSupervisionError::CommandFence)
+        };
     };
+    if policy == RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution
+        && runtime_fence.is_none()
+    {
+        return Ok(());
+    }
     let binding_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT binding_id FROM project_runtime_supervisor_bindings \
          WHERE community_id = $1 AND assignment_id = $2 \
@@ -915,8 +966,10 @@ pub(crate) async fn validate_runtime_command_fence_in_tx(
     .await?;
     let Some(binding_id) = binding_id else {
         return match policy {
+            #[cfg(test)]
             RuntimeCommandFencePolicy::LegacyOptionalSupervision => Ok(()),
-            RuntimeCommandFencePolicy::RequireSupervisedRuntime => {
+            RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution
+            | RuntimeCommandFencePolicy::RequireSupervisedRuntime => {
                 Err(RuntimeSupervisionError::CommandFence)
             }
         };

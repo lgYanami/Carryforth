@@ -323,6 +323,20 @@ pub struct RuntimeLeaseStatus {
     pub last_evidence_at: DateTime<Utc>,
 }
 
+/// Public, non-secret view of one active Assignment-scoped supervisor binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSupervisorBindingStatus {
+    /// Immutable binding identity.
+    pub binding_id: Uuid,
+    /// Hex public key expected to sign Runtime evidence.
+    pub supervisor_pubkey: String,
+    /// Operator-installed bounded recovery policy.
+    pub policy: RuntimeRecoveryPolicy,
+    /// Canonical registration time.
+    pub registered_at: DateTime<Utc>,
+}
+
 /// Read model for one Assignment's trusted runtime supervision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +345,11 @@ pub struct AssignmentRuntimeStatus {
     pub assignment_id: Uuid,
     /// Whether at least one active supervisor binding exists.
     pub managed: bool,
+    /// Current active binding. Its public coordinate lets a trusted harness
+    /// distinguish disabled supervision from missing or mismatched local
+    /// configuration without exposing any secret material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<RuntimeSupervisorBindingStatus>,
     /// Aggregate availability. Absent when the Assignment is not supervised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<RuntimeAvailability>,
@@ -447,5 +466,37 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn runtime_status_binding_view_is_additive_and_closed() {
+        let assignment_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "assignment_id": assignment_id,
+            "managed": false,
+            "runtimes": [],
+        });
+        let parsed: AssignmentRuntimeStatus =
+            serde_json::from_value(legacy).expect("legacy status remains readable");
+        assert!(parsed.binding.is_none());
+
+        let status = AssignmentRuntimeStatus {
+            assignment_id,
+            managed: true,
+            binding: Some(RuntimeSupervisorBindingStatus {
+                binding_id: Uuid::new_v4(),
+                supervisor_pubkey: "11".repeat(32),
+                policy: RuntimeRecoveryPolicy::default(),
+                registered_at: Utc::now(),
+            }),
+            availability: Some(RuntimeAvailability::Unavailable),
+            runtimes: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&status).expect("serialize binding status");
+        assert_eq!(
+            serde_json::from_value::<AssignmentRuntimeStatus>(encoded)
+                .expect("round-trip binding status"),
+            status
+        );
     }
 }

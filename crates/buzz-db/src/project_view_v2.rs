@@ -53,7 +53,7 @@ pub enum ProjectViewV2WriteError {
     /// Shared ordinary-object reducer rejected a schema-v2 command.
     #[error(transparent)]
     ObjectDomain(#[from] DomainError),
-    /// Trusted runtime fencing rejected a supervised managed command.
+    /// An explicitly claimed Runtime attribution was missing or stale.
     #[error(transparent)]
     RuntimeSupervision(#[from] crate::project_runtime::RuntimeSupervisionError),
     /// Community is not an initialized, enabled v2 Project View.
@@ -1858,7 +1858,7 @@ impl ProjectViewV2WriteTx {
             self.community_id,
             command.acting_assignment_id,
             command.runtime_fence,
-            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+            crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
         )
         .await?;
         if let Some(receipt) =
@@ -1982,7 +1982,7 @@ impl ProjectViewV2WriteTx {
             command_event.pubkey,
             command.acting_assignment_id,
             command.runtime_fence,
-            crate::project_runtime::RuntimeCommandFencePolicy::LegacyOptionalSupervision,
+            crate::project_runtime::RuntimeCommandFencePolicy::ValidateExplicitRuntimeAttribution,
         )
         .await?;
         if let Some(receipt) =
@@ -3049,30 +3049,29 @@ pub(crate) async fn validate_project_object_actor_fence(
     runtime_fence: Option<buzz_project_view::v2::RuntimeFence>,
     policy: crate::project_runtime::RuntimeCommandFencePolicy,
 ) -> ProjectViewV2WriteResult<()> {
-    let Some(assignment_id) = acting_assignment_id else {
-        return Ok(());
-    };
-    let valid: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM project_role_assignments \
-             WHERE community_id = $1 AND assignment_id = $2 \
-               AND member_pubkey = $3 AND ended_at IS NULL \
-         )",
-    )
-    .bind(community_id.as_uuid())
-    .bind(assignment_id)
-    .bind(actor.to_hex())
-    .fetch_one(&mut **tx)
-    .await?;
-    if !valid {
-        return Err(ProjectViewV2WriteError::Domain(
-            RoleContinuityError::ActingAssignmentInvalid,
-        ));
+    if let Some(assignment_id) = acting_assignment_id {
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM project_role_assignments \
+                 WHERE community_id = $1 AND assignment_id = $2 \
+                   AND member_pubkey = $3 AND ended_at IS NULL \
+             )",
+        )
+        .bind(community_id.as_uuid())
+        .bind(assignment_id)
+        .bind(actor.to_hex())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !valid {
+            return Err(ProjectViewV2WriteError::Domain(
+                RoleContinuityError::ActingAssignmentInvalid,
+            ));
+        }
     }
     crate::project_runtime::validate_runtime_command_fence_in_tx(
         tx,
         community_id,
-        Some(assignment_id),
+        acting_assignment_id,
         runtime_fence,
         policy,
     )

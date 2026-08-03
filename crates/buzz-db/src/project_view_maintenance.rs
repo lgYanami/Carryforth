@@ -299,6 +299,7 @@ impl Db {
         .fetch_all(&mut *tx)
         .await?;
         let mut managed_assignments = Vec::with_capacity(managed_assignment_rows.len());
+        let mut supervision_blockers = Vec::new();
         for row in managed_assignment_rows {
             let assignment_id: Uuid = row.try_get("assignment_id")?;
             let member_pubkey: String = row.try_get("member_pubkey")?;
@@ -314,9 +315,15 @@ impl Db {
             .fetch_all(&mut *tx)
             .await?;
             let [binding] = binding_rows.as_slice() else {
-                return Err(ProjectViewMaintenanceError::Conflict(format!(
-                    "managed Assignment {assignment_id} does not have exactly one active supervisor binding"
-                )));
+                supervision_blockers.push(json!({
+                    "code": if binding_rows.is_empty() {
+                        "assignment_unbound"
+                    } else {
+                        "supervisor_mismatch"
+                    },
+                    "assignment_id": assignment_id,
+                }));
+                continue;
             };
             managed_assignments.push((
                 assignment_id,
@@ -324,6 +331,12 @@ impl Db {
                 binding.try_get::<Uuid, _>("binding_id")?,
                 binding.try_get::<Vec<u8>, _>("supervisor_pubkey")?,
             ));
+        }
+        if !supervision_blockers.is_empty() {
+            return Err(ProjectViewMaintenanceError::Conflict(format!(
+                "maintenance:supervisor_not_ready:{}",
+                json!({ "blockers": supervision_blockers })
+            )));
         }
 
         let project_revision = db_u64(current.try_get("project_revision")?, "project_revision")?;
@@ -630,25 +643,31 @@ impl Db {
         let mut runtime_ack_pending = Vec::new();
         let mut runtime_live = Vec::new();
         for row in runtime_rows {
+            let assignment_id: Uuid = row.try_get("assignment_id")?;
+            let binding_id: Uuid = row.try_get("binding_id")?;
             let runtime_id: Uuid = row.try_get("runtime_id")?;
             let runtime_epoch = db_u64(row.try_get("runtime_epoch")?, "runtime_epoch")?;
             let ack_status: Option<String> = row.try_get("ack_status")?;
             let ended_at: Option<DateTime<Utc>> = row.try_get("ended_at")?;
             if ack_status.is_none() {
                 runtime_ack_pending.push(json!({
+                    "assignment_id": assignment_id,
+                    "binding_id": binding_id,
                     "runtime_id": runtime_id,
                     "runtime_epoch": runtime_epoch,
                 }));
             }
             if ended_at.is_none() {
                 runtime_live.push(json!({
+                    "assignment_id": assignment_id,
+                    "binding_id": binding_id,
                     "runtime_id": runtime_id,
                     "runtime_epoch": runtime_epoch,
                 }));
             }
             runtimes.push(json!({
-                "binding_id": row.try_get::<Uuid, _>("binding_id")?,
-                "assignment_id": row.try_get::<Uuid, _>("assignment_id")?,
+                "binding_id": binding_id,
+                "assignment_id": assignment_id,
                 "runtime_id": runtime_id,
                 "runtime_epoch": runtime_epoch,
                 "availability_at_begin": row.try_get::<String, _>("availability_at_begin")?,
@@ -707,6 +726,38 @@ impl Db {
             && durable_acks_complete
             && runtime_retirement_complete
             && invalidations == 0;
+        let mut supervision_blockers = Vec::new();
+        for assignment_id in &protocol_pending {
+            supervision_blockers.push(json!({
+                "code": "supervisor_missing",
+                "assignment_id": assignment_id,
+            }));
+        }
+        for assignment_id in &poll_pending {
+            supervision_blockers.push(json!({
+                "code": "lease_or_monitor_stale",
+                "assignment_id": assignment_id,
+            }));
+        }
+        for assignment_id in &assignment_ack_pending {
+            supervision_blockers.push(json!({
+                "code": "pending_runtime_ack",
+                "assignment_id": assignment_id,
+            }));
+        }
+        for runtime in &runtime_ack_pending {
+            supervision_blockers.push(json!({
+                "code": "pending_runtime_ack",
+                "runtime": runtime,
+            }));
+        }
+        if claims > 0 || new_runtimes > 0 {
+            supervision_blockers.push(json!({
+                "code": "runtime_recovery_in_progress",
+                "scheduler_claim_count": claims,
+                "post_begin_runtime_count": new_runtimes,
+            }));
+        }
         tx.commit().await?;
         Ok(json!({
             "community_id": community_id.to_string(),
@@ -733,6 +784,7 @@ impl Db {
             "scheduler_claim_count": claims,
             "post_begin_runtime_count": new_runtimes,
             "pre_cutover_invalidation_count": invalidations,
+            "supervision_blockers": supervision_blockers,
             "assignments": assignments,
             "runtimes": runtimes,
         }))

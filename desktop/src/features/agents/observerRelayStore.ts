@@ -4,7 +4,10 @@ import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
 import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
-import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents";
+import {
+  putManagedAgentRuntimeLifecycle,
+  putManagedAgentRuntimeSupervision,
+} from "@/shared/api/tauriManagedAgents";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { decryptObserverEvent } from "@/shared/api/tauriObserver";
 import {
@@ -407,6 +410,12 @@ async function handleRelayObserverEvent(
       void putManagedAgentRuntimeLifecycle(agentPubkey, parsed.payload).catch(
         (error) => {
           console.debug("Late/untracked lifecycle frame dropped:", error);
+        },
+      );
+    } else if (parsed.kind === "managed_agent_runtime_supervision") {
+      void putManagedAgentRuntimeSupervision(agentPubkey, parsed.payload).catch(
+        (error) => {
+          console.debug("Late/untracked supervision frame dropped:", error);
         },
       );
     }

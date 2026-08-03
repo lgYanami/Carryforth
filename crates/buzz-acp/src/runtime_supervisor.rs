@@ -14,7 +14,8 @@ use std::time::Duration;
 use atomic_write_file::AtomicWriteFile;
 use buzz_project_view::v2::{
     AssignmentRuntimeStatus, RuntimeAvailability, RuntimeEvidence, RuntimeEvidenceReceipt,
-    RuntimeEvidenceRequest, RuntimeFence, RUNTIME_SUPERVISION_SCHEMA_VERSION,
+    RuntimeEvidenceRequest, RuntimeFence, RuntimeSupervisorBindingStatus,
+    RUNTIME_SUPERVISION_SCHEMA_VERSION,
 };
 use buzz_project_view::v3::{
     MaintenanceAckCommand, MaintenanceAckRequest, MaintenanceRuntimeAckStatus,
@@ -46,7 +47,107 @@ const MAINTENANCE_POLL_MAX: u64 = 60;
 const MAINTENANCE_ACK_ID_DOMAIN: &[u8] = b"buzz-acp-maintenance-ack-id-v1\0";
 const LEASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RECOVERY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const SUPERVISION_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 const SUPERVISOR_COMMAND_CAPACITY: usize = 16;
+
+/// Operator supervision is diagnostic state, not Agent business authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeSupervisionState {
+    NotApplicable,
+    Disabled,
+    AwaitingBinding,
+    Starting,
+    Active,
+    Recovering,
+    DegradedMissingKey,
+    DegradedMismatch,
+    Expired,
+    Unavailable,
+    Unknown,
+}
+
+impl RuntimeSupervisionState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Disabled => "disabled",
+            Self::AwaitingBinding => "awaiting_binding",
+            Self::Starting => "starting",
+            Self::Active => "active",
+            Self::Recovering => "recovering",
+            Self::DegradedMissingKey => "degraded_missing_key",
+            Self::DegradedMismatch => "degraded_mismatch",
+            Self::Expired => "expired",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Secret-free supervision state shared with Role context and Desktop
+/// observer consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RuntimeSupervisionStatus {
+    pub state: RuntimeSupervisionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_code: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl RuntimeSupervisionStatus {
+    fn new(state: RuntimeSupervisionState) -> Self {
+        Self {
+            state,
+            assignment_id: None,
+            binding_id: None,
+            supervisor_pubkey: None,
+            runtime_id: None,
+            runtime_epoch: None,
+            lease_expires_at: None,
+            detail_code: None,
+            observed_at: Utc::now(),
+        }
+    }
+
+    fn for_assignment(state: RuntimeSupervisionState, assignment_id: Uuid) -> Self {
+        Self {
+            assignment_id: Some(assignment_id),
+            ..Self::new(state)
+        }
+    }
+
+    fn with_binding(mut self, binding: &RuntimeSupervisorBindingStatus) -> Self {
+        self.binding_id = Some(binding.binding_id);
+        self.supervisor_pubkey = Some(binding.supervisor_pubkey.clone());
+        self
+    }
+
+    fn with_runtime(mut self, receipt: &RuntimeEvidenceReceipt) -> Self {
+        self.runtime_id = Some(receipt.runtime_id);
+        self.runtime_epoch = Some(receipt.runtime_epoch);
+        self.lease_expires_at = receipt.lease_expires_at;
+        self
+    }
+
+    fn with_detail(mut self, detail_code: impl Into<String>) -> Self {
+        self.detail_code = Some(detail_code.into());
+        self
+    }
+}
 
 /// Long-lived maintenance observation shared with the main-loop admission
 /// gate. `ResumeRequired` remains closed until the old pool and durable child
@@ -141,6 +242,7 @@ struct MaintenanceAckReceiptView {
 }
 
 /// Secret supervisor identity and pair-scoped durable recovery state.
+#[derive(Clone)]
 pub(crate) struct RuntimeSupervisorConfig {
     keys: Keys,
     state_path: PathBuf,
@@ -210,6 +312,12 @@ impl RuntimeSupervisorConfig {
     /// different Assignment or epoch.
     pub(crate) fn fence_path(&self) -> PathBuf {
         self.fence_path.clone()
+    }
+
+    /// Public coordinate of the secret identity retained by the trusted
+    /// harness. This value is safe to expose in diagnostics.
+    pub(crate) fn public_key(&self) -> PublicKey {
+        self.keys.public_key()
     }
 
     /// Pair-scoped durable registry used to prove that no model-facing child
@@ -349,52 +457,51 @@ fn runtime_is_current(
         })
 }
 
+fn failed_supervision_state(status: &AssignmentRuntimeStatus) -> RuntimeSupervisionState {
+    let now = Utc::now();
+    if status.runtimes.iter().any(|runtime| {
+        runtime.availability == RuntimeAvailability::Available
+            && runtime
+                .lease_expires_at
+                .is_none_or(|deadline| deadline <= now)
+    }) {
+        RuntimeSupervisionState::Expired
+    } else if status.availability == Some(RuntimeAvailability::Unavailable)
+        && !status.runtimes.is_empty()
+    {
+        RuntimeSupervisionState::Unavailable
+    } else {
+        RuntimeSupervisionState::Unknown
+    }
+}
+
 /// Active Assignment-scoped runtime fence and its lease-renewal task.
 pub(crate) struct RuntimeSupervisor {
     client: RestClient,
     state_path: PathBuf,
+    fence_path: PathBuf,
+    binding: RuntimeSupervisorBindingStatus,
     state: PersistedRuntimeState,
     receipt: RuntimeEvidenceReceipt,
     recovery_attempt_in_flight: bool,
+    supervision_tx: watch::Sender<RuntimeSupervisionStatus>,
     lease_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeSupervisor {
-    /// Enable supervision only when the verified current Assignment has an
-    /// operator-installed binding. A managed binding without a configured
-    /// supervisor fails closed instead of launching an unfenced Agent.
+    /// Prepare supervision after the coordinator has established that the
+    /// verified Assignment binding matches this trusted local identity.
     pub(crate) async fn prepare(
-        config: Option<&RuntimeSupervisorConfig>,
+        config: &RuntimeSupervisorConfig,
         agent_client: &RestClient,
         member_pubkey: PublicKey,
-        assignment_id: Option<Uuid>,
+        status: AssignmentRuntimeStatus,
         relay_url: &str,
+        supervision_tx: watch::Sender<RuntimeSupervisionStatus>,
     ) -> Result<Option<Self>, String> {
-        let Some(assignment_id) = assignment_id else {
-            if let Some(config) = config {
-                remove_state_if_present(&config.state_path)?;
-            }
-            return Ok(None);
-        };
-        let status = read_status(agent_client, assignment_id).await?;
-        if status.assignment_id != assignment_id {
-            return Err(format!(
-                "Runtime status returned Assignment {}, expected {assignment_id}",
-                status.assignment_id
-            ));
-        }
-        if !status.managed {
-            if let Some(config) = config {
-                remove_state_if_present(&config.state_path)?;
-            }
-            return Ok(None);
-        }
-
-        let config = config.ok_or_else(|| {
-            format!(
-                "Assignment {assignment_id} is supervised, but \
-                 {SUPERVISOR_PRIVATE_KEY_ENV} is not configured"
-            )
+        let assignment_id = status.assignment_id;
+        let binding = status.binding.clone().ok_or_else(|| {
+            format!("Assignment {assignment_id} Runtime status omitted its active binding")
         })?;
         let supervisor_pubkey = config.keys.public_key();
         if supervisor_pubkey == member_pubkey {
@@ -402,6 +509,13 @@ impl RuntimeSupervisor {
                 "runtime supervisor identity must be distinct from the managed Agent identity"
                     .to_owned(),
             );
+        }
+        if binding.supervisor_pubkey != supervisor_pubkey.to_hex() {
+            return Err(format!(
+                "Assignment {assignment_id} expects supervisor {}, local identity is {}",
+                binding.supervisor_pubkey,
+                supervisor_pubkey.to_hex()
+            ));
         }
         let mut client = agent_client.clone();
         client.keys = config.keys.clone();
@@ -531,9 +645,12 @@ impl RuntimeSupervisor {
         Ok(Some(Self {
             client,
             state_path: config.state_path.clone(),
+            fence_path: config.fence_path.clone(),
+            binding,
             state,
             receipt,
             recovery_attempt_in_flight,
+            supervision_tx,
             lease_task: None,
         }))
     }
@@ -556,6 +673,12 @@ impl RuntimeSupervisor {
         }
     }
 
+    fn supervision_status(&self, state: RuntimeSupervisionState) -> RuntimeSupervisionStatus {
+        RuntimeSupervisionStatus::for_assignment(state, self.state.assignment_id)
+            .with_binding(&self.binding)
+            .with_runtime(&self.receipt)
+    }
+
     /// Confirm that the replacement harness is healthy and begin lease renewal.
     pub(crate) async fn mark_healthy(&mut self) -> Result<(), String> {
         if self.recovery_attempt_in_flight {
@@ -571,6 +694,8 @@ impl RuntimeSupervisor {
             self.state.runtime_epoch = self.receipt.runtime_epoch;
             write_state(&self.state_path, &self.state)?;
         }
+        self.supervision_tx
+            .send_replace(self.supervision_status(RuntimeSupervisionState::Active));
         self.start_lease_task();
         Ok(())
     }
@@ -667,6 +792,9 @@ impl RuntimeSupervisor {
         let runtime_id = self.state.runtime_id;
         let runtime_epoch = self.state.runtime_epoch;
         let mut receipt = self.receipt.clone();
+        let fence_path = self.fence_path.clone();
+        let binding = self.binding.clone();
+        let supervision_tx = self.supervision_tx.clone();
         self.lease_task = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(lease_renewal_delay(receipt.lease_expires_at)).await;
@@ -679,12 +807,47 @@ impl RuntimeSupervisor {
                 )
                 .await
                 {
-                    Ok(next) => receipt = next,
+                    Ok(next) => {
+                        receipt = next;
+                        let fence = RuntimeFence {
+                            runtime_id,
+                            runtime_epoch,
+                        };
+                        if let Err(error) = write_fence(&fence_path, fence) {
+                            tracing::warn!(
+                                assignment_id = %assignment_id,
+                                "renewed Runtime lease but could not publish fence: {error}"
+                            );
+                        }
+                        supervision_tx.send_replace(
+                            RuntimeSupervisionStatus::for_assignment(
+                                RuntimeSupervisionState::Active,
+                                assignment_id,
+                            )
+                            .with_binding(&binding)
+                            .with_runtime(&receipt),
+                        );
+                    }
                     Err(error) => {
                         tracing::warn!(
                             assignment_id = %assignment_id,
                             "Runtime lease renewal failed closed: {error}"
                         );
+                        if receipt
+                            .lease_expires_at
+                            .is_none_or(|deadline| deadline <= Utc::now())
+                        {
+                            let _ = remove_file_if_present(&fence_path, "Runtime fence");
+                            supervision_tx.send_replace(
+                                RuntimeSupervisionStatus::for_assignment(
+                                    RuntimeSupervisionState::Expired,
+                                    assignment_id,
+                                )
+                                .with_binding(&binding)
+                                .with_runtime(&receipt)
+                                .with_detail("lease_expired"),
+                            );
+                        }
                         tokio::time::sleep(LEASE_RETRY_DELAY).await;
                     }
                 }
@@ -713,6 +876,9 @@ pub(crate) struct RuntimeSupervisorCoordinator {
     current_assignment_id: Option<Uuid>,
     active: Option<RuntimeSupervisor>,
     lifecycle_gate: crate::role_brief::TurnLifecycleGate,
+    observer: Option<crate::observer::ObserverHandle>,
+    start_nonce: String,
+    supervision_tx: watch::Sender<RuntimeSupervisionStatus>,
     maintenance_tx: watch::Sender<MaintenanceWatchState>,
     maintenance_latch: Option<u64>,
     maintenance_blocked: bool,
@@ -726,6 +892,8 @@ impl RuntimeSupervisorCoordinator {
         member_pubkey: PublicKey,
         relay_url: String,
         lifecycle_gate: crate::role_brief::TurnLifecycleGate,
+        observer: Option<crate::observer::ObserverHandle>,
+        start_nonce: String,
     ) -> Self {
         let maintenance_client = config.as_ref().map(|config| {
             let mut client = agent_client.clone();
@@ -741,6 +909,9 @@ impl RuntimeSupervisorCoordinator {
             MaintenanceWatchState::Normal
         };
         let (maintenance_tx, _) = watch::channel(initial_state);
+        let (supervision_tx, _) = watch::channel(RuntimeSupervisionStatus::new(
+            RuntimeSupervisionState::Unknown,
+        ));
         Self {
             config,
             agent_client,
@@ -750,6 +921,9 @@ impl RuntimeSupervisorCoordinator {
             current_assignment_id: None,
             active: None,
             lifecycle_gate,
+            observer,
+            start_nonce,
+            supervision_tx,
             maintenance_tx,
             maintenance_latch: None,
             maintenance_blocked: false,
@@ -762,6 +936,51 @@ impl RuntimeSupervisorCoordinator {
         self.config
             .as_ref()
             .map(RuntimeSupervisorConfig::fence_path)
+    }
+
+    fn set_supervision_status(&self, mut status: RuntimeSupervisionStatus) {
+        let previous = self.supervision_tx.borrow();
+        let unchanged = previous.state == status.state
+            && previous.assignment_id == status.assignment_id
+            && previous.binding_id == status.binding_id
+            && previous.supervisor_pubkey == status.supervisor_pubkey
+            && previous.runtime_id == status.runtime_id
+            && previous.runtime_epoch == status.runtime_epoch
+            && previous.lease_expires_at == status.lease_expires_at
+            && previous.detail_code == status.detail_code;
+        drop(previous);
+        if unchanged {
+            return;
+        }
+        status.observed_at = Utc::now();
+        self.supervision_tx.send_replace(status);
+    }
+
+    fn emit_supervision_status(&self, status: &RuntimeSupervisionStatus) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let Ok(mut payload) = serde_json::to_value(status) else {
+            tracing::warn!("could not serialize Runtime supervision observer status");
+            return;
+        };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "pubkey".to_owned(),
+                Value::String(self.member_pubkey.to_hex()),
+            );
+            object.insert("relayUrl".to_owned(), Value::String(self.relay_url.clone()));
+            object.insert(
+                "startNonce".to_owned(),
+                Value::String(self.start_nonce.clone()),
+            );
+        }
+        observer.emit(
+            "managed_agent_runtime_supervision",
+            None,
+            &crate::observer::ObserverContext::default(),
+            payload,
+        );
     }
 
     /// Perform the synchronous maintenance observation required before Role
@@ -1029,24 +1248,30 @@ impl RuntimeSupervisorCoordinator {
         if self.maintenance_blocked {
             return Err("Runtime admission is blocked by Project View maintenance".to_owned());
         }
-        self.current_assignment_id = assignment_id;
-        self.active = RuntimeSupervisor::prepare(
-            self.config.as_ref(),
-            &self.agent_client,
-            self.member_pubkey,
-            assignment_id,
-            &self.relay_url,
-        )
-        .await?;
-        self.publish_current_fence()
+        self.reconcile_supervision(assignment_id, false).await;
+        Ok(())
     }
 
     /// Mark the initialized harness healthy and publish its final fence.
     pub(crate) async fn mark_healthy(&mut self) -> Result<(), String> {
         if let Some(active) = self.active.as_mut() {
-            active.mark_healthy().await?;
+            if let Err(error) = active.mark_healthy().await {
+                let status = active
+                    .supervision_status(RuntimeSupervisionState::Unknown)
+                    .with_detail("evidence_rejected");
+                self.pause_active();
+                let _ = self.clear_fence();
+                self.set_supervision_status(status);
+                tracing::warn!("Runtime supervision health evidence degraded: {error}");
+                return Ok(());
+            }
+            let status = active.supervision_status(RuntimeSupervisionState::Active);
+            self.set_supervision_status(status);
         }
-        self.publish_current_fence()
+        if let Err(error) = self.publish_current_fence() {
+            tracing::warn!("Runtime supervision fence publication degraded: {error}");
+        }
+        Ok(())
     }
 
     /// Record eager pool startup failure and immediately withdraw local writes.
@@ -1066,77 +1291,248 @@ impl RuntimeSupervisorCoordinator {
             self.clear_fence()?;
             return Err("Runtime admission is blocked by Project View maintenance".to_owned());
         }
+        self.reconcile_supervision(assignment_id, true).await;
+        Ok(())
+    }
+
+    async fn reconcile_supervision(&mut self, assignment_id: Option<Uuid>, mark_healthy: bool) {
         if assignment_id != self.current_assignment_id {
             self.pause_active();
-            self.clear_fence()?;
+            if let Err(error) = self.clear_fence() {
+                tracing::warn!("could not clear replaced Runtime fence: {error}");
+            }
             self.current_assignment_id = assignment_id;
         }
 
         let Some(assignment_id) = assignment_id else {
             self.pause_active();
             if let Some(config) = &self.config {
-                remove_state_if_present(&config.state_path)?;
+                if let Err(error) = remove_state_if_present(&config.state_path) {
+                    tracing::warn!("could not clear inapplicable Runtime state: {error}");
+                }
             }
-            return self.clear_fence();
+            if let Err(error) = self.clear_fence() {
+                tracing::warn!("could not clear inapplicable Runtime fence: {error}");
+            }
+            self.set_supervision_status(RuntimeSupervisionStatus::new(
+                RuntimeSupervisionState::NotApplicable,
+            ));
+            return;
         };
 
         let status = match read_status(&self.agent_client, assignment_id).await {
             Ok(status) => status,
             Err(error) => {
-                self.clear_fence()?;
-                return Err(error);
+                self.pause_active();
+                if let Err(clear_error) = self.clear_fence() {
+                    tracing::warn!("could not clear unknown Runtime fence: {clear_error}");
+                }
+                self.set_supervision_status(
+                    RuntimeSupervisionStatus::for_assignment(
+                        RuntimeSupervisionState::Unknown,
+                        assignment_id,
+                    )
+                    .with_detail("relay_unavailable"),
+                );
+                tracing::warn!("Runtime supervision status is temporarily unavailable: {error}");
+                return;
             }
         };
         if status.assignment_id != assignment_id {
-            self.clear_fence()?;
-            return Err(format!(
-                "Runtime status returned Assignment {}, expected {assignment_id}",
-                status.assignment_id
-            ));
+            self.pause_active();
+            if let Err(error) = self.clear_fence() {
+                tracing::warn!("could not clear inconsistent Runtime fence: {error}");
+            }
+            self.set_supervision_status(
+                RuntimeSupervisionStatus::for_assignment(
+                    RuntimeSupervisionState::Unknown,
+                    assignment_id,
+                )
+                .with_detail("assignment_mismatch"),
+            );
+            tracing::warn!(
+                returned_assignment_id = %status.assignment_id,
+                expected_assignment_id = %assignment_id,
+                "Runtime status returned a different Assignment"
+            );
+            return;
         }
-        if !status.managed {
+
+        let binding = match (&status.binding, status.managed) {
+            (None, false) => None,
+            (Some(binding), true) => Some(binding.clone()),
+            _ => {
+                self.pause_active();
+                if let Err(error) = self.clear_fence() {
+                    tracing::warn!("could not clear malformed Runtime fence: {error}");
+                }
+                self.set_supervision_status(
+                    RuntimeSupervisionStatus::for_assignment(
+                        RuntimeSupervisionState::Unknown,
+                        assignment_id,
+                    )
+                    .with_detail("invalid_status"),
+                );
+                tracing::warn!(
+                    managed = status.managed,
+                    has_binding = status.binding.is_some(),
+                    "Runtime status binding fields are inconsistent"
+                );
+                return;
+            }
+        };
+        let Some(binding) = binding else {
             self.pause_active();
             if let Some(config) = &self.config {
-                remove_state_if_present(&config.state_path)?;
+                if let Err(error) = remove_state_if_present(&config.state_path) {
+                    tracing::warn!("could not clear disabled Runtime state: {error}");
+                }
             }
-            return self.clear_fence();
-        }
-        if self.config.is_none() {
+            if let Err(error) = self.clear_fence() {
+                tracing::warn!("could not clear disabled Runtime fence: {error}");
+            }
+            let state = if self.config.is_some() {
+                RuntimeSupervisionState::AwaitingBinding
+            } else {
+                RuntimeSupervisionState::Disabled
+            };
+            let mut supervision = RuntimeSupervisionStatus::for_assignment(state, assignment_id);
+            if let Some(config) = &self.config {
+                supervision.supervisor_pubkey = Some(config.public_key().to_hex());
+            }
+            self.set_supervision_status(supervision);
+            return;
+        };
+
+        let Some(config) = self.config.clone() else {
             self.pause_active();
-            self.clear_fence()?;
-            return Err(format!(
-                "Assignment {assignment_id} is supervised, but \
-                 {SUPERVISOR_PRIVATE_KEY_ENV} is not configured"
-            ));
+            if let Err(error) = self.clear_fence() {
+                tracing::warn!("could not clear degraded Runtime fence: {error}");
+            }
+            self.set_supervision_status(
+                RuntimeSupervisionStatus::for_assignment(
+                    RuntimeSupervisionState::DegradedMissingKey,
+                    assignment_id,
+                )
+                .with_binding(&binding)
+                .with_detail("missing_key"),
+            );
+            return;
+        };
+        if config.public_key().to_hex() != binding.supervisor_pubkey
+            || config.public_key() == self.member_pubkey
+        {
+            self.pause_active();
+            if let Err(error) = self.clear_fence() {
+                tracing::warn!("could not clear mismatched Runtime fence: {error}");
+            }
+            if let Err(error) = remove_state_if_present(&config.state_path) {
+                tracing::warn!("could not clear mismatched Runtime state: {error}");
+            }
+            self.set_supervision_status(
+                RuntimeSupervisionStatus::for_assignment(
+                    RuntimeSupervisionState::DegradedMismatch,
+                    assignment_id,
+                )
+                .with_binding(&binding)
+                .with_detail("key_mismatch"),
+            );
+            return;
         }
         if self
             .active
             .as_ref()
             .is_some_and(|active| active.is_current(&status))
         {
-            return self.publish_current_fence();
+            if mark_healthy {
+                if let Err(error) = self.publish_current_fence() {
+                    tracing::warn!("could not republish current Runtime fence: {error}");
+                }
+            }
+            if let Some(active) = self.active.as_ref() {
+                self.set_supervision_status(
+                    active.supervision_status(RuntimeSupervisionState::Active),
+                );
+            }
+            return;
         }
 
         self.pause_active();
-        self.clear_fence()?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| "Runtime supervisor configuration disappeared".to_owned())?;
-        let mut active = RuntimeSupervisor::prepare(
-            Some(config),
+        if let Err(error) = self.clear_fence() {
+            tracing::warn!("could not clear Runtime fence before reconciliation: {error}");
+        }
+        let preparation_state = if status.availability == Some(RuntimeAvailability::Recovering) {
+            RuntimeSupervisionState::Recovering
+        } else {
+            RuntimeSupervisionState::Starting
+        };
+        self.set_supervision_status(
+            RuntimeSupervisionStatus::for_assignment(preparation_state, assignment_id)
+                .with_binding(&binding),
+        );
+        let prepared = RuntimeSupervisor::prepare(
+            &config,
             &self.agent_client,
             self.member_pubkey,
-            Some(assignment_id),
+            status.clone(),
             &self.relay_url,
+            self.supervision_tx.clone(),
         )
-        .await?
-        .ok_or_else(|| {
-            format!("Assignment {assignment_id} changed supervision state during reconciliation")
-        })?;
-        active.mark_healthy().await?;
+        .await;
+        let mut active = match prepared {
+            Ok(Some(active)) => active,
+            Ok(None) => {
+                self.set_supervision_status(
+                    RuntimeSupervisionStatus::for_assignment(
+                        RuntimeSupervisionState::Unknown,
+                        assignment_id,
+                    )
+                    .with_binding(&binding)
+                    .with_detail("binding_changed"),
+                );
+                return;
+            }
+            Err(error) => {
+                let state = failed_supervision_state(&status);
+                let detail_code = match state {
+                    RuntimeSupervisionState::Expired => "lease_expired",
+                    RuntimeSupervisionState::Unavailable => "recovery_unavailable",
+                    _ => "evidence_rejected",
+                };
+                self.set_supervision_status(
+                    RuntimeSupervisionStatus::for_assignment(state, assignment_id)
+                        .with_binding(&binding)
+                        .with_detail(detail_code),
+                );
+                tracing::warn!(
+                    assignment_id = %assignment_id,
+                    "Runtime supervision reconciliation degraded: {error}"
+                );
+                return;
+            }
+        };
+        if mark_healthy {
+            if let Err(error) = active.mark_healthy().await {
+                self.set_supervision_status(
+                    active
+                        .supervision_status(RuntimeSupervisionState::Unknown)
+                        .with_detail("evidence_rejected"),
+                );
+                tracing::warn!("Runtime supervision health transition degraded: {error}");
+                return;
+            }
+        }
         self.active = Some(active);
-        self.publish_current_fence()
+        if mark_healthy {
+            if let Err(error) = self.publish_current_fence() {
+                tracing::warn!("could not publish reconciled Runtime fence: {error}");
+            }
+            if let Some(active) = self.active.as_ref() {
+                self.set_supervision_status(
+                    active.supervision_status(RuntimeSupervisionState::Active),
+                );
+            }
+        }
     }
 
     fn suspend(&mut self) -> Result<(), String> {
@@ -1210,21 +1606,38 @@ impl RuntimeSupervisorCoordinator {
     pub(crate) fn spawn(mut self) -> (RuntimeSupervisorClient, tokio::task::JoinHandle<()>) {
         let (sender, mut receiver) =
             mpsc::channel::<RuntimeSupervisorCommand>(SUPERVISOR_COMMAND_CAPACITY);
+        let mut supervision_rx = self.supervision_tx.subscribe();
         let client = RuntimeSupervisorClient {
             sender,
             maintenance_rx: self.maintenance_tx.subscribe(),
+            supervision_rx: self.supervision_tx.subscribe(),
         };
         let task = tokio::spawn(async move {
+            self.emit_supervision_status(&supervision_rx.borrow().clone());
             let mut next_maintenance_poll = tokio::time::Instant::now() + self.poll_after;
+            let mut next_supervision_poll =
+                tokio::time::Instant::now() + SUPERVISION_RECONCILE_INTERVAL;
             'worker: loop {
                 tokio::select! {
                     biased;
+                    changed = supervision_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        self.emit_supervision_status(&supervision_rx.borrow().clone());
+                    }
                     _ = tokio::time::sleep_until(next_maintenance_poll), if self.maintenance_client.is_some() => {
                         if let Err(error) = self.poll_maintenance().await {
                             tracing::warn!("Runtime maintenance watcher failed closed: {error}");
                             self.fail_maintenance_poll(&error);
                         }
                         next_maintenance_poll = tokio::time::Instant::now() + self.poll_after;
+                    }
+                    _ = tokio::time::sleep_until(next_supervision_poll), if self.config.is_some() && self.current_assignment_id.is_some() && !self.maintenance_blocked => {
+                        let assignment_id = self.current_assignment_id;
+                        self.reconcile_supervision(assignment_id, true).await;
+                        next_supervision_poll =
+                            tokio::time::Instant::now() + SUPERVISION_RECONCILE_INTERVAL;
                     }
                     command = receiver.recv() => {
                         let Some(command) = command else {
@@ -1327,11 +1740,16 @@ enum RuntimeSupervisorCommand {
 pub(crate) struct RuntimeSupervisorClient {
     sender: mpsc::Sender<RuntimeSupervisorCommand>,
     maintenance_rx: watch::Receiver<MaintenanceWatchState>,
+    supervision_rx: watch::Receiver<RuntimeSupervisionStatus>,
 }
 
 impl RuntimeSupervisorClient {
     pub(crate) fn maintenance_receiver(&self) -> watch::Receiver<MaintenanceWatchState> {
         self.maintenance_rx.clone()
+    }
+
+    pub(crate) fn current_supervision_status(&self) -> RuntimeSupervisionStatus {
+        self.supervision_rx.borrow().clone()
     }
 
     pub(crate) async fn reconcile(&self, assignment_id: Option<Uuid>) -> Result<(), String> {
@@ -1987,6 +2405,7 @@ mod tests {
     struct MockRuntimeApi {
         assignment_id: Uuid,
         managed: bool,
+        supervisor_pubkey: Option<String>,
         runtime: Option<buzz_project_view::v2::RuntimeLeaseStatus>,
         evidence: Vec<String>,
         maintenance: Option<MockMaintenanceApi>,
@@ -2223,6 +2642,15 @@ mod tests {
                         serde_json::to_value(AssignmentRuntimeStatus {
                             assignment_id: state.assignment_id,
                             managed: state.managed,
+                            binding: state.managed.then(|| RuntimeSupervisorBindingStatus {
+                                binding_id: Uuid::from_u128(21),
+                                supervisor_pubkey: state
+                                    .supervisor_pubkey
+                                    .clone()
+                                    .unwrap_or_else(|| "33".repeat(32)),
+                                policy: buzz_project_view::v2::RuntimeRecoveryPolicy::default(),
+                                registered_at: Utc::now(),
+                            }),
                             availability: if state.managed {
                                 Some(
                                     state
@@ -2317,6 +2745,12 @@ mod tests {
         AssignmentRuntimeStatus {
             assignment_id: Uuid::new_v4(),
             managed: true,
+            binding: Some(RuntimeSupervisorBindingStatus {
+                binding_id: Uuid::from_u128(21),
+                supervisor_pubkey: "22".repeat(32),
+                policy: buzz_project_view::v2::RuntimeRecoveryPolicy::default(),
+                registered_at: Utc::now(),
+            }),
             availability: runtime.as_ref().map(|runtime| runtime.availability),
             runtimes: runtime.into_iter().collect(),
         }
@@ -2643,6 +3077,8 @@ mod tests {
             member_keys.public_key(),
             "ws://relay.example".to_owned(),
             lifecycle_gate.clone(),
+            None,
+            String::new(),
         );
 
         assert!(matches!(
@@ -2674,13 +3110,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_supervisor_provisioning_degrades_without_blocking_harness_startup() {
+        let assignment_id = Uuid::new_v4();
+        let member_keys = Keys::generate();
+        let canonical_supervisor = Keys::generate();
+        let api_state = Arc::new(Mutex::new(MockRuntimeApi {
+            assignment_id,
+            managed: true,
+            supervisor_pubkey: Some(canonical_supervisor.public_key().to_hex()),
+            ..MockRuntimeApi::default()
+        }));
+        let (client, server) =
+            mock_runtime_client(Arc::clone(&api_state), member_keys.clone()).await;
+
+        let mut missing_key = RuntimeSupervisorCoordinator::new(
+            None,
+            client.clone(),
+            member_keys.public_key(),
+            "ws://relay.example".to_owned(),
+            crate::role_brief::TurnLifecycleGate::new(),
+            None,
+            String::new(),
+        );
+        missing_key
+            .prepare_startup(Some(assignment_id))
+            .await
+            .expect("missing key must not block Agent startup");
+        assert_eq!(
+            missing_key.supervision_tx.borrow().state,
+            RuntimeSupervisionState::DegradedMissingKey
+        );
+
+        api_state.lock().expect("lock mock Runtime API").managed = false;
+        let directory = std::env::temp_dir().join(format!(
+            "buzz-acp-supervision-degraded-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create degraded test directory");
+        let local_supervisor = Keys::generate();
+        let mut awaiting = RuntimeSupervisorCoordinator::new(
+            Some(RuntimeSupervisorConfig {
+                keys: local_supervisor.clone(),
+                state_path: directory.join("awaiting-state.json"),
+                fence_path: directory.join("awaiting-fence.json"),
+            }),
+            client.clone(),
+            member_keys.public_key(),
+            "ws://relay.example".to_owned(),
+            crate::role_brief::TurnLifecycleGate::new(),
+            None,
+            String::new(),
+        );
+        awaiting
+            .prepare_startup(Some(assignment_id))
+            .await
+            .expect("unbound local identity must not block Agent startup");
+        assert_eq!(
+            awaiting.supervision_tx.borrow().state,
+            RuntimeSupervisionState::AwaitingBinding
+        );
+
+        {
+            let mut state = api_state.lock().expect("lock mock Runtime API");
+            state.managed = true;
+            state.supervisor_pubkey = Some(canonical_supervisor.public_key().to_hex());
+        }
+        let mut mismatch = RuntimeSupervisorCoordinator::new(
+            Some(RuntimeSupervisorConfig {
+                keys: local_supervisor,
+                state_path: directory.join("mismatch-state.json"),
+                fence_path: directory.join("mismatch-fence.json"),
+            }),
+            client,
+            member_keys.public_key(),
+            "ws://relay.example".to_owned(),
+            crate::role_brief::TurnLifecycleGate::new(),
+            None,
+            String::new(),
+        );
+        mismatch
+            .prepare_startup(Some(assignment_id))
+            .await
+            .expect("mismatched key must not block Agent startup");
+        assert_eq!(
+            mismatch.supervision_tx.borrow().state,
+            RuntimeSupervisionState::DegradedMismatch
+        );
+        assert!(
+            api_state
+                .lock()
+                .expect("lock mock Runtime API")
+                .evidence
+                .is_empty(),
+            "degraded states must not submit Runtime evidence"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(directory).expect("remove degraded test directory");
+    }
+
+    #[tokio::test]
     async fn running_harness_converges_across_binding_and_assignment_changes() {
         let assignment_id = Uuid::new_v4();
         let member_keys = Keys::generate();
         let supervisor_keys = Keys::generate();
+        let supervisor_pubkey = supervisor_keys.public_key().to_hex();
         let api_state = Arc::new(Mutex::new(MockRuntimeApi {
             assignment_id,
             managed: true,
+            supervisor_pubkey: Some(supervisor_pubkey),
             ..MockRuntimeApi::default()
         }));
         let (client, server) =
@@ -2700,6 +3238,8 @@ mod tests {
             member_keys.public_key(),
             "ws://relay.example".to_owned(),
             crate::role_brief::TurnLifecycleGate::new(),
+            None,
+            String::new(),
         );
         coordinator
             .prepare_startup(Some(assignment_id))

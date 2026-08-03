@@ -6,6 +6,7 @@ import {
 import type {
   ManagedAgent,
   ManagedAgentRuntimeStatus,
+  RuntimeSupervisorIdentityStatus,
 } from "@/shared/api/types";
 
 export async function startManagedAgent(pubkey: string): Promise<ManagedAgent> {
@@ -87,6 +88,29 @@ export async function putManagedAgentRuntimeLifecycle(
     outerPubkey,
     payload,
   });
+}
+
+export async function putManagedAgentRuntimeSupervision(
+  outerPubkey: string,
+  payload: unknown,
+): Promise<ManagedAgentRuntimeStatus> {
+  return invokeTauri("put_managed_agent_runtime_supervision", {
+    outerPubkey,
+    payload,
+  });
+}
+
+export async function getRuntimeSupervisorIdentityStatus(
+  relayUrl: string,
+): Promise<RuntimeSupervisorIdentityStatus> {
+  return invokeTauri("get_runtime_supervisor_identity_status", { relayUrl });
+}
+
+export async function prepareRuntimeSupervisorIdentity(input: {
+  relayUrl: string;
+  agentPubkey: string;
+}): Promise<RuntimeSupervisorIdentityStatus> {
+  return invokeTauri("prepare_runtime_supervisor_identity", input);
 }
 
 export async function reconcileManagedAgentRuntimes(

@@ -25,7 +25,7 @@ pub use role_continuity::{
 pub use runtime_supervision::{
     AssignmentRuntimeStatus, RuntimeAvailability, RuntimeEvidence, RuntimeEvidenceReceipt,
     RuntimeEvidenceRequest, RuntimeFence, RuntimeLeaseStatus, RuntimeRecoveryPolicy,
-    RUNTIME_SUPERVISION_SCHEMA_VERSION,
+    RuntimeSupervisorBindingStatus, RUNTIME_SUPERVISION_SCHEMA_VERSION,
 };
 
 const CHANGE_ID_DOMAIN: &[u8] = b"buzz-project-view-v2:change-id\0";

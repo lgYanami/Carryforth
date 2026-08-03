@@ -1,7 +1,9 @@
 //! Shared verified Project View v2 snapshot reader for CLI commands.
 
 use std::collections::HashSet;
+#[cfg(test)]
 use std::io::Read as _;
+#[cfg(test)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,7 +12,9 @@ use buzz_core::kind::{
     KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::PublicKey;
-use buzz_project_view::v2::{RoleContinuityEntity, RuntimeFence};
+use buzz_project_view::v2::RoleContinuityEntity;
+#[cfg(test)]
+use buzz_project_view::v2::RuntimeFence;
 use buzz_sdk::project_view_v2::{
     parse_entity_projection, parse_membership_projection, parse_meta_projection,
     parse_project_object_projection, V2EntityProjection, V2MembershipProjection, V2MetaProjection,
@@ -37,7 +41,9 @@ pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_ENTITY_PAGE_SIZE: usize = 500;
+#[cfg(test)]
 const RUNTIME_FENCE_FILE_MAX_BYTES: u64 = 4 * 1024;
+#[cfg(test)]
 const RUNTIME_FENCE_PATH_ENV: &str = "BUZZ_RUNTIME_FENCE_PATH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,16 +686,7 @@ fn is_managed_runtime_value(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-pub(crate) fn runtime_fence_from_env() -> Result<Option<RuntimeFence>, CliError> {
-    if let Some(path) = std::env::var_os(RUNTIME_FENCE_PATH_ENV) {
-        return runtime_fence_from_file(Path::new(&path));
-    }
-    runtime_fence_from_legacy_env(
-        std::env::var("BUZZ_RUNTIME_ID").ok().as_deref(),
-        std::env::var("BUZZ_RUNTIME_EPOCH").ok().as_deref(),
-    )
-}
-
+#[cfg(test)]
 fn runtime_fence_from_file(path: &Path) -> Result<Option<RuntimeFence>, CliError> {
     if !path.is_absolute() {
         return Err(CliError::Auth(format!(
@@ -733,6 +730,7 @@ fn runtime_fence_from_file(path: &Path) -> Result<Option<RuntimeFence>, CliError
     Ok(Some(runtime_fence))
 }
 
+#[cfg(test)]
 fn runtime_fence_from_legacy_env(
     runtime_id: Option<&str>,
     runtime_epoch: Option<&str>,

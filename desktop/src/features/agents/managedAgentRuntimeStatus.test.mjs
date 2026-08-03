@@ -6,7 +6,11 @@ import {
   agentCommunityStatusDetail,
   canonicalRelayUrl,
   findManagedAgentRuntime,
+  managedAgentConnectionRelayUrl,
   managedAgentRuntimeKey,
+  runtimeSupervisionImpact,
+  runtimeSupervisionLabel,
+  runtimeSupervisorOperatorCommand,
 } from "./managedAgentRuntimeStatus.ts";
 
 const runtime = (overrides = {}) => ({
@@ -110,4 +114,101 @@ test("matches a stored community URL against canonical backend rows", () => {
     findManagedAgentRuntime(runtimes, "aa", "ws://localhost:3001"),
     undefined,
   );
+});
+
+test("runtime supervision remains separate from Agent availability", () => {
+  const degraded = runtime({
+    supervision: {
+      state: "degraded_missing_key",
+      connectionRelayUrl: "ws://localhost:3000",
+      assignmentId: "12345678-0000-0000-0000-000000000000",
+      bindingId: "87654321-0000-0000-0000-000000000000",
+      supervisorPubkey: "bb",
+      localSupervisorPubkey: null,
+      identitySource: null,
+      runtimeId: null,
+      runtimeEpoch: null,
+      leaseExpiresAt: null,
+      detailCode: "missing_key",
+      observedAt: new Date(0).toISOString(),
+      stale: false,
+    },
+  });
+
+  assert.equal(agentCommunityAvailability(degraded), "Here");
+  assert.equal(runtimeSupervisionLabel(degraded), "Supervisor degraded");
+  assert.match(
+    runtimeSupervisionImpact(degraded),
+    /Ordinary chat and Role operations remain available/,
+  );
+  assert.match(runtimeSupervisionImpact(degraded), /Assignment 12345678/);
+});
+
+test("active Runtime supervision reports its independent state", () => {
+  const active = runtime({
+    supervision: {
+      state: "active",
+      connectionRelayUrl: "wss://relay.example",
+      assignmentId: null,
+      bindingId: null,
+      supervisorPubkey: null,
+      localSupervisorPubkey: null,
+      identitySource: null,
+      runtimeId: null,
+      runtimeEpoch: null,
+      leaseExpiresAt: null,
+      detailCode: null,
+      observedAt: new Date(0).toISOString(),
+      stale: false,
+    },
+  });
+
+  assert.equal(runtimeSupervisionLabel(active), "Supervisor active");
+  assert.equal(
+    runtimeSupervisionImpact(active),
+    "Runtime supervision does not change Role authority.",
+  );
+});
+
+test("operator commands preserve the live localhost authority", () => {
+  const awaiting = runtime({
+    relayUrl: "ws://127.0.0.1:3000",
+    supervision: {
+      state: "awaiting_binding",
+      connectionRelayUrl: "ws://localhost:3000",
+      assignmentId: "12345678-0000-0000-0000-000000000000",
+      bindingId: null,
+      supervisorPubkey: null,
+      localSupervisorPubkey: "bb".repeat(32),
+      identityAvailability: "ready",
+      identitySource: "keyring",
+      identityDetailCode: null,
+      runtimeId: null,
+      runtimeEpoch: null,
+      leaseExpiresAt: null,
+      detailCode: null,
+      observedAt: new Date(0).toISOString(),
+      stale: false,
+    },
+  });
+  assert.equal(managedAgentConnectionRelayUrl(awaiting), "ws://localhost:3000");
+  assert.match(
+    runtimeSupervisorOperatorCommand(awaiting),
+    /--host localhost:3000/,
+  );
+  assert.doesNotMatch(
+    runtimeSupervisorOperatorCommand(awaiting),
+    /127\.0\.0\.1/,
+  );
+
+  const mismatch = runtime({
+    ...awaiting,
+    supervision: {
+      ...awaiting.supervision,
+      state: "degraded_mismatch",
+      bindingId: "87654321-0000-0000-0000-000000000000",
+    },
+  });
+  assert.match(runtimeSupervisorOperatorCommand(mismatch), / revoke /);
+  assert.match(runtimeSupervisorOperatorCommand(mismatch), / && buzz-admin /);
 });
