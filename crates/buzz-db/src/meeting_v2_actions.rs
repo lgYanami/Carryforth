@@ -10,7 +10,7 @@ use buzz_core::CommunityId;
 use buzz_project_view::v2::{ProjectObjectCommand, RoleCommand, RoleCommandRequest};
 use buzz_project_view::{
     CreateMutation, MutationRequest, NewProjectViewObject, ObjectRef, Priority,
-    ProjectViewObjectData, ProjectViewObjectType, RequirementStatus, WorkStatus,
+    ProjectViewObjectType, ProjectWork, Requirement, RequirementStatus, WorkStatus,
 };
 use chrono::{DateTime, Duration, Utc};
 use nostr::{Event, Keys};
@@ -107,7 +107,8 @@ pub enum ActionCommand {
 }
 
 impl ActionCommand {
-    fn action(&self) -> &'static str {
+    /// Stable low-cardinality wire action label.
+    pub fn action(&self) -> &'static str {
         match self {
             Self::Begin { .. } => "begin",
             Self::Plan { .. } => "plan",
@@ -166,6 +167,71 @@ struct ActionRunRow {
     action_phase: String,
     action_condition: String,
     terminal_status: Option<String>,
+    last_error_code: Option<String>,
+}
+
+/// Block one action window whose independent database deadline has elapsed.
+///
+/// Callers must already hold the Meeting Session row lock. The transition and
+/// Relay-signed State/outbox rows commit in the caller's transaction, making
+/// sweeper and command-triggered lazy recovery converge on the same CAS.
+pub(crate) async fn recover_due_action_locked_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    relay_keys: &Keys,
+    now: DateTime<Utc>,
+) -> Result<Option<crate::meeting_baton::BatonTransitionResult>> {
+    let row = sqlx::query(
+        "SELECT action_run_id, action_phase \
+         FROM meeting_v2_action_runs \
+         WHERE community_id = $1 AND session_id = $2 \
+           AND terminal_status IS NULL AND action_condition = 'runnable' \
+           AND action_phase IN ('planning', 'applying') \
+           AND action_deadline_at IS NOT NULL AND action_deadline_at <= $3 \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(now)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let action_run_id: Uuid = row.try_get("action_run_id")?;
+    let action_phase: String = row.try_get("action_phase")?;
+    let updated = sqlx::query(
+        "UPDATE meeting_v2_action_runs \
+         SET action_condition = 'blocked', action_deadline_at = NULL, \
+             last_error_code = 'action_deadline_exceeded', updated_at = $4 \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+           AND terminal_status IS NULL AND action_condition = 'runnable' \
+           AND action_phase IN ('planning', 'applying')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(action_run_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Ok(None);
+    }
+    let transition = crate::meeting_baton::publish_v2_action_deadline_transition_tx(
+        tx,
+        community_id,
+        session_id,
+        action_run_id,
+        relay_keys,
+        "action_deadline_exceeded",
+        "action",
+        &format!("{action_phase}/runnable"),
+        &format!("{action_phase}/blocked"),
+        now,
+    )
+    .await?;
+    Ok(Some(transition))
 }
 
 #[derive(Debug)]
@@ -282,10 +348,29 @@ pub async fn execute_action_command(
         });
     }
 
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(tx.as_mut())
+        .await?;
+    let deadline_recovered = if session.status == "active" {
+        recover_due_action_locked_tx(
+            &mut tx,
+            params.community_id,
+            params.session_id,
+            params.relay_keys,
+            now,
+        )
+        .await?
+        .is_some()
+    } else {
+        false
+    };
     let applied = if session.status != "active" {
         AppliedCommand::rejected("meeting_ended", None)
+    } else if deadline_recovered {
+        let run = load_active_run_tx(&mut tx, params.community_id, params.session_id, true).await?;
+        AppliedCommand::rejected("action_deadline_recovered", run.as_ref())
     } else {
-        apply_command_tx(&mut tx, &params).await?
+        apply_command_tx(&mut tx, &params, now).await?
     };
     let response = json!({
         "meeting_id": params.session_id,
@@ -309,10 +394,8 @@ pub async fn execute_action_command(
 async fn apply_command_tx(
     tx: &mut Transaction<'_, Postgres>,
     params: &ActionCommandTxParams<'_>,
+    now: DateTime<Utc>,
 ) -> Result<AppliedCommand> {
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(tx.as_mut())
-        .await?;
     match &params.command {
         ActionCommand::Begin {
             expected_control_epoch,
@@ -973,6 +1056,7 @@ async fn apply_step_prepared_tx(
         json!({
             "step_id": step_id,
             "step_order": step.step_order,
+            "step_kind": step.step_kind,
             "attempt": attempt,
             "project_event_id": hex::encode(project_event_id),
             "expected_project_revision": expected_project_revision,
@@ -1138,6 +1222,7 @@ async fn apply_step_applied_tx(
         json!({
             "step_id": step_id,
             "step_order": step.step_order,
+            "step_kind": step.step_kind,
             "attempt": attempt_row.try_get::<i32, _>("attempt_number")?,
             "project_event_id": hex::encode(project_event_id),
             "accepted_project_revision": accepted_project_revision,
@@ -1548,13 +1633,26 @@ pub(crate) async fn fence_prepared_project_event_tx(
     event: &Event,
     expected_project_revision: u64,
 ) -> Result<Option<PreparedActionProjectEvent>> {
+    let session_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT session_id FROM meeting_v2_action_step_attempts \
+         WHERE community_id = $1 AND project_command_event_id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event.id.as_bytes().as_slice())
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    crate::meeting_baton::lock_baton_session_tx(tx, community_id, session_id).await?;
     let row = sqlx::query(
         "SELECT attempt.session_id, attempt.action_run_id, attempt.step_id, \
                 attempt.attempt_number, attempt.action_window_epoch, \
                 attempt.expected_project_revision, attempt.signed_project_event, \
                 attempt.status AS attempt_status, step.status AS step_status, \
                 step.attempt_count, run.action_window_epoch AS current_action_window, \
-                run.action_phase, run.action_condition, run.terminal_status, \
+                run.action_phase, run.action_condition, run.action_deadline_at, \
+                run.terminal_status, clock_timestamp() AS database_now, \
                 session.status AS meeting_status, session.host_pubkey \
          FROM meeting_v2_action_step_attempts attempt \
          JOIN meeting_v2_action_steps step \
@@ -1570,10 +1668,12 @@ pub(crate) async fn fence_prepared_project_event_tx(
            ON session.community_id = attempt.community_id \
           AND session.session_id = attempt.session_id \
          WHERE attempt.community_id = $1 AND attempt.project_command_event_id = $2 \
+           AND attempt.session_id = $3 \
          FOR UPDATE OF attempt, step, run",
     )
     .bind(community_id.as_uuid())
     .bind(event.id.as_bytes().as_slice())
+    .bind(session_id)
     .fetch_optional(tx.as_mut())
     .await?;
     let Some(row) = row else {
@@ -1589,11 +1689,14 @@ pub(crate) async fn fence_prepared_project_event_tx(
     let attempt_count: i32 = row.try_get("attempt_count")?;
     let attempt_window: i64 = row.try_get("action_window_epoch")?;
     let current_window: i64 = row.try_get("current_action_window")?;
+    let action_deadline: Option<DateTime<Utc>> = row.try_get("action_deadline_at")?;
+    let database_now: DateTime<Utc> = row.try_get("database_now")?;
     let host_pubkey: Vec<u8> = row.try_get("host_pubkey")?;
     let valid = row.try_get::<String, _>("attempt_status")? == "prepared"
         && row.try_get::<String, _>("step_status")? == "prepared"
         && row.try_get::<String, _>("action_phase")? == "applying"
         && row.try_get::<String, _>("action_condition")? == "runnable"
+        && action_deadline.is_some_and(|deadline| deadline > database_now)
         && row
             .try_get::<Option<String>, _>("terminal_status")?
             .is_none()
@@ -1610,7 +1713,7 @@ pub(crate) async fn fence_prepared_project_event_tx(
     }
     Ok(Some(PreparedActionProjectEvent {
         community_id,
-        session_id: row.try_get("session_id")?,
+        session_id,
         action_run_id: row.try_get("action_run_id")?,
         step_id: row.try_get("step_id")?,
         attempt_number,
@@ -1816,7 +1919,7 @@ async fn apply_block_tx(
         run.action_run_id,
         run.action_window_epoch,
         transition.state_revision,
-        json!({"reason_code": reason_code}),
+        json!({"reason_code": reason_code, "phase": run.action_phase}),
     ))
 }
 
@@ -1842,6 +1945,7 @@ async fn apply_retry_tx(
         .action_window_epoch
         .checked_add(1)
         .ok_or_else(|| DbError::InvalidData("Meeting V2 action window overflow".to_string()))?;
+    let retry_reason = run.last_error_code.as_deref().unwrap_or("unspecified");
     let duration_ms = action_duration_ms_tx(tx, params.community_id, params.session_id).await?;
     let deadline = now + Duration::milliseconds(duration_ms);
     sqlx::query(
@@ -1878,7 +1982,11 @@ async fn apply_retry_tx(
         run.action_run_id,
         next_window,
         transition.state_revision,
-        json!({"action_deadline_at_ms": deadline.timestamp_millis()}),
+        json!({
+            "action_deadline_at_ms": deadline.timestamp_millis(),
+            "retry_reason": retry_reason,
+            "phase": run.action_phase,
+        }),
     ))
 }
 
@@ -2036,11 +2144,10 @@ async fn verify_action_projection_tx(
             "project_view.create_requirement" => {
                 let payload: RequirementStepPayload =
                     serde_json::from_value(row.try_get("desired_payload")?)?;
-                let Some(ProjectViewObjectData::Requirement(requirement)) =
-                    body.map(serde_json::from_value).transpose()?
-                else {
+                let Some(body) = body else {
                     return Ok(None);
                 };
+                let requirement: Requirement = serde_json::from_value(body)?;
                 if row.try_get::<Option<String>, _>("object_type")?.as_deref()
                     != Some("requirement")
                     || requirement.title != payload.title
@@ -2059,11 +2166,10 @@ async fn verify_action_projection_tx(
             "project_view.create_work" => {
                 let payload: WorkStepPayload =
                     serde_json::from_value(row.try_get("desired_payload")?)?;
-                let Some(ProjectViewObjectData::Work(work)) =
-                    body.map(serde_json::from_value).transpose()?
-                else {
+                let Some(body) = body else {
                     return Ok(None);
                 };
+                let work: ProjectWork = serde_json::from_value(body)?;
                 if row.try_get::<Option<String>, _>("object_type")?.as_deref() != Some("work")
                     || work.title != payload.title
                     || work.description
@@ -2114,26 +2220,87 @@ async fn apply_return_to_board_tx(
     if !matches!(run.action_phase.as_str(), "planning" | "applying") {
         return Ok(AppliedCommand::rejected("action_cannot_return", Some(&run)));
     }
-    let effect_count: i64 = sqlx::query_scalar(
+    sqlx::query(
+        "SELECT step_id FROM meeting_v2_action_steps \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+         ORDER BY step_order FOR UPDATE",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "SELECT step_id, attempt_number FROM meeting_v2_action_step_attempts \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+         ORDER BY step_id, attempt_number FOR UPDATE",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    let accepted_or_applied: bool = sqlx::query_scalar(
         "SELECT \
-             (SELECT count(*) FROM meeting_v2_action_steps \
-              WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
-                AND status IN ('prepared', 'applied')) \
-           + (SELECT count(*) FROM meeting_v2_action_step_attempts \
-              WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
-                AND status <> 'abandoned')",
+           EXISTS (SELECT 1 FROM meeting_v2_action_steps \
+                   WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+                     AND status = 'applied') \
+           OR EXISTS (SELECT 1 FROM meeting_v2_action_step_attempts \
+                      WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+                        AND status = 'accepted')",
     )
     .bind(params.community_id.as_uuid())
     .bind(params.session_id)
     .bind(run.action_run_id)
     .fetch_one(tx.as_mut())
     .await?;
-    if effect_count != 0 {
+    if accepted_or_applied {
         return Ok(AppliedCommand::rejected(
             "action_has_external_effects",
             Some(&run),
         ));
     }
+    let unstable_attempt: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM meeting_v2_action_step_attempts \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+               AND status IN ('published', 'indeterminate'))",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .fetch_one(tx.as_mut())
+    .await?;
+    if unstable_attempt {
+        return Ok(AppliedCommand::rejected(
+            "action_attempt_in_flight",
+            Some(&run),
+        ));
+    }
+    sqlx::query(
+        "UPDATE meeting_v2_action_step_attempts \
+         SET status = 'abandoned', error_code = 'returned_to_board', updated_at = $4 \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+           AND status IN ('prepared', 'rejected')",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "UPDATE meeting_v2_action_steps \
+         SET status = 'abandoned', last_error_code = 'returned_to_board', updated_at = $4 \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+           AND status <> 'applied'",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
     sqlx::query(
         "UPDATE meeting_v2_action_runs \
          SET terminal_status = 'returned_to_board', terminal_at = $4, \
@@ -2202,13 +2369,15 @@ async fn load_active_run_tx(
 ) -> Result<Option<ActionRunRow>> {
     let sql = if for_update {
         "SELECT action_run_id, plan_event_id, board_event_id, control_epoch, \
-                action_window_epoch, action_phase, action_condition, terminal_status \
+                action_window_epoch, action_phase, action_condition, terminal_status, \
+                last_error_code \
          FROM meeting_v2_action_runs \
          WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL \
          FOR UPDATE"
     } else {
         "SELECT action_run_id, plan_event_id, board_event_id, control_epoch, \
-                action_window_epoch, action_phase, action_condition, terminal_status \
+                action_window_epoch, action_phase, action_condition, terminal_status, \
+                last_error_code \
          FROM meeting_v2_action_runs \
          WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL"
     };
@@ -2230,6 +2399,7 @@ fn action_run_from_row(row: sqlx::postgres::PgRow) -> Result<ActionRunRow> {
         action_phase: row.try_get("action_phase")?,
         action_condition: row.try_get("action_condition")?,
         terminal_status: row.try_get("terminal_status")?,
+        last_error_code: row.try_get("last_error_code")?,
     })
 }
 
@@ -2622,15 +2792,82 @@ pub(crate) async fn mark_active_run_terminal_tx(
             "invalid Meeting V2 action terminal status: {terminal_status}"
         )));
     }
+    let action_run_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT action_run_id FROM meeting_v2_action_runs \
+         WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(action_run_id) = action_run_id else {
+        return Ok(());
+    };
+    sqlx::query(
+        "SELECT step_id FROM meeting_v2_action_steps \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+         ORDER BY step_order FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(action_run_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "SELECT step_id, attempt_number FROM meeting_v2_action_step_attempts \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+         ORDER BY step_id, attempt_number FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(action_run_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "UPDATE meeting_v2_action_step_attempts \
+         SET status = 'abandoned', error_code = $4, updated_at = $5 \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+           AND status <> 'accepted'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(action_run_id)
+    .bind(terminal_status)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "UPDATE meeting_v2_action_steps step \
+         SET status = 'abandoned', last_error_code = $4, updated_at = $5 \
+         WHERE step.community_id = $1 AND step.session_id = $2 \
+           AND step.action_run_id = $3 AND step.status <> 'applied' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM meeting_v2_action_step_attempts attempt \
+               WHERE attempt.community_id = step.community_id \
+                 AND attempt.session_id = step.session_id \
+                 AND attempt.action_run_id = step.action_run_id \
+                 AND attempt.step_id = step.step_id \
+                 AND attempt.status = 'accepted')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(action_run_id)
+    .bind(terminal_status)
+    .bind(now)
+    .execute(tx.as_mut())
+    .await?;
     sqlx::query(
         "UPDATE meeting_v2_action_runs \
          SET terminal_status = $3, terminal_at = $4, action_deadline_at = NULL, updated_at = $4 \
-         WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL",
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $5 \
+           AND terminal_status IS NULL",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(terminal_status)
     .bind(now)
+    .bind(action_run_id)
     .execute(tx.as_mut())
     .await?;
     Ok(())

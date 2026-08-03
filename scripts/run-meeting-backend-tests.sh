@@ -39,6 +39,7 @@ export REDIS_URL="${BUZZ_TEST_REDIS_URL:-redis://localhost:6379}"
 export RELAY_URL="ws://localhost:${MEETING_RELAY_PORT}"
 export BUZZ_MEETING_V1_CREATE_ENABLED=true
 export BUZZ_MEETING_V2_CREATE_ENABLED=true
+export BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED=true
 export BUZZ_MEETING_ROLLOUT_FIXTURE="${ROLLOUT_FIXTURE_FILE}"
 export BUZZ_TEST_RELAY_PID_FILE="${RELAY_PID_FILE}"
 export BUZZ_TEST_RELAY_LOG_FILE="${RELAY_LOG_FILE}"
@@ -121,6 +122,17 @@ jq -e '
     and (.turns | index("floor_decision") != null)
     and (.currentBoard == "authoritative_read_before_each_semantic_turn")
 ' "${ACP_CAPABILITY_FILE}" >/dev/null
+jq -e '
+  (.meeting.capabilities | index("meeting-v2-action-finalization-v1") != null)
+  and any(
+    .meeting.protocols[];
+    .schemaVersion == "3"
+      and .policy == "moderated-board-actions-v1"
+      and .capability == "meeting-v2-action-finalization-v1"
+      and (.turns | index("action_finalization") != null)
+      and .moderatorContinuity == "exact_agent_slot_and_acp_session"
+  )
+' "${ACP_CAPABILITY_FILE}" >/dev/null
 
 echo "Creating isolated Meeting contract and Relay databases..."
 docker compose up -d postgres redis minio minio-init
@@ -183,6 +195,8 @@ curl --silent --show-error --fail \
   | jq -e '
       (.supported_extensions | index("buzz-meeting-v2") != null)
       and (.supported_extensions | index("buzz-meeting-v2-create") != null)
+      and (.supported_extensions | index("buzz-meeting-v2-actions") != null)
+      and (.supported_extensions | index("buzz-meeting-v2-actions-create") != null)
     ' >/dev/null
 curl --silent --show-error --fail \
   "http://127.0.0.1:${MEETING_RELAY_PORT}/_readiness" \
@@ -213,6 +227,7 @@ stop_relay
 BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
   BUZZ_MEETING_V1_CREATE_ENABLED=false \
   BUZZ_MEETING_V2_CREATE_ENABLED=false \
+  BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED=false \
   "${SCRIPT_DIR}/start-relay-for-tests.sh" --no-build --no-schema
 
 echo "Verifying closed Create retains the Meeting V2 drain capability..."
@@ -223,6 +238,8 @@ curl --silent --show-error --fail \
   | jq -e '
       (.supported_extensions | index("buzz-meeting-v2") != null)
       and (.supported_extensions | index("buzz-meeting-v2-create") == null)
+      and (.supported_extensions | index("buzz-meeting-v2-actions") != null)
+      and (.supported_extensions | index("buzz-meeting-v2-actions-create") == null)
     ' >/dev/null
 curl --silent --show-error --fail \
   "http://127.0.0.1:${MEETING_RELAY_PORT}/_readiness" \
@@ -243,6 +260,22 @@ BUZZ_REQUIRE_RELAY_MEMBERSHIP=true \
 
 cargo test -p buzz-test-client --test e2e_meeting_baton \
   relay_member_removal_disconnects_live_meeting_reader_and_blocks_reentry -- \
+  --ignored \
+  --test-threads=1 \
+  --nocapture
+
+# This scenario intentionally upgrades the shared Community to Project View v2.
+# Keep it last so that its irreversible fixture cannot affect the V0/V1/V2
+# compatibility and membership-revocation scenarios above.
+echo "Restarting Relay for the isolated Meeting action-finalization scenario..."
+stop_relay
+BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
+  BUZZ_MEETING_V1_CREATE_ENABLED=true \
+  BUZZ_MEETING_V2_CREATE_ENABLED=true \
+  BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED=true \
+  "${SCRIPT_DIR}/start-relay-for-tests.sh" --no-build --no-schema
+
+cargo test -p buzz-test-client --test e2e_meeting_v2_actions -- \
   --ignored \
   --test-threads=1 \
   --nocapture

@@ -514,7 +514,23 @@ async fn handle_meeting_create(
         protocol,
         state.config.meeting_v1_create_enabled,
         state.config.meeting_v2_create_enabled,
+        state.config.meeting_v2_actions_create_enabled,
     )?;
+    if protocol == MeetingProtocol::ModeratedBoardActionsV2
+        && !buzz_db::meeting_v2::action_roster_supports_capability_tx(
+            &mut tx,
+            tenant.community(),
+            &participant_pubkeys,
+            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
+        )
+        .await
+        .map_err(map_meeting_db_error)?
+    {
+        return Err(IngestError::Rejected(format!(
+            "restricted: every Agent in the Meeting roster must advertise {}",
+            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY
+        )));
+    }
 
     let (created_participant_pubkeys, board_event_id) = match protocol {
         MeetingProtocol::UniformV0 => {
@@ -977,7 +993,7 @@ async fn handle_meeting_end(
                     plan_event_id: &fence.plan_event_id,
                 }
             });
-            match buzz_db::meeting_v2::end_meeting_v2_tx(
+            let end = buzz_db::meeting_v2::end_meeting_v2_tx(
                 &mut tx,
                 buzz_db::meeting_v2::EndMeetingV2Params {
                     community_id: tenant.community(),
@@ -991,9 +1007,22 @@ async fn handle_meeting_end(
                     relay_keys: &state.relay_keypair,
                 },
             )
-            .await
-            .map_err(map_meeting_db_error)?
+            .await;
+            if protocol.has_action_finalization()
+                && v2_terminal.0 == buzz_db::meeting_v2::TerminalOutcome::Closed
+                && matches!(
+                    &end,
+                    Err(buzz_db::DbError::InvalidData(message))
+                        if message.contains("required action completion gate")
+                )
             {
+                metrics::counter!(
+                    "meeting_v2_action_close_gate_rejection_total",
+                    "reason" => "not_ready"
+                )
+                .increment(1);
+            }
+            match end.map_err(map_meeting_db_error)? {
                 buzz_db::meeting_v2::EndMeetingV2Outcome::Ended(_) => ManualEndResult::Ended,
                 buzz_db::meeting_v2::EndMeetingV2Outcome::AlreadyEnded(outcome) => {
                     ManualEndResult::AlreadyEnded(Some(outcome))
@@ -1516,15 +1545,23 @@ fn ensure_meeting_create_enabled(
     protocol: MeetingProtocol,
     meeting_v1_create_enabled: bool,
     meeting_v2_create_enabled: bool,
+    meeting_v2_actions_create_enabled: bool,
 ) -> Result<(), IngestError> {
     if protocol == MeetingProtocol::ModeratedBatonV1 && !meeting_v1_create_enabled {
         return Err(IngestError::Rejected(
             "restricted: Meeting V1 creation is disabled".into(),
         ));
     }
-    if protocol.is_v2() && !meeting_v2_create_enabled {
+    if matches!(protocol, MeetingProtocol::ModeratedBoardV2) && !meeting_v2_create_enabled {
         return Err(IngestError::Rejected(
             "restricted: Meeting V2 creation is disabled".into(),
+        ));
+    }
+    if protocol == MeetingProtocol::ModeratedBoardActionsV2
+        && (!meeting_v2_create_enabled || !meeting_v2_actions_create_enabled)
+    {
+        return Err(IngestError::Rejected(
+            "restricted: action-capable Meeting V2 creation is disabled".into(),
         ));
     }
     Ok(())
@@ -3026,31 +3063,58 @@ mod meeting_protocol_tests {
 
     #[test]
     fn create_gates_only_control_their_new_protocol_sessions() {
-        assert!(ensure_meeting_create_enabled(MeetingProtocol::UniformV0, false, false).is_ok());
         assert!(
-            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, true, false).is_ok()
-        );
-        assert!(
-            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBatonV1, false, true).is_err()
-        );
-        assert!(
-            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBoardV2, false, true).is_ok()
-        );
-        assert!(
-            ensure_meeting_create_enabled(MeetingProtocol::ModeratedBoardV2, true, false).is_err()
+            ensure_meeting_create_enabled(MeetingProtocol::UniformV0, false, false, false).is_ok()
         );
         assert!(ensure_meeting_create_enabled(
-            MeetingProtocol::ModeratedBoardActionsV2,
-            false,
+            MeetingProtocol::ModeratedBatonV1,
             true,
+            false,
+            false,
         )
         .is_ok());
         assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBatonV1,
+            false,
+            true,
+            true,
+        )
+        .is_err());
+        assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBoardV2,
+            false,
+            true,
+            false,
+        )
+        .is_ok());
+        assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBoardV2,
+            true,
+            false,
+            true,
+        )
+        .is_err());
+        assert!(ensure_meeting_create_enabled(
             MeetingProtocol::ModeratedBoardActionsV2,
+            true,
+            false,
+            true,
+        )
+        .is_err());
+        assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBoardActionsV2,
+            false,
             true,
             false,
         )
         .is_err());
+        assert!(ensure_meeting_create_enabled(
+            MeetingProtocol::ModeratedBoardActionsV2,
+            false,
+            true,
+            true,
+        )
+        .is_ok());
     }
 
     #[test]

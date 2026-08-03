@@ -1451,6 +1451,46 @@ pub async fn end_meeting_v2_tx(
     Ok(EndMeetingV2Outcome::Ended(Box::new(snapshot)))
 }
 
+/// Return whether every managed Agent in a proposed action-capable roster
+/// advertises the required runtime capability.
+///
+/// Human participants are intentionally ignored. Agent identity uses the same
+/// durable `agent_owner_pubkey` discriminator that freezes participant type at
+/// Meeting creation, so a partial or stale capability rollout fails closed.
+pub async fn action_roster_supports_capability_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    participant_pubkeys: &[Vec<u8>],
+    required_capability: &str,
+) -> Result<bool> {
+    if participant_pubkeys.is_empty()
+        || required_capability.is_empty()
+        || required_capability.len() > 128
+        || required_capability.trim() != required_capability
+        || required_capability.chars().any(char::is_control)
+        || participant_pubkeys.iter().any(|pubkey| pubkey.len() != 32)
+    {
+        return Err(DbError::InvalidData(
+            "invalid Meeting V2 action roster capability check".to_string(),
+        ));
+    }
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::BIGINT \
+         FROM users \
+         WHERE community_id = $1 AND pubkey = ANY($2::bytea[]) \
+           AND agent_owner_pubkey IS NOT NULL \
+           AND (capabilities IS NULL \
+             OR jsonb_typeof(capabilities) <> 'array' \
+             OR NOT capabilities @> jsonb_build_array($3::text))",
+    )
+    .bind(community_id.as_uuid())
+    .bind(participant_pubkeys)
+    .bind(required_capability)
+    .fetch_one(tx.as_mut())
+    .await?;
+    Ok(missing_count == 0)
+}
+
 /// Atomically create a private Meeting V2 room and its initial current board.
 ///
 /// The signed Create event must already exist in `events` inside `tx` and its
@@ -1994,6 +2034,81 @@ mod tests {
         .execute(tx.as_mut())
         .await
         .expect("insert signed Meeting V2 Create");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn action_capability_gate_covers_every_agent_but_not_humans() {
+        let (pool, admin, database_name) =
+            setup_isolated_pool("buzz_meeting_action_capability").await;
+        let community_id = make_community(&pool).await;
+        let owner = Keys::generate().public_key().to_bytes().to_vec();
+        let first_agent = Keys::generate().public_key().to_bytes().to_vec();
+        let second_agent = Keys::generate().public_key().to_bytes().to_vec();
+        let human = Keys::generate().public_key().to_bytes().to_vec();
+        for pubkey in [&owner, &first_agent, &second_agent, &human] {
+            seed_identity(&pool, community_id, pubkey, "member").await;
+        }
+        for agent in [&first_agent, &second_agent] {
+            sqlx::query(
+                "UPDATE users SET agent_owner_pubkey = $3 \
+                 WHERE community_id = $1 AND pubkey = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(agent)
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .expect("mark managed Agent");
+        }
+        crate::user::set_agent_capabilities(
+            &pool,
+            community_id,
+            &first_agent,
+            &[buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY.to_string()],
+        )
+        .await
+        .expect("advertise first Agent capability");
+        let roster = vec![first_agent.clone(), second_agent.clone(), human];
+
+        let mut tx = pool.begin().await.expect("begin missing-capability check");
+        assert!(!action_roster_supports_capability_tx(
+            &mut tx,
+            community_id,
+            &roster,
+            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
+        )
+        .await
+        .expect("check incomplete Agent rollout"));
+        tx.rollback().await.expect("rollback capability check");
+
+        crate::user::set_agent_capabilities(
+            &pool,
+            community_id,
+            &second_agent,
+            &[buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY.to_string()],
+        )
+        .await
+        .expect("advertise second Agent capability");
+        let mut tx = pool.begin().await.expect("begin complete-capability check");
+        assert!(action_roster_supports_capability_tx(
+            &mut tx,
+            community_id,
+            &roster,
+            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
+        )
+        .await
+        .expect("check complete Agent rollout"));
+        tx.rollback().await.expect("rollback capability check");
+
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop isolated Meeting action capability database");
+        admin.close().await;
     }
 
     #[test]
@@ -2884,6 +2999,54 @@ mod tests {
         )
         .expect("parse first action run id");
 
+        sqlx::query(
+            "UPDATE meeting_v2_action_runs \
+             SET action_deadline_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .execute(&pool)
+        .await
+        .expect("force first action deadline");
+        let due = crate::meeting_baton::claim_due_baton_sessions(&db, 100)
+            .await
+            .expect("claim action deadline");
+        assert!(due
+            .iter()
+            .any(|candidate| candidate.session_id == session_id));
+        let recovered =
+            crate::meeting_baton::recover_meeting_v1(&db, community_id, session_id, &relay_keys)
+                .await
+                .expect("recover action deadline through the shared sweeper path");
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|transition| transition.primary_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["action_deadline_exceeded"]
+        );
+        let recovered_action: (String, Option<DateTime<Utc>>, Option<String>) = sqlx::query_as(
+            "SELECT action_condition, action_deadline_at, last_error_code \
+                 FROM meeting_v2_action_runs \
+                 WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered action deadline");
+        assert_eq!(
+            recovered_action,
+            (
+                "blocked".to_string(),
+                None,
+                Some("action_deadline_exceeded".to_string())
+            )
+        );
+
         let early_close =
             buzz_sdk::build_meeting_v2_actions_end(buzz_sdk::MeetingV2ActionsEndParams {
                 session_id,
@@ -2918,6 +3081,105 @@ mod tests {
             .await
             .expect("rollback rejected premature close");
 
+        let abandoned_step_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_steps \
+                 (community_id, session_id, action_run_id, step_id, step_order, step_kind, \
+                  desired_payload, target_object_type, target_object_id, status, attempt_count) \
+             VALUES ($1, $2, $3, $4, 1, 'project_view.create_requirement', \
+                     '{\"title\":\"not published\"}'::jsonb, 'requirement', $5, 'prepared', 1)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .bind(abandoned_step_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("seed unaccepted prepared step");
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_step_attempts \
+                 (community_id, session_id, action_run_id, step_id, action_window_epoch, \
+                  attempt_number, project_command_event_id, signed_project_event, \
+                  expected_project_revision, status) \
+             VALUES ($1, $2, $3, $4, 1, 1, $5, '{}'::jsonb, 1, 'prepared')",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .bind(abandoned_step_id)
+        .bind(vec![0x91_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed unaccepted prepared attempt");
+
+        let abort = buzz_sdk::build_meeting_v2_actions_end(buzz_sdk::MeetingV2ActionsEndParams {
+            session_id,
+            create_event_id: &create.id.to_hex(),
+            outcome: buzz_sdk::MeetingV2EndOutcome::Aborted,
+            reason_code: Some("unable_to_form_conclusion"),
+            reason: Some("bounded abort fence probe"),
+            action_fence: None,
+        })
+        .expect("build action-stage abort")
+        .sign_with_keys(&host_keys)
+        .expect("sign action-stage abort");
+        let mut abort_tx = pool.begin().await.expect("begin action-stage abort");
+        insert_create_event_tx(&mut abort_tx, community_id, session_id, &abort).await;
+        assert!(matches!(
+            end_meeting_v2_tx(
+                &mut abort_tx,
+                EndMeetingV2Params {
+                    community_id,
+                    session_id,
+                    actor_pubkey: &host,
+                    create_event_id: create.id.as_bytes(),
+                    end_event_id: abort.id.as_bytes(),
+                    outcome: TerminalOutcome::Aborted,
+                    reason_code: Some("unable_to_form_conclusion"),
+                    action_fence: None,
+                    relay_keys: &relay_keys,
+                },
+            )
+            .await
+            .expect("abort during action finalization"),
+            EndMeetingV2Outcome::Ended(_)
+        ));
+        let aborted_audit: (String, String, String) = sqlx::query_as(
+            "SELECT run.terminal_status, step.status, attempt.status \
+             FROM meeting_v2_action_runs run \
+             JOIN meeting_v2_action_steps step \
+               ON step.community_id = run.community_id \
+              AND step.session_id = run.session_id \
+              AND step.action_run_id = run.action_run_id \
+             JOIN meeting_v2_action_step_attempts attempt \
+               ON attempt.community_id = step.community_id \
+              AND attempt.session_id = step.session_id \
+              AND attempt.action_run_id = step.action_run_id \
+              AND attempt.step_id = step.step_id \
+             WHERE run.community_id = $1 AND run.session_id = $2 \
+               AND run.action_run_id = $3 AND step.step_id = $4",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .bind(abandoned_step_id)
+        .fetch_one(abort_tx.as_mut())
+        .await
+        .expect("read action abort audit");
+        assert_eq!(
+            aborted_audit,
+            (
+                "completed_aborted".to_string(),
+                "abandoned".to_string(),
+                "abandoned".to_string()
+            )
+        );
+        abort_tx
+            .rollback()
+            .await
+            .expect("roll back action-stage abort probe");
+
         let return_event = buzz_sdk::build_meeting_v2_action_return_to_board(
             buzz_sdk::MeetingV2ActionCommandParams {
                 session_id,
@@ -2950,6 +3212,28 @@ mod tests {
         .await
         .expect("return first action run to Board");
         assert!(returned.accepted);
+        let abandoned: (String, String) = sqlx::query_as(
+            "SELECT step.status, attempt.status \
+             FROM meeting_v2_action_steps step \
+             JOIN meeting_v2_action_step_attempts attempt \
+               ON attempt.community_id = step.community_id \
+              AND attempt.session_id = step.session_id \
+              AND attempt.action_run_id = step.action_run_id \
+              AND attempt.step_id = step.step_id \
+             WHERE step.community_id = $1 AND step.session_id = $2 \
+               AND step.action_run_id = $3 AND step.step_id = $4",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .bind(abandoned_step_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read atomically abandoned prepared write");
+        assert_eq!(
+            abandoned,
+            ("abandoned".to_string(), "abandoned".to_string())
+        );
         let returned_runtime: (String, i64, String) = sqlx::query_as(
             "SELECT runtime.runtime_phase, runtime.board_window, run.terminal_status \
              FROM meeting_v2_bootstrap_state runtime \
@@ -3210,6 +3494,90 @@ mod tests {
         assert!(retried.accepted);
         assert_eq!(retried.response["action_window_epoch"].as_i64(), Some(2));
 
+        sqlx::query(
+            "UPDATE meeting_v2_action_runs \
+             SET action_deadline_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_two)
+        .execute(&pool)
+        .await
+        .expect("force retry-window deadline");
+        let lazy_probe =
+            buzz_sdk::build_meeting_v2_action_complete(buzz_sdk::MeetingV2ActionCommandParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id: run_two,
+                    action_window: 2,
+                    plan_event_id: Some(&plan_event.id.to_hex()),
+                },
+            })
+            .expect("build lazy-recovery probe")
+            .sign_with_keys(&host_keys)
+            .expect("sign lazy-recovery probe");
+        let lazy_recovered = crate::meeting_v2_actions::execute_action_command(
+            &db,
+            crate::meeting_v2_actions::ActionCommandTxParams {
+                community_id,
+                session_id,
+                event: &lazy_probe,
+                command: crate::meeting_v2_actions::ActionCommand::Complete {
+                    fence: crate::meeting_v2_actions::ActionRunFence {
+                        action_run_id: run_two,
+                        action_window_epoch: 2,
+                        plan_event_id: Some(plan_event_id.clone()),
+                    },
+                },
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect("commit lazy action-deadline recovery");
+        assert!(!lazy_recovered.accepted);
+        assert_eq!(lazy_recovered.outcome_code, "action_deadline_recovered");
+
+        let retry_after_deadline =
+            buzz_sdk::build_meeting_v2_action_retry(buzz_sdk::MeetingV2ActionCommandParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id: run_two,
+                    action_window: 2,
+                    plan_event_id: Some(&plan_event.id.to_hex()),
+                },
+            })
+            .expect("build retry after deadline")
+            .sign_with_keys(&host_keys)
+            .expect("sign retry after deadline");
+        let retried_after_deadline = crate::meeting_v2_actions::execute_action_command(
+            &db,
+            crate::meeting_v2_actions::ActionCommandTxParams {
+                community_id,
+                session_id,
+                event: &retry_after_deadline,
+                command: crate::meeting_v2_actions::ActionCommand::Retry {
+                    fence: crate::meeting_v2_actions::ActionRunFence {
+                        action_run_id: run_two,
+                        action_window_epoch: 2,
+                        plan_event_id: Some(plan_event_id.clone()),
+                    },
+                },
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect("retry after durable deadline block");
+        assert!(retried_after_deadline.accepted);
+        assert_eq!(
+            retried_after_deadline.response["action_window_epoch"].as_i64(),
+            Some(3)
+        );
+        assert_eq!(
+            retried_after_deadline.response["details"]["retry_reason"],
+            "action_deadline_exceeded"
+        );
+
         // Directly changing step status is not sufficient proof of an external
         // effect. Completion must still fail without exact accepted attempts
         // and verified Project View projections.
@@ -3230,7 +3598,7 @@ mod tests {
                 session_id,
                 fence: buzz_sdk::MeetingV2ActionRunFence {
                     action_run_id: run_two,
-                    action_window: 2,
+                    action_window: 3,
                     plan_event_id: Some(&plan_event.id.to_hex()),
                 },
             })
@@ -3246,7 +3614,7 @@ mod tests {
                 command: crate::meeting_v2_actions::ActionCommand::Complete {
                     fence: crate::meeting_v2_actions::ActionRunFence {
                         action_run_id: run_two,
-                        action_window_epoch: 2,
+                        action_window_epoch: 3,
                         plan_event_id: Some(plan_event_id.clone()),
                     },
                 },

@@ -1988,6 +1988,17 @@ impl MeetingV1Coordinator {
 
         match completed.result {
             Ok(board) => {
+                if completed.request.kind == MeetingTurnKind::V2ActionFinalization {
+                    let frozen_board_matches = self
+                        .ledger_for(completed.session_id)
+                        .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                        .is_some_and(|record| record.board_event_id == board.event_id);
+                    if !frozen_board_matches {
+                        self.finish_board_load_failure(completed.request, completed.attempt)
+                            .await;
+                        return;
+                    }
+                }
                 let event_id = board.event_id.clone();
                 let original_bytes = board.original_bytes;
                 let truncated = board.truncated;
@@ -2181,24 +2192,25 @@ impl MeetingV1Coordinator {
                 else {
                     return false;
                 };
+                let action_record_matches = self
+                    .ledger_for(request.session_id)
+                    .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                    .is_some_and(|record| {
+                        record.action_run_id == action.action_run_id
+                            && record.board_event_id == action.board_event_id
+                            && record.action_window_epoch == action.action_window_epoch
+                            && matches!(record.state.as_str(), "pending" | "queued" | "running")
+                    });
                 view.protocol.has_action_finalization()
                     && view.baton.moderator_pubkey == self.agent_pubkey
                     && action.action_run_id.to_string() == request.basis_id
-                    && action.board_event_id
-                        == request.board_event_id.as_deref().unwrap_or_default()
                     && action.control_epoch == request.round_number
                     && action.action_window_epoch == request.floor_revision
                     && action.phase == "planning"
                     && action.condition == "runnable"
                     && action.plan_event_id.is_none()
                     && now_ms() < request.hard_deadline_unix_ms
-                    && self
-                        .ledger_for(request.session_id)
-                        .and_then(|ledger| ledger.v2_action_finalization.as_ref())
-                        .is_some_and(|record| {
-                            record.action_run_id == action.action_run_id
-                                && matches!(record.state.as_str(), "pending" | "queued" | "running")
-                        })
+                    && action_record_matches
             }
             MeetingTurnKind::V1ModeratorControl
             | MeetingTurnKind::V0Intent
@@ -2342,14 +2354,19 @@ impl MeetingV1Coordinator {
                 self.persist_ledger_best_effort();
             }
             MeetingTurnKind::V2ActionFinalization => {
-                if let Some(record) = self
-                    .ledger_for_mut(request.session_id)
-                    .and_then(|ledger| ledger.v2_action_finalization.as_mut())
-                {
-                    record.state = "board_read_failed".to_string();
-                    record.turn_id = None;
+                let record = self
+                    .ledger_for(request.session_id)
+                    .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                    .cloned();
+                if let Some(record) = record {
+                    self.block_v2_action_run(
+                        request.session_id,
+                        "board-read",
+                        &record,
+                        "provider_failure",
+                        "the exact final Meeting Board could not be read authoritatively",
+                    );
                 }
-                self.persist_ledger_best_effort();
             }
             MeetingTurnKind::V1ModeratorControl
             | MeetingTurnKind::V0Intent
@@ -4268,6 +4285,8 @@ impl MeetingV1Coordinator {
                                 prepared_project_attempt: None,
                             });
                         } else if let Some(record) = ledger.v2_action_finalization.as_mut() {
+                            let window_advanced =
+                                action.action_window_epoch > record.action_window_epoch;
                             record.hard_deadline_unix_ms = reconcile_action_deadline(
                                 record.action_window_epoch,
                                 record.hard_deadline_unix_ms,
@@ -4287,6 +4306,15 @@ impl MeetingV1Coordinator {
                                 record.turn_id = None;
                                 record.prepared_plan_event = None;
                                 record.prepared_plan_event_id = None;
+                            } else if action.phase == "planning" && window_advanced {
+                                // A Relay-accepted retry creates a new semantic
+                                // window. Dispatch still requires the exact
+                                // locally bound slot/ACP Session; a restarted
+                                // or replaced Runtime will fail that claim and
+                                // durably block as affinity_lost.
+                                record.state = "pending".to_string();
+                                record.turn_id = None;
+                                record.format_attempts = 0;
                             }
                             if let Some(step_id) = record.prepared_project_step_id {
                                 let canonical =
@@ -13080,6 +13108,44 @@ mod tests {
             serde_json::to_value(&view.baton.board_control).expect("serialize Board control");
     }
 
+    fn set_v2_action_planning(
+        view: &mut MeetingView,
+        action_run_id: Uuid,
+        board_event_id: String,
+        relay_deadline_ms: i64,
+    ) {
+        view.baton.phase = "moderator_idle".to_string();
+        let board = view
+            .baton
+            .board_control
+            .as_mut()
+            .expect("action-capable Board control");
+        board.phase = "finalizing_actions".to_string();
+        board.action = Some(ActionRunView {
+            action_run_id,
+            plan_event_id: None,
+            board_event_id,
+            control_epoch: board.control_epoch,
+            board_window: board.board_window,
+            action_window_epoch: 1,
+            phase: "planning".to_string(),
+            condition: "runnable".to_string(),
+            terminal_status: None,
+            completion_project_revision: None,
+            action_deadline_at_ms: Some(relay_deadline_ms),
+            last_error_code: None,
+            required_step_count: 0,
+            applied_step_count: 0,
+            steps: Vec::new(),
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+            terminal_at_ms: None,
+        });
+        view.baton.raw_state["phase"] = json!("moderator_idle");
+        view.baton.raw_state["board_control"] =
+            serde_json::to_value(&view.baton.board_control).expect("serialize Board control");
+    }
+
     fn make_v2_local_moderator(view: &mut MeetingView, agent_pubkey: &str) {
         view.baton.moderator_pubkey = agent_pubkey.to_string();
         view.baton.raw_state["moderator_pubkey"] = json!(agent_pubkey);
@@ -13089,6 +13155,41 @@ mod tests {
         relay: &Keys,
         session_id: Uuid,
         moderator_pubkey: &str,
+        body: &str,
+        timestamp: u64,
+    ) -> Event {
+        meeting_v2_board_event_for_policy(
+            relay,
+            session_id,
+            moderator_pubkey,
+            buzz_sdk::MEETING_V2_POLICY,
+            body,
+            timestamp,
+        )
+    }
+
+    fn meeting_v2_actions_board_event(
+        relay: &Keys,
+        session_id: Uuid,
+        moderator_pubkey: &str,
+        body: &str,
+        timestamp: u64,
+    ) -> Event {
+        meeting_v2_board_event_for_policy(
+            relay,
+            session_id,
+            moderator_pubkey,
+            buzz_sdk::MEETING_V2_ACTIONS_POLICY,
+            body,
+            timestamp,
+        )
+    }
+
+    fn meeting_v2_board_event_for_policy(
+        relay: &Keys,
+        session_id: Uuid,
+        moderator_pubkey: &str,
+        policy: &str,
         body: &str,
         timestamp: u64,
     ) -> Event {
@@ -13105,7 +13206,7 @@ mod tests {
         .tags([
             Tag::parse(["h", session.as_str()]).expect("Board h tag"),
             Tag::parse(["v", buzz_sdk::MEETING_V2_SCHEMA_VERSION]).expect("Board v tag"),
-            Tag::parse(["policy", buzz_sdk::MEETING_V2_POLICY]).expect("Board policy tag"),
+            Tag::parse(["policy", policy]).expect("Board policy tag"),
             Tag::parse(["format", buzz_sdk::MEETING_V2_BOARD_FORMAT]).expect("Board format tag"),
             Tag::parse(["moderator", moderator_pubkey]).expect("Board moderator tag"),
         ])
@@ -18669,6 +18770,140 @@ mod tests {
     }
 
     #[test]
+    fn action_restart_and_retry_do_not_bypass_session_continuity() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let moderator = Keys::generate();
+        let moderator_pubkey = moderator.public_key().to_hex();
+        let participant_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
+        let board_event_id = pubkey(87);
+        let mut coordinator = test_coordinator(
+            moderator,
+            directory.path().join("meeting-v2-action-recovery.json"),
+            None,
+        );
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
+        let mut view =
+            meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
+        make_v2_local_moderator(&mut view, &moderator_pubkey);
+        let board = view
+            .baton
+            .board_control
+            .as_mut()
+            .expect("action-capable Board control");
+        board.phase = "finalizing_actions".to_string();
+        board.action = Some(ActionRunView {
+            action_run_id,
+            plan_event_id: None,
+            board_event_id: board_event_id.clone(),
+            control_epoch: board.control_epoch,
+            board_window: board.board_window,
+            action_window_epoch: 1,
+            phase: "planning".to_string(),
+            condition: "blocked".to_string(),
+            terminal_status: None,
+            completion_project_revision: None,
+            action_deadline_at_ms: None,
+            last_error_code: Some("action_deadline_exceeded".to_string()),
+            required_step_count: 0,
+            applied_step_count: 0,
+            steps: Vec::new(),
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+            terminal_at_ms: None,
+        });
+        coordinator.apply_view_to_ledger(&view);
+        let record = coordinator
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+            .expect("blocked action record");
+        record.state = "deadline_exceeded".to_string();
+        record.hard_deadline_unix_ms = now_ms().saturating_sub(1);
+        coordinator.apply_view_to_ledger(&view);
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                .map(|record| record.state.as_str()),
+            Some("blocked"),
+            "authoritative blocked State remains durable"
+        );
+
+        let action = view
+            .baton
+            .board_control
+            .as_mut()
+            .and_then(|board| board.action.as_mut())
+            .expect("action run");
+        action.action_window_epoch = 2;
+        action.condition = "runnable".to_string();
+        action.action_deadline_at_ms = Some(now_ms().saturating_add(120_000));
+        action.last_error_code = None;
+        coordinator.apply_view_to_ledger(&view);
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                .map(|record| (record.state.as_str(), record.action_window_epoch)),
+            Some(("pending", 2)),
+            "only a Relay-advanced retry window may queue semantic work"
+        );
+
+        let plan_event_id = pubkey(88);
+        let action = view
+            .baton
+            .board_control
+            .as_mut()
+            .and_then(|board| board.action.as_mut())
+            .expect("action run");
+        action.phase = "applying".to_string();
+        action.plan_event_id = Some(plan_event_id.clone());
+        if let Some(record) = coordinator
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+        {
+            record.state = "affinity_lost".to_string();
+        }
+        coordinator.apply_view_to_ledger(&view);
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                .map(|record| record.state.as_str()),
+            Some("materializing"),
+            "a frozen plan may resume mechanically without a new Agent Turn"
+        );
+
+        let ledger = coordinator
+            .ledger_for_mut(session_id)
+            .expect("Meeting action ledger");
+        ledger.v2_continuity = Some(V2ContinuityRecord {
+            agent_index: 0,
+            acp_session_id: "exact-session".to_string(),
+            phase: "action".to_string(),
+            updated_at_ms: now_ms(),
+        });
+        let (_, _, changed) = recover_interrupted_meeting_turns(ledger);
+        assert!(
+            !changed,
+            "mechanical state needs no semantic restart rewrite"
+        );
+        assert_eq!(
+            ledger
+                .v2_continuity
+                .as_ref()
+                .map(|continuity| continuity.acp_session_id.as_str()),
+            Some("exact-session"),
+            "restart evidence is retained for exact-claim verification"
+        );
+    }
+
+    #[test]
     fn project_write_receipt_is_bound_to_event_operation_and_revision() {
         let keys = Keys::generate();
         let event = build_project_object_command(ProjectObjectCommand::new(
@@ -18737,6 +18972,156 @@ mod tests {
         view.protocol = MeetingBatonProtocol::V2;
         assert!(parse_v2_floor_output(raw, &view).is_err());
         assert!(parse_control_output(candidate_raw, &view, &attempt, &moderator_pubkey).is_err());
+    }
+
+    #[tokio::test]
+    async fn action_finalization_reads_the_exact_frozen_board_after_begin_confirmation() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let moderator = Keys::generate();
+        let moderator_pubkey = moderator.public_key().to_hex();
+        let participant_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
+        let board_event = meeting_v2_actions_board_event(
+            &relay,
+            session_id,
+            &moderator_pubkey,
+            "# Final Board\nThe action decision is frozen.",
+            84,
+        );
+        let board_event_id = board_event.id.to_hex();
+        let (rest, server) =
+            rest_responding_in_order(moderator.clone(), vec![json!([board_event])]).await;
+        let mut coordinator = test_coordinator(
+            moderator,
+            directory.path().join("meeting-v2-action-board-read.json"),
+            None,
+        );
+        coordinator.rest = rest;
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
+        let mut view =
+            meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
+        make_v2_local_moderator(&mut view, &moderator_pubkey);
+        let relay_deadline = now_ms().saturating_add(180_000);
+        set_v2_action_planning(
+            &mut view,
+            action_run_id,
+            board_event_id.clone(),
+            relay_deadline,
+        );
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view.clone()),
+            SyncApplyResult::Applied
+        );
+
+        coordinator.reconcile(session_id).await;
+        assert_eq!(
+            coordinator.front_kind(),
+            Some(MeetingTurnKind::V2ActionFinalization)
+        );
+        assert!(
+            coordinator.pop_pending().is_none(),
+            "Action Finalization must stop at the exact-Board read fence"
+        );
+
+        // The asynchronous begin submission can confirm while the Board read
+        // is in flight. Re-applying that same authority must not make the
+        // request stale merely because its fetched Board ID is not attached yet.
+        coordinator.apply_view_to_ledger(&view);
+        wait_for_board_load(&mut coordinator).await;
+        let action_request = coordinator
+            .pop_pending()
+            .expect("exact frozen Board makes Action Finalization dispatchable");
+        assert_eq!(
+            action_request.board_event_id.as_deref(),
+            Some(board_event_id.as_str())
+        );
+        assert!(action_request.prompt.contains("action decision is frozen"));
+
+        server.await.expect("action Board server finishes");
+    }
+
+    #[tokio::test]
+    async fn action_finalization_blocks_when_current_board_is_not_the_frozen_board() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let moderator = Keys::generate();
+        let moderator_pubkey = moderator.public_key().to_hex();
+        let participant_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
+        let frozen_board = meeting_v2_actions_board_event(
+            &relay,
+            session_id,
+            &moderator_pubkey,
+            "# Frozen Board",
+            84,
+        );
+        let frozen_board_id = frozen_board.id.to_hex();
+        let unexpected_board = meeting_v2_actions_board_event(
+            &relay,
+            session_id,
+            &moderator_pubkey,
+            "# Unexpected newer Board",
+            85,
+        );
+        let (rest, server) = rest_responding_in_order(
+            moderator.clone(),
+            vec![json!([frozen_board, unexpected_board])],
+        )
+        .await;
+        let mut coordinator = test_coordinator(
+            moderator,
+            directory
+                .path()
+                .join("meeting-v2-action-board-mismatch.json"),
+            None,
+        );
+        coordinator.rest = rest;
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
+        let mut view =
+            meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
+        make_v2_local_moderator(&mut view, &moderator_pubkey);
+        set_v2_action_planning(
+            &mut view,
+            action_run_id,
+            frozen_board_id,
+            now_ms().saturating_add(180_000),
+        );
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+
+        coordinator.reconcile(session_id).await;
+        assert!(coordinator.pop_pending().is_none());
+        wait_for_board_load(&mut coordinator).await;
+
+        assert!(coordinator.pending.is_empty());
+        let ledger = coordinator.ledger_for(session_id).expect("action ledger");
+        assert_eq!(
+            ledger
+                .v2_action_finalization
+                .as_ref()
+                .map(|record| record.state.as_str()),
+            Some("block_prepared")
+        );
+        assert_eq!(
+            ledger
+                .prepared_moderator_action
+                .as_ref()
+                .map(|prepared| prepared.action_kind.as_str()),
+            Some("action_block")
+        );
+
+        server.await.expect("mismatched Board server finishes");
     }
 
     #[test]

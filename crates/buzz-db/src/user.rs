@@ -404,6 +404,96 @@ pub async fn set_channel_add_policy(
     Ok(())
 }
 
+/// Replace the bounded capability list advertised by one Agent profile.
+pub async fn set_agent_capabilities(
+    pool: &PgPool,
+    community_id: CommunityId,
+    pubkey: &[u8],
+    capabilities: &[String],
+) -> Result<()> {
+    if pubkey.len() != 32 {
+        return Err(crate::error::DbError::InvalidData(
+            "invalid Agent capability profile".to_string(),
+        ));
+    }
+    let value = validate_agent_capabilities(capabilities)?;
+    let result = sqlx::query(
+        "UPDATE users SET capabilities = $1, updated_at = clock_timestamp() \
+         WHERE community_id = $2 AND pubkey = $3",
+    )
+    .bind(value)
+    .bind(community_id.as_uuid())
+    .bind(pubkey)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::error::DbError::NotFound(
+            "pubkey not found in users table".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically replace the controls carried by one Agent profile event.
+///
+/// Omitted capabilities preserve the last advertised list so older profile
+/// writers can continue changing only the channel-add policy.
+pub async fn set_agent_profile_controls(
+    pool: &PgPool,
+    community_id: CommunityId,
+    pubkey: &[u8],
+    policy: &str,
+    capabilities: Option<&[String]>,
+) -> Result<()> {
+    if pubkey.len() != 32 || !matches!(policy, "anyone" | "owner_only" | "nobody") {
+        return Err(crate::error::DbError::InvalidData(
+            "invalid Agent profile controls".to_string(),
+        ));
+    }
+    let capabilities = capabilities.map(validate_agent_capabilities).transpose()?;
+    let result = sqlx::query(
+        "UPDATE users \
+         SET channel_add_policy = $1::channel_add_policy, \
+             capabilities = COALESCE($2, capabilities), \
+             updated_at = clock_timestamp() \
+         WHERE community_id = $3 AND pubkey = $4",
+    )
+    .bind(policy)
+    .bind(capabilities)
+    .bind(community_id.as_uuid())
+    .bind(pubkey)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::error::DbError::NotFound(
+            "pubkey not found in users table".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_capabilities(capabilities: &[String]) -> Result<serde_json::Value> {
+    if capabilities.len() > 64 {
+        return Err(crate::error::DbError::InvalidData(
+            "invalid Agent capability profile".to_string(),
+        ));
+    }
+    let mut unique = std::collections::HashSet::with_capacity(capabilities.len());
+    for capability in capabilities {
+        if capability.is_empty()
+            || capability.len() > 128
+            || capability.trim() != capability
+            || capability.chars().any(char::is_control)
+            || !unique.insert(capability.as_str())
+        {
+            return Err(crate::error::DbError::InvalidData(
+                "Agent capabilities must be unique clean strings of 1..=128 bytes".to_string(),
+            ));
+        }
+    }
+    serde_json::to_value(capabilities).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -250,7 +250,9 @@ pub(crate) async fn handle_action_command(
     }
     let (parsed_session_id, command) = parse_action_command(event)?;
     debug_assert_eq!(parsed_session_id, session_id);
-    let commit = buzz_db::meeting_v2_actions::execute_action_command(
+    let action_label = command.action();
+    let started_at = Instant::now();
+    let commit = match buzz_db::meeting_v2_actions::execute_action_command(
         &state.db,
         buzz_db::meeting_v2_actions::ActionCommandTxParams {
             community_id: tenant.community(),
@@ -261,7 +263,14 @@ pub(crate) async fn handle_action_command(
         },
     )
     .await
-    .map_err(map_baton_db_error)?;
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            record_action_command_failure_metrics(action_label, started_at.elapsed().as_secs_f64());
+            return Err(map_baton_db_error(error));
+        }
+    };
+    record_action_command_metrics(action_label, &commit, started_at.elapsed().as_secs_f64());
     let mut response = commit.response;
     if let Some(object) = response.as_object_mut() {
         object.insert(
@@ -277,6 +286,162 @@ pub(crate) async fn handle_action_command(
         accepted: true,
         message: format!("response:{response}"),
     })
+}
+
+fn record_action_command_failure_metrics(action: &'static str, latency_seconds: f64) {
+    metrics::counter!(
+        "meeting_v2_action_command_total",
+        "action" => action,
+        "outcome" => "error",
+        "duplicate" => "false"
+    )
+    .increment(1);
+    if matches!(action, "step-prepared" | "step-applied") {
+        metrics::counter!(
+            "meeting_v2_action_step_total",
+            "kind" => "unknown",
+            "outcome" => "error"
+        )
+        .increment(1);
+        metrics::histogram!(
+            "meeting_v2_action_step_latency_seconds",
+            "kind" => "unknown",
+            "outcome" => "error"
+        )
+        .record(latency_seconds);
+    }
+}
+
+fn record_action_command_metrics(
+    action: &'static str,
+    commit: &buzz_db::meeting_v2_actions::ActionCommandCommit,
+    latency_seconds: f64,
+) {
+    let outcome = if commit.accepted {
+        "accepted"
+    } else if commit.outcome_code == "action_deadline_recovered" {
+        "expired"
+    } else {
+        "conflict"
+    };
+    let duplicate = if commit.duplicate { "true" } else { "false" };
+    metrics::counter!(
+        "meeting_v2_action_command_total",
+        "action" => action,
+        "outcome" => outcome,
+        "duplicate" => duplicate
+    )
+    .increment(1);
+
+    let details = &commit.response["details"];
+    if matches!(action, "step-prepared" | "step-applied") {
+        let kind =
+            action_step_metric_kind(details.get("step_kind").and_then(serde_json::Value::as_str));
+        metrics::counter!(
+            "meeting_v2_action_step_total",
+            "kind" => kind,
+            "outcome" => outcome
+        )
+        .increment(1);
+        metrics::histogram!(
+            "meeting_v2_action_step_latency_seconds",
+            "kind" => kind,
+            "outcome" => outcome
+        )
+        .record(latency_seconds);
+    }
+    if !commit.accepted || commit.duplicate {
+        return;
+    }
+
+    let reason = match action {
+        "block" => action_reason_metric_label(
+            details
+                .get("reason_code")
+                .and_then(serde_json::Value::as_str),
+        ),
+        "retry" => action_reason_metric_label(
+            details
+                .get("retry_reason")
+                .and_then(serde_json::Value::as_str),
+        ),
+        "begin" => "begin",
+        "plan" => "plan_frozen",
+        "complete" => "complete",
+        "return-to-board" => "return_to_board",
+        _ => "none",
+    };
+    if let Some((from, to)) = action_phase_metric_transition(action, details) {
+        metrics::counter!(
+            "meeting_v2_action_phase_transition_total",
+            "from" => from,
+            "to" => to,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+    if action == "block" {
+        metrics::counter!("meeting_v2_action_blocked_total", "reason" => reason).increment(1);
+        if reason == "affinity_lost" {
+            metrics::counter!(
+                "meeting_v2_action_affinity_mismatch_total",
+                "reason" => "slot_or_session"
+            )
+            .increment(1);
+        }
+    } else if action == "retry" {
+        metrics::counter!("meeting_v2_action_retry_total", "reason" => reason).increment(1);
+    }
+}
+
+fn action_phase_metric_transition(
+    action: &str,
+    details: &serde_json::Value,
+) -> Option<(&'static str, &'static str)> {
+    let phase = details.get("phase").and_then(serde_json::Value::as_str);
+    match action {
+        "begin" => Some(("floor_ready", "planning/runnable")),
+        "plan" => Some(("planning/runnable", "applying/runnable")),
+        "complete" => Some(("applying/runnable", "ready_to_close/runnable")),
+        "return-to-board" => Some(("action_active", "board_pending")),
+        "block" => Some(match phase {
+            Some("planning") => ("planning/runnable", "planning/blocked"),
+            Some("applying") => ("applying/runnable", "applying/blocked"),
+            _ => ("action/runnable", "action/blocked"),
+        }),
+        "retry" => Some(match phase {
+            Some("planning") => ("planning/blocked", "planning/runnable"),
+            Some("applying") => ("applying/blocked", "applying/runnable"),
+            _ => ("action/blocked", "action/runnable"),
+        }),
+        _ => None,
+    }
+}
+
+fn action_step_metric_kind(value: Option<&str>) -> &'static str {
+    match value {
+        Some("project_view.create_requirement") => "create_requirement",
+        Some("project_view.create_work") => "create_work",
+        Some("project_view.set_work_responsibility") => "set_work_responsibility",
+        _ => "unknown",
+    }
+}
+
+fn action_reason_metric_label(value: Option<&str>) -> &'static str {
+    match value {
+        Some("project_view_v2_unavailable") => "project_view_v2_unavailable",
+        Some("assignee_unresolved") => "assignee_unresolved",
+        Some("assignee_mapping_changed") => "assignee_mapping_changed",
+        Some("object_id_conflict") => "object_id_conflict",
+        Some("responsibility_conflict") => "responsibility_conflict",
+        Some("missing_dependency") => "missing_dependency",
+        Some("provenance_mismatch") => "provenance_mismatch",
+        Some("provider_failure") => "provider_failure",
+        Some("affinity_lost") => "affinity_lost",
+        Some("action_deadline_exceeded") => "action_deadline_exceeded",
+        Some("unspecified") | None => "unspecified",
+        Some(_) => "other",
+    }
 }
 
 fn parse_action_command(
@@ -1854,6 +2019,24 @@ mod tests {
             Tag::parse(["v", "2"]).expect("v"),
             Tag::parse(["action", action]).expect("action"),
         ]
+    }
+
+    #[test]
+    fn action_metric_labels_are_closed_and_phase_aware() {
+        assert_eq!(
+            action_step_metric_kind(Some("project_view.create_work")),
+            "create_work"
+        );
+        assert_eq!(action_step_metric_kind(Some("business.text")), "unknown");
+        assert_eq!(
+            action_reason_metric_label(Some("affinity_lost")),
+            "affinity_lost"
+        );
+        assert_eq!(action_reason_metric_label(Some("private-id")), "other");
+        assert_eq!(
+            action_phase_metric_transition("block", &serde_json::json!({"phase": "applying"})),
+            Some(("applying/runnable", "applying/blocked"))
+        );
     }
 
     #[test]

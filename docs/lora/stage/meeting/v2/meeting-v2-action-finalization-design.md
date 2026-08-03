@@ -1,6 +1,6 @@
 # Meeting V2：会议行动收口实现设计
 
-> 状态：核心产品决策已确认，协议细节待阶段实现时冻结
+> 状态：阶段一至四均已提交；阶段四实现、确定性门禁与经授权的真实 provider 签收均通过
 >
 > 日期：2026-08-03
 >
@@ -1288,3 +1288,94 @@ Relay State 前进到已验证结果后及时清理对应 prepared event；Meeti
 
 这些细节不得改变三个核心不变量：行动属于 Meeting 关闭前的生命周期、Agent 路径必须同槽
 同 ACP Session、Project View 仍然只是可选 materializer。
+
+## 23. 阶段交付记录
+
+### 23.1 已提交基线
+
+截至 2026-08-03，前三阶段分别提交为：
+
+- 阶段一 `e94566efc`：action policy、权威状态、命令与关闭 gate；
+- 阶段二 `0fd9ea08e`：主持槽/ACP Session 连续性、Action Turn 与确定性计划编译；
+- 阶段三 `83ed9cd04`：Project View v2 materializer、逐步 receipt 与恢复。
+
+阶段四已在该基线上完成实现、review 与收口提交。
+
+### 23.2 阶段四已实现范围
+
+- `BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED` 是默认关闭、叠加在原 V2 Create gate 上的独立开关；
+  关闭新建不会移除存量 action Session 的 runtime/drain 能力。
+- Relay NIP-11 分开声明 action runtime 与 action Create；ACP 静态 probe 声明
+  `meeting-v2-action-finalization-v1`。
+- Agent profile 可以发布有界 capability 列表；创建 action-capable Meeting 时，Relay 在同一
+  transaction 中检查完整 roster 的所有 managed Agent，Human 不需要该能力。
+- action deadline 已进入 sweeper、lazy recovery 和 restart recovery；到期只把当前 run 置为
+  durable blocked，不伪造成功或关闭会议，后续显式 retry 推进新的 action window。
+- Project View ingest 在 reducer 运行前锁定并核验精确 prepared attempt；target accept 与
+  Meeting receipt 同 transaction 提交。`RETURN_TO_BOARD`、abort、deadline 和 target ingest
+  竞态只能收敛为 accepted receipt、明确 reject 或 abandoned，已接受 event 的精确 replay
+  继续返回原 receipt。
+- abort 保留 action audit，并清理未接受 attempt；正常 End 继续要求
+  `ready_to_close + verified projection`。
+- ACP restart、slot/session affinity loss 和 provider/read failure 均 fail closed；精确冻结 Board
+  在模型调用前读取，并在读取完成后再次核对 event ID。
+- 新增 action command、phase、step、retry、affinity、blocked 与 close-gate 的低基数指标；
+  ID、公钥、Board 和业务文本不进入 label。
+- 后端 gate 的最后一个隔离场景使用三个 Agent，走通
+  `FINALIZE_ACTIONS → Requirement → Work → responsibility → End(closed)`；Project View v2
+  fixture 被刻意放在旧协议回归之后，避免不可逆 cutover 污染前序场景。
+
+### 23.3 自动化验收结果
+
+2026-08-03 在隔离端口和一次性数据库上运行：
+
+```bash
+CARGO_PROFILE=ci \
+BUZZ_TEST_RELAY_PORT=3314 \
+BUZZ_TEST_RELAY_HEALTH_PORT=9314 \
+BUZZ_TEST_RELAY_METRICS_PORT=9414 \
+./scripts/run-meeting-backend-tests.sh
+```
+
+结果为 PASS：ACP 765 项、acceptance feature 3 项、Relay Meeting 37 项、Postgres Meeting
+58 项、migration 7 项全部通过；Meeting schema drift、V0/V1/旧 V2 E2E、关闭 Create 后排空、
+安全撤权和新 policy 三 Agent E2E 均通过。`bash -n` 同时通过两个阶段四脚本；当前 Hermit
+工具链未安装 `shellcheck`，因此没有把它记作已执行门禁。
+
+真实验收期间发现并修复了一个确定性缺陷：Action Turn 的异步 Board 请求在 fetch 前尚无
+`board_event_id`，旧围栏却把该空值与冻结 Board ID 比较，导致正确的 Action Turn 必然以
+`authority_changed` 被丢弃。修复后采用两段校验：fetch 前核对 action run/window/冻结 Board
+权威记录，fetch 后核对实际读取事件 ID。新增正反回归分别证明正确冻结 Board 可 dispatch，
+错误 Board 会准备 durable action block。
+
+### 23.4 真实 provider 手动签收记录
+
+两次运行都分别遵守“一次有界运行、不自动重试”。首次诊断运行的 FAIL 证据继续保留：
+
+| 项目 | 结果 |
+|---|---|
+| Run ID | `meeting-v2-actions-20260803T114714Z-1275090` |
+| 本地证据目录 | `/tmp/buzz-meeting-v2-actions-acceptance-runs/meeting-v2-actions-20260803T114714Z-1275090` |
+| Adapter | `@agentclientprotocol/codex-acp 1.1.7` |
+| Roster | 1 Agent 主持 + 1 Human |
+| 连续性 | Board 与 Floor 使用 `agent_index=0`、同一 ACP Session |
+| 模型结果 | Board `UNCHANGED`，Floor `FINALIZE_ACTIONS` |
+| 最终结果 | **FAIL**：Action Board read 被旧围栏误判为 `authority_changed`，随后 deadline 收敛为 blocked |
+
+缺陷修复并通过自动化门禁后，经用户明确授权执行一次新的修复后签收；该次运行未重试：
+
+| 项目 | 结果 |
+|---|---|
+| Run ID | `meeting-v2-actions-20260803T122438Z-1420859` |
+| 本地证据目录 | `/tmp/buzz-meeting-v2-actions-acceptance-runs/meeting-v2-actions-20260803T122438Z-1420859` |
+| Adapter / model | `@agentclientprotocol/codex-acp 1.1.7` / `gpt-5.6-sol[max]` |
+| Roster | 1 Agent 主持 + 1 Human |
+| 模型结果 | Board `UNCHANGED`，Floor `FINALIZE_ACTIONS`，生成 1 个行动项 |
+| 连续性 | Board、Floor 与 Action 均为 `agent_index=0`、ACP Session `019fc795-85e3-76a1-ae99-a3f405b81b19`；`continuity_lost=0` |
+| 物化结果 | 3/3 step 和 3/3 attempt 已接受；创建 1 Requirement、1 Work、1 responsibility；Project revision 6 |
+| 会议终态 | `ended/closed`，action `completed_closed`，verified projection 后关闭 |
+| 源码与证据 | 运行前后源码状态/差异哈希一致；`sha256.txt` 全量校验通过 |
+| 最终结果 | **PASS** |
+
+首次 FAIL 不被改写或删除，修复后的 PASS 也没有覆盖原证据目录。至此阶段四后端完成定义的
+真实 provider 门槛已经满足；阶段四已完成 review 并提交。

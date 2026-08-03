@@ -1131,6 +1131,13 @@ async fn handle_agent_profile(
         .get("channel_add_policy")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("kind:10100 missing channel_add_policy field"))?;
+    let capabilities = content
+        .get("capabilities")
+        .map(|value| {
+            serde_json::from_value::<Vec<String>>(value.clone())
+                .map_err(|error| anyhow::anyhow!("kind:10100 invalid capabilities: {error}"))
+        })
+        .transpose()?;
 
     let pubkey_bytes = event.pubkey.to_bytes().to_vec();
     if state
@@ -1146,10 +1153,20 @@ async fn handle_agent_profile(
     }
     state
         .db
-        .set_channel_add_policy(tenant.community(), &pubkey_bytes, policy)
+        .set_agent_profile_controls(
+            tenant.community(),
+            &pubkey_bytes,
+            policy,
+            capabilities.as_deref(),
+        )
         .await?;
 
-    info!(pubkey = %hex::encode(&pubkey_bytes), policy, "kind:10100 channel_add_policy updated");
+    info!(
+        pubkey = %hex::encode(&pubkey_bytes),
+        policy,
+        capability_count = capabilities.as_ref().map_or(0, Vec::len),
+        "kind:10100 Agent profile controls updated"
+    );
     Ok(())
 }
 

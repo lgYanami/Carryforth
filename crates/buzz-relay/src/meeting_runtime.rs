@@ -245,6 +245,7 @@ pub async fn run(state: Arc<AppState>) {
         revocation_session_batch,
         meeting_v1_create_enabled = state.config.meeting_v1_create_enabled,
         meeting_v2_create_enabled = state.config.meeting_v2_create_enabled,
+        meeting_v2_actions_create_enabled = state.config.meeting_v2_actions_create_enabled,
         "Meeting runtime started"
     );
 
@@ -361,6 +362,20 @@ async fn recover_due_batons(state: &Arc<AppState>, limit: i64) -> Result<(), buz
                         "deadline_type" => deadline_type
                     )
                     .record(recovery_lag_seconds);
+                    if transition.primary_type == "action_deadline_exceeded" {
+                        metrics::counter!(
+                            "meeting_v2_action_phase_transition_total",
+                            "from" => "action/runnable",
+                            "to" => "action/blocked",
+                            "reason" => "action_deadline_exceeded"
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            "meeting_v2_action_blocked_total",
+                            "reason" => "action_deadline_exceeded"
+                        )
+                        .increment(1);
+                    }
                 }
                 if protocol == "v1" {
                     metrics::counter!("meeting_v1_recovery_result_total", "outcome" => outcome)
@@ -704,6 +719,7 @@ fn classify_recovery_transition(primary_type: &str) -> &'static str {
         "grant_soft_expired" => "grant_soft_expired",
         "grant_hard_expired" => "grant_hard_expired",
         "moderator_fallback" => "moderator_fallback",
+        "action_deadline_exceeded" => "action_deadline_exceeded",
         _ => "unknown",
     }
 }
@@ -715,6 +731,7 @@ fn classify_recovery_deadline(primary_type: &str) -> &'static str {
         "grant_hard_expired" => "grant_hard",
         "moderator_fallback" => "moderator_decision",
         "participant_revoked" => "security_revocation",
+        "action_deadline_exceeded" => "action",
         _ => "unknown",
     }
 }

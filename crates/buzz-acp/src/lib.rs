@@ -78,6 +78,7 @@ fn meeting_capabilities() -> serde_json::Value {
         "meeting": {
             "ledgerVersion": meeting_v1::capability_ledger_version(),
             "qualificationEvidenceCompiled": cfg!(feature = "meeting-acceptance"),
+            "capabilities": [buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY],
             "protocols": [
                 {
                     "schemaVersion": buzz_sdk::MEETING_V1_SCHEMA_VERSION,
@@ -101,6 +102,7 @@ fn meeting_capabilities() -> serde_json::Value {
                 {
                     "schemaVersion": buzz_sdk::MEETING_V2_SCHEMA_VERSION,
                     "policy": buzz_sdk::MEETING_V2_ACTIONS_POLICY,
+                    "capability": buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
                     "roles": ["participant", "moderator"],
                     "turns": [
                         "intent",
@@ -179,6 +181,14 @@ mod meeting_capability_tests {
         assert_eq!(
             actions["moderatorContinuity"],
             "exact_agent_slot_and_acp_session"
+        );
+        assert_eq!(
+            actions["capability"],
+            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY
+        );
+        assert_eq!(
+            capabilities["meeting"]["capabilities"],
+            serde_json::json!([buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY])
         );
         assert_eq!(
             capabilities["meeting"]["ledgerVersion"],

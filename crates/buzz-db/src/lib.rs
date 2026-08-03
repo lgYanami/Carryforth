@@ -1926,6 +1926,28 @@ impl Db {
         user::set_channel_add_policy(&self.pool, community_id, pubkey, policy).await
     }
 
+    /// Replace the bounded capability list advertised by one Agent profile.
+    pub async fn set_agent_capabilities(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+        capabilities: &[String],
+    ) -> Result<()> {
+        user::set_agent_capabilities(&self.pool, community_id, pubkey, capabilities).await
+    }
+
+    /// Atomically apply the controls carried by one Agent profile event.
+    pub async fn set_agent_profile_controls(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+        policy: &str,
+        capabilities: Option<&[String]>,
+    ) -> Result<()> {
+        user::set_agent_profile_controls(&self.pool, community_id, pubkey, policy, capabilities)
+            .await
+    }
+
     /// Find an existing DM by its participant hash.
     pub async fn find_dm_by_participants(
         &self,

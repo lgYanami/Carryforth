@@ -1279,7 +1279,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "buzz-audit",
  "buzz-core",
+ "buzz-db",
  "buzz-project-view",
  "buzz-sdk",
  "buzz-ws-client",

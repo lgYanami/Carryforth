@@ -3384,6 +3384,68 @@ pub(crate) async fn publish_v2_action_transition_tx(
     consumed_decision_attempt_id: Option<&[u8]>,
     now: DateTime<Utc>,
 ) -> Result<BatonTransitionResult> {
+    publish_v2_action_transition_inner_tx(
+        tx,
+        community_id,
+        session_id,
+        action_run_id,
+        relay_keys,
+        transition_type,
+        Some(caused_by_event_id),
+        None,
+        from,
+        to,
+        consumed_decision_attempt_id,
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_v2_action_deadline_transition_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    action_run_id: Uuid,
+    relay_keys: &Keys,
+    transition_type: &'static str,
+    deadline_type: &'static str,
+    from: &str,
+    to: &str,
+    now: DateTime<Utc>,
+) -> Result<BatonTransitionResult> {
+    publish_v2_action_transition_inner_tx(
+        tx,
+        community_id,
+        session_id,
+        action_run_id,
+        relay_keys,
+        transition_type,
+        None,
+        Some(deadline_type),
+        from,
+        to,
+        None,
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_v2_action_transition_inner_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    action_run_id: Uuid,
+    relay_keys: &Keys,
+    transition_type: &'static str,
+    caused_by_event_id: Option<&[u8]>,
+    deadline_type: Option<&'static str>,
+    from: &str,
+    to: &str,
+    consumed_decision_attempt_id: Option<&[u8]>,
+    now: DateTime<Utc>,
+) -> Result<BatonTransitionResult> {
     let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
     if !protocol.has_action_finalization() {
         return Err(DbError::InvalidData(format!(
@@ -3432,12 +3494,25 @@ pub(crate) async fn publish_v2_action_transition_tx(
             effects.push(phase_effect(session_id, state.phase, target.phase));
         }
     }
-    let transition = TransitionSpec::command(
-        transition_type,
-        Some(action_run_id.as_bytes().to_vec()),
-        caused_by_event_id,
-        effects,
-    );
+    let transition = match (caused_by_event_id, deadline_type) {
+        (Some(event_id), None) => TransitionSpec::command(
+            transition_type,
+            Some(action_run_id.as_bytes().to_vec()),
+            event_id,
+            effects,
+        ),
+        (None, Some(deadline_type)) => TransitionSpec::deadline(
+            transition_type,
+            Some(action_run_id.as_bytes().to_vec()),
+            deadline_type,
+            effects,
+        ),
+        _ => {
+            return Err(DbError::InvalidData(
+                "Meeting V2 action transition must have exactly one cause".to_string(),
+            ));
+        }
+    };
     let (_, result) = commit_transition_tx(
         tx,
         community_id,
@@ -3866,10 +3941,22 @@ async fn advance_due_locked_tx(
 ) -> Result<(StateRow, Vec<BatonTransitionResult>)> {
     let config = load_config_tx(tx, community_id, session_id).await?;
     let mut transitions = Vec::new();
-    if load_baton_protocol_tx(tx, community_id, session_id)
+    let protocol = load_baton_protocol_tx(tx, community_id, session_id).await?;
+    if protocol.has_action_finalization() {
+        if let Some(transition) = crate::meeting_v2_actions::recover_due_action_locked_tx(
+            tx,
+            community_id,
+            session_id,
+            relay_keys,
+            now,
+        )
         .await?
-        .is_v2()
-    {
+        {
+            transitions.push(transition);
+            state = load_state_tx(tx, community_id, session_id, true).await?;
+        }
+    }
+    if protocol.is_v2() {
         if let Some(transition) = crate::meeting_v2::recover_due_board_locked_tx(
             tx,
             community_id,
@@ -4201,15 +4288,24 @@ pub async fn claim_due_baton_sessions(db: &Db, limit: i64) -> Result<Vec<BatonDu
     let rows = sqlx::query(
         "WITH due AS ( \
              SELECT s.community_id, s.session_id, m.schema_version, \
-                    COALESCE(LEAST(s.next_action_at, v2.board_deadline_at), \
-                             s.next_action_at, v2.board_deadline_at) AS effective_deadline \
+                    COALESCE(LEAST(s.next_action_at, v2.board_deadline_at, \
+                                          action.action_deadline_at), \
+                             s.next_action_at, v2.board_deadline_at, \
+                             action.action_deadline_at) AS effective_deadline \
              FROM meeting_baton_state s \
              JOIN meeting_sessions m \
                ON m.community_id = s.community_id AND m.session_id = s.session_id \
              LEFT JOIN meeting_v2_bootstrap_state v2 \
                ON v2.community_id = s.community_id AND v2.session_id = s.session_id \
-             WHERE COALESCE(LEAST(s.next_action_at, v2.board_deadline_at), \
-                            s.next_action_at, v2.board_deadline_at) <= clock_timestamp() \
+             LEFT JOIN meeting_v2_action_runs action \
+               ON action.community_id = s.community_id \
+              AND action.session_id = s.session_id \
+              AND action.terminal_status IS NULL \
+              AND action.action_condition = 'runnable' \
+             WHERE COALESCE(LEAST(s.next_action_at, v2.board_deadline_at, \
+                                         action.action_deadline_at), \
+                            s.next_action_at, v2.board_deadline_at, \
+                            action.action_deadline_at) <= clock_timestamp() \
                AND s.recovery_retry_at <= clock_timestamp() \
                AND m.status = 'active' \
                AND ((m.schema_version = 2 AND m.floor_policy_version = $1) \
@@ -4601,6 +4697,20 @@ pub async fn execute_baton_command(
                 snapshot,
             });
         }
+        let action_recovery = if session.status == "active" {
+            crate::meeting_v2_actions::recover_due_action_locked_tx(
+                &mut tx,
+                params.community_id,
+                params.session_id,
+                params.relay_keys,
+                now,
+            )
+            .await?
+            .into_iter()
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let runtime = crate::meeting_v2::load_runtime_tx(
             &mut tx,
             params.community_id,
@@ -4619,7 +4729,11 @@ pub async fn execute_baton_command(
                 "rejected_terminal",
                 "meeting_finalizing_actions",
                 None,
-                Some(state.state_revision),
+                Some(
+                    action_recovery
+                        .last()
+                        .map_or(state.state_revision, |transition| transition.state_revision),
+                ),
                 None,
             )
             .await?;
@@ -4627,7 +4741,7 @@ pub async fn execute_baton_command(
                 load_snapshot_tx(&mut tx, params.community_id, params.session_id).await?;
             tx.commit().await?;
             return Ok(BatonCommitResult {
-                recovery_transitions: Vec::new(),
+                recovery_transitions: action_recovery,
                 command_outcome: BatonCommandOutcome::RejectedTerminal {
                     code: "meeting_finalizing_actions".to_string(),
                     canonical_object_id: None,
