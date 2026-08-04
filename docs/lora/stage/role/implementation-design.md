@@ -6,6 +6,11 @@
 >
 > 本文是一份实现设计，不在本阶段提交 Rust、SQL 或客户端代码。
 
+> 2026-08-03 局部覆盖：第 9.1 节中“普通 Role 沿用 Project View member 能力”的旧结论已被
+> [Project Role 治理授权与 admin Role 创建修复设计](../bug/project-role-governance-authorization-and-admin-role-creation-fix-design.md)
+> 收敛。普通 member 不再能维护 Role 定义；owner 可治理 admin/member，Active Leader 只可
+> 治理 member。Assignment 仍不成为非 Role Project 对象的 ACL。
+
 ## 1. 文档目的
 
 [项目定位与目标](../../project-positioning.md)已经确定：
@@ -791,7 +796,7 @@ v2 仍不开放任意 JSON batch。需要多对象原子变化的业务动作使
 
 | 操作 | Community owner | active Leader/admin | 普通 Role | verified human owner |
 |---|---:|---:|---:|---:|
-| 创建/修改普通 Role 定义 | 是 | 是 | 沿用 Project View member 能力 | 否 |
+| 创建/修改普通 Role 定义 | 是 | 是 | 否 | 否 |
 | 创建 admin Role、任意涉及 admin 的等级变化、停用/启用 admin Role | 是 | 否 | 否 | 否 |
 | 授权/替换普通 Role Assignment | 是 | 是 | 否 | 否 |
 | 授权/替换 admin Role Assignment | 是 | 否 | 否 | 否 |

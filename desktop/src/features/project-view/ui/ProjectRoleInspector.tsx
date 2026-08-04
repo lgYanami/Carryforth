@@ -135,7 +135,10 @@ export function ProjectRoleInspector({
     ? continuity.roles.find((role) => role.roleId === viewerAssignment.roleId)
     : undefined;
   const isOwner = viewerMembership?.role === "owner";
-  const isLeader = viewerRole?.level === "admin";
+  const isLeader =
+    viewerMembership?.role === "admin" &&
+    viewerRole?.active === true &&
+    viewerRole.level === "admin";
   const canGovernRole = Boolean(
     isOwner || (isLeader && definition.level === "member"),
   );

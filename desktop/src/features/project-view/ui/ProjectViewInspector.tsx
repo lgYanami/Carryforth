@@ -19,6 +19,10 @@ import {
 } from "@/features/project-view/model";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
+import {
+  canGovernProjectRole,
+  type ProjectRoleGovernanceCapabilities,
+} from "@/features/project-view/projectRoleGovernance";
 import { ProjectViewContextSection } from "@/features/project-view/ui/ProjectViewContextSection";
 import { ProjectRoleInspector } from "@/features/project-view/ui/ProjectRoleInspector";
 import { ProjectWorkContinuity } from "@/features/project-view/ui/ProjectWorkContinuity";
@@ -56,6 +60,7 @@ type ProjectViewInspectorProps = {
   schemaVersion: 1 | 2 | 3;
   roleContinuity?: ProjectViewRoleContinuity;
   roleDefinition?: ProjectRoleDefinition;
+  roleGovernance: ProjectRoleGovernanceCapabilities;
   view: ProjectView;
 };
 
@@ -230,6 +235,7 @@ function ProjectViewInspectorContent({
   schemaVersion,
   roleContinuity,
   roleDefinition,
+  roleGovernance,
   view,
 }: ProjectViewInspectorProps) {
   const status = projectViewObjectStatus(object);
@@ -277,6 +283,12 @@ function ProjectViewInspectorContent({
   );
   const roleLifecycleBlocked =
     roleHasActiveAssignment || roleHasOpenProposal || roleHasResponsibleWork;
+  const canGovernRoleDefinition =
+    object.objectType !== "role" ||
+    Boolean(
+      roleDefinition &&
+        canGovernProjectRole(roleGovernance, roleDefinition.level),
+    );
 
   return (
     <>
@@ -312,34 +324,36 @@ function ProjectViewInspectorContent({
       </div>
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
-        <section className="grid grid-cols-2 gap-2">
-          <Button
-            onClick={() => onEdit(object)}
-            type="button"
-            variant="outline"
-          >
-            <Pencil />
-            Edit
-          </Button>
-          <Button
-            disabled={roleLifecycleBlocked}
-            onClick={() => onDelete(object)}
-            title={
-              roleHasActiveAssignment
-                ? "End the active Assignment before deleting this Role."
-                : roleHasOpenProposal
-                  ? "Resolve or withdraw the open Proposal before deleting this Role."
-                  : roleHasResponsibleWork
-                    ? "Clear or reassign this Role's Work before deleting it."
-                    : undefined
-            }
-            type="button"
-            variant="outline"
-          >
-            <Trash2 />
-            Delete
-          </Button>
-        </section>
+        {canGovernRoleDefinition ? (
+          <section className="grid grid-cols-2 gap-2">
+            <Button
+              onClick={() => onEdit(object)}
+              type="button"
+              variant="outline"
+            >
+              <Pencil />
+              Edit
+            </Button>
+            <Button
+              disabled={roleLifecycleBlocked}
+              onClick={() => onDelete(object)}
+              title={
+                roleHasActiveAssignment
+                  ? "End the active Assignment before deleting this Role."
+                  : roleHasOpenProposal
+                    ? "Resolve or withdraw the open Proposal before deleting this Role."
+                    : roleHasResponsibleWork
+                      ? "Clear or reassign this Role's Work before deleting it."
+                      : undefined
+              }
+              type="button"
+              variant="outline"
+            >
+              <Trash2 />
+              Delete
+            </Button>
+          </section>
+        ) : null}
 
         <div className="space-y-4">
           <ObjectDetails object={object} />
@@ -380,6 +394,12 @@ function ProjectViewInspectorContent({
 
         {schemaVersion === 3 ? (
           <ProjectViewContextSection
+            actingAssignmentId={
+              object.objectType === "role"
+                ? roleGovernance.actingAssignmentId
+                : undefined
+            }
+            canMutate={canGovernRoleDefinition}
             contextCapability={contextCapability}
             object={object}
             objectsById={objectsById}

@@ -25,6 +25,10 @@ import {
   useProjectViewQuery,
 } from "@/features/project-view/hooks";
 import { useProjectViewActors } from "@/features/project-view/useProjectViewActors";
+import {
+  canGovernProjectRole,
+  projectRoleGovernanceCapabilities,
+} from "@/features/project-view/projectRoleGovernance";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
 import { ProjectViewDeleteDialog } from "@/features/project-view/ui/ProjectViewDeleteDialog";
 import { ProjectViewInspector } from "@/features/project-view/ui/ProjectViewInspector";
@@ -174,6 +178,7 @@ function ProjectProfile({
 
 function SupportingObjects({
   actorProfiles,
+  canCreateRole,
   currentPubkey,
   onCreateObject,
   onSelectObject,
@@ -182,6 +187,7 @@ function SupportingObjects({
   view,
 }: {
   actorProfiles?: UserProfileLookup;
+  canCreateRole: boolean;
   currentPubkey?: string;
   onCreateObject: (
     objectType: "role" | "resource",
@@ -221,16 +227,18 @@ function SupportingObjects({
           <span className="text-xs text-muted-foreground">
             Semantic responsibilities
           </span>
-          <Button
-            className="ml-auto h-7"
-            onClick={() => onCreateObject("role")}
-            size="sm"
-            type="button"
-            variant="ghost"
-          >
-            <Plus />
-            Add Role
-          </Button>
+          {canCreateRole ? (
+            <Button
+              className="ml-auto h-7"
+              onClick={() => onCreateObject("role")}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              <Plus />
+              Add Role
+            </Button>
+          ) : null}
         </div>
         {view.roles.length > 0 ? (
           <div className="grid gap-2 sm:grid-cols-2">
@@ -423,6 +431,10 @@ function ReadyProjectView({
     view,
     roleContinuity,
   );
+  const roleGovernance = React.useMemo(
+    () => projectRoleGovernanceCapabilities(roleContinuity, currentPubkey),
+    [currentPubkey, roleContinuity],
+  );
   const selectedObject = selectedObjectId
     ? objectsById.get(selectedObjectId)
     : undefined;
@@ -432,6 +444,9 @@ function ReadyProjectView({
           (definition) => definition.roleId === selectedObject.id,
         )
       : undefined;
+  const selectedRoleCanGovern = selectedRoleDefinition
+    ? canGovernProjectRole(roleGovernance, selectedRoleDefinition.level)
+    : false;
   React.useEffect(() => {
     if (selectedObjectId && !selectedObject) {
       onSelectObject(undefined);
@@ -446,8 +461,11 @@ function ReadyProjectView({
     (
       objectType: Exclude<ProjectViewObjectType, "project_profile">,
       context?: ProjectViewCreateContext,
-    ) => setEditor({ mode: "create", initialType: objectType, context }),
-    [],
+    ) => {
+      if (objectType === "role" && !roleGovernance.canCreateMemberRole) return;
+      setEditor({ mode: "create", initialType: objectType, context });
+    },
+    [roleGovernance.canCreateMemberRole],
   );
   const closeInspector = React.useCallback(() => {
     const closingObjectId = selectedObject?.id;
@@ -557,6 +575,7 @@ function ReadyProjectView({
           />
           <SupportingObjects
             actorProfiles={actorProfiles}
+            canCreateRole={roleGovernance.canCreateMemberRole}
             currentPubkey={currentPubkey}
             onCreateObject={createObject}
             onSelectObject={selectObject}
@@ -591,11 +610,19 @@ function ReadyProjectView({
           schemaVersion={schemaVersion}
           roleContinuity={roleContinuity}
           roleDefinition={selectedRoleDefinition}
+          roleGovernance={roleGovernance}
           view={view}
         />
       ) : null}
       {editor ? (
         <ProjectViewObjectDialog
+          canCreateAdminRole={roleGovernance.canCreateAdminRole}
+          canCreateRole={roleGovernance.canCreateMemberRole}
+          canGovernRole={
+            editor.mode === "edit" && editor.object.objectType === "role"
+              ? selectedRoleCanGovern
+              : true
+          }
           context={editor.mode === "create" ? editor.context : undefined}
           initialType={
             editor.mode === "create" ? editor.initialType : undefined
@@ -632,11 +659,13 @@ function ReadyProjectView({
               ),
             )
           }
+          roleActingAssignmentId={roleGovernance.actingAssignmentId}
           schemaVersion={schemaVersion}
           view={view}
         />
       ) : null}
       <ProjectViewDeleteDialog
+        actingAssignmentId={roleGovernance.actingAssignmentId}
         object={deleteTarget}
         onDeleted={() => onSelectObject(undefined)}
         onOpenChange={(open) => {

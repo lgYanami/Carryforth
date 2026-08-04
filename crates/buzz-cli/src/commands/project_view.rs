@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use buzz_core::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
-use buzz_core::CommunityId;
-use buzz_project_view::v2::ProjectObjectCommand;
+use buzz_core::{CommunityId, PublicKey};
+use buzz_project_view::v2::{CommunityMemberRole, ProjectObjectCommand, RoleLevel};
 use buzz_project_view::v3::{
     canonicalize_context_references, CreateProjectObjectV3, DeleteProjectObjectV3,
     DocumentReferenceMode, NewProjectViewObjectV3, ProjectContextReference, ProjectObjectCommandV3,
@@ -234,7 +234,17 @@ pub async fn dispatch(
             object_type,
             expected_project_revision,
             data,
-        } => cmd_create(client, object_type.into(), expected_project_revision, &data).await,
+            role_level,
+        } => {
+            cmd_create(
+                client,
+                object_type.into(),
+                expected_project_revision,
+                &data,
+                role_level.map(Into::into),
+            )
+            .await
+        }
         ProjectViewCmd::Update {
             object_type,
             id,
@@ -390,9 +400,15 @@ async fn submit_context_replacement(
         object.id,
         json!({ "context_references": context_references }),
     )?;
+    let acting_assignment_id = if object.object_type == ProjectViewObjectType::Role {
+        let governance = role_governance_from_v3(client.public_key(), snapshot);
+        governance.authorize(governance.role_level(object.id)?)?
+    } else {
+        None
+    };
     let command = ProjectObjectCommandV3::new(
         snapshot.meta().project_revision,
-        None,
+        acting_assignment_id,
         ProjectObjectRequestV3::Update(update),
     );
     let event =
@@ -539,6 +555,7 @@ async fn cmd_create(
     object_type: ProjectViewObjectType,
     expected_project_revision: u64,
     data_path: &str,
+    role_level: Option<RoleLevel>,
 ) -> Result<(), CliError> {
     if object_type == ProjectViewObjectType::ProjectProfile {
         return Err(CliError::Usage(
@@ -546,10 +563,28 @@ async fn cmd_create(
         ));
     }
     let identity = require_capability(client).await?;
+    if object_type != ProjectViewObjectType::Role && role_level.is_some() {
+        return Err(CliError::Usage(
+            "--role-level is valid only when creating a role".to_owned(),
+        ));
+    }
+    let (acting_assignment_id, role_level) = if object_type == ProjectViewObjectType::Role {
+        let level = role_level.unwrap_or(RoleLevel::Member);
+        let governance = read_role_governance(client, identity).await?;
+        (governance.authorize(level)?, Some(level))
+    } else {
+        (None, None)
+    };
     let object_id = Uuid::new_v4();
     let data = read_json_value(data_path, "data")?;
     let event = match identity.schema {
         ProjectViewSchema::V1 => {
+            if role_level.is_some() {
+                return Err(CliError::Other(
+                    "unsupported: governed Role creation requires Project View schema v2 or v3"
+                        .to_owned(),
+                ));
+            }
             let object = create_input(object_type, object_id, data)?;
             client.sign_event_exact(
                 build_create(expected_project_revision, object).map_err(sdk_err)?,
@@ -557,20 +592,22 @@ async fn cmd_create(
         }
         ProjectViewSchema::V2 => {
             let object = create_input(object_type, object_id, data)?;
-            let command = ProjectObjectCommand::new(
+            let mut command = ProjectObjectCommand::new(
                 expected_project_revision,
-                None,
+                acting_assignment_id,
                 MutationRequest::Create(CreateMutation { object }),
             );
+            command.initial_role_level = role_level;
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
         }
         ProjectViewSchema::V3 => {
             let object = create_input_v3(object_type, object_id, data)?;
-            let command = ProjectObjectCommandV3::new(
+            let mut command = ProjectObjectCommandV3::new(
                 expected_project_revision,
-                None,
+                acting_assignment_id,
                 ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
             );
+            command.initial_role_level = role_level;
             client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
         }
     };
@@ -597,8 +634,21 @@ async fn cmd_update(
 ) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
     let patch = read_json_value(patch_path, "patch")?;
+    let acting_assignment_id = if object_type == ProjectViewObjectType::Role {
+        let governance = read_role_governance(client, identity).await?;
+        let level = governance.role_level(object_id)?;
+        governance.authorize(level)?
+    } else {
+        None
+    };
     let event = match identity.schema {
         ProjectViewSchema::V1 => {
+            if object_type == ProjectViewObjectType::Role {
+                return Err(CliError::Other(
+                    "unsupported: governed Role updates require Project View schema v2 or v3"
+                        .to_owned(),
+                ));
+            }
             let update = update_input(object_type, object_id, patch)?;
             client.sign_event_exact(
                 build_update(expected_project_revision, update).map_err(sdk_err)?,
@@ -608,7 +658,7 @@ async fn cmd_update(
             let update = update_input(object_type, object_id, patch)?;
             let command = ProjectObjectCommand::new(
                 expected_project_revision,
-                None,
+                acting_assignment_id,
                 MutationRequest::Update(update),
             );
             client.sign_event_exact(build_project_object_command(command).map_err(sdk_err)?)?
@@ -617,7 +667,7 @@ async fn cmd_update(
             let update = update_input_v3(object_type, object_id, patch)?;
             let command = ProjectObjectCommandV3::new(
                 expected_project_revision,
-                None,
+                acting_assignment_id,
                 ProjectObjectRequestV3::Update(update),
             );
             client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?
@@ -637,14 +687,29 @@ async fn cmd_delete(
     expected_project_revision: u64,
 ) -> Result<(), CliError> {
     let identity = require_capability(client).await?;
+    let acting_assignment_id = if object_type == ProjectViewObjectType::Role {
+        let governance = read_role_governance(client, identity).await?;
+        let level = governance.role_level(object_id)?;
+        governance.authorize(level)?
+    } else {
+        None
+    };
     let event = match identity.schema {
-        ProjectViewSchema::V1 => client.sign_event_exact(
-            build_delete(expected_project_revision, object_type, object_id).map_err(sdk_err)?,
-        )?,
+        ProjectViewSchema::V1 => {
+            if object_type == ProjectViewObjectType::Role {
+                return Err(CliError::Other(
+                    "unsupported: governed Role deletion requires Project View schema v2 or v3"
+                        .to_owned(),
+                ));
+            }
+            client.sign_event_exact(
+                build_delete(expected_project_revision, object_type, object_id).map_err(sdk_err)?,
+            )?
+        }
         ProjectViewSchema::V2 => {
             let command = ProjectObjectCommand::new(
                 expected_project_revision,
-                None,
+                acting_assignment_id,
                 MutationRequest::Delete(DeleteMutation {
                     object_type,
                     object_id,
@@ -655,7 +720,7 @@ async fn cmd_delete(
         ProjectViewSchema::V3 => {
             let command = ProjectObjectCommandV3::new(
                 expected_project_revision,
-                None,
+                acting_assignment_id,
                 ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
                     object_type,
                     object_id,
@@ -669,6 +734,145 @@ async fn cmd_delete(
     confirm_object_receipt(client, identity, object_type, object_id, &receipt).await?;
     println!("{}", normalize_write_response(&raw));
     Ok(())
+}
+
+struct CliRoleGovernance {
+    is_owner: bool,
+    leader_assignment_id: Option<Uuid>,
+    role_levels: BTreeMap<Uuid, RoleLevel>,
+}
+
+impl CliRoleGovernance {
+    fn authorize(&self, target_level: RoleLevel) -> Result<Option<Uuid>, CliError> {
+        if self.is_owner {
+            return Ok(None);
+        }
+        if target_level == RoleLevel::Admin {
+            return Err(CliError::Auth(
+                "owner_required: only the Community owner can govern an admin Role".to_owned(),
+            ));
+        }
+        self.leader_assignment_id.map(Some).ok_or_else(|| {
+            CliError::Auth(
+                "authorization: Role governance requires Community admin membership and an active admin Assignment"
+                    .to_owned(),
+            )
+        })
+    }
+
+    fn role_level(&self, role_id: Uuid) -> Result<RoleLevel, CliError> {
+        self.role_levels.get(&role_id).copied().ok_or_else(|| {
+            CliError::NotFound(format!(
+                "active Project Role {role_id} was not found in the verified snapshot"
+            ))
+        })
+    }
+}
+
+async fn read_role_governance(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+) -> Result<CliRoleGovernance, CliError> {
+    let actor = client.public_key();
+    match identity.schema {
+        ProjectViewSchema::V1 => Err(CliError::Other(
+            "unsupported: governed Role mutations require Project View schema v2 or v3".to_owned(),
+        )),
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let membership_role = snapshot
+                .membership()
+                .members
+                .iter()
+                .find(|member| member.pubkey == actor)
+                .map(|member| member.role);
+            let role_levels = snapshot
+                .roles()
+                .map(|role| (role.role_id, (role.level, role.active)))
+                .collect::<BTreeMap<_, _>>();
+            let leader_assignment_id = current_admin_assignment(
+                actor,
+                membership_role,
+                snapshot.assignments().map(|assignment| {
+                    (
+                        assignment.assignment_id,
+                        assignment.role_id,
+                        assignment.member_pubkey,
+                        assignment.is_active(),
+                    )
+                }),
+                &role_levels,
+            );
+            Ok(CliRoleGovernance {
+                is_owner: membership_role == Some(CommunityMemberRole::Owner),
+                leader_assignment_id,
+                role_levels: role_levels
+                    .into_iter()
+                    .map(|(role_id, (level, _))| (role_id, level))
+                    .collect(),
+            })
+        }
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            Ok(role_governance_from_v3(actor, &snapshot))
+        }
+    }
+}
+
+fn role_governance_from_v3(
+    actor: PublicKey,
+    snapshot: &VerifiedRoleBriefSnapshotV3,
+) -> CliRoleGovernance {
+    let membership_role = snapshot
+        .membership()
+        .members
+        .iter()
+        .find(|member| member.pubkey == actor)
+        .map(|member| member.role);
+    let role_levels = snapshot
+        .roles()
+        .map(|role| (role.role_id, (role.level, role.active)))
+        .collect::<BTreeMap<_, _>>();
+    let leader_assignment_id = current_admin_assignment(
+        actor,
+        membership_role,
+        snapshot.assignments().map(|assignment| {
+            (
+                assignment.assignment_id,
+                assignment.role_id,
+                assignment.member_pubkey,
+                assignment.is_active(),
+            )
+        }),
+        &role_levels,
+    );
+    CliRoleGovernance {
+        is_owner: membership_role == Some(CommunityMemberRole::Owner),
+        leader_assignment_id,
+        role_levels: role_levels
+            .into_iter()
+            .map(|(role_id, (level, _))| (role_id, level))
+            .collect(),
+    }
+}
+
+fn current_admin_assignment(
+    actor: PublicKey,
+    membership_role: Option<CommunityMemberRole>,
+    assignments: impl Iterator<Item = (Uuid, Uuid, PublicKey, bool)>,
+    roles: &BTreeMap<Uuid, (RoleLevel, bool)>,
+) -> Option<Uuid> {
+    if membership_role != Some(CommunityMemberRole::Admin) {
+        return None;
+    }
+    assignments
+        .filter(|(_, _, member_pubkey, active)| *active && *member_pubkey == actor)
+        .find_map(|(assignment_id, role_id, _, _)| {
+            roles
+                .get(&role_id)
+                .is_some_and(|(level, active)| *active && *level == RoleLevel::Admin)
+                .then_some(assignment_id)
+        })
 }
 
 async fn require_capability(client: &BuzzClient) -> Result<ProjectViewIdentity, CliError> {

@@ -764,6 +764,52 @@ function vacantV2View() {
   return next;
 }
 
+function memberViewerV2View() {
+  const next = vacantV2View();
+  if (!next.role_continuity) {
+    throw new Error("v2 fixture must include Role continuity");
+  }
+  next.role_continuity.members = [
+    { pubkey: "f".repeat(64), role: "owner" },
+    { pubkey: HUMAN, role: "member" },
+    { pubkey: ACTOR, role: "member" },
+  ];
+  return next;
+}
+
+function activeLeaderV2View() {
+  const next = structuredClone(V2_READY_VIEW) as Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >;
+  const continuity = next.role_continuity;
+  if (!continuity) {
+    throw new Error("v2 fixture must include Role continuity");
+  }
+  continuity.members = [
+    { pubkey: "f".repeat(64), role: "owner" },
+    { pubkey: HUMAN, role: "admin" },
+  ];
+  continuity.assignments = [
+    {
+      assignment_id: ROLE_STATE_IDS.currentAssignment,
+      role_id: IDS.role,
+      member_pubkey: HUMAN,
+      started_at: NOW,
+      started_by: HUMAN,
+      entity_revision: 1,
+      project_revision: 7,
+    },
+  ];
+  continuity.proposals = [];
+  continuity.commitments = [];
+  continuity.workResponsibilities = [];
+  continuity.checkpoints = [];
+  continuity.handoffs = [];
+  continuity.briefs = [];
+  return next;
+}
+
 function humanAssignedV2View() {
   const next = structuredClone(V2_READY_VIEW) as Extract<
     RawProjectViewLoadResult,
@@ -1259,6 +1305,96 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
 
   await inspector.getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Active role")).toBeDisabled();
+});
+
+test("ordinary member can inspect and request Roles but cannot govern them", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: memberViewerV2View() });
+  await page.goto("/");
+  await openFullProjectView(page);
+
+  await expect(page.getByRole("button", { name: "Add Role" })).toHaveCount(0);
+  await page.getByTestId("project-view-add").click();
+  await expect(
+    page.getByLabel("Object type").locator('option[value="role"]'),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "Cancel" }).click();
+
+  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  const inspector = page.getByTestId("project-view-inspector");
+  await expect(inspector.getByRole("button", { name: "Edit" })).toHaveCount(0);
+  await expect(inspector.getByRole("button", { name: "Delete" })).toHaveCount(
+    0,
+  );
+  await expect(page.getByTestId("project-role-request")).toBeVisible();
+});
+
+test("owner creates an admin Role with an explicit signed level", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: V2_READY_VIEW });
+  await page.goto("/");
+  await openFullProjectView(page);
+
+  await page.getByRole("button", { name: "Add Role" }).click();
+  await page.getByLabel("Role level").selectOption("admin");
+  await page.getByLabel("Name").fill("Delivery leader");
+  await page.getByLabel("Purpose").fill("Govern member Roles");
+  await page.getByRole("button", { name: "Create Role" }).click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const intent = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.[0],
+  );
+  expect(intent).toMatchObject({
+    operation: "create",
+    object_type: "role",
+    initial_role_level: "admin",
+  });
+  expect(intent).not.toHaveProperty("acting_assignment_id");
+});
+
+test("active Leader creates only member Roles through the exact Assignment", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectView: activeLeaderV2View(),
+  });
+  await page.goto("/");
+  await openFullProjectView(page);
+
+  await page.getByRole("button", { name: "Add Role" }).click();
+  await expect(page.getByLabel("Role level")).toHaveValue("member");
+  await expect(
+    page.getByLabel("Role level").locator('option[value="admin"]'),
+  ).toHaveCount(0);
+  await page.getByLabel("Name").fill("Release steward");
+  await page.getByLabel("Purpose").fill("Coordinate releases");
+  await page.getByRole("button", { name: "Create Role" }).click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const intent = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__?.[0],
+  );
+  expect(intent).toMatchObject({
+    operation: "create",
+    object_type: "role",
+    initial_role_level: "member",
+    acting_assignment_id: ROLE_STATE_IDS.currentAssignment,
+  });
 });
 
 test("an open Role Proposal blocks deletion and deactivation", async ({

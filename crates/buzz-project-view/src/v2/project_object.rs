@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::SchemaVersion;
+use super::{RoleLevel, SchemaVersion};
 use crate::{
-    DomainError, DomainResult, Mutation, MutationRequest, MAX_MUTATION_CONTENT_BYTES,
-    MAX_MUTATION_JSON_DEPTH,
+    CreateMutation, DomainError, DomainResult, Mutation, MutationRequest, NewProjectViewObject,
+    MAX_MUTATION_CONTENT_BYTES, MAX_MUTATION_JSON_DEPTH,
 };
 
 /// A revision-checked schema-v2 mutation for an ordinary Project View object.
@@ -30,6 +30,11 @@ pub struct ProjectObjectCommand {
     /// Current runtime epoch when the acting Assignment is supervised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_fence: Option<super::RuntimeFence>,
+    /// Initial governance level for a Role create. Omission preserves the
+    /// legacy member-Role default. This field is invalid for every other
+    /// object operation and cannot be used to patch an existing Role level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_role_level: Option<RoleLevel>,
     /// Closed ordinary-object operation.
     pub request: MutationRequest,
 }
@@ -47,6 +52,7 @@ impl ProjectObjectCommand {
             expected_project_revision,
             acting_assignment_id,
             runtime_fence: None,
+            initial_role_level: None,
             request,
         }
     }
@@ -55,6 +61,13 @@ impl ProjectObjectCommand {
     #[must_use]
     pub const fn with_runtime_fence(mut self, runtime_fence: super::RuntimeFence) -> Self {
         self.runtime_fence = Some(runtime_fence);
+        self
+    }
+
+    /// Set the signed initial level of a new Role.
+    #[must_use]
+    pub const fn with_initial_role_level(mut self, level: RoleLevel) -> Self {
+        self.initial_role_level = Some(level);
         self
     }
 
@@ -116,7 +129,37 @@ impl ProjectObjectCommand {
                 });
             }
         }
+        if self.initial_role_level.is_some() && !self.creates_role() {
+            return Err(DomainError::InvalidField {
+                field: "initial_role_level",
+                reason: "is valid only when creating a Role".to_owned(),
+            });
+        }
         self.as_reducer_mutation().validate_for_submission()
+    }
+
+    /// Return whether this command creates one Role definition.
+    #[must_use]
+    pub const fn creates_role(&self) -> bool {
+        matches!(
+            &self.request,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Role { .. },
+            })
+        )
+    }
+
+    /// Return the canonical initial level for a Role create.
+    #[must_use]
+    pub const fn created_role_level(&self) -> Option<RoleLevel> {
+        if self.creates_role() {
+            Some(match self.initial_role_level {
+                Some(level) => level,
+                None => RoleLevel::Member,
+            })
+        } else {
+            None
+        }
     }
 
     /// Return the stable operation spelling used by receipts and telemetry.
@@ -174,6 +217,55 @@ mod tests {
         );
         assert_eq!(command.as_reducer_mutation().schema_version, 1);
         assert_eq!(command.operation(), "create");
+    }
+
+    #[test]
+    fn role_create_round_trips_explicit_initial_level() {
+        let command = ProjectObjectCommand::new(
+            7,
+            None,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Role {
+                    id: Uuid::new_v4(),
+                    name: "Leader".to_owned(),
+                    purpose: "Govern member Roles".to_owned(),
+                    responsibilities: Vec::new(),
+                    boundaries: Vec::new(),
+                    active: true,
+                },
+            }),
+        )
+        .with_initial_role_level(RoleLevel::Admin);
+
+        let encoded = serde_json::to_string(&command).expect("serialize command");
+        let decoded = ProjectObjectCommand::from_json(&encoded).expect("parse command");
+        assert_eq!(decoded, command);
+        assert_eq!(decoded.created_role_level(), Some(RoleLevel::Admin));
+    }
+
+    #[test]
+    fn initial_role_level_is_rejected_for_non_role_create() {
+        let command = ProjectObjectCommand::new(
+            7,
+            None,
+            MutationRequest::Create(CreateMutation {
+                object: NewProjectViewObject::Goal {
+                    id: Uuid::new_v4(),
+                    title: "Goal".to_owned(),
+                    desired_outcome: "Outcome".to_owned(),
+                    directions: Vec::new(),
+                },
+            }),
+        )
+        .with_initial_role_level(RoleLevel::Admin);
+
+        assert!(matches!(
+            command.validate_for_submission(),
+            Err(DomainError::InvalidField {
+                field: "initial_role_level",
+                ..
+            })
+        ));
     }
 
     #[test]

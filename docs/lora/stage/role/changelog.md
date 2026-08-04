@@ -1,5 +1,23 @@
 # 角色连续性变更记录
 
+## 2026-08-03 — Role 定义与 Assignment 治理统一（已修复并验证）
+
+- 修复普通 Community member 能创建 Role、却无权向它发 Offer 的分裂授权。Role 定义的
+  create/update/deactivate/delete 现在与 Role Assignment 治理使用同一层级：Human owner
+  可治理 admin/member，Community admin + exact active admin Assignment 的 Leader 只可治理
+  member，普通 member 只能读取、申请并处理属于自己的 Proposal。
+- v2/v3 Role create command 增加签名的 create-only `initial_role_level`。owner 可在初始化后
+  创建 admin Role；Active Leader 只能创建 member Role；既有 Role level 仍不能通过 generic
+  JSON patch 修改。
+- Role definition gate 在 DB transaction 与 receipt replay 前重验；Supervisor binding、Runtime
+  lease/fence 继续只表达运行归因，不成为治理权限。非 Role Project View、Document、Resource
+  的 Community writer 边界未被收紧。
+- CLI、Tauri 与 Desktop 使用 verified membership + Role + Assignment snapshot 组装同一能力。
+  自动化验收覆盖普通 member、owner、Active Leader、missing/stale Assignment 与 admin target。
+
+实现依据见
+[Project Role 治理授权与 admin Role 创建缺口修复设计](../bug/project-role-governance-authorization-and-admin-role-creation-fix-design.md)。
+
 ## 2026-08-03 — Role Assignment 恢复为行为 fence，而非 Project ACL
 
 - 修复 schema v3 通用 actor gate 对 managed Agent 无条件要求 Assignment 的逻辑错误。

@@ -3406,6 +3406,194 @@ mod tests {
         scratch.cleanup().await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn role_definition_governance_rejects_member_and_accepts_owner() {
+        let scratch = ScratchDatabase::create("buzz_pv_role_governance").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let member = Keys::generate();
+
+        db.bootstrap_owner(community_id, &owner.public_key().to_hex())
+            .await
+            .expect("bootstrap Community owner");
+        db.add_relay_member(
+            community_id,
+            &member.public_key().to_hex(),
+            "member",
+            Some(&owner.public_key().to_hex()),
+        )
+        .await
+        .expect("add ordinary Community member");
+
+        let mut tx = scratch.pool.begin().await.expect("begin governance check");
+        crate::project_view_v2::authorize_role_definition_in_tx(
+            &mut tx,
+            community_id,
+            owner.public_key(),
+            None,
+            RoleLevel::Admin,
+            true,
+        )
+        .await
+        .expect("owner creates admin Role");
+        crate::project_view_v2::authorize_role_definition_in_tx(
+            &mut tx,
+            community_id,
+            owner.public_key(),
+            None,
+            RoleLevel::Member,
+            true,
+        )
+        .await
+        .expect("owner creates member Role");
+
+        assert!(matches!(
+            crate::project_view_v2::authorize_role_definition_in_tx(
+                &mut tx,
+                community_id,
+                member.public_key(),
+                None,
+                RoleLevel::Member,
+                true,
+            )
+            .await,
+            Err(ProjectViewV2WriteError::Domain(
+                RoleContinuityError::NotAuthorized
+            ))
+        ));
+        tx.rollback().await.expect("roll back governance check");
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn role_definition_governance_requires_exact_active_leader_assignment() {
+        let scratch = ScratchDatabase::create("buzz_pv_role_leader_governance").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = seed_community(&scratch.pool, true).await;
+        let owner = Keys::generate();
+        let leader = Keys::generate();
+        let relay = Keys::generate();
+        let (member_role_id, admin_role_id) = cutover_role_continuity_fixture(
+            &db,
+            &scratch.pool,
+            community_id,
+            &owner,
+            &relay,
+            &leader,
+        )
+        .await;
+
+        let mut tx = scratch.pool.begin().await.expect("begin Leader gate check");
+        let leader_assignment_id: Uuid = sqlx::query_scalar(
+            "SELECT assignment_id FROM project_role_assignments \
+             WHERE community_id = $1 AND role_id = $2 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(admin_role_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read active admin Assignment");
+        let source_change_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT source_change_id FROM project_role_assignments \
+             WHERE community_id = $1 AND role_id = $2 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(member_role_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read member Assignment source");
+        sqlx::query(
+            "UPDATE project_role_assignments SET \
+                 ended_at = clock_timestamp(), ended_by = $3, ended_reason = 'revoked', \
+                 ended_source_change_id = $4 \
+             WHERE community_id = $1 AND role_id = $2 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(member_role_id)
+        .bind(owner.public_key().as_bytes())
+        .bind(&source_change_id)
+        .execute(&mut *tx)
+        .await
+        .expect("vacate Leader's old member Role");
+        sqlx::query(
+            "UPDATE project_role_assignments SET member_pubkey = $3 \
+             WHERE community_id = $1 AND assignment_id = $2 AND ended_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(leader_assignment_id)
+        .bind(leader.public_key().to_hex())
+        .execute(&mut *tx)
+        .await
+        .expect("assign the admin Role to the Leader");
+        sqlx::query(
+            "UPDATE relay_members SET role = 'admin' \
+             WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(leader.public_key().to_hex())
+        .execute(&mut *tx)
+        .await
+        .expect("project Leader Community admin membership");
+
+        crate::project_view_v2::authorize_role_definition_in_tx(
+            &mut tx,
+            community_id,
+            leader.public_key(),
+            Some(leader_assignment_id),
+            RoleLevel::Member,
+            true,
+        )
+        .await
+        .expect("active Leader creates a member Role");
+        assert!(matches!(
+            crate::project_view_v2::authorize_role_definition_in_tx(
+                &mut tx,
+                community_id,
+                leader.public_key(),
+                None,
+                RoleLevel::Member,
+                true,
+            )
+            .await,
+            Err(ProjectViewV2WriteError::Domain(
+                RoleContinuityError::ActingAssignmentRequired
+            ))
+        ));
+        assert!(matches!(
+            crate::project_view_v2::authorize_role_definition_in_tx(
+                &mut tx,
+                community_id,
+                leader.public_key(),
+                Some(Uuid::new_v4()),
+                RoleLevel::Member,
+                true,
+            )
+            .await,
+            Err(ProjectViewV2WriteError::Domain(
+                RoleContinuityError::ActingAssignmentInvalid
+            ))
+        ));
+        assert!(matches!(
+            crate::project_view_v2::authorize_role_definition_in_tx(
+                &mut tx,
+                community_id,
+                leader.public_key(),
+                Some(leader_assignment_id),
+                RoleLevel::Admin,
+                true,
+            )
+            .await,
+            Err(ProjectViewV2WriteError::Domain(
+                RoleContinuityError::OwnerRequired
+            ))
+        ));
+        tx.rollback().await.expect("roll back Leader gate check");
+        scratch.cleanup().await;
+    }
+
     fn initialize_mutation() -> Mutation {
         Mutation::new(
             0,

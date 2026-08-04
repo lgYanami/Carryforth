@@ -38,6 +38,8 @@ function contextLabel(
 }
 
 export function ProjectViewContextSection({
+  actingAssignmentId,
+  canMutate,
   contextCapability,
   object,
   objectsById,
@@ -45,6 +47,8 @@ export function ProjectViewContextSection({
   onSelectObject,
   projectRevision,
 }: {
+  actingAssignmentId?: string;
+  canMutate: boolean;
   contextCapability: boolean;
   object: ProjectViewObject;
   objectsById: ReadonlyMap<string, ProjectViewObject>;
@@ -84,6 +88,7 @@ export function ProjectViewContextSection({
   const documentOptions = documentsQuery.data?.documents ?? [];
   const isDocumentTarget = targetKind !== "resource";
   const canAdd =
+    canMutate &&
     contextCapability &&
     Boolean(targetId) &&
     (targetKind !== "pinned_document" ||
@@ -99,6 +104,7 @@ export function ProjectViewContextSection({
         objectType: object.objectType,
         objectId: object.id,
         contextReferences: canonicalizeProjectViewContextReferences(next),
+        actingAssignmentId,
       });
       if (result.status === "conflict") {
         setMessage(
@@ -218,28 +224,30 @@ export function ProjectViewContextSection({
                     </Link>
                   </Button>
                 )}
-                <Button
-                  aria-label={`Remove Context ${label}`}
-                  disabled={mutation.isPending}
-                  onClick={() => removeReference(reference)}
-                  size="icon"
-                  title={
-                    contextCapability
-                      ? "Remove Context Reference"
-                      : "Remove preserved coordinate while Context is unavailable"
-                  }
-                  type="button"
-                  variant="ghost"
-                >
-                  <Trash2 />
-                </Button>
+                {canMutate ? (
+                  <Button
+                    aria-label={`Remove Context ${label}`}
+                    disabled={mutation.isPending}
+                    onClick={() => removeReference(reference)}
+                    size="icon"
+                    title={
+                      contextCapability
+                        ? "Remove Context Reference"
+                        : "Remove preserved coordinate while Context is unavailable"
+                    }
+                    type="button"
+                    variant="ghost"
+                  >
+                    <Trash2 />
+                  </Button>
+                ) : null}
               </div>
             );
           })}
         </div>
       )}
 
-      {contextCapability ? (
+      {contextCapability && canMutate ? (
         <div className="space-y-2 rounded-lg border border-border/70 p-3">
           <div className="grid gap-2 sm:grid-cols-2">
             <select
@@ -309,6 +317,11 @@ export function ProjectViewContextSection({
             </p>
           ) : null}
         </div>
+      ) : !canMutate ? (
+        <p className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+          Your current Community and Assignment state can read, but cannot
+          change this Role's Context.
+        </p>
       ) : references.length > 0 ? (
         <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-muted-foreground">
           Context is temporarily unavailable. Preserved coordinates remain

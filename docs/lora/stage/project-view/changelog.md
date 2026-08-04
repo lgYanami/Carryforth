@@ -1,5 +1,46 @@
 # Project View 变更记录
 
+## 2026-08-03 — Role 定义治理授权与初始化后 admin Role 创建（已修复并验证）
+
+### 问题与边界
+
+- Role 定义此前仍走 Goal、Issue、Resource 等普通 Project View 对象的 Community writer
+  路径。普通 member 因而可以创建 Role，却会在向同一 Role 发 Offer 时被 Role Continuity
+  拒绝，形成“能创建但不能治理”的不一致。
+- 初始化后的 v2/v3 Role create 固定为 `member`，Desktop 和 CLI 均没有合法创建新
+  `admin` Role 的入口。已有 Leader 结构只能依赖初始化数据，无法正常扩展。
+- 本次将 Role 定义收敛为治理对象：直接 Human owner 可治理 `admin/member` Role；同时具备
+  Community `admin` 与 exact active admin Assignment 的 Leader 只能治理 `member` Role；
+  普通 member 不再能创建、修改、停用或删除 Role。非 Role Project 对象、Document、
+  Resource 和 Context 的 Community member 写权限保持不变。
+
+### 实现
+
+- schema v2/v3 Project object command 新增 create-only `initial_role_level`，省略时兼容为
+  `member`；字段不能用于非 Role 或既有 Role 的 level patch。Reducer、规范表与 projection
+  均保留签名的初始 level。
+- DB 在 Community Project lock 内、receipt lookup 前解析当前 membership、managed identity、
+  Assignment 和目标 Role level，并为 v2/v3 generic/raw event 共用同一 Role gate。owner
+  必须是直接 Human identity；non-owner Leader 必须携 exact active admin Assignment；Runtime
+  supervisor/binding/fence 不授予治理 authority。
+- Role Continuity receipt replay 现在也重验当前 governor authority；失去 owner/Leader 状态的
+  旧治理命令不能仅凭历史成功 receipt 绕过当前边界。
+- `buzz project-view create role` 新增 `--role-level admin|member`；Role create/update/delete 与
+  Role Context 会从 verified snapshot 组装当前治理上下文。Desktop 按同一 snapshot 派生能力，
+  普通 member 隐藏 Role Add/Edit/Delete，owner 可选择 admin，Active Leader 只看到 member，
+  Tauri 最终生成 closed v2/v3 command。
+
+### 验证
+
+- `buzz-project-view` 44 个单元测试及 36 个关系、属性、wire 测试通过；`buzz-cli` 278 个测试
+  通过；Desktop Tauri 14 个目标 mutation 测试通过。
+- 两个真实 PostgreSQL 临时数据库用例通过，覆盖 owner/member 拒绝矩阵，以及 Community
+  admin + exact active admin Assignment、missing/stale Assignment 和 admin target owner-only。
+- Desktop 3536 个单元测试、TypeScript 检查、E2E build 和 3 个目标 Playwright 场景通过。
+
+完整边界、威胁模型、协议形状和验收矩阵见
+[Project Role 治理授权与 admin Role 创建缺口修复设计](../bug/project-role-governance-authorization-and-admin-role-creation-fix-design.md)。
+
 ## 2026-08-03 — Community 写权限与 Assignment fence 错误耦合（已修复）
 
 ### 问题与根因

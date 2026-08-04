@@ -15,16 +15,18 @@ use buzz_core::kind::{
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::ChangeSource;
 use buzz_project_view::v2::{
-    AssignmentEndReason, CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds,
-    HandoffCause, MemberGovernance, ProjectObjectCommand, ProposalStatus, ProposalType,
-    RoleAssignment, RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent, RoleCommand,
+    authorize_role_creation, authorize_role_governance_transition, AssignmentEndReason,
+    CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, HandoffCause,
+    MemberGovernance, ProjectObjectCommand, ProposalStatus, ProposalType, RoleAssignment,
+    RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent, RoleCommand,
     RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityReference,
-    RoleContinuityState, RoleDefinition, RoleHandoff, RoleHandoffContent, RoleLevel, RoleSlot,
-    WorkCommitment, WorkResponsibility,
+    RoleContinuityState, RoleDefinition, RoleGovernanceError, RoleGovernanceState,
+    RoleGovernorAuthority, RoleHandoff, RoleHandoffContent, RoleLevel, RoleSlot, WorkCommitment,
+    WorkResponsibility,
 };
 use buzz_project_view::{
-    DomainError, MutationOutcome, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
-    ProjectViewObjectType, ProjectViewState, WorkStatus,
+    DomainError, MutationOutcome, MutationRequest, ProjectViewEntry, ProjectViewObject,
+    ProjectViewObjectData, ProjectViewObjectType, ProjectViewState, WorkStatus,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -1976,6 +1978,57 @@ impl ProjectViewV2WriteTx {
         }
 
         let loaded = load_v2_project_object_state(&mut self.tx, self.community_id).await?;
+        let role_target = match &command.request {
+            MutationRequest::Create(_) => command.created_role_level().map(|level| (level, true)),
+            MutationRequest::Update(update)
+                if update.object_type() == ProjectViewObjectType::Role =>
+            {
+                Some((
+                    loaded
+                        .role_levels
+                        .get(&update.object_id())
+                        .copied()
+                        .ok_or_else(|| {
+                            ProjectViewV2WriteError::InvalidCommit(format!(
+                                "active Role {} has no governance level",
+                                update.object_id()
+                            ))
+                        })?,
+                    false,
+                ))
+            }
+            MutationRequest::Delete(delete)
+                if delete.object_type == ProjectViewObjectType::Role =>
+            {
+                Some((
+                    loaded
+                        .role_levels
+                        .get(&delete.object_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            ProjectViewV2WriteError::InvalidCommit(format!(
+                                "active Role {} has no governance level",
+                                delete.object_id
+                            ))
+                        })?,
+                    false,
+                ))
+            }
+            MutationRequest::Initialize(_)
+            | MutationRequest::Update(_)
+            | MutationRequest::Delete(_) => None,
+        };
+        if let Some((target_level, creating)) = role_target {
+            authorize_role_definition_in_tx(
+                &mut self.tx,
+                self.community_id,
+                command_event.pubkey,
+                command.acting_assignment_id,
+                target_level,
+                creating,
+            )
+            .await?;
+        }
         validate_project_object_actor_fence(
             &mut self.tx,
             self.community_id,
@@ -2015,7 +2068,8 @@ impl ProjectViewV2WriteTx {
         let mut role_levels = loaded.role_levels;
         for entry in &outcome.changed_entries {
             if entry.object_type() == ProjectViewObjectType::Role {
-                role_levels.entry(entry.id()).or_insert(RoleLevel::Member);
+                let default_level = command.created_role_level().unwrap_or(RoleLevel::Member);
+                role_levels.entry(entry.id()).or_insert(default_level);
             }
         }
         let heads = outcome
@@ -3077,6 +3131,85 @@ pub(crate) async fn validate_project_object_actor_fence(
     )
     .await?;
     Ok(())
+}
+
+/// Authorize one Role-definition mutation against locked Community,
+/// membership, Assignment, and Role-level state.
+///
+/// A Community owner may govern either level. A non-owner must be a current
+/// Community admin acting through the exact active admin Assignment, and may
+/// govern only member Roles. Runtime supervision is deliberately not a source
+/// of this authority.
+pub(crate) async fn authorize_role_definition_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    actor: PublicKey,
+    acting_assignment_id: Option<Uuid>,
+    target_level: RoleLevel,
+    creating: bool,
+) -> ProjectViewV2WriteResult<()> {
+    let members = load_member_governance(tx, community_id).await?;
+    let member = members
+        .iter()
+        .find(|member| member.pubkey == actor && member.eligible)
+        .ok_or(RoleContinuityError::NotAuthorized)?;
+
+    let authority = match member.community_role {
+        Some(CommunityMemberRole::Owner) if member.managed_agent_owner.is_none() => {
+            RoleGovernorAuthority::Owner
+        }
+        Some(CommunityMemberRole::Owner) => {
+            return Err(RoleContinuityError::NotAuthorized.into());
+        }
+        Some(CommunityMemberRole::Admin) => {
+            if matches!(target_level, RoleLevel::Admin) {
+                return Err(RoleContinuityError::OwnerRequired.into());
+            }
+            let assignment_id =
+                acting_assignment_id.ok_or(RoleContinuityError::ActingAssignmentRequired)?;
+            let valid: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 \
+                     FROM project_role_assignments assignment \
+                     JOIN project_view_objects role_object \
+                       ON role_object.community_id = assignment.community_id \
+                      AND role_object.object_id = assignment.role_id \
+                     WHERE assignment.community_id = $1 \
+                       AND assignment.assignment_id = $2 \
+                       AND assignment.member_pubkey = $3 \
+                       AND assignment.ended_at IS NULL \
+                       AND role_object.object_type = 'role' \
+                       AND role_object.deleted_at IS NULL \
+                       AND role_object.role_level = 'admin' \
+                       AND role_object.body->'active' = 'true'::jsonb \
+                 )",
+            )
+            .bind(community_id.as_uuid())
+            .bind(assignment_id)
+            .bind(actor.to_hex())
+            .fetch_one(&mut **tx)
+            .await?;
+            if !valid {
+                return Err(RoleContinuityError::ActingAssignmentInvalid.into());
+            }
+            RoleGovernorAuthority::ActiveLeader
+        }
+        Some(CommunityMemberRole::Member) | None => RoleGovernorAuthority::Member,
+    };
+
+    let authorized = if creating {
+        authorize_role_creation(target_level, authority)
+    } else {
+        let state = RoleGovernanceState {
+            level: target_level,
+            active: true,
+        };
+        authorize_role_governance_transition(state, state, authority)
+    };
+    authorized.map_err(|error| match error {
+        RoleGovernanceError::NotAuthorized => RoleContinuityError::NotAuthorized.into(),
+        RoleGovernanceError::OwnerRequired => RoleContinuityError::OwnerRequired.into(),
+    })
 }
 
 async fn reject_assigned_role_deactivation(

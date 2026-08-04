@@ -260,6 +260,8 @@ fn create_and_update_are_parsed_by_closed_domain_types() {
     let create = prepare_mutation(ProjectViewMutationInput::Create {
         expected_project_revision: 4,
         object_type: ProjectViewObjectType::Plan,
+        initial_role_level: None,
+        acting_assignment_id: None,
         data: json!({
             "title": "Client",
             "description": "Human interface",
@@ -279,6 +281,7 @@ fn create_and_update_are_parsed_by_closed_domain_types() {
         expected_project_revision: 5,
         object_type: ProjectViewObjectType::Issue,
         object_id,
+        acting_assignment_id: None,
         patch: json!({
             "status": "resolved",
             "about": null,
@@ -293,6 +296,8 @@ fn create_rejects_unknown_fields_before_signing() {
     let error = prepare_mutation(ProjectViewMutationInput::Create {
         expected_project_revision: 1,
         object_type: ProjectViewObjectType::Goal,
+        initial_role_level: None,
+        acting_assignment_id: None,
         data: json!({
             "title": "Ship",
             "desired_outcome": "Done",
@@ -305,11 +310,59 @@ fn create_rejects_unknown_fields_before_signing() {
 }
 
 #[test]
+fn role_create_preserves_signed_level_and_leader_assignment() {
+    let assignment_id = Uuid::new_v4();
+    let prepared = prepare_v3_mutation(ProjectViewMutationInput::Create {
+        expected_project_revision: 8,
+        object_type: ProjectViewObjectType::Role,
+        data: json!({
+            "name": "Delivery leader",
+            "purpose": "Govern member Roles",
+            "responsibilities": [],
+            "boundaries": [],
+            "active": true,
+        }),
+        initial_role_level: Some(RoleLevel::Member),
+        acting_assignment_id: Some(assignment_id),
+    })
+    .expect("prepare governed Role create");
+    let event = prepared
+        .builder
+        .sign_with_keys(&Keys::generate())
+        .expect("sign governed Role create");
+    let command =
+        ProjectObjectCommandV3::from_json(&event.content).expect("parse governed Role create");
+
+    assert_eq!(command.initial_role_level, Some(RoleLevel::Member));
+    assert_eq!(command.acting_assignment_id, Some(assignment_id));
+}
+
+#[test]
+fn role_governance_fields_are_rejected_for_ordinary_objects() {
+    let error = prepare_v3_mutation(ProjectViewMutationInput::Create {
+        expected_project_revision: 8,
+        object_type: ProjectViewObjectType::Goal,
+        data: json!({
+            "title": "Ship",
+            "desired_outcome": "Done",
+            "directions": [],
+        }),
+        initial_role_level: Some(RoleLevel::Admin),
+        acting_assignment_id: None,
+    })
+    .expect_err("ordinary object must reject Role level");
+
+    assert!(error.contains("Role governance fields"));
+}
+
+#[test]
 fn v3_resource_mutation_is_guide_only_and_keeps_unknown_kinds() {
     let guide_document_id = Uuid::new_v4();
     let prepared = prepare_v3_mutation(ProjectViewMutationInput::Create {
         expected_project_revision: 8,
         object_type: ProjectViewObjectType::Resource,
+        initial_role_level: None,
+        acting_assignment_id: None,
         data: json!({
             "name": "Release console",
             "resource_kind": "internal-release-console-v7",
@@ -343,6 +396,8 @@ fn v3_resource_rejects_the_legacy_locator_shape() {
     let error = prepare_v3_mutation(ProjectViewMutationInput::Create {
         expected_project_revision: 8,
         object_type: ProjectViewObjectType::Resource,
+        initial_role_level: None,
+        acting_assignment_id: None,
         data: json!({
             "name": "Legacy",
             "resource_type": "repository",
@@ -376,6 +431,7 @@ fn v3_context_replacement_round_trips_only_closed_coordinates() {
         expected_project_revision: 11,
         object_type: ProjectViewObjectType::Role,
         object_id,
+        acting_assignment_id: None,
         context_references: references.clone(),
     })
     .expect("prepare v3 Context replacement");
@@ -572,6 +628,8 @@ async fn desktop_create_confirms_the_signed_object_projection() {
         ProjectViewMutationInput::Create {
             expected_project_revision: 1,
             object_type: ProjectViewObjectType::Plan,
+            initial_role_level: None,
+            acting_assignment_id: None,
             data: json!({
                 "title": "Client",
                 "description": "Human interface",
@@ -610,6 +668,8 @@ async fn revision_conflict_is_typed_and_never_retried() {
         ProjectViewMutationInput::Create {
             expected_project_revision: 7,
             object_type: ProjectViewObjectType::Plan,
+            initial_role_level: None,
+            acting_assignment_id: None,
             data: json!({
                 "title": "Client",
                 "description": "Human interface",

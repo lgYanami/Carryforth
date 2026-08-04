@@ -1,7 +1,7 @@
 //! Typed Project View mutation bridge for the desktop client.
 
 use buzz_core_pkg::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
-use buzz_project_view_pkg::v2::{ProjectObjectCommand, RoleContinuityChange};
+use buzz_project_view_pkg::v2::{ProjectObjectCommand, RoleContinuityChange, RoleLevel};
 use buzz_project_view_pkg::v3::{
     CreateProjectObjectV3, DeleteProjectObjectV3, NewProjectViewObjectV3, ProjectContextReference,
     ProjectObjectCommandV3, ProjectObjectRequestV3, UpdateProjectObjectV3,
@@ -77,6 +77,12 @@ pub enum ProjectViewMutationInput {
         object_type: ProjectViewObjectType,
         /// Closed per-type fields. Rust injects the object type and UUID.
         data: Value,
+        /// Signed initial governance level. Valid only for Role creation.
+        #[serde(default)]
+        initial_role_level: Option<RoleLevel>,
+        /// Exact active Leader Assignment used by a non-owner Role governor.
+        #[serde(default)]
+        acting_assignment_id: Option<Uuid>,
     },
     /// Replace explicitly supplied fields on one active object.
     Update {
@@ -88,6 +94,9 @@ pub enum ProjectViewMutationInput {
         object_id: Uuid,
         /// Closed typed patch. Explicit `null` clears an optional relation.
         patch: Value,
+        /// Exact active Leader Assignment used by a non-owner Role governor.
+        #[serde(default)]
+        acting_assignment_id: Option<Uuid>,
     },
     /// Tombstone one unreferenced active object.
     Delete {
@@ -97,6 +106,9 @@ pub enum ProjectViewMutationInput {
         object_type: ProjectViewObjectType,
         /// Stable object identifier.
         object_id: Uuid,
+        /// Exact active Leader Assignment used by a non-owner Role governor.
+        #[serde(default)]
+        acting_assignment_id: Option<Uuid>,
     },
     /// Replace the complete canonical Context Reference set on one v3 object.
     Context {
@@ -108,6 +120,9 @@ pub enum ProjectViewMutationInput {
         object_id: Uuid,
         /// Complete canonical replacement set.
         context_references: Vec<ProjectContextReference>,
+        /// Exact active Leader Assignment used when the source is a Role.
+        #[serde(default)]
+        acting_assignment_id: Option<Uuid>,
     },
 }
 
@@ -147,6 +162,8 @@ pub enum ProjectViewMutationResult {
 struct PreparedMutation {
     builder: EventBuilder,
     request: Option<MutationRequest>,
+    acting_assignment_id: Option<Uuid>,
+    initial_role_level: Option<RoleLevel>,
     expected_project_revision: u64,
     target: Option<MutationTarget>,
 }
@@ -258,14 +275,18 @@ async fn execute_mutation(
     };
     let builder = match context.identity.schema {
         ProjectViewSchema::V1 => prepared.builder,
-        ProjectViewSchema::V2 => build_project_object_command(ProjectObjectCommand::new(
-            prepared.expected_project_revision,
-            None,
-            prepared.request.ok_or_else(|| {
-                "Project View integrity error: missing legacy mutation request".to_owned()
-            })?,
-        ))
-        .map_err(|error| format!("invalid Project View v2 mutation: {error}"))?,
+        ProjectViewSchema::V2 => {
+            let mut command = ProjectObjectCommand::new(
+                prepared.expected_project_revision,
+                prepared.acting_assignment_id,
+                prepared.request.ok_or_else(|| {
+                    "Project View integrity error: missing legacy mutation request".to_owned()
+                })?,
+            );
+            command.initial_role_level = prepared.initial_role_level;
+            build_project_object_command(command)
+                .map_err(|error| format!("invalid Project View v2 mutation: {error}"))?
+        }
         ProjectViewSchema::V3 => prepared.builder,
     };
     let event = builder
@@ -327,6 +348,8 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
                 builder: build_initialize(profile, goals)
                     .map_err(|error| format!("invalid Project View initialization: {error}"))?,
                 request: Some(request),
+                acting_assignment_id: None,
+                initial_role_level: None,
                 expected_project_revision: 0,
                 target: None,
             })
@@ -335,12 +358,16 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             expected_project_revision,
             object_type,
             data,
+            initial_role_level,
+            acting_assignment_id,
         } => {
             if object_type == ProjectViewObjectType::ProjectProfile {
                 return Err("the Project Profile can only be created by initialization".to_owned());
             }
             let object_id = Uuid::new_v4();
             let object = create_input(object_type, object_id, data)?;
+            let initial_role_level =
+                role_create_level(object_type, initial_role_level, acting_assignment_id)?;
             let request = MutationRequest::Create(CreateMutation {
                 object: object.clone(),
             });
@@ -348,6 +375,8 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
                 builder: build_create(expected_project_revision, object)
                     .map_err(|error| format!("invalid Project View create: {error}"))?,
                 request: Some(request),
+                acting_assignment_id,
+                initial_role_level,
                 expected_project_revision,
                 target: Some(MutationTarget {
                     operation: "create",
@@ -362,13 +391,17 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             object_type,
             object_id,
             patch,
+            acting_assignment_id,
         } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
             let update = update_input(object_type, object_id, patch)?;
             let request = MutationRequest::Update(update.clone());
             Ok(PreparedMutation {
                 builder: build_update(expected_project_revision, update)
                     .map_err(|error| format!("invalid Project View update: {error}"))?,
                 request: Some(request),
+                acting_assignment_id,
+                initial_role_level: None,
                 expected_project_revision,
                 target: Some(MutationTarget {
                     operation: "update",
@@ -382,7 +415,9 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
             expected_project_revision,
             object_type,
             object_id,
+            acting_assignment_id,
         } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
             let request = MutationRequest::Delete(DeleteMutation {
                 object_type,
                 object_id,
@@ -391,6 +426,8 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
                 builder: build_delete(expected_project_revision, object_type, object_id)
                     .map_err(|error| format!("invalid Project View delete: {error}"))?,
                 request: Some(request),
+                acting_assignment_id,
+                initial_role_level: None,
                 expected_project_revision,
                 target: Some(MutationTarget {
                     operation: "delete",
@@ -404,7 +441,13 @@ fn prepare_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation,
 }
 
 fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation, String> {
-    let (expected_project_revision, target, request) = match input {
+    let (
+        expected_project_revision,
+        target,
+        request,
+        acting_assignment_id,
+        initial_role_level,
+    ) = match input {
         ProjectViewMutationInput::Initialize { .. } => {
             return Err(
                 "unsupported: Project View v3 initialization requires the prepared owner bootstrap command"
@@ -415,12 +458,19 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
             expected_project_revision,
             object_type,
             data,
+            initial_role_level,
+            acting_assignment_id,
         } => {
             if object_type == ProjectViewObjectType::ProjectProfile {
                 return Err("the Project Profile can only be created by initialization".to_owned());
             }
             let object_id = Uuid::new_v4();
             let object = create_input_v3(object_type, object_id, data)?;
+            let initial_role_level = role_create_level(
+                object_type,
+                initial_role_level,
+                acting_assignment_id,
+            )?;
             (
                 expected_project_revision,
                 MutationTarget {
@@ -430,6 +480,8 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
                     deleted: false,
                 },
                 ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
+                acting_assignment_id,
+                initial_role_level,
             )
         }
         ProjectViewMutationInput::Update {
@@ -437,62 +489,110 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
             object_type,
             object_id,
             patch,
-        } => (
-            expected_project_revision,
-            MutationTarget {
-                operation: "update",
-                object_type,
-                object_id,
-                deleted: false,
-            },
-            ProjectObjectRequestV3::Update(update_input_v3(object_type, object_id, patch)?),
-        ),
+            acting_assignment_id,
+        } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
+            (
+                expected_project_revision,
+                MutationTarget {
+                    operation: "update",
+                    object_type,
+                    object_id,
+                    deleted: false,
+                },
+                ProjectObjectRequestV3::Update(update_input_v3(object_type, object_id, patch)?),
+                acting_assignment_id,
+                None,
+            )
+        }
         ProjectViewMutationInput::Delete {
             expected_project_revision,
             object_type,
             object_id,
-        } => (
-            expected_project_revision,
-            MutationTarget {
-                operation: "delete",
-                object_type,
-                object_id,
-                deleted: true,
-            },
-            ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
-                object_type,
-                object_id,
-            }),
-        ),
+            acting_assignment_id,
+        } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
+            (
+                expected_project_revision,
+                MutationTarget {
+                    operation: "delete",
+                    object_type,
+                    object_id,
+                    deleted: true,
+                },
+                ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
+                    object_type,
+                    object_id,
+                }),
+                acting_assignment_id,
+                None,
+            )
+        }
         ProjectViewMutationInput::Context {
             expected_project_revision,
             object_type,
             object_id,
             context_references,
-        } => (
-            expected_project_revision,
-            MutationTarget {
-                operation: "update",
-                object_type,
-                object_id,
-                deleted: false,
-            },
-            ProjectObjectRequestV3::Update(update_input_v3(
-                object_type,
-                object_id,
-                json!({ "context_references": context_references }),
-            )?),
-        ),
+            acting_assignment_id,
+        } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
+            (
+                expected_project_revision,
+                MutationTarget {
+                    operation: "update",
+                    object_type,
+                    object_id,
+                    deleted: false,
+                },
+                ProjectObjectRequestV3::Update(update_input_v3(
+                    object_type,
+                    object_id,
+                    json!({ "context_references": context_references }),
+                )?),
+                acting_assignment_id,
+                None,
+            )
+        }
     };
-    let command = ProjectObjectCommandV3::new(expected_project_revision, None, request);
+    let mut command =
+        ProjectObjectCommandV3::new(expected_project_revision, acting_assignment_id, request);
+    command.initial_role_level = initial_role_level;
     let builder = build_v3_project_object_command(command)
         .map_err(|error| format!("invalid Project View v3 mutation: {error}"))?;
     Ok(PreparedMutation {
         builder,
         request: None,
+        acting_assignment_id,
+        initial_role_level,
         expected_project_revision,
         target: Some(target),
     })
+}
+
+fn role_create_level(
+    object_type: ProjectViewObjectType,
+    initial_role_level: Option<RoleLevel>,
+    acting_assignment_id: Option<Uuid>,
+) -> Result<Option<RoleLevel>, String> {
+    if object_type == ProjectViewObjectType::Role {
+        return Ok(Some(initial_role_level.unwrap_or(RoleLevel::Member)));
+    }
+    if initial_role_level.is_some() || acting_assignment_id.is_some() {
+        return Err("Role governance fields are valid only when creating a Role".to_owned());
+    }
+    Ok(None)
+}
+
+fn validate_role_actor_field(
+    object_type: ProjectViewObjectType,
+    acting_assignment_id: Option<Uuid>,
+) -> Result<(), String> {
+    if object_type != ProjectViewObjectType::Role && acting_assignment_id.is_some() {
+        return Err(
+            "acting_assignment_id is valid only when mutating a Role definition".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn create_input(

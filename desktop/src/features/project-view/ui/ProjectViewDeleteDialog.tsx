@@ -27,6 +27,7 @@ import {
 import { Button } from "@/shared/ui/button";
 
 export function ProjectViewDeleteDialog({
+  actingAssignmentId,
   object,
   onDeleted,
   onOpenChange,
@@ -35,6 +36,7 @@ export function ProjectViewDeleteDialog({
   projectRevision,
   view,
 }: {
+  actingAssignmentId?: string;
   object?: ProjectViewObject;
   onDeleted: () => void;
   onOpenChange: (open: boolean) => void;
@@ -108,6 +110,8 @@ export function ProjectViewDeleteDialog({
         expectedProjectRevision: baseRevision,
         objectType: object.objectType,
         objectId: object.id,
+        actingAssignmentId:
+          object.objectType === "role" ? actingAssignmentId : undefined,
       });
       if (result.status === "conflict") {
         setConflict(result);

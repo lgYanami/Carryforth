@@ -18,11 +18,11 @@ use buzz_project_view::v2::{
 };
 use buzz_project_view::v3::{
     DocumentCoordinate, DocumentReferenceMode, DocumentTargetState, ProjectContextReference,
-    ProjectObjectCommandV3, ProjectObjectOutcomeV3, ProjectViewEntryV3, ProjectViewInitializeV3,
-    ProjectViewInitializeV3Request, ProjectViewObjectDataV3, ProjectViewObjectV3,
-    ProjectViewStateV3, ProjectViewTombstoneV3, ProjectedHeadV3, ProjectionPlanV3,
-    ReferenceTargetProof, RoleCommandV3, RoleDefinitionV3, V3ContractError, V3ProjectObjectError,
-    V3ReducerCapabilities,
+    ProjectObjectCommandV3, ProjectObjectOutcomeV3, ProjectObjectRequestV3, ProjectViewEntryV3,
+    ProjectViewInitializeV3, ProjectViewInitializeV3Request, ProjectViewObjectDataV3,
+    ProjectViewObjectV3, ProjectViewStateV3, ProjectViewTombstoneV3, ProjectedHeadV3,
+    ProjectionPlanV3, ReferenceTargetProof, RoleCommandV3, RoleDefinitionV3, V3ContractError,
+    V3ProjectObjectError, V3ReducerCapabilities,
 };
 use buzz_project_view::{
     ObjectRef, ProjectRole, ProjectViewObjectType, ProjectViewRelations, WorkStatus,
@@ -1406,6 +1406,57 @@ impl ProjectViewV3WriteTx {
         )
         .await?;
         let loaded = load_v3_project_object_state(&mut self.tx, self.community_id).await?;
+        let role_target = match &command.request {
+            ProjectObjectRequestV3::Create(_) => {
+                command.created_role_level().map(|level| (level, true))
+            }
+            ProjectObjectRequestV3::Update(update)
+                if update.object_type() == ProjectViewObjectType::Role =>
+            {
+                Some((
+                    loaded
+                        .role_levels
+                        .get(&update.object_id())
+                        .copied()
+                        .ok_or_else(|| {
+                            ProjectViewV3WriteError::InvalidCommit(format!(
+                                "active Role {} has no governance level",
+                                update.object_id()
+                            ))
+                        })?,
+                    false,
+                ))
+            }
+            ProjectObjectRequestV3::Delete(delete)
+                if delete.object_type == ProjectViewObjectType::Role =>
+            {
+                Some((
+                    loaded
+                        .role_levels
+                        .get(&delete.object_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            ProjectViewV3WriteError::InvalidCommit(format!(
+                                "active Role {} has no governance level",
+                                delete.object_id
+                            ))
+                        })?,
+                    false,
+                ))
+            }
+            ProjectObjectRequestV3::Update(_) | ProjectObjectRequestV3::Delete(_) => None,
+        };
+        if let Some((target_level, creating)) = role_target {
+            crate::project_view_v2::authorize_role_definition_in_tx(
+                &mut self.tx,
+                self.community_id,
+                command_event.pubkey,
+                command.acting_assignment_id,
+                target_level,
+                creating,
+            )
+            .await?;
+        }
         validate_v3_optional_assignment_fence_in_tx(
             &mut self.tx,
             self.community_id,
@@ -1436,7 +1487,7 @@ impl ProjectViewV3WriteTx {
             &delta.required_coordinates(),
         )
         .await?;
-        let (_next_state, outcome) = loaded.state.reduce(
+        let (next_state, outcome) = loaded.state.reduce(
             command,
             command_event.pubkey,
             loaded.canonical_time,
@@ -1463,21 +1514,19 @@ impl ProjectViewV3WriteTx {
         .await?;
 
         let plan = ProjectionPlanV3::for_object_outcome(&outcome, |role_id| {
-            loaded.role_levels.get(&role_id).copied().or_else(|| {
-                outcome
-                    .changed_entries
-                    .iter()
-                    .any(|entry| {
-                        entry.id() == role_id && entry.object_type() == ProjectViewObjectType::Role
-                    })
-                    .then_some(RoleLevel::Member)
-            })
+            next_state.role_level(role_id)
         })?;
         plan.validate_single_head_per_object()?;
         let mut role_levels = loaded.role_levels;
         for entry in &outcome.changed_entries {
             if entry.object_type() == ProjectViewObjectType::Role {
-                role_levels.entry(entry.id()).or_insert(RoleLevel::Member);
+                let level = next_state.role_level(entry.id()).ok_or_else(|| {
+                    ProjectViewV3WriteError::InvalidCommit(format!(
+                        "Role {} has no governance level after reduction",
+                        entry.id()
+                    ))
+                })?;
+                role_levels.insert(entry.id(), level);
             }
         }
         let heads = plan

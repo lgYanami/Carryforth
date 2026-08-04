@@ -93,6 +93,10 @@ pub struct ProjectObjectCommandV3 {
     /// through an Assignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_fence: Option<RuntimeFence>,
+    /// Initial governance level for a Role create. Existing clients that omit
+    /// it create a member Role. The field is invalid for non-Role operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_role_level: Option<RoleLevel>,
     /// Closed ordinary-object operation.
     pub request: ProjectObjectRequestV3,
 }
@@ -110,6 +114,7 @@ impl ProjectObjectCommandV3 {
             expected_project_revision,
             acting_assignment_id,
             runtime_fence: None,
+            initial_role_level: None,
             request,
         }
     }
@@ -118,6 +123,13 @@ impl ProjectObjectCommandV3 {
     #[must_use]
     pub const fn with_runtime_fence(mut self, runtime_fence: RuntimeFence) -> Self {
         self.runtime_fence = Some(runtime_fence);
+        self
+    }
+
+    /// Set the signed initial level of a new Role.
+    #[must_use]
+    pub const fn with_initial_role_level(mut self, level: RoleLevel) -> Self {
+        self.initial_role_level = Some(level);
         self
     }
 
@@ -194,7 +206,38 @@ impl ProjectObjectCommandV3 {
                 .into());
             }
         }
+        if self.initial_role_level.is_some() && !self.creates_role() {
+            return Err(DomainError::InvalidField {
+                field: "initial_role_level",
+                reason: "is valid only when creating a Role".to_owned(),
+            }
+            .into());
+        }
         self.request.validate_for_submission()
+    }
+
+    /// Return whether this command creates one Role definition.
+    #[must_use]
+    pub const fn creates_role(&self) -> bool {
+        matches!(
+            &self.request,
+            ProjectObjectRequestV3::Create(CreateProjectObjectV3 {
+                object: NewProjectViewObjectV3::Role { .. },
+            })
+        )
+    }
+
+    /// Return the canonical initial level for a Role create.
+    #[must_use]
+    pub const fn created_role_level(&self) -> Option<RoleLevel> {
+        if self.creates_role() {
+            Some(match self.initial_role_level {
+                Some(level) => level,
+                None => RoleLevel::Member,
+            })
+        } else {
+            None
+        }
     }
 
     /// Stable operation spelling used by receipts and metrics.
@@ -1152,7 +1195,12 @@ impl ProjectViewStateV3 {
                     context_references,
                 };
                 if object.object_type == ProjectViewObjectType::Role {
-                    next.role_levels.insert(object.id, RoleLevel::Member);
+                    let level = command.created_role_level().ok_or_else(|| {
+                        V3ProjectObjectError::InvalidRoleLevels(
+                            "Role create has no initial governance level".to_owned(),
+                        )
+                    })?;
+                    next.role_levels.insert(object.id, level);
                 }
                 ProjectViewEntryV3::Active(Box::new(object))
             }
@@ -1708,6 +1756,67 @@ mod tests {
         })
         .to_string();
         assert!(ProjectObjectCommandV3::from_json(&content).is_err());
+    }
+
+    #[test]
+    fn role_create_preserves_explicit_admin_level() {
+        let now = Utc::now();
+        let state = initialized_state(now);
+        let role_id = Uuid::new_v4();
+        let command = ProjectObjectCommandV3::new(
+            1,
+            None,
+            ProjectObjectRequestV3::Create(CreateProjectObjectV3 {
+                object: NewProjectViewObjectV3::Role {
+                    id: role_id,
+                    name: "Leader".to_owned(),
+                    purpose: "Govern member Roles".to_owned(),
+                    responsibilities: Vec::new(),
+                    boundaries: Vec::new(),
+                    active: true,
+                    context_references: Vec::new(),
+                },
+            }),
+        )
+        .with_initial_role_level(RoleLevel::Admin);
+
+        let (next, outcome) = state
+            .reduce(
+                &command,
+                actor(),
+                now,
+                V3ReducerCapabilities::stage4(false),
+                &ReferenceTargetProof::new(),
+            )
+            .expect("create admin Role");
+        assert_eq!(outcome.project_revision, 2);
+        assert_eq!(next.role_level(role_id), Some(RoleLevel::Admin));
+    }
+
+    #[test]
+    fn initial_role_level_is_rejected_for_non_role_create() {
+        let command = ProjectObjectCommandV3::new(
+            1,
+            None,
+            ProjectObjectRequestV3::Create(CreateProjectObjectV3 {
+                object: NewProjectViewObjectV3::Goal {
+                    id: Uuid::new_v4(),
+                    title: "Goal".to_owned(),
+                    desired_outcome: "Outcome".to_owned(),
+                    directions: Vec::new(),
+                    context_references: Vec::new(),
+                },
+            }),
+        )
+        .with_initial_role_level(RoleLevel::Admin);
+
+        assert!(matches!(
+            command.validate_for_submission(),
+            Err(V3ProjectObjectError::Object(DomainError::InvalidField {
+                field: "initial_role_level",
+                ..
+            }))
+        ));
     }
 
     #[test]

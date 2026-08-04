@@ -265,6 +265,21 @@ pub enum RoleLevel {
     Member,
 }
 
+/// Current Project Role governance authority of one verified Community actor.
+///
+/// Community membership and the exact active Leader Assignment are resolved
+/// transactionally by the persistence layer before this closed domain value is
+/// constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleGovernorAuthority {
+    /// The unique Community owner. Owner authority is not granted by a Role.
+    Owner,
+    /// A non-owner Community admin acting through an active admin Assignment.
+    ActiveLeader,
+    /// An eligible Community member without Role-governance authority.
+    Member,
+}
+
 impl RoleLevel {
     /// Return the stable wire and database spelling.
     #[must_use]
@@ -301,20 +316,27 @@ impl RoleGovernanceState {
 pub fn authorize_role_governance_transition(
     current: RoleGovernanceState,
     next: RoleGovernanceState,
-    actor_is_community_owner: bool,
+    authority: RoleGovernorAuthority,
 ) -> Result<(), RoleGovernanceError> {
-    if current.transition_requires_owner(next) && !actor_is_community_owner {
+    if matches!(authority, RoleGovernorAuthority::Member) {
+        return Err(RoleGovernanceError::NotAuthorized);
+    }
+    if current.transition_requires_owner(next) && !matches!(authority, RoleGovernorAuthority::Owner)
+    {
         return Err(RoleGovernanceError::OwnerRequired);
     }
     Ok(())
 }
 
-/// Reject creation of an admin Role that lacks Community-owner authority.
+/// Reject Role creation that lacks the required owner or Leader authority.
 pub fn authorize_role_creation(
     level: RoleLevel,
-    actor_is_community_owner: bool,
+    authority: RoleGovernorAuthority,
 ) -> Result<(), RoleGovernanceError> {
-    if matches!(level, RoleLevel::Admin) && !actor_is_community_owner {
+    if matches!(authority, RoleGovernorAuthority::Member) {
+        return Err(RoleGovernanceError::NotAuthorized);
+    }
+    if matches!(level, RoleLevel::Admin) && !matches!(authority, RoleGovernorAuthority::Owner) {
         return Err(RoleGovernanceError::OwnerRequired);
     }
     Ok(())
@@ -323,6 +345,9 @@ pub fn authorize_role_creation(
 /// Stable authorization failures for Role governance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RoleGovernanceError {
+    /// A Community member attempted to govern a Role definition.
+    #[error("owner or active Leader authorization is required for Role governance")]
+    NotAuthorized,
     /// An admin Role lifecycle change was attempted by a non-owner.
     #[error("Community owner authorization is required for an admin Role lifecycle change")]
     OwnerRequired,
@@ -404,11 +429,16 @@ mod tests {
             (admin_inactive, admin_active),
         ] {
             assert_eq!(
-                authorize_role_governance_transition(current, next, false),
+                authorize_role_governance_transition(
+                    current,
+                    next,
+                    RoleGovernorAuthority::ActiveLeader,
+                ),
                 Err(RoleGovernanceError::OwnerRequired)
             );
             assert!(
-                authorize_role_governance_transition(current, next, true).is_ok(),
+                authorize_role_governance_transition(current, next, RoleGovernorAuthority::Owner,)
+                    .is_ok(),
                 "owner must be allowed to perform {current:?} -> {next:?}"
             );
         }
@@ -417,18 +447,42 @@ mod tests {
     #[test]
     fn admin_role_creation_is_owner_only() {
         assert_eq!(
-            authorize_role_creation(RoleLevel::Admin, false),
+            authorize_role_creation(RoleLevel::Admin, RoleGovernorAuthority::ActiveLeader),
             Err(RoleGovernanceError::OwnerRequired)
         );
-        assert!(authorize_role_creation(RoleLevel::Admin, true).is_ok());
-        assert!(authorize_role_creation(RoleLevel::Member, false).is_ok());
+        assert!(authorize_role_creation(RoleLevel::Admin, RoleGovernorAuthority::Owner).is_ok());
+        assert!(
+            authorize_role_creation(RoleLevel::Member, RoleGovernorAuthority::ActiveLeader).is_ok()
+        );
+        assert_eq!(
+            authorize_role_creation(RoleLevel::Member, RoleGovernorAuthority::Member),
+            Err(RoleGovernanceError::NotAuthorized)
+        );
+        assert_eq!(
+            authorize_role_creation(RoleLevel::Admin, RoleGovernorAuthority::Member),
+            Err(RoleGovernanceError::NotAuthorized)
+        );
     }
 
     #[test]
-    fn member_role_lifecycle_does_not_require_owner() {
+    fn member_role_lifecycle_requires_owner_or_active_leader() {
         let active = state(RoleLevel::Member, true);
         let inactive = state(RoleLevel::Member, false);
-        assert!(authorize_role_governance_transition(active, inactive, false).is_ok());
-        assert!(authorize_role_governance_transition(inactive, active, false).is_ok());
+        assert!(authorize_role_governance_transition(
+            active,
+            inactive,
+            RoleGovernorAuthority::ActiveLeader,
+        )
+        .is_ok());
+        assert!(authorize_role_governance_transition(
+            inactive,
+            active,
+            RoleGovernorAuthority::Owner,
+        )
+        .is_ok());
+        assert_eq!(
+            authorize_role_governance_transition(active, inactive, RoleGovernorAuthority::Member,),
+            Err(RoleGovernanceError::NotAuthorized)
+        );
     }
 }

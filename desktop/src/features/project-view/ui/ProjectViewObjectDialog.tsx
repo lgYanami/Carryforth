@@ -69,6 +69,7 @@ const BASE_FORM: FormState = {
   directions: "",
   responsibilities: "",
   boundaries: "",
+  roleLevel: "member",
   active: true,
   status: "",
   priority: "normal",
@@ -352,6 +353,9 @@ function writableFromForm(
 }
 
 export function ProjectViewObjectDialog({
+  canCreateAdminRole,
+  canCreateRole,
+  canGovernRole,
   context,
   initialType,
   mode,
@@ -363,9 +367,13 @@ export function ProjectViewObjectDialog({
   projectRevision,
   roleHasActiveAssignment,
   roleHasOpenProposal,
+  roleActingAssignmentId,
   schemaVersion,
   view,
 }: {
+  canCreateAdminRole: boolean;
+  canCreateRole: boolean;
+  canGovernRole: boolean;
   context?: ProjectViewCreateContext;
   initialType?: CreatableObjectType;
   mode: "create" | "edit";
@@ -377,11 +385,20 @@ export function ProjectViewObjectDialog({
   projectRevision: number;
   roleHasActiveAssignment?: boolean;
   roleHasOpenProposal?: boolean;
+  roleActingAssignmentId?: string;
   schemaVersion: 1 | 2 | 3;
   view: ProjectView;
 }) {
+  const createTypes = React.useMemo(
+    () => CREATE_TYPES.filter((type) => type !== "role" || canCreateRole),
+    [canCreateRole],
+  );
   const initialObjectType =
-    mode === "edit" && object ? object.objectType : (initialType ?? "goal");
+    mode === "edit" && object
+      ? object.objectType
+      : initialType === "role" && !canCreateRole
+        ? "goal"
+        : (initialType ?? "goal");
   const [objectType, setObjectType] =
     React.useState<ProjectViewObjectType>(initialObjectType);
   const mutation = useProjectViewMutation();
@@ -444,7 +461,11 @@ export function ProjectViewObjectDialog({
   React.useEffect(() => {
     if (open && !wasOpen.current) {
       const type =
-        mode === "edit" && object ? object.objectType : (initialType ?? "goal");
+        mode === "edit" && object
+          ? object.objectType
+          : initialType === "role" && !canCreateRole
+            ? "goal"
+            : (initialType ?? "goal");
       setObjectType(type);
       setForm(object ? formFromObject(object) : emptyForm(type, context));
       setBaseRevision(projectRevision);
@@ -458,6 +479,7 @@ export function ProjectViewObjectDialog({
     wasOpen.current = open;
   }, [
     context,
+    canCreateRole,
     initialType,
     mode,
     object,
@@ -483,6 +505,25 @@ export function ProjectViewObjectDialog({
     if (reviewingLatest) return;
     setReviewingLatest(true);
     try {
+      if (objectType === "role") {
+        if (mode === "create" && !canCreateRole) {
+          throw new Error(
+            "Only the Community owner or an active Leader can create Roles.",
+          );
+        }
+        if (mode === "edit" && !canGovernRole) {
+          throw new Error(
+            "Your current Community and Assignment state cannot govern this Role.",
+          );
+        }
+        if (
+          mode === "create" &&
+          form.roleLevel === "admin" &&
+          !canCreateAdminRole
+        ) {
+          throw new Error("Only the Community owner can create an admin Role.");
+        }
+      }
       await onReviewLatest();
     } finally {
       setReviewingLatest(false);
@@ -572,6 +613,8 @@ export function ProjectViewObjectDialog({
               expectedProjectRevision: baseRevision,
               objectId: object.id,
               object: writable,
+              actingAssignmentId:
+                objectType === "role" ? roleActingAssignmentId : undefined,
             }
           : {
               operation: "create",
@@ -580,6 +623,10 @@ export function ProjectViewObjectDialog({
                 ProjectViewWritableObject,
                 { objectType: "project_profile" }
               >,
+              initialRoleLevel:
+                objectType === "role" ? form.roleLevel : undefined,
+              actingAssignmentId:
+                objectType === "role" ? roleActingAssignmentId : undefined,
             },
       );
       if (result.status === "conflict") {
@@ -677,7 +724,7 @@ export function ProjectViewObjectDialog({
                 }
                 value={objectType}
               >
-                {CREATE_TYPES.map((type) => (
+                {createTypes.map((type) => (
                   <option key={type} value={type}>
                     {projectViewObjectTypeLabel(type)}
                   </option>
@@ -688,10 +735,12 @@ export function ProjectViewObjectDialog({
 
           <div className="space-y-4">
             <ProjectViewObjectTextFields
+              canCreateAdminRole={canCreateAdminRole}
               form={form}
               guideOptions={guideOptions}
               roleHasActiveAssignment={roleHasActiveAssignment}
               roleHasOpenProposal={roleHasOpenProposal}
+              roleCreation={mode === "create"}
               schemaVersion={schemaVersion}
               set={set}
               type={objectType}

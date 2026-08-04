@@ -6,6 +6,12 @@
 >
 > 范围：Project View schema v2/v3、Role Continuity、Agent-first CLI 与 managed ACP 纵向链路
 
+> 2026-08-03 局部覆盖：本文“Role definition CRUD 属于所有 Community member 的 ordinary
+> write”结论已被
+> [Project Role 治理授权与 admin Role 创建修复设计](./project-role-governance-authorization-and-admin-role-creation-fix-design.md)
+> 收敛。Assignment 仍不是整个 Project 的 ACL，但 Role 定义本身现在属于 owner/Active
+> Leader 治理对象；非 Role 普通对象边界不变。
+
 ## 1. 结论
 
 本修复采用以下权威边界：
@@ -153,14 +159,17 @@ Agent 的普通 Project View ACL，与原始 Community 授权模型和 Role Cont
 | 操作类型 | 示例 | Community gate | Assignment | managed Runtime fence |
 |---|---|---:|---:|---:|
 | 普通 Project View 读取 | snapshot、对象详情、Role Directory | 必须 | 不需要 | 不需要 |
-| 普通 Project View 写入 | Goal/Plan/Stage/Issue/Work/Resource/Role definition CRUD、Context Reference 更新 | 必须 | 不需要 | 不需要 |
+| 普通 Project View 写入 | Goal/Plan/Stage/Issue/Work/Resource、非 Role Context Reference 更新 | 必须 | 不需要 | 不需要 |
+| Role definition 治理 | Role create/update/deactivate/delete、Role Context Reference 更新 | owner 或 admin + active Leader | non-owner Leader 必须 | 仅显式归因时验证，不授予权限 |
 | Candidate identity | `request_role`、接受自己的 Offer、候选者拒绝、创建者撤回 | 必须 | 不需要 | 不需要 |
 | Community owner 治理 | Offer/Authorize、admin Role、结束/替换 Assignment | owner | 不需要 | 不需要 |
 | Leader 治理 | 普通 Role Offer/Authorize、允许范围内的结束/替换、Work responsibility | admin + active Leader | 必须 | managed Leader 必须 |
 | Role-bearing 行为 | Work Commitment、Checkpoint、Handoff、replacement/unable report | 必须 | 必须 | managed assignee 必须 |
 
-普通 Role definition 仍是 Project View 对象。涉及 `admin` level、已有 active Assignment 的
-停用/删除、Community 等级同步等操作继续由现有领域不变量限制，不能借“普通 CRUD”绕过治理。
+Role definition 仍存储为 Project View 对象，但不再属于所有 member 的普通 CRUD。涉及
+`member` Role 的定义治理要求 owner 或 Active Leader；涉及 `admin` level 的定义治理只允许
+直接 Human owner。已有 active Assignment、开放 Proposal、Community 等级同步等领域不变量
+继续生效。
 
 ### 4.3 Candidate Proposal 的精确规则
 

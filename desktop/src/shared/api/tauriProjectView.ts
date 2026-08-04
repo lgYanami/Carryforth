@@ -3,6 +3,7 @@ import { ProjectViewIntegrityError } from "@/shared/api/tauriProjectViewIntegrit
 import { assembleProjectViewV3 } from "@/shared/api/tauriProjectViewV3";
 import {
   normalizeRoleContinuity,
+  type ProjectRoleLevel,
   type ProjectViewRoleContinuity,
   type RawProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectViewRole";
@@ -507,18 +508,22 @@ export type ProjectViewMutationIntent =
         ProjectViewWritableObject,
         { objectType: "project_profile" }
       >;
+      initialRoleLevel?: ProjectRoleLevel;
+      actingAssignmentId?: string;
     }
   | {
       operation: "update";
       expectedProjectRevision: number;
       objectId: string;
       object: ProjectViewWritableObject;
+      actingAssignmentId?: string;
     }
   | {
       operation: "delete";
       expectedProjectRevision: number;
       objectType: Exclude<ProjectViewObjectType, "project_profile">;
       objectId: string;
+      actingAssignmentId?: string;
     }
   | {
       operation: "context";
@@ -526,6 +531,7 @@ export type ProjectViewMutationIntent =
       objectType: ProjectViewObjectType;
       objectId: string;
       contextReferences: ProjectViewContextReference[];
+      actingAssignmentId?: string;
     };
 
 export type RawProjectViewMutationResult =

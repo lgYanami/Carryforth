@@ -110,6 +110,12 @@ export function serializeProjectViewMutationIntent(
         expected_project_revision: intent.expectedProjectRevision,
         object_type: intent.object.objectType,
         data: serializeWritableObject(intent.object),
+        ...(intent.initialRoleLevel
+          ? { initial_role_level: intent.initialRoleLevel }
+          : {}),
+        ...(intent.actingAssignmentId
+          ? { acting_assignment_id: intent.actingAssignmentId }
+          : {}),
       };
     case "update":
       return {
@@ -118,6 +124,9 @@ export function serializeProjectViewMutationIntent(
         object_type: intent.object.objectType,
         object_id: intent.objectId,
         patch: serializeWritableObject(intent.object),
+        ...(intent.actingAssignmentId
+          ? { acting_assignment_id: intent.actingAssignmentId }
+          : {}),
       };
     case "delete":
       return {
@@ -125,6 +134,9 @@ export function serializeProjectViewMutationIntent(
         expected_project_revision: intent.expectedProjectRevision,
         object_type: intent.objectType,
         object_id: intent.objectId,
+        ...(intent.actingAssignmentId
+          ? { acting_assignment_id: intent.actingAssignmentId }
+          : {}),
       };
     case "context":
       return {
@@ -135,6 +147,9 @@ export function serializeProjectViewMutationIntent(
         context_references: canonicalizeProjectViewContextReferences(
           intent.contextReferences,
         ).map(rawContextReference),
+        ...(intent.actingAssignmentId
+          ? { acting_assignment_id: intent.actingAssignmentId }
+          : {}),
       };
   }
 }

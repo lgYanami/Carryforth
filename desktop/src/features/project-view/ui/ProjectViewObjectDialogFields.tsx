@@ -20,6 +20,7 @@ import {
   type ProjectViewObjectFormState,
 } from "@/features/project-view/ui/projectViewObjectDialogState";
 import type {
+  ProjectRoleLevel,
   ProjectViewLocatorType,
   ProjectViewObject,
   ProjectViewObjectType,
@@ -36,18 +37,22 @@ type SetFormField = <K extends keyof ProjectViewObjectFormState>(
 ) => void;
 
 export function ProjectViewObjectTextFields({
+  canCreateAdminRole,
   form,
   guideOptions,
   roleHasActiveAssignment,
   roleHasOpenProposal,
+  roleCreation,
   schemaVersion,
   set,
   type,
 }: {
+  canCreateAdminRole: boolean;
   form: ProjectViewObjectFormState;
   guideOptions: Array<{ value: string; label: string }>;
   roleHasActiveAssignment?: boolean;
   roleHasOpenProposal?: boolean;
+  roleCreation: boolean;
   schemaVersion: 1 | 2 | 3;
   set: SetFormField;
   type: ProjectViewObjectType;
@@ -112,6 +117,14 @@ export function ProjectViewObjectTextFields({
   if (type === "role") {
     return (
       <>
+        {roleCreation ? (
+          <ProjectViewEnumSelect
+            label="Role level"
+            onChange={(value) => set("roleLevel", value as ProjectRoleLevel)}
+            value={form.roleLevel}
+            values={canCreateAdminRole ? ["member", "admin"] : ["member"]}
+          />
+        ) : null}
         <ProjectViewField label="Name" required>
           <Input
             autoFocus
@@ -143,7 +156,7 @@ export function ProjectViewObjectTextFields({
                 ? "End or replace the active Assignment before deactivating this Role."
                 : roleHasOpenProposal
                   ? "Resolve or withdraw the open Proposal before deactivating this Role."
-                  : "This is semantic project state, not Buzz authorization."}
+                  : "An active Assignment projects this Role's level into Community membership."}
             </div>
           </div>
           <Switch

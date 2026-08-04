@@ -1211,7 +1211,72 @@ impl RoleContinuityState {
         actor: PublicKey,
     ) -> Result<(), RoleContinuityError> {
         command.validate_for_submission()?;
-        self.validate_actor_fence(command, actor)
+        self.validate_actor_fence(command, actor)?;
+        match &command.request {
+            RoleCommandRequest::OfferRole {
+                role_id,
+                candidate_pubkey,
+                ..
+            } => self.require_current_governor_for_role(
+                command,
+                actor,
+                *role_id,
+                Some(*candidate_pubkey),
+            ),
+            RoleCommandRequest::AuthorizeProposal { proposal_id } => {
+                let proposal = self
+                    .proposals
+                    .get(proposal_id)
+                    .ok_or(RoleContinuityError::ProposalNotFound)?;
+                self.require_current_governor_for_role(
+                    command,
+                    actor,
+                    proposal.role_id,
+                    Some(proposal.candidate_pubkey),
+                )
+            }
+            RoleCommandRequest::RejectProposal { proposal_id, .. } => {
+                let proposal = self
+                    .proposals
+                    .get(proposal_id)
+                    .ok_or(RoleContinuityError::ProposalNotFound)?;
+                if proposal.candidate_pubkey == actor {
+                    Ok(())
+                } else {
+                    self.require_current_governor_for_role(
+                        command,
+                        actor,
+                        proposal.role_id,
+                        Some(proposal.candidate_pubkey),
+                    )
+                }
+            }
+            RoleCommandRequest::EndAssignment { assignment_id, .. } => {
+                let assignment = self
+                    .assignments
+                    .get(assignment_id)
+                    .ok_or(RoleContinuityError::AssignmentNotFound)?;
+                self.authorize_assignment_end(actor, assignment)?;
+                if self.assignment_end_requires_role_authority(actor, assignment)? {
+                    self.require_governor_fence(command, actor)?;
+                }
+                Ok(())
+            }
+            RoleCommandRequest::SetWorkResponsibility { .. } => {
+                self.require_governor_fence(command, actor)
+            }
+            RoleCommandRequest::RequestRole { .. }
+            | RoleCommandRequest::AcceptProposal { .. }
+            | RoleCommandRequest::WithdrawProposal { .. }
+            | RoleCommandRequest::ExpireProposal { .. }
+            | RoleCommandRequest::RequestReplacement { .. }
+            | RoleCommandRequest::ReportUnableToContinue { .. }
+            | RoleCommandRequest::AcceptWork { .. }
+            | RoleCommandRequest::EndCommitment { .. }
+            | RoleCommandRequest::ReplaceCommitment { .. }
+            | RoleCommandRequest::AppendCheckpoint { .. }
+            | RoleCommandRequest::AppendHandoff { .. } => Ok(()),
+        }
     }
 
     /// Apply one signed command using Relay canonical time.
@@ -2348,6 +2413,45 @@ impl RoleContinuityState {
             || role.level != RoleLevel::Admin
         {
             return Err(RoleContinuityError::NotAuthorized);
+        }
+        Ok(())
+    }
+
+    fn require_current_governor_for_role(
+        &self,
+        command: &RoleCommand,
+        actor: PublicKey,
+        target_role_id: Uuid,
+        target_member: Option<PublicKey>,
+    ) -> Result<(), RoleContinuityError> {
+        self.require_governor_fence(command, actor)?;
+        let actor_member = self
+            .members
+            .get(&actor)
+            .filter(|member| member.eligible)
+            .ok_or(RoleContinuityError::NotAuthorized)?;
+        if actor_member.is_owner() {
+            return Ok(());
+        }
+        let target_role = self
+            .roles
+            .get(&target_role_id)
+            .ok_or(RoleContinuityError::RoleNotFound)?;
+        if !target_role.active {
+            return Err(RoleContinuityError::RoleInactive);
+        }
+        if target_role.level == RoleLevel::Admin {
+            return Err(RoleContinuityError::OwnerRequired);
+        }
+        if actor_member.is_managed_agent()
+            && target_member.is_some_and(|target| {
+                !self
+                    .members
+                    .get(&target)
+                    .is_some_and(MemberGovernance::is_managed_agent)
+            })
+        {
+            return Err(RoleContinuityError::ManagedLeaderTargetUnknown);
         }
         Ok(())
     }
@@ -3626,6 +3730,65 @@ mod tests {
             .expect("proposal")
             .candidate_accepted_at
             .is_none());
+    }
+
+    #[test]
+    fn accepted_governance_receipt_replay_rechecks_current_authority() {
+        let original_owner = pubkey();
+        let successor_owner = pubkey();
+        let candidate = pubkey();
+        let target_role = Uuid::new_v4();
+        let roles = vec![RoleSlot {
+            role_id: target_role,
+            level: RoleLevel::Member,
+            active: true,
+        }];
+        let current = state(
+            roles.clone(),
+            vec![
+                member(original_owner, Some(CommunityMemberRole::Owner)),
+                member(successor_owner, Some(CommunityMemberRole::Member)),
+                member(candidate, Some(CommunityMemberRole::Member)),
+            ],
+            Vec::new(),
+        );
+        let proposal_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_100, 0).expect("timestamp");
+        let offer = RoleCommand::new(
+            7,
+            None,
+            RoleCommandRequest::OfferRole {
+                proposal_id,
+                role_id: target_role,
+                candidate_pubkey: candidate,
+                expires_at: now + Duration::days(2),
+                reason: None,
+            },
+        );
+        let (offered, _) = current
+            .reduce(&offer, original_owner, now, &ids(0))
+            .expect("original owner offer");
+        assert!(offered
+            .validate_actor_for_replay(&offer, original_owner)
+            .is_ok());
+
+        let after_owner_transfer = RoleContinuityState::from_snapshot(
+            9,
+            roles,
+            vec![
+                member(original_owner, Some(CommunityMemberRole::Member)),
+                member(successor_owner, Some(CommunityMemberRole::Owner)),
+                member(candidate, Some(CommunityMemberRole::Member)),
+            ],
+            offered.proposals.values().cloned().collect(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("state after owner transfer");
+        assert_eq!(
+            after_owner_transfer.validate_actor_for_replay(&offer, original_owner),
+            Err(RoleContinuityError::ActingAssignmentRequired)
+        );
     }
 
     #[test]

@@ -293,6 +293,24 @@ impl From<ProjectViewObjectTypeArg> for buzz_project_view::ProjectViewObjectType
     }
 }
 
+/// Governance level assigned when creating a Project Role.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProjectRoleLevelArg {
+    /// A Leader Role whose active Assignment projects Community admin.
+    Admin,
+    /// An ordinary Role whose active Assignment projects Community member.
+    Member,
+}
+
+impl From<ProjectRoleLevelArg> for buzz_project_view::v2::RoleLevel {
+    fn from(value: ProjectRoleLevelArg) -> Self {
+        match value {
+            ProjectRoleLevelArg::Admin => Self::Admin,
+            ProjectRoleLevelArg::Member => Self::Member,
+        }
+    }
+}
+
 /// Commands for the Community-global Project View.
 #[derive(Subcommand)]
 pub enum ProjectViewCmd {
@@ -342,6 +360,9 @@ pub enum ProjectViewCmd {
         /// JSON file containing the typed object body and relations, or `-`.
         #[arg(long)]
         data: String,
+        /// Initial Role level. Valid only when object_type is `role`.
+        #[arg(long, value_enum)]
+        role_level: Option<ProjectRoleLevelArg>,
     },
     /// Apply one closed, typed patch to an active object
     Update {
@@ -2594,12 +2615,34 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     /// Smoke test: CLI definition is valid and parseable.
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn project_view_role_create_parses_explicit_admin_level() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "project-view",
+            "create",
+            "role",
+            "--expected-project-revision",
+            "7",
+            "--data",
+            "role.json",
+            "--role-level",
+            "admin",
+        ])
+        .expect("parse governed Role create");
+
+        let Cmd::ProjectView(ProjectViewCmd::Create { role_level, .. }) = cli.command else {
+            panic!("expected Project View Role create");
+        };
+        assert!(matches!(role_level, Some(ProjectRoleLevelArg::Admin)));
     }
 
     #[test]
