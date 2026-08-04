@@ -1781,6 +1781,25 @@ pub(crate) fn prepend_role_brief(role_brief: &str, body: &str) -> String {
     format!("{role_brief}\n{body}")
 }
 
+/// Assemble one complete ACP prompt with freshly resolved Role Context before
+/// every dynamic body block. Meeting turns use the no-command path, so their
+/// current envelope and Board always follow the Role Brief/Binding.
+fn complete_turn_prompt_blocks<'a>(
+    slash_command: Option<&'a str>,
+    role_context: &'a str,
+    prompt_sections: &'a [String],
+) -> Vec<&'a str> {
+    match slash_command {
+        Some(command) => std::iter::once(command)
+            .chain(std::iter::once(role_context))
+            .chain(prompt_sections.iter().map(String::as_str))
+            .collect(),
+        None => std::iter::once(role_context)
+            .chain(prompt_sections.iter().map(String::as_str))
+            .collect(),
+    }
+}
+
 /// Frame the `session/new` `systemPrompt` so each section carries its own
 /// header and ownership boundary remains recoverable downstream.
 ///
@@ -2694,15 +2713,11 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
-    let prompt_blocks: Vec<&str> = match slash_command {
-        Some(ref cmd) => std::iter::once(cmd.as_str())
-            .chain(std::iter::once(role_context.markdown.as_str()))
-            .chain(prompt_sections.iter().map(String::as_str))
-            .collect(),
-        None => std::iter::once(role_context.markdown.as_str())
-            .chain(prompt_sections.iter().map(String::as_str))
-            .collect(),
-    };
+    let prompt_blocks = complete_turn_prompt_blocks(
+        slash_command.as_deref(),
+        &role_context.markdown,
+        &prompt_sections,
+    );
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -5251,6 +5266,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn complete_meeting_turn_places_current_role_context_before_the_envelope() {
+        let prompt_sections = vec![
+            "MEETING TURN ENVELOPE:\n{\"context_version\":\"meeting-context-v1\"}\n\nCURRENT MEETING BOARD:\n{\"current_board\":{}}"
+                .to_string(),
+        ];
+        for role_context in [
+            "[Role Brief]\nState: assigned\nAssignment: current",
+            "[Role Binding]\nState: unchanged\nAssignment: current",
+            "[Role Context]\nState: unavailable",
+        ] {
+            let blocks = complete_turn_prompt_blocks(None, role_context, &prompt_sections);
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0], role_context);
+            assert!(blocks[1].starts_with("MEETING TURN ENVELOPE:"));
+            assert!(blocks[1].contains("CURRENT MEETING BOARD:"));
+        }
+    }
+
     // Pin the session/new systemPrompt framing: each present prompt carries its
     // own header so the desktop observer can split into labeled sub-sections.
 
@@ -6106,6 +6140,39 @@ mod tests {
         assert_eq!(
             state.sessions.get(&channel_id).map(String::as_str),
             Some("meeting-session")
+        );
+    }
+
+    #[test]
+    fn connector_reset_keeps_meeting_session_and_forces_full_role_context() {
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let contract_id = crate::meeting_context::V2_MEETING_CONTRACT.id();
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(channel_id, "continuous-meeting-session".into());
+        state.record_meeting_contract(&source, Some(contract_id));
+        state.force_role_context_refresh(&source, RoleContextRefreshReason::ConnectorContextReset);
+
+        assert!(!state.invalidate_stale_meeting_contract(&source, Some(contract_id)));
+        assert_eq!(
+            state.sessions.get(&channel_id).map(String::as_str),
+            Some("continuous-meeting-session")
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_reason_for(&state, &source),
+            "connector_context_reset"
+        );
+
+        state.acknowledge_role_context_refresh(&source, true);
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Incremental
         );
     }
 

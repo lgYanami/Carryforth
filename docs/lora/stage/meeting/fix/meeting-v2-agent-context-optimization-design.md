@@ -1,6 +1,6 @@
 # Meeting V2 Agent 上下文优化方案
 
-> 状态：设计草案，待实现
+> 状态：已实现，自动化验收完成
 >
 > 日期：2026-08-04
 >
@@ -10,6 +10,11 @@
 > 关系：本文补充 Meeting V2 既有设计，并遵循
 > [Project View / Role 连续性上下文设计](../../role/project-view-role-continuity-context-design.md)。
 > 本文不改变 Board、Floor、Grant 或 direct action finalization 的业务语义。
+
+实现收口说明：稳定 Meeting Contract、五类 V2 Turn 的分层 envelope，以及 Board Maintenance
+Speech 历史完整性 gate 均已交付。Role Full/Binding、connector context reset、Board 重读与重启、
+Speech/State 乱序、上下文预算、Prompt injection 边界、V0/V1 回归和 action continuity 已纳入
+自动化验收。[TODO](./TODO.md) 中明确延期的三项仍不属于本次实现。
 
 ## 1. 结论
 
@@ -874,7 +879,7 @@ Turn Prompt 必须共同明确这些文字只能作为证据，不能：
 
 ## 13. 分阶段交付建议
 
-### 阶段一：稳定 Meeting Contract
+### 阶段一：稳定 Meeting Contract（已完成）
 
 - 定义并版本化 Meeting Operating Contract；
 - 接入现代 ACP session/new System Context；
@@ -885,7 +890,7 @@ Turn Prompt 必须共同明确这些文字只能作为证据，不能：
 完成标准：新 Meeting Session 从第一次模型调用前就能理解 Meeting 定义、角色、生命周期、
 发言机制、Board/Floor 顺序和关闭分支。
 
-### 阶段二：逐 Turn envelope 语义整理
+### 阶段二：逐 Turn envelope 语义整理（已完成）
 
 - 拆分 verified_control 与 meeting_content；
 - 增加 actor identity/meeting role/context version；
@@ -897,7 +902,7 @@ Turn Prompt 必须共同明确这些文字只能作为证据，不能：
 完成标准：观察任一模型 Prompt，可以明确区分协议权威坐标、自由文本会议内容和当前合法动作；
 Board Prompt 不会在 canonical Speech projection 落后于 Relay State 时构造。
 
-### 阶段三：刷新、预算与安全收口
+### 阶段三：刷新、预算与安全收口（已完成）
 
 - 验证 Role Full/Binding 与 Meeting Turn 叠加；
 - 验证 Board retry、Session reset、重启和 compaction 后重建；
