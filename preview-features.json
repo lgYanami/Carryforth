@@ -26,6 +26,14 @@
       ]
     },
     {
+      "id": "meeting",
+      "name": "Meetings",
+      "description": "Moderated meetings with an authoritative Board, Floor, and action closeout",
+      "platforms": [
+        "desktop"
+      ]
+    },
+    {
       "id": "pulse",
       "name": "Pulse",
       "description": "Activity feed with notes, social posts, and agent activity",

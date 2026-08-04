@@ -13,6 +13,7 @@ import {
 } from "@/features/agents/hooks";
 import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
 import { requestOpenCreateMeeting } from "@/features/meeting/openCreateMeetingEvent";
+import { FeatureGate } from "@/shared/features";
 import { useChannelMembersQuery } from "@/features/channels/hooks";
 import { canStartHuddleInChannel } from "@/features/channels/lib/huddleAvailability";
 import type { Channel } from "@/shared/api/types";
@@ -167,15 +168,17 @@ export function ChannelMembersBar({
           </DropdownMenuItem>
           {huddleIndicator}
           {canUseAsMeetingSource ? (
-            <DropdownMenuItem
-              data-testid="start-meeting-from-channel"
-              onSelect={() =>
-                requestOpenCreateMeeting({ sourceChannelId: channel.id })
-              }
-            >
-              <UsersRound />
-              <span>Start a Meeting</span>
-            </DropdownMenuItem>
+            <FeatureGate feature="meeting">
+              <DropdownMenuItem
+                data-testid="start-meeting-from-channel"
+                onSelect={() =>
+                  requestOpenCreateMeeting({ sourceChannelId: channel.id })
+                }
+              >
+                <UsersRound />
+                <span>Start a Meeting</span>
+              </DropdownMenuItem>
+            </FeatureGate>
           ) : null}
           <DropdownMenuItem
             data-testid="channel-management-trigger"

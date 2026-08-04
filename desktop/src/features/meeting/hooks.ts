@@ -37,6 +37,16 @@ const MEETING_LIVE_LOOKBACK_SECONDS = 5;
 const MEETING_INVALIDATION_DELAY_MS = 150;
 const MEETING_SUBSCRIPTION_RETRY_BASE_MS = 500;
 const MEETING_SUBSCRIPTION_RETRY_MAX_MS = 5_000;
+const MEETING_DIRECTORY_BATCH_SIZE = 64;
+const MEETING_LIVE_BATCH_SIZE = 64;
+
+function chunks<T>(items: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size));
+  }
+  return result;
+}
 
 export const meetingQueryRoot = (communityId: string | undefined) =>
   ["meetings", communityId ?? "no-community"] as const;
@@ -126,7 +136,13 @@ export function useMeetingDirectory(meetingIds: readonly string[]) {
   );
   return useQuery({
     queryKey: meetingDirectoryQueryKey(activeCommunity?.id, stableIds),
-    queryFn: () => listMeetings(stableIds),
+    queryFn: async () => {
+      const meetings = [];
+      for (const batch of chunks(stableIds, MEETING_DIRECTORY_BATCH_SIZE)) {
+        meetings.push(...(await listMeetings(batch)));
+      }
+      return meetings;
+    },
     enabled: Boolean(activeCommunity) && stableIds.length > 0,
     staleTime: 10_000,
     refetchOnWindowFocus: true,
@@ -287,7 +303,7 @@ export function useMeetingLiveSync(meetingIds: readonly string[]): void {
     let cancelled = false;
     let timer: number | null = null;
     let retryTimer: number | null = null;
-    let disposeSubscription: (() => Promise<void>) | undefined;
+    let disposeSubscriptions: Array<() => Promise<void>> = [];
     const signal = () => {
       if (cancelled) return;
       if (timer !== null) window.clearTimeout(timer);
@@ -299,28 +315,43 @@ export function useMeetingLiveSync(meetingIds: readonly string[]): void {
 
     let retryAttempt = 0;
     const subscribe = async () => {
+      const nextSubscriptions: Array<() => Promise<void>> = [];
       try {
-        const dispose = await relayClient.subscribeLive(
-          {
-            kinds: [KIND_STREAM_MESSAGE, KIND_MEETING_STATE, KIND_MEETING_END],
-            "#h": stableIds,
-            limit: 256,
-            since: Math.max(
-              0,
-              Math.floor(Date.now() / 1_000) - MEETING_LIVE_LOOKBACK_SECONDS,
+        for (const batch of chunks(stableIds, MEETING_LIVE_BATCH_SIZE)) {
+          nextSubscriptions.push(
+            await relayClient.subscribeLive(
+              {
+                kinds: [
+                  KIND_STREAM_MESSAGE,
+                  KIND_MEETING_STATE,
+                  KIND_MEETING_END,
+                ],
+                "#h": batch,
+                limit: 256,
+                since: Math.max(
+                  0,
+                  Math.floor(Date.now() / 1_000) -
+                    MEETING_LIVE_LOOKBACK_SECONDS,
+                ),
+              },
+              signal,
             ),
-          },
-          signal,
-        );
+          );
+        }
         if (cancelled) {
-          void dispose().catch(() => {});
+          for (const dispose of nextSubscriptions) {
+            void dispose().catch(() => {});
+          }
           return;
         }
-        disposeSubscription = dispose;
+        disposeSubscriptions = nextSubscriptions;
         retryAttempt = 0;
         // Close the snapshot → subscription race.
         signal();
       } catch (error) {
+        for (const dispose of nextSubscriptions) {
+          void dispose().catch(() => {});
+        }
         if (cancelled) return;
         console.error("Failed to subscribe to Meeting updates", error);
         const delay = Math.min(
@@ -340,7 +371,9 @@ export function useMeetingLiveSync(meetingIds: readonly string[]): void {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
       if (retryTimer !== null) window.clearTimeout(retryTimer);
-      if (disposeSubscription) void disposeSubscription().catch(() => {});
+      for (const dispose of disposeSubscriptions) {
+        void dispose().catch(() => {});
+      }
     };
   }, [communityId, stableIds]);
 }

@@ -316,6 +316,13 @@ type E2eConfig = {
     meetingCapability?: MeetingCapability;
     /** Membership-scoped Meeting rooms and their verified native projections. */
     meetings?: MockMeetingSeed[];
+    /** Community-isolated Meeting rooms keyed by the currently applied Relay. */
+    meetingsByRelayUrl?: Record<string, MockMeetingSeed[]>;
+    /** Definitive failures for successive authoritative snapshot reads. */
+    meetingSnapshotErrors?: Array<string | null>;
+    /** Persistent authoritative snapshot read failure until the test clears it. */
+    meetingSnapshotError?: string;
+    meetingSnapshotDelayMs?: number;
     /** Definitive failures for successive Meeting Create submissions. */
     meetingCreateErrors?: Array<string | null>;
     /** Return an indeterminate result this many times before accepting. */
@@ -2413,10 +2420,18 @@ function mockMeetingChannel(
 function listMockChannels(config?: E2eConfig): RawChannelWithMembership[] {
   return [
     ...mockChannels.map((channel) => toRawChannel(channel, config)),
-    ...(config?.mock?.meetings ?? []).map((meeting) =>
+    ...getMockMeetings(config).map((meeting) =>
       mockMeetingChannel(meeting, config),
     ),
   ];
+}
+
+function getMockMeetings(config?: E2eConfig): MockMeetingSeed[] {
+  return (
+    config?.mock?.meetingsByRelayUrl?.[mockAppliedRelayUrl] ??
+    config?.mock?.meetings ??
+    []
+  );
 }
 
 function getMockMeetingSeed(
@@ -2424,7 +2439,7 @@ function getMockMeetingSeed(
   config?: E2eConfig,
 ): MockMeetingSeed | null {
   return (
-    config?.mock?.meetings?.find((meeting) => meeting.id === meetingId) ?? null
+    getMockMeetings(config).find((meeting) => meeting.id === meetingId) ?? null
   );
 }
 
@@ -11416,12 +11431,32 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_meetings": {
         const { meetingIds } = payload as { meetingIds: string[] };
+        if (meetingIds.length > 64) {
+          throw new Error("Meeting list accepts at most 64 room IDs");
+        }
         return meetingIds
           .map((meetingId) => getMockMeetingSeed(meetingId, activeConfig))
           .filter((meeting): meeting is MockMeetingSeed => meeting !== null)
           .map(mockMeetingListItem);
       }
-      case "get_meeting_snapshot":
+      case "get_meeting_snapshot": {
+        const snapshotDelayMs = activeConfig?.mock?.meetingSnapshotDelayMs ?? 0;
+        if (snapshotDelayMs > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, snapshotDelayMs),
+          );
+        }
+        const snapshotError =
+          activeConfig?.mock?.meetingSnapshotError ??
+          activeConfig?.mock?.meetingSnapshotErrors?.shift();
+        if (snapshotError) throw new Error(snapshotError);
+        const { meetingId } = payload as { meetingId: string };
+        return (
+          getMockMeetingSeed(meetingId, activeConfig)?.result ?? {
+            status: "not_found",
+          }
+        );
+      }
       case "get_meeting_board": {
         const { meetingId } = payload as { meetingId: string };
         return (

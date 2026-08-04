@@ -27,6 +27,7 @@ export function MeetingTerminalSummary({
   const closed = end.outcome === "closed";
   return (
     <section
+      aria-label="Meeting outcome"
       className="flex shrink-0 items-center gap-3 border-b bg-background px-4 py-2.5"
       data-testid="meeting-terminal-summary"
     >

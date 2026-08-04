@@ -32,7 +32,8 @@ export function MeetingSpeechTimeline({
   speeches: MeetingSpeech[];
 }) {
   return (
-    <div
+    <section
+      aria-label="Formal Meeting speech"
       className="mx-auto flex w-full max-w-3xl flex-col gap-1 px-4 py-5 sm:px-7"
       data-testid="meeting-speech-timeline"
     >
@@ -104,6 +105,6 @@ export function MeetingSpeechTimeline({
           );
         })
       )}
-    </div>
+    </section>
   );
 }

@@ -99,7 +99,8 @@ export function MeetingActionFinalizationCard({
     actionController.disabled || hostController.disabled || deadlineExpired;
 
   return (
-    <div
+    <section
+      aria-label="Meeting action finalization"
       className="mx-auto max-h-[45vh] w-full max-w-4xl overflow-y-auto rounded-xl border bg-background p-4 shadow-xs"
       data-action-condition={action.condition}
       data-testid="meeting-action-finalization-card"
@@ -381,6 +382,6 @@ export function MeetingActionFinalizationCard({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </section>
   );
 }

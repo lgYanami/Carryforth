@@ -39,6 +39,9 @@ type MeetingsSidebarSectionProps = {
   onSelectMeeting: (meetingId: string) => void;
 };
 
+const ACTIVE_PAGE_SIZE = 20;
+const HISTORY_PAGE_SIZE = 50;
+
 function lifecycleLabel(lifecycle: MeetingLifecycle | null): string {
   switch (lifecycle) {
     case "initializing":
@@ -133,6 +136,8 @@ export function MeetingsSidebarSection({
 }: MeetingsSidebarSectionProps) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [historyOpen, setHistoryOpen] = React.useState(false);
+  const [activeLimit, setActiveLimit] = React.useState(ACTIVE_PAGE_SIZE);
+  const [historyLimit, setHistoryLimit] = React.useState(HISTORY_PAGE_SIZE);
   const activeItems = React.useMemo(
     () =>
       items
@@ -151,6 +156,8 @@ export function MeetingsSidebarSection({
         .sort((left, right) => (right.endedAt ?? 0) - (left.endedAt ?? 0)),
     [items],
   );
+  const visibleActiveItems = activeItems.slice(0, activeLimit);
+  const visibleHistoryItems = historyItems.slice(0, historyLimit);
 
   return (
     <>
@@ -200,7 +207,7 @@ export function MeetingsSidebarSection({
         {!collapsed ? (
           <SidebarGroupContent>
             <SidebarMenu data-testid="meeting-active-list">
-              {activeItems.map((item) => (
+              {visibleActiveItems.map((item) => (
                 <MeetingRow
                   isSelected={item.meetingId === selectedMeetingId}
                   isUnread={unreadMeetingIds.has(item.meetingId)}
@@ -218,6 +225,24 @@ export function MeetingsSidebarSection({
                   <span className="block px-2 py-1 text-xs text-sidebar-foreground/55 group-data-[collapsible=icon]:hidden">
                     No active meetings
                   </span>
+                </SidebarMenuItem>
+              ) : null}
+              {activeItems.length > activeLimit ? (
+                <SidebarMenuItem>
+                  <Button
+                    className="h-8 w-full justify-start text-xs"
+                    onClick={() =>
+                      setActiveLimit((current) => current + ACTIVE_PAGE_SIZE)
+                    }
+                    variant="ghost"
+                  >
+                    Show{" "}
+                    {Math.min(
+                      ACTIVE_PAGE_SIZE,
+                      activeItems.length - activeLimit,
+                    )}{" "}
+                    more meetings
+                  </Button>
                 </SidebarMenuItem>
               ) : null}
             </SidebarMenu>
@@ -242,7 +267,7 @@ export function MeetingsSidebarSection({
                 No completed meetings yet.
               </div>
             ) : (
-              historyItems.map((item) => (
+              visibleHistoryItems.map((item) => (
                 <Button
                   className="h-auto w-full justify-start gap-3 px-3 py-2 text-left"
                   key={item.meetingId}
@@ -267,6 +292,22 @@ export function MeetingsSidebarSection({
                 </Button>
               ))
             )}
+            {historyItems.length > historyLimit ? (
+              <Button
+                className="w-full"
+                onClick={() =>
+                  setHistoryLimit((current) => current + HISTORY_PAGE_SIZE)
+                }
+                variant="outline"
+              >
+                Load{" "}
+                {Math.min(
+                  HISTORY_PAGE_SIZE,
+                  historyItems.length - historyLimit,
+                )}{" "}
+                older meetings
+              </Button>
+            ) : null}
           </div>
         </DialogContent>
       </Dialog>

@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { FeatureGate } from "@/shared/features";
 import { Outlet, useLocation } from "@tanstack/react-router";
 import { deriveShellRoute } from "@/app/AppShell.helpers";
 import { AppShellProvider } from "@/app/AppShellContext";
@@ -914,7 +915,9 @@ export function AppShell() {
                     )}
                     <RequestedAgentCreateDialogs />
                     <AgentManagementDialogs />
-                    <CreateMeetingDialogController />
+                    <FeatureGate feature="meeting">
+                      <CreateMeetingDialogController />
+                    </FeatureGate>
                     <AppShellOverlays
                       activeChannel={managedChannel}
                       browseDialogType={browseDialogType}

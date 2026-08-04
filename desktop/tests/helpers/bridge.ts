@@ -153,6 +153,10 @@ type MockBridgeOptions = {
   relaySelf?: string | null;
   meetingCapability?: MeetingCapability;
   meetings?: MockMeetingSeed[];
+  meetingsByRelayUrl?: Record<string, MockMeetingSeed[]>;
+  meetingSnapshotErrors?: Array<string | null>;
+  meetingSnapshotError?: string;
+  meetingSnapshotDelayMs?: number;
   meetingCreateErrors?: Array<string | null>;
   meetingCreateIndeterminateResponses?: number;
   meetingCreateDelayMs?: number;

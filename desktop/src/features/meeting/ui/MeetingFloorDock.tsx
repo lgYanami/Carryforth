@@ -38,6 +38,7 @@ type StaleDraft = {
 };
 
 type MeetingFloorDockProps = {
+  authorityAvailable: boolean;
   boardDraft: MeetingBoardDraft;
   currentPubkey?: string;
   onRefresh: () => void;
@@ -68,12 +69,14 @@ function ReadOnlyFloor({ message }: { message: string }) {
 }
 
 export function MeetingFloorDock({
+  authorityAvailable,
   boardDraft,
   currentPubkey,
   onRefresh,
   profiles,
   snapshot,
 }: MeetingFloorDockProps) {
+  const dockRef = React.useRef<HTMLElement>(null);
   const {
     error: floorError,
     isPending,
@@ -186,16 +189,19 @@ export function MeetingFloorDock({
   }, [handleResult, mutateAsync, resetMutation, unresolved]);
 
   const disabled =
+    !authorityAvailable ||
     isPending ||
     unresolved !== null ||
     hostController.disabled ||
     actionController.disabled;
   const hostControlsDisabled =
+    !authorityAvailable ||
     hostController.disabled ||
     actionController.disabled ||
     isPending ||
     unresolved !== null;
   const actionControlsDisabled =
+    !authorityAvailable ||
     actionController.disabled ||
     hostController.disabled ||
     isPending ||
@@ -210,12 +216,38 @@ export function MeetingFloorDock({
   };
   const terminal =
     snapshot.lifecycle === "closed" || snapshot.lifecycle === "aborted";
+  const attentionKey = !authorityAvailable
+    ? null
+    : ownOffer
+      ? `offer:${ownOffer.offerId}`
+      : ownGrant
+        ? `grant:${ownGrant.grantId}`
+        : normalizedPubkey === snapshot.moderatorPubkey && snapshot.action
+          ? `action:${snapshot.action.actionRunId}:${snapshot.action.actionWindowEpoch}:${snapshot.action.condition}`
+          : normalizedPubkey === snapshot.moderatorPubkey && snapshot.host
+            ? `host:${snapshot.host.controlToken}:${snapshot.host.boardControl.phase}`
+            : null;
+  const previousAttentionRef = React.useRef<string | null>(attentionKey);
+  React.useEffect(() => {
+    const previous = previousAttentionRef.current;
+    previousAttentionRef.current = attentionKey;
+    if (!attentionKey || attentionKey === previous) return;
+    const activeElement = document.activeElement;
+    if (
+      activeElement === document.body ||
+      (activeElement && dockRef.current?.contains(activeElement))
+    ) {
+      dockRef.current?.focus({ preventScroll: true });
+    }
+  }, [attentionKey]);
 
   return (
     <section
       aria-label="Meeting floor"
       className="shrink-0 border-t bg-muted/20 px-4 py-3"
       data-testid="meeting-floor-dock"
+      ref={dockRef}
+      tabIndex={-1}
     >
       {unresolved ? (
         <div
@@ -232,7 +264,7 @@ export function MeetingFloorDock({
           </div>
           <Button
             data-testid="meeting-floor-retry"
-            disabled={isPending}
+            disabled={!authorityAvailable || isPending}
             onClick={() => void retryExact()}
             size="sm"
             variant="outline"
@@ -260,7 +292,7 @@ export function MeetingFloorDock({
           </div>
           <Button
             data-testid="meeting-host-retry"
-            disabled={hostController.isPending}
+            disabled={!authorityAvailable || hostController.isPending}
             onClick={() => void hostController.retryExact()}
             size="sm"
             variant="outline"
@@ -290,7 +322,7 @@ export function MeetingFloorDock({
           </div>
           <Button
             data-testid="meeting-action-retry-exact"
-            disabled={actionController.isPending}
+            disabled={!authorityAvailable || actionController.isPending}
             onClick={() => void actionController.retryExact()}
             size="sm"
             variant="outline"
@@ -362,7 +394,9 @@ export function MeetingFloorDock({
         </div>
       ) : null}
 
-      {terminal ? (
+      {!authorityAvailable ? (
+        <ReadOnlyFloor message="Meeting controls are paused until Desktop verifies the latest authoritative state." />
+      ) : terminal ? (
         <ReadOnlyFloor message="This Meeting is read-only. Its final Board and formal Speech remain available." />
       ) : snapshot.lifecycle === "finalizing_actions" ? (
         normalizedPubkey === snapshot.moderatorPubkey &&

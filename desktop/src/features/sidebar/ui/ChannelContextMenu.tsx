@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { requestOpenCreateMeeting } from "@/features/meeting/openCreateMeetingEvent";
+import { FeatureGate } from "@/shared/features";
 import {
   useArchiveChannelMutation,
   useChannelMembersQuery,
@@ -222,7 +223,7 @@ export function ChannelContextMenuItems({
     <>
       <CopyChannelSubmenu channel={channel} />
       {channel.channelType !== "dm" && channel.roomKind === null ? (
-        <>
+        <FeatureGate feature="meeting">
           <ContextMenuItem
             data-testid={`start-meeting-from-channel-${channel.name}`}
             onSelect={() =>
@@ -237,7 +238,7 @@ export function ChannelContextMenuItems({
             <span>Start a Meeting</span>
           </ContextMenuItem>
           <ContextMenuSeparator />
-        </>
+        </FeatureGate>
       ) : null}
       {showMove ? (
         <MoveToSectionSubmenu

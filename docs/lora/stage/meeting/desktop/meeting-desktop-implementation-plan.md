@@ -1,6 +1,6 @@
 # Meeting Desktop-only 分阶段实现计划
 
-> 状态：实施中（阶段一至五已完成，阶段六待开始）
+> 状态：实施中（阶段一至五已完成；阶段六代码与自动化已完成，待一次真实 Tauri 穿行）
 >
 > 产品规格：
 > [Meeting Desktop 产品规格](./meeting-desktop-spec.md)
@@ -692,8 +692,8 @@ Desktop rollout gate 只控制新 UI 是否公开；Relay capability 决定当�
 | 2. Human 发起会议 | 已完成 | `636c693d6`；Create dialog、roster/capability/source gate、创建 E2E |
 | 3. Human 参会者 Floor 生命周期 | 已完成 | `24815ad00`；native verified Floor command、Request/Offer/Grant/Speech/Yield/Handoff、精确重试与 9 条 Floor E2E |
 | 4. Human 主持讨论生命周期 | 已完成 | `56d4e8052`；verified Native host boundary、Board/Floor、Intent/self/handoff/recall、close/abort；Host E2E |
-| 5. Action Finalization 与终态闭环 | 已完成 | Native direct-action boundary、opaque action fence 与精确重试；Human 行动卡、现有 Project View 导航、confirm/block/retry/return/abort；8 条 Action E2E，Meeting 合并回归 29/29 |
-| 6. 恢复、兼容、体验与真实验收收口 | 待开始 | Desktop gates、真实 Relay/Agent 证据、发布候选 |
+| 5. Action Finalization 与终态闭环 | 已完成 | `86cac9a1e`；Native direct-action boundary、opaque action fence 与精确重试；Human 行动卡、现有 Project View 导航、confirm/block/retry/return/abort；8 条 Action E2E，Meeting 合并回归 29/29 |
+| 6. 恢复、兼容、体验与真实验收收口 | 代码与自动化已完成；待一次真实 Tauri 穿行 | 权威重连恢复、Community 隔离、preview gate、响应式 Board、分页/批次边界；Meeting 回归 34/34、Desktop 单测 3528/3528、`just ci` 通过；验收记录见 `meeting-desktop-acceptance.md` |
 
 ## 9. 整体完成定义
 

@@ -524,15 +524,17 @@ export function AppSidebar({
 
               {!isLoading ? (
                 <>
-                  <MeetingsSidebarSection
-                    currentPubkey={currentPubkey}
-                    items={meetingItems}
-                    onSelectMeeting={onSelectChannel}
-                    selectedMeetingId={
-                      selectedView === "channel" ? selectedChannelId : null
-                    }
-                    unreadMeetingIds={unreadMeetingIds}
-                  />
+                  <FeatureGate feature="meeting">
+                    <MeetingsSidebarSection
+                      currentPubkey={currentPubkey}
+                      items={meetingItems}
+                      onSelectMeeting={onSelectChannel}
+                      selectedMeetingId={
+                        selectedView === "channel" ? selectedChannelId : null
+                      }
+                      unreadMeetingIds={unreadMeetingIds}
+                    />
+                  </FeatureGate>
                   {starredChannels.length > 0 ? (
                     <ChannelGroupSection
                       hasUnread={starredChannels.some((c) =>

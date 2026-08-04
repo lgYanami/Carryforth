@@ -17,6 +17,9 @@ import {
   useMeetingSpeeches,
 } from "@/features/meeting/hooks";
 import { useMeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
+import { useMeetingAuthority } from "@/features/meeting/useMeetingAuthority";
+import { useResizableMeetingBoardWidth } from "@/features/meeting/useResizableMeetingBoardWidth";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type {
@@ -28,6 +31,7 @@ import { setVisibleChannel } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { useMediaBreakpoint } from "@/shared/hooks/use-mobile";
+import { usePreviewFeatureWarning } from "@/shared/features";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -172,12 +176,21 @@ function MeetingLoadState({
 }
 
 export function MeetingScreen({ meetingId }: { meetingId: string }) {
+  usePreviewFeatureWarning("meeting");
+  const { activeCommunity } = useCommunities();
   const { goChannel } = useAppNavigation();
   const { markChannelRead } = useAppShell();
   const identityQuery = useIdentityQuery();
   const snapshotQuery = useMeetingSnapshot(meetingId);
   const snapshot =
     snapshotQuery.data?.status === "ready" ? snapshotQuery.data.snapshot : null;
+  const meetingAuthority = useMeetingAuthority({
+    hasVerifiedSnapshot: snapshot !== null,
+    readError: Boolean(snapshotQuery.error),
+    refetch: snapshotQuery.refetch,
+    scopeKey: `${activeCommunity?.id ?? "no-community"}:${meetingId}`,
+  });
+  const boardWidth = useResizableMeetingBoardWidth(activeCommunity?.id);
   const normalizedPubkey = identityQuery.data?.pubkey.toLowerCase();
   const currentParticipant = snapshot?.participants.find(
     (participant) => participant.pubkey === normalizedPubkey,
@@ -248,7 +261,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   if (snapshotQuery.isPending) {
     return <ViewLoadingFallback includeHeader kind="channel" />;
   }
-  if (snapshotQuery.error) {
+  if (snapshotQuery.error && !snapshotQuery.data) {
     return (
       <MeetingLoadState
         message={
@@ -305,6 +318,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     <div
       className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
       data-meeting-lifecycle={readySnapshot.lifecycle}
+      data-meeting-authority={meetingAuthority.status}
       data-testid="meeting-screen"
     >
       <TopChromeInsetHeader flush>
@@ -384,7 +398,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
                 editor={
                   boardEditable
                     ? {
-                        disabled: false,
+                        disabled: !meetingAuthority.authorityAvailable,
                         onChange: boardDraft.setValue,
                         value: boardDraft.value,
                       }
@@ -408,7 +422,37 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
         </header>
       </TopChromeInsetHeader>
 
+      {meetingAuthority.status !== "current" ? (
+        <div
+          aria-atomic="true"
+          aria-live="polite"
+          className="flex shrink-0 items-center gap-3 border-b border-amber-500/30 bg-amber-500/5 px-4 py-2 text-xs"
+          data-testid="meeting-authority-banner"
+          role="status"
+        >
+          <AlertTriangle className="size-4 shrink-0 text-amber-600" />
+          <span className="min-w-0 flex-1">
+            {meetingAuthority.status === "resyncing"
+              ? "Rechecking authoritative Meeting state before restoring controls…"
+              : "Connection interrupted or the latest read failed. This is the last verified Meeting state; controls remain paused."}
+          </span>
+          {meetingAuthority.canRetry ? (
+            <Button
+              data-testid="meeting-authority-retry"
+              onClick={() => void meetingAuthority.retry()}
+              size="sm"
+              variant="outline"
+            >
+              <RefreshCw className="size-4" />
+              Recheck
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+
       <div
+        aria-atomic="true"
+        aria-live="polite"
         className="flex shrink-0 items-center gap-2 border-b bg-muted/25 px-4 py-2 text-xs"
         data-testid="meeting-status-strip"
       >
@@ -453,23 +497,43 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
             </div>
           ) : null}
         </main>
-        <MeetingBoardPanel
-          board={readySnapshot.board}
-          className="hidden w-96 shrink-0 border-l xl:flex"
-          editor={
-            boardEditable
-              ? {
-                  disabled: false,
-                  onChange: boardDraft.setValue,
-                  value: boardDraft.value,
-                }
-              : undefined
-          }
-          onDismissStaleDraft={boardDraft.dismissStale}
-          staleDraft={boardDraft.stale}
-        />
+        <aside
+          aria-label="Meeting board panel"
+          className="relative hidden shrink-0 xl:flex"
+          data-testid="meeting-board-wide"
+          style={{ width: boardWidth.widthPx }}
+        >
+          <button
+            aria-label="Resize Meeting board"
+            className="group absolute inset-y-0 left-0 z-40 w-3 -translate-x-1/2 cursor-col-resize"
+            data-testid="meeting-board-resize-handle"
+            onDoubleClick={boardWidth.reset}
+            onKeyDown={boardWidth.onResizeKeyDown}
+            onPointerDown={boardWidth.onResizeStart}
+            title="Drag or use arrow keys to resize. Press Home or double-click to reset."
+            type="button"
+          >
+            <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/80 group-focus-visible:bg-ring" />
+          </button>
+          <MeetingBoardPanel
+            board={readySnapshot.board}
+            className="h-full w-full border-l"
+            editor={
+              boardEditable
+                ? {
+                    disabled: !meetingAuthority.authorityAvailable,
+                    onChange: boardDraft.setValue,
+                    value: boardDraft.value,
+                  }
+                : undefined
+            }
+            onDismissStaleDraft={boardDraft.dismissStale}
+            staleDraft={boardDraft.stale}
+          />
+        </aside>
       </div>
       <MeetingFloorDock
+        authorityAvailable={meetingAuthority.authorityAvailable}
         boardDraft={boardDraft}
         currentPubkey={identityQuery.data?.pubkey}
         onRefresh={() => void snapshotQuery.refetch()}

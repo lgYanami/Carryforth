@@ -98,7 +98,8 @@ export function MeetingHostConsole({
     !deadlineExpired;
 
   return (
-    <div
+    <section
+      aria-label="Meeting host controls"
       className="mx-auto max-h-[45vh] w-full max-w-4xl overflow-y-auto rounded-xl border bg-background p-4 shadow-xs"
       data-board-phase={host.boardControl.phase}
       data-testid="meeting-host-console"
@@ -321,6 +322,6 @@ export function MeetingHostConsole({
           submitFinalization={actionController.submit}
         />
       ) : null}
-    </div>
+    </section>
   );
 }

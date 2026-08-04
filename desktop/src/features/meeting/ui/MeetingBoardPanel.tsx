@@ -35,6 +35,7 @@ export function MeetingBoardPanel({
 }) {
   return (
     <section
+      aria-label="Meeting board"
       className={cn("flex min-h-0 flex-col bg-background", className)}
       data-testid="meeting-board"
     >
