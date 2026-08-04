@@ -1,4 +1,4 @@
-import { EllipsisVertical, Settings2, Users } from "lucide-react";
+import { EllipsisVertical, Settings2, Users, UsersRound } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -12,6 +12,7 @@ import {
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
 import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
+import { requestOpenCreateMeeting } from "@/features/meeting/openCreateMeetingEvent";
 import { useChannelMembersQuery } from "@/features/channels/hooks";
 import { canStartHuddleInChannel } from "@/features/channels/lib/huddleAvailability";
 import type { Channel } from "@/shared/api/types";
@@ -90,6 +91,8 @@ export function ChannelMembersBar({
     currentPubkey,
     selfMember,
   });
+  const canUseAsMeetingSource =
+    channel.channelType !== "dm" && channel.roomKind === null;
   const previousChannelIdRef = React.useRef(channel.id);
 
   React.useEffect(() => {
@@ -163,6 +166,17 @@ export function ChannelMembersBar({
             </span>
           </DropdownMenuItem>
           {huddleIndicator}
+          {canUseAsMeetingSource ? (
+            <DropdownMenuItem
+              data-testid="start-meeting-from-channel"
+              onSelect={() =>
+                requestOpenCreateMeeting({ sourceChannelId: channel.id })
+              }
+            >
+              <UsersRound />
+              <span>Start a Meeting</span>
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuItem
             data-testid="channel-management-trigger"
             onSelect={onManageChannel}

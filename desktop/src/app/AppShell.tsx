@@ -27,6 +27,7 @@ import {
   useOpenDmMutation,
 } from "@/features/channels/hooks";
 import { useUnreadChannels } from "@/features/channels/useUnreadChannels";
+import { CreateMeetingDialogController } from "@/features/meeting/ui/CreateMeetingDialogController";
 import {
   useMeetingRoomPartition,
   useUnreadMeetingIds,
@@ -913,6 +914,7 @@ export function AppShell() {
                     )}
                     <RequestedAgentCreateDialogs />
                     <AgentManagementDialogs />
+                    <CreateMeetingDialogController />
                     <AppShellOverlays
                       activeChannel={managedChannel}
                       browseDialogType={browseDialogType}

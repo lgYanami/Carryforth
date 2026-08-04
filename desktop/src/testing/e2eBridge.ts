@@ -59,9 +59,12 @@ import type {
 } from "@/shared/api/tauriProjectView";
 import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRoleHistory";
 import type {
+  CreateMeetingInput,
+  CreateMeetingResult,
   MeetingCapability,
   MeetingListItem,
   MeetingLoadResult,
+  MeetingSnapshot,
   MeetingSpeech,
 } from "@/shared/api/tauriMeetings";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -307,6 +310,11 @@ type E2eConfig = {
     meetingCapability?: MeetingCapability;
     /** Membership-scoped Meeting rooms and their verified native projections. */
     meetings?: MockMeetingSeed[];
+    /** Definitive failures for successive Meeting Create submissions. */
+    meetingCreateErrors?: Array<string | null>;
+    /** Return an indeterminate result this many times before accepting. */
+    meetingCreateIndeterminateResponses?: number;
+    meetingCreateDelayMs?: number;
     /** Verified Project View command result returned to the View screen. */
     projectView?: RawProjectViewLoadResult;
     /** Community-isolated Project View results keyed by applied Relay URL. */
@@ -2440,6 +2448,124 @@ function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
     endedAt: null,
     latestSpeechAt: null,
     compatibility,
+  };
+}
+
+async function handleCreateMeeting(
+  args: { input: CreateMeetingInput },
+  config?: E2eConfig,
+): Promise<CreateMeetingResult> {
+  const delayMs = config?.mock?.meetingCreateDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingCreateErrors?.shift();
+  if (configuredError) {
+    throw new Error(configuredError);
+  }
+
+  const input = args.input;
+  const meetingId = input.submissionId;
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const hostPubkey = getMockMemberPubkey(config).toLowerCase();
+  if ((config?.mock?.meetingCreateIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingCreateIndeterminateResponses =
+        (config.mock.meetingCreateIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId,
+      eventId,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+
+  const title = input.title.trim().replace(/^#+\s*/u, "") || "Meeting";
+  const relayAgentPubkeys = new Set(
+    (config?.mock?.relayAgents ?? []).map((agent) =>
+      normalizePubkey(agent.pubkey),
+    ),
+  );
+  const profileAgents = new Set(
+    (config?.mock?.searchProfiles ?? [])
+      .filter((profile) => profile.isAgent)
+      .map((profile) => normalizePubkey(profile.pubkey)),
+  );
+  const now = Math.floor(Date.now() / 1_000);
+  const snapshot: MeetingSnapshot = {
+    meetingId,
+    title,
+    description: input.description ?? null,
+    sourceChannelId: input.sourceChannelId ?? null,
+    schemaVersion: 3,
+    policy: "moderated-board-actions-v2",
+    hostPubkey,
+    moderatorPubkey: hostPubkey,
+    createEventId: eventId,
+    createdAt: now,
+    lifecycle: "active",
+    phase: "moderator_control",
+    stateRevision: 1,
+    floorRevision: 0,
+    intentRevision: 0,
+    speechRevision: 0,
+    currentSpeakerPubkey: null,
+    currentOfferPubkey: null,
+    participants: [
+      { pubkey: hostPubkey, participantType: "human", channelRole: "owner" },
+      ...input.participantPubkeys.map((pubkey) => {
+        const normalized = normalizePubkey(pubkey);
+        return {
+          pubkey: normalized,
+          participantType:
+            relayAgentPubkeys.has(normalized) || profileAgents.has(normalized)
+              ? ("agent" as const)
+              : ("human" as const),
+          channelRole: "member",
+        };
+      }),
+    ],
+    board: {
+      eventId: "b".repeat(64),
+      format: "markdown",
+      body: input.initialBoard,
+      moderatorPubkey: hostPubkey,
+      updatedAt: now,
+      source: "create",
+    },
+    action: null,
+    end: null,
+    latestSpeechAt: null,
+  };
+  const meetings = config?.mock?.meetings;
+  if (meetings && !meetings.some((meeting) => meeting.id === meetingId)) {
+    meetings.push({
+      id: meetingId,
+      title,
+      description: input.description ?? null,
+      result: { status: "ready", snapshot },
+      speeches: [],
+    });
+  } else if (config?.mock && !meetings) {
+    config.mock.meetings = [
+      {
+        id: meetingId,
+        title,
+        description: input.description ?? null,
+        result: { status: "ready", snapshot },
+        speeches: [],
+      },
+    ];
+  }
+
+  return {
+    status: "accepted",
+    meetingId,
+    eventId,
+    hostPubkey,
+    participantPubkeys: input.participantPubkeys,
+    title,
   };
 }
 
@@ -10232,6 +10358,11 @@ export function maybeInstallE2eTauriMocks() {
             supportsDirectActions: true,
             canCreateDirectActions: false,
           }
+        );
+      case "create_meeting":
+        return handleCreateMeeting(
+          payload as { input: CreateMeetingInput },
+          activeConfig,
         );
       case "list_meetings": {
         const { meetingIds } = payload as { meetingIds: string[] };

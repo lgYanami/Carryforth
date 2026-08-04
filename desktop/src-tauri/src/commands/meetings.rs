@@ -4,6 +4,9 @@
 //! assembled from a signed Create event and Relay-authored State/Board
 //! projections, so live WebSocket payloads can remain invalidation signals.
 
+mod create;
+pub use create::create_meeting;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_core_pkg::kind::{
@@ -504,8 +507,16 @@ fn build_meeting_speech_filter(
 }
 
 async fn read_meeting_identity(state: &AppState) -> Result<Option<MeetingIdentity>, String> {
+    let api_base_url = relay_api_base_url_with_override(state);
+    read_meeting_identity_at(state, &api_base_url).await
+}
+
+async fn read_meeting_identity_at(
+    state: &AppState,
+    api_base_url: &str,
+) -> Result<Option<MeetingIdentity>, String> {
     crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/info", relay_api_base_url_with_override(state));
+    let url = format!("{}/info", api_base_url.trim_end_matches('/'));
     let response = state
         .http_client
         .get(url)

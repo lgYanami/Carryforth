@@ -20,6 +20,7 @@ mod models;
 mod native_websocket;
 mod nostr_bind;
 pub mod nostr_convert;
+mod pending_writes;
 mod prevent_sleep;
 mod ptt_shortcut;
 mod relay;
@@ -724,6 +725,7 @@ pub fn run() {
             get_meeting_snapshot,
             get_meeting_board,
             get_meeting_speeches,
+            create_meeting,
             create_channel,
             ensure_starter_channels,
             open_dm,

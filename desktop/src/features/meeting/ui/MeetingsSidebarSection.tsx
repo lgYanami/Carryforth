@@ -1,6 +1,13 @@
 import * as React from "react";
-import { CalendarClock, ChevronDown, History, UsersRound } from "lucide-react";
+import {
+  CalendarClock,
+  ChevronDown,
+  History,
+  Plus,
+  UsersRound,
+} from "lucide-react";
 
+import { requestOpenCreateMeeting } from "@/features/meeting/openCreateMeetingEvent";
 import type {
   MeetingLifecycle,
   MeetingListItem,
@@ -137,8 +144,6 @@ export function MeetingsSidebarSection({
     [items],
   );
 
-  if (items.length === 0) return null;
-
   return (
     <>
       <SidebarGroup
@@ -161,16 +166,28 @@ export function MeetingsSidebarSection({
               />
             </span>
           </button>
-          <button
-            aria-label="Meeting history"
-            className="ml-auto flex size-6 items-center justify-center rounded-md text-sidebar-foreground/55 hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-            data-testid="meeting-history-trigger"
-            onClick={() => setHistoryOpen(true)}
-            title="Meeting history"
-            type="button"
-          >
-            <History className="size-4" />
-          </button>
+          <div className="ml-auto flex items-center gap-0.5">
+            <button
+              aria-label="Start a Meeting"
+              className="flex size-6 items-center justify-center rounded-md text-sidebar-foreground/55 hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              data-testid="meeting-create-trigger"
+              onClick={() => requestOpenCreateMeeting()}
+              title="Start a Meeting"
+              type="button"
+            >
+              <Plus className="size-4" />
+            </button>
+            <button
+              aria-label="Meeting history"
+              className="flex size-6 items-center justify-center rounded-md text-sidebar-foreground/55 hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              data-testid="meeting-history-trigger"
+              onClick={() => setHistoryOpen(true)}
+              title="Meeting history"
+              type="button"
+            >
+              <History className="size-4" />
+            </button>
+          </div>
         </SidebarGroupLabel>
         {!collapsed ? (
           <SidebarGroupContent>

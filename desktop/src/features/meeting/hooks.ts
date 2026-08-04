@@ -1,19 +1,26 @@
 import * as React from "react";
 import {
   useInfiniteQuery,
+  useMutation,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
 
 import { useCommunities } from "@/features/communities/useCommunities";
+import {
+  channelsQueryKey,
+  upsertCachedChannel,
+} from "@/features/channels/hooks";
 import { relayClient } from "@/shared/api/relayClient";
 import {
+  createMeeting,
   getMeetingCapability,
   getMeetingSnapshot,
   getMeetingSpeeches,
   listMeetings,
   type MeetingSpeechCursor,
 } from "@/shared/api/tauriMeetings";
+import type { Channel } from "@/shared/api/types";
 import {
   KIND_MEETING_END,
   KIND_MEETING_STATE,
@@ -54,6 +61,53 @@ export function useMeetingCapability() {
     enabled: Boolean(activeCommunity),
     staleTime: 30_000,
     refetchOnWindowFocus: true,
+  });
+}
+
+export function useCreateMeetingMutation() {
+  const { activeCommunity } = useCommunities();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: createMeeting,
+    onSuccess: (result, input) => {
+      if (result.status !== "accepted") return;
+
+      const participantPubkeys = [
+        result.hostPubkey,
+        ...result.participantPubkeys,
+      ];
+      const acceptedRoom: Channel = {
+        id: result.meetingId,
+        name: result.title,
+        channelType: "stream",
+        roomKind: "meeting",
+        visibility: "private",
+        description: input.description ?? "",
+        topic: null,
+        purpose: null,
+        memberCount: participantPubkeys.length,
+        memberPubkeys: participantPubkeys,
+        lastMessageAt: null,
+        archivedAt: null,
+        participants: [],
+        participantPubkeys: [],
+        isMember: true,
+        ttlSeconds: null,
+        ttlDeadline: null,
+      };
+      queryClient.setQueryData<Channel[]>(channelsQueryKey, (current) =>
+        upsertCachedChannel(current, acceptedRoom),
+      );
+      void queryClient.invalidateQueries({
+        queryKey: meetingQueryRoot(activeCommunity?.id),
+        refetchType: "none",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: channelsQueryKey,
+        refetchType: "none",
+      });
+    },
   });
 }
 

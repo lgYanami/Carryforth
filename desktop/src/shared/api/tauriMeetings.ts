@@ -7,6 +7,33 @@ export type MeetingCapability = {
   canCreateDirectActions: boolean;
 };
 
+export type CreateMeetingInput = {
+  /** Stable UUID reused while an indeterminate signed Create is retried. */
+  submissionId: string;
+  title: string;
+  description?: string;
+  sourceChannelId?: string;
+  /** Frozen roster excluding the current Human host. */
+  participantPubkeys: string[];
+  initialBoard: string;
+};
+
+export type CreateMeetingResult =
+  | {
+      status: "accepted";
+      meetingId: string;
+      eventId: string;
+      hostPubkey: string;
+      participantPubkeys: string[];
+      title: string;
+    }
+  | {
+      status: "indeterminate";
+      meetingId: string;
+      eventId: string;
+      message: string;
+    };
+
 export type MeetingLifecycle =
   | "initializing"
   | "active"
@@ -129,6 +156,12 @@ export type MeetingSpeechPage = {
 
 export async function getMeetingCapability(): Promise<MeetingCapability> {
   return invokeTauri<MeetingCapability>("get_meeting_capability");
+}
+
+export async function createMeeting(
+  input: CreateMeetingInput,
+): Promise<CreateMeetingResult> {
+  return invokeTauri<CreateMeetingResult>("create_meeting", { input });
 }
 
 export async function listMeetings(

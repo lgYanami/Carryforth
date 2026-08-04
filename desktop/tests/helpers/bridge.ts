@@ -153,6 +153,9 @@ type MockBridgeOptions = {
   relaySelf?: string | null;
   meetingCapability?: MeetingCapability;
   meetings?: MockMeetingSeed[];
+  meetingCreateErrors?: Array<string | null>;
+  meetingCreateIndeterminateResponses?: number;
+  meetingCreateDelayMs?: number;
   /** Verified Project View command result returned to the View screen. */
   projectView?: RawProjectViewLoadResult;
   /** Community-isolated Project View results keyed by applied Relay URL. */

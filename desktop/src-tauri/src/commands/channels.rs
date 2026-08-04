@@ -111,7 +111,7 @@ pub async fn get_channels(state: State<'_, AppState>) -> Result<Vec<ChannelInfo>
     channel_ids.dedup();
 
     // The real kind:39002 membership has now resolved for these channels —
-    // drop them from the pending-owner overlay (see `AppState::pending_owned_channels`)
+    // drop them from the pending-owner overlay (see `AppState::pending_writes`)
     // so a channel this identity created no longer speaks through the overlay
     // once genuine membership is observable, and a later leave correctly
     // flips it back to `is_member=false`.
@@ -185,7 +185,7 @@ pub async fn get_channels(state: State<'_, AppState>) -> Result<Vec<ChannelInfo>
                 continue;
             }
         }
-        // The overlay (`AppState::pending_owned_channels`) marks channels this
+        // The overlay (`AppState::pending_writes`) marks channels this
         // identity just created via `create_channel` whose kind:39002 owner
         // membership hasn't propagated yet (#1761) — a fresh channel has no
         // member event and would otherwise fall through to `is_member=false`

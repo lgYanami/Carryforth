@@ -63,10 +63,15 @@ function candidateWithAgentMetadata(
 export function useNewMessageRecipients({
   active,
   currentPubkey,
+  includeAllRelayAgents = false,
+  recipientLimit = NEW_MESSAGE_RECIPIENT_LIMIT,
 }: {
   /** When false, the directory/agent queries stay idle. */
   active: boolean;
   currentPubkey?: string;
+  /** Meeting rosters may select any discoverable Community Agent. */
+  includeAllRelayAgents?: boolean;
+  recipientLimit?: number;
 }) {
   const [searchQuery, setSearchQuery] = React.useState("");
   const [directoryIdentityQuery, setDirectoryIdentityQuery] = React.useState<
@@ -77,8 +82,7 @@ export function useNewMessageRecipients({
   );
   const selectedUsersCountRef = React.useRef(0);
   const deferredSearchQuery = React.useDeferredValue(searchQuery.trim());
-  const hasReachedRecipientLimit =
-    selectedUsers.length >= NEW_MESSAGE_RECIPIENT_LIMIT;
+  const hasReachedRecipientLimit = selectedUsers.length >= recipientLimit;
 
   const selectedPubkeys = React.useMemo(
     () => new Set(selectedUsers.map((user) => normalizePubkey(user.pubkey))),
@@ -109,14 +113,21 @@ export function useNewMessageRecipients({
     const currentPubkeyNormalized = currentPubkey
       ? normalizePubkey(currentPubkey)
       : null;
-    const eligibleAgentPubkeys = getMentionableAgentPubkeys({
-      currentPubkey,
-      managedAgentPubkeys: (managedAgentsQuery.data ?? []).map(
-        (agent) => agent.pubkey,
-      ),
-      relayAgents: relayAgentsQuery.data,
-      sharedChannelIds: getSharedChannelIds(channelsQuery.data),
-    });
+    const eligibleAgentPubkeys = includeAllRelayAgents
+      ? new Set(
+          [
+            ...(managedAgentsQuery.data ?? []).map((agent) => agent.pubkey),
+            ...(relayAgentsQuery.data ?? []).map((agent) => agent.pubkey),
+          ].map(normalizePubkey),
+        )
+      : getMentionableAgentPubkeys({
+          currentPubkey,
+          managedAgentPubkeys: (managedAgentsQuery.data ?? []).map(
+            (agent) => agent.pubkey,
+          ),
+          relayAgents: relayAgentsQuery.data,
+          sharedChannelIds: getSharedChannelIds(channelsQuery.data),
+        });
 
     const addCandidate = (
       candidate: NewMessageRecipientCandidate,
@@ -219,6 +230,7 @@ export function useNewMessageRecipients({
     channelsQuery.data,
     currentPubkey,
     deferredSearchQuery,
+    includeAllRelayAgents,
     isArchivedDiscovery,
     managedAgentsQuery.data,
     relayAgentsQuery.data,
@@ -276,7 +288,7 @@ export function useNewMessageRecipients({
 
   const selectUser = React.useCallback(
     (user: UserSearchResult) => {
-      if (selectedUsers.length >= NEW_MESSAGE_RECIPIENT_LIMIT) {
+      if (selectedUsers.length >= recipientLimit) {
         return;
       }
 
@@ -294,7 +306,7 @@ export function useNewMessageRecipients({
       });
       setSearchQuery("");
     },
-    [selectedUsers.length],
+    [recipientLimit, selectedUsers.length],
   );
 
   const removeUser = React.useCallback((pubkey: string) => {
