@@ -9,7 +9,7 @@ import {
   getMentionableAgentPubkeys,
   getSharedChannelIds,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import {
   useFlattenedUserSearchResults,
@@ -88,7 +88,7 @@ export function useNewMessageRecipients({
   const identityQuery = useIdentityQuery();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: active });
   const relayAgentsQuery = useRelayAgentsQuery({ enabled: active });
-  const channelsQuery = useChannelsQuery({ enabled: active });
+  const channelsQuery = useChatRooms({ enabled: active });
   const userSearchQuery = useInfiniteUserSearchQuery(deferredSearchQuery, {
     allowEmpty: true,
     enabled:

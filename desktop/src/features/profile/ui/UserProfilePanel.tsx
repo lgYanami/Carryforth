@@ -45,7 +45,7 @@ import {
   editPersonaDialogState,
   type PersonaDialogState,
 } from "@/features/agents/ui/personaDialogState";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { useIdentityArchive } from "@/features/identity-archive/hooks";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import {
@@ -254,7 +254,7 @@ export function UserProfilePanel({
   const usersBatchQuery = useUsersBatchQuery(
     effectivePubkey ? [effectivePubkey] : [],
   );
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const presenceQuery = usePresenceQuery(
     effectivePubkey ? [effectivePubkey] : [],
   );

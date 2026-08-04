@@ -17,6 +17,7 @@ export type RawChannel = {
   id: string;
   name: string;
   channel_type: ChannelType;
+  room_kind?: string | null;
   visibility: "open" | "private";
   description: string;
   topic: string | null;
@@ -63,6 +64,7 @@ export function fromRawChannel(channel: RawChannel): Channel {
     id: channel.id,
     name: channel.name,
     channelType: channel.channel_type,
+    roomKind: channel.room_kind === "meeting" ? "meeting" : null,
     visibility: channel.visibility,
     description: channel.description,
     topic: channel.topic,

@@ -20,7 +20,7 @@ import {
   getSharedChannelIds,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
-import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
+import { useChatRooms, useOpenDmMutation } from "@/features/channels/hooks";
 import {
   useChannelMessagesQuery,
   useChannelSubscription,
@@ -129,7 +129,7 @@ function useAgentCandidates() {
   const identityQuery = useIdentityQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
 
   return React.useMemo(() => {
     const managed = managedAgentsQuery.data ?? [];
@@ -285,7 +285,7 @@ export function ProjectsAgentPromptPage({
   const identityQuery = useIdentityQuery();
   const profileQuery = useProfileQuery();
   const candidates = useAgentCandidates();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const openDmMutation = useOpenDmMutation();
   const startAgentMutation = useStartManagedAgentMutation();
 

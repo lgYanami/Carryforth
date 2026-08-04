@@ -4,7 +4,7 @@ import { RefreshCcw } from "lucide-react";
 import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
-import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
+import { useChatRooms, useOpenDmMutation } from "@/features/channels/hooks";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 import { ChannelManagementSheet } from "@/features/channels/ui/ChannelManagementSheet";
 import {
@@ -291,7 +291,7 @@ export function HomeView({
         activeLatchedItem.id)
       : null;
 
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const channels = channelsQuery.data;
   const selectedChannelIdCandidate = React.useMemo(() => {
     return threadContextFeedItem?.channelId ?? null;

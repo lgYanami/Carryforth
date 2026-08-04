@@ -2,7 +2,7 @@ import { FileText, Lock, Pencil, Send, Trash2 } from "lucide-react";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import {
   getActiveDraftEntries,
   renameDraftEntry,
@@ -514,7 +514,7 @@ export function useActiveDraftCount(
 export function useDraftViewItems(enabled: boolean): DraftViewItem[] {
   const identityQuery = useIdentityQuery();
   const currentPubkey = identityQuery.data?.pubkey;
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
 
   useDraftsSnapshot();
   const drafts = getActiveDraftEntries().filter(isVisibleDraft);

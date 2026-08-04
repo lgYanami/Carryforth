@@ -33,6 +33,12 @@ export const KIND_MEETING_MODERATOR_COMMAND = 42106;
 export const KIND_MEETING_HUMAN_FLOOR_REQUEST = 42107;
 export const KIND_MEETING_OFFER_RESPONSE = 42108;
 export const KIND_MEETING_GRANT_SIGNAL = 42109;
+// Relay-authored current Board projection and the two Human/Agent command
+// kinds. Keep these values pinned to buzz-core; only the projection is read in
+// Desktop stage one.
+export const KIND_MEETING_BOARD = 42110;
+export const KIND_MEETING_BOARD_COMMAND = 42111;
+export const KIND_MEETING_ACTION_COMMAND = 42112;
 export const KIND_JOB_REQUEST = 43001;
 export const KIND_JOB_ACCEPTED = 43002;
 export const KIND_JOB_PROGRESS = 43003;

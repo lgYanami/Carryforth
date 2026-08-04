@@ -7,7 +7,7 @@ import {
 } from "@/features/agents/hooks";
 import {
   useChannelMembersQuery,
-  useChannelsQuery,
+  useChatRooms,
 } from "@/features/channels/hooks";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import type { MentionSuggestion } from "@/features/messages/ui/MentionAutocomplete";
@@ -105,7 +105,7 @@ export function useMentions(
   const isArchivedDiscovery = useIsArchivedPredicate();
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const personasQuery = usePersonasQuery();
   const teamsQuery = useTeamsQuery();
   const managedAgentDirectoryReady =

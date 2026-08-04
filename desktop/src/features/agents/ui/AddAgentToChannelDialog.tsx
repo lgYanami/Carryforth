@@ -6,7 +6,7 @@ import {
 } from "@/features/agents/hooks";
 import {
   useChannelMembersQuery,
-  useChannelsQuery,
+  useChatRooms,
 } from "@/features/channels/hooks";
 import type { Channel, ChannelRole, ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -34,7 +34,7 @@ export function AddAgentToChannelDialog({
   ) => void;
   onOpenChange: (open: boolean) => void;
 }) {
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const [channelId, setChannelId] = React.useState("");
   const [role, setRole] = React.useState<Exclude<ChannelRole, "owner">>("bot");
   const attachAgentMutation = useAttachManagedAgentToChannelMutation(

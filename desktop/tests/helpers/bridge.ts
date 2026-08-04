@@ -1,6 +1,11 @@
 import type { Page } from "@playwright/test";
 import type { ChannelTemplate } from "../../src/shared/api/types";
 import type {
+  MeetingCapability,
+  MeetingLoadResult,
+  MeetingSpeech,
+} from "../../src/shared/api/tauriMeetings";
+import type {
   RawProjectViewLoadResult,
   RawProjectViewMutationResult,
   RawProjectViewRoleMutationResult,
@@ -77,6 +82,14 @@ type MockSearchProfileSeed = {
   isAgent?: boolean;
 };
 
+type MockMeetingSeed = {
+  id: string;
+  title: string;
+  description?: string | null;
+  result: MeetingLoadResult;
+  speeches?: MeetingSpeech[];
+};
+
 type MockRelayAgentSeed = {
   pubkey: string;
   name: string;
@@ -138,6 +151,8 @@ type MockBridgeOptions = {
   projectHeadBranch?: string;
   /** Relay NIP-11 identity used to sign authoritative repository state. */
   relaySelf?: string | null;
+  meetingCapability?: MeetingCapability;
+  meetings?: MockMeetingSeed[];
   /** Verified Project View command result returned to the View screen. */
   projectView?: RawProjectViewLoadResult;
   /** Community-isolated Project View results keyed by applied Relay URL. */

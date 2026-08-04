@@ -187,7 +187,16 @@ function setChannelArchivedState(
   );
 }
 
-export function useChannelsQuery(options?: { enabled?: boolean }) {
+type ChannelsQueryOptions = {
+  enabled?: boolean;
+  conversationOnly?: boolean;
+};
+
+function selectConversationChannels(channels: Channel[]): Channel[] {
+  return channels.filter((channel) => channel.roomKind !== "meeting");
+}
+
+function useChannelCollectionQuery(options?: ChannelsQueryOptions) {
   const { activeCommunity } = useCommunities();
   const relayUrl = activeCommunity?.relayUrl ?? null;
 
@@ -214,7 +223,18 @@ export function useChannelsQuery(options?: { enabled?: boolean }) {
     staleTime: 60_000,
     refetchInterval: 60_000,
     refetchIntervalInBackground: false,
+    select: options?.conversationOnly ? selectConversationChannels : undefined,
   });
+}
+
+/** Read every discovered room, including protocol-specific Meeting rooms. */
+export function useChannelsQuery(options?: { enabled?: boolean }) {
+  return useChannelCollectionQuery(options);
+}
+
+/** Read only ordinary Channel/Forum/DM rooms for conversation product UI. */
+export function useChatRooms(options?: { enabled?: boolean }) {
+  return useChannelCollectionQuery({ ...options, conversationOnly: true });
 }
 
 export function useCreateChannelMutation() {

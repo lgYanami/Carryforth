@@ -1,0 +1,488 @@
+//! Strict parsers for signed Meeting Create and Relay-authored projections.
+
+use super::*;
+
+pub(super) fn parse_create(
+    event: &Event,
+    meeting_id: &str,
+) -> Result<Option<CreateProjection>, MeetingReadError> {
+    if event.kind.as_u16() as u32 != KIND_MEETING_CREATE
+        || single_tag(event, "h") != Some(meeting_id)
+    {
+        return Ok(None);
+    }
+    verify_event(event, "Meeting Create")?;
+    let version = required_tag(event, "v", "Meeting Create")?;
+    let policy = required_tag(event, "policy", "Meeting Create")?;
+    if version != buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION
+        || !matches!(
+            policy,
+            buzz_sdk_pkg::MEETING_V2_POLICY | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
+        )
+    {
+        return Ok(None);
+    }
+    let title = required_tag(event, "name", "Meeting Create")?.trim();
+    if title.is_empty() {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting Create has an empty title",
+        )));
+    }
+    let host_pubkey = event.pubkey.to_hex();
+    let mut participants = BTreeSet::from([host_pubkey.clone()]);
+    for tag in tags_named(event, "p") {
+        let Some(pubkey) = tag.get(1) else {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting Create has an invalid participant tag",
+            )));
+        };
+        require_hex64(pubkey, "Meeting participant").map_err(MeetingReadError::Other)?;
+        if !participants.insert(pubkey.clone()) {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting Create has a duplicate participant",
+            )));
+        }
+    }
+    if participants.len() < 2 || participants.len() > 12 {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting Create roster is outside the supported bounds",
+        )));
+    }
+    let initial_board = buzz_sdk_pkg::parse_meeting_v2_board_content(&event.content)
+        .map_err(|error| MeetingReadError::Other(integrity_error(error.to_string())))?;
+    let source_channel_id = optional_tag(event, "source", "Meeting Create")?
+        .map(|source| {
+            let parsed = Uuid::parse_str(source).map_err(|_| {
+                MeetingReadError::Other(integrity_error(
+                    "Meeting Create source is not a canonical Channel UUID",
+                ))
+            })?;
+            if parsed.is_nil() || parsed.to_string() != source || source == meeting_id {
+                return Err(MeetingReadError::Other(integrity_error(
+                    "Meeting Create source is not a distinct canonical Channel UUID",
+                )));
+            }
+            Ok(source.to_string())
+        })
+        .transpose()?;
+    Ok(Some(CreateProjection {
+        meeting_id: meeting_id.to_string(),
+        title: title.to_string(),
+        description: optional_tag(event, "about", "Meeting Create")?.map(str::to_string),
+        source_channel_id,
+        policy: policy.to_string(),
+        host_pubkey,
+        participant_pubkeys: participants,
+        event_id: event.id.to_hex(),
+        created_at: event.created_at.as_secs(),
+        initial_board,
+    }))
+}
+
+pub(super) fn parse_state(
+    event: &Event,
+    identity: &MeetingIdentity,
+    create: &CreateProjection,
+) -> Result<Option<StateProjection>, MeetingReadError> {
+    if event.kind.as_u16() as u32 != KIND_MEETING_STATE
+        || single_tag(event, "h") != Some(create.meeting_id.as_str())
+    {
+        return Ok(None);
+    }
+    verify_relay_event(event, identity, "Meeting State")?;
+    if required_tag(event, "v", "Meeting State")? != buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION
+        || required_tag(event, "policy", "Meeting State")? != create.policy
+        || required_tag(event, "moderator", "Meeting State")? != create.host_pubkey
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State protocol does not match Create",
+        )));
+    }
+    let state: StateWire = serde_json::from_str(&event.content).map_err(|error| {
+        MeetingReadError::Other(integrity_error(format!(
+            "invalid Meeting State content: {error}"
+        )))
+    })?;
+    let tag_state_revision = parse_revision_tag(event, "state-revision", "Meeting State")?;
+    let tag_floor_revision = parse_revision_tag(event, "floor-revision", "Meeting State")?;
+    let tag_intent_revision = parse_revision_tag(event, "intent-revision", "Meeting State")?;
+    let tag_speech_revision = parse_revision_tag(event, "speech-revision", "Meeting State")?;
+    if required_tag(event, "phase", "Meeting State")? != state.phase
+        || state.moderator_pubkey != create.host_pubkey
+        || state.state_revision != tag_state_revision
+        || state.floor_revision != tag_floor_revision
+        || state.intent_revision != tag_intent_revision
+        || state.speech_revision != tag_speech_revision
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State content does not match its signed tags",
+        )));
+    }
+    if !matches!(
+        state.phase.as_str(),
+        "moderator_idle" | "moderator_control" | "offered" | "granted" | "ended"
+    ) {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State has an unsupported phase",
+        )));
+    }
+    validate_board_control(state.board_control.as_ref(), create)?;
+    for target in [
+        state
+            .offer
+            .as_ref()
+            .and_then(|offer| offer.target_pubkey.as_deref()),
+        state
+            .grant
+            .as_ref()
+            .and_then(|grant| grant.holder_pubkey.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        require_hex64(target, "Meeting State floor target").map_err(MeetingReadError::Other)?;
+        if !create.participant_pubkeys.contains(target) {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State floor target is outside the frozen roster",
+            )));
+        }
+    }
+    Ok(Some(StateProjection {
+        event_id: event.id.to_hex(),
+        state,
+    }))
+}
+
+fn validate_board_control(
+    control: Option<&BoardControlWire>,
+    create: &CreateProjection,
+) -> Result<(), MeetingReadError> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    if !matches!(
+        control.phase.as_str(),
+        "bootstrap_locked" | "board_pending" | "floor_ready" | "finalizing_actions" | "ended"
+    ) {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State has an unsupported Board phase",
+        )));
+    }
+    if create.policy != buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY && control.action.is_some() {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State exposes actions for a non-action policy",
+        )));
+    }
+    if control.phase == "finalizing_actions" && control.action.is_none() {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State is finalizing actions without an action run",
+        )));
+    }
+    let Some(action) = &control.action else {
+        return Ok(());
+    };
+    if action.action_run_id.is_nil() {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action run ID is nil",
+        )));
+    }
+    if action.action_window_epoch == 0 {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action window is zero",
+        )));
+    }
+    require_hex64(&action.board_event_id, "Meeting action Board event")
+        .map_err(MeetingReadError::Other)?;
+    if !matches!(action.condition.as_str(), "runnable" | "blocked") {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action run has an unsupported condition",
+        )));
+    }
+    if action.terminal_status.as_deref().is_some_and(|status| {
+        !matches!(
+            status,
+            "returned_to_board" | "completed_closed" | "completed_aborted"
+        )
+    }) {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action run has an unsupported terminal status",
+        )));
+    }
+    if let Some(completion_event_id) = &action.completion_event_id {
+        require_hex64(completion_event_id, "Meeting action completion event")
+            .map_err(MeetingReadError::Other)?;
+    }
+    if action
+        .action_deadline_at_ms
+        .is_some_and(|deadline| deadline < 0)
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action deadline is negative",
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn select_current_state(
+    mut states: Vec<StateProjection>,
+    create: &CreateProjection,
+) -> Result<Option<StateProjection>, MeetingReadError> {
+    states.sort_by(|left, right| {
+        left.state
+            .state_revision
+            .cmp(&right.state.state_revision)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+
+    let mut previous_revisions: Option<(u64, u64, u64, u64)> = None;
+    let mut frozen_participants: Option<Vec<MeetingParticipant>> = None;
+    let mut previous_state_revision: Option<u64> = None;
+    let mut previous_event_id: Option<&str> = None;
+    for state in &states {
+        if previous_state_revision == Some(state.state.state_revision)
+            && previous_event_id != Some(state.event_id.as_str())
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "conflicting Relay State events share a state revision",
+            )));
+        }
+
+        let revisions = (
+            state.state.state_revision,
+            state.state.floor_revision,
+            state.state.intent_revision,
+            state.state.speech_revision,
+        );
+        if let Some(previous) = previous_revisions {
+            if revisions.0 < previous.0
+                || revisions.1 < previous.1
+                || revisions.2 < previous.2
+                || revisions.3 < previous.3
+            {
+                return Err(MeetingReadError::Other(integrity_error(
+                    "Meeting State revisions moved backwards",
+                )));
+            }
+        }
+
+        let participants = validate_participants(&state.state, create)?;
+        if frozen_participants
+            .as_ref()
+            .is_some_and(|frozen| frozen != &participants)
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State changed a frozen participant classification",
+            )));
+        }
+        frozen_participants = Some(participants);
+        previous_revisions = Some(revisions);
+        previous_state_revision = Some(state.state.state_revision);
+        previous_event_id = Some(state.event_id.as_str());
+    }
+
+    Ok(states.pop())
+}
+
+pub(super) fn parse_current_board(
+    events: &[Event],
+    identity: &MeetingIdentity,
+    create: &CreateProjection,
+) -> Result<MeetingBoard, MeetingReadError> {
+    let mut boards = Vec::new();
+    for event in events {
+        if event.kind.as_u16() as u32 != KIND_MEETING_BOARD
+            || single_tag(event, "h") != Some(create.meeting_id.as_str())
+        {
+            continue;
+        }
+        verify_relay_event(event, identity, "Meeting Board")?;
+        if required_tag(event, "v", "Meeting Board")? != buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION
+            || required_tag(event, "policy", "Meeting Board")? != create.policy
+            || required_tag(event, "format", "Meeting Board")?
+                != buzz_sdk_pkg::MEETING_V2_BOARD_FORMAT
+            || required_tag(event, "moderator", "Meeting Board")? != create.host_pubkey
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting Board protocol does not match Create",
+            )));
+        }
+        let content = buzz_sdk_pkg::parse_meeting_v2_board_content(&event.content)
+            .map_err(|error| MeetingReadError::Other(integrity_error(error.to_string())))?;
+        boards.push(MeetingBoard {
+            event_id: event.id.to_hex(),
+            format: content.format,
+            body: content.body,
+            moderator_pubkey: create.host_pubkey.clone(),
+            updated_at: event.created_at.as_secs(),
+            source: MeetingBoardSource::Projection,
+        });
+    }
+    boards.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    Ok(boards.pop().unwrap_or_else(|| MeetingBoard {
+        event_id: create.event_id.clone(),
+        format: create.initial_board.format.clone(),
+        body: create.initial_board.body.clone(),
+        moderator_pubkey: create.host_pubkey.clone(),
+        updated_at: create.created_at,
+        source: MeetingBoardSource::Create,
+    }))
+}
+
+pub(super) fn parse_current_end(
+    events: &[Event],
+    create: &CreateProjection,
+) -> Result<Option<MeetingEndState>, MeetingReadError> {
+    let mut ends = Vec::new();
+    for event in events {
+        if event.kind.as_u16() as u32 != KIND_MEETING_END
+            || single_tag(event, "h") != Some(create.meeting_id.as_str())
+        {
+            continue;
+        }
+        verify_event(event, "Meeting End")?;
+        let outcome = required_tag(event, "outcome", "Meeting End")?;
+        if required_tag(event, "v", "Meeting End")? != buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION
+            || required_tag(event, "policy", "Meeting End")? != create.policy
+            || required_tag(event, "e", "Meeting End")? != create.event_id
+            || !matches!(outcome, "closed" | "aborted")
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting End protocol does not match Create",
+            )));
+        }
+        let reason_code = optional_tag(event, "reason-code", "Meeting End")?.map(str::to_string);
+        if outcome == "aborted" && reason_code.is_none() {
+            return Err(MeetingReadError::Other(integrity_error(
+                "aborted Meeting End has no reason code",
+            )));
+        }
+        let attestation = optional_tag(event, "attestation", "Meeting End")?;
+        if attestation.is_some_and(|value| value != "actions-recorded") {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting End has an unsupported attestation",
+            )));
+        }
+        let actions_attested = attestation == Some("actions-recorded");
+        if actions_attested
+            && (outcome != "closed" || create.policy != buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY)
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting End action attestation does not match its outcome or policy",
+            )));
+        }
+        ends.push(MeetingEndState {
+            event_id: event.id.to_hex(),
+            outcome: outcome.to_string(),
+            reason_code,
+            reason: (!event.content.trim().is_empty()).then(|| event.content.clone()),
+            ended_by: event.pubkey.to_hex(),
+            ended_at: event.created_at.as_secs(),
+            actions_attested,
+        });
+    }
+    ends.sort_by(|left, right| {
+        left.ended_at
+            .cmp(&right.ended_at)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    if ends.len() > 1 {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting has conflicting End events",
+        )));
+    }
+    Ok(ends.pop())
+}
+
+pub(super) fn validate_participants(
+    state: &StateWire,
+    create: &CreateProjection,
+) -> Result<Vec<MeetingParticipant>, MeetingReadError> {
+    let mut participants = BTreeMap::new();
+    for participant in &state.participants {
+        require_hex64(&participant.pubkey, "Meeting State participant")
+            .map_err(MeetingReadError::Other)?;
+        if participants
+            .insert(
+                participant.pubkey.clone(),
+                MeetingParticipant {
+                    pubkey: participant.pubkey.clone(),
+                    participant_type: participant.participant_type.into(),
+                    channel_role: participant.channel_role.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State has a duplicate participant",
+            )));
+        }
+    }
+    if participants.keys().cloned().collect::<BTreeSet<_>>() != create.participant_pubkeys {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State roster does not match Create",
+        )));
+    }
+    Ok(participants.into_values().collect())
+}
+
+pub(super) fn action_from_wire(action: &ActionWire) -> MeetingActionState {
+    MeetingActionState {
+        action_run_id: action.action_run_id.to_string(),
+        board_event_id: action.board_event_id.clone(),
+        action_window_epoch: action.action_window_epoch,
+        condition: action.condition.clone(),
+        terminal_status: action.terminal_status.clone(),
+        completion_event_id: action.completion_event_id.clone(),
+        action_deadline_at_ms: action.action_deadline_at_ms,
+        last_error_code: action.last_error_code.clone(),
+    }
+}
+
+pub(super) fn parse_speech(
+    event: &Event,
+    meeting_id: &str,
+    roster: &BTreeSet<String>,
+    current_speech_revision: u64,
+) -> Result<Option<MeetingSpeech>, String> {
+    if event.kind.as_u16() as u32 != KIND_STREAM_MESSAGE
+        || single_tag(event, "h") != Some(meeting_id)
+        || single_tag(event, "v") != Some(buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION)
+    {
+        return Ok(None);
+    }
+    event
+        .verify()
+        .map_err(|error| integrity_error(format!("invalid Meeting Speech signature: {error}")))?;
+    let author_pubkey = event.pubkey.to_hex();
+    if !roster.contains(&author_pubkey) {
+        return Ok(None);
+    }
+    let grant_event_id = required_tag_string(event, "meeting-grant", "Meeting Speech")?;
+    require_hex64(&grant_event_id, "Meeting Speech grant")?;
+    let speech_revision = required_tag_string(event, "speech-revision", "Meeting Speech")?
+        .parse::<u64>()
+        .map_err(|_| integrity_error("Meeting Speech has an invalid revision"))?;
+    if speech_revision == 0 || speech_revision > current_speech_revision {
+        return Ok(None);
+    }
+    if event.content.trim().is_empty() {
+        return Err(integrity_error("Meeting Speech content is empty"));
+    }
+    let mentions = tags_named(event, "p")
+        .filter_map(|tag| tag.get(1).cloned())
+        .filter(|pubkey| roster.contains(pubkey))
+        .collect();
+    Ok(Some(MeetingSpeech {
+        event_id: event.id.to_hex(),
+        author_pubkey,
+        content: event.content.clone(),
+        created_at: event.created_at.as_secs(),
+        speech_revision,
+        grant_event_id,
+        mentions,
+    }))
+}

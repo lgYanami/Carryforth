@@ -273,6 +273,7 @@ fn starter_match_requires_open_unarchived_stream_by_normalized_name() {
         id: "chan-1".to_string(),
         name: " General ".to_string(),
         channel_type: "stream".to_string(),
+        room_kind: None,
         visibility: "open".to_string(),
         description: "".to_string(),
         topic: None,

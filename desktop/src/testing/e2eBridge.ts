@@ -58,6 +58,12 @@ import type {
   RawProjectViewRoleMutationResult,
 } from "@/shared/api/tauriProjectView";
 import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRoleHistory";
+import type {
+  MeetingCapability,
+  MeetingListItem,
+  MeetingLoadResult,
+  MeetingSpeech,
+} from "@/shared/api/tauriMeetings";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -137,6 +143,14 @@ type MockSearchProfileSeed = {
   about?: string | null;
   ownerPubkey?: string | null;
   isAgent?: boolean;
+};
+
+type MockMeetingSeed = {
+  id: string;
+  title: string;
+  description?: string | null;
+  result: MeetingLoadResult;
+  speeches?: MeetingSpeech[];
 };
 
 type E2eConfig = {
@@ -289,6 +303,10 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    /** Relay Meeting capability returned by the native read boundary. */
+    meetingCapability?: MeetingCapability;
+    /** Membership-scoped Meeting rooms and their verified native projections. */
+    meetings?: MockMeetingSeed[];
     /** Verified Project View command result returned to the View screen. */
     projectView?: RawProjectViewLoadResult;
     /** Community-isolated Project View results keyed by applied Relay URL. */
@@ -537,6 +555,7 @@ type RawChannel = {
   id: string;
   name: string;
   channel_type: "stream" | "forum" | "dm";
+  room_kind?: string | null;
   visibility: "open" | "private";
   description: string;
   topic: string | null;
@@ -1337,6 +1356,7 @@ function toRawChannel(
     id: channel.id,
     name: channel.name,
     channel_type: channel.channel_type,
+    room_kind: channel.room_kind ?? null,
     visibility: channel.visibility,
     description: channel.description,
     topic: channel.topic,
@@ -2325,8 +2345,102 @@ function listMockProfiles(): RawProfile[] {
     .filter((profile): profile is RawProfile => profile !== null);
 }
 
+function mockMeetingChannel(
+  seed: MockMeetingSeed,
+  config?: E2eConfig,
+): RawChannelWithMembership {
+  const currentPubkey = getMockMemberPubkey(config).toLowerCase();
+  const snapshot = seed.result.status === "ready" ? seed.result.snapshot : null;
+  const participantPubkeys = snapshot
+    ? snapshot.participants.map((participant) => participant.pubkey)
+    : [currentPubkey];
+  if (!participantPubkeys.includes(currentPubkey)) {
+    participantPubkeys.push(currentPubkey);
+  }
+  const endedAt = snapshot?.end?.endedAt ?? null;
+  const latestSpeechAt = snapshot?.latestSpeechAt ?? null;
+  return {
+    id: seed.id,
+    name: seed.title,
+    channel_type: "stream",
+    room_kind: "meeting",
+    visibility: "private",
+    description: seed.description ?? snapshot?.description ?? "",
+    topic: null,
+    purpose: null,
+    member_count: participantPubkeys.length,
+    member_pubkeys: participantPubkeys,
+    last_message_at: latestSpeechAt
+      ? new Date(latestSpeechAt * 1_000).toISOString()
+      : null,
+    archived_at: endedAt ? new Date(endedAt * 1_000).toISOString() : null,
+    participants: [],
+    participant_pubkeys: [],
+    ttl_seconds: null,
+    ttl_deadline: null,
+    is_member: true,
+  };
+}
+
 function listMockChannels(config?: E2eConfig): RawChannelWithMembership[] {
-  return mockChannels.map((channel) => toRawChannel(channel, config));
+  return [
+    ...mockChannels.map((channel) => toRawChannel(channel, config)),
+    ...(config?.mock?.meetings ?? []).map((meeting) =>
+      mockMeetingChannel(meeting, config),
+    ),
+  ];
+}
+
+function getMockMeetingSeed(
+  meetingId: string,
+  config?: E2eConfig,
+): MockMeetingSeed | null {
+  return (
+    config?.mock?.meetings?.find((meeting) => meeting.id === meetingId) ?? null
+  );
+}
+
+function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
+  if (seed.result.status === "ready") {
+    const snapshot = seed.result.snapshot;
+    return {
+      meetingId: seed.id,
+      title: seed.title,
+      lifecycle: snapshot.lifecycle,
+      phase: snapshot.phase,
+      currentSpeakerPubkey: snapshot.currentSpeakerPubkey,
+      moderatorPubkey: snapshot.moderatorPubkey,
+      policy: snapshot.policy,
+      updatedAt:
+        snapshot.end?.endedAt ??
+        snapshot.latestSpeechAt ??
+        snapshot.board.updatedAt,
+      endedAt: snapshot.end?.endedAt ?? null,
+      latestSpeechAt: snapshot.latestSpeechAt,
+      compatibility: "ready",
+    };
+  }
+  const compatibility =
+    seed.result.status === "unsupported_relay"
+      ? "unsupported_relay"
+      : seed.result.status === "unsupported_protocol"
+        ? "unsupported_protocol"
+        : seed.result.status === "forbidden"
+          ? "forbidden"
+          : "not_found";
+  return {
+    meetingId: seed.id,
+    title: seed.title,
+    lifecycle: null,
+    phase: null,
+    currentSpeakerPubkey: null,
+    moderatorPubkey: null,
+    policy: null,
+    updatedAt: null,
+    endedAt: null,
+    latestSpeechAt: null,
+    compatibility,
+  };
 }
 
 function getMockChannel(channelId: string): MockChannel {
@@ -10110,6 +10224,67 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "get_channels":
         return handleGetChannels(activeConfig);
+      case "get_meeting_capability":
+        return (
+          activeConfig?.mock?.meetingCapability ?? {
+            status: "readable",
+            relayPubkey: activeConfig?.mock?.relaySelf ?? "ab".repeat(32),
+            supportsDirectActions: true,
+            canCreateDirectActions: false,
+          }
+        );
+      case "list_meetings": {
+        const { meetingIds } = payload as { meetingIds: string[] };
+        return meetingIds
+          .map((meetingId) => getMockMeetingSeed(meetingId, activeConfig))
+          .filter((meeting): meeting is MockMeetingSeed => meeting !== null)
+          .map(mockMeetingListItem);
+      }
+      case "get_meeting_snapshot":
+      case "get_meeting_board": {
+        const { meetingId } = payload as { meetingId: string };
+        return (
+          getMockMeetingSeed(meetingId, activeConfig)?.result ?? {
+            status: "not_found",
+          }
+        );
+      }
+      case "get_meeting_speeches": {
+        const { meetingId, before, beforeId, limit } = payload as {
+          meetingId: string;
+          before?: number | null;
+          beforeId?: string | null;
+          limit?: number | null;
+        };
+        const pageSize = Math.max(1, Math.min(limit ?? 50, 100));
+        const ordered = [
+          ...(getMockMeetingSeed(meetingId, activeConfig)?.speeches ?? []),
+        ]
+          .filter(
+            (speech) =>
+              before == null ||
+              speech.createdAt < before ||
+              (speech.createdAt === before &&
+                beforeId != null &&
+                speech.eventId > beforeId),
+          )
+          .sort(
+            (left, right) =>
+              right.speechRevision - left.speechRevision ||
+              right.eventId.localeCompare(left.eventId),
+          );
+        const hasMore = ordered.length > pageSize;
+        const speeches = ordered.slice(0, pageSize);
+        const oldest = speeches.at(-1);
+        speeches.reverse();
+        return {
+          speeches,
+          nextCursor:
+            hasMore && oldest
+              ? { before: oldest.createdAt, beforeId: oldest.eventId }
+              : null,
+        };
+      }
       case "get_feed":
         return handleGetFeed(
           (payload as Parameters<typeof handleGetFeed>[0]) ?? {},

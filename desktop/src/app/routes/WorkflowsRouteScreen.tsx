@@ -1,5 +1,5 @@
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { WorkflowsScreen } from "@/features/workflows/ui/WorkflowsScreen";
 
 type WorkflowsRouteScreenProps = {
@@ -10,7 +10,7 @@ export function WorkflowsRouteScreen({
   selectedWorkflowId,
 }: WorkflowsRouteScreenProps) {
   const { closeWorkflowDetail, goWorkflow } = useAppNavigation();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const channels = channelsQuery.data ?? [];
   const memberChannels = channels.filter((channel) => channel.isMember);
 

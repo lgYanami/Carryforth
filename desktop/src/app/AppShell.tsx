@@ -9,6 +9,7 @@ import { AppTopChrome } from "@/app/AppTopChrome";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useBackForwardControls } from "@/app/navigation/useBackForwardControls";
 import { useCommunityNavigationTransitions } from "@/app/useCommunityNavigationTransitions";
+import { useCommunityDestinationRestore } from "@/app/useCommunityDestinationRestore";
 import { useLiveHomeFeedActions } from "@/app/useLiveHomeFeedActions";
 import { useChannelBrowserDialog } from "@/app/useChannelBrowserDialog";
 import { useMarkAsReadShortcuts } from "@/app/useMarkAsReadShortcuts";
@@ -26,6 +27,10 @@ import {
   useOpenDmMutation,
 } from "@/features/channels/hooks";
 import { useUnreadChannels } from "@/features/channels/useUnreadChannels";
+import {
+  useMeetingRoomPartition,
+  useUnreadMeetingIds,
+} from "@/features/meeting/useMeetingShellState";
 import { msgContextKey } from "@/features/channels/readState/readStateFormat";
 import { useMembershipNotifications } from "@/features/channels/useMembershipNotifications";
 import { useFeedItemState } from "@/features/home/useFeedItemState";
@@ -73,11 +78,6 @@ import { CommunityRail } from "@/features/sidebar/ui/CommunityRail";
 import { useChannelMutes } from "@/features/sidebar/lib/useChannelMutes";
 import { useChannelStars } from "@/features/sidebar/lib/useChannelStars";
 import { useCommunities } from "@/features/communities/useCommunities";
-import {
-  consumePendingCommunityRestore,
-  loadCommunityDestination,
-  saveCommunityDestination,
-} from "@/features/communities/communityNavigationStorage";
 import { useAddCommunityDialogState } from "@/features/communities/addCommunityPrefill";
 import { useApplyTemplate } from "@/features/channel-templates/useApplyTemplate";
 import { relayClient } from "@/shared/api/relayClient";
@@ -211,10 +211,12 @@ export function AppShell() {
   const feedItemState = useFeedItemState(identityQuery.data?.pubkey);
   const channelsQuery = useChannelsQuery();
   const channels = channelsQuery.data ?? [];
+  const { conversationChannels, meetingItems, meetingRooms, sidebarChannels } =
+    useMeetingRoomPartition(channels);
   useReminderNotifications(
     identityQuery.data?.pubkey,
     notificationSettings.settings,
-    channels,
+    conversationChannels,
   );
   const refetchHomeFeedFromLiveSignal = React.useEffectEvent(() => {
     void homeFeedQuery.refetch();
@@ -232,62 +234,15 @@ export function AppShell() {
     channelsErrorMessage,
     communitiesHook.activeCommunity?.relayUrl,
   );
-  const memberChannels = React.useMemo(
-    () => channels.filter((channel) => channel.isMember),
-    [channels],
-  );
-  const sidebarChannels = React.useMemo(
-    () => memberChannels.filter((channel) => channel.archivedAt === null),
-    [memberChannels],
-  );
-  const hasRestoredCommunityDestinationRef = React.useRef(false);
-  React.useEffect(() => {
-    const activeCommunityId = communitiesHook.activeCommunity?.id;
-    if (
-      hasRestoredCommunityDestinationRef.current ||
-      !channelsQuery.isSuccess ||
-      channelsQuery.dataUpdatedAt === 0 ||
-      !activeCommunityId
-    ) {
-      return;
-    }
-    hasRestoredCommunityDestinationRef.current = true;
-
-    // Restoration belongs to an explicit community transition. Cold boot and
-    // reconnect remounts must preserve the route the user explicitly opened.
-    if (!consumePendingCommunityRestore(activeCommunityId)) {
-      return;
-    }
-
-    const destination = loadCommunityDestination(activeCommunityId);
-    if (!destination || destination.kind === "home") {
-      return;
-    }
-
-    const channelIsAvailable = sidebarChannels.some(
-      (channel) => channel.id === destination.channelId,
-    );
-    if (!channelIsAvailable) {
-      saveCommunityDestination(activeCommunityId, { kind: "home" });
-      void goHome({ replace: true });
-      return;
-    }
-
-    // Onboarding and deep-link transitions may request destination restoration
-    // after the target community mounts. Normal rail navigation now enters the
-    // Overview explicitly and exposes the destination through Continue.
-    if (selectedView === "home") {
-      void goChannel(destination.channelId, { replace: true });
-    }
-  }, [
-    channelsQuery.dataUpdatedAt,
-    channelsQuery.isSuccess,
-    communitiesHook.activeCommunity?.id,
-    goChannel,
-    goHome,
+  useCommunityDestinationRestore({
+    activeCommunityId: communitiesHook.activeCommunity?.id,
+    channelsDataUpdatedAt: channelsQuery.dataUpdatedAt,
+    channelsReady: channelsQuery.isSuccess,
+    meetingRooms,
     selectedView,
     sidebarChannels,
-  ]);
+    navigation: { goChannel, goHome },
+  });
   const activeChannel = React.useMemo(
     () =>
       selectedChannelId
@@ -298,16 +253,20 @@ export function AppShell() {
   const managedChannel = React.useMemo(() => {
     const targetChannelId = managedChannelId ?? selectedChannelId;
     return targetChannelId
-      ? (channels.find((channel) => channel.id === targetChannelId) ?? null)
+      ? (conversationChannels.find(
+          (channel) => channel.id === targetChannelId,
+        ) ?? null)
       : null;
-  }, [channels, managedChannelId, selectedChannelId]);
+  }, [conversationChannels, managedChannelId, selectedChannelId]);
+  const activeConversationChannel =
+    activeChannel?.roomKind === "meeting" ? null : activeChannel;
 
   const {
     handleChannelNotification,
     handleDmNotification,
     handleThreadReplyDesktopNotification,
   } = useAppShellDesktopNotifications({
-    channels,
+    channels: conversationChannels,
     goChannel,
     goHome,
     notificationSettings: notificationSettings.settings,
@@ -341,7 +300,7 @@ export function AppShell() {
     mutedRootIds,
     muteThread,
     unmuteThread,
-  } = useUnreadChannels(sidebarChannels, activeChannel, {
+  } = useUnreadChannels(sidebarChannels, activeConversationChannel, {
     pubkey: identityQuery.data?.pubkey,
     relayClient,
     relayUrl: communitiesHook.activeCommunity?.relayUrl,
@@ -401,7 +360,17 @@ export function AppShell() {
   const threadActivityFeedItems = useThreadActivityFeedItems(
     threadActivityItems,
     mutedRootIds,
-    channels,
+    conversationChannels,
+  );
+
+  const unreadMeetingIds = useUnreadMeetingIds(
+    meetingItems,
+    getChannelReadAt,
+    readStateVersion,
+  );
+  const allUnreadRoomIds = React.useMemo(
+    () => new Set([...unreadChannelIds, ...unreadMeetingIds]),
+    [unreadChannelIds, unreadMeetingIds],
   );
 
   // Badge count consumes the shared NIP-RS read-state from useUnreadChannels.
@@ -421,7 +390,7 @@ export function AppShell() {
       threadActivityFeedItems,
       getThreadReadAt,
       getMessageReadAt,
-      channels,
+      conversationChannels,
     );
 
   const dueReminderBadge = useDueReminderBadgeCount(
@@ -616,8 +585,9 @@ export function AppShell() {
 
   useAppShellLifecycleEffects({
     homeBadgeCountExcludingHighPriority,
-    unreadChannelIds,
-    unreadChannelNotificationCount,
+    unreadChannelIds: allUnreadRoomIds,
+    unreadChannelNotificationCount:
+      unreadChannelNotificationCount + unreadMeetingIds.size,
   });
 
   // Dispatch `buzz://message` deep links into the router.
@@ -700,8 +670,8 @@ export function AppShell() {
     open: settingsOpen,
   });
   useMarkAsReadShortcuts({
-    activeChannelId: activeChannel?.id ?? null,
-    activeChannelLastMessageAt: activeChannel?.lastMessageAt,
+    activeChannelId: activeConversationChannel?.id ?? null,
+    activeChannelLastMessageAt: activeConversationChannel?.lastMessageAt,
     markAllChannelsRead,
     markChannelRead,
     selectedView,
@@ -709,7 +679,7 @@ export function AppShell() {
 
   return (
     <PreventSleepProvider>
-      <ChannelNavigationProvider channels={channels}>
+      <ChannelNavigationProvider channels={conversationChannels}>
         <AppShellProvider
           value={{
             markAllChannelsRead,
@@ -824,6 +794,7 @@ export function AppShell() {
                         <AppSidebar
                           activeCommunity={communitiesHook.activeCommunity}
                           channels={sidebarChannels}
+                          meetingItems={meetingItems}
                           currentPubkey={identityQuery.data?.pubkey}
                           errorMessage={channelsErrorMessage}
                           fallbackDisplayName={identityQuery.data?.displayName}
@@ -880,7 +851,7 @@ export function AppShell() {
                             void goChannel(channelId)
                           }
                           onOpenSearchResult={handleOpenSearchResult}
-                          searchChannels={channels}
+                          searchChannels={conversationChannels}
                           searchFocusRequest={searchFocusRequest}
                           onSelectHome={() => void goHome()}
                           onSelectProjects={() => void goProjects()}
@@ -910,6 +881,7 @@ export function AppShell() {
                           selectedChannelId={selectedChannelId}
                           selectedView={selectedView}
                           unreadChannelIds={unreadChannelIds}
+                          unreadMeetingIds={unreadMeetingIds}
                           unreadChannelCounts={unreadChannelCounts}
                           mutedChannelIds={mutedChannelIds}
                           onMuteChannel={muteChannel}
@@ -944,7 +916,7 @@ export function AppShell() {
                     <AppShellOverlays
                       activeChannel={managedChannel}
                       browseDialogType={browseDialogType}
-                      channels={channels}
+                      channels={conversationChannels}
                       currentPubkey={identityQuery.data?.pubkey}
                       isChannelManagementOpen={isChannelManagementOpen}
                       isCreatingBrowseChannel={

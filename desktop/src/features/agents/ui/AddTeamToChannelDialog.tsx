@@ -16,7 +16,7 @@ import {
   getDefaultPersonaRuntime,
   resolvePersonaRuntime,
 } from "@/features/agents/lib/resolvePersonaRuntime";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import type {
   AgentPersona,
@@ -52,7 +52,7 @@ export function AddTeamToChannelDialog({
   onDeployed,
 }: AddTeamToChannelDialogProps) {
   const { globalConfig } = useGlobalAgentConfig();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const providersQuery = useAvailableAcpRuntimes();
   const [channelId, setChannelId] = React.useState("");
   const [role, setRole] = React.useState<Exclude<ChannelRole, "owner">>("bot");

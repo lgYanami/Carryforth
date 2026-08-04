@@ -69,6 +69,7 @@ function normalizeChannelName(name: string) {
 
 function isOpenStreamStarterChannel(channel: Channel, name: string) {
   return (
+    channel.roomKind !== "meeting" &&
     normalizeChannelName(channel.name) === normalizeChannelName(name) &&
     channel.channelType === "stream" &&
     channel.visibility === "open" &&
@@ -128,6 +129,7 @@ export function isWelcomeChannel(channel: Channel | null | undefined) {
   return (
     channel !== null &&
     channel !== undefined &&
+    channel.roomKind !== "meeting" &&
     channel.name === WELCOME_CHANNEL_NAME &&
     channel.channelType === "stream" &&
     channel.visibility === "private"

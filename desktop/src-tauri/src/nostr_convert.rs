@@ -117,6 +117,7 @@ pub fn channel_info_from_event(
                 "stream".to_string()
             }
         });
+    let room_kind = first_tag_value(event, "room_kind").map(str::to_string);
     let visibility_tag = first_tag_value(event, "visibility");
     let visibility = if has_tag(event, "public") || visibility_tag == Some("open") {
         "open".to_string()
@@ -162,6 +163,7 @@ pub fn channel_info_from_event(
         id,
         name,
         channel_type,
+        room_kind,
         visibility,
         description,
         topic,
@@ -198,6 +200,7 @@ pub fn channel_detail_from_event(event: &Event) -> Result<ChannelDetailInfo, Str
                 "stream".to_string()
             }
         });
+    let room_kind = first_tag_value(event, "room_kind").map(str::to_string);
     let visibility_tag = first_tag_value(event, "visibility");
     let visibility = if has_tag(event, "public") || visibility_tag == Some("open") {
         "open".to_string()
@@ -219,6 +222,7 @@ pub fn channel_detail_from_event(event: &Event) -> Result<ChannelDetailInfo, Str
         id,
         name,
         channel_type,
+        room_kind,
         visibility,
         description,
         topic,
@@ -630,9 +634,31 @@ mod tests {
         assert_eq!(info.name, "general");
         assert_eq!(info.description, "main channel");
         assert_eq!(info.channel_type, "stream");
+        assert_eq!(info.room_kind, None);
         assert_eq!(info.visibility, "open");
         assert_eq!(info.member_count, 0);
         assert!(info.is_member);
+    }
+
+    #[test]
+    fn channel_info_preserves_explicit_room_kind_without_inference() {
+        for (room_kind, expected) in [
+            ("channel", "channel"),
+            ("meeting", "meeting"),
+            ("future-room", "future-room"),
+        ] {
+            let e = ev(
+                39000,
+                "",
+                vec![
+                    vec!["d", "u"],
+                    vec!["name", "Meeting-looking title"],
+                    vec!["room_kind", room_kind],
+                ],
+            );
+            let info = channel_info_from_event(&e, None, None).unwrap();
+            assert_eq!(info.room_kind.as_deref(), Some(expected));
+        }
     }
 
     #[test]
