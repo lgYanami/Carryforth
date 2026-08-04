@@ -50,14 +50,6 @@ const MAX_MENTIONS: usize = 32;
 pub(crate) const V0_SYSTEM_PROMPT: &str = include_str!("meeting_prompt.md");
 /// Meeting V1 advisory system policy installed for moderated baton turns.
 pub(crate) const V1_SYSTEM_PROMPT: &str = include_str!("meeting_v1_prompt.md");
-/// Meeting V2 participant policy installed for moderated Board turns.
-pub(crate) const V2_SYSTEM_PROMPT: &str = include_str!("meeting_v2_participant_prompt.md");
-/// Meeting V2 moderator policy installed for Board/Floor control turns.
-pub(crate) const V2_MODERATOR_SYSTEM_PROMPT: &str = include_str!("meeting_v2_moderator_prompt.md");
-/// Unified Meeting V2 action-capable policy installed for every Turn in the
-/// same channel ACP Session.
-pub(crate) const V2_ACTIONS_SYSTEM_PROMPT: &str = include_str!("meeting_v2_actions_prompt.md");
-
 /// The dedicated room subscription used independently of ordinary ACP rules.
 pub(crate) fn subscription_filter() -> ChannelFilter {
     ChannelFilter {
@@ -90,6 +82,9 @@ pub(crate) struct MeetingTurnRequest {
     pub(super) basis_id: String,
     pub(super) round_number: u64,
     pub(super) speech_cursor: Option<String>,
+    /// Authoritative Speech revision the Board prompt was built from. Present
+    /// only for Meeting V2 Board Maintenance requests.
+    pub(super) expected_speech_revision: Option<u64>,
     pub(super) floor_revision: u64,
     pub(super) grant_event_id: Option<String>,
     pub(super) queued_at_unix_ms: i64,
@@ -1766,6 +1761,7 @@ impl V0MeetingCoordinator {
                 basis_id: basis,
                 round_number: view.floor.round_number,
                 speech_cursor: view.speech_cursor.clone(),
+                expected_speech_revision: None,
                 floor_revision: view.floor.floor_revision,
                 grant_event_id: Some(grant_id.clone()),
                 queued_at_unix_ms: now_ms(),
@@ -1856,6 +1852,7 @@ impl V0MeetingCoordinator {
             basis_id: basis.clone(),
             round_number: updated_view.floor.round_number,
             speech_cursor: updated_view.speech_cursor.clone(),
+            expected_speech_revision: None,
             floor_revision: updated_view.floor.floor_revision,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
@@ -3616,6 +3613,7 @@ mod tests {
             basis_id: basis_id.to_string(),
             round_number: 1,
             speech_cursor: None,
+            expected_speech_revision: None,
             floor_revision: 1,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
@@ -3635,6 +3633,7 @@ mod tests {
             basis_id: format!("{kind:?}:{session_id}"),
             round_number: 1,
             speech_cursor: None,
+            expected_speech_revision: None,
             floor_revision: 1,
             grant_event_id: matches!(
                 kind,

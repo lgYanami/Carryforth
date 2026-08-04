@@ -92,6 +92,9 @@ pub struct SessionState {
     /// This version axis is intentionally independent of Project revision.
     /// A missing or mismatched ID makes an otherwise-active session stale.
     project_space_contract_ids: HashMap<Uuid, [u8; 32]>,
+    /// Optional Meeting operating contract installed in each active channel
+    /// session. Absence means the session is an ordinary non-Meeting session.
+    meeting_contract_ids: HashMap<Uuid, [u8; 32]>,
     /// Contract content ID installed in the active heartbeat session.
     heartbeat_project_space_contract_id: Option<[u8; 32]>,
     /// Explicit Full Role Context refreshes waiting for a complete channel
@@ -192,6 +195,7 @@ impl SessionState {
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
         self.project_space_contract_ids.remove(channel_id);
+        self.meeting_contract_ids.remove(channel_id);
         self.deferred_channel_rotations.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
@@ -203,6 +207,7 @@ impl SessionState {
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
         self.project_space_contract_ids.clear();
+        self.meeting_contract_ids.clear();
         self.deferred_channel_rotations.clear();
         self.heartbeat_project_space_contract_id = None;
         self.core_sections.clear();
@@ -263,6 +268,57 @@ impl SessionState {
         }
     }
 
+    /// Invalidate an active channel session when its installed Meeting
+    /// contract differs from the contract required by the current prompt.
+    ///
+    /// Comparing `Option` is intentional: entering Meeting V2 rebuilds an
+    /// ordinary channel session, and returning to a non-Meeting context
+    /// rebuilds a session that still carries Meeting-only system policy.
+    fn invalidate_stale_meeting_contract(
+        &mut self,
+        source: &PromptSource,
+        current_id: Option<[u8; 32]>,
+    ) -> bool {
+        let PromptSource::Channel(channel_id) = source else {
+            debug_assert!(
+                current_id.is_none(),
+                "heartbeat cannot require Meeting context"
+            );
+            return false;
+        };
+        if !self.sessions.contains_key(channel_id) {
+            self.meeting_contract_ids.remove(channel_id);
+            return false;
+        }
+        let installed_id = self.meeting_contract_ids.get(channel_id).copied();
+        if installed_id == current_id {
+            false
+        } else {
+            self.invalidate_channel(channel_id)
+        }
+    }
+
+    /// Record the optional Meeting contract only after session creation and
+    /// compatibility system-prompt setup have both succeeded.
+    fn record_meeting_contract(&mut self, source: &PromptSource, current_id: Option<[u8; 32]>) {
+        let PromptSource::Channel(channel_id) = source else {
+            debug_assert!(
+                current_id.is_none(),
+                "heartbeat cannot require Meeting context"
+            );
+            return;
+        };
+        debug_assert!(self.sessions.contains_key(channel_id));
+        match current_id {
+            Some(id) => {
+                self.meeting_contract_ids.insert(*channel_id, id);
+            }
+            None => {
+                self.meeting_contract_ids.remove(channel_id);
+            }
+        }
+    }
+
     fn defer_rotation(&mut self, source: &PromptSource) {
         if let PromptSource::Channel(channel_id) = source {
             self.deferred_channel_rotations.insert(*channel_id);
@@ -285,6 +341,7 @@ impl SessionState {
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
             || self.project_space_contract_ids.contains_key(channel_id)
+            || self.meeting_contract_ids.contains_key(channel_id)
     }
 }
 
@@ -749,6 +806,9 @@ pub struct PromptContext {
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
     pub team_instructions: Option<String>,
+    /// Stable Meeting operating contract installed only for Meeting V2
+    /// sessions. Current Meeting facts remain in the per-turn envelope.
+    pub meeting_contract: Option<crate::meeting_context::MeetingOperatingContract>,
     pub heartbeat_prompt: Option<String>,
     /// Base prompt content, or `None` if `--no-base-prompt` was passed.
     ///
@@ -1350,8 +1410,8 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
 ) -> Result<String, AcpError> {
-    // Build workspace/base + the platform-owned Project Space contract +
-    // persona/team + agent core + canvas metadata into a single prompt.
+    // Build workspace/base + platform-owned Project Space and optional Meeting
+    // contracts + persona/team + agent core + canvas metadata into one prompt.
     // Standard protocol-v2 agents receive it in `session/new`; Goose receives
     // it through the custom request below. Legacy agents receive equivalent
     // labeled user-message sections via `format_prompt`. Dynamic Project and
@@ -1360,7 +1420,12 @@ async fn create_session_and_apply_model(
     let combined_system_prompt = with_canvas(
         with_core(
             with_team(
-                framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                framed_system_prompt(
+                    &ctx.cwd,
+                    ctx.base_prompt,
+                    ctx.meeting_contract.map(|contract| contract.section()),
+                    ctx.system_prompt.as_deref(),
+                ),
                 ctx.team_instructions.as_deref(),
             ),
             agent_core,
@@ -1675,6 +1740,19 @@ pub(crate) fn prepend_project_space_for_legacy(protocol_version: u32, body: &str
     }
 }
 
+/// Prepend an optional stable `[Meeting]` contract for a legacy user-message
+/// path. Modern agents receive it once through `session/new`.
+pub(crate) fn prepend_meeting_contract_for_legacy(
+    protocol_version: u32,
+    meeting_contract: Option<&str>,
+    body: &str,
+) -> String {
+    match meeting_contract {
+        Some(contract) if protocol_version < 2 => format!("{contract}\n\n{body}"),
+        _ => body.to_string(),
+    }
+}
+
 /// Prepend the `[Channel Canvas]` section to the legacy initial-message body.
 ///
 /// Protocol-v2 agents already receive the canvas in `systemPrompt`; only
@@ -1703,13 +1781,33 @@ pub(crate) fn prepend_role_brief(role_brief: &str, body: &str) -> String {
     format!("{role_brief}\n{body}")
 }
 
+/// Assemble one complete ACP prompt with freshly resolved Role Context before
+/// every dynamic body block. Meeting turns use the no-command path, so their
+/// current envelope and Board always follow the Role Brief/Binding.
+fn complete_turn_prompt_blocks<'a>(
+    slash_command: Option<&'a str>,
+    role_context: &'a str,
+    prompt_sections: &'a [String],
+) -> Vec<&'a str> {
+    match slash_command {
+        Some(command) => std::iter::once(command)
+            .chain(std::iter::once(role_context))
+            .chain(prompt_sections.iter().map(String::as_str))
+            .collect(),
+        None => std::iter::once(role_context)
+            .chain(prompt_sections.iter().map(String::as_str))
+            .collect(),
+    }
+}
+
 /// Frame the `session/new` `systemPrompt` so each section carries its own
 /// header and ownership boundary remains recoverable downstream.
 ///
 /// The stable `[Project Space]` contract is always present, independently of
-/// `--no-base-prompt` and persona configuration. The header framing matches
-/// the legacy per-turn path so the desktop observer can split the combined
-/// value into labeled sub-sections.
+/// `--no-base-prompt` and persona configuration. An optional `[Meeting]`
+/// contract follows it for Meeting V2 sessions. The header framing matches the
+/// legacy per-turn path so the desktop observer can split the combined value
+/// into labeled sub-sections.
 ///
 /// Prepends a `[Workspace]` section naming the agent's absolute working
 /// directory. The base prompt describes the workspace layout but never its
@@ -1721,9 +1819,10 @@ pub(crate) fn prepend_role_brief(role_brief: &str, body: &str) -> String {
 fn framed_system_prompt(
     cwd: &str,
     base_prompt: Option<&str>,
+    meeting_contract: Option<&str>,
     system_prompt: Option<&str>,
 ) -> Option<String> {
-    let mut sections = Vec::with_capacity(4);
+    let mut sections = Vec::with_capacity(5);
 
     // Anchor the workspace only when a base prompt is present — the workspace
     // section grounds the base prompt's layout description.
@@ -1736,6 +1835,9 @@ fn framed_system_prompt(
         sections.push(crate::queue::base_section(base_prompt));
     }
     sections.push(crate::project_space::PROJECT_SPACE_SECTION.to_string());
+    if let Some(meeting_contract) = meeting_contract {
+        sections.push(meeting_contract.to_string());
+    }
     if let Some(system_prompt) = system_prompt {
         sections.push(format!("[System]\n{system_prompt}"));
     }
@@ -2028,6 +2130,20 @@ pub async fn run_prompt_task(
             "invalidated session with stale Project Space contract"
         );
     }
+    let meeting_contract_id = ctx.meeting_contract.map(|contract| contract.id());
+    if agent
+        .state
+        .invalidate_stale_meeting_contract(&source, meeting_contract_id)
+    {
+        tracing::info!(
+            target: "pool::session",
+            contract_version = ctx
+                .meeting_contract
+                .map(|contract| contract.version())
+                .unwrap_or("none"),
+            "invalidated session with mismatched Meeting contract"
+        );
+    }
     if let Some((session_id, reason)) = connector_context_reset {
         agent
             .state
@@ -2066,6 +2182,8 @@ pub async fn run_prompt_task(
         serde_json::json!({
             "contractVersion": crate::project_space::PROJECT_SPACE_CONTRACT_VERSION,
             "contractId": hex::encode(project_space_contract_id),
+            "meetingContractVersion": ctx.meeting_contract.map(|contract| contract.version()),
+            "meetingContractId": meeting_contract_id.map(hex::encode),
             "requestedRefresh": match role_context_refresh {
                 crate::role_brief::RoleContextRefresh::Incremental => "incremental",
                 crate::role_brief::RoleContextRefresh::Full => "full",
@@ -2235,6 +2353,9 @@ pub async fn run_prompt_task(
                         agent
                             .state
                             .record_project_space_contract(&source, project_space_contract_id);
+                        agent
+                            .state
+                            .record_meeting_contract(&source, meeting_contract_id);
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
@@ -2286,6 +2407,9 @@ pub async fn run_prompt_task(
                         agent
                             .state
                             .record_project_space_contract(&source, project_space_contract_id);
+                        agent
+                            .state
+                            .record_meeting_contract(&source, meeting_contract_id);
                         (sid, true)
                     }
                     Err(AcpError::AgentExited) => {
@@ -2342,7 +2466,8 @@ pub async fn run_prompt_task(
             // Modern agents already received all stable sections through the
             // system role. Legacy agents need labeled compatibility context on
             // this first user message. Compose in reverse-prepend order so the
-            // final stable order is [Base] → [Project Space] → [Channel Canvas].
+            // final stable order is [Base] → [Project Space] → [Meeting] →
+            // [Channel Canvas].
             let prompt_protocol_version = if agent.has_system_prompt_support() {
                 2
             } else {
@@ -2352,6 +2477,11 @@ pub async fn run_prompt_task(
                 prompt_protocol_version,
                 agent_canvas.as_deref(),
                 initial_msg,
+            );
+            let init_msg = prepend_meeting_contract_for_legacy(
+                prompt_protocol_version,
+                ctx.meeting_contract.map(|contract| contract.section()),
+                &init_msg,
             );
             let init_msg = prepend_project_space_for_legacy(prompt_protocol_version, &init_msg);
             let init_msg =
@@ -2480,6 +2610,11 @@ pub async fn run_prompt_task(
         } else {
             1
         };
+        let text = prepend_meeting_contract_for_legacy(
+            prompt_protocol_version,
+            ctx.meeting_contract.map(|contract| contract.section()),
+            &text,
+        );
         let text = prepend_project_space_for_legacy(prompt_protocol_version, &text);
         let text = prepend_base_for_legacy(prompt_protocol_version, ctx.base_prompt, &text);
         vec![text]
@@ -2526,6 +2661,7 @@ pub async fn run_prompt_task(
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: ctx.base_prompt,
                 project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
+                meeting_contract: ctx.meeting_contract.map(|contract| contract.section()),
                 system_prompt: ctx.system_prompt.as_deref(),
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
@@ -2610,15 +2746,11 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
-    let prompt_blocks: Vec<&str> = match slash_command {
-        Some(ref cmd) => std::iter::once(cmd.as_str())
-            .chain(std::iter::once(role_context.markdown.as_str()))
-            .chain(prompt_sections.iter().map(String::as_str))
-            .collect(),
-        None => std::iter::once(role_context.markdown.as_str())
-            .chain(prompt_sections.iter().map(String::as_str))
-            .collect(),
-    };
+    let prompt_blocks = complete_turn_prompt_blocks(
+        slash_command.as_deref(),
+        &role_context.markdown,
+        &prompt_sections,
+    );
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -5081,6 +5213,25 @@ mod tests {
         assert_eq!(composed, "hello channel");
     }
 
+    // ── prepend_meeting_contract_for_legacy ────────────────────────────────
+
+    #[test]
+    fn legacy_meeting_agent_gets_labeled_contract_before_turn_body() {
+        let contract = crate::meeting_context::V2_MEETING_CONTRACT.section();
+        let composed = prepend_meeting_contract_for_legacy(1, Some(contract), "turn body");
+        assert!(composed.starts_with("[Meeting]\n"));
+        assert!(composed.ends_with("\n\nturn body"));
+    }
+
+    #[test]
+    fn modern_meeting_agent_omits_contract_from_user_message() {
+        let contract = crate::meeting_context::V2_MEETING_CONTRACT.section();
+        assert_eq!(
+            prepend_meeting_contract_for_legacy(2, Some(contract), "turn body"),
+            "turn body"
+        );
+    }
+
     // ── prepend_canvas_for_legacy ─────────────────────────────────────────────
 
     #[test]
@@ -5168,12 +5319,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn complete_meeting_turn_places_current_role_context_before_the_envelope() {
+        let prompt_sections = vec![
+            "MEETING TURN ENVELOPE:\n{\"context_version\":\"meeting-context-v1\"}\n\nCURRENT MEETING BOARD:\n{\"current_board\":{}}"
+                .to_string(),
+        ];
+        for role_context in [
+            "[Role Brief]\nState: assigned\nAssignment: current",
+            "[Role Binding]\nState: unchanged\nAssignment: current",
+            "[Role Context]\nState: unavailable",
+        ] {
+            let blocks = complete_turn_prompt_blocks(None, role_context, &prompt_sections);
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0], role_context);
+            assert!(blocks[1].starts_with("MEETING TURN ENVELOPE:"));
+            assert!(blocks[1].contains("CURRENT MEETING BOARD:"));
+        }
+    }
+
     // Pin the session/new systemPrompt framing: each present prompt carries its
     // own header so the desktop observer can split into labeled sub-sections.
 
     #[test]
     fn test_framed_system_prompt_both_present_carries_both_headers() {
-        let framed = framed_system_prompt("/", Some("base text"), Some("persona text"))
+        let framed = framed_system_prompt("/", Some("base text"), None, Some("persona text"))
             .expect("both present yields Some");
         assert_eq!(
             framed,
@@ -5186,7 +5356,8 @@ mod tests {
 
     #[test]
     fn test_framed_system_prompt_base_only_labels_base() {
-        let framed = framed_system_prompt("/", Some("base text"), None).expect("base yields Some");
+        let framed =
+            framed_system_prompt("/", Some("base text"), None, None).expect("base yields Some");
         assert_eq!(
             framed,
             format!(
@@ -5200,8 +5371,8 @@ mod tests {
     fn test_framed_system_prompt_persona_only_labels_system() {
         // A bare persona would be mislabeled "Base" downstream — it must carry
         // its own [System] header even when no base prompt exists.
-        let framed =
-            framed_system_prompt("/", None, Some("persona text")).expect("persona yields Some");
+        let framed = framed_system_prompt("/", None, None, Some("persona text"))
+            .expect("persona yields Some");
         assert_eq!(
             framed,
             format!(
@@ -5213,7 +5384,7 @@ mod tests {
 
     #[test]
     fn test_framed_system_prompt_contract_survives_no_base_and_no_persona() {
-        let framed = framed_system_prompt("/", None, None)
+        let framed = framed_system_prompt("/", None, None, None)
             .expect("Project Space contract survives without base or persona");
         assert_eq!(framed, crate::project_space::PROJECT_SPACE_SECTION);
         assert!(framed.contains("versioned Project Documents"));
@@ -5224,7 +5395,7 @@ mod tests {
 
     #[test]
     fn test_framed_system_prompt_absolute_cwd_prepends_workspace_before_base() {
-        let framed = framed_system_prompt("/Users/me/.buzz", Some("base text"), None)
+        let framed = framed_system_prompt("/Users/me/.buzz", Some("base text"), None, None)
             .expect("base yields Some");
         assert!(
             framed.starts_with("[Workspace]\n"),
@@ -5246,7 +5417,7 @@ mod tests {
     fn test_framed_system_prompt_persona_only_omits_workspace() {
         // The workspace section grounds the base prompt's layout; a persona-only
         // agent never received that layout, so no [Workspace] anchor is emitted.
-        let framed = framed_system_prompt("/Users/me/.buzz", None, Some("persona text"))
+        let framed = framed_system_prompt("/Users/me/.buzz", None, None, Some("persona text"))
             .expect("persona yields Some");
         assert_eq!(
             framed,
@@ -5260,7 +5431,8 @@ mod tests {
     #[test]
     fn test_framed_system_prompt_root_cwd_omits_workspace() {
         // The "/" fallback must never be named — it would invite a $HOME scan.
-        let framed = framed_system_prompt("/", Some("base text"), None).expect("base yields Some");
+        let framed =
+            framed_system_prompt("/", Some("base text"), None, None).expect("base yields Some");
         assert_eq!(
             framed,
             format!(
@@ -5275,7 +5447,12 @@ mod tests {
         let prompt = with_canvas(
             with_core(
                 with_team(
-                    framed_system_prompt("/workspace", Some("base text"), Some("persona text")),
+                    framed_system_prompt(
+                        "/workspace",
+                        Some("base text"),
+                        Some(crate::meeting_context::V2_MEETING_CONTRACT.section()),
+                        Some("persona text"),
+                    ),
                     Some("team text"),
                 ),
                 Some("[Agent Memory — core]\ncore text"),
@@ -5288,6 +5465,7 @@ mod tests {
             "[Workspace]",
             "[Base]",
             "[Project Space]",
+            "[Meeting]",
             "[System]",
             "[Team Instructions]",
             "[Agent Memory — core]",
@@ -6006,6 +6184,88 @@ mod tests {
             .project_space_contract_ids
             .contains_key(&other_channel_id));
         assert!(state.heartbeat_project_space_contract_id.is_none());
+    }
+
+    #[test]
+    fn current_meeting_contract_preserves_the_channel_session() {
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let current_id = crate::meeting_context::V2_MEETING_CONTRACT.id();
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "meeting-session".into());
+        state.record_meeting_contract(&source, Some(current_id));
+
+        assert!(!state.invalidate_stale_meeting_contract(&source, Some(current_id)));
+        assert_eq!(
+            state.sessions.get(&channel_id).map(String::as_str),
+            Some("meeting-session")
+        );
+    }
+
+    #[test]
+    fn connector_reset_keeps_meeting_session_and_forces_full_role_context() {
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let contract_id = crate::meeting_context::V2_MEETING_CONTRACT.id();
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(channel_id, "continuous-meeting-session".into());
+        state.record_meeting_contract(&source, Some(contract_id));
+        state.force_role_context_refresh(&source, RoleContextRefreshReason::ConnectorContextReset);
+
+        assert!(!state.invalidate_stale_meeting_contract(&source, Some(contract_id)));
+        assert_eq!(
+            state.sessions.get(&channel_id).map(String::as_str),
+            Some("continuous-meeting-session")
+        );
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+        assert_eq!(
+            role_context_refresh_reason_for(&state, &source),
+            "connector_context_reset"
+        );
+
+        state.acknowledge_role_context_refresh(&source, true);
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Incremental
+        );
+    }
+
+    #[test]
+    fn entering_meeting_rebuilds_an_ordinary_channel_session() {
+        let channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(channel_id);
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "ordinary-session".into());
+
+        assert!(state.invalidate_stale_meeting_contract(
+            &source,
+            Some(crate::meeting_context::V2_MEETING_CONTRACT.id())
+        ));
+        assert!(!state.has_channel_state(&channel_id));
+        assert_eq!(
+            role_context_refresh_for(&state, &source),
+            crate::role_brief::RoleContextRefresh::Full
+        );
+    }
+
+    #[test]
+    fn changed_or_removed_meeting_contract_rebuilds_the_session() {
+        let current_id = crate::meeting_context::V2_MEETING_CONTRACT.id();
+        for desired in [Some([0x6b; 32]), None] {
+            let channel_id = Uuid::new_v4();
+            let source = PromptSource::Channel(channel_id);
+            let mut state = SessionState::default();
+            state.sessions.insert(channel_id, "meeting-session".into());
+            state.record_meeting_contract(&source, Some(current_id));
+
+            assert!(state.invalidate_stale_meeting_contract(&source, desired));
+            assert!(!state.has_channel_state(&channel_id));
+        }
     }
 
     #[test]
@@ -7040,6 +7300,7 @@ mod tests {
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
             team_instructions: None,
+            meeting_contract: None,
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),

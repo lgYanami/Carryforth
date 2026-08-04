@@ -8,6 +8,7 @@ mod filter;
 mod meeting;
 #[cfg(feature = "meeting-acceptance")]
 mod meeting_acceptance;
+mod meeting_context;
 mod meeting_v1;
 mod meeting_v2;
 mod observer;
@@ -1835,6 +1836,7 @@ async fn tokio_main(
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
         team_instructions: config.team_instructions.clone(),
+        meeting_contract: None,
         base_prompt: if config.no_base_prompt {
             None
         } else if let Some(content) = base_prompt_content {
@@ -1879,6 +1881,7 @@ async fn tokio_main(
         dedup_mode: DedupMode::Drop,
         system_prompt: ctx.system_prompt.clone(),
         team_instructions: ctx.team_instructions.clone(),
+        meeting_contract: None,
         base_prompt: Some(meeting::V0_SYSTEM_PROMPT),
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
@@ -1907,6 +1910,7 @@ async fn tokio_main(
         dedup_mode: DedupMode::Drop,
         system_prompt: ctx.system_prompt.clone(),
         team_instructions: ctx.team_instructions.clone(),
+        meeting_contract: None,
         base_prompt: Some(meeting::V1_SYSTEM_PROMPT),
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
@@ -1923,9 +1927,10 @@ async fn tokio_main(
         harness_name: ctx.harness_name.clone(),
         relay_url: ctx.relay_url.clone(),
     });
+    // Participant, moderator, and action-capable V2 Turns deliberately share
+    // this exact PromptContext. Their per-Turn envelopes narrow authority;
+    // changing Turn kind must never replace the Session's stable contract.
     let meeting_v2_ctx = Arc::new(PromptContext {
-        // V2 participants retain the V1 advisory tool surface behind a
-        // participant-only authority boundary.
         mcp_servers: mcp_servers.clone(),
         initial_message: None,
         idle_timeout: ctx.idle_timeout,
@@ -1934,7 +1939,8 @@ async fn tokio_main(
         dedup_mode: DedupMode::Drop,
         system_prompt: ctx.system_prompt.clone(),
         team_instructions: ctx.team_instructions.clone(),
-        base_prompt: Some(meeting::V2_SYSTEM_PROMPT),
+        meeting_contract: Some(meeting_context::V2_MEETING_CONTRACT),
+        base_prompt: ctx.base_prompt,
         heartbeat_prompt: None,
         cwd: ctx.cwd.clone(),
         rest_client: ctx.rest_client.clone(),
@@ -1950,61 +1956,8 @@ async fn tokio_main(
         harness_name: ctx.harness_name.clone(),
         relay_url: ctx.relay_url.clone(),
     });
-    let meeting_v2_moderator_ctx = Arc::new(PromptContext {
-        // Moderator Board/Floor proposals use the same advisory Runtime tools,
-        // but a distinct system boundary and never publish protocol events.
-        mcp_servers: mcp_servers.clone(),
-        initial_message: None,
-        idle_timeout: ctx.idle_timeout,
-        max_turn_duration: Duration::from_secs(270),
-        turn_liveness_interval: ctx.turn_liveness_interval,
-        dedup_mode: DedupMode::Drop,
-        system_prompt: ctx.system_prompt.clone(),
-        team_instructions: ctx.team_instructions.clone(),
-        base_prompt: Some(meeting::V2_MODERATOR_SYSTEM_PROMPT),
-        heartbeat_prompt: None,
-        cwd: ctx.cwd.clone(),
-        rest_client: ctx.rest_client.clone(),
-        role_brief_resolver: ctx.role_brief_resolver.clone(),
-        channel_info: ctx.channel_info.clone(),
-        context_message_limit: 0,
-        max_turns_per_session: ctx.max_turns_per_session,
-        permission_mode: ctx.permission_mode,
-        require_permission_mode: false,
-        agent_keys: ctx.agent_keys.clone(),
-        agent_owner_pubkey: ctx.agent_owner_pubkey,
-        memory_enabled: ctx.memory_enabled,
-        harness_name: ctx.harness_name.clone(),
-        relay_url: ctx.relay_url.clone(),
-    });
-    let meeting_v2_actions_ctx = Arc::new(PromptContext {
-        // The action-capable policy is deliberately uniform across
-        // participant, Board, Floor, and Action turns so one channel ACP
-        // Session never changes its authority boundary mid-meeting.
-        mcp_servers: mcp_servers.clone(),
-        initial_message: None,
-        idle_timeout: ctx.idle_timeout,
-        max_turn_duration: Duration::from_secs(270),
-        turn_liveness_interval: ctx.turn_liveness_interval,
-        dedup_mode: DedupMode::Drop,
-        system_prompt: ctx.system_prompt.clone(),
-        team_instructions: ctx.team_instructions.clone(),
-        base_prompt: Some(meeting::V2_ACTIONS_SYSTEM_PROMPT),
-        heartbeat_prompt: None,
-        cwd: ctx.cwd.clone(),
-        rest_client: ctx.rest_client.clone(),
-        role_brief_resolver: ctx.role_brief_resolver.clone(),
-        channel_info: ctx.channel_info.clone(),
-        context_message_limit: 0,
-        max_turns_per_session: ctx.max_turns_per_session,
-        permission_mode: ctx.permission_mode,
-        require_permission_mode: false,
-        agent_keys: ctx.agent_keys.clone(),
-        agent_owner_pubkey: ctx.agent_owner_pubkey,
-        memory_enabled: ctx.memory_enabled,
-        harness_name: ctx.harness_name.clone(),
-        relay_url: ctx.relay_url.clone(),
-    });
+    let meeting_v2_moderator_ctx = Arc::clone(&meeting_v2_ctx);
+    let meeting_v2_actions_ctx = Arc::clone(&meeting_v2_ctx);
     let mut meeting_controller = meeting::MeetingCoordinator::new(
         ctx.rest_client.clone(),
         config.keys.clone(),

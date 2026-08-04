@@ -1368,6 +1368,9 @@ pub struct FormatPromptArgs<'a> {
     /// an explicit argument makes this legacy boundary visible and testable
     /// instead of coupling queue formatting to session configuration.
     pub project_space_contract: Option<&'a str>,
+    /// Platform-owned Meeting operating contract for legacy Meeting V2
+    /// sessions. Ordinary channels and modern agents omit it here.
+    pub meeting_contract: Option<&'a str>,
     /// System prompt content for legacy agents (protocol_version < 2).
     pub system_prompt: Option<&'a str>,
     /// Team instructions for legacy agents, rendered after `[System]`.
@@ -1395,13 +1398,14 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// Produces a stable prompt with these sections (in order):
 /// 0. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
 /// 1. `[Project Space]` — stable contract (legacy agents)
-/// 2. `[System]` — system prompt (legacy agents)
-/// 3. `[Team Instructions]` — team instructions (legacy agents)
-/// 4. `[Agent Memory — core]` — if agent core memory is set
-/// 5. `[Channel Canvas]` — if channel canvas metadata is set
-/// 6. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 7. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 8. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 2. `[Meeting]` — stable Meeting contract (legacy Meeting V2 agents)
+/// 3. `[System]` — system prompt (legacy agents)
+/// 4. `[Team Instructions]` — team instructions (legacy agents)
+/// 5. `[Agent Memory — core]` — if agent core memory is set
+/// 6. `[Channel Canvas]` — if channel canvas metadata is set
+/// 7. `[Context]` — scope, channel name, and contextual hints for the agent
+/// 8. `[Thread Context]` or `[Conversation Context]` — if fetched
+/// 9. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1431,7 +1435,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         .map(|ci| ci.channel_type == "dm")
         .unwrap_or(false);
 
-    let mut sections: Vec<String> = Vec::with_capacity(9);
+    let mut sections: Vec<String> = Vec::with_capacity(10);
 
     // For legacy agents (protocol_version < 2), inject base_prompt and
     // system_prompt as user-message sections. Modern agents receive these
@@ -1441,6 +1445,9 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             sections.push(base_section(bp));
         }
         if let Some(contract) = args.project_space_contract {
+            sections.push(contract.to_string());
+        }
+        if let Some(contract) = args.meeting_contract {
             sections.push(contract.to_string());
         }
         if let Some(sp) = args.system_prompt {
@@ -2384,6 +2391,7 @@ mod tests {
                 has_system_prompt_support: false,
                 base_prompt: Some("test base prompt"),
                 project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
+                meeting_contract: Some(crate::meeting_context::V2_MEETING_CONTRACT.section()),
                 system_prompt: Some("test system prompt"),
                 team_instructions: Some("test team instructions"),
                 agent_core: Some(core),
@@ -2406,10 +2414,12 @@ mod tests {
             prompt.contains(crate::project_space::PROJECT_SPACE_SECTION),
             "missing [Project Space] section"
         );
+        assert!(prompt.contains("[Meeting]"), "missing [Meeting] section");
 
         // Stable ownership order must precede memory and turn context.
         let base_pos = prompt.find("[Base]").unwrap();
         let project_space_pos = prompt.find("[Project Space]").unwrap();
+        let meeting_pos = prompt.find("[Meeting]").unwrap();
         let system_pos = prompt.find("[System]").unwrap();
         let team_pos = prompt.find("[Team Instructions]").unwrap();
         let core_pos = prompt.find("[Agent Memory").unwrap();
@@ -2421,8 +2431,12 @@ mod tests {
             "[Base] should come before [Project Space]"
         );
         assert!(
-            project_space_pos < system_pos,
-            "[Project Space] should come before [System]"
+            project_space_pos < meeting_pos,
+            "[Project Space] should come before [Meeting]"
+        );
+        assert!(
+            meeting_pos < system_pos,
+            "[Meeting] should come before [System]"
         );
         assert!(
             system_pos < team_pos,
@@ -2464,6 +2478,7 @@ mod tests {
                 has_system_prompt_support: true,
                 base_prompt: Some("test base prompt"),
                 project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
+                meeting_contract: Some(crate::meeting_context::V2_MEETING_CONTRACT.section()),
                 system_prompt: Some("test system prompt"),
                 ..Default::default()
             },
@@ -2482,6 +2497,10 @@ mod tests {
         assert!(
             !prompt.contains("[Project Space]"),
             "[Project Space] should be suppressed from modern user context"
+        );
+        assert!(
+            !prompt.contains("[Meeting]"),
+            "[Meeting] should be suppressed from modern user context"
         );
         assert!(prompt.starts_with("[Context]"));
     }
