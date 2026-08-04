@@ -82,6 +82,9 @@ pub(crate) struct MeetingTurnRequest {
     pub(super) basis_id: String,
     pub(super) round_number: u64,
     pub(super) speech_cursor: Option<String>,
+    /// Authoritative Speech revision the Board prompt was built from. Present
+    /// only for Meeting V2 Board Maintenance requests.
+    pub(super) expected_speech_revision: Option<u64>,
     pub(super) floor_revision: u64,
     pub(super) grant_event_id: Option<String>,
     pub(super) queued_at_unix_ms: i64,
@@ -1758,6 +1761,7 @@ impl V0MeetingCoordinator {
                 basis_id: basis,
                 round_number: view.floor.round_number,
                 speech_cursor: view.speech_cursor.clone(),
+                expected_speech_revision: None,
                 floor_revision: view.floor.floor_revision,
                 grant_event_id: Some(grant_id.clone()),
                 queued_at_unix_ms: now_ms(),
@@ -1848,6 +1852,7 @@ impl V0MeetingCoordinator {
             basis_id: basis.clone(),
             round_number: updated_view.floor.round_number,
             speech_cursor: updated_view.speech_cursor.clone(),
+            expected_speech_revision: None,
             floor_revision: updated_view.floor.floor_revision,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
@@ -3608,6 +3613,7 @@ mod tests {
             basis_id: basis_id.to_string(),
             round_number: 1,
             speech_cursor: None,
+            expected_speech_revision: None,
             floor_revision: 1,
             grant_event_id: None,
             queued_at_unix_ms: now_ms(),
@@ -3627,6 +3633,7 @@ mod tests {
             basis_id: format!("{kind:?}:{session_id}"),
             round_number: 1,
             speech_cursor: None,
+            expected_speech_revision: None,
             floor_revision: 1,
             grant_event_id: matches!(
                 kind,
