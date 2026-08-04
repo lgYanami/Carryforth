@@ -11,7 +11,6 @@ use buzz_sdk_pkg::{
     MeetingV1HandoffType, MeetingV1HumanFloorRequestParams, MeetingV1HumanFloorWithdrawParams,
     MeetingV1OfferAckParams, MeetingV1OfferDeclineParams, MeetingV1SpeechParams,
 };
-use nostr::Event;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -25,12 +24,14 @@ use crate::{
     },
 };
 
+use super::pending::{
+    canonical_hex64, canonical_uuid, find_pending, insert_or_reuse_pending,
+    is_indeterminate_submit_error, remove_pending, PendingBinding,
+};
 use super::{
     load_meeting_snapshot_at, read_meeting_identity_at, MeetingLifecycle, MeetingLoadResult,
     MeetingParticipantType, MeetingSnapshot,
 };
-
-const MAX_PENDING_MEETING_COMMANDS: usize = 64;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -187,29 +188,29 @@ async fn execute_floor_action(
     let signer_pubkey = keys.public_key().to_hex();
     let validated = validate_input(input)?;
 
-    let pending =
-        if let Some(pending) = find_pending(state, &validated, &api_base_url, &signer_pubkey)? {
-            pending
-        } else {
-            let identity = read_meeting_identity_at(state, &api_base_url)
-                .await?
-                .ok_or_else(|| "unsupported: Relay does not advertise Meeting V2".to_string())?;
-            let loaded = load_meeting_snapshot_at(
-                state,
-                &identity,
-                &validated.meeting_id,
-                &api_base_url,
-                &keys,
-            )
-            .await
-            .map_err(super::read_error_message)?;
-            let MeetingLoadResult::Ready { snapshot } = loaded else {
-                return Err("Meeting Floor is unavailable for this Meeting".to_string());
-            };
-            let prepared =
-                prepare_command(&validated, &snapshot, &api_base_url, &signer_pubkey, &keys)?;
-            insert_or_reuse_pending(state, prepared, &validated, &api_base_url, &signer_pubkey)?
+    let binding = pending_binding(&validated, &api_base_url, &signer_pubkey);
+    let pending = if let Some(pending) = find_pending(state, &binding)? {
+        pending
+    } else {
+        let identity = read_meeting_identity_at(state, &api_base_url)
+            .await?
+            .ok_or_else(|| "unsupported: Relay does not advertise Meeting V2".to_string())?;
+        let loaded = load_meeting_snapshot_at(
+            state,
+            &identity,
+            &validated.meeting_id,
+            &api_base_url,
+            &keys,
+        )
+        .await
+        .map_err(super::read_error_message)?;
+        let MeetingLoadResult::Ready { snapshot } = loaded else {
+            return Err("Meeting Floor is unavailable for this Meeting".to_string());
         };
+        let prepared =
+            prepare_command(&validated, &snapshot, &api_base_url, &signer_pubkey, &keys)?;
+        insert_or_reuse_pending(state, prepared, &binding)?
+    };
 
     let response =
         match submit_signed_event_at_with_keys(&pending.event, state, &pending.api_base_url, &keys)
@@ -245,6 +246,21 @@ async fn execute_floor_action(
         state_revision: receipt.state_revision,
         duplicate: receipt.duplicate,
     })
+}
+
+fn pending_binding<'a>(
+    input: &'a ValidatedInput,
+    api_base_url: &'a str,
+    signer_pubkey: &'a str,
+) -> PendingBinding<'a> {
+    PendingBinding {
+        submission_id: &input.submission_id,
+        meeting_id: &input.meeting_id,
+        fingerprint: &input.fingerprint,
+        api_base_url,
+        signer_pubkey,
+        context: "Meeting Floor",
+    }
 }
 
 fn validate_input(input: MeetingFloorActionInput) -> Result<ValidatedInput, String> {
@@ -560,81 +576,6 @@ fn own_grant<'a>(
         .ok_or_else(|| "active Floor Grant disappeared".to_string())
 }
 
-fn find_pending(
-    state: &AppState,
-    input: &ValidatedInput,
-    api_base_url: &str,
-    signer_pubkey: &str,
-) -> Result<Option<PendingMeetingCommand>, String> {
-    let pending = state
-        .pending_writes
-        .meeting_commands
-        .lock()
-        .map_err(|error| error.to_string())?;
-    let Some(existing) = pending.get(&input.submission_id) else {
-        return Ok(None);
-    };
-    validate_pending_binding(existing, input, api_base_url, signer_pubkey)?;
-    Ok(Some(existing.clone()))
-}
-
-fn insert_or_reuse_pending(
-    state: &AppState,
-    prepared: PendingMeetingCommand,
-    input: &ValidatedInput,
-    api_base_url: &str,
-    signer_pubkey: &str,
-) -> Result<PendingMeetingCommand, String> {
-    let mut pending = state
-        .pending_writes
-        .meeting_commands
-        .lock()
-        .map_err(|error| error.to_string())?;
-    if let Some(existing) = pending.get(&input.submission_id) {
-        validate_pending_binding(existing, input, api_base_url, signer_pubkey)?;
-        return Ok(existing.clone());
-    }
-    if pending.len() >= MAX_PENDING_MEETING_COMMANDS {
-        return Err(
-            "too many unresolved Meeting Floor submissions; retry an existing submission first"
-                .to_string(),
-        );
-    }
-    pending.insert(input.submission_id.clone(), prepared.clone());
-    Ok(prepared)
-}
-
-fn validate_pending_binding(
-    pending: &PendingMeetingCommand,
-    input: &ValidatedInput,
-    api_base_url: &str,
-    signer_pubkey: &str,
-) -> Result<(), String> {
-    if pending.fingerprint != input.fingerprint {
-        return Err(
-            "Meeting Floor submission ID is already bound to a different action".to_string(),
-        );
-    }
-    if pending.meeting_id != input.meeting_id || pending.api_base_url != api_base_url {
-        return Err("Meeting Floor submission belongs to a different Community or Meeting; switch back before retrying".to_string());
-    }
-    if pending.signer_pubkey != signer_pubkey {
-        return Err("Meeting Floor submission belongs to a different identity; restore that identity before retrying".to_string());
-    }
-    Ok(())
-}
-
-fn remove_pending(state: &AppState, submission_id: &str, event: &Event) {
-    if let Ok(mut pending) = state.pending_writes.meeting_commands.lock() {
-        if pending
-            .get(submission_id)
-            .is_some_and(|candidate| candidate.event.id == event.id)
-        {
-            pending.remove(submission_id);
-        }
-    }
-}
-
 fn validate_receipt(
     response: &SubmitEventResponse,
     pending: &PendingMeetingCommand,
@@ -666,32 +607,6 @@ fn indeterminate_result(
         action: pending.action.clone(),
         message,
     }
-}
-
-fn is_indeterminate_submit_error(message: &str) -> bool {
-    message.starts_with("relay unreachable:")
-        || message.starts_with("relay returned malformed response:")
-        || message.starts_with("relay returned 408")
-        || message.starts_with("relay returned 5")
-}
-
-fn canonical_uuid(value: &str, context: &str) -> Result<String, String> {
-    let parsed = Uuid::parse_str(value).map_err(|_| format!("{context} must be a UUID"))?;
-    if parsed.is_nil() || parsed.to_string() != value {
-        return Err(format!("{context} must be a canonical non-nil UUID"));
-    }
-    Ok(value.to_string())
-}
-
-fn canonical_hex64(value: &str, context: &str) -> Result<(), String> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!("{context} must be canonical lowercase hex"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -729,6 +644,7 @@ mod tests {
                 offer: None,
                 grant: None,
             }),
+            host: None,
             participants: vec![
                 super::super::MeetingParticipant {
                     pubkey: host.clone(),
@@ -817,14 +733,15 @@ mod tests {
             fingerprint: input.fingerprint.clone(),
             action: "request".to_string(),
         };
+        let signer = "bb".repeat(32);
+        let binding = pending_binding(&input, "http://relay", &signer);
+        assert!(super::super::pending::validate_pending_binding(&pending, &binding).is_ok());
+        let other_relay = pending_binding(&input, "http://other", &signer);
+        assert!(super::super::pending::validate_pending_binding(&pending, &other_relay).is_err());
+        let other_signer = "cc".repeat(32);
+        let other_identity = pending_binding(&input, "http://relay", &other_signer);
         assert!(
-            validate_pending_binding(&pending, &input, "http://relay", &"bb".repeat(32)).is_ok()
-        );
-        assert!(
-            validate_pending_binding(&pending, &input, "http://other", &"bb".repeat(32)).is_err()
-        );
-        assert!(
-            validate_pending_binding(&pending, &input, "http://relay", &"cc".repeat(32)).is_err()
+            super::super::pending::validate_pending_binding(&pending, &other_identity).is_err()
         );
     }
 
@@ -857,6 +774,10 @@ mod tests {
             allocation_source: "moderator_select".to_string(),
             turn_role: "participant".to_string(),
             selection_reason: None,
+            source_intent_id: None,
+            source_request_id: None,
+            source_handoff_id: None,
+            source_speech_event_id: None,
             handoff_context: None,
             created_at_ms: 1,
             soft_lease_expires_at_ms: 2,

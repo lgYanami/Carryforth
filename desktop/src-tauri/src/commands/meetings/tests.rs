@@ -98,6 +98,12 @@ fn test_state(input: StateFixture<'_>) -> Event {
         "floor_revision": input.floor_revision,
         "intent_revision": input.intent_revision,
         "speech_revision": input.speech_revision,
+        "control_epoch": 1,
+        "decision_epoch": 1,
+        "moderator_decision_deadline_ms": null,
+        "next_action_at_ms": null,
+        "consecutive_moderator_speeches": 0,
+        "forced_return_to_moderator": false,
         "moderator_pubkey": input.create.host_pubkey,
         "participants": [
             {
@@ -111,9 +117,21 @@ fn test_state(input: StateFixture<'_>) -> Event {
                 "channel_role": "member"
             }
         ],
+        "pending_intents": [],
         "human_queue": [],
+        "unresolved_handoffs": [],
         "offer": offer,
-        "grant": grant
+        "grant": grant,
+        "board_control": {
+            "phase": "floor_ready",
+            "control_epoch": 1,
+            "board_window": 1,
+            "board_started_at_ms": 0,
+            "board_deadline_at_ms": 1_000,
+            "board_completed_at_ms": 1,
+            "board_outcome": "unchanged",
+            "action": null
+        }
     });
     EventBuilder::new(
         Kind::Custom(KIND_MEETING_STATE as u16),
@@ -418,6 +436,102 @@ fn current_state_rejects_conflicts_regressions_and_frozen_type_changes() {
         floor_target: None,
     }));
     assert!(select_current_state(vec![first(), changed_type], &create).is_err());
+}
+
+#[test]
+fn host_projection_accepts_initial_eligible_epoch_and_rejects_self_addressing() {
+    let host = Keys::generate();
+    let participant = Keys::generate();
+    let relay = Keys::generate();
+    let (_, create) = test_create(&host, &participant);
+    let identity = test_identity(&relay);
+    let participant_pubkey = participant.public_key().to_hex();
+    let state = test_state(StateFixture {
+        signer: &relay,
+        create: &create,
+        meeting_id: TEST_MEETING_ID,
+        phase: "moderator_idle",
+        state_revision_tag: 1,
+        state_revision_content: 1,
+        floor_revision: 1,
+        intent_revision: 1,
+        speech_revision: 0,
+        participant_type: "agent",
+        floor_target: None,
+    });
+    let mut projection = parse_state(&state, &identity, &create)
+        .unwrap_or_else(|error| panic!("parse State: {error:?}"))
+        .unwrap_or_else(|| panic!("State must match"));
+    projection.state.pending_intents.push(PendingIntentWire {
+        intent_id: "10".repeat(32),
+        current_event_id: "11".repeat(32),
+        author_pubkey: participant_pubkey.clone(),
+        basis_speech_revision: 0,
+        summary: "Review the initial Board".to_string(),
+        addressed_to: None,
+        created_at_ms: 1,
+        deferred: false,
+        selection_attempt_count: 0,
+        last_offer_id: None,
+        last_attempt_outcome: None,
+        eligible_decision_epoch: 0,
+    });
+    projection.state.unresolved_handoffs.push(OpenHandoffWire {
+        handoff_id: "12".repeat(32),
+        source_speech_event_id: "13".repeat(32),
+        from_pubkey: participant_pubkey.clone(),
+        to_pubkey: create.host_pubkey.clone(),
+        reason_type: "question".to_string(),
+        reason_text: "Please clarify the goal".to_string(),
+        created_at_ms: 1,
+        question_state: "open".to_string(),
+        attempt_count: 0,
+        last_offer_id: None,
+        last_grant_id: None,
+        last_attempt_outcome: None,
+        blocked_by: None,
+        moderator_retry_blocked: false,
+        eligible_decision_epoch: 0,
+    });
+    assert!(projection::validate_host_projection(&projection.state, &create).is_ok());
+
+    projection.state.pending_intents[0].addressed_to = Some(participant_pubkey);
+    assert!(projection::validate_host_projection(&projection.state, &create).is_err());
+}
+
+#[test]
+fn human_request_priority_disables_host_recall() {
+    let host = Keys::generate();
+    let participant = Keys::generate();
+    let relay = Keys::generate();
+    let (_, create) = test_create(&host, &participant);
+    let identity = test_identity(&relay);
+    let participant_pubkey = participant.public_key().to_hex();
+    let state = test_state(StateFixture {
+        signer: &relay,
+        create: &create,
+        meeting_id: TEST_MEETING_ID,
+        phase: "offered",
+        state_revision_tag: 2,
+        state_revision_content: 2,
+        floor_revision: 2,
+        intent_revision: 0,
+        speech_revision: 0,
+        participant_type: "human",
+        floor_target: Some(&participant_pubkey),
+    });
+    let mut projection = parse_state(&state, &identity, &create)
+        .unwrap_or_else(|error| panic!("parse State: {error:?}"))
+        .unwrap_or_else(|| panic!("State must match"));
+    assert!(host_from_projection(&projection, TEST_MEETING_ID).is_some_and(|host| host.can_recall));
+
+    projection.state.human_queue.push(HumanFloorRequestWire {
+        request_id: "20".repeat(32),
+        requester_pubkey: participant_pubkey,
+        queue_position: 1,
+        state: "queued".to_string(),
+    });
+    assert!(host_from_projection(&projection, TEST_MEETING_ID).is_some_and(|host| !host.can_recall));
 }
 
 #[test]

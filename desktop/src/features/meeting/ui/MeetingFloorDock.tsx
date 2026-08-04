@@ -2,6 +2,8 @@ import * as React from "react";
 import { AlertTriangle, ClipboardCopy, Hand, Loader2 } from "lucide-react";
 
 import { useMeetingFloorActionMutation } from "@/features/meeting/hooks";
+import type { MeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
+import { useMeetingHostActionController } from "@/features/meeting/useMeetingHostActionController";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type {
   MeetingFloorAction,
@@ -14,6 +16,7 @@ import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
 import { MeetingOfferControls } from "./MeetingOfferControls";
+import { MeetingHostConsole } from "./MeetingHostConsole";
 import {
   MeetingSpeechComposer,
   type MeetingSpeechDraft,
@@ -33,6 +36,7 @@ type StaleDraft = {
 };
 
 type MeetingFloorDockProps = {
+  boardDraft: MeetingBoardDraft;
   currentPubkey?: string;
   onRefresh: () => void;
   profiles: Record<string, UserProfileSummary>;
@@ -62,6 +66,7 @@ function ReadOnlyFloor({ message }: { message: string }) {
 }
 
 export function MeetingFloorDock({
+  boardDraft,
   currentPubkey,
   onRefresh,
   profiles,
@@ -94,6 +99,10 @@ export function MeetingFloorDock({
     ownGrant?.grantId ?? null,
   );
   const [staleDraft, setStaleDraft] = React.useState<StaleDraft | null>(null);
+  const hostController = useMeetingHostActionController({
+    onBoardAccepted: boardDraft.markAccepted,
+    snapshot,
+  });
 
   React.useEffect(() => {
     const currentGrantId = ownGrant?.grantId ?? null;
@@ -128,7 +137,7 @@ export function MeetingFloorDock({
 
   const submit = React.useCallback(
     async (action: MeetingFloorAction) => {
-      if (!floor || unresolved) return undefined;
+      if (!floor || unresolved || hostController.disabled) return undefined;
       resetMutation();
       const input: MeetingFloorActionInput = {
         submissionId: crypto.randomUUID(),
@@ -148,6 +157,7 @@ export function MeetingFloorDock({
     [
       floor,
       handleResult,
+      hostController.disabled,
       mutateAsync,
       resetMutation,
       snapshot.meetingId,
@@ -172,7 +182,13 @@ export function MeetingFloorDock({
     }
   }, [handleResult, mutateAsync, resetMutation, unresolved]);
 
-  const disabled = isPending || unresolved !== null;
+  const disabled = isPending || unresolved !== null || hostController.disabled;
+  const hostControlsDisabled =
+    hostController.disabled || isPending || unresolved !== null;
+  const renderedHostController = {
+    ...hostController,
+    disabled: hostControlsDisabled,
+  };
   const terminal =
     snapshot.lifecycle === "closed" || snapshot.lifecycle === "aborted";
 
@@ -208,6 +224,36 @@ export function MeetingFloorDock({
         </div>
       ) : null}
 
+      {hostController.unresolved ? (
+        <div
+          className="mx-auto mb-3 flex max-w-3xl items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3"
+          data-testid="meeting-host-indeterminate"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <div className="min-w-0 flex-1 text-xs">
+            <p className="font-medium">
+              The host command receipt is incomplete.
+            </p>
+            <p className="mt-1 text-muted-foreground">
+              Retry republishes the exact same signed event. Board and Floor
+              controls remain locked until its outcome is known.
+            </p>
+          </div>
+          <Button
+            data-testid="meeting-host-retry"
+            disabled={hostController.isPending}
+            onClick={() => void hostController.retryExact()}
+            size="sm"
+            variant="outline"
+          >
+            {hostController.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : null}
+            Retry exact action
+          </Button>
+        </div>
+      ) : null}
+
       {floorError ? (
         <div
           className="mx-auto mb-3 max-w-3xl rounded-lg border border-destructive/35 bg-destructive/5 px-3 py-2 text-xs text-destructive"
@@ -216,6 +262,15 @@ export function MeetingFloorDock({
           {floorError instanceof Error
             ? floorError.message
             : "The Floor action was rejected."}
+        </div>
+      ) : null}
+
+      {hostController.error ? (
+        <div
+          className="mx-auto mb-3 max-w-3xl rounded-lg border border-destructive/35 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          data-testid="meeting-host-error"
+        >
+          {hostController.error.message}
         </div>
       ) : null}
 
@@ -323,7 +378,14 @@ export function MeetingFloorDock({
           </Button>
         </div>
       ) : normalizedPubkey === snapshot.moderatorPubkey ? (
-        <ReadOnlyFloor message="You currently host this Meeting. Host Board and Floor decisions are delivered in the next Desktop stage." />
+        <MeetingHostConsole
+          boardDraft={boardDraft}
+          controller={renderedHostController}
+          currentPubkey={normalizedPubkey}
+          onRefresh={onRefresh}
+          profiles={profiles}
+          snapshot={snapshot}
+        />
       ) : (
         <div className="mx-auto flex max-w-3xl items-center gap-3">
           <div className="min-w-0 flex-1">

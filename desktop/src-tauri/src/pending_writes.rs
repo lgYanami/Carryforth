@@ -14,7 +14,7 @@ pub(crate) struct PendingMeetingCreate {
     pub(crate) fingerprint: String,
 }
 
-/// One already-signed Human Meeting Floor command retained for exact retry.
+/// One already-signed Human Meeting Floor or host command retained for exact retry.
 /// The event and its binding metadata contain no private key material.
 #[derive(Clone)]
 pub(crate) struct PendingMeetingCommand {
@@ -36,6 +36,6 @@ pub(crate) struct PendingWrites {
     /// Stable submission ID to signed Meeting Create. The command layer bounds
     /// the map and validates both target Community and signer on every retry.
     pub(crate) meeting_creates: Mutex<HashMap<String, PendingMeetingCreate>>,
-    /// Stable submission ID to signed Meeting Floor command.
+    /// Stable submission ID to a signed Meeting Floor or host command.
     pub(crate) meeting_commands: Mutex<HashMap<String, PendingMeetingCommand>>,
 }

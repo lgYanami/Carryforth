@@ -159,6 +159,9 @@ type MockBridgeOptions = {
   meetingFloorErrors?: Array<string | null>;
   meetingFloorIndeterminateResponses?: number;
   meetingFloorActionDelayMs?: number;
+  meetingHostErrors?: Array<string | null>;
+  meetingHostIndeterminateResponses?: number;
+  meetingHostActionDelayMs?: number;
   /** Verified Project View command result returned to the View screen. */
   projectView?: RawProjectViewLoadResult;
   /** Community-isolated Project View results keyed by applied Relay URL. */

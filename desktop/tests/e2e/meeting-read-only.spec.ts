@@ -79,6 +79,7 @@ function readyMeeting(input: {
     currentSpeakerPubkey: input.phase === "granted" ? AGENT : null,
     currentOfferPubkey: null,
     floor: null,
+    host: null,
     participants: [
       { pubkey: HOST, participantType: "agent", channelRole: "owner" },
       { pubkey: HUMAN, participantType: "human", channelRole: "member" },

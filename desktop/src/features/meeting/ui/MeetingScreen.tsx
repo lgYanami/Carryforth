@@ -16,6 +16,7 @@ import {
   useMeetingSnapshot,
   useMeetingSpeeches,
 } from "@/features/meeting/hooks";
+import { useMeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type {
@@ -26,6 +27,7 @@ import type {
 import { setVisibleChannel } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
+import { useMediaBreakpoint } from "@/shared/hooks/use-mobile";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -109,6 +111,9 @@ function meetingStatusText(
       ? "The host's action-recording window is blocked and requires recovery."
       : "The host is recording the final Board actions in the relevant systems.";
   }
+  if (snapshot.host?.boardControl.phase === "board_pending") {
+    return "The host must review the Meeting Board before arranging the next speaker.";
+  }
   if (snapshot.phase === "granted") {
     const speaker = profileName(snapshot.currentSpeakerPubkey, profiles);
     return speaker
@@ -173,6 +178,28 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   const snapshotQuery = useMeetingSnapshot(meetingId);
   const snapshot =
     snapshotQuery.data?.status === "ready" ? snapshotQuery.data.snapshot : null;
+  const normalizedPubkey = identityQuery.data?.pubkey.toLowerCase();
+  const currentParticipant = snapshot?.participants.find(
+    (participant) => participant.pubkey === normalizedPubkey,
+  );
+  const boardEditable = Boolean(
+    snapshot &&
+      snapshot.lifecycle === "active" &&
+      normalizedPubkey === snapshot.moderatorPubkey &&
+      currentParticipant?.participantType === "human" &&
+      snapshot.host?.boardControl.phase === "board_pending",
+  );
+  const boardDraft = useMeetingBoardDraft({
+    editable: boardEditable,
+    snapshot,
+  });
+  const boardPanelIsOverlay = useMediaBreakpoint(1280);
+  const [boardSheetOpen, setBoardSheetOpen] = React.useState(false);
+  React.useEffect(() => {
+    if (boardEditable && boardPanelIsOverlay && boardDraft.controlToken) {
+      setBoardSheetOpen(true);
+    }
+  }, [boardDraft.controlToken, boardEditable, boardPanelIsOverlay]);
   const speechesQuery = useMeetingSpeeches({
     meetingId,
     enabled: snapshot !== null,
@@ -332,7 +359,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
               </div>
             </SheetContent>
           </Sheet>
-          <Sheet>
+          <Sheet onOpenChange={setBoardSheetOpen} open={boardSheetOpen}>
             <SheetTrigger asChild>
               <Button
                 className="xl:hidden"
@@ -354,6 +381,17 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
               <MeetingBoardPanel
                 board={readySnapshot.board}
                 className="h-full"
+                editor={
+                  boardEditable
+                    ? {
+                        disabled: false,
+                        onChange: boardDraft.setValue,
+                        value: boardDraft.value,
+                      }
+                    : undefined
+                }
+                onDismissStaleDraft={boardDraft.dismissStale}
+                staleDraft={boardDraft.stale}
               />
             </SheetContent>
           </Sheet>
@@ -414,9 +452,21 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
         <MeetingBoardPanel
           board={readySnapshot.board}
           className="hidden w-96 shrink-0 border-l xl:flex"
+          editor={
+            boardEditable
+              ? {
+                  disabled: false,
+                  onChange: boardDraft.setValue,
+                  value: boardDraft.value,
+                }
+              : undefined
+          }
+          onDismissStaleDraft={boardDraft.dismissStale}
+          staleDraft={boardDraft.stale}
         />
       </div>
       <MeetingFloorDock
+        boardDraft={boardDraft}
         currentPubkey={identityQuery.data?.pubkey}
         onRefresh={() => void snapshotQuery.refetch()}
         profiles={profiles}

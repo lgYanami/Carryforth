@@ -690,8 +690,8 @@ Desktop rollout gate 只控制新 UI 是否公开；Relay capability 决定当�
 |---|---|---|
 | 1. 只读纵向链路与房间分流 | 已完成 | `736ab91c0`；roomKind、verified read model、Meetings 导航、只读房间与 E2E |
 | 2. Human 发起会议 | 已完成 | `636c693d6`；Create dialog、roster/capability/source gate、创建 E2E |
-| 3. Human 参会者 Floor 生命周期 | 已完成 | native verified Floor command、Request/Offer/Grant/Speech/Yield/Handoff、精确重试与 9 条 Floor E2E |
-| 4. Human 主持讨论生命周期 | 待开始 | Board/Floor、Intent/self/handoff/recall、close/abort E2E |
+| 3. Human 参会者 Floor 生命周期 | 已完成 | `24815ad00`；native verified Floor command、Request/Offer/Grant/Speech/Yield/Handoff、精确重试与 9 条 Floor E2E |
+| 4. Human 主持讨论生命周期 | 已完成 | verified Native host boundary、Board/Floor、Intent/self/handoff/recall、close/abort；29 条 Meeting Rust tests 与 7 条 Host E2E |
 | 5. Action Finalization 与终态闭环 | 待开始 | direct action、Project View 导航、confirm/block/retry/return E2E |
 | 6. 恢复、兼容、体验与真实验收收口 | 待开始 | Desktop gates、真实 Relay/Agent 证据、发布候选 |
 

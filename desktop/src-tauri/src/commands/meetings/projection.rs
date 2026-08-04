@@ -126,8 +126,9 @@ pub(super) fn parse_state(
             "Meeting State has an unsupported phase",
         )));
     }
-    validate_board_control(state.board_control.as_ref(), create)?;
+    validate_board_control(state.board_control.as_ref(), &state, create)?;
     validate_floor_state(&state, create)?;
+    validate_host_projection(&state, create)?;
     Ok(Some(StateProjection {
         event_id: event.id.to_hex(),
         state,
@@ -240,6 +241,154 @@ fn validate_floor_state(
     Ok(())
 }
 
+pub(super) fn validate_host_projection(
+    state: &StateWire,
+    create: &CreateProjection,
+) -> Result<(), MeetingReadError> {
+    if state.control_epoch == 0
+        || u32::try_from(state.consecutive_moderator_speeches).is_err()
+        || state
+            .moderator_decision_deadline_ms
+            .is_some_and(|deadline| deadline < 0)
+        || state.next_action_at_ms.is_some_and(|deadline| deadline < 0)
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State has invalid moderator control metadata",
+        )));
+    }
+    let roster = state
+        .participants
+        .iter()
+        .map(|participant| participant.pubkey.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut intent_ids = BTreeSet::new();
+    let mut intent_events = BTreeSet::new();
+    let mut intent_authors = BTreeSet::new();
+    for intent in &state.pending_intents {
+        require_hex64(&intent.intent_id, "Meeting Intent").map_err(MeetingReadError::Other)?;
+        require_hex64(&intent.current_event_id, "Meeting Intent event")
+            .map_err(MeetingReadError::Other)?;
+        require_hex64(&intent.author_pubkey, "Meeting Intent author")
+            .map_err(MeetingReadError::Other)?;
+        if let Some(addressed_to) = &intent.addressed_to {
+            require_hex64(addressed_to, "Meeting Intent addressee")
+                .map_err(MeetingReadError::Other)?;
+            if !roster.contains(addressed_to.as_str()) {
+                return Err(MeetingReadError::Other(integrity_error(
+                    "Meeting Intent addressee is outside the frozen roster",
+                )));
+            }
+            if addressed_to == &intent.author_pubkey {
+                return Err(MeetingReadError::Other(integrity_error(
+                    "Meeting Intent cannot address its own author",
+                )));
+            }
+        }
+        if let Some(last_offer_id) = &intent.last_offer_id {
+            require_hex64(last_offer_id, "Meeting Intent last Offer")
+                .map_err(MeetingReadError::Other)?;
+        }
+        if !roster.contains(intent.author_pubkey.as_str())
+            || intent.basis_speech_revision > state.speech_revision
+            || intent.summary.trim().is_empty()
+            || intent.summary.trim() != intent.summary
+            || intent.summary.len() > 512
+            || intent.summary.chars().any(char::is_control)
+            || intent.created_at_ms < 0
+            || u32::try_from(intent.selection_attempt_count).is_err()
+            || !intent_ids.insert(intent.intent_id.as_str())
+            || !intent_events.insert(intent.current_event_id.as_str())
+            || !intent_authors.insert(intent.author_pubkey.as_str())
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State has an invalid pending Intent pool",
+            )));
+        }
+    }
+
+    let active_handoff_id = state
+        .offer
+        .as_ref()
+        .and_then(|offer| offer.source_handoff_id.as_deref())
+        .or_else(|| {
+            state
+                .grant
+                .as_ref()
+                .and_then(|grant| grant.source_handoff_id.as_deref())
+        });
+    let mut handoff_ids = BTreeSet::new();
+    for handoff in &state.unresolved_handoffs {
+        for (value, context) in [
+            (&handoff.handoff_id, "Meeting Handoff"),
+            (
+                &handoff.source_speech_event_id,
+                "Meeting Handoff source Speech",
+            ),
+            (&handoff.from_pubkey, "Meeting Handoff source participant"),
+            (&handoff.to_pubkey, "Meeting Handoff target participant"),
+        ] {
+            require_hex64(value, context).map_err(MeetingReadError::Other)?;
+        }
+        for value in [
+            handoff.last_offer_id.as_ref(),
+            handoff.last_grant_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            require_hex64(value, "Meeting Handoff attempt").map_err(MeetingReadError::Other)?;
+        }
+        if handoff.question_state != "open"
+            || !roster.contains(handoff.from_pubkey.as_str())
+            || !roster.contains(handoff.to_pubkey.as_str())
+            || handoff.from_pubkey == handoff.to_pubkey
+            || !matches!(
+                handoff.reason_type.as_str(),
+                "question"
+                    | "information_request"
+                    | "clarification"
+                    | "review"
+                    | "response_requested"
+            )
+            || handoff.reason_text.trim().is_empty()
+            || handoff.reason_text.trim() != handoff.reason_text
+            || handoff.reason_text.len() > 1024
+            || handoff.reason_text.chars().any(char::is_control)
+            || handoff.created_at_ms < 0
+            || u32::try_from(handoff.attempt_count).is_err()
+            || !handoff_ids.insert(handoff.handoff_id.as_str())
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State has an invalid open Handoff pool",
+            )));
+        }
+        if active_handoff_id == Some(handoff.handoff_id.as_str())
+            && handoff.last_offer_id.is_none()
+            && handoff.last_grant_id.is_none()
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "active Meeting Handoff has no attempt projection",
+            )));
+        }
+    }
+    if state
+        .pending_intents
+        .iter()
+        .any(|intent| intent.author_pubkey == create.host_pubkey)
+        && state
+            .pending_intents
+            .iter()
+            .filter(|intent| intent.author_pubkey == create.host_pubkey)
+            .count()
+            > 1
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State has multiple moderator self Intents",
+        )));
+    }
+    Ok(())
+}
+
 fn validate_floor_id(value: &str, context: &str) -> Result<(), MeetingReadError> {
     require_hex64(value, context).map_err(MeetingReadError::Other)
 }
@@ -296,7 +445,9 @@ fn validate_handoff(
             "question" | "information_request" | "clarification" | "review" | "response_requested"
         )
         || context.reason_text.trim().is_empty()
+        || context.reason_text.trim() != context.reason_text
         || context.reason_text.len() > 1024
+        || context.reason_text.chars().any(char::is_control)
     {
         return Err(MeetingReadError::Other(integrity_error(
             "Meeting Handoff context is invalid",
@@ -307,10 +458,13 @@ fn validate_handoff(
 
 fn validate_board_control(
     control: Option<&BoardControlWire>,
+    state: &StateWire,
     create: &CreateProjection,
 ) -> Result<(), MeetingReadError> {
     let Some(control) = control else {
-        return Ok(());
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting V2 State has no Board control projection",
+        )));
     };
     if !matches!(
         control.phase.as_str(),
@@ -319,6 +473,41 @@ fn validate_board_control(
         return Err(MeetingReadError::Other(integrity_error(
             "Meeting State has an unsupported Board phase",
         )));
+    }
+    if control.control_epoch == 0
+        || control.control_epoch != state.control_epoch
+        || (control.phase != "bootstrap_locked" && control.board_window == 0)
+        || control
+            .board_started_at_ms
+            .is_some_and(|timestamp| timestamp < 0)
+        || control
+            .board_deadline_at_ms
+            .is_some_and(|timestamp| timestamp < 0)
+        || control
+            .board_completed_at_ms
+            .is_some_and(|timestamp| timestamp < 0)
+        || control.board_outcome.as_deref().is_some_and(|outcome| {
+            !matches!(outcome, "updated" | "unchanged" | "timed_out" | "preempted")
+        })
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting State has invalid Board control fences",
+        )));
+    }
+    match control.phase.as_str() {
+        "board_pending"
+            if control.board_started_at_ms.is_some()
+                && control.board_deadline_at_ms.is_some()
+                && control.board_completed_at_ms.is_none()
+                && control.board_outcome.is_none() => {}
+        "floor_ready" | "finalizing_actions" | "ended"
+            if control.board_completed_at_ms.is_some() && control.board_outcome.is_some() => {}
+        "bootstrap_locked" => {}
+        _ => {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State Board phase does not match its window outcome",
+            )));
+        }
     }
     if create.policy != buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY && control.action.is_some() {
         return Err(MeetingReadError::Other(integrity_error(

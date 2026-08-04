@@ -63,6 +63,8 @@ import type {
   CreateMeetingResult,
   MeetingFloorActionInput,
   MeetingFloorActionResult,
+  MeetingHostActionInput,
+  MeetingHostActionResult,
   MeetingCapability,
   MeetingListItem,
   MeetingLoadResult,
@@ -322,6 +324,11 @@ type E2eConfig = {
     /** Process then return an incomplete receipt this many times. */
     meetingFloorIndeterminateResponses?: number;
     meetingFloorActionDelayMs?: number;
+    /** Definitive failures for successive Human host submissions. */
+    meetingHostErrors?: Array<string | null>;
+    /** Process then lose this many Human host command receipts. */
+    meetingHostIndeterminateResponses?: number;
+    meetingHostActionDelayMs?: number;
     /** Verified Project View command result returned to the View screen. */
     projectView?: RawProjectViewLoadResult;
     /** Community-isolated Project View results keyed by applied Relay URL. */
@@ -1023,6 +1030,10 @@ declare global {
       command: string;
       payload: unknown;
     }>;
+    __BUZZ_E2E_PREEMPT_MEETING_BOARD__?: (input: {
+      meetingId: string;
+      requesterPubkey: string;
+    }) => boolean;
     __BUZZ_E2E_WEBVIEW_ZOOM__?: number;
     __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
       channelName: string;
@@ -2416,6 +2427,7 @@ function getMockMeetingSeed(
 }
 
 const mockMeetingFloorSubmissions = new Map<string, MeetingFloorActionResult>();
+const mockMeetingHostSubmissions = new Map<string, MeetingHostActionResult>();
 
 function nextMeetingStateEventId(revision: number): string {
   return revision.toString(16).padStart(64, "0");
@@ -2436,6 +2448,460 @@ function acceptedMeetingFloorResult(
     stateRevision,
     duplicate,
   };
+}
+
+function nextMeetingControlToken(revision: number): string {
+  return `f${revision.toString(16).padStart(63, "0")}`;
+}
+
+function advanceMockMeetingState(snapshot: MeetingSnapshot): void {
+  snapshot.stateRevision += 1;
+  const stateEventId = nextMeetingStateEventId(snapshot.stateRevision);
+  if (snapshot.floor) snapshot.floor.stateEventId = stateEventId;
+  if (snapshot.host) {
+    snapshot.host.stateEventId = stateEventId;
+    snapshot.host.controlToken = nextMeetingControlToken(
+      snapshot.stateRevision,
+    );
+  }
+}
+
+function returnMockControlToBoard(snapshot: MeetingSnapshot): void {
+  const host = snapshot.host;
+  if (!host || snapshot.lifecycle !== "active") return;
+  snapshot.phase = "moderator_control";
+  snapshot.currentOfferPubkey = null;
+  snapshot.currentSpeakerPubkey = null;
+  host.controlEpoch += 1;
+  host.decisionDeadlineMs = null;
+  host.nextActionAtMs = null;
+  host.forcedReturnToModerator = false;
+  host.canSelect = false;
+  host.canClose = false;
+  host.canRecall = false;
+  host.boardControl = {
+    phase: "board_pending",
+    controlEpoch: host.controlEpoch,
+    boardWindow: host.boardControl.boardWindow + 1,
+    boardStartedAtMs: Date.now(),
+    boardDeadlineAtMs: Date.now() + 120_000,
+    boardCompletedAtMs: null,
+    boardOutcome: null,
+  };
+}
+
+function preemptMockMeetingBoard(
+  meetingId: string,
+  requesterPubkey: string,
+  config?: E2eConfig,
+): boolean {
+  const seed = getMockMeetingSeed(meetingId, config);
+  if (seed?.result.status !== "ready") return false;
+  const snapshot = seed.result.snapshot;
+  const host = snapshot.host;
+  const floor = snapshot.floor;
+  if (!host || !floor || host.boardControl.phase !== "board_pending") {
+    return false;
+  }
+  const participant = snapshot.participants.find(
+    (candidate) => candidate.pubkey === requesterPubkey,
+  );
+  if (participant?.participantType !== "human") return false;
+
+  const now = Date.now();
+  const requestId = `7${requesterPubkey.slice(1)}`;
+  const offerId = `8${requesterPubkey.slice(1)}`;
+  floor.humanQueue = [
+    {
+      requestId,
+      requesterPubkey,
+      queuePosition: 1,
+      state: "offered",
+    },
+  ];
+  floor.offer = {
+    offerId,
+    targetPubkey: requesterPubkey,
+    targetParticipantType: "human",
+    allocationSource: "human_request",
+    turnRole: "participant",
+    selectionReason: null,
+    sourceIntentId: null,
+    sourceRequestId: requestId,
+    sourceHandoffId: null,
+    sourceSpeechEventId: null,
+    handoffContext: null,
+    createdAtMs: now,
+    ackDeadlineMs: now + 30_000,
+  };
+  floor.grant = null;
+  snapshot.phase = "offered";
+  snapshot.currentOfferPubkey = requesterPubkey;
+  snapshot.currentSpeakerPubkey = null;
+  snapshot.floorRevision += 1;
+  host.boardControl.phase = "floor_ready";
+  host.boardControl.boardDeadlineAtMs = null;
+  host.boardControl.boardCompletedAtMs = now;
+  host.boardControl.boardOutcome = "preempted";
+  host.decisionDeadlineMs = null;
+  host.canSelect = false;
+  host.canClose = false;
+  host.canRecall = false;
+  advanceMockMeetingState(snapshot);
+  return true;
+}
+
+function acceptedMeetingHostResult(
+  input: MeetingHostActionInput,
+  eventId: string,
+  snapshot: MeetingSnapshot,
+  duplicate: boolean,
+): MeetingHostActionResult {
+  const boardAction =
+    input.action.type === "board_update" ||
+    input.action.type === "board_unchanged";
+  const endAction =
+    input.action.type === "close" || input.action.type === "abort";
+  return {
+    status: "accepted",
+    meetingId: input.meetingId,
+    eventId,
+    action: input.action.type,
+    canonicalObjectId: endAction
+      ? null
+      : boardAction
+        ? snapshot.board.eventId
+        : eventId,
+    stateRevision: endAction ? null : snapshot.stateRevision,
+    duplicate,
+  };
+}
+
+async function handleMeetingHostAction(
+  args: { input: MeetingHostActionInput },
+  config?: E2eConfig,
+): Promise<MeetingHostActionResult> {
+  const input = args.input;
+  const delayMs = config?.mock?.meetingHostActionDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingHostErrors?.shift();
+  if (configuredError) throw new Error(configuredError);
+
+  const prior = mockMeetingHostSubmissions.get(input.submissionId);
+  if (prior?.status === "accepted") return { ...prior, duplicate: true };
+
+  const seed = getMockMeetingSeed(input.meetingId, config);
+  if (seed?.result.status !== "ready") {
+    throw new Error("Meeting host controls are unavailable for this Meeting");
+  }
+  const snapshot = seed.result.snapshot;
+  const host = snapshot.host;
+  const actor = getMockMemberPubkey(config).toLowerCase();
+  const actorParticipant = snapshot.participants.find(
+    (participant) => participant.pubkey === actor,
+  );
+  if (
+    !host ||
+    actor !== snapshot.moderatorPubkey ||
+    actorParticipant?.participantType !== "human"
+  ) {
+    throw new Error("only the frozen Human moderator can use host controls");
+  }
+  if (host.controlToken !== input.expectedControlToken) {
+    throw new Error("Meeting host control changed; refresh before submitting");
+  }
+
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const now = Date.now();
+  const action = input.action;
+  switch (action.type) {
+    case "board_update":
+    case "board_unchanged": {
+      if (host.boardControl.phase !== "board_pending") {
+        throw new Error("the Board Maintenance window is no longer active");
+      }
+      if (action.type === "board_update") {
+        snapshot.board = {
+          ...snapshot.board,
+          body: action.body,
+          eventId,
+          source: "projection",
+          updatedAt: Math.floor(now / 1_000),
+        };
+      }
+      host.boardControl.phase = "floor_ready";
+      host.boardControl.boardCompletedAtMs = now;
+      host.boardControl.boardOutcome =
+        action.type === "board_update" ? "updated" : "unchanged";
+      host.decisionEpoch += 1;
+      host.decisionDeadlineMs = now + 90_000;
+      host.canSelect = true;
+      host.canClose = true;
+      host.canRecall = false;
+      break;
+    }
+    case "intent_submit": {
+      if (!host.canSelect) throw new Error("Floor Decision is not active");
+      if (action.addressedTo === actor) {
+        throw new Error("a self Intent cannot be addressed to the host");
+      }
+      if (host.pendingIntents.some((intent) => intent.authorPubkey === actor)) {
+        throw new Error("the host already has a pending self Intent");
+      }
+      host.pendingIntents.push({
+        intentId: eventId,
+        currentEventId: eventId,
+        authorPubkey: actor,
+        basisSpeechRevision: snapshot.speechRevision,
+        summary: action.summary.trim(),
+        addressedTo: action.addressedTo ?? null,
+        createdAtMs: now,
+        deferred: false,
+        selectionAttemptCount: 0,
+        lastOfferId: null,
+        lastAttemptOutcome: null,
+        eligibleDecisionEpoch: host.decisionEpoch,
+        selectable: true,
+      });
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "intent_refresh": {
+      const intent = host.pendingIntents.find(
+        (candidate) =>
+          candidate.intentId === action.intentId &&
+          candidate.authorPubkey === actor,
+      );
+      if (!intent) throw new Error("the self Intent is no longer pending");
+      if (action.addressedTo === actor) {
+        throw new Error("a self Intent cannot be addressed to the host");
+      }
+      intent.currentEventId = eventId;
+      intent.summary = action.summary.trim();
+      intent.addressedTo = action.addressedTo ?? null;
+      intent.basisSpeechRevision = snapshot.speechRevision;
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "intent_withdraw": {
+      const before = host.pendingIntents.length;
+      host.pendingIntents = host.pendingIntents.filter(
+        (intent) =>
+          intent.intentId !== action.intentId || intent.authorPubkey !== actor,
+      );
+      if (host.pendingIntents.length === before) {
+        throw new Error("the self Intent is no longer pending");
+      }
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "select_intent": {
+      if (!host.canSelect || !snapshot.floor) {
+        throw new Error("Floor Decision is not active");
+      }
+      const intent = host.pendingIntents.find(
+        (candidate) => candidate.intentId === action.intentId,
+      );
+      if (!intent?.selectable) {
+        throw new Error("the selected Intent is not eligible");
+      }
+      const selfIntent = host.pendingIntents.find(
+        (candidate) => candidate.authorPubkey === actor,
+      );
+      if (selfIntent && intent.authorPubkey !== actor) {
+        throw new Error("the host self Intent must be selected first");
+      }
+      const otherSelectable = host.pendingIntents.some(
+        (candidate) =>
+          candidate.authorPubkey !== actor &&
+          candidate.selectable &&
+          !candidate.deferred,
+      );
+      if (
+        intent.authorPubkey === actor &&
+        host.consecutiveModeratorSpeeches >= 1 &&
+        otherSelectable &&
+        !action.deferralReason?.trim()
+      ) {
+        throw new Error("self speech requires a deferral reason");
+      }
+      const target = intent.authorPubkey;
+      const targetType =
+        snapshot.participants.find(
+          (participant) => participant.pubkey === target,
+        )?.participantType === "agent"
+          ? "agent"
+          : "human";
+      snapshot.floor.offer = {
+        offerId: eventId,
+        targetPubkey: target,
+        targetParticipantType: targetType,
+        allocationSource: "moderator_select",
+        turnRole: target === actor ? "moderator_self" : "participant",
+        selectionReason: action.selectionReason ?? null,
+        sourceIntentId: intent.intentId,
+        sourceRequestId: null,
+        sourceHandoffId: null,
+        sourceSpeechEventId: null,
+        handoffContext: null,
+        createdAtMs: now,
+        ackDeadlineMs: now + 30_000,
+      };
+      intent.selectionAttemptCount += 1;
+      intent.lastOfferId = eventId;
+      intent.lastAttemptOutcome = "offered";
+      snapshot.phase = "offered";
+      snapshot.currentOfferPubkey = target;
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = true;
+      host.decisionDeadlineMs = null;
+      snapshot.floorRevision += 1;
+      break;
+    }
+    case "select_handoff": {
+      if (!host.canSelect || !snapshot.floor) {
+        throw new Error("Floor Decision is not active");
+      }
+      if (host.pendingIntents.some((intent) => intent.authorPubkey === actor)) {
+        throw new Error("the host self Intent must be selected first");
+      }
+      const handoff = host.openHandoffs.find(
+        (candidate) => candidate.handoffId === action.handoffId,
+      );
+      if (!handoff?.selectable) {
+        throw new Error("the selected Handoff is not eligible");
+      }
+      const targetType =
+        snapshot.participants.find(
+          (participant) => participant.pubkey === handoff.toPubkey,
+        )?.participantType === "agent"
+          ? "agent"
+          : "human";
+      snapshot.floor.offer = {
+        offerId: eventId,
+        targetPubkey: handoff.toPubkey,
+        targetParticipantType: targetType,
+        allocationSource: "directed_handoff",
+        turnRole: "participant",
+        selectionReason: action.selectionReason ?? null,
+        sourceIntentId: null,
+        sourceRequestId: null,
+        sourceHandoffId: handoff.handoffId,
+        sourceSpeechEventId: handoff.sourceSpeechEventId,
+        handoffContext: {
+          fromPubkey: handoff.fromPubkey,
+          reasonType: handoff.reasonType,
+          reasonText: handoff.reasonText,
+        },
+        createdAtMs: now,
+        ackDeadlineMs: now + 30_000,
+      };
+      handoff.attemptCount += 1;
+      handoff.lastOfferId = eventId;
+      handoff.lastAttemptOutcome = "offered";
+      handoff.attemptActive = true;
+      handoff.selectable = false;
+      snapshot.phase = "offered";
+      snapshot.currentOfferPubkey = handoff.toPubkey;
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = true;
+      host.decisionDeadlineMs = null;
+      snapshot.floorRevision += 1;
+      break;
+    }
+    case "reject_intent": {
+      const before = host.pendingIntents.length;
+      host.pendingIntents = host.pendingIntents.filter(
+        (intent) =>
+          intent.intentId !== action.intentId || intent.authorPubkey === actor,
+      );
+      if (host.pendingIntents.length === before) {
+        throw new Error("the participant Intent is no longer pending");
+      }
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "dismiss_handoff": {
+      const handoff = host.openHandoffs.find(
+        (candidate) => candidate.handoffId === action.handoffId,
+      );
+      if (!handoff || handoff.attemptActive) {
+        throw new Error("the Handoff cannot be dismissed now");
+      }
+      host.openHandoffs = host.openHandoffs.filter(
+        (candidate) => candidate.handoffId !== action.handoffId,
+      );
+      break;
+    }
+    case "recall":
+      if (!host.canRecall || snapshot.floor?.humanQueue.length) {
+        throw new Error("Recall is not available");
+      }
+      host.forcedReturnToModerator = true;
+      host.canRecall = false;
+      break;
+    case "close":
+      if (!host.canClose) {
+        throw new Error("normal close requires an explicitly completed Board");
+      }
+      snapshot.lifecycle = "closed";
+      snapshot.phase = "ended";
+      snapshot.end = {
+        eventId,
+        outcome: "closed",
+        reasonCode: null,
+        reason: null,
+        endedBy: actor,
+        endedAt: Math.floor(now / 1_000),
+        actionsAttested: false,
+      };
+      host.boardControl.phase = "ended";
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      break;
+    case "abort":
+      snapshot.lifecycle = "aborted";
+      snapshot.phase = "ended";
+      snapshot.end = {
+        eventId,
+        outcome: "aborted",
+        reasonCode: action.reasonCode,
+        reason: action.reason ?? null,
+        endedBy: actor,
+        endedAt: Math.floor(now / 1_000),
+        actionsAttested: false,
+      };
+      host.boardControl.phase = "ended";
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      break;
+  }
+
+  if (action.type !== "close" && action.type !== "abort") {
+    advanceMockMeetingState(snapshot);
+  }
+  const accepted = acceptedMeetingHostResult(input, eventId, snapshot, false);
+  mockMeetingHostSubmissions.set(input.submissionId, accepted);
+  if ((config?.mock?.meetingHostIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingHostIndeterminateResponses =
+        (config.mock.meetingHostIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId: input.meetingId,
+      eventId,
+      action: action.type,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+  return accepted;
 }
 
 async function handleMeetingFloorAction(
@@ -2483,6 +2949,11 @@ async function handleMeetingFloorAction(
       };
       floor.humanQueue.push(request);
       if (request.state === "offered") {
+        if (snapshot.host?.boardControl.phase === "board_pending") {
+          snapshot.host.boardControl.phase = "floor_ready";
+          snapshot.host.boardControl.boardCompletedAtMs = Date.now();
+          snapshot.host.boardControl.boardOutcome = "preempted";
+        }
         floor.offer = {
           offerId: "a".repeat(32) + eventId.slice(32),
           targetPubkey: actor,
@@ -2490,12 +2961,22 @@ async function handleMeetingFloorAction(
           allocationSource: "human_request",
           turnRole: "participant",
           selectionReason: null,
+          sourceIntentId: null,
+          sourceRequestId: request.requestId,
+          sourceHandoffId: null,
+          sourceSpeechEventId: null,
           handoffContext: null,
           createdAtMs: Date.now(),
           ackDeadlineMs: Date.now() + 30_000,
         };
         snapshot.phase = "offered";
         snapshot.currentOfferPubkey = actor;
+        if (snapshot.host) {
+          snapshot.host.canSelect = false;
+          snapshot.host.canClose = false;
+          snapshot.host.canRecall = false;
+          snapshot.host.decisionDeadlineMs = null;
+        }
       }
       break;
     }
@@ -2506,7 +2987,7 @@ async function handleMeetingFloorAction(
       if (floor.offer?.targetPubkey === actor) {
         floor.offer = null;
         snapshot.currentOfferPubkey = null;
-        snapshot.phase = "moderator_control";
+        returnMockControlToBoard(snapshot);
       }
       break;
     case "offer_ack": {
@@ -2520,6 +3001,10 @@ async function handleMeetingFloorAction(
         allocationSource: offer.allocationSource,
         turnRole: offer.turnRole,
         selectionReason: offer.selectionReason,
+        sourceIntentId: offer.sourceIntentId,
+        sourceRequestId: offer.sourceRequestId,
+        sourceHandoffId: offer.sourceHandoffId,
+        sourceSpeechEventId: offer.sourceSpeechEventId,
         handoffContext: offer.handoffContext,
         createdAtMs: Date.now(),
         softLeaseExpiresAtMs: Date.now() + 60_000,
@@ -2527,33 +3012,82 @@ async function handleMeetingFloorAction(
         progressSeq: 0,
       };
       floor.offer = null;
+      if (offer.sourceIntentId && snapshot.host) {
+        snapshot.host.pendingIntents = snapshot.host.pendingIntents.filter(
+          (intent) => intent.intentId !== offer.sourceIntentId,
+        );
+        snapshot.intentRevision += 1;
+      }
+      if (offer.sourceHandoffId && snapshot.host) {
+        const handoff = snapshot.host.openHandoffs.find(
+          (candidate) => candidate.handoffId === offer.sourceHandoffId,
+        );
+        if (handoff) {
+          handoff.lastGrantId = floor.grant.grantId;
+          handoff.lastAttemptOutcome = "granted";
+          handoff.attemptActive = true;
+        }
+      }
       floor.humanQueue = floor.humanQueue.filter(
         (request) => request.requesterPubkey !== actor,
       );
       snapshot.phase = "granted";
       snapshot.currentOfferPubkey = null;
       snapshot.currentSpeakerPubkey = actor;
+      if (snapshot.host) {
+        snapshot.host.canSelect = false;
+        snapshot.host.canClose = false;
+        snapshot.host.canRecall = true;
+      }
       break;
     }
-    case "offer_decline":
+    case "offer_decline": {
       if (!floor.offer || floor.offer.targetPubkey !== actor) {
         throw new Error("Floor Offer is not addressed to this Human");
       }
+      const declinedOffer = floor.offer;
       floor.offer = null;
       floor.humanQueue = floor.humanQueue.filter(
         (request) => request.requesterPubkey !== actor,
       );
-      snapshot.phase = "moderator_control";
-      snapshot.currentOfferPubkey = null;
+      if (declinedOffer.sourceIntentId && snapshot.host) {
+        const intent = snapshot.host.pendingIntents.find(
+          (candidate) => candidate.intentId === declinedOffer.sourceIntentId,
+        );
+        if (intent) intent.lastAttemptOutcome = "declined";
+      }
+      if (declinedOffer.sourceHandoffId && snapshot.host) {
+        const handoff = snapshot.host.openHandoffs.find(
+          (candidate) => candidate.handoffId === declinedOffer.sourceHandoffId,
+        );
+        if (handoff) {
+          handoff.attemptActive = false;
+          handoff.selectable = true;
+          handoff.lastAttemptOutcome = "declined";
+        }
+      }
+      returnMockControlToBoard(snapshot);
       break;
-    case "grant_yield":
+    }
+    case "grant_yield": {
       if (!floor.grant || floor.grant.holderPubkey !== actor) {
         throw new Error("Floor Grant is not held by this Human");
       }
+      const yieldedGrant = floor.grant;
       floor.grant = null;
-      snapshot.phase = "moderator_control";
-      snapshot.currentSpeakerPubkey = null;
+      if (yieldedGrant.sourceHandoffId && snapshot.host) {
+        const handoff = snapshot.host.openHandoffs.find(
+          (candidate) => candidate.handoffId === yieldedGrant.sourceHandoffId,
+        );
+        if (handoff) {
+          handoff.attemptActive = false;
+          handoff.selectable = true;
+          handoff.lastAttemptOutcome = "yielded";
+        }
+      }
+      returnMockControlToBoard(snapshot);
       break;
+    }
     case "speech": {
       if (!floor.grant || floor.grant.holderPubkey !== actor) {
         throw new Error("Floor Grant is not held by this Human");
@@ -2571,10 +3105,17 @@ async function handleMeetingFloorAction(
       });
       snapshot.speechRevision = speechRevision;
       snapshot.latestSpeechAt = Math.floor(Date.now() / 1_000);
+      const completedGrant = floor.grant;
       floor.grant = null;
       snapshot.currentSpeakerPubkey = null;
+      if (completedGrant.sourceHandoffId && snapshot.host) {
+        snapshot.host.openHandoffs = snapshot.host.openHandoffs.filter(
+          (handoff) => handoff.handoffId !== completedGrant.sourceHandoffId,
+        );
+      }
       const handoff = input.action.handoff;
       if (handoff) {
+        const handoffId = `e${eventId.slice(1)}`;
         floor.offer = {
           offerId: "c".repeat(32) + eventId.slice(32),
           targetPubkey: handoff.targetPubkey,
@@ -2587,6 +3128,10 @@ async function handleMeetingFloorAction(
           allocationSource: "directed_handoff",
           turnRole: "participant",
           selectionReason: null,
+          sourceIntentId: null,
+          sourceRequestId: null,
+          sourceHandoffId: handoffId,
+          sourceSpeechEventId: eventId,
           handoffContext: {
             fromPubkey: actor,
             reasonType: handoff.handoffType,
@@ -2597,17 +3142,38 @@ async function handleMeetingFloorAction(
         };
         snapshot.phase = "offered";
         snapshot.currentOfferPubkey = handoff.targetPubkey;
+        if (snapshot.host) {
+          snapshot.host.openHandoffs.push({
+            handoffId,
+            sourceSpeechEventId: eventId,
+            fromPubkey: actor,
+            toPubkey: handoff.targetPubkey,
+            reasonType: handoff.handoffType,
+            reasonText: handoff.reason,
+            createdAtMs: Date.now(),
+            attemptCount: 1,
+            lastOfferId: floor.offer.offerId,
+            lastGrantId: null,
+            lastAttemptOutcome: "offered",
+            blockedBy: null,
+            moderatorRetryBlocked: false,
+            eligibleDecisionEpoch: snapshot.host.decisionEpoch,
+            attemptActive: true,
+            selectable: false,
+          });
+          snapshot.host.canSelect = false;
+          snapshot.host.canClose = false;
+          snapshot.host.canRecall = true;
+        }
       } else {
-        snapshot.phase = "moderator_control";
-        snapshot.currentOfferPubkey = null;
+        returnMockControlToBoard(snapshot);
       }
       break;
     }
   }
 
-  snapshot.stateRevision += 1;
   snapshot.floorRevision += 1;
-  floor.stateEventId = nextMeetingStateEventId(snapshot.stateRevision);
+  advanceMockMeetingState(snapshot);
   const accepted = acceptedMeetingFloorResult(
     input,
     eventId,
@@ -2753,6 +3319,30 @@ async function handleCreateMeeting(
       humanQueue: [],
       offer: null,
       grant: null,
+    },
+    host: {
+      controlToken: "e".repeat(64),
+      stateEventId: "d".repeat(64),
+      controlEpoch: 1,
+      decisionEpoch: 0,
+      decisionDeadlineMs: null,
+      nextActionAtMs: null,
+      consecutiveModeratorSpeeches: 0,
+      forcedReturnToModerator: false,
+      pendingIntents: [],
+      openHandoffs: [],
+      boardControl: {
+        phase: "board_pending",
+        controlEpoch: 1,
+        boardWindow: 1,
+        boardStartedAtMs: Date.now(),
+        boardDeadlineAtMs: Date.now() + 120_000,
+        boardCompletedAtMs: null,
+        boardOutcome: null,
+      },
+      canSelect: false,
+      canClose: false,
+      canRecall: false,
     },
     participants: [
       { pubkey: hostPubkey, participantType: "human", channelRole: "owner" },
@@ -9530,11 +10120,18 @@ export function maybeInstallE2eTauriMocks() {
   resetMockSaveSubscriptions(config);
   resetMockPendingCommunityDeepLinks(config);
   mockMeetingFloorSubmissions.clear();
+  mockMeetingHostSubmissions.clear();
   mockWebsocketSendMutexWedged = false;
   mockWindows("main");
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
+  window.__BUZZ_E2E_PREEMPT_MEETING_BOARD__ = (input) =>
+    preemptMockMeetingBoard(
+      input.meetingId,
+      input.requesterPubkey.toLowerCase(),
+      config,
+    );
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({
@@ -10610,6 +11207,11 @@ export function maybeInstallE2eTauriMocks() {
       case "submit_meeting_floor_action":
         return handleMeetingFloorAction(
           payload as { input: MeetingFloorActionInput },
+          activeConfig,
+        );
+      case "submit_meeting_host_action":
+        return handleMeetingHostAction(
+          payload as { input: MeetingHostActionInput },
           activeConfig,
         );
       case "list_meetings": {

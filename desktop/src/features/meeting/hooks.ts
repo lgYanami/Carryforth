@@ -19,7 +19,9 @@ import {
   getMeetingSpeeches,
   listMeetings,
   submitMeetingFloorAction,
+  submitMeetingHostAction,
   type MeetingFloorActionInput,
+  type MeetingHostActionInput,
   type MeetingSpeechCursor,
 } from "@/shared/api/tauriMeetings";
 import type { Channel } from "@/shared/api/types";
@@ -162,6 +164,38 @@ export function useMeetingFloorActionMutation(meetingId: string) {
           queryClient.invalidateQueries({
             queryKey: meetingSpeechesQueryKey(activeCommunity?.id, meetingId),
           }),
+        );
+      }
+      await Promise.all(invalidations);
+    },
+    onError: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+      });
+    },
+  });
+}
+
+export function useMeetingHostActionMutation(meetingId: string) {
+  const { activeCommunity } = useCommunities();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: MeetingHostActionInput) =>
+      submitMeetingHostAction(input),
+    onSuccess: async (result) => {
+      if (result.status !== "accepted") return;
+      const invalidations: Promise<unknown>[] = [
+        queryClient.invalidateQueries({
+          queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: [...meetingQueryRoot(activeCommunity?.id), "directory"],
+        }),
+      ];
+      if (result.action === "close" || result.action === "abort") {
+        invalidations.push(
+          queryClient.invalidateQueries({ queryKey: channelsQueryKey }),
         );
       }
       await Promise.all(invalidations);

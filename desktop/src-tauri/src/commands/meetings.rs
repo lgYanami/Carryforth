@@ -8,8 +8,11 @@ mod create;
 pub use create::create_meeting;
 mod floor;
 pub use floor::submit_meeting_floor_action;
+mod host;
+pub use host::submit_meeting_host_action;
 mod model;
 use model::*;
+mod pending;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +23,7 @@ use buzz_core_pkg::kind::{
 use nostr::{Event, PublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use tauri::State;
 use uuid::Uuid;
 
@@ -69,161 +73,6 @@ enum MeetingCapabilityStatus {
     Unsupported,
     Readable,
     Creatable,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingBoard {
-    event_id: String,
-    format: String,
-    body: String,
-    moderator_pubkey: String,
-    updated_at: u64,
-    source: MeetingBoardSource,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum MeetingBoardSource {
-    Projection,
-    Create,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingActionState {
-    action_run_id: String,
-    board_event_id: String,
-    action_window_epoch: u64,
-    condition: String,
-    terminal_status: Option<String>,
-    completion_event_id: Option<String>,
-    action_deadline_at_ms: Option<i64>,
-    last_error_code: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingEndState {
-    event_id: String,
-    outcome: String,
-    reason_code: Option<String>,
-    reason: Option<String>,
-    ended_by: String,
-    ended_at: u64,
-    actions_attested: bool,
-}
-
-/// Complete read-only Meeting view consumed by React.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingSnapshot {
-    meeting_id: String,
-    title: String,
-    description: Option<String>,
-    source_channel_id: Option<String>,
-    schema_version: u16,
-    policy: String,
-    host_pubkey: String,
-    moderator_pubkey: String,
-    create_event_id: String,
-    created_at: u64,
-    lifecycle: MeetingLifecycle,
-    phase: String,
-    state_revision: u64,
-    floor_revision: u64,
-    intent_revision: u64,
-    speech_revision: u64,
-    current_speaker_pubkey: Option<String>,
-    current_offer_pubkey: Option<String>,
-    floor: Option<MeetingFloorState>,
-    participants: Vec<MeetingParticipant>,
-    board: MeetingBoard,
-    action: Option<MeetingActionState>,
-    end: Option<MeetingEndState>,
-    latest_speech_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MeetingLifecycle {
-    Initializing,
-    Active,
-    FinalizingActions,
-    Closed,
-    Aborted,
-}
-
-/// Safe load states for Meeting routes. Unsupported protocols remain isolated
-/// from the normal Channel surface.
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum MeetingLoadResult {
-    UnsupportedRelay,
-    Forbidden,
-    NotFound,
-    UnsupportedProtocol {
-        meeting_id: String,
-        schema_version: Option<String>,
-        policy: Option<String>,
-    },
-    Ready {
-        snapshot: Box<MeetingSnapshot>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingListItem {
-    meeting_id: String,
-    title: String,
-    lifecycle: Option<MeetingLifecycle>,
-    phase: Option<String>,
-    current_speaker_pubkey: Option<String>,
-    current_offer_pubkey: Option<String>,
-    human_floor_attention_pubkey: Option<String>,
-    moderator_pubkey: Option<String>,
-    policy: Option<String>,
-    updated_at: Option<u64>,
-    ended_at: Option<u64>,
-    latest_speech_at: Option<u64>,
-    compatibility: MeetingListCompatibility,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum MeetingListCompatibility {
-    Ready,
-    UnsupportedRelay,
-    UnsupportedProtocol,
-    Forbidden,
-    NotFound,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingSpeech {
-    event_id: String,
-    author_pubkey: String,
-    content: String,
-    created_at: u64,
-    speech_revision: u64,
-    grant_event_id: String,
-    mentions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingSpeechCursor {
-    before: u64,
-    before_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingSpeechPage {
-    speeches: Vec<MeetingSpeech>,
-    next_cursor: Option<MeetingSpeechCursor>,
 }
 
 #[derive(Debug)]
@@ -569,7 +418,7 @@ async fn load_meeting_snapshot_at(
     let board = parse_current_board(&events, identity, &create)?;
     let end = parse_current_end(&events, &create)?;
 
-    let (participants, phase, revisions, current_speaker, current_offer, floor, action) =
+    let (participants, phase, revisions, current_speaker, current_offer, floor, host, action) =
         if let Some(state) = &current_state {
             let participants = validate_participants(&state.state, &create)?;
             let current_speaker = state
@@ -583,6 +432,7 @@ async fn load_meeting_snapshot_at(
                 .as_ref()
                 .map(|offer| offer.target_pubkey.clone());
             let floor = floor_from_projection(state);
+            let host = host_from_projection(state, meeting_id);
             let action = state
                 .state
                 .board_control
@@ -601,6 +451,7 @@ async fn load_meeting_snapshot_at(
                 current_speaker,
                 current_offer,
                 Some(floor),
+                host,
                 action,
             )
         } else {
@@ -621,6 +472,7 @@ async fn load_meeting_snapshot_at(
                 participants,
                 "initializing".to_string(),
                 (0, 0, 0, 0),
+                None,
                 None,
                 None,
                 None,
@@ -691,6 +543,7 @@ async fn load_meeting_snapshot_at(
             current_speaker_pubkey: current_speaker,
             current_offer_pubkey: current_offer,
             floor,
+            host,
             participants,
             board,
             action,
@@ -737,6 +590,10 @@ fn floor_from_projection(projection: &StateProjection) -> MeetingFloorState {
             allocation_source: offer.allocation_source.clone(),
             turn_role: offer.turn_role.clone(),
             selection_reason: offer.selection_reason.clone(),
+            source_intent_id: offer.source_intent_id.clone(),
+            source_request_id: offer.source_request_id.clone(),
+            source_handoff_id: offer.source_handoff_id.clone(),
+            source_speech_event_id: offer.source_speech_event_id.clone(),
             handoff_context: offer.handoff_context.as_ref().map(handoff_from_wire),
             created_at_ms: offer.created_at_ms,
             ack_deadline_ms: offer.ack_deadline_ms,
@@ -747,6 +604,10 @@ fn floor_from_projection(projection: &StateProjection) -> MeetingFloorState {
             allocation_source: grant.allocation_source.clone(),
             turn_role: grant.turn_role.clone(),
             selection_reason: grant.selection_reason.clone(),
+            source_intent_id: grant.source_intent_id.clone(),
+            source_request_id: grant.source_request_id.clone(),
+            source_handoff_id: grant.source_handoff_id.clone(),
+            source_speech_event_id: grant.source_speech_event_id.clone(),
             handoff_context: grant.handoff_context.as_ref().map(handoff_from_wire),
             created_at_ms: grant.created_at_ms,
             soft_lease_expires_at_ms: grant.soft_lease_expires_at_ms,
@@ -754,6 +615,119 @@ fn floor_from_projection(projection: &StateProjection) -> MeetingFloorState {
             progress_seq: grant.progress_seq as u64,
         }),
     }
+}
+
+fn host_from_projection(
+    projection: &StateProjection,
+    meeting_id: &str,
+) -> Option<MeetingHostState> {
+    let state = &projection.state;
+    let control = state.board_control.as_ref()?;
+    let moderator_has_control =
+        matches!(state.phase.as_str(), "moderator_idle" | "moderator_control")
+            && state.offer.is_none()
+            && state.grant.is_none()
+            && state.human_queue.is_empty();
+    let floor_ready = control.phase == "floor_ready";
+    let can_select = moderator_has_control && floor_ready;
+    let can_close = can_select
+        && matches!(
+            control.board_outcome.as_deref(),
+            Some("updated" | "unchanged")
+        );
+    let active_handoff_id = state
+        .offer
+        .as_ref()
+        .and_then(|offer| offer.source_handoff_id.as_deref())
+        .or_else(|| {
+            state
+                .grant
+                .as_ref()
+                .and_then(|grant| grant.source_handoff_id.as_deref())
+        });
+    let control_binding = if control.phase == "board_pending" {
+        format!(
+            "board|{meeting_id}|{}|{}",
+            control.control_epoch, control.board_window
+        )
+    } else {
+        format!("state|{meeting_id}|{}", projection.event_id)
+    };
+    let control_token = hex::encode(Sha256::digest(control_binding.as_bytes()));
+    Some(MeetingHostState {
+        control_token,
+        state_event_id: projection.event_id.clone(),
+        control_epoch: state.control_epoch,
+        decision_epoch: state.decision_epoch,
+        decision_deadline_ms: state.moderator_decision_deadline_ms,
+        next_action_at_ms: state.next_action_at_ms,
+        consecutive_moderator_speeches: state.consecutive_moderator_speeches as u32,
+        forced_return_to_moderator: state.forced_return_to_moderator,
+        pending_intents: state
+            .pending_intents
+            .iter()
+            .map(|intent| MeetingPendingIntent {
+                intent_id: intent.intent_id.clone(),
+                current_event_id: intent.current_event_id.clone(),
+                author_pubkey: intent.author_pubkey.clone(),
+                basis_speech_revision: intent.basis_speech_revision,
+                summary: intent.summary.clone(),
+                addressed_to: intent.addressed_to.clone(),
+                created_at_ms: intent.created_at_ms,
+                deferred: intent.deferred,
+                selection_attempt_count: intent.selection_attempt_count as u32,
+                last_offer_id: intent.last_offer_id.clone(),
+                last_attempt_outcome: intent.last_attempt_outcome.clone(),
+                eligible_decision_epoch: intent.eligible_decision_epoch,
+                selectable: can_select
+                    && !intent.deferred
+                    && intent.eligible_decision_epoch <= state.decision_epoch,
+            })
+            .collect(),
+        open_handoffs: state
+            .unresolved_handoffs
+            .iter()
+            .map(|handoff| {
+                let attempt_active = active_handoff_id == Some(handoff.handoff_id.as_str());
+                MeetingOpenHandoff {
+                    handoff_id: handoff.handoff_id.clone(),
+                    source_speech_event_id: handoff.source_speech_event_id.clone(),
+                    from_pubkey: handoff.from_pubkey.clone(),
+                    to_pubkey: handoff.to_pubkey.clone(),
+                    reason_type: handoff.reason_type.clone(),
+                    reason_text: handoff.reason_text.clone(),
+                    created_at_ms: handoff.created_at_ms,
+                    attempt_count: handoff.attempt_count as u32,
+                    last_offer_id: handoff.last_offer_id.clone(),
+                    last_grant_id: handoff.last_grant_id.clone(),
+                    last_attempt_outcome: handoff.last_attempt_outcome.clone(),
+                    blocked_by: handoff.blocked_by.clone(),
+                    moderator_retry_blocked: handoff.moderator_retry_blocked,
+                    eligible_decision_epoch: handoff.eligible_decision_epoch,
+                    attempt_active,
+                    selectable: can_select
+                        && !attempt_active
+                        && handoff.blocked_by.is_none()
+                        && !handoff.moderator_retry_blocked
+                        && handoff.eligible_decision_epoch <= state.decision_epoch,
+                }
+            })
+            .collect(),
+        board_control: MeetingBoardControl {
+            phase: control.phase.clone(),
+            control_epoch: control.control_epoch,
+            board_window: control.board_window,
+            board_started_at_ms: control.board_started_at_ms,
+            board_deadline_at_ms: control.board_deadline_at_ms,
+            board_completed_at_ms: control.board_completed_at_ms,
+            board_outcome: control.board_outcome.clone(),
+        },
+        can_select,
+        can_close,
+        can_recall: matches!(state.phase.as_str(), "offered" | "granted")
+            && !state.forced_return_to_moderator
+            && state.human_queue.is_empty(),
+    })
 }
 
 fn list_item_from_load(

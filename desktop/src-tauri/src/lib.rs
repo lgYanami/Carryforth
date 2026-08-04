@@ -727,6 +727,7 @@ pub fn run() {
             get_meeting_speeches,
             create_meeting,
             submit_meeting_floor_action,
+            submit_meeting_host_action,
             create_channel,
             ensure_starter_channels,
             open_dm,

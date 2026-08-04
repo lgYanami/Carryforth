@@ -76,6 +76,10 @@ export type MeetingOffer = {
     | "directed_handoff";
   turnRole: "participant" | "moderator_self";
   selectionReason: string | null;
+  sourceIntentId: string | null;
+  sourceRequestId: string | null;
+  sourceHandoffId: string | null;
+  sourceSpeechEventId: string | null;
   handoffContext: MeetingHandoffContext | null;
   createdAtMs: number;
   ackDeadlineMs: number;
@@ -87,6 +91,10 @@ export type MeetingGrant = {
   allocationSource: MeetingOffer["allocationSource"];
   turnRole: MeetingOffer["turnRole"];
   selectionReason: string | null;
+  sourceIntentId: string | null;
+  sourceRequestId: string | null;
+  sourceHandoffId: string | null;
+  sourceSpeechEventId: string | null;
   handoffContext: MeetingHandoffContext | null;
   createdAtMs: number;
   softLeaseExpiresAtMs: number;
@@ -100,6 +108,74 @@ export type MeetingFloorState = {
   humanQueue: MeetingHumanFloorRequest[];
   offer: MeetingOffer | null;
   grant: MeetingGrant | null;
+};
+
+export type MeetingPendingIntent = {
+  intentId: string;
+  currentEventId: string;
+  authorPubkey: string;
+  basisSpeechRevision: number;
+  summary: string;
+  addressedTo: string | null;
+  createdAtMs: number;
+  deferred: boolean;
+  selectionAttemptCount: number;
+  lastOfferId: string | null;
+  lastAttemptOutcome: string | null;
+  eligibleDecisionEpoch: number;
+  selectable: boolean;
+};
+
+export type MeetingOpenHandoff = {
+  handoffId: string;
+  sourceSpeechEventId: string;
+  fromPubkey: string;
+  toPubkey: string;
+  reasonType: MeetingHandoffType;
+  reasonText: string;
+  createdAtMs: number;
+  attemptCount: number;
+  lastOfferId: string | null;
+  lastGrantId: string | null;
+  lastAttemptOutcome: string | null;
+  blockedBy: string | null;
+  moderatorRetryBlocked: boolean;
+  eligibleDecisionEpoch: number;
+  attemptActive: boolean;
+  selectable: boolean;
+};
+
+export type MeetingBoardControl = {
+  phase:
+    | "bootstrap_locked"
+    | "board_pending"
+    | "floor_ready"
+    | "finalizing_actions"
+    | "ended";
+  controlEpoch: number;
+  boardWindow: number;
+  boardStartedAtMs: number | null;
+  boardDeadlineAtMs: number | null;
+  boardCompletedAtMs: number | null;
+  boardOutcome: "updated" | "unchanged" | "timed_out" | "preempted" | null;
+};
+
+export type MeetingHostState = {
+  /** Opaque native-issued concurrency token; never interpreted by React. */
+  controlToken: string;
+  stateEventId: string;
+  controlEpoch: number;
+  decisionEpoch: number;
+  decisionDeadlineMs: number | null;
+  nextActionAtMs: number | null;
+  consecutiveModeratorSpeeches: number;
+  forcedReturnToModerator: boolean;
+  pendingIntents: MeetingPendingIntent[];
+  openHandoffs: MeetingOpenHandoff[];
+  boardControl: MeetingBoardControl;
+  canSelect: boolean;
+  canClose: boolean;
+  canRecall: boolean;
 };
 
 export type MeetingBoard = {
@@ -152,6 +228,7 @@ export type MeetingSnapshot = {
   currentSpeakerPubkey: string | null;
   currentOfferPubkey: string | null;
   floor: MeetingFloorState | null;
+  host: MeetingHostState | null;
   participants: MeetingParticipant[];
   board: MeetingBoard;
   action: MeetingActionState | null;
@@ -273,6 +350,90 @@ export type MeetingFloorActionResult =
       message: string;
     };
 
+export type MeetingIntentRejectionReason =
+  | "off_topic"
+  | "duplicate"
+  | "superseded"
+  | "unsupported"
+  | "agenda_mismatch";
+
+export type MeetingHandoffDismissReason =
+  | "superseded"
+  | "answered_elsewhere"
+  | "out_of_scope"
+  | "no_longer_needed";
+
+export type MeetingAbortReason =
+  | "goal_unreachable"
+  | "insufficient_information"
+  | "discussion_blocked"
+  | "unable_to_form_conclusion"
+  | "moderator_unable_to_continue";
+
+export type MeetingHostAction =
+  | { type: "board_update"; body: string }
+  | { type: "board_unchanged" }
+  | { type: "intent_submit"; summary: string; addressedTo?: string }
+  | {
+      type: "intent_refresh";
+      intentId: string;
+      summary: string;
+      addressedTo?: string;
+    }
+  | { type: "intent_withdraw"; intentId: string }
+  | {
+      type: "select_intent";
+      intentId: string;
+      selectionReason?: string;
+      deferralReason?: string;
+    }
+  | {
+      type: "select_handoff";
+      handoffId: string;
+      selectionReason?: string;
+    }
+  | {
+      type: "reject_intent";
+      intentId: string;
+      reasonCode: MeetingIntentRejectionReason;
+      reason: string;
+    }
+  | {
+      type: "dismiss_handoff";
+      handoffId: string;
+      reasonCode: MeetingHandoffDismissReason;
+      reason: string;
+    }
+  | { type: "recall"; reason?: string }
+  | { type: "close" }
+  | { type: "abort"; reasonCode: MeetingAbortReason; reason?: string };
+
+export type MeetingHostActionInput = {
+  /** Stable UUID reused while an indeterminate signed command is retried. */
+  submissionId: string;
+  meetingId: string;
+  expectedControlToken: string;
+  action: MeetingHostAction;
+};
+
+export type MeetingHostActionResult =
+  | {
+      status: "accepted";
+      meetingId: string;
+      eventId: string;
+      action: string;
+      canonicalObjectId: string | null;
+      stateRevision: number | null;
+      duplicate: boolean;
+    }
+  | {
+      status: "indeterminate";
+      meetingId: string;
+      eventId: string;
+      action: string;
+      message: string;
+    };
+
 export async function getMeetingCapability(): Promise<MeetingCapability> {
   return invokeTauri<MeetingCapability>("get_meeting_capability");
 }
@@ -287,6 +448,14 @@ export async function submitMeetingFloorAction(
   input: MeetingFloorActionInput,
 ): Promise<MeetingFloorActionResult> {
   return invokeTauri<MeetingFloorActionResult>("submit_meeting_floor_action", {
+    input,
+  });
+}
+
+export async function submitMeetingHostAction(
+  input: MeetingHostActionInput,
+): Promise<MeetingHostActionResult> {
+  return invokeTauri<MeetingHostActionResult>("submit_meeting_host_action", {
     input,
   });
 }
