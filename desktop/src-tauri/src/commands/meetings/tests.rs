@@ -56,9 +56,40 @@ fn test_state(input: StateFixture<'_>) -> Event {
         .iter()
         .find(|pubkey| *pubkey != &input.create.host_pubkey)
         .unwrap_or_else(|| panic!("test Create has another participant"));
+    let target_type = if input.floor_target == Some(input.create.host_pubkey.as_str()) {
+        "human"
+    } else {
+        input.participant_type
+    };
     let (offer, grant) = match input.phase {
-        "offered" => (json!({ "target_pubkey": input.floor_target }), Value::Null),
-        "granted" => (Value::Null, json!({ "holder_pubkey": input.floor_target })),
+        "offered" => (
+            json!({
+                "offer_id": "aa".repeat(32),
+                "target_pubkey": input.floor_target,
+                "target_participant_type": target_type,
+                "allocation_source": "fallback",
+                "turn_role": "participant",
+                "basis_speech_revision": input.speech_revision,
+                "created_at_ms": 1_000,
+                "ack_deadline_ms": 31_000
+            }),
+            Value::Null,
+        ),
+        "granted" => (
+            Value::Null,
+            json!({
+                "grant_id": "bb".repeat(32),
+                "holder_pubkey": input.floor_target,
+                "allocation_source": "fallback",
+                "turn_role": "participant",
+                "source_offer_id": "aa".repeat(32),
+                "basis_speech_revision": input.speech_revision,
+                "created_at_ms": 1_000,
+                "soft_lease_expires_at_ms": 31_000,
+                "hard_deadline_ms": 61_000,
+                "progress_seq": 0
+            }),
+        ),
         _ => (Value::Null, Value::Null),
     };
     let content = json!({
@@ -80,6 +111,7 @@ fn test_state(input: StateFixture<'_>) -> Event {
                 "channel_role": "member"
             }
         ],
+        "human_queue": [],
         "offer": offer,
         "grant": grant
     });

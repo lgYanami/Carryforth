@@ -32,6 +32,7 @@ import {
 } from "@/shared/ui/sidebar";
 
 type MeetingsSidebarSectionProps = {
+  currentPubkey?: string;
   items: MeetingListItem[];
   selectedMeetingId: string | null;
   unreadMeetingIds: ReadonlySet<string>;
@@ -67,11 +68,13 @@ function meetingStatus(item: MeetingListItem): string {
 
 function MeetingRow({
   item,
+  needsAttention,
   isSelected,
   isUnread,
   onSelect,
 }: {
   item: MeetingListItem;
+  needsAttention: boolean;
   isSelected: boolean;
   isUnread: boolean;
   onSelect: () => void;
@@ -98,26 +101,31 @@ function MeetingRow({
             {meetingStatus(item)}
           </span>
         </span>
-        {isUnread ? (
-          <span
-            aria-label="Unread Meeting speech"
-            className="mt-1.5 size-2 shrink-0 rounded-full bg-primary group-data-[collapsible=icon]:hidden"
-            data-testid={`meeting-unread-${item.meetingId}`}
-            role="status"
-          />
-        ) : item.lifecycle === "finalizing_actions" ? (
-          <span
-            aria-label="Meeting needs action"
-            className="mt-1.5 size-2 shrink-0 rounded-full bg-amber-500 group-data-[collapsible=icon]:hidden"
-            role="status"
-          />
-        ) : null}
+        <span className="mt-1.5 flex shrink-0 gap-1 group-data-[collapsible=icon]:hidden">
+          {isUnread ? (
+            <span
+              aria-label="Unread Meeting speech"
+              className="size-2 rounded-full bg-primary"
+              data-testid={`meeting-unread-${item.meetingId}`}
+              role="status"
+            />
+          ) : null}
+          {needsAttention ? (
+            <span
+              aria-label="Meeting needs your attention"
+              className="size-2 rounded-full bg-amber-500"
+              data-testid={`meeting-attention-${item.meetingId}`}
+              role="status"
+            />
+          ) : null}
+        </span>
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
 }
 
 export function MeetingsSidebarSection({
+  currentPubkey,
   items,
   selectedMeetingId,
   unreadMeetingIds,
@@ -198,6 +206,10 @@ export function MeetingsSidebarSection({
                   isUnread={unreadMeetingIds.has(item.meetingId)}
                   item={item}
                   key={item.meetingId}
+                  needsAttention={
+                    Boolean(currentPubkey) &&
+                    item.humanFloorAttentionPubkey === currentPubkey
+                  }
                   onSelect={() => onSelectMeeting(item.meetingId)}
                 />
               ))}

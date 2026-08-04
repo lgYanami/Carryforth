@@ -18,6 +18,8 @@ import {
   getMeetingSnapshot,
   getMeetingSpeeches,
   listMeetings,
+  submitMeetingFloorAction,
+  type MeetingFloorActionInput,
   type MeetingSpeechCursor,
 } from "@/shared/api/tauriMeetings";
 import type { Channel } from "@/shared/api/types";
@@ -135,6 +137,40 @@ export function useMeetingSnapshot(meetingId: string) {
     enabled: Boolean(activeCommunity && meetingId),
     staleTime: 5_000,
     refetchOnWindowFocus: true,
+  });
+}
+
+export function useMeetingFloorActionMutation(meetingId: string) {
+  const { activeCommunity } = useCommunities();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: MeetingFloorActionInput) =>
+      submitMeetingFloorAction(input),
+    onSuccess: async (result) => {
+      if (result.status !== "accepted") return;
+      const invalidations: Promise<unknown>[] = [
+        queryClient.invalidateQueries({
+          queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: [...meetingQueryRoot(activeCommunity?.id), "directory"],
+        }),
+      ];
+      if (result.action === "speech") {
+        invalidations.push(
+          queryClient.invalidateQueries({
+            queryKey: meetingSpeechesQueryKey(activeCommunity?.id, meetingId),
+          }),
+        );
+      }
+      await Promise.all(invalidations);
+    },
+    onError: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+      });
+    },
   });
 }
 

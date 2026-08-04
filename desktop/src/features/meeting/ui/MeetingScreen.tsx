@@ -39,6 +39,7 @@ import {
 } from "@/shared/ui/sheet";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import { MeetingBoardPanel } from "./MeetingBoardPanel";
+import { MeetingFloorDock } from "./MeetingFloorDock";
 import { MeetingParticipantsPanel } from "./MeetingParticipantsPanel";
 import { MeetingSpeechTimeline } from "./MeetingSpeechTimeline";
 import { MeetingTerminalSummary } from "./MeetingTerminalSummary";
@@ -127,30 +128,6 @@ function meetingStatusText(
     return "The Relay is preparing the authoritative Meeting state.";
   }
   return "The host currently controls the meeting floor.";
-}
-
-function ReadOnlyState({
-  currentPubkey,
-  snapshot,
-}: {
-  currentPubkey?: string;
-  snapshot: MeetingSnapshot;
-}) {
-  const isHost = currentPubkey === snapshot.moderatorPubkey;
-  const terminal =
-    snapshot.lifecycle === "closed" || snapshot.lifecycle === "aborted";
-  return (
-    <div
-      className="shrink-0 border-t bg-muted/25 px-4 py-3 text-center text-xs text-muted-foreground"
-      data-testid="meeting-read-only-floor"
-    >
-      {terminal
-        ? "This Meeting is read-only. Its final Board and formal Speech remain available."
-        : isHost
-          ? "Host controls are not available in this read-only room."
-          : "You are observing the authoritative Meeting in read-only mode."}
-    </div>
-  );
 }
 
 function MeetingLoadState({
@@ -439,8 +416,10 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
           className="hidden w-96 shrink-0 border-l xl:flex"
         />
       </div>
-      <ReadOnlyState
+      <MeetingFloorDock
         currentPubkey={identityQuery.data?.pubkey}
+        onRefresh={() => void snapshotQuery.refetch()}
+        profiles={profiles}
         snapshot={readySnapshot}
       />
     </div>

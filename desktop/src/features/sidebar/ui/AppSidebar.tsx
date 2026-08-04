@@ -525,6 +525,7 @@ export function AppSidebar({
               {!isLoading ? (
                 <>
                   <MeetingsSidebarSection
+                    currentPubkey={currentPubkey}
                     items={meetingItems}
                     onSelectMeeting={onSelectChannel}
                     selectedMeetingId={

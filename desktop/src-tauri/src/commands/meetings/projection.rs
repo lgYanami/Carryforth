@@ -127,30 +127,182 @@ pub(super) fn parse_state(
         )));
     }
     validate_board_control(state.board_control.as_ref(), create)?;
-    for target in [
-        state
-            .offer
-            .as_ref()
-            .and_then(|offer| offer.target_pubkey.as_deref()),
-        state
-            .grant
-            .as_ref()
-            .and_then(|grant| grant.holder_pubkey.as_deref()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        require_hex64(target, "Meeting State floor target").map_err(MeetingReadError::Other)?;
-        if !create.participant_pubkeys.contains(target) {
-            return Err(MeetingReadError::Other(integrity_error(
-                "Meeting State floor target is outside the frozen roster",
-            )));
-        }
-    }
+    validate_floor_state(&state, create)?;
     Ok(Some(StateProjection {
         event_id: event.id.to_hex(),
         state,
     }))
+}
+
+fn validate_floor_state(
+    state: &StateWire,
+    create: &CreateProjection,
+) -> Result<(), MeetingReadError> {
+    let participant_types = state
+        .participants
+        .iter()
+        .map(|participant| (participant.pubkey.as_str(), participant.participant_type))
+        .collect::<BTreeMap<_, _>>();
+    let mut request_ids = BTreeSet::new();
+    let mut requesters = BTreeSet::new();
+    let mut positions = BTreeSet::new();
+    for request in &state.human_queue {
+        require_hex64(&request.request_id, "Meeting Human Floor Request")
+            .map_err(MeetingReadError::Other)?;
+        require_hex64(&request.requester_pubkey, "Meeting Human Floor requester")
+            .map_err(MeetingReadError::Other)?;
+        if request.queue_position <= 0
+            || !matches!(request.state.as_str(), "queued" | "offered")
+            || participant_types.get(request.requester_pubkey.as_str())
+                != Some(&FrozenParticipantType::Human)
+            || request.requester_pubkey == create.host_pubkey
+            || !request_ids.insert(request.request_id.as_str())
+            || !requesters.insert(request.requester_pubkey.as_str())
+            || !positions.insert(request.queue_position)
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State has an invalid Human Floor queue",
+            )));
+        }
+    }
+
+    match state.phase.as_str() {
+        "offered" if state.offer.is_some() && state.grant.is_none() => {}
+        "granted" if state.grant.is_some() && state.offer.is_none() => {}
+        "moderator_idle" | "moderator_control" | "ended"
+            if state.offer.is_none() && state.grant.is_none() => {}
+        _ => {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting State phase does not match its active Offer or Grant",
+            )));
+        }
+    }
+
+    if let Some(offer) = &state.offer {
+        validate_floor_id(&offer.offer_id, "Meeting Offer")?;
+        validate_floor_actor(
+            &offer.target_pubkey,
+            offer.target_participant_type,
+            &participant_types,
+            "Meeting Offer target",
+        )?;
+        validate_allocation(&offer.allocation_source, &offer.turn_role)?;
+        validate_source_ids([
+            offer.source_intent_id.as_deref(),
+            offer.source_request_id.as_deref(),
+            offer.source_handoff_id.as_deref(),
+            offer.source_speech_event_id.as_deref(),
+        ])?;
+        validate_handoff(offer.handoff_context.as_ref(), &participant_types)?;
+        if offer.basis_speech_revision != state.speech_revision
+            || offer.created_at_ms < 0
+            || offer.ack_deadline_ms < offer.created_at_ms
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting Offer has an invalid revision or deadline",
+            )));
+        }
+    }
+    if let Some(grant) = &state.grant {
+        validate_floor_id(&grant.grant_id, "Meeting Grant")?;
+        validate_floor_actor(
+            &grant.holder_pubkey,
+            *participant_types
+                .get(grant.holder_pubkey.as_str())
+                .ok_or_else(|| {
+                    MeetingReadError::Other(integrity_error(
+                        "Meeting Grant holder is outside the frozen roster",
+                    ))
+                })?,
+            &participant_types,
+            "Meeting Grant holder",
+        )?;
+        validate_allocation(&grant.allocation_source, &grant.turn_role)?;
+        validate_floor_id(&grant.source_offer_id, "Meeting Grant source Offer")?;
+        validate_source_ids([
+            grant.source_intent_id.as_deref(),
+            grant.source_request_id.as_deref(),
+            grant.source_handoff_id.as_deref(),
+            grant.source_speech_event_id.as_deref(),
+        ])?;
+        validate_handoff(grant.handoff_context.as_ref(), &participant_types)?;
+        if grant.basis_speech_revision != state.speech_revision
+            || grant.created_at_ms < 0
+            || grant.soft_lease_expires_at_ms < grant.created_at_ms
+            || grant.hard_deadline_ms < grant.soft_lease_expires_at_ms
+            || grant.progress_seq < 0
+        {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting Grant has an invalid revision, deadline, or progress sequence",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_floor_id(value: &str, context: &str) -> Result<(), MeetingReadError> {
+    require_hex64(value, context).map_err(MeetingReadError::Other)
+}
+
+fn validate_floor_actor(
+    pubkey: &str,
+    participant_type: FrozenParticipantType,
+    participant_types: &BTreeMap<&str, FrozenParticipantType>,
+    context: &str,
+) -> Result<(), MeetingReadError> {
+    require_hex64(pubkey, context).map_err(MeetingReadError::Other)?;
+    if participant_types.get(pubkey) != Some(&participant_type) {
+        return Err(MeetingReadError::Other(integrity_error(format!(
+            "{context} does not match the frozen roster"
+        ))));
+    }
+    Ok(())
+}
+
+fn validate_allocation(source: &str, turn_role: &str) -> Result<(), MeetingReadError> {
+    if !matches!(
+        source,
+        "human_request" | "fallback" | "moderator_select" | "directed_handoff"
+    ) || !matches!(turn_role, "participant" | "moderator_self")
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting Floor allocation is unsupported",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_source_ids<'a>(
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<(), MeetingReadError> {
+    for value in values.into_iter().flatten() {
+        validate_floor_id(value, "Meeting Floor source event")?;
+    }
+    Ok(())
+}
+
+fn validate_handoff(
+    context: Option<&HandoffContextWire>,
+    participant_types: &BTreeMap<&str, FrozenParticipantType>,
+) -> Result<(), MeetingReadError> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    require_hex64(&context.from_pubkey, "Meeting Handoff source")
+        .map_err(MeetingReadError::Other)?;
+    if !participant_types.contains_key(context.from_pubkey.as_str())
+        || !matches!(
+            context.reason_type.as_str(),
+            "question" | "information_request" | "clarification" | "review" | "response_requested"
+        )
+        || context.reason_text.trim().is_empty()
+        || context.reason_text.len() > 1024
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting Handoff context is invalid",
+        )));
+    }
+    Ok(())
 }
 
 fn validate_board_control(

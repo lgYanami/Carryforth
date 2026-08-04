@@ -47,6 +47,61 @@ export type MeetingParticipant = {
   channelRole: string;
 };
 
+export type MeetingHumanFloorRequest = {
+  requestId: string;
+  requesterPubkey: string;
+  queuePosition: number;
+  state: "queued" | "offered";
+};
+
+export type MeetingHandoffContext = {
+  fromPubkey: string;
+  reasonType:
+    | "question"
+    | "information_request"
+    | "clarification"
+    | "review"
+    | "response_requested";
+  reasonText: string;
+};
+
+export type MeetingOffer = {
+  offerId: string;
+  targetPubkey: string;
+  targetParticipantType: "human" | "agent";
+  allocationSource:
+    | "human_request"
+    | "fallback"
+    | "moderator_select"
+    | "directed_handoff";
+  turnRole: "participant" | "moderator_self";
+  selectionReason: string | null;
+  handoffContext: MeetingHandoffContext | null;
+  createdAtMs: number;
+  ackDeadlineMs: number;
+};
+
+export type MeetingGrant = {
+  grantId: string;
+  holderPubkey: string;
+  allocationSource: MeetingOffer["allocationSource"];
+  turnRole: MeetingOffer["turnRole"];
+  selectionReason: string | null;
+  handoffContext: MeetingHandoffContext | null;
+  createdAtMs: number;
+  softLeaseExpiresAtMs: number;
+  hardDeadlineMs: number;
+  progressSeq: number;
+};
+
+export type MeetingFloorState = {
+  /** Opaque Relay-authored concurrency token. */
+  stateEventId: string;
+  humanQueue: MeetingHumanFloorRequest[];
+  offer: MeetingOffer | null;
+  grant: MeetingGrant | null;
+};
+
 export type MeetingBoard = {
   eventId: string;
   format: "markdown";
@@ -96,6 +151,7 @@ export type MeetingSnapshot = {
   speechRevision: number;
   currentSpeakerPubkey: string | null;
   currentOfferPubkey: string | null;
+  floor: MeetingFloorState | null;
   participants: MeetingParticipant[];
   board: MeetingBoard;
   action: MeetingActionState | null;
@@ -121,6 +177,8 @@ export type MeetingListItem = {
   lifecycle: MeetingLifecycle | null;
   phase: string | null;
   currentSpeakerPubkey: string | null;
+  currentOfferPubkey: string | null;
+  humanFloorAttentionPubkey: string | null;
   moderatorPubkey: string | null;
   policy: string | null;
   updatedAt: number | null;
@@ -154,6 +212,67 @@ export type MeetingSpeechPage = {
   nextCursor: MeetingSpeechCursor | null;
 };
 
+export type MeetingHandoffType =
+  | "question"
+  | "information_request"
+  | "clarification"
+  | "review"
+  | "response_requested";
+
+export type MeetingGrantYieldReason =
+  | "no_longer_needed"
+  | "unable_to_answer"
+  | "insufficient_context"
+  | "tool_failure"
+  | "cancelled";
+
+export type MeetingFloorAction =
+  | { type: "request" }
+  | { type: "withdraw" }
+  | { type: "offer_ack" }
+  | { type: "offer_decline"; reason?: string }
+  | {
+      type: "grant_yield";
+      reasonCode?: MeetingGrantYieldReason;
+      reason?: string;
+    }
+  | {
+      type: "speech";
+      content: string;
+      mentions: string[];
+      handoff?: {
+        targetPubkey: string;
+        handoffType: MeetingHandoffType;
+        reason: string;
+      };
+    };
+
+export type MeetingFloorActionInput = {
+  /** Stable UUID reused while an indeterminate signed command is retried. */
+  submissionId: string;
+  meetingId: string;
+  expectedStateEventId: string;
+  action: MeetingFloorAction;
+};
+
+export type MeetingFloorActionResult =
+  | {
+      status: "accepted";
+      meetingId: string;
+      eventId: string;
+      action: string;
+      canonicalObjectId: string | null;
+      stateRevision: number | null;
+      duplicate: boolean;
+    }
+  | {
+      status: "indeterminate";
+      meetingId: string;
+      eventId: string;
+      action: string;
+      message: string;
+    };
+
 export async function getMeetingCapability(): Promise<MeetingCapability> {
   return invokeTauri<MeetingCapability>("get_meeting_capability");
 }
@@ -162,6 +281,14 @@ export async function createMeeting(
   input: CreateMeetingInput,
 ): Promise<CreateMeetingResult> {
   return invokeTauri<CreateMeetingResult>("create_meeting", { input });
+}
+
+export async function submitMeetingFloorAction(
+  input: MeetingFloorActionInput,
+): Promise<MeetingFloorActionResult> {
+  return invokeTauri<MeetingFloorActionResult>("submit_meeting_floor_action", {
+    input,
+  });
 }
 
 export async function listMeetings(

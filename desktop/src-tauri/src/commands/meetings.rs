@@ -6,6 +6,10 @@
 
 mod create;
 pub use create::create_meeting;
+mod floor;
+pub use floor::submit_meeting_floor_action;
+mod model;
+use model::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,8 +25,8 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::relay::{
-    classify_request_error, parse_json_response, query_relay, relay_api_base_url_with_override,
-    relay_error_message,
+    classify_request_error, parse_json_response, query_relay, query_relay_at_with_keys,
+    relay_api_base_url_with_override, relay_error_message,
 };
 
 const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
@@ -65,38 +69,6 @@ enum MeetingCapabilityStatus {
     Unsupported,
     Readable,
     Creatable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingParticipant {
-    pubkey: String,
-    participant_type: MeetingParticipantType,
-    channel_role: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum MeetingParticipantType {
-    Human,
-    Agent,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum FrozenParticipantType {
-    Human,
-    Agent,
-}
-
-impl From<FrozenParticipantType> for MeetingParticipantType {
-    fn from(value: FrozenParticipantType) -> Self {
-        match value {
-            FrozenParticipantType::Human => Self::Human,
-            FrozenParticipantType::Agent => Self::Agent,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +136,7 @@ pub struct MeetingSnapshot {
     speech_revision: u64,
     current_speaker_pubkey: Option<String>,
     current_offer_pubkey: Option<String>,
+    floor: Option<MeetingFloorState>,
     participants: Vec<MeetingParticipant>,
     board: MeetingBoard,
     action: Option<MeetingActionState>,
@@ -207,6 +180,8 @@ pub struct MeetingListItem {
     lifecycle: Option<MeetingLifecycle>,
     phase: Option<String>,
     current_speaker_pubkey: Option<String>,
+    current_offer_pubkey: Option<String>,
+    human_floor_attention_pubkey: Option<String>,
     moderator_pubkey: Option<String>,
     policy: Option<String>,
     updated_at: Option<u64>,
@@ -249,81 +224,6 @@ pub struct MeetingSpeechCursor {
 pub struct MeetingSpeechPage {
     speeches: Vec<MeetingSpeech>,
     next_cursor: Option<MeetingSpeechCursor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct StateParticipant {
-    pubkey: String,
-    participant_type: FrozenParticipantType,
-    channel_role: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct StateTarget {
-    #[serde(default)]
-    target_pubkey: Option<String>,
-    #[serde(default)]
-    holder_pubkey: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActionWire {
-    action_run_id: Uuid,
-    board_event_id: String,
-    action_window_epoch: u64,
-    condition: String,
-    #[serde(default)]
-    terminal_status: Option<String>,
-    #[serde(default)]
-    completion_event_id: Option<String>,
-    #[serde(default)]
-    action_deadline_at_ms: Option<i64>,
-    #[serde(default)]
-    last_error_code: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BoardControlWire {
-    phase: String,
-    #[serde(default)]
-    action: Option<ActionWire>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StateWire {
-    phase: String,
-    state_revision: u64,
-    floor_revision: u64,
-    intent_revision: u64,
-    speech_revision: u64,
-    moderator_pubkey: String,
-    participants: Vec<StateParticipant>,
-    #[serde(default)]
-    offer: Option<StateTarget>,
-    #[serde(default)]
-    grant: Option<StateTarget>,
-    #[serde(default)]
-    board_control: Option<BoardControlWire>,
-}
-
-#[derive(Debug)]
-struct CreateProjection {
-    meeting_id: String,
-    title: String,
-    description: Option<String>,
-    source_channel_id: Option<String>,
-    policy: String,
-    host_pubkey: String,
-    participant_pubkeys: BTreeSet<String>,
-    event_id: String,
-    created_at: u64,
-    initial_board: buzz_sdk_pkg::MeetingV2BoardContent,
-}
-
-#[derive(Debug)]
-struct StateProjection {
-    event_id: String,
-    state: StateWire,
 }
 
 #[derive(Debug)]
@@ -572,6 +472,18 @@ async fn load_meeting_snapshot(
     identity: &MeetingIdentity,
     meeting_id: &str,
 ) -> Result<MeetingLoadResult, MeetingReadError> {
+    let api_base_url = relay_api_base_url_with_override(state);
+    let keys = state.signing_keys().map_err(MeetingReadError::Other)?;
+    load_meeting_snapshot_at(state, identity, meeting_id, &api_base_url, &keys).await
+}
+
+async fn load_meeting_snapshot_at(
+    state: &AppState,
+    identity: &MeetingIdentity,
+    meeting_id: &str,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+) -> Result<MeetingLoadResult, MeetingReadError> {
     let filters = [
         json!({
             "kinds": [KIND_MEETING_CREATE],
@@ -599,7 +511,7 @@ async fn load_meeting_snapshot(
             "limit": SNAPSHOT_EVENT_LIMIT,
         }),
     ];
-    let events = query_meeting(state, &filters).await?;
+    let events = query_meeting_at(state, api_base_url, keys, &filters).await?;
     let create_events = events
         .iter()
         .filter(|event| event.kind.as_u16() as u32 == KIND_MEETING_CREATE)
@@ -657,19 +569,20 @@ async fn load_meeting_snapshot(
     let board = parse_current_board(&events, identity, &create)?;
     let end = parse_current_end(&events, &create)?;
 
-    let (participants, phase, revisions, current_speaker, current_offer, action) =
+    let (participants, phase, revisions, current_speaker, current_offer, floor, action) =
         if let Some(state) = &current_state {
             let participants = validate_participants(&state.state, &create)?;
             let current_speaker = state
                 .state
                 .grant
                 .as_ref()
-                .and_then(|grant| grant.holder_pubkey.clone());
+                .map(|grant| grant.holder_pubkey.clone());
             let current_offer = state
                 .state
                 .offer
                 .as_ref()
-                .and_then(|offer| offer.target_pubkey.clone());
+                .map(|offer| offer.target_pubkey.clone());
+            let floor = floor_from_projection(state);
             let action = state
                 .state
                 .board_control
@@ -687,6 +600,7 @@ async fn load_meeting_snapshot(
                 ),
                 current_speaker,
                 current_offer,
+                Some(floor),
                 action,
             )
         } else {
@@ -707,6 +621,7 @@ async fn load_meeting_snapshot(
                 participants,
                 "initializing".to_string(),
                 (0, 0, 0, 0),
+                None,
                 None,
                 None,
                 None,
@@ -775,6 +690,7 @@ async fn load_meeting_snapshot(
             speech_revision: revisions.3,
             current_speaker_pubkey: current_speaker,
             current_offer_pubkey: current_offer,
+            floor,
             participants,
             board,
             action,
@@ -792,29 +708,93 @@ use projection::{
     parse_state, select_current_state, validate_participants,
 };
 
+fn handoff_from_wire(context: &HandoffContextWire) -> MeetingHandoffContext {
+    MeetingHandoffContext {
+        from_pubkey: context.from_pubkey.clone(),
+        reason_type: context.reason_type.clone(),
+        reason_text: context.reason_text.clone(),
+    }
+}
+
+fn floor_from_projection(projection: &StateProjection) -> MeetingFloorState {
+    MeetingFloorState {
+        state_event_id: projection.event_id.clone(),
+        human_queue: projection
+            .state
+            .human_queue
+            .iter()
+            .map(|request| MeetingHumanFloorRequest {
+                request_id: request.request_id.clone(),
+                requester_pubkey: request.requester_pubkey.clone(),
+                queue_position: request.queue_position as u64,
+                state: request.state.clone(),
+            })
+            .collect(),
+        offer: projection.state.offer.as_ref().map(|offer| MeetingOffer {
+            offer_id: offer.offer_id.clone(),
+            target_pubkey: offer.target_pubkey.clone(),
+            target_participant_type: offer.target_participant_type.into(),
+            allocation_source: offer.allocation_source.clone(),
+            turn_role: offer.turn_role.clone(),
+            selection_reason: offer.selection_reason.clone(),
+            handoff_context: offer.handoff_context.as_ref().map(handoff_from_wire),
+            created_at_ms: offer.created_at_ms,
+            ack_deadline_ms: offer.ack_deadline_ms,
+        }),
+        grant: projection.state.grant.as_ref().map(|grant| MeetingGrant {
+            grant_id: grant.grant_id.clone(),
+            holder_pubkey: grant.holder_pubkey.clone(),
+            allocation_source: grant.allocation_source.clone(),
+            turn_role: grant.turn_role.clone(),
+            selection_reason: grant.selection_reason.clone(),
+            handoff_context: grant.handoff_context.as_ref().map(handoff_from_wire),
+            created_at_ms: grant.created_at_ms,
+            soft_lease_expires_at_ms: grant.soft_lease_expires_at_ms,
+            hard_deadline_ms: grant.hard_deadline_ms,
+            progress_seq: grant.progress_seq as u64,
+        }),
+    }
+}
+
 fn list_item_from_load(
     meeting_id: String,
     loaded: Result<MeetingLoadResult, MeetingReadError>,
 ) -> MeetingListItem {
     match loaded {
-        Ok(MeetingLoadResult::Ready { snapshot }) => MeetingListItem {
-            meeting_id,
-            title: snapshot.title.clone(),
-            lifecycle: Some(snapshot.lifecycle),
-            phase: Some(snapshot.phase.clone()),
-            current_speaker_pubkey: snapshot.current_speaker_pubkey.clone(),
-            moderator_pubkey: Some(snapshot.moderator_pubkey.clone()),
-            policy: Some(snapshot.policy.clone()),
-            updated_at: Some(
-                snapshot
-                    .end
-                    .as_ref()
-                    .map_or(snapshot.board.updated_at, |end| end.ended_at),
-            ),
-            ended_at: snapshot.end.as_ref().map(|end| end.ended_at),
-            latest_speech_at: snapshot.latest_speech_at,
-            compatibility: MeetingListCompatibility::Ready,
-        },
+        Ok(MeetingLoadResult::Ready { snapshot }) => {
+            let active_floor_pubkey = snapshot
+                .current_offer_pubkey
+                .as_ref()
+                .or(snapshot.current_speaker_pubkey.as_ref());
+            let human_floor_attention_pubkey = active_floor_pubkey
+                .filter(|pubkey| {
+                    snapshot.participants.iter().any(|participant| {
+                        participant.pubkey == **pubkey
+                            && participant.participant_type == MeetingParticipantType::Human
+                    })
+                })
+                .cloned();
+            MeetingListItem {
+                meeting_id,
+                title: snapshot.title.clone(),
+                lifecycle: Some(snapshot.lifecycle),
+                phase: Some(snapshot.phase.clone()),
+                current_speaker_pubkey: snapshot.current_speaker_pubkey.clone(),
+                current_offer_pubkey: snapshot.current_offer_pubkey.clone(),
+                human_floor_attention_pubkey,
+                moderator_pubkey: Some(snapshot.moderator_pubkey.clone()),
+                policy: Some(snapshot.policy.clone()),
+                updated_at: Some(
+                    snapshot
+                        .end
+                        .as_ref()
+                        .map_or(snapshot.board.updated_at, |end| end.ended_at),
+                ),
+                ended_at: snapshot.end.as_ref().map(|end| end.ended_at),
+                latest_speech_at: snapshot.latest_speech_at,
+                compatibility: MeetingListCompatibility::Ready,
+            }
+        }
         Ok(MeetingLoadResult::UnsupportedRelay) => {
             empty_list_item(meeting_id, MeetingListCompatibility::UnsupportedRelay)
         }
@@ -840,6 +820,8 @@ fn empty_list_item(meeting_id: String, compatibility: MeetingListCompatibility) 
         lifecycle: None,
         phase: None,
         current_speaker_pubkey: None,
+        current_offer_pubkey: None,
+        human_floor_attention_pubkey: None,
         moderator_pubkey: None,
         policy: None,
         updated_at: None,
@@ -864,6 +846,29 @@ async fn query_meeting(
             MeetingReadError::Other(message)
         }
     })
+}
+
+async fn query_meeting_at(
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+    filters: &[Value],
+) -> Result<Vec<Event>, MeetingReadError> {
+    query_relay_at_with_keys(state, api_base_url, filters, keys, None)
+        .await
+        .map_err(map_meeting_query_error)
+}
+
+fn map_meeting_query_error(message: String) -> MeetingReadError {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("forbidden")
+        || normalized.contains("restricted")
+        || normalized.contains("403")
+    {
+        MeetingReadError::Forbidden
+    } else {
+        MeetingReadError::Other(message)
+    }
 }
 
 fn canonical_meeting_id(value: &str) -> Result<String, String> {

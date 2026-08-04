@@ -44,6 +44,8 @@ export function useMeetingRoomPartition(channels: Channel[]) {
         lifecycle: "initializing",
         phase: "initializing",
         currentSpeakerPubkey: null,
+        currentOfferPubkey: null,
+        humanFloorAttentionPubkey: null,
         moderatorPubkey: null,
         policy: null,
         updatedAt: room.lastMessageAt
