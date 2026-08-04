@@ -50,14 +50,6 @@ const MAX_MENTIONS: usize = 32;
 pub(crate) const V0_SYSTEM_PROMPT: &str = include_str!("meeting_prompt.md");
 /// Meeting V1 advisory system policy installed for moderated baton turns.
 pub(crate) const V1_SYSTEM_PROMPT: &str = include_str!("meeting_v1_prompt.md");
-/// Meeting V2 participant policy installed for moderated Board turns.
-pub(crate) const V2_SYSTEM_PROMPT: &str = include_str!("meeting_v2_participant_prompt.md");
-/// Meeting V2 moderator policy installed for Board/Floor control turns.
-pub(crate) const V2_MODERATOR_SYSTEM_PROMPT: &str = include_str!("meeting_v2_moderator_prompt.md");
-/// Unified Meeting V2 action-capable policy installed for every Turn in the
-/// same channel ACP Session.
-pub(crate) const V2_ACTIONS_SYSTEM_PROMPT: &str = include_str!("meeting_v2_actions_prompt.md");
-
 /// The dedicated room subscription used independently of ordinary ACP rules.
 pub(crate) fn subscription_filter() -> ChannelFilter {
     ChannelFilter {
