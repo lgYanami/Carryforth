@@ -15,7 +15,7 @@ import {
   KIND_AGENT_OBSERVER_FRAME,
   KIND_AGENT_TURN_METRIC,
 } from "@/shared/constants/kinds";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { Button } from "@/shared/ui/button";
 import { Checkbox } from "@/shared/ui/checkbox";
@@ -385,7 +385,7 @@ function AddSubscriptionForm({ channels, onSaved, onCancel }: AddFormProps) {
 
 export function LocalArchiveSettingsCard() {
   const identityQuery = useIdentityQuery();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const [subs, setSubs] = React.useState<SaveSubscription[]>([]);
   const [isLoading, setIsLoading] = React.useState(true);
   const [deletingKey, setDeletingKey] = React.useState<string | null>(null);

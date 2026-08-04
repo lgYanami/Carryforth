@@ -11,9 +11,22 @@ description = "ACP harness that bridges Buzz events to AI agents"
 name = "buzz_acp"
 path = "src/lib.rs"
 
+[features]
+# Test-only timing and privacy-filtered evidence hooks shared by Meeting V1 and
+# V2 real-provider qualification. Production builds do not include the local
+# acceptance NDJSON sink or Unix-socket race barrier.
+meeting-acceptance = []
+# Compatibility alias for the existing Meeting V1 qualification scripts.
+meeting-v1-acceptance = ["meeting-acceptance"]
+
 [[bin]]
 name = "buzz-acp"
 path = "src/main.rs"
+
+[[bin]]
+name = "buzz-meeting-v1-acceptance-barrier"
+path = "src/bin/meeting_v1_acceptance_barrier.rs"
+required-features = ["meeting-v1-acceptance"]
 
 [dependencies]
 # Internal
@@ -72,6 +85,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Config file
 toml = "1.0"
+dirs = "6"
 
 # Filter expressions
 evalexpr = { workspace = true }
@@ -84,3 +98,4 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
+tempfile = "3"

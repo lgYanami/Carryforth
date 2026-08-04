@@ -511,6 +511,19 @@ pub async fn remove_relay_member(
     community: CommunityId,
     pubkey: &str,
 ) -> Result<RemoveResult> {
+    let revocation_event_id: [u8; 32] = rand::random();
+    remove_relay_member_with_revocation(pool, community, pubkey, &revocation_event_id).await
+}
+
+/// Removes a relay member and atomically enqueues Meeting cleanup using the
+/// signed event or audit identifier that authorized the revocation.
+pub async fn remove_relay_member_with_revocation(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &str,
+    revocation_event_id: &[u8],
+) -> Result<RemoveResult> {
+    let revoked_pubkey = decode_pubkey(pubkey)?;
     let mut tx = begin_membership_write(pool, community).await?;
     if is_governed_in_tx(&mut tx, community).await? {
         if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
@@ -521,7 +534,6 @@ pub async fn remove_relay_member(
         }
         return Err(v2_membership_coordinator_unavailable());
     }
-
     let result = sqlx::query(
         "DELETE FROM relay_members \
          WHERE community_id = $1 AND pubkey = $2 AND role <> 'owner'",
@@ -532,6 +544,14 @@ pub async fn remove_relay_member(
     .await?;
 
     if result.rows_affected() > 0 {
+        crate::meeting_baton::enqueue_revocation_job_tx(
+            &mut tx,
+            community,
+            uuid::Uuid::new_v4(),
+            &revoked_pubkey,
+            revocation_event_id,
+        )
+        .await?;
         tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
@@ -572,6 +592,27 @@ pub async fn remove_relay_member_if_role(
     pubkey: &str,
     expected_role: &str,
 ) -> Result<RemoveResult> {
+    let revocation_event_id: [u8; 32] = rand::random();
+    remove_relay_member_if_role_with_revocation(
+        pool,
+        community,
+        pubkey,
+        expected_role,
+        &revocation_event_id,
+    )
+    .await
+}
+
+/// Removes a relay member with a matching role and atomically enqueues Meeting
+/// cleanup using the signed event or audit identifier that caused revocation.
+pub async fn remove_relay_member_if_role_with_revocation(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &str,
+    expected_role: &str,
+    revocation_event_id: &[u8],
+) -> Result<RemoveResult> {
+    let revoked_pubkey = decode_pubkey(pubkey)?;
     let mut tx = begin_membership_write(pool, community).await?;
     if is_governed_in_tx(&mut tx, community).await? {
         if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
@@ -582,7 +623,6 @@ pub async fn remove_relay_member_if_role(
         }
         return Err(v2_membership_coordinator_unavailable());
     }
-
     let result = sqlx::query(
         "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3",
     )
@@ -593,6 +633,14 @@ pub async fn remove_relay_member_if_role(
     .await?;
 
     if result.rows_affected() > 0 {
+        crate::meeting_baton::enqueue_revocation_job_tx(
+            &mut tx,
+            community,
+            uuid::Uuid::new_v4(),
+            &revoked_pubkey,
+            revocation_event_id,
+        )
+        .await?;
         tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
@@ -621,6 +669,18 @@ pub async fn remove_relay_member_if_role(
     };
     tx.rollback().await?;
     result
+}
+
+fn decode_pubkey(pubkey: &str) -> Result<Vec<u8>> {
+    let decoded = hex::decode(pubkey).map_err(|error| {
+        crate::error::DbError::InvalidData(format!("invalid relay member pubkey: {error}"))
+    })?;
+    if decoded.len() != 32 {
+        return Err(crate::error::DbError::InvalidData(
+            "relay member pubkey must decode to exactly 32 bytes".to_string(),
+        ));
+    }
+    Ok(decoded)
 }
 
 /// Updates the role of an existing relay member in `community`. Returns `true`
@@ -1112,6 +1172,66 @@ mod tests {
             list_b.iter().all(|m| m.pubkey != pubkey),
             "community B list must not contain A's member"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn removal_and_meeting_revocation_job_commit_atomically() {
+        let pool = setup_pool().await;
+        let community = make_test_community(&pool).await;
+        let member = test_pubkey();
+        add_relay_member(&pool, community, &member, "member", None)
+            .await
+            .expect("add removable member");
+        let revocation_event_id = [0x51_u8; 32];
+
+        assert_eq!(
+            remove_relay_member_with_revocation(&pool, community, &member, &revocation_event_id,)
+                .await
+                .expect("remove with durable Meeting cleanup"),
+            RemoveResult::Removed
+        );
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM meeting_revocation_jobs \
+                 WHERE community_id = $1 AND revocation_event_id = $2 \
+             )",
+        )
+        .bind(community.as_uuid())
+        .bind(revocation_event_id.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("read Meeting revocation job");
+        assert!(queued);
+        assert!(add_relay_member(&pool, community, &member, "member", None)
+            .await
+            .expect("rapidly re-add removed member"));
+        let durable_after_readd: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM meeting_revocation_jobs \
+                 WHERE community_id = $1 AND revocation_event_id = $2 \
+             )",
+        )
+        .bind(community.as_uuid())
+        .bind(revocation_event_id.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("read durable job after re-add");
+        assert!(durable_after_readd);
+
+        let rollback_member = test_pubkey();
+        add_relay_member(&pool, community, &rollback_member, "member", None)
+            .await
+            .expect("add rollback member");
+        assert!(
+            remove_relay_member_with_revocation(&pool, community, &rollback_member, &[1_u8; 31])
+                .await
+                .is_err(),
+            "invalid job evidence must abort the removal transaction"
+        );
+        assert!(is_relay_member(&pool, community, &rollback_member)
+            .await
+            .expect("membership survived rollback"));
     }
 
     /// Owner bootstrap is community-scoped: bootstrapping the owner in A does not

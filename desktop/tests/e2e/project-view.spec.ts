@@ -1404,6 +1404,7 @@ test("an open Role Proposal blocks deletion and deactivation", async ({
   projectView.role_continuity.assignments = [];
   projectView.role_continuity.commitments = [];
   projectView.role_continuity.workResponsibilities = [];
+  projectView.role_continuity.briefs = [];
   await installMockBridge(page, { projectView });
   await page.goto("/");
   await openFullProjectView(page);

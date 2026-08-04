@@ -2,7 +2,7 @@ import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { HomeScreen } from "@/features/home/ui/HomeScreen";
 import {
   consumePendingWelcomeChannel,
@@ -45,7 +45,7 @@ export const Route = createFileRoute("/")({
 
 function HomeRouteComponent() {
   const { goChannel } = useAppNavigation();
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const identityQuery = useIdentityQuery();
   const channels = channelsQuery.data ?? [];
   const availableChannelIds = React.useMemo(

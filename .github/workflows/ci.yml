@@ -50,6 +50,10 @@ jobs:
               - '.github/workflows/docker.yml'
               - '.github/workflows/sprig.yml'
               - 'scripts/run-tests.sh'
+              - 'scripts/run-meeting-backend-tests.sh'
+              - 'scripts/meeting-v2-*.sh'
+              - 'scripts/meeting-v2-*.jq'
+              - 'scripts/start-relay-for-tests.sh'
               - 'scripts/test-project-view-*.sh'
               - 'scripts/test-project-document-*.sh'
               - 'scripts/project-document-capacity-fixture.sql'
@@ -178,6 +182,10 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Unit tests
         run: just test-unit
+      - name: Meeting V2 qualification evidence contracts
+        run: |
+          cargo test -p buzz-acp --features meeting-acceptance --lib acceptance
+          ./scripts/meeting-v2-qualification-gates-test.sh
 
   desktop-core:
     name: Desktop Core
@@ -380,7 +388,7 @@ jobs:
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'scripts/test-project-document-*.sh', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'scripts/test-project-document-*.sh', 'scripts/meeting-v2-*', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -408,6 +416,11 @@ jobs:
             --test e2e_event_reminder \
             --test e2e_project_document_disabled \
             --test e2e_project_document_enabled \
+            --test e2e_meeting \
+            --test e2e_meeting_floor \
+            --test e2e_meeting_baton \
+            --test e2e_meeting_v2_stage1 \
+            --test e2e_meeting_rollout \
             --test e2e_project_view \
             --archive-file target/ci/backend-integration-tests.tar.zst
       - name: Save relay artifacts cache
@@ -420,7 +433,7 @@ jobs:
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'scripts/test-project-document-*.sh', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/test-project-view-*.sh', 'scripts/test-project-document-*.sh', 'scripts/meeting-v2-*', 'Dockerfile', 'Justfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - name: Upload relay artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -630,11 +643,13 @@ jobs:
   backend-integration:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
+    env:
+      BUZZ_RELAY_PRIVATE_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
@@ -679,6 +694,36 @@ jobs:
         with:
           name: desktop-e2e-relay
           path: target/ci
+      - name: Meeting database contracts and races
+        # Keep SQLx migration contracts in a separate database. pgschema owns
+        # the Relay E2E database and intentionally does not populate
+        # _sqlx_migrations; mixing the two schema managers causes false drift
+        # in either execution order.
+        run: |
+          docker exec -e PGPASSWORD="${BUZZ_TEST_POSTGRES_PASSWORD}" buzz-postgres \
+            psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE buzz_meeting_contracts OWNER buzz'
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-db) and test(meeting)' \
+            --run-ignored ignored-only \
+            --test-threads 1
+        env:
+          BUZZ_TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_meeting_contracts
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz_meeting_contracts
+      - name: Meeting migration and schema drift
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: buzz
+          PGPASSWORD: buzz_dev
+          PGDATABASE: buzz_meeting_contracts
+          PGSCHEMA_PLAN_HOST: localhost
+          PGSCHEMA_PLAN_PORT: "5432"
+          PGSCHEMA_PLAN_DB: postgres
+          PGSCHEMA_PLAN_USER: buzz
+          PGSCHEMA_PLAN_PASSWORD: buzz_dev
+        run: ./scripts/meeting-v2-schema-drift.sh
       - name: Apply schema and seed deployment community
         # MT: the relay resolves each request's tenant from the communities host
         # map and fails closed on an unmapped host. The reminder scheduler binds
@@ -722,6 +767,9 @@ jobs:
             RELAY_URL=ws://localhost:3000 \
             BUZZ_BIND_ADDR=0.0.0.0:3000 \
             BUZZ_REQUIRE_AUTH_TOKEN=false \
+            BUZZ_MEETING_V1_CREATE_ENABLED=true \
+            BUZZ_MEETING_V2_CREATE_ENABLED=true \
+            BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
             BUZZ_RECONCILE_CHANNELS=true \
             BUZZ_GIT_PROBE_WRITERS=8 \
             SPROUT_REMINDER_SCHEDULER_INTERVAL_SECS=1 \
@@ -759,6 +807,127 @@ jobs:
             -E 'binary(e2e_event_reminder)' \
             --run-ignored ignored-only
         env:
+          RELAY_URL: ws://localhost:3000
+      - name: Meeting V0, V1, and V2 relay e2e
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E '(binary(e2e_meeting) | binary(e2e_meeting_floor) | binary(e2e_meeting_baton) | binary(e2e_meeting_v2_stage1)) and not test(relay_member_removal_disconnects_live_meeting_reader_and_blocks_reentry)' \
+            --run-ignored ignored-only \
+            --test-threads 1
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          RELAY_URL: ws://localhost:3000
+      - name: Meeting V1 and V2 rollout phase one
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'binary(e2e_meeting_rollout) and test(create_rollout_fixture_before_gate_closes)' \
+            --run-ignored ignored-only \
+            --test-threads 1
+        env:
+          BUZZ_MEETING_ROLLOUT_FIXTURE: /tmp/buzz-meeting-v1-rollout.json
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          RELAY_URL: ws://localhost:3000
+      - name: Restart relay with V1 and V2 creation disabled
+        run: |
+          kill "$(cat /tmp/buzz-relay.pid)"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
+              break
+            fi
+            if [ "${attempt}" = "30" ]; then
+              kill -9 "$(cat /tmp/buzz-relay.pid)"
+            fi
+            sleep 1
+          done
+          nohup env \
+            DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
+            REDIS_URL=redis://localhost:6379 \
+            RELAY_URL=ws://localhost:3000 \
+            BUZZ_BIND_ADDR=0.0.0.0:3000 \
+            BUZZ_REQUIRE_AUTH_TOKEN=false \
+            BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
+            BUZZ_MEETING_V1_CREATE_ENABLED=false \
+            BUZZ_MEETING_V2_CREATE_ENABLED=false \
+            BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+            BUZZ_RECONCILE_CHANNELS=true \
+            BUZZ_GIT_PROBE_WRITERS=8 \
+            ./target/ci/buzz-relay > /tmp/buzz-relay.log 2>&1 &
+          echo $! > /tmp/buzz-relay.pid
+          for attempt in $(seq 1 60); do
+            if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
+              cat /tmp/buzz-relay.log
+              exit 1
+            fi
+            status_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/_readiness || true)
+            if [ "${status_code}" = "200" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/buzz-relay.log
+          exit 1
+      - name: Meeting V1 and V2 rollout phase two
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'binary(e2e_meeting_rollout) and test(existing_v1_and_v2_survive_closed_gates_and_v0_still_works)' \
+            --run-ignored ignored-only \
+            --test-threads 1
+        env:
+          BUZZ_MEETING_ROLLOUT_FIXTURE: /tmp/buzz-meeting-v1-rollout.json
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          RELAY_URL: ws://localhost:3000
+      - name: Restart relay with membership enforcement
+        run: |
+          kill "$(cat /tmp/buzz-relay.pid)"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
+              break
+            fi
+            if [ "${attempt}" = "30" ]; then
+              kill -9 "$(cat /tmp/buzz-relay.pid)"
+            fi
+            sleep 1
+          done
+          nohup env \
+            DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
+            REDIS_URL=redis://localhost:6379 \
+            RELAY_URL=ws://localhost:3000 \
+            BUZZ_BIND_ADDR=0.0.0.0:3000 \
+            BUZZ_REQUIRE_AUTH_TOKEN=false \
+            BUZZ_REQUIRE_RELAY_MEMBERSHIP=true \
+            BUZZ_MEETING_V1_CREATE_ENABLED=true \
+            BUZZ_MEETING_V2_CREATE_ENABLED=false \
+            BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+            RELAY_OWNER_PUBKEY=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 \
+            BUZZ_RECONCILE_CHANNELS=true \
+            BUZZ_GIT_PROBE_WRITERS=8 \
+            ./target/ci/buzz-relay > /tmp/buzz-relay.log 2>&1 &
+          echo $! > /tmp/buzz-relay.pid
+          for attempt in $(seq 1 60); do
+            if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
+              cat /tmp/buzz-relay.log
+              exit 1
+            fi
+            status_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/_readiness || true)
+            if [ "${status_code}" = "200" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/buzz-relay.log
+          exit 1
+      - name: Meeting membership revocation e2e
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'binary(e2e_meeting_baton) and test(relay_member_removal_disconnects_live_meeting_reader_and_blocks_reentry)' \
+            --run-ignored ignored-only \
+            --test-threads 1
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           RELAY_URL: ws://localhost:3000
       - name: Upload relay log
         if: failure()

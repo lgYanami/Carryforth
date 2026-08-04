@@ -10,7 +10,9 @@ use rmcp::{
 use std::path::Path;
 use std::sync::Arc;
 
+mod meeting_read;
 mod paths;
+mod project_explore;
 mod read_file;
 mod rg;
 mod shell;
@@ -24,6 +26,7 @@ mod view_image;
 struct DevMcp {
     state: Arc<shell::SharedState>,
     todos: Arc<todo::TodoState>,
+    read_only: bool,
     tool_router: ToolRouter<DevMcp>,
 }
 
@@ -33,6 +36,8 @@ impl DevMcp {
         Self {
             state,
             todos: Arc::new(todo::TodoState::new()),
+            read_only: std::env::var("BUZZ_DEV_MCP_READ_ONLY")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             tool_router: Self::tool_router(),
         }
     }
@@ -46,6 +51,7 @@ impl DevMcp {
         Parameters(p): Parameters<shell::ShellParams>,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        enforce_mutation_allowed(self.read_only, "shell")?;
         shell::run(&self.state, p, context.ct).await
     }
 
@@ -58,6 +64,40 @@ impl DevMcp {
         Parameters(p): Parameters<read_file::ReadFileParams>,
     ) -> Result<String, ErrorData> {
         read_file::run(&self.state, p)
+    }
+
+    #[tool(
+        name = "list_directory",
+        description = "Safely list project files and directories without a shell. The target is canonicalized and confined to workdir; workdir must remain inside the server workspace. In-bound absolute paths are allowed, while escapes through `..`, out-of-bound absolute paths, or symlinks are rejected. Honors ignore files and skips build/vendor directories. Use `depth` (default 2, max 10) and `max_entries` (default 200, max 1000) to bound output."
+    )]
+    async fn list_directory(
+        &self,
+        Parameters(p): Parameters<project_explore::ListDirectoryParams>,
+    ) -> Result<String, ErrorData> {
+        project_explore::list_directory(&self.state, p)
+    }
+
+    #[tool(
+        name = "search_text",
+        description = "Safely search for literal text in project files without a shell. The target is canonicalized and confined to workdir; workdir must remain inside the server workspace. In-bound absolute paths are allowed, while escapes through `..`, out-of-bound absolute paths, or symlinks are rejected. Honors ignore files, skips large/binary/build/vendor files, and caps traversal, matches, line length, and total output."
+    )]
+    async fn search_text(
+        &self,
+        Parameters(p): Parameters<project_explore::SearchTextParams>,
+    ) -> Result<String, ErrorData> {
+        project_explore::search_text(&self.state, p)
+    }
+
+    #[tool(
+        name = "meeting_read",
+        description = "Read Relay-authoritative Meeting context through a fixed Buzz CLI allowlist. Operations: show, participants, history, intents, floor_status, floor_history. `meeting` must be a canonical UUID. `limit` is accepted only for history/floor_history (default 100, maximum 500). The command, runtime, and returned output are bounded; no shell or write-capable Buzz command is exposed."
+    )]
+    async fn meeting_read(
+        &self,
+        Parameters(p): Parameters<meeting_read::MeetingReadParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        meeting_read::run(&self.state, p, context.ct).await
     }
 
     #[tool(
@@ -79,6 +119,7 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<str_replace::StrReplaceParams>,
     ) -> Result<String, ErrorData> {
+        enforce_mutation_allowed(self.read_only, "str_replace")?;
         str_replace::run(&self.state, p)
     }
 
@@ -90,6 +131,9 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<todo::TodoParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if p.todos.is_some() {
+            enforce_mutation_allowed(self.read_only, "todo update")?;
+        }
         match self.todos.handle_todo(p) {
             Ok(text) => todo::text_result(text),
             Err(e) => todo::error_result(format!("Error: {e}")),
@@ -121,6 +165,16 @@ impl DevMcp {
     ) -> Result<CallToolResult, ErrorData> {
         todo::text_result(self.todos.post_compact())
     }
+}
+
+fn enforce_mutation_allowed(read_only: bool, operation: &str) -> Result<(), ErrorData> {
+    if read_only {
+        return Err(ErrorData::invalid_request(
+            format!("{operation} is disabled: this MCP session is enforced read-only"),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -210,4 +264,33 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod meeting_policy_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_profile_rejects_every_mutating_tool_class() {
+        for operation in ["shell", "str_replace", "todo update"] {
+            let error = enforce_mutation_allowed(true, operation)
+                .expect_err("read-only profile must reject mutations");
+            assert!(
+                error.message.contains(operation),
+                "error must identify the rejected operation"
+            );
+            assert!(
+                error.message.contains("read-only"),
+                "error must identify the enforced boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sessions_keep_mutating_tools_available() {
+        for operation in ["shell", "str_replace", "todo update"] {
+            enforce_mutation_allowed(false, operation)
+                .expect("ordinary MCP sessions must preserve existing tools");
+        }
+    }
 }

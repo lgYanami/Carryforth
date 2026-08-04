@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 36);
+        assert_eq!(migrations.len(), 46);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1039,6 +1039,214 @@ mod tests {
         assert!(role_proposal_guard.contains("proposal.status = 'open'"));
         assert!(role_proposal_guard.contains("role_object.deleted_at IS NOT NULL"));
         assert!(role_proposal_guard.contains("DEFERRABLE INITIALLY DEFERRED"));
+
+        // Meeting V0 lifecycle projection follows the complete Project View
+        // series so every migration version remains globally unique.
+        assert_eq!(migrations[36].version, 37);
+        let meeting_v0 = migrations[36].sql.as_str();
+        assert!(meeting_v0.contains("ADD COLUMN room_kind"));
+        assert!(meeting_v0.contains("CREATE TABLE meeting_sessions"));
+        assert!(meeting_v0.contains("PRIMARY KEY (community_id, session_id)"));
+        assert!(!migrations[0].sql.as_str().contains("meeting_sessions"));
+
+        // Meeting V0 stage 2 persists the complete floor state machine and its
+        // transactional delivery outbox in the next additive migration.
+        assert_eq!(migrations[37].version, 38);
+        let meeting_floor = migrations[37].sql.as_str();
+        assert!(meeting_floor.contains("CREATE TABLE meeting_rounds"));
+        assert!(meeting_floor.contains("CREATE TABLE meeting_floor_claims"));
+        assert!(meeting_floor.contains("CREATE TABLE meeting_event_outbox"));
+        assert!(meeting_floor
+            .contains("PRIMARY KEY (community_id, session_id, round_number, claimant_pubkey)"));
+
+        // Meeting V0 stage 3 adds agent decision signals and enables early
+        // cohort settlement without changing either prior Meeting migration.
+        assert_eq!(migrations[38].version, 39);
+        let meeting_agent_floor = migrations[38].sql.as_str();
+        assert!(meeting_agent_floor.contains("CREATE TABLE meeting_floor_signals"));
+        assert!(meeting_agent_floor.contains("action IN ('ready', 'pass', 'yield')"));
+        assert!(meeting_agent_floor.contains("CREATE TABLE meeting_round_decision_cohort"));
+        assert!(meeting_agent_floor
+            .contains("PRIMARY KEY (community_id, session_id, round_number, participant_pubkey)"));
+
+        // Meeting V1 remains additive and persists a policy-isolated,
+        // recoverable moderated-baton projection.
+        assert_eq!(migrations[39].version, 40);
+        let meeting_baton = migrations[39].sql.as_str();
+        assert!(meeting_baton.contains("moderated-baton-v1"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_participants"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_config"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_state_history"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_state"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_speech_intents"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_human_floor_requests"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_offers"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_grants"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_grant_progress"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_directed_handoffs"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_baton_fallback_attempts"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_v1_command_receipts"));
+        assert!(meeting_baton.contains("CREATE TABLE meeting_revocation_jobs"));
+        assert!(meeting_baton.contains("chk_meeting_protocol_shape"));
+        assert!(meeting_baton.contains("trg_meeting_session_protocol_immutable"));
+
+        // Stage 2 corrects the deterministic Progress vocabulary without
+        // rewriting the checksum-frozen Meeting V1 foundation migration.
+        assert_eq!(migrations[40].version, 41);
+        let meeting_baton_stage_two = migrations[40].sql.as_str();
+        assert!(meeting_baton_stage_two.contains("'context_sync'"));
+        assert!(meeting_baton_stage_two.contains("'tool_use'"));
+        assert!(meeting_baton_stage_two.contains("'generating'"));
+        assert!(meeting_baton_stage_two.contains("'submitting'"));
+        assert!(
+            meeting_baton_stage_two.contains("idx_meeting_event_outbox_pending_session_sequence")
+        );
+        assert!(meeting_baton_stage_two.contains("recovery_retry_at"));
+        assert!(meeting_baton_stage_two.contains("recovery_attempts"));
+        assert!(meeting_baton_stage_two.contains("idx_meeting_baton_state_recovery_due"));
+        assert!(meeting_baton_stage_two.contains("idx_meeting_revocation_jobs_reader_fence"));
+
+        // Moderator optimistic-decision state remains additive: candidate
+        // eligibility, signed Attempt snapshots, and one-use retry evidence
+        // upgrade existing V1 sessions without rewriting prior migrations.
+        assert_eq!(migrations[41].version, 42);
+        let meeting_moderator_attempts = migrations[41].sql.as_str();
+        assert!(meeting_moderator_attempts.contains("eligible_decision_epoch"));
+        assert!(
+            meeting_moderator_attempts.contains("CREATE TABLE meeting_moderator_decision_attempts")
+        );
+        assert!(meeting_moderator_attempts.contains("CREATE TABLE meeting_moderator_retry_tickets"));
+        assert!(meeting_moderator_attempts.contains("active_decision_attempt_id"));
+        assert!(meeting_moderator_attempts.contains("retry_ticket_id"));
+
+        // Meeting V2 stage one adds a protocol-isolated current board while
+        // deliberately keeping its runtime fail-closed.
+        assert_eq!(migrations[42].version, 43);
+        let meeting_v2_stage_one = migrations[42].sql.as_str();
+        assert!(meeting_v2_stage_one.contains("moderated-board-v1"));
+        assert!(meeting_v2_stage_one.contains("CREATE TABLE meeting_current_boards"));
+        assert!(meeting_v2_stage_one.contains("CREATE TABLE meeting_v2_bootstrap_state"));
+        assert!(meeting_v2_stage_one.contains("bootstrap_locked"));
+
+        // Meeting V2 stage two adds the Board/Floor gate, command receipts,
+        // independent Board timing, and explicit closed/aborted outcomes.
+        assert_eq!(migrations[43].version, 44);
+        let meeting_v2_stage_two = migrations[43].sql.as_str();
+        assert!(meeting_v2_stage_two.contains("CREATE TABLE meeting_v2_config"));
+        assert!(meeting_v2_stage_two.contains("board_pending"));
+        assert!(meeting_v2_stage_two.contains("floor_ready"));
+        assert!(meeting_v2_stage_two.contains("CREATE TABLE meeting_v2_board_command_receipts"));
+        assert!(meeting_v2_stage_two.contains("terminal_outcome"));
+
+        // Action finalization is an additive, policy-discriminated Meeting V2
+        // lifecycle stage with its own durable saga ledger.
+        assert_eq!(migrations[44].version, 45);
+        let meeting_v2_actions = migrations[44].sql.as_str();
+        assert!(meeting_v2_actions.contains("moderated-board-actions-v1"));
+        assert!(meeting_v2_actions.contains("finalizing_actions"));
+        assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_runs"));
+        assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_steps"));
+        assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_command_receipts"));
+
+        // Direct action finalization removes the unreleased Plan/Step runtime
+        // and replaces it with a moderator attestation fence.
+        assert_eq!(migrations[45].version, 46);
+        let meeting_v2_direct_actions = migrations[45].sql.as_str();
+        assert!(meeting_v2_direct_actions.contains("moderated-board-actions-v2"));
+        assert!(meeting_v2_direct_actions.contains("DROP TABLE meeting_v2_action_steps"));
+        assert!(meeting_v2_direct_actions.contains("completion_event_id"));
+        assert!(meeting_v2_direct_actions
+            .contains("action IN ('begin', 'block', 'retry', 'return-to-board')"));
+    }
+
+    #[test]
+    fn desired_schema_contains_moderator_optimistic_decision_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "moderator_max_rejudgments",
+            "moderator_max_cas_rebases_per_attempt",
+            "eligible_decision_epoch",
+            "active_decision_attempt_id",
+            "CREATE TABLE meeting_moderator_decision_attempts",
+            "CREATE TABLE meeting_moderator_retry_tickets",
+            "fk_meeting_baton_active_decision_attempt",
+            "fk_meeting_v1_receipt_retry_ticket",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0042 object {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_schema_contains_meeting_v2_stage_one_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "moderated-board-v1",
+            "CREATE TABLE meeting_current_boards",
+            "CREATE TABLE meeting_v2_bootstrap_state",
+            "bootstrap_locked",
+            "OCTET_LENGTH(board_content) <= 65536",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0043 object {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_schema_contains_meeting_v2_stage_two_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "CREATE TABLE meeting_v2_config",
+            "board_maintenance_ms",
+            "board_window",
+            "board_pending",
+            "floor_ready",
+            "CREATE TABLE meeting_v2_board_command_receipts",
+            "terminal_outcome",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0044 object {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_schema_contains_meeting_v2_direct_action_finalization_state() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "moderated-board-actions-v2",
+            "finalizing_actions",
+            "action_finalization_ms",
+            "CREATE TABLE meeting_v2_action_runs",
+            "completion_event_id",
+            "CREATE TABLE meeting_v2_action_command_receipts",
+            "action IN ('begin', 'block', 'retry', 'return-to-board')",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0046 object {required}"
+            );
+        }
+        for removed in [
+            "CREATE TABLE meeting_v2_action_steps",
+            "CREATE TABLE meeting_v2_action_step_attempts",
+            "plan_event_id",
+            "action_phase",
+        ] {
+            assert!(
+                !schema.contains(removed),
+                "schema/schema.sql must omit removed planned-action object {removed}"
+            );
+        }
     }
 
     #[test]
@@ -1102,6 +1310,148 @@ mod tests {
                 "schema/schema.sql is missing Project View fragment: {fragment}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn direct_action_upgrade_blocks_active_planned_session_then_removes_old_runtime() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!(
+            "buzz_meeting_direct_upgrade_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create direct-action migration scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect direct-action migration scratch database");
+
+        MIGRATOR
+            .run_to(45, &pool)
+            .await
+            .expect("apply migrations through planned Meeting actions");
+        let community_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let action_run_id = uuid::Uuid::new_v4();
+        let host = vec![0x41_u8; 32];
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("direct-upgrade-{}.test", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("seed direct-action migration Community");
+        sqlx::query(
+            "INSERT INTO channels \
+                 (community_id, id, name, channel_type, visibility, created_by, room_kind) \
+             VALUES ($1, $2, 'planned-action-upgrade', 'stream', 'private', $3, 'meeting')",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("seed planned-action Meeting Channel");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, schema_version, \
+                  floor_policy_version, moderator_pubkey) \
+             VALUES ($1, $2, $3, $4, 3, 'moderated-board-actions-v1', $4)",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(vec![0x42_u8; 32])
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("seed active planned-action Meeting");
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_runs \
+                 (community_id, session_id, action_run_id, begin_event_id, board_event_id, \
+                  control_epoch, board_window, action_phase, action_condition, action_deadline_at) \
+             VALUES ($1, $2, $3, $4, $5, 1, 1, 'planning', 'runnable', \
+                     clock_timestamp() + interval '5 minutes')",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(vec![0x43_u8; 32])
+        .bind(vec![0x44_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed active planned-action run");
+
+        let blocked = MIGRATOR.run_to(46, &pool).await;
+        assert!(
+            blocked
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains(
+                    "cannot remove Meeting planned actions while an active moderated-board-actions-v1 Session exists"
+                )),
+            "0046 must fail before mutating an active planned-action Meeting: {blocked:?}"
+        );
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(45));
+        let old_run_survived: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM meeting_v2_action_runs \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3)",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(action_run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("verify failed migration left old run intact");
+        assert!(old_run_survived);
+
+        sqlx::query(
+            "UPDATE meeting_sessions \
+             SET status = 'ended', ended_at = clock_timestamp(), ended_by = $3, \
+                 end_event_id = $4, terminal_outcome = 'aborted', \
+                 terminal_reason_code = 'migration_fixture' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(&host)
+        .bind(vec![0x45_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("end planned-action migration fixture");
+        MIGRATOR
+            .run_to(46, &pool)
+            .await
+            .expect("replace ended planned-action projections with direct runtime");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+        let direct_shape: (bool, bool, bool, i64) = sqlx::query_as(
+            "SELECT \
+                 to_regclass('meeting_v2_action_steps') IS NULL, \
+                 to_regclass('meeting_v2_action_step_attempts') IS NULL, \
+                 EXISTS (SELECT 1 FROM pg_attribute \
+                         WHERE attrelid = 'meeting_v2_action_runs'::regclass \
+                           AND attname = 'completion_event_id' AND NOT attisdropped), \
+                 (SELECT count(*) FROM meeting_v2_action_runs)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect direct action runtime after upgrade");
+        assert_eq!(direct_shape, (true, true, true, 0));
+
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop direct-action migration scratch database");
+        admin.close().await;
     }
 
     #[tokio::test]
@@ -1351,6 +1701,191 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn meeting_v2_stage_two_upgrade_preserves_v0_v1_and_stage_one_v2() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(42, &pool)
+            .await
+            .expect("apply migrations through Meeting V1");
+
+        let community_id = uuid::Uuid::new_v4();
+        let v0_session = uuid::Uuid::new_v4();
+        let v1_session = uuid::Uuid::new_v4();
+        let v2_session = uuid::Uuid::new_v4();
+        let invalid_v2_session = uuid::Uuid::new_v4();
+        let host = vec![0x81_u8; 32];
+        let v1_moderator = vec![0x82_u8; 32];
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("meeting-v2-upgrade-{}.test", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("seed pre-V2 community");
+        for (session_id, name) in [
+            (v0_session, "V0 preserved"),
+            (v1_session, "V1 preserved"),
+            (v2_session, "V2 valid"),
+            (invalid_v2_session, "V2 invalid"),
+        ] {
+            sqlx::query(
+                "INSERT INTO channels \
+                     (community_id, id, name, channel_type, visibility, created_by, room_kind) \
+                 VALUES ($1, $2, $3, 'stream', 'private', $4, 'meeting')",
+            )
+            .bind(community_id)
+            .bind(session_id)
+            .bind(name)
+            .bind(&host)
+            .execute(&pool)
+            .await
+            .expect("seed Meeting Channel");
+        }
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, \
+                  schema_version, floor_policy_version) \
+             VALUES ($1, $2, $3, $4, 1, 'uniform-v0')",
+        )
+        .bind(community_id)
+        .bind(v0_session)
+        .bind([0x83_u8; 32].as_slice())
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("seed V0 Session before V2 upgrade");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, \
+                  schema_version, floor_policy_version, moderator_pubkey) \
+             VALUES ($1, $2, $3, $4, 2, 'moderated-baton-v1', $5)",
+        )
+        .bind(community_id)
+        .bind(v1_session)
+        .bind([0x84_u8; 32].as_slice())
+        .bind(&host)
+        .bind(&v1_moderator)
+        .execute(&pool)
+        .await
+        .expect("seed V1 Session before V2 upgrade");
+        sqlx::query(
+            "INSERT INTO meeting_participants \
+                 (community_id, session_id, pubkey, participant_type, channel_role) \
+             VALUES ($1, $2, $3, 'human', 'member')",
+        )
+        .bind(community_id)
+        .bind(v1_session)
+        .bind(&v1_moderator)
+        .execute(&pool)
+        .await
+        .expect("seed frozen V1 participant");
+
+        MIGRATOR
+            .run_to(43, &pool)
+            .await
+            .expect("upgrade Meeting schema through V2 stage one");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, \
+                  schema_version, floor_policy_version, moderator_pubkey) \
+             VALUES ($1, $2, $3, $4, 3, 'moderated-board-v1', $4)",
+        )
+        .bind(community_id)
+        .bind(v2_session)
+        .bind([0x85_u8; 32].as_slice())
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("seed stage-one V2 Session");
+        sqlx::query(
+            "INSERT INTO meeting_v2_bootstrap_state (community_id, session_id) \
+             VALUES ($1, $2)",
+        )
+        .bind(community_id)
+        .bind(v2_session)
+        .execute(&pool)
+        .await
+        .expect("seed stage-one V2 bootstrap runtime");
+        sqlx::query(
+            "INSERT INTO meeting_current_boards \
+                 (community_id, session_id, board_event_id, board_format, board_content) \
+             VALUES ($1, $2, $3, 'markdown', '# Existing stage-one Board')",
+        )
+        .bind(community_id)
+        .bind(v2_session)
+        .bind([0x87_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed stage-one V2 current Board");
+
+        run_migrations(&pool)
+            .await
+            .expect("upgrade Meeting schema through V2 stage two");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+        let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
+             FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
+        )
+        .bind(community_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read preserved V0/V1/V2 Sessions");
+        assert_eq!(preserved.len(), 3);
+        assert!(preserved.iter().any(|row| {
+            row.0 == v0_session && row.1 == 1 && row.2 == "uniform-v0" && row.3.is_none()
+        }));
+        assert!(preserved.iter().any(|row| {
+            row.0 == v1_session
+                && row.1 == 2
+                && row.2 == "moderated-baton-v1"
+                && row.3.as_deref() == Some(v1_moderator.as_slice())
+        }));
+        assert!(preserved.iter().any(|row| {
+            row.0 == v2_session
+                && row.1 == 3
+                && row.2 == "moderated-board-v1"
+                && row.3.as_deref() == Some(host.as_slice())
+        }));
+        let new_projection_rows: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM meeting_current_boards), \
+                 (SELECT count(*) FROM meeting_v2_bootstrap_state), \
+                 (SELECT count(*) FROM meeting_v2_config)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count additive V2 projections");
+        assert_eq!(new_projection_rows, (1, 1, 0));
+        let upgraded_runtime: (String, i64, i64, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT runtime_phase, control_epoch, board_window, board_deadline_at \
+                 FROM meeting_v2_bootstrap_state \
+                 WHERE community_id = $1 AND session_id = $2",
+            )
+            .bind(community_id)
+            .bind(v2_session)
+            .fetch_one(&pool)
+            .await
+            .expect("read upgraded stage-one V2 runtime");
+        assert_eq!(upgraded_runtime, ("bootstrap_locked".into(), 1, 0, None));
+        let invalid = sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, \
+                  schema_version, floor_policy_version, moderator_pubkey) \
+             VALUES ($1, $2, $3, $4, 3, 'moderated-board-v1', $5)",
+        )
+        .bind(community_id)
+        .bind(invalid_v2_session)
+        .bind([0x86_u8; 32].as_slice())
+        .bind(&host)
+        .bind(&v1_moderator)
+        .execute(&pool)
+        .await;
+        assert!(invalid.is_err(), "V2 moderator must equal the creator");
+    }
+
+    #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn project_view_upgrade_from_0024_is_additive_and_disabled() {
         let admin_url = test_database_url();
@@ -1392,8 +1927,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0036");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(36));
+            .expect("upgrade scratch database through 0046");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1529,8 +2064,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0036");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(36));
+            .expect("upgrade scratch database through 0046");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -1607,7 +2142,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(36));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(46));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -1695,7 +2230,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(36));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
     }
 
     #[tokio::test]

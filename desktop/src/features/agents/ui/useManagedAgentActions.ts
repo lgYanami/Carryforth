@@ -13,7 +13,7 @@ import {
   useDeleteManagedAgentMutation,
 } from "@/features/agents/hooks";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import type {
   AgentPersona,
@@ -40,7 +40,7 @@ export function useManagedAgentActions() {
   const relayAgentsQuery = useRelayAgentsQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const [shouldLoadChannels, setShouldLoadChannels] = React.useState(false);
-  const channelsQuery = useChannelsQuery({ enabled: shouldLoadChannels });
+  const channelsQuery = useChatRooms({ enabled: shouldLoadChannels });
   const startMutation = useStartManagedAgentMutation();
   const stopMutation = useStopManagedAgentMutation();
   const deleteMutation = useDeleteManagedAgentMutation();

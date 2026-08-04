@@ -889,6 +889,12 @@ impl VerifiedRoleBriefSnapshotV3 {
         self.objects.get(&object_id).map(|head| &head.source)
     }
 
+    /// Return one active ordinary object with responsibility and signed source.
+    #[must_use]
+    pub fn active_object(&self, object_id: Uuid) -> Option<RoleBriefObjectV3> {
+        self.objects.get(&object_id).map(role_brief_object)
+    }
+
     /// Look up the signed source for one active Role.
     #[must_use]
     pub fn role_source(&self, role_id: Uuid) -> Option<&RoleBriefSourceReference> {

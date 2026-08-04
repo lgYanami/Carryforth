@@ -521,6 +521,8 @@ mod tests {
         assert!(fence.verified_through().is_none(), "must start closed");
         assert!(!fence.covers(Utc::now() - chrono::Duration::days(365)));
 
+        // ReplicaFence stores PostgreSQL-compatible microsecond timestamps, so
+        // normalize the exact value used for the round-trip assertion.
         let ts = Utc::now();
         let stored_ts = DateTime::from_timestamp_micros(ts.timestamp_micros())
             .expect("current timestamp fits in microseconds");

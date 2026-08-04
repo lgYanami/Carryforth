@@ -133,6 +133,7 @@ use crate::config::ChannelFilter;
 pub struct ChannelInfo {
     pub name: String,
     pub channel_type: String,
+    pub room_kind: String,
 }
 
 pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
@@ -172,7 +173,7 @@ pub(crate) fn merge_discovered_channels(
     channel_uuids: Vec<Uuid>,
     meta_events: &serde_json::Value,
 ) -> HashMap<Uuid, ChannelInfo> {
-    let mut meta_map: HashMap<Uuid, (String, String)> = HashMap::new();
+    let mut meta_map: HashMap<Uuid, (String, String, String)> = HashMap::new();
     let mut archived: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     if let Some(arr) = meta_events.as_array() {
         for ev in arr {
@@ -182,12 +183,14 @@ pub(crate) fn merge_discovered_channels(
             };
             let mut d_val = None;
             let mut name = None;
+            let mut room_kind = None;
             let mut is_archived = false;
             for tag in tags {
                 if let Some(arr) = tag.as_array() {
                     match arr.first().and_then(|v| v.as_str()) {
                         Some("d") => d_val = arr.get(1).and_then(|v| v.as_str()),
                         Some("name") => name = arr.get(1).and_then(|v| v.as_str()),
+                        Some("room_kind") => room_kind = arr.get(1).and_then(|v| v.as_str()),
                         Some("archived") => {
                             is_archived = arr.get(1).and_then(|v| v.as_str()) == Some("true")
                         }
@@ -203,7 +206,8 @@ pub(crate) fn merge_discovered_channels(
                     }
                     let ch_name = name.unwrap_or("unknown").to_string();
                     let ch_type = channel_type_from_tags(tags);
-                    meta_map.insert(uuid, (ch_name, ch_type));
+                    let room_kind = room_kind.unwrap_or("community").to_string();
+                    meta_map.insert(uuid, (ch_name, ch_type, room_kind));
                 }
             }
         }
@@ -214,10 +218,21 @@ pub(crate) fn merge_discovered_channels(
         if archived.contains(&uuid) {
             continue;
         }
-        let (name, channel_type) = meta_map
-            .remove(&uuid)
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-        map.insert(uuid, ChannelInfo { name, channel_type });
+        let (name, channel_type, room_kind) = meta_map.remove(&uuid).unwrap_or_else(|| {
+            (
+                "unknown".to_string(),
+                "unknown".to_string(),
+                "unknown".to_string(),
+            )
+        });
+        map.insert(
+            uuid,
+            ChannelInfo {
+                name,
+                channel_type,
+                room_kind,
+            },
+        );
     }
     map
 }
@@ -238,9 +253,118 @@ pub struct RestClient {
     pub auth_tag_json: Option<String>,
 }
 
+/// Confirmed successful protocol submission returned by `POST /events`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolSubmitAccepted {
+    /// Submitted signed event ID.
+    pub event_id: String,
+    /// Canonical Meeting object created or changed, when returned by the Relay.
+    pub canonical_object_id: Option<String>,
+    /// Full Relay response retained for compatibility and diagnostics.
+    pub response: Value,
+}
+
+/// Confirmed protocol rejection returned by the Relay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolSubmitRejected {
+    /// HTTP status returned by the Relay.
+    pub http_status: u16,
+    /// Submitted signed event ID.
+    pub event_id: String,
+    /// Stable machine-readable rejection code.
+    pub code: String,
+    /// Canonical object that won the race, when any.
+    pub canonical_object_id: Option<String>,
+    /// One-use selected-source retry evidence, when issued.
+    pub retry_ticket_id: Option<String>,
+    /// Human-readable Relay detail.
+    pub message: String,
+    /// Full Relay response retained for diagnostics.
+    pub response: Value,
+}
+
+/// Transport ambiguity for which no authoritative Relay outcome was observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolSubmitUncertain {
+    /// Submitted signed event ID.
+    pub event_id: String,
+    /// Bounded local transport or response failure description.
+    pub reason: String,
+}
+
+/// Authoritative or transport-ambiguous result of one signed protocol submission.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProtocolSubmitOutcome {
+    /// Relay confirmed acceptance.
+    Accepted(ProtocolSubmitAccepted),
+    /// Relay confirmed rejection.
+    Rejected(ProtocolSubmitRejected),
+    /// The client could not determine whether the Relay committed the event.
+    Uncertain(ProtocolSubmitUncertain),
+}
+
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
 fn is_retriable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
+
+fn classify_protocol_submit_response(
+    event_id: &str,
+    status: reqwest::StatusCode,
+    value: Value,
+) -> ProtocolSubmitOutcome {
+    let accepted = value.get("accepted").and_then(Value::as_bool);
+    if status.is_success() && accepted == Some(true) {
+        return ProtocolSubmitOutcome::Accepted(ProtocolSubmitAccepted {
+            event_id: value
+                .get("event_id")
+                .and_then(Value::as_str)
+                .unwrap_or(event_id)
+                .to_string(),
+            canonical_object_id: value
+                .get("canonical_object_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            response: value,
+        });
+    }
+    if status.is_success() && accepted.is_none() {
+        return ProtocolSubmitOutcome::Uncertain(ProtocolSubmitUncertain {
+            event_id: event_id.to_string(),
+            reason: "Relay returned HTTP success without an authoritative accepted flag"
+                .to_string(),
+        });
+    }
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+    let message = value
+        .get("message")
+        .or_else(|| value.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or("Relay rejected protocol submission")
+        .to_string();
+    ProtocolSubmitOutcome::Rejected(ProtocolSubmitRejected {
+        http_status: status.as_u16(),
+        event_id: value
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or(event_id)
+            .to_string(),
+        code,
+        canonical_object_id: value
+            .get("canonical_object_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        retry_ticket_id: value
+            .get("retry_ticket_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message,
+        response: value,
+    })
 }
 
 /// Base retry delays for transient HTTP failures: 500ms, 1s, 2s.
@@ -364,6 +488,55 @@ impl RestClient {
             .unwrap_or_else(|| RelayError::Http(format!("{method} {path} failed after retries"))))
     }
 
+    /// Retry transient failures while preserving the final deterministic HTTP
+    /// response body for protocol-level classification.
+    async fn request_with_retry_raw<F, Fut>(
+        &self,
+        method: &str,
+        path: &str,
+        build_request: F,
+    ) -> Result<reqwest::Response, RelayError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    {
+        let mut last_err = None;
+        for (attempt, delay) in std::iter::once(None)
+            .chain(
+                REST_RETRY_BASE_DELAYS
+                    .iter()
+                    .map(|duration| Some(*duration)),
+            )
+            .enumerate()
+        {
+            if let Some(base) = delay {
+                let jittered = jittered_duration(base);
+                tracing::debug!(
+                    "retrying {method} {path} (attempt {attempt}) in {:.1}s",
+                    jittered.as_secs_f64()
+                );
+                tokio::time::sleep(jittered).await;
+            }
+            match build_request().await {
+                Ok(response) if is_retriable_status(response.status()) => {
+                    let status = response.status();
+                    tracing::warn!("{method} {path} returned retriable HTTP {status}");
+                    last_err = Some(RelayError::Http(format!(
+                        "{method} {path} returned HTTP {status}"
+                    )));
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_timeout() || error.is_connect() => {
+                    tracing::warn!("{method} {path} network error: {error}");
+                    last_err = Some(RelayError::Http(error.to_string()));
+                }
+                Err(error) => return Err(RelayError::Http(error.to_string())),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| RelayError::Http(format!("{method} {path} failed after retries"))))
+    }
+
     /// POST with NIP-98 auth and retry. Re-signs on each attempt.
     async fn bridge_post(
         &self,
@@ -388,6 +561,31 @@ impl RestClient {
                 req = req.header("x-auth-tag", tag);
             }
             req.body(body_owned.clone()).send()
+        })
+        .await
+    }
+
+    async fn bridge_post_raw(
+        &self,
+        path: &str,
+        body_bytes: &[u8],
+    ) -> Result<reqwest::Response, RelayError> {
+        let url = format!("{}{}", self.base_url, path);
+        let body_owned = body_bytes.to_vec();
+        let auth_tag_header = self.auth_tag_json.clone();
+        self.request_with_retry_raw("POST", path, || {
+            let auth = self
+                .nip98_header("POST", &url, Some(&body_owned))
+                .unwrap_or_default();
+            let mut request = self
+                .http
+                .post(&url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/json");
+            if let Some(ref auth_tag) = auth_tag_header {
+                request = request.header("x-auth-tag", auth_tag);
+            }
+            request.body(body_owned.clone()).send()
         })
         .await
     }
@@ -453,16 +651,17 @@ impl RestClient {
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
     /// Returns the events as a `serde_json::Value` (JSON array of event objects).
     pub async fn query(&self, filters: &[nostr::Filter]) -> Result<Value, RelayError> {
-        let body_bytes = serde_json::to_vec(filters)
+        let filters = filters
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
-        let resp = self.bridge_post("/query", &body_bytes).await?;
-        resp.json()
-            .await
-            .map_err(|e| RelayError::Http(e.to_string()))
+        self.query_raw(&filters).await
     }
 
-    /// Query with raw Nostr filter JSON when a Relay extension must survive
-    /// serialization (for example revision-pinned Project View pagination).
+    /// Query events with raw Nostr filters, preserving Buzz bridge extensions
+    /// such as composite `before_id` cursors and revision-pinned Project View
+    /// pagination.
     pub async fn query_raw(&self, filters: &[Value]) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(filters)
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
@@ -487,6 +686,56 @@ impl RestClient {
             return Ok(Value::Null);
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
+    }
+
+    /// Submit a signed event without collapsing deterministic protocol
+    /// rejection into a transport error.
+    pub async fn submit_event_outcome(&self, event: &Event) -> ProtocolSubmitOutcome {
+        let event_id = event.id.to_hex();
+        let body_bytes = match serde_json::to_vec(event) {
+            Ok(body) => body,
+            Err(error) => {
+                return ProtocolSubmitOutcome::Uncertain(ProtocolSubmitUncertain {
+                    event_id,
+                    reason: format!("event serialize error: {error}"),
+                });
+            }
+        };
+        let response = match self.bridge_post_raw("/events", &body_bytes).await {
+            Ok(response) => response,
+            Err(error) => {
+                return ProtocolSubmitOutcome::Uncertain(ProtocolSubmitUncertain {
+                    event_id,
+                    reason: error.to_string(),
+                });
+            }
+        };
+        let status = response.status();
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                return ProtocolSubmitOutcome::Uncertain(ProtocolSubmitUncertain {
+                    event_id,
+                    reason: format!("could not read Relay response: {error}"),
+                });
+            }
+        };
+        let value = if text.is_empty() {
+            Value::Null
+        } else {
+            match serde_json::from_str::<Value>(&text) {
+                Ok(value) => value,
+                Err(error) => {
+                    return ProtocolSubmitOutcome::Uncertain(ProtocolSubmitUncertain {
+                        event_id,
+                        reason: format!(
+                            "Relay returned an invalid JSON response after submission: {error}"
+                        ),
+                    });
+                }
+            }
+        };
+        classify_protocol_submit_response(&event_id, status, value)
     }
 }
 
@@ -4100,6 +4349,63 @@ mod tests {
             relay_ws_to_http("wss://relay.example.com:4000/ws"),
             "https://relay.example.com:4000/ws"
         );
+    }
+
+    #[test]
+    fn protocol_submit_conflict_is_typed_rejected_not_uncertain() {
+        let event_id = "11".repeat(32);
+        let ticket = "22".repeat(32);
+        let outcome = classify_protocol_submit_response(
+            &event_id,
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({
+                "event_id": event_id,
+                "accepted": false,
+                "code": "selected_source_changed",
+                "retry_ticket_id": ticket,
+                "canonical_object_id": null,
+                "message": "selected source changed",
+            }),
+        );
+        let ProtocolSubmitOutcome::Rejected(rejected) = outcome else {
+            panic!("deterministic HTTP 409 must be Rejected");
+        };
+        assert_eq!(rejected.code, "selected_source_changed");
+        assert_eq!(rejected.retry_ticket_id.as_deref(), Some(ticket.as_str()));
+        assert_eq!(rejected.http_status, 409);
+    }
+
+    #[test]
+    fn protocol_submit_success_preserves_canonical_object() {
+        let event_id = "33".repeat(32);
+        let canonical = "44".repeat(32);
+        let outcome = classify_protocol_submit_response(
+            &event_id,
+            reqwest::StatusCode::OK,
+            serde_json::json!({
+                "event_id": event_id,
+                "accepted": true,
+                "canonical_object_id": canonical,
+            }),
+        );
+        let ProtocolSubmitOutcome::Accepted(accepted) = outcome else {
+            panic!("HTTP 200 accepted body must be Accepted");
+        };
+        assert_eq!(
+            accepted.canonical_object_id.as_deref(),
+            Some(canonical.as_str())
+        );
+    }
+
+    #[test]
+    fn protocol_submit_success_without_accepted_flag_is_uncertain() {
+        let event_id = "55".repeat(32);
+        let outcome = classify_protocol_submit_response(
+            &event_id,
+            reqwest::StatusCode::OK,
+            serde_json::json!({"event_id": event_id}),
+        );
+        assert!(matches!(outcome, ProtocolSubmitOutcome::Uncertain(_)));
     }
 
     #[test]

@@ -1,0 +1,53 @@
+{
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "create_event_id": "abababababababababababababababababababababababababababababababab",
+  "board": {
+    "control_epoch": 7,
+    "board_window": 4,
+    "body": "# Goal\nAgree on the release boundary.\n\n## Conclusions\n- Ship the API first.",
+    "update_tags": [
+      ["h", "11111111-2222-4333-8444-555555555555"],
+      ["v", "3"],
+      ["policy", "moderated-board-v1"],
+      ["action", "update"],
+      ["expected-control-epoch", "7"],
+      ["board-window", "4"]
+    ],
+    "unchanged_tags": [
+      ["h", "11111111-2222-4333-8444-555555555555"],
+      ["v", "3"],
+      ["policy", "moderated-board-v1"],
+      ["action", "unchanged"],
+      ["expected-control-epoch", "7"],
+      ["board-window", "4"]
+    ]
+  },
+  "intent": {
+    "summary": "I can provide the rollout evidence.",
+    "tags": [
+      ["h", "11111111-2222-4333-8444-555555555555"],
+      ["v", "3"],
+      ["action", "submit"],
+      ["basis-speech-revision", "2"]
+    ]
+  },
+  "close_tags": [
+    ["h", "11111111-2222-4333-8444-555555555555"],
+    ["v", "3"],
+    ["policy", "moderated-board-v1"],
+    ["e", "abababababababababababababababababababababababababababababababab"],
+    ["outcome", "closed"]
+  ],
+  "abort": {
+    "reason_code": "goal_unreachable",
+    "reason": "Required evidence is unavailable.",
+    "tags": [
+      ["h", "11111111-2222-4333-8444-555555555555"],
+      ["v", "3"],
+      ["policy", "moderated-board-v1"],
+      ["e", "abababababababababababababababababababababababababababababababab"],
+      ["outcome", "aborted"],
+      ["reason-code", "goal_unreachable"]
+    ]
+  }
+}

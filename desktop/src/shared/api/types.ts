@@ -1,4 +1,5 @@
 export type ChannelType = "stream" | "forum" | "dm";
+export type ChannelRoomKind = "meeting" | null;
 export type ChannelVisibility = "open" | "private";
 export type ChannelRole = "owner" | "admin" | "member" | "guest" | "bot";
 
@@ -6,6 +7,8 @@ export type Channel = {
   id: string;
   name: string;
   channelType: ChannelType;
+  /** Stable Relay domain discriminator. Never infer this from the room name. */
+  roomKind: ChannelRoomKind;
   visibility: ChannelVisibility;
   description: string;
   topic: string | null;

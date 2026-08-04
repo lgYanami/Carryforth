@@ -40,6 +40,67 @@ pub(crate) const FILTER_QUERY_CONCURRENCY: usize = 4;
 // the range fails the build.
 const _: () = assert!(FILTER_QUERY_CONCURRENCY >= 2 && FILTER_QUERY_CONCURRENCY <= 8);
 
+/// Result of the uncached, request-local Meeting reader gate.
+pub(crate) struct MeetingReadScope {
+    /// Candidate Channels confirmed to be Meeting Sessions for this request.
+    pub meeting_channels: HashSet<uuid::Uuid>,
+    /// Meeting Channels removed from this request's otherwise-accessible scope.
+    pub revoked_channels: HashSet<uuid::Uuid>,
+}
+
+/// Remove Meeting Channels from one read request when its current principal
+/// security state has been revoked.
+///
+/// Ordinary Channel access remains untouched. The principal check is
+/// deliberately uncached; `accessible_channels` may come from a stale cache or
+/// from the immutable Meeting roster, neither of which is an authorization
+/// source after relay membership removal, deactivation, or a ban.
+pub(crate) async fn apply_meeting_read_scope(
+    state: &AppState,
+    community_id: buzz_core::CommunityId,
+    pubkey: &[u8],
+    accessible_channels: &mut Vec<uuid::Uuid>,
+) -> Result<MeetingReadScope, buzz_db::DbError> {
+    let meeting_channels: HashSet<_> =
+        buzz_db::meeting::meeting_channel_ids(&state.db, community_id, accessible_channels)
+            .await?
+            .into_iter()
+            .collect();
+    if meeting_channels.is_empty() {
+        return Ok(MeetingReadScope {
+            meeting_channels,
+            revoked_channels: HashSet::new(),
+        });
+    }
+
+    let reader_active =
+        buzz_db::meeting::is_meeting_reader_security_active(&state.db, community_id, pubkey)
+            .await?;
+    let authorized_channels: HashSet<_> = if reader_active {
+        let meeting_channel_ids: Vec<_> = meeting_channels.iter().copied().collect();
+        buzz_db::meeting::meeting_channel_ids_for_frozen_reader(
+            &state.db,
+            community_id,
+            pubkey,
+            &meeting_channel_ids,
+        )
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        HashSet::new()
+    };
+    let revoked_channels: HashSet<_> = meeting_channels
+        .difference(&authorized_channels)
+        .copied()
+        .collect();
+    accessible_channels.retain(|channel_id| !revoked_channels.contains(channel_id));
+    Ok(MeetingReadScope {
+        meeting_channels,
+        revoked_channels,
+    })
+}
+
 /// Handle a REQ message: register the subscription, deliver historical events, then send EOSE.
 pub async fn handle_req(
     sub_id: String,
@@ -47,11 +108,17 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
+    let mut board_read_observation =
+        crate::meeting_observability::MeetingV2BoardReadObservation::for_filters(
+            "websocket",
+            &filters,
+        );
     let (conn_id, pubkey_bytes, token_channel_ids, auth_scopes) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => {
                 if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
+                    board_read_observation.denied();
                     conn.send(RelayMessage::notice("restricted: insufficient scope"));
                     conn.send(RelayMessage::closed(
                         &sub_id,
@@ -79,6 +146,7 @@ pub async fn handle_req(
                 )
             }
             _ => {
+                board_read_observation.denied();
                 conn.send(RelayMessage::notice(
                     "auth-required: authenticate before subscribing",
                 ));
@@ -270,12 +338,40 @@ pub async fn handle_req(
             token_allows,
             db_is_member,
         ) {
+            board_read_observation.denied();
             conn.send(RelayMessage::closed(
                 &sub_id,
                 "restricted: not a channel member",
             ));
             return;
         }
+    }
+
+    // Meeting rosters are immutable collaboration history, not a durable read
+    // authorization source. Re-check the principal after any targeted-channel
+    // cache repair and before search, subscription registration, or history.
+    let meeting_scope = match apply_meeting_read_scope(
+        &state,
+        conn.tenant.community(),
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(error) => {
+            warn!(conn_id = %conn_id, "Meeting reader security check failed: {error}");
+            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            return;
+        }
+    };
+    if channel_id.is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id)) {
+        board_read_observation.denied();
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "restricted: meeting access revoked",
+        ));
+        return;
     }
 
     // Applied BEFORE the NIP-50 search branch so that an authenticated member
@@ -538,6 +634,7 @@ pub async fn handle_req(
     }
 
     conn.send(RelayMessage::eose(&sub_id));
+    board_read_observation.completed(total_sent);
 
     debug!(
         conn_id = %conn_id,

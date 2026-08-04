@@ -41,6 +41,58 @@ pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Resolve an exploration target while enforcing both the server workspace
+/// boundary and the caller-selected workdir boundary.
+///
+/// `workdir` is resolved relative to the MCP server's initial cwd and must
+/// remain inside it. `path` is then resolved relative to that workdir and must
+/// remain inside the workdir after canonicalization. Canonicalizing before the
+/// containment checks also rejects `..` and symlink-based escapes.
+pub(crate) fn resolve_exploration_path(
+    state: &SharedState,
+    path: &str,
+    workdir: Option<&str>,
+) -> Result<(PathBuf, PathBuf), ErrorData> {
+    let workspace_root = std::fs::canonicalize(&state.cwd).map_err(|e| {
+        ErrorData::internal_error(
+            format!(
+                "cannot resolve server workspace {}: {e}",
+                state.cwd.display()
+            ),
+            None,
+        )
+    })?;
+
+    let workdir = match workdir {
+        Some(workdir) => resolve_path(&workspace_root, workdir)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid workdir: {e}"), None))?,
+        None => workspace_root.clone(),
+    };
+    if !workdir.starts_with(&workspace_root) {
+        return Err(ErrorData::invalid_params(
+            format!("workdir escapes server workspace: {}", workdir.display()),
+            None,
+        ));
+    }
+    if !workdir.is_dir() {
+        return Err(ErrorData::invalid_params(
+            format!("workdir is not a directory: {}", workdir.display()),
+            None,
+        ));
+    }
+
+    let target = resolve_path(&workdir, path)
+        .map_err(|e| ErrorData::invalid_params(format!("invalid path: {e}"), None))?;
+    if !target.starts_with(&workdir) {
+        return Err(ErrorData::invalid_params(
+            format!("path escapes workdir: {}", target.display()),
+            None,
+        ));
+    }
+
+    Ok((workdir, target))
+}
+
 /// Translate the MSYS/Cygwin absolute path forms bash would accept into a
 /// native Windows path, matching `cygpath -w` semantics so the file tools
 /// resolve the same inputs the `shell` tool does. Anything that is not a
@@ -206,6 +258,58 @@ mod tests {
         // Resolves a normal path inside.
         let p = resolve_path(dir.path(), "file.txt").expect("resolve");
         assert!(p.ends_with("file.txt"));
+    }
+
+    fn make_state(cwd: &std::path::Path) -> SharedState {
+        let shim = crate::shim::Shim::install().expect("shim install");
+        SharedState::new(cwd.to_path_buf(), shim).expect("state new")
+    }
+
+    #[test]
+    fn exploration_path_rejects_parent_escape() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        let target = outside.path().join("secret.txt");
+        fs::write(&target, b"secret").expect("write");
+        let state = make_state(workspace.path());
+
+        let err = resolve_exploration_path(
+            &state,
+            &target.display().to_string(),
+            Some(&workspace.path().display().to_string()),
+        )
+        .expect_err("absolute target outside workdir must fail");
+
+        assert!(err.message.contains("escapes workdir"), "{err:?}");
+    }
+
+    #[test]
+    fn exploration_workdir_must_stay_in_server_workspace() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        let state = make_state(workspace.path());
+
+        let err =
+            resolve_exploration_path(&state, ".", Some(&outside.path().display().to_string()))
+                .expect_err("outside workdir must fail");
+
+        assert!(err.message.contains("escapes server workspace"), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exploration_path_rejects_symlink_escape() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        fs::write(outside.path().join("secret.txt"), b"secret").expect("write");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside"))
+            .expect("symlink");
+        let state = make_state(workspace.path());
+
+        let err = resolve_exploration_path(&state, "outside/secret.txt", None)
+            .expect_err("symlink escape must fail");
+
+        assert!(err.message.contains("escapes workdir"), "{err:?}");
     }
 
     // Windows MSYS-absolute path translation. These test `msys_to_windows`

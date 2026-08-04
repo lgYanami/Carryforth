@@ -2043,7 +2043,6 @@ impl ProjectViewV2WriteTx {
         {
             return Ok(ProjectViewV2ProjectObjectPrepareOutcome::Replayed(receipt));
         }
-
         let mutation = command.as_reducer_mutation();
         let (next_state, outcome) =
             loaded
@@ -2134,6 +2133,7 @@ impl ProjectViewV2WriteTx {
             load_old_projection_ids(&mut self.tx, self.community_id, &continuity_changes).await?;
 
         let receipt_result = project_object_receipt(
+            command,
             &outcome.changed_entries,
             &continuity_changes,
             outcome.project_revision,
@@ -2418,7 +2418,6 @@ impl ProjectViewV2WriteTx {
                 "active Commitment count differs from the prepared v2 state".to_owned(),
             ));
         }
-
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
             .execute(&mut *self.tx)
             .await?;
@@ -2689,7 +2688,6 @@ impl ProjectViewV2WriteTx {
                 },
             ));
         }
-
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
             .execute(&mut *self.tx)
             .await?;
@@ -3870,12 +3868,17 @@ async fn insert_change(
 }
 
 fn project_object_receipt(
+    command: &ProjectObjectCommand,
     entries: &[ProjectViewEntry],
     continuity_changes: &[RoleContinuityChange],
     project_revision: u64,
 ) -> Value {
     let mut result = serde_json::Map::new();
     result.insert("project_revision".to_owned(), Value::from(project_revision));
+    result.insert(
+        "operation".to_owned(),
+        Value::String(command.operation().to_owned()),
+    );
     if let [entry] = entries {
         result.insert(
             "object_id".to_owned(),

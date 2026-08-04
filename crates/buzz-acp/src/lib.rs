@@ -5,6 +5,11 @@ mod child_registry;
 mod config;
 mod engram_fetch;
 mod filter;
+mod meeting;
+#[cfg(feature = "meeting-acceptance")]
+mod meeting_acceptance;
+mod meeting_v1;
+mod meeting_v2;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -58,12 +63,143 @@ use uuid::Uuid;
 ///
 /// This avoids clap rejecting harness flags (like `--private-key`) that aren't
 /// declared on the subcommand's `Parser`. The `models` path has its own
-/// dedicated parser; the default path uses the existing `CliArgs`.
+/// dedicated parser; the default path uses the existing `CliArgs`. The static
+/// `capabilities` probe intentionally needs no provider process or credentials.
 ///
 /// **Constraint**: subcommand must be argv[1] — flags before the subcommand
 /// name (e.g., `buzz-acp --verbose models`) are not supported.
 fn is_subcommand(name: &str) -> bool {
     std::env::args().nth(1).map(|a| a == name).unwrap_or(false)
+}
+
+fn meeting_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "component": "buzz-acp",
+        "version": env!("CARGO_PKG_VERSION"),
+        "meeting": {
+            "ledgerVersion": meeting_v1::capability_ledger_version(),
+            "qualificationEvidenceCompiled": cfg!(feature = "meeting-acceptance"),
+            "capabilities": [buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY],
+            "protocols": [
+                {
+                    "schemaVersion": buzz_sdk::MEETING_V1_SCHEMA_VERSION,
+                    "policy": buzz_sdk::MEETING_V1_POLICY,
+                    "roles": ["participant", "moderator"],
+                    "turns": ["intent", "granted_speech", "floor_decision"]
+                },
+                {
+                    "schemaVersion": buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+                    "policy": buzz_sdk::MEETING_V2_POLICY,
+                    "roles": ["participant", "moderator"],
+                    "turns": [
+                        "intent",
+                        "granted_speech",
+                        "board_maintenance",
+                        "floor_decision"
+                    ],
+                    "currentBoard": "authoritative_read_before_each_semantic_turn",
+                    "boardFloorDeadlines": "independent"
+                },
+                {
+                    "schemaVersion": buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+                    "policy": buzz_sdk::MEETING_V2_ACTIONS_POLICY,
+                    "capability": buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
+                    "roles": ["participant", "moderator"],
+                    "turns": [
+                        "intent",
+                        "granted_speech",
+                        "board_maintenance",
+                        "floor_decision",
+                        "action_finalization"
+                    ],
+                    "currentBoard": "exact_authoritative_read_before_each_semantic_turn",
+                    "boardFloorActionDeadlines": "independent",
+                    "moderatorContinuity": "exact_agent_slot_and_acp_session"
+                }
+            ]
+        }
+    })
+}
+
+fn run_capabilities() -> Result<()> {
+    let trailing = std::env::args().skip(2).collect::<Vec<_>>();
+    if !trailing.is_empty() && trailing != ["--json"] {
+        anyhow::bail!("usage: buzz-acp capabilities [--json]");
+    }
+    println!("{}", serde_json::to_string_pretty(&meeting_capabilities())?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod meeting_capability_tests {
+    use super::*;
+
+    #[test]
+    fn static_probe_declares_the_complete_v2_turn_surface() {
+        let capabilities = meeting_capabilities();
+        let v2 = capabilities["meeting"]["protocols"]
+            .as_array()
+            .and_then(|protocols| {
+                protocols.iter().find(|protocol| {
+                    protocol["schemaVersion"] == buzz_sdk::MEETING_V2_SCHEMA_VERSION
+                        && protocol["policy"] == buzz_sdk::MEETING_V2_POLICY
+                })
+            })
+            .expect("Meeting V2 capability");
+        assert_eq!(v2["roles"], serde_json::json!(["participant", "moderator"]));
+        assert_eq!(
+            v2["turns"],
+            serde_json::json!([
+                "intent",
+                "granted_speech",
+                "board_maintenance",
+                "floor_decision"
+            ])
+        );
+        assert_eq!(
+            v2["currentBoard"],
+            "authoritative_read_before_each_semantic_turn"
+        );
+        let actions = capabilities["meeting"]["protocols"]
+            .as_array()
+            .and_then(|protocols| {
+                protocols.iter().find(|protocol| {
+                    protocol["schemaVersion"] == buzz_sdk::MEETING_V2_SCHEMA_VERSION
+                        && protocol["policy"] == buzz_sdk::MEETING_V2_ACTIONS_POLICY
+                })
+            })
+            .expect("action-capable Meeting V2 capability");
+        assert_eq!(
+            actions["turns"],
+            serde_json::json!([
+                "intent",
+                "granted_speech",
+                "board_maintenance",
+                "floor_decision",
+                "action_finalization"
+            ])
+        );
+        assert_eq!(
+            actions["moderatorContinuity"],
+            "exact_agent_slot_and_acp_session"
+        );
+        assert_eq!(
+            actions["capability"],
+            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY
+        );
+        assert_eq!(
+            capabilities["meeting"]["capabilities"],
+            serde_json::json!([buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY])
+        );
+        assert_eq!(
+            capabilities["meeting"]["ledgerVersion"],
+            meeting_v1::capability_ledger_version()
+        );
+        assert_eq!(
+            capabilities["meeting"]["qualificationEvidenceCompiled"],
+            cfg!(feature = "meeting-acceptance")
+        );
+    }
 }
 
 /// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
@@ -1283,6 +1419,9 @@ impl Drop for RespawnGuard {
 // worker threads (Rust 2024 edition safety requirement).
 
 pub fn run() -> Result<()> {
+    if is_subcommand("capabilities") {
+        return run_capabilities();
+    }
     config::propagate_legacy_env_vars();
     let runtime_supervisor = runtime_supervisor::RuntimeSupervisorConfig::take_from_env()
         .map_err(|error| anyhow::anyhow!("runtime supervisor configuration error: {error}"))?;
@@ -1356,6 +1495,23 @@ async fn tokio_main(
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
+    #[cfg(feature = "meeting-acceptance")]
+    let acceptance_events_path = meeting_acceptance::acceptance_events_path();
+    #[cfg(feature = "meeting-acceptance")]
+    let observer = match acceptance_events_path.as_deref() {
+        Some(path) => Some(
+            observer::ObserverHandle::in_process_with_acceptance_sink(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "create Meeting acceptance evidence {}: {error}",
+                    path.display()
+                )
+            })?,
+        ),
+        None => config
+            .relay_observer
+            .then(observer::ObserverHandle::in_process),
+    };
+    #[cfg(not(feature = "meeting-acceptance"))]
     let observer = config
         .relay_observer
         .then(observer::ObserverHandle::in_process);
@@ -1370,6 +1526,9 @@ async fn tokio_main(
                 "agentArgs": config.agent_args,
                 "parallelism": config.agents,
                 "relayObserver": config.relay_observer,
+                "meetingAcceptance": cfg!(feature = "meeting-acceptance"),
+                "meetingV1Acceptance": cfg!(feature = "meeting-acceptance"),
+                "meetingCapabilities": meeting_capabilities()["meeting"].clone(),
             }),
         );
     }
@@ -1568,6 +1727,10 @@ async fn tokio_main(
 
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
+    let meeting_channel_ids: Vec<Uuid> = channel_info_map
+        .iter()
+        .filter_map(|(channel_id, info)| (info.room_kind == "meeting").then_some(*channel_id))
+        .collect();
 
     let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
         SubscribeMode::Mentions => {
@@ -1606,7 +1769,10 @@ async fn tokio_main(
         }
     };
 
-    let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    let mut channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    for channel_id in &meeting_channel_ids {
+        channel_filters.insert(*channel_id, meeting::subscription_filter());
+    }
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
@@ -1659,8 +1825,9 @@ async fn tokio_main(
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    let mcp_servers = build_mcp_servers(&config);
     let ctx = Arc::new(PromptContext {
-        mcp_servers: build_mcp_servers(&config),
+        mcp_servers: mcp_servers.clone(),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
@@ -1686,6 +1853,7 @@ async fn tokio_main(
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
+        require_permission_mode: false,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
             .as_deref()
@@ -1694,6 +1862,170 @@ async fn tokio_main(
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
+    let meeting_v0_mcp_servers = build_meeting_v0_mcp_servers(&mcp_servers);
+    if !mcp_servers.is_empty() && meeting_v0_mcp_servers.is_empty() {
+        tracing::warn!(
+            "Meeting V0 turns will not receive the configured MCP server because only \
+             buzz-dev-mcp has an enforced read-only profile"
+        );
+    }
+    let meeting_v0_ctx = Arc::new(PromptContext {
+        // V0 keeps its original enforced Plan/read-only execution profile.
+        mcp_servers: meeting_v0_mcp_servers,
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V0_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: config::PermissionMode::Plan,
+        require_permission_mode: true,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let meeting_v1_ctx = Arc::new(PromptContext {
+        // V1 uses an advisory tool policy: the Agent keeps its normal tools,
+        // while the prompt asks it not to create persistent side effects.
+        // Protocol event publication remains Harness-owned.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V1_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let meeting_v2_ctx = Arc::new(PromptContext {
+        // V2 participants retain the V1 advisory tool surface behind a
+        // participant-only authority boundary.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V2_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let meeting_v2_moderator_ctx = Arc::new(PromptContext {
+        // Moderator Board/Floor proposals use the same advisory Runtime tools,
+        // but a distinct system boundary and never publish protocol events.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V2_MODERATOR_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let meeting_v2_actions_ctx = Arc::new(PromptContext {
+        // The action-capable policy is deliberately uniform across
+        // participant, Board, Floor, and Action turns so one channel ACP
+        // Session never changes its authority boundary mid-meeting.
+        mcp_servers: mcp_servers.clone(),
+        initial_message: None,
+        idle_timeout: ctx.idle_timeout,
+        max_turn_duration: Duration::from_secs(270),
+        turn_liveness_interval: ctx.turn_liveness_interval,
+        dedup_mode: DedupMode::Drop,
+        system_prompt: ctx.system_prompt.clone(),
+        team_instructions: ctx.team_instructions.clone(),
+        base_prompt: Some(meeting::V2_ACTIONS_SYSTEM_PROMPT),
+        heartbeat_prompt: None,
+        cwd: ctx.cwd.clone(),
+        rest_client: ctx.rest_client.clone(),
+        role_brief_resolver: ctx.role_brief_resolver.clone(),
+        channel_info: ctx.channel_info.clone(),
+        context_message_limit: 0,
+        max_turns_per_session: ctx.max_turns_per_session,
+        permission_mode: ctx.permission_mode,
+        require_permission_mode: false,
+        agent_keys: ctx.agent_keys.clone(),
+        agent_owner_pubkey: ctx.agent_owner_pubkey,
+        memory_enabled: ctx.memory_enabled,
+        harness_name: ctx.harness_name.clone(),
+        relay_url: ctx.relay_url.clone(),
+    });
+    let mut meeting_controller = meeting::MeetingCoordinator::new(
+        ctx.rest_client.clone(),
+        config.keys.clone(),
+        observer.clone(),
+        config.agents as usize,
+    );
+    pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+    pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
+    meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+    meeting_controller.set_available_agent_slots(if pool_ready {
+        pool.claimable_unleased_count()
+    } else {
+        0
+    });
+    for channel_id in meeting_channel_ids {
+        meeting_controller.register(channel_id).await;
+    }
+    // V1 Agent Offers have a 5-second ACK window. A sub-second controller tick
+    // leaves room to replay one prepared ACK after an uncertain HTTP result.
+    let mut meeting_tick = tokio::time::interval(Duration::from_millis(500));
+    meeting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -1847,6 +2179,35 @@ async fn tokio_main(
     }
 
     let main_loop_exit = loop {
+        apply_meeting_continuity_directives(&mut pool, &mut meeting_controller);
+        pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+        pool.set_reserved_meeting_board_slots(meeting_controller.board_dispatch_reserved_slots());
+        meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+        meeting_controller.set_available_agent_slots(if pool_ready {
+            pool.claimable_unleased_count()
+        } else {
+            0
+        });
+        if pool_ready {
+            for channel_id in meeting_controller.take_preemptions() {
+                let _ = signal_in_flight_task(&mut pool, channel_id, ControlSignal::Cancel);
+            }
+            dispatch_meeting_pending(
+                &mut pool,
+                &mut meeting_controller,
+                &meeting_v0_ctx,
+                &meeting_v1_ctx,
+                &meeting_v2_ctx,
+                &meeting_v2_moderator_ctx,
+                &meeting_v2_actions_ctx,
+            );
+            pool.set_reserved_meeting_slots(meeting_controller.unassigned_reserved_slots());
+            pool.set_reserved_meeting_board_slots(
+                meeting_controller.board_dispatch_reserved_slots(),
+            );
+            meeting_controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+            meeting_controller.set_available_agent_slots(pool.claimable_unleased_count());
+        }
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -1854,7 +2215,7 @@ async fn tokio_main(
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if !maintenance_mode && config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            lazy_wake_work_pending = queue.has_flushable_work() || meeting_controller.has_pending();
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -1907,6 +2268,17 @@ async fn tokio_main(
                 }
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
+                if let Some(ref observer) = observer {
+                    observer.emit(
+                        "respawn_scheduled",
+                        Some(idx),
+                        &observer::ObserverContext::default(),
+                        serde_json::json!({
+                            "delay_ms": 0,
+                            "reason": "empty_slot_refill",
+                        }),
+                    );
+                }
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = managed_agent_env(
@@ -1957,11 +2329,30 @@ async fn tokio_main(
                     };
                     pool.return_agent(agent);
                     tracing::info!(agent = rr.index, "respawn complete");
+                    if let Some(ref observer) = observer {
+                        observer.emit(
+                            "respawn_completed",
+                            Some(rr.index),
+                            &observer::ObserverContext::default(),
+                            serde_json::json!({ "outcome": "ready" }),
+                        );
+                    }
                     respawn_collected = true;
                 }
                 Err(e) => {
                     crash_history[rr.index].mark_spawn_failed();
                     tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
+                    if let Some(ref observer) = observer {
+                        observer.emit(
+                            "respawn_failed",
+                            Some(rr.index),
+                            &observer::ObserverContext::default(),
+                            serde_json::json!({
+                                "outcome": "failed",
+                                "error_class": "spawn_or_initialize",
+                            }),
+                        );
+                    }
                 }
             }
         }
@@ -1969,6 +2360,15 @@ async fn tokio_main(
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
+            dispatch_meeting_pending(
+                &mut pool,
+                &mut meeting_controller,
+                &meeting_v0_ctx,
+                &meeting_v1_ctx,
+                &meeting_v2_ctx,
+                &meeting_v2_moderator_ctx,
+                &meeting_v2_actions_ctx,
+            );
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                 typing_channels.insert(channel_id, thread_tags);
             }
@@ -2068,6 +2468,11 @@ async fn tokio_main(
                     }
                     None
                 }
+                _ = meeting_tick.tick() => {
+                    let _ = result_rx;
+                    meeting_controller.tick().await;
+                    None
+                }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
                 buzz_event = relay.next_event() => {
                     let _ = result_rx; // end split borrow before relay handling
@@ -2132,8 +2537,31 @@ async fn tokio_main(
                                     // stripped for a legitimately re-added channel.
                                     removed_channels.remove(&ch);
 
+                                    let is_meeting = ctx
+                                        .channel_info
+                                        .resolve(ch)
+                                        .await
+                                        .is_some_and(|info| info.room_kind == "meeting");
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
+                                        if is_meeting && !meeting_controller.contains(ch) {
+                                            meeting_controller.register(ch).await;
+                                        }
+                                    } else if is_meeting {
+                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to Meeting room");
+                                        if let Err(e) = relay
+                                            .subscribe_channel_from(
+                                                ch,
+                                                meeting::subscription_filter(),
+                                                Some(ts),
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!("failed to subscribe to meeting {ch}: {e}");
+                                        } else {
+                                            subscribed_channel_ids.insert(ch);
+                                            meeting_controller.register(ch).await;
+                                        }
                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
@@ -2163,6 +2591,7 @@ async fn tokio_main(
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
+                                    meeting_controller.remove(ch);
                                     typing_channels.remove(&ch);
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
@@ -2187,6 +2616,25 @@ async fn tokio_main(
                                             "cleaned up after membership removal"
                                         );
                                     }
+                                }
+                                continue;
+                            }
+
+                            let is_meeting_event = if meeting_controller
+                                .contains(buzz_event.channel_id)
+                            {
+                                true
+                            } else {
+                                ctx.channel_info
+                                    .resolve(buzz_event.channel_id)
+                                    .await
+                                    .is_some_and(|info| info.room_kind == "meeting")
+                            };
+                            if is_meeting_event {
+                                if !meeting_controller.contains(buzz_event.channel_id) {
+                                    meeting_controller.register(buzz_event.channel_id).await;
+                                } else {
+                                    meeting_controller.handle_event(&buzz_event).await;
                                 }
                                 continue;
                             }
@@ -2439,6 +2887,7 @@ async fn tokio_main(
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 break MainLoopExit::Abnormal("Relay reconnect failed");
                             }
+                            meeting_controller.mark_all_for_resync();
                         }
                     }
                     None
@@ -2518,15 +2967,124 @@ async fn tokio_main(
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
+                let mut result = *result;
                 // Stop typing indicator for the completed channel.
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                let meeting_turn = meeting_controller.owns_turn(&result.turn_id);
+                let meeting_turn_id = result.turn_id.clone();
+                let continuity_info = meeting_controller.turn_continuity_info(&result.turn_id);
+                let meeting_output = meeting_turn.then(|| result.agent.acp.take_agent_message());
+                let mut meeting_succeeded = matches!(&result.outcome, PromptOutcome::Ok(_));
+                if let Some(info) = continuity_info {
+                    let agent_index = result.agent.index;
+                    let resolved_session_id = result.resolved_session_id.as_deref();
+                    let process_will_be_replaced = prompt_outcome_replaces_agent(&result.outcome);
+                    let mut affinity_lost = process_will_be_replaced;
+                    let output = meeting_output.as_deref().unwrap_or_default();
+                    let binding_existed = pool.meeting_slot_binding(info.session_id).is_some();
+                    match info.kind {
+                        meeting::MeetingTurnKind::V2ModeratorBoard
+                            if meeting_succeeded && v2_actions_board_output_is_holdable(output) =>
+                        {
+                            if let Some(acp_session_id) = resolved_session_id {
+                                let phase = pool.meeting_slot_binding(info.session_id).map_or(
+                                    pool::MeetingSlotBindingPhase::FinalControlCycle,
+                                    |binding| binding.phase,
+                                );
+                                if pool
+                                    .bind_meeting_slot(
+                                        info.session_id,
+                                        agent_index,
+                                        acp_session_id.to_string(),
+                                        phase,
+                                        result.rotation_deferred,
+                                    )
+                                    .is_err()
+                                {
+                                    affinity_lost = true;
+                                    meeting_succeeded = false;
+                                } else {
+                                    meeting_controller.record_continuity_binding(
+                                        info.session_id,
+                                        agent_index,
+                                        acp_session_id,
+                                        continuity_phase_name(phase),
+                                    );
+                                }
+                            } else {
+                                affinity_lost = true;
+                                meeting_succeeded = false;
+                            }
+                        }
+                        meeting::MeetingTurnKind::V2ModeratorBoard => {}
+                        meeting::MeetingTurnKind::V2ModeratorFloor
+                        | meeting::MeetingTurnKind::V2ActionFinalization => {
+                            let binding_matches = pool
+                                .meeting_slot_binding(info.session_id)
+                                .is_some_and(|binding| {
+                                    binding.agent_index == agent_index
+                                        && resolved_session_id
+                                            == Some(binding.acp_session_id.as_str())
+                                });
+                            if !binding_matches {
+                                affinity_lost = true;
+                                meeting_succeeded = false;
+                            } else if let Some(acp_session_id) = resolved_session_id {
+                                let current_phase = pool
+                                    .meeting_slot_binding(info.session_id)
+                                    .map(|binding| binding.phase)
+                                    .unwrap_or(pool::MeetingSlotBindingPhase::FinalControlCycle);
+                                let phase = if info.kind
+                                    == meeting::MeetingTurnKind::V2ActionFinalization
+                                {
+                                    pool::MeetingSlotBindingPhase::Action
+                                } else if meeting_succeeded
+                                    && v2_actions_floor_selects_finalization(output)
+                                    && current_phase
+                                        != pool::MeetingSlotBindingPhase::ModeratorMeeting
+                                {
+                                    pool::MeetingSlotBindingPhase::PendingAction
+                                } else {
+                                    current_phase
+                                };
+                                let _ = pool.bind_meeting_slot(
+                                    info.session_id,
+                                    agent_index,
+                                    acp_session_id.to_string(),
+                                    phase,
+                                    result.rotation_deferred,
+                                );
+                                meeting_controller.record_continuity_binding(
+                                    info.session_id,
+                                    agent_index,
+                                    acp_session_id,
+                                    continuity_phase_name(phase),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    if affinity_lost
+                        && !(info.kind == meeting::MeetingTurnKind::V2ModeratorBoard
+                            && !binding_existed
+                            && !v2_actions_board_output_is_holdable(output))
+                    {
+                        continue_meeting_continuity_failure(
+                            &mut pool,
+                            &mut meeting_controller,
+                            &meeting_turn_id,
+                            info.session_id,
+                            "Agent slot or ACP Session continuity was lost",
+                        );
+                    }
+                }
+                let loop_action = handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
-                    *result,
+                    result,
                     &mut heartbeat_in_flight,
                     &removed_channels,
                     &mut crash_history,
@@ -2534,13 +3092,18 @@ async fn tokio_main(
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
-                {
+                );
+                if let Some(output) = meeting_output {
+                    meeting_controller
+                        .handle_turn_result(&meeting_turn_id, output, meeting_succeeded)
+                        .await;
+                }
+                if loop_action == LoopAction::Exit {
                     break MainLoopExit::Abnormal(
                         "Agent pool exhausted while handling a prompt result",
                     );
                 }
-                if drain_ready_join_results(
+                let (drain_action, failed_meeting_turns) = drain_ready_join_results(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -2551,18 +3114,40 @@ async fn tokio_main(
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                ) == LoopAction::Exit
-                {
+                    &meeting_controller,
+                );
+                for turn_id in failed_meeting_turns {
+                    meeting_controller.mark_turn_continuity_lost(&turn_id, "Agent task panicked");
+                    meeting_controller.handle_turn_failure(&turn_id).await;
+                }
+                if drain_action == LoopAction::Exit {
                     break MainLoopExit::Abnormal(
                         "Agent pool exhausted while draining completed work",
                     );
                 }
+                dispatch_meeting_pending(
+                    &mut pool,
+                    &mut meeting_controller,
+                    &meeting_v0_ctx,
+                    &meeting_v1_ctx,
+                    &meeting_v2_ctx,
+                    &meeting_v2_moderator_ctx,
+                    &meeting_v2_actions_ctx,
+                );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
+                let failed_meeting_turn = pool
+                    .task_map()
+                    .get(&join_error.id())
+                    .map(|meta| meta.turn_id.clone())
+                    .filter(|turn_id| meeting_controller.owns_turn(turn_id));
+                if let Some(turn_id) = failed_meeting_turn.as_deref() {
+                    meeting_controller.mark_turn_continuity_lost(turn_id, "Agent task panicked");
+                }
                 recover_panicked_agent(
                     &mut pool,
                     &mut queue,
@@ -2576,10 +3161,22 @@ async fn tokio_main(
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if let Some(turn_id) = failed_meeting_turn {
+                    meeting_controller.handle_turn_failure(&turn_id).await;
+                }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break MainLoopExit::Abnormal("all Agent processes are unavailable");
                 }
+                dispatch_meeting_pending(
+                    &mut pool,
+                    &mut meeting_controller,
+                    &meeting_v0_ctx,
+                    &meeting_v1_ctx,
+                    &meeting_v2_ctx,
+                    &meeting_v2_moderator_ctx,
+                    &meeting_v2_actions_ctx,
+                );
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -2914,6 +3511,15 @@ async fn tokio_main(
                             "ready",
                             None,
                         );
+                        dispatch_meeting_pending(
+                            &mut pool,
+                            &mut meeting_controller,
+                            &meeting_v0_ctx,
+                            &meeting_v1_ctx,
+                            &meeting_v2_ctx,
+                            &meeting_v2_moderator_ctx,
+                            &meeting_v2_actions_ctx,
+                        );
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
                         {
@@ -3086,6 +3692,15 @@ async fn tokio_main(
 
     if let Some(handle) = relay_observer_publisher_task.take() {
         handle.abort();
+    }
+
+    if let Some(observer) = &observer {
+        observer.emit(
+            "harness_stopped",
+            None,
+            &observer::ObserverContext::default(),
+            serde_json::json!({ "reason": "normal_shutdown" }),
+        );
     }
 
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
@@ -3279,6 +3894,258 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+fn prompt_outcome_replaces_agent(outcome: &PromptOutcome) -> bool {
+    match outcome {
+        PromptOutcome::AgentExited
+        | PromptOutcome::Timeout(_)
+        | PromptOutcome::CancelDrainTimeout(_) => true,
+        PromptOutcome::Error(error) => matches!(
+            error,
+            acp::AcpError::Io(_)
+                | acp::AcpError::WriteTimeout(_)
+                | acp::AcpError::Timeout(_)
+                | acp::AcpError::Protocol(_)
+        ),
+        PromptOutcome::Ok(_) | PromptOutcome::Cancelled => false,
+    }
+}
+
+fn v2_actions_board_output_is_holdable(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 3
+        || object
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    match object.get("action").and_then(serde_json::Value::as_str) {
+        Some("UNCHANGED") => object.get("board").is_some_and(serde_json::Value::is_null),
+        Some("UPDATE") => object
+            .get("board")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|body| {
+                buzz_sdk::validate_meeting_v2_board_content(&buzz_sdk::MeetingV2BoardContent {
+                    format: buzz_sdk::MEETING_V2_BOARD_FORMAT.to_string(),
+                    body: body.to_string(),
+                })
+                .is_ok()
+            }),
+        _ => false,
+    }
+}
+
+fn v2_actions_floor_selects_finalization(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return false;
+    };
+    value.get("action").and_then(serde_json::Value::as_str) == Some("FINALIZE_ACTIONS")
+        || value
+            .get("next_action")
+            .and_then(|next| next.get("action"))
+            .and_then(serde_json::Value::as_str)
+            == Some("finalize_actions")
+}
+
+fn continuity_phase_name(phase: pool::MeetingSlotBindingPhase) -> &'static str {
+    match phase {
+        pool::MeetingSlotBindingPhase::FinalControlCycle => "final_control_cycle",
+        pool::MeetingSlotBindingPhase::PendingAction => "pending_action",
+        pool::MeetingSlotBindingPhase::Action => "action",
+        pool::MeetingSlotBindingPhase::ModeratorMeeting => "moderator_meeting",
+    }
+}
+
+fn continue_meeting_continuity_failure(
+    pool: &mut AgentPool,
+    controller: &mut meeting::MeetingCoordinator,
+    turn_id: &str,
+    session_id: Uuid,
+    reason: &str,
+) {
+    pool.release_meeting_slot_binding(session_id);
+    controller.mark_turn_continuity_lost(turn_id, reason);
+}
+
+fn apply_meeting_continuity_directives(
+    pool: &mut AgentPool,
+    controller: &mut meeting::MeetingCoordinator,
+) {
+    for directive in controller.take_continuity_directives() {
+        match directive {
+            meeting::MeetingContinuityDirective::Release { session_id } => {
+                if pool.release_meeting_slot_binding(session_id) {
+                    controller.clear_continuity_binding(session_id);
+                }
+            }
+            meeting::MeetingContinuityDirective::ReleaseFinalControl { session_id } => {
+                if pool
+                    .meeting_slot_binding(session_id)
+                    .is_some_and(|binding| {
+                        matches!(
+                            binding.phase,
+                            pool::MeetingSlotBindingPhase::FinalControlCycle
+                                | pool::MeetingSlotBindingPhase::PendingAction
+                        )
+                    })
+                    && pool.release_meeting_slot_binding(session_id)
+                {
+                    controller.clear_continuity_binding(session_id);
+                }
+            }
+            meeting::MeetingContinuityDirective::PromoteAction { session_id } => {
+                pool.promote_meeting_slot_binding(
+                    session_id,
+                    pool::MeetingSlotBindingPhase::Action,
+                );
+            }
+            meeting::MeetingContinuityDirective::PromoteModeratorMeeting { session_id } => {
+                pool.promote_meeting_slot_binding(
+                    session_id,
+                    pool::MeetingSlotBindingPhase::ModeratorMeeting,
+                );
+            }
+        }
+    }
+    controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+}
+
+/// Dispatch controller-owned Meeting turns before ordinary channel work.
+///
+/// The empty batch supplies channel/session affinity without leaking meeting
+/// events into the ordinary prompt formatter. The controller owns retries and
+/// durable recovery, so the queue-recovery copy is intentionally absent.
+fn dispatch_meeting_pending(
+    pool: &mut AgentPool,
+    controller: &mut meeting::MeetingCoordinator,
+    v0_ctx: &Arc<PromptContext>,
+    v1_ctx: &Arc<PromptContext>,
+    v2_ctx: &Arc<PromptContext>,
+    v2_moderator_ctx: &Arc<PromptContext>,
+    v2_actions_ctx: &Arc<PromptContext>,
+) {
+    apply_meeting_continuity_directives(pool, controller);
+    while let Some(request) = controller.pop_pending() {
+        let channel_id = request.session_id;
+        let ctx = match request.baton_protocol {
+            Some(meeting::MeetingBatonProtocol::V1) => Arc::clone(v1_ctx),
+            Some(meeting::MeetingBatonProtocol::V2) if request.kind.is_v2_moderator() => {
+                Arc::clone(v2_moderator_ctx)
+            }
+            Some(meeting::MeetingBatonProtocol::V2) => Arc::clone(v2_ctx),
+            Some(meeting::MeetingBatonProtocol::V2Actions) => Arc::clone(v2_actions_ctx),
+            None => Arc::clone(v0_ctx),
+        };
+        let action_host_turn = request.baton_protocol
+            == Some(meeting::MeetingBatonProtocol::V2Actions)
+            && request.kind.is_v2_moderator();
+        // Granted turns may consume their Offer reservation. A Board-backed V2
+        // participant Turn may consume only its short-lived Board reservation,
+        // while still respecting every stronger Offer/Grant reservation.
+        let claimed = if action_host_turn && pool.meeting_slot_binding(channel_id).is_some() {
+            match pool.claim_exact_meeting(channel_id) {
+                Ok(agent) => Some(agent),
+                Err(pool::ExactMeetingClaimError::Busy) => {
+                    controller.requeue_front(request);
+                    break;
+                }
+                Err(
+                    pool::ExactMeetingClaimError::MissingBinding
+                    | pool::ExactMeetingClaimError::AffinityLost,
+                ) => {
+                    pool.release_meeting_slot_binding(channel_id);
+                    controller.mark_continuity_lost(&request, "exact slot/session affinity lost");
+                    continue;
+                }
+            }
+        } else if action_host_turn && request.kind != meeting::MeetingTurnKind::V2ModeratorBoard {
+            controller.mark_continuity_lost(&request, "required continuity binding is missing");
+            continue;
+        } else if request.kind == meeting::MeetingTurnKind::V1Granted {
+            pool.try_claim_meeting(channel_id)
+        } else if request
+            .baton_protocol
+            .is_some_and(meeting::MeetingBatonProtocol::is_v2)
+            && request.board_event_id.is_some()
+        {
+            pool.try_claim_meeting_board(channel_id)
+        } else {
+            pool.try_claim(Some(channel_id))
+        };
+        let mut agent = match claimed {
+            Some(agent) => agent,
+            None => {
+                controller.requeue_front(request);
+                break;
+            }
+        };
+        let result_tx = pool.result_tx();
+        let agent_index = agent.index;
+        let prompt = request.prompt.clone();
+        let batch = FlushBatch {
+            channel_id,
+            events: Vec::new(),
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
+        agent.acp.install_steer_rx(steer_rx);
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
+        let absolute_hard_deadline =
+            tokio::time::Instant::now() + meeting::remaining_before(request.hard_deadline_unix_ms);
+        let abort_handle = pool.join_set.spawn(async move {
+            pool::run_prompt_task(
+                agent,
+                Some(batch),
+                Some(prompt),
+                ctx,
+                result_tx,
+                pool::PromptExecution {
+                    control_rx: Some(control_rx),
+                    absolute_hard_deadline: Some(absolute_hard_deadline),
+                    turn_id: task_turn_id,
+                    defer_session_rotation: action_host_turn,
+                },
+            )
+            .await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(channel_id),
+                turn_id: turn_id.clone(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: Some(steer_tx),
+            },
+        );
+        controller.mark_dispatched(turn_id, request);
+        controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+        controller.set_available_agent_slots(pool.claimable_unleased_count());
+        tracing::info!(
+            agent = agent_index,
+            meeting = %channel_id,
+            "meeting_turn_dispatched"
+        );
+    }
+    // `pop_pending` may have started or cancelled a current-Board read even
+    // when it returned no dispatchable request. Refresh both floors before any
+    // caller proceeds to ordinary channel work in the same main-loop branch.
+    pool.set_reserved_meeting_slots(controller.unassigned_reserved_slots());
+    pool.set_reserved_meeting_board_slots(controller.board_dispatch_reserved_slots());
+    controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
+    controller.set_available_agent_slots(pool.claimable_unleased_count());
+}
+
 /// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
@@ -3349,8 +4216,12 @@ fn dispatch_pending(
                 None,
                 ctx_clone,
                 result_tx,
-                Some(control_rx),
-                task_turn_id,
+                pool::PromptExecution {
+                    control_rx: Some(control_rx),
+                    absolute_hard_deadline: None,
+                    turn_id: task_turn_id,
+                    defer_session_rotation: false,
+                },
             )
             .await;
         });
@@ -3576,10 +4447,16 @@ fn handle_prompt_result(
     for ch in removed_channels {
         result.agent.state.invalidate_channel(ch);
     }
+    let continuity_bound = match &result.source {
+        PromptSource::Channel(channel_id) => pool
+            .meeting_slot_binding(*channel_id)
+            .is_some_and(|binding| binding.agent_index == result.agent.index),
+        PromptSource::Heartbeat => false,
+    };
     if let PromptSource::Channel(channel_id) = &result.source {
         if removed_channels.contains(channel_id) {
             pool.discard_pending_role_context_refresh(*channel_id);
-        } else {
+        } else if !continuity_bound {
             pool.apply_pending_role_context_refresh(&mut result.agent.state, &result.source);
         }
     }
@@ -3613,6 +4490,19 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
+    if prompt_outcome_replaces_agent(&result.outcome) {
+        pool.lose_meeting_slot_bindings_for_agent(agent_index);
+    }
+    if let Some(ref observer) = observer {
+        observer.emit(
+            "prompt_terminal",
+            Some(agent_index),
+            &observer::context_for(channel_id, None, Some(turn_id.clone())),
+            serde_json::json!({
+                "outcome": outcome_label,
+            }),
+        );
+    }
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
             let mut payload = serde_json::json!({
@@ -3643,6 +4533,7 @@ fn handle_prompt_result(
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
+            result.agent.acp.observe_process_terminal(outcome_label);
             tracing::warn!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -3693,6 +4584,10 @@ fn handle_prompt_result(
         // removed channel) is decided above — the message stays fate-neutral
         // since it must be true in every case.
         PromptOutcome::CancelDrainTimeout(grace) => {
+            result
+                .agent
+                .acp
+                .observe_process_terminal("cancel_drain_timeout");
             tracing::warn!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -3761,6 +4656,10 @@ fn handle_prompt_result(
                 _ => None,
             };
             if is_transport_error {
+                result
+                    .agent
+                    .acp
+                    .observe_process_terminal("transport_protocol_error");
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
@@ -3823,6 +4722,7 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    pool.lose_meeting_slot_bindings_for_agent(i);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -3888,6 +4788,17 @@ fn recover_panicked_agent(
 
     // Spawn respawn work off the main loop.
     slot.respawn_in_flight = true;
+    if let Some(ref observer) = observer {
+        observer.emit(
+            "respawn_scheduled",
+            Some(i),
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "delay_ms": delay.as_millis(),
+                "reason": "agent_task_panic",
+            }),
+        );
+    }
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = managed_agent_env(
@@ -3917,10 +4828,20 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) -> LoopAction {
+    meeting_controller: &meeting::MeetingCoordinator,
+) -> (LoopAction, Vec<String>) {
+    let mut failed_meeting_turns = Vec::new();
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
+            if let Some(turn_id) = pool
+                .task_map()
+                .get(&join_error.id())
+                .map(|meta| meta.turn_id.clone())
+                .filter(|turn_id| meeting_controller.owns_turn(turn_id))
+            {
+                failed_meeting_turns.push(turn_id);
+            }
             recover_panicked_agent(
                 pool,
                 queue,
@@ -3935,11 +4856,11 @@ fn drain_ready_join_results(
                 observer.clone(),
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                return LoopAction::Exit;
+                return (LoopAction::Exit, failed_meeting_turns);
             }
         }
     }
-    LoopAction::Continue
+    (LoopAction::Continue, failed_meeting_turns)
 }
 
 fn dispatch_heartbeat(
@@ -3976,8 +4897,12 @@ fn dispatch_heartbeat(
             Some(prompt_text),
             ctx_clone,
             result_tx,
-            None,
-            task_turn_id,
+            pool::PromptExecution {
+                control_rx: None,
+                absolute_hard_deadline: None,
+                turn_id: task_turn_id,
+                defer_session_rotation: false,
+            },
         )
         .await;
     });
@@ -4087,6 +5012,17 @@ fn spawn_respawn_task(
     };
 
     slot.respawn_in_flight = true;
+    if let Some(ref observer) = observer {
+        observer.emit(
+            "respawn_scheduled",
+            Some(index),
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "delay_ms": delay.as_millis(),
+                "reason": "process_unusable",
+            }),
+        );
+    }
 
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
@@ -4897,9 +5833,55 @@ fn build_mcp_servers_for_owner(
     }]
 }
 
+fn build_meeting_v0_mcp_servers(servers: &[McpServer]) -> Vec<McpServer> {
+    servers
+        .iter()
+        .filter(|server| server.name == "buzz-dev-mcp")
+        .cloned()
+        .map(|mut server| {
+            server
+                .env
+                .retain(|variable| variable.name != "BUZZ_DEV_MCP_READ_ONLY");
+            server.env.push(EnvVar {
+                name: "BUZZ_DEV_MCP_READ_ONLY".to_string(),
+                value: "1".to_string(),
+            });
+            server
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod heartbeat_base_prompt_tests {
     use super::*;
+
+    #[test]
+    fn meeting_v0_mcp_allowlist_keeps_only_enforced_read_only_dev_mcp() {
+        let servers = vec![
+            McpServer {
+                name: "buzz-dev-mcp".into(),
+                command: "/tmp/buzz-dev-mcp".into(),
+                args: Vec::new(),
+                env: vec![EnvVar {
+                    name: "BUZZ_DEV_MCP_READ_ONLY".into(),
+                    value: "0".into(),
+                }],
+            },
+            McpServer {
+                name: "untrusted-writer".into(),
+                command: "/tmp/untrusted-writer".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+        ];
+
+        let allowed = build_meeting_v0_mcp_servers(&servers);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].name, "buzz-dev-mcp");
+        assert!(allowed[0].env.iter().any(|variable| {
+            variable.name == "BUZZ_DEV_MCP_READ_ONLY" && variable.value == "1"
+        }));
+    }
 
     // Pins the heartbeat dispatch path (dispatch_heartbeat, ~line 2359): a
     // legacy agent WITH a base_prompt must get [Base] prepended to the
@@ -5322,6 +6304,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    room_kind: "community".into(),
                 },
             ),
             (
@@ -5329,6 +6312,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    room_kind: "community".into(),
                 },
             ),
         ]);
@@ -5345,6 +6329,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                room_kind: "unknown".into(),
             },
         )]);
         assert!(
@@ -6055,6 +7040,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
             outcome,
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: None,
         };
 
@@ -6221,6 +7208,8 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(Uuid::new_v4()),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                resolved_session_id: None,
+                rotation_deferred: false,
                 batch: None,
             };
             handle_prompt_result(
@@ -6311,6 +7300,8 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                resolved_session_id: None,
+                rotation_deferred: false,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -6416,6 +7407,8 @@ mod error_outcome_emission_tests {
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
+                resolved_session_id: None,
+                rotation_deferred: false,
                 batch: Some(batch),
             };
             handle_prompt_result(
@@ -6507,6 +7500,8 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -6600,6 +7595,8 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -6714,6 +7711,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
 
@@ -6843,6 +7842,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
+            resolved_session_id: None,
+            rotation_deferred: false,
             // Explicit Stop already dropped the batch upstream in
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
@@ -7029,6 +8030,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -7114,6 +8117,8 @@ mod error_outcome_emission_tests {
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
+            resolved_session_id: None,
+            rotation_deferred: false,
             batch: Some(batch),
         };
         handle_prompt_result(

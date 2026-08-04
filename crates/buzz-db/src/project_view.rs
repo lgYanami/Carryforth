@@ -3845,6 +3845,16 @@ mod tests {
             .expect("build v2 Role command")
             .sign_with_keys(actor)
             .expect("sign v2 Role command");
+        commit_v2_role_event_for_test(db, community_id, relay, command_event, command).await
+    }
+
+    async fn commit_v2_role_event_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        relay: &Keys,
+        command_event: Event,
+        command: RoleCommand,
+    ) -> ProjectViewV2CommitOutcome {
         let mut write = db
             .begin_project_view_v2_write(community_id)
             .await
@@ -3978,6 +3988,16 @@ mod tests {
             .expect("build v2 Project object command")
             .sign_with_keys(actor)
             .expect("sign v2 Project object command");
+        commit_v2_object_event_for_test(db, community_id, relay, command_event, command).await
+    }
+
+    async fn commit_v2_object_event_for_test(
+        db: &Db,
+        community_id: CommunityId,
+        relay: &Keys,
+        command_event: Event,
+        command: ProjectObjectCommand,
+    ) -> ProjectViewV2CommitOutcome {
         let mut write = db
             .begin_project_view_v2_write(community_id)
             .await

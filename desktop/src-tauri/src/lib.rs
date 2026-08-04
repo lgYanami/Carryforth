@@ -20,6 +20,7 @@ mod models;
 mod native_websocket;
 mod nostr_bind;
 pub mod nostr_convert;
+mod pending_writes;
 mod prevent_sleep;
 mod ptt_shortcut;
 mod relay;
@@ -725,6 +726,15 @@ pub fn run() {
             nip44_encrypt_to_self,
             nip44_decrypt_from_self,
             get_channels,
+            get_meeting_capability,
+            list_meetings,
+            get_meeting_snapshot,
+            get_meeting_board,
+            get_meeting_speeches,
+            create_meeting,
+            submit_meeting_action_finalization,
+            submit_meeting_floor_action,
+            submit_meeting_host_action,
             create_channel,
             ensure_starter_channels,
             open_dm,

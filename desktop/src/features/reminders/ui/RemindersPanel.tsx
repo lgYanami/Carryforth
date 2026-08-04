@@ -3,7 +3,7 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChatRooms } from "@/features/channels/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import {
   resolveUserLabel,
@@ -187,7 +187,7 @@ export function RemindersPanel({
   const { goChannel } = useAppNavigation();
   const identityQuery = useIdentityQuery();
   const currentPubkey = identityQuery.data?.pubkey;
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const channels = channelsQuery.data;
 
   const authorPubkeys = React.useMemo(

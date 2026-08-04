@@ -66,6 +66,21 @@ import type {
   ProjectDocumentMeta,
   ProjectDocumentMutationResult,
 } from "@/shared/api/tauriProjectDocument";
+import type {
+  CreateMeetingInput,
+  CreateMeetingResult,
+  MeetingActionFinalizationInput,
+  MeetingActionFinalizationResult,
+  MeetingFloorActionInput,
+  MeetingFloorActionResult,
+  MeetingHostActionInput,
+  MeetingHostActionResult,
+  MeetingCapability,
+  MeetingListItem,
+  MeetingLoadResult,
+  MeetingSnapshot,
+  MeetingSpeech,
+} from "@/shared/api/tauriMeetings";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type TestIdentity = {
@@ -152,6 +167,14 @@ export type MockProjectDocumentState = {
   documents: ProjectDocumentListItem[];
   /** Oldest-to-newest verified full snapshots, keyed by Document UUID. */
   revisions: Record<string, ProjectDocument[]>;
+};
+
+type MockMeetingSeed = {
+  id: string;
+  title: string;
+  description?: string | null;
+  result: MeetingLoadResult;
+  speeches?: MeetingSpeech[];
 };
 
 type E2eConfig = {
@@ -304,6 +327,32 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    /** Relay Meeting capability returned by the native read boundary. */
+    meetingCapability?: MeetingCapability;
+    /** Membership-scoped Meeting rooms and their verified native projections. */
+    meetings?: MockMeetingSeed[];
+    /** Community-isolated Meeting rooms keyed by the currently applied Relay. */
+    meetingsByRelayUrl?: Record<string, MockMeetingSeed[]>;
+    /** Definitive failures for successive authoritative snapshot reads. */
+    meetingSnapshotErrors?: Array<string | null>;
+    /** Persistent authoritative snapshot read failure until the test clears it. */
+    meetingSnapshotError?: string;
+    meetingSnapshotDelayMs?: number;
+    /** Definitive failures for successive Meeting Create submissions. */
+    meetingCreateErrors?: Array<string | null>;
+    /** Return an indeterminate result this many times before accepting. */
+    meetingCreateIndeterminateResponses?: number;
+    meetingCreateDelayMs?: number;
+    /** Definitive failures for successive Meeting Floor submissions. */
+    meetingFloorErrors?: Array<string | null>;
+    /** Process then return an incomplete receipt this many times. */
+    meetingFloorIndeterminateResponses?: number;
+    meetingFloorActionDelayMs?: number;
+    /** Definitive failures for successive Human host submissions. */
+    meetingHostErrors?: Array<string | null>;
+    /** Process then lose this many Human host command receipts. */
+    meetingHostIndeterminateResponses?: number;
+    meetingHostActionDelayMs?: number;
     /** Verified Project View command result returned to the View screen. */
     projectView?: RawProjectViewLoadResult;
     /** Community-isolated Project View results keyed by applied Relay URL. */
@@ -560,6 +609,7 @@ type RawChannel = {
   id: string;
   name: string;
   channel_type: "stream" | "forum" | "dm";
+  room_kind?: string | null;
   visibility: "open" | "private";
   description: string;
   topic: string | null;
@@ -1012,6 +1062,10 @@ declare global {
       command: string;
       payload: unknown;
     }>;
+    __BUZZ_E2E_PREEMPT_MEETING_BOARD__?: (input: {
+      meetingId: string;
+      requesterPubkey: string;
+    }) => boolean;
     __BUZZ_E2E_WEBVIEW_ZOOM__?: number;
     __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
       channelName: string;
@@ -1375,6 +1429,7 @@ function toRawChannel(
     id: channel.id,
     name: channel.name,
     channel_type: channel.channel_type,
+    room_kind: channel.room_kind ?? null,
     visibility: channel.visibility,
     description: channel.description,
     topic: channel.topic,
@@ -2363,8 +2418,1234 @@ function listMockProfiles(): RawProfile[] {
     .filter((profile): profile is RawProfile => profile !== null);
 }
 
+function mockMeetingChannel(
+  seed: MockMeetingSeed,
+  config?: E2eConfig,
+): RawChannelWithMembership {
+  const currentPubkey = getMockMemberPubkey(config).toLowerCase();
+  const snapshot = seed.result.status === "ready" ? seed.result.snapshot : null;
+  const participantPubkeys = snapshot
+    ? snapshot.participants.map((participant) => participant.pubkey)
+    : [currentPubkey];
+  if (!participantPubkeys.includes(currentPubkey)) {
+    participantPubkeys.push(currentPubkey);
+  }
+  const endedAt = snapshot?.end?.endedAt ?? null;
+  const latestSpeechAt = snapshot?.latestSpeechAt ?? null;
+  return {
+    id: seed.id,
+    name: seed.title,
+    channel_type: "stream",
+    room_kind: "meeting",
+    visibility: "private",
+    description: seed.description ?? snapshot?.description ?? "",
+    topic: null,
+    purpose: null,
+    member_count: participantPubkeys.length,
+    member_pubkeys: participantPubkeys,
+    last_message_at: latestSpeechAt
+      ? new Date(latestSpeechAt * 1_000).toISOString()
+      : null,
+    archived_at: endedAt ? new Date(endedAt * 1_000).toISOString() : null,
+    participants: [],
+    participant_pubkeys: [],
+    ttl_seconds: null,
+    ttl_deadline: null,
+    is_member: true,
+  };
+}
+
 function listMockChannels(config?: E2eConfig): RawChannelWithMembership[] {
-  return mockChannels.map((channel) => toRawChannel(channel, config));
+  return [
+    ...mockChannels.map((channel) => toRawChannel(channel, config)),
+    ...getMockMeetings(config).map((meeting) =>
+      mockMeetingChannel(meeting, config),
+    ),
+  ];
+}
+
+function getMockMeetings(config?: E2eConfig): MockMeetingSeed[] {
+  return (
+    config?.mock?.meetingsByRelayUrl?.[mockAppliedRelayUrl] ??
+    config?.mock?.meetings ??
+    []
+  );
+}
+
+function getMockMeetingSeed(
+  meetingId: string,
+  config?: E2eConfig,
+): MockMeetingSeed | null {
+  return (
+    getMockMeetings(config).find((meeting) => meeting.id === meetingId) ?? null
+  );
+}
+
+const mockMeetingFloorSubmissions = new Map<string, MeetingFloorActionResult>();
+const mockMeetingHostSubmissions = new Map<string, MeetingHostActionResult>();
+const mockMeetingActionSubmissions = new Map<
+  string,
+  MeetingActionFinalizationResult
+>();
+
+function nextMeetingStateEventId(revision: number): string {
+  return revision.toString(16).padStart(64, "0");
+}
+
+function acceptedMeetingFloorResult(
+  input: MeetingFloorActionInput,
+  eventId: string,
+  stateRevision: number,
+  duplicate: boolean,
+): MeetingFloorActionResult {
+  return {
+    status: "accepted",
+    meetingId: input.meetingId,
+    eventId,
+    action: input.action.type,
+    canonicalObjectId: eventId,
+    stateRevision,
+    duplicate,
+  };
+}
+
+function nextMeetingControlToken(revision: number): string {
+  return `f${revision.toString(16).padStart(63, "0")}`;
+}
+
+function advanceMockMeetingState(snapshot: MeetingSnapshot): void {
+  snapshot.stateRevision += 1;
+  const stateEventId = nextMeetingStateEventId(snapshot.stateRevision);
+  if (snapshot.floor) snapshot.floor.stateEventId = stateEventId;
+  if (snapshot.host) {
+    snapshot.host.stateEventId = stateEventId;
+    snapshot.host.controlToken = nextMeetingControlToken(
+      snapshot.stateRevision,
+    );
+  }
+}
+
+function returnMockControlToBoard(snapshot: MeetingSnapshot): void {
+  const host = snapshot.host;
+  if (!host || snapshot.lifecycle !== "active") return;
+  snapshot.phase = "moderator_control";
+  snapshot.currentOfferPubkey = null;
+  snapshot.currentSpeakerPubkey = null;
+  host.controlEpoch += 1;
+  host.decisionDeadlineMs = null;
+  host.nextActionAtMs = null;
+  host.forcedReturnToModerator = false;
+  host.canSelect = false;
+  host.canClose = false;
+  host.canRecall = false;
+  host.boardControl = {
+    phase: "board_pending",
+    controlEpoch: host.controlEpoch,
+    boardWindow: host.boardControl.boardWindow + 1,
+    boardStartedAtMs: Date.now(),
+    boardDeadlineAtMs: Date.now() + 120_000,
+    boardCompletedAtMs: null,
+    boardOutcome: null,
+  };
+}
+
+function preemptMockMeetingBoard(
+  meetingId: string,
+  requesterPubkey: string,
+  config?: E2eConfig,
+): boolean {
+  const seed = getMockMeetingSeed(meetingId, config);
+  if (seed?.result.status !== "ready") return false;
+  const snapshot = seed.result.snapshot;
+  const host = snapshot.host;
+  const floor = snapshot.floor;
+  if (!host || !floor || host.boardControl.phase !== "board_pending") {
+    return false;
+  }
+  const participant = snapshot.participants.find(
+    (candidate) => candidate.pubkey === requesterPubkey,
+  );
+  if (participant?.participantType !== "human") return false;
+
+  const now = Date.now();
+  const requestId = `7${requesterPubkey.slice(1)}`;
+  const offerId = `8${requesterPubkey.slice(1)}`;
+  floor.humanQueue = [
+    {
+      requestId,
+      requesterPubkey,
+      queuePosition: 1,
+      state: "offered",
+    },
+  ];
+  floor.offer = {
+    offerId,
+    targetPubkey: requesterPubkey,
+    targetParticipantType: "human",
+    allocationSource: "human_request",
+    turnRole: "participant",
+    selectionReason: null,
+    sourceIntentId: null,
+    sourceRequestId: requestId,
+    sourceHandoffId: null,
+    sourceSpeechEventId: null,
+    handoffContext: null,
+    createdAtMs: now,
+    ackDeadlineMs: now + 30_000,
+  };
+  floor.grant = null;
+  snapshot.phase = "offered";
+  snapshot.currentOfferPubkey = requesterPubkey;
+  snapshot.currentSpeakerPubkey = null;
+  snapshot.floorRevision += 1;
+  host.boardControl.phase = "floor_ready";
+  host.boardControl.boardDeadlineAtMs = null;
+  host.boardControl.boardCompletedAtMs = now;
+  host.boardControl.boardOutcome = "preempted";
+  host.decisionDeadlineMs = null;
+  host.canSelect = false;
+  host.canClose = false;
+  host.canRecall = false;
+  advanceMockMeetingState(snapshot);
+  return true;
+}
+
+function acceptedMeetingHostResult(
+  input: MeetingHostActionInput,
+  eventId: string,
+  snapshot: MeetingSnapshot,
+  duplicate: boolean,
+): MeetingHostActionResult {
+  const boardAction =
+    input.action.type === "board_update" ||
+    input.action.type === "board_unchanged";
+  const endAction =
+    input.action.type === "close" || input.action.type === "abort";
+  return {
+    status: "accepted",
+    meetingId: input.meetingId,
+    eventId,
+    action: input.action.type,
+    canonicalObjectId: endAction
+      ? null
+      : boardAction
+        ? snapshot.board.eventId
+        : eventId,
+    stateRevision: endAction ? null : snapshot.stateRevision,
+    duplicate,
+  };
+}
+
+async function handleMeetingHostAction(
+  args: { input: MeetingHostActionInput },
+  config?: E2eConfig,
+): Promise<MeetingHostActionResult> {
+  const input = args.input;
+  const delayMs = config?.mock?.meetingHostActionDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingHostErrors?.shift();
+  if (configuredError) throw new Error(configuredError);
+
+  const prior = mockMeetingHostSubmissions.get(input.submissionId);
+  if (prior?.status === "accepted") return { ...prior, duplicate: true };
+
+  const seed = getMockMeetingSeed(input.meetingId, config);
+  if (seed?.result.status !== "ready") {
+    throw new Error("Meeting host controls are unavailable for this Meeting");
+  }
+  const snapshot = seed.result.snapshot;
+  const host = snapshot.host;
+  const actor = getMockMemberPubkey(config).toLowerCase();
+  const actorParticipant = snapshot.participants.find(
+    (participant) => participant.pubkey === actor,
+  );
+  if (
+    !host ||
+    actor !== snapshot.moderatorPubkey ||
+    actorParticipant?.participantType !== "human"
+  ) {
+    throw new Error("only the frozen Human moderator can use host controls");
+  }
+  if (host.controlToken !== input.expectedControlToken) {
+    throw new Error("Meeting host control changed; refresh before submitting");
+  }
+
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const now = Date.now();
+  const action = input.action;
+  switch (action.type) {
+    case "board_update":
+    case "board_unchanged": {
+      if (host.boardControl.phase !== "board_pending") {
+        throw new Error("the Board Maintenance window is no longer active");
+      }
+      if (action.type === "board_update") {
+        snapshot.board = {
+          ...snapshot.board,
+          body: action.body,
+          eventId,
+          source: "projection",
+          updatedAt: Math.floor(now / 1_000),
+        };
+      }
+      host.boardControl.phase = "floor_ready";
+      host.boardControl.boardCompletedAtMs = now;
+      host.boardControl.boardOutcome =
+        action.type === "board_update" ? "updated" : "unchanged";
+      host.decisionEpoch += 1;
+      host.decisionDeadlineMs = now + 90_000;
+      host.canSelect = true;
+      host.canClose = true;
+      host.canRecall = false;
+      break;
+    }
+    case "intent_submit": {
+      if (!host.canSelect) throw new Error("Floor Decision is not active");
+      if (action.addressedTo === actor) {
+        throw new Error("a self Intent cannot be addressed to the host");
+      }
+      if (host.pendingIntents.some((intent) => intent.authorPubkey === actor)) {
+        throw new Error("the host already has a pending self Intent");
+      }
+      host.pendingIntents.push({
+        intentId: eventId,
+        currentEventId: eventId,
+        authorPubkey: actor,
+        basisSpeechRevision: snapshot.speechRevision,
+        summary: action.summary.trim(),
+        addressedTo: action.addressedTo ?? null,
+        createdAtMs: now,
+        deferred: false,
+        selectionAttemptCount: 0,
+        lastOfferId: null,
+        lastAttemptOutcome: null,
+        eligibleDecisionEpoch: host.decisionEpoch,
+        selectable: true,
+      });
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "intent_refresh": {
+      const intent = host.pendingIntents.find(
+        (candidate) =>
+          candidate.intentId === action.intentId &&
+          candidate.authorPubkey === actor,
+      );
+      if (!intent) throw new Error("the self Intent is no longer pending");
+      if (action.addressedTo === actor) {
+        throw new Error("a self Intent cannot be addressed to the host");
+      }
+      intent.currentEventId = eventId;
+      intent.summary = action.summary.trim();
+      intent.addressedTo = action.addressedTo ?? null;
+      intent.basisSpeechRevision = snapshot.speechRevision;
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "intent_withdraw": {
+      const before = host.pendingIntents.length;
+      host.pendingIntents = host.pendingIntents.filter(
+        (intent) =>
+          intent.intentId !== action.intentId || intent.authorPubkey !== actor,
+      );
+      if (host.pendingIntents.length === before) {
+        throw new Error("the self Intent is no longer pending");
+      }
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "select_intent": {
+      if (!host.canSelect || !snapshot.floor) {
+        throw new Error("Floor Decision is not active");
+      }
+      const intent = host.pendingIntents.find(
+        (candidate) => candidate.intentId === action.intentId,
+      );
+      if (!intent?.selectable) {
+        throw new Error("the selected Intent is not eligible");
+      }
+      const selfIntent = host.pendingIntents.find(
+        (candidate) => candidate.authorPubkey === actor,
+      );
+      if (selfIntent && intent.authorPubkey !== actor) {
+        throw new Error("the host self Intent must be selected first");
+      }
+      const otherSelectable = host.pendingIntents.some(
+        (candidate) =>
+          candidate.authorPubkey !== actor &&
+          candidate.selectable &&
+          !candidate.deferred,
+      );
+      if (
+        intent.authorPubkey === actor &&
+        host.consecutiveModeratorSpeeches >= 1 &&
+        otherSelectable &&
+        !action.deferralReason?.trim()
+      ) {
+        throw new Error("self speech requires a deferral reason");
+      }
+      const target = intent.authorPubkey;
+      const targetType =
+        snapshot.participants.find(
+          (participant) => participant.pubkey === target,
+        )?.participantType === "agent"
+          ? "agent"
+          : "human";
+      snapshot.floor.offer = {
+        offerId: eventId,
+        targetPubkey: target,
+        targetParticipantType: targetType,
+        allocationSource: "moderator_select",
+        turnRole: target === actor ? "moderator_self" : "participant",
+        selectionReason: action.selectionReason ?? null,
+        sourceIntentId: intent.intentId,
+        sourceRequestId: null,
+        sourceHandoffId: null,
+        sourceSpeechEventId: null,
+        handoffContext: null,
+        createdAtMs: now,
+        ackDeadlineMs: now + 30_000,
+      };
+      intent.selectionAttemptCount += 1;
+      intent.lastOfferId = eventId;
+      intent.lastAttemptOutcome = "offered";
+      snapshot.phase = "offered";
+      snapshot.currentOfferPubkey = target;
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = true;
+      host.decisionDeadlineMs = null;
+      snapshot.floorRevision += 1;
+      break;
+    }
+    case "select_handoff": {
+      if (!host.canSelect || !snapshot.floor) {
+        throw new Error("Floor Decision is not active");
+      }
+      if (host.pendingIntents.some((intent) => intent.authorPubkey === actor)) {
+        throw new Error("the host self Intent must be selected first");
+      }
+      const handoff = host.openHandoffs.find(
+        (candidate) => candidate.handoffId === action.handoffId,
+      );
+      if (!handoff?.selectable) {
+        throw new Error("the selected Handoff is not eligible");
+      }
+      const targetType =
+        snapshot.participants.find(
+          (participant) => participant.pubkey === handoff.toPubkey,
+        )?.participantType === "agent"
+          ? "agent"
+          : "human";
+      snapshot.floor.offer = {
+        offerId: eventId,
+        targetPubkey: handoff.toPubkey,
+        targetParticipantType: targetType,
+        allocationSource: "directed_handoff",
+        turnRole: "participant",
+        selectionReason: action.selectionReason ?? null,
+        sourceIntentId: null,
+        sourceRequestId: null,
+        sourceHandoffId: handoff.handoffId,
+        sourceSpeechEventId: handoff.sourceSpeechEventId,
+        handoffContext: {
+          fromPubkey: handoff.fromPubkey,
+          reasonType: handoff.reasonType,
+          reasonText: handoff.reasonText,
+        },
+        createdAtMs: now,
+        ackDeadlineMs: now + 30_000,
+      };
+      handoff.attemptCount += 1;
+      handoff.lastOfferId = eventId;
+      handoff.lastAttemptOutcome = "offered";
+      handoff.attemptActive = true;
+      handoff.selectable = false;
+      snapshot.phase = "offered";
+      snapshot.currentOfferPubkey = handoff.toPubkey;
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = true;
+      host.decisionDeadlineMs = null;
+      snapshot.floorRevision += 1;
+      break;
+    }
+    case "reject_intent": {
+      const before = host.pendingIntents.length;
+      host.pendingIntents = host.pendingIntents.filter(
+        (intent) =>
+          intent.intentId !== action.intentId || intent.authorPubkey === actor,
+      );
+      if (host.pendingIntents.length === before) {
+        throw new Error("the participant Intent is no longer pending");
+      }
+      snapshot.intentRevision += 1;
+      break;
+    }
+    case "dismiss_handoff": {
+      const handoff = host.openHandoffs.find(
+        (candidate) => candidate.handoffId === action.handoffId,
+      );
+      if (!handoff || handoff.attemptActive) {
+        throw new Error("the Handoff cannot be dismissed now");
+      }
+      host.openHandoffs = host.openHandoffs.filter(
+        (candidate) => candidate.handoffId !== action.handoffId,
+      );
+      break;
+    }
+    case "recall":
+      if (!host.canRecall || snapshot.floor?.humanQueue.length) {
+        throw new Error("Recall is not available");
+      }
+      host.forcedReturnToModerator = true;
+      host.canRecall = false;
+      break;
+    case "close":
+      if (!host.canClose) {
+        throw new Error("normal close requires an explicitly completed Board");
+      }
+      snapshot.lifecycle = "closed";
+      snapshot.phase = "ended";
+      snapshot.end = {
+        eventId,
+        outcome: "closed",
+        reasonCode: null,
+        reason: null,
+        endedBy: actor,
+        endedAt: Math.floor(now / 1_000),
+        actionsAttested: false,
+      };
+      host.boardControl.phase = "ended";
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      break;
+    case "abort":
+      if (snapshot.lifecycle === "finalizing_actions" && snapshot.action) {
+        snapshot.action.terminalStatus = "completed_aborted";
+        snapshot.action.actionDeadlineAtMs = null;
+        snapshot.action.completionEventId = null;
+      }
+      snapshot.lifecycle = "aborted";
+      snapshot.phase = "ended";
+      snapshot.end = {
+        eventId,
+        outcome: "aborted",
+        reasonCode: action.reasonCode,
+        reason: action.reason ?? null,
+        endedBy: actor,
+        endedAt: Math.floor(now / 1_000),
+        actionsAttested: false,
+      };
+      host.boardControl.phase = "ended";
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      break;
+  }
+
+  if (action.type !== "close" && action.type !== "abort") {
+    advanceMockMeetingState(snapshot);
+  }
+  const accepted = acceptedMeetingHostResult(input, eventId, snapshot, false);
+  mockMeetingHostSubmissions.set(input.submissionId, accepted);
+  if ((config?.mock?.meetingHostIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingHostIndeterminateResponses =
+        (config.mock.meetingHostIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId: input.meetingId,
+      eventId,
+      action: action.type,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+  return accepted;
+}
+
+function acceptedMeetingActionResult(
+  input: MeetingActionFinalizationInput,
+  eventId: string,
+  snapshot: MeetingSnapshot,
+  duplicate: boolean,
+): MeetingActionFinalizationResult {
+  return {
+    status: "accepted",
+    meetingId: input.meetingId,
+    eventId,
+    action: input.action.type,
+    stateRevision:
+      input.action.type === "confirm" ? null : snapshot.stateRevision,
+    duplicate,
+  };
+}
+
+async function handleMeetingActionFinalization(
+  args: { input: MeetingActionFinalizationInput },
+  config?: E2eConfig,
+): Promise<MeetingActionFinalizationResult> {
+  const input = args.input;
+  const delayMs = config?.mock?.meetingHostActionDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingHostErrors?.shift();
+  if (configuredError) throw new Error(configuredError);
+
+  const prior = mockMeetingActionSubmissions.get(input.submissionId);
+  if (prior?.status === "accepted") return { ...prior, duplicate: true };
+
+  const seed = getMockMeetingSeed(input.meetingId, config);
+  if (seed?.result.status !== "ready") {
+    throw new Error("Meeting action finalization is unavailable");
+  }
+  const snapshot = seed.result.snapshot;
+  const host = snapshot.host;
+  const actor = getMockMemberPubkey(config).toLowerCase();
+  const actorParticipant = snapshot.participants.find(
+    (participant) => participant.pubkey === actor,
+  );
+  if (
+    !host ||
+    actor !== snapshot.moderatorPubkey ||
+    actorParticipant?.participantType !== "human"
+  ) {
+    throw new Error(
+      "only the frozen Human moderator can operate action finalization",
+    );
+  }
+  if (host.controlToken !== input.expectedControlToken) {
+    throw new Error(
+      "Meeting action-finalization control changed; refresh before submitting",
+    );
+  }
+
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const now = Date.now();
+  const action = input.action;
+  switch (action.type) {
+    case "begin":
+      if (
+        snapshot.lifecycle !== "active" ||
+        snapshot.phase !== "moderator_idle" ||
+        !host.canClose ||
+        host.boardControl.phase !== "floor_ready" ||
+        host.pendingIntents.length > 0 ||
+        host.openHandoffs.length > 0
+      ) {
+        throw new Error(
+          "action finalization requires an explicit final Board and idle Floor",
+        );
+      }
+      snapshot.lifecycle = "finalizing_actions";
+      snapshot.phase = "moderator_idle";
+      snapshot.currentOfferPubkey = null;
+      snapshot.currentSpeakerPubkey = null;
+      snapshot.action = {
+        actionRunId: input.submissionId,
+        boardEventId: snapshot.board.eventId,
+        actionWindowEpoch: 1,
+        condition: "runnable",
+        terminalStatus: null,
+        completionEventId: null,
+        actionDeadlineAtMs: now + 180_000,
+        lastErrorCode: null,
+      };
+      host.boardControl.phase = "finalizing_actions";
+      host.decisionDeadlineMs = null;
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      advanceMockMeetingState(snapshot);
+      break;
+    case "block":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        snapshot.action?.condition !== "runnable" ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting action run is not runnable");
+      }
+      snapshot.action.condition = "blocked";
+      snapshot.action.actionDeadlineAtMs = null;
+      snapshot.action.lastErrorCode = action.reasonCode;
+      advanceMockMeetingState(snapshot);
+      break;
+    case "retry":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        snapshot.action?.condition !== "blocked" ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting action run is not blocked");
+      }
+      snapshot.action.condition = "runnable";
+      snapshot.action.actionWindowEpoch += 1;
+      snapshot.action.actionDeadlineAtMs = now + 180_000;
+      snapshot.action.lastErrorCode = null;
+      advanceMockMeetingState(snapshot);
+      break;
+    case "return_to_board":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        !snapshot.action ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting has no active action run");
+      }
+      snapshot.action.terminalStatus = "returned_to_board";
+      snapshot.action.actionDeadlineAtMs = null;
+      snapshot.lifecycle = "active";
+      returnMockControlToBoard(snapshot);
+      advanceMockMeetingState(snapshot);
+      break;
+    case "confirm":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        snapshot.action?.condition !== "runnable" ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting action run is not runnable");
+      }
+      snapshot.lifecycle = "closed";
+      snapshot.phase = "ended";
+      snapshot.action.terminalStatus = "completed_closed";
+      snapshot.action.completionEventId = eventId;
+      snapshot.action.actionDeadlineAtMs = null;
+      snapshot.end = {
+        eventId,
+        outcome: "closed",
+        reasonCode: null,
+        reason: null,
+        endedBy: actor,
+        endedAt: Math.floor(now / 1_000),
+        actionsAttested: true,
+      };
+      host.boardControl.phase = "ended";
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      break;
+  }
+
+  const accepted = acceptedMeetingActionResult(input, eventId, snapshot, false);
+  mockMeetingActionSubmissions.set(input.submissionId, accepted);
+  if ((config?.mock?.meetingHostIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingHostIndeterminateResponses =
+        (config.mock.meetingHostIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId: input.meetingId,
+      eventId,
+      action: action.type,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+  return accepted;
+}
+
+async function handleMeetingFloorAction(
+  args: { input: MeetingFloorActionInput },
+  config?: E2eConfig,
+): Promise<MeetingFloorActionResult> {
+  const input = args.input;
+  const delayMs = config?.mock?.meetingFloorActionDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingFloorErrors?.shift();
+  if (configuredError) throw new Error(configuredError);
+
+  const prior = mockMeetingFloorSubmissions.get(input.submissionId);
+  if (prior?.status === "accepted") {
+    return { ...prior, duplicate: true };
+  }
+  const seed = getMockMeetingSeed(input.meetingId, config);
+  if (seed?.result.status !== "ready") {
+    throw new Error("Meeting Floor is unavailable for this Meeting");
+  }
+  const snapshot = seed.result.snapshot;
+  const floor = snapshot.floor;
+  if (!floor) {
+    throw new Error("Meeting Floor is unavailable for this Meeting");
+  }
+  if (floor.stateEventId !== input.expectedStateEventId) {
+    throw new Error("Meeting State changed; refresh before submitting");
+  }
+  const actor = getMockMemberPubkey(config).toLowerCase();
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  switch (input.action.type) {
+    case "request": {
+      const request = {
+        requestId: eventId,
+        requesterPubkey: actor,
+        queuePosition:
+          Math.max(0, ...floor.humanQueue.map((item) => item.queuePosition)) +
+          1,
+        state: (snapshot.phase === "moderator_control" ||
+        snapshot.phase === "moderator_idle"
+          ? "offered"
+          : "queued") as "offered" | "queued",
+      };
+      floor.humanQueue.push(request);
+      if (request.state === "offered") {
+        if (snapshot.host?.boardControl.phase === "board_pending") {
+          snapshot.host.boardControl.phase = "floor_ready";
+          snapshot.host.boardControl.boardCompletedAtMs = Date.now();
+          snapshot.host.boardControl.boardOutcome = "preempted";
+        }
+        floor.offer = {
+          offerId: "a".repeat(32) + eventId.slice(32),
+          targetPubkey: actor,
+          targetParticipantType: "human",
+          allocationSource: "human_request",
+          turnRole: "participant",
+          selectionReason: null,
+          sourceIntentId: null,
+          sourceRequestId: request.requestId,
+          sourceHandoffId: null,
+          sourceSpeechEventId: null,
+          handoffContext: null,
+          createdAtMs: Date.now(),
+          ackDeadlineMs: Date.now() + 30_000,
+        };
+        snapshot.phase = "offered";
+        snapshot.currentOfferPubkey = actor;
+        if (snapshot.host) {
+          snapshot.host.canSelect = false;
+          snapshot.host.canClose = false;
+          snapshot.host.canRecall = false;
+          snapshot.host.decisionDeadlineMs = null;
+        }
+      }
+      break;
+    }
+    case "withdraw":
+      floor.humanQueue = floor.humanQueue.filter(
+        (request) => request.requesterPubkey !== actor,
+      );
+      if (floor.offer?.targetPubkey === actor) {
+        floor.offer = null;
+        snapshot.currentOfferPubkey = null;
+        returnMockControlToBoard(snapshot);
+      }
+      break;
+    case "offer_ack": {
+      if (!floor.offer || floor.offer.targetPubkey !== actor) {
+        throw new Error("Floor Offer is not addressed to this Human");
+      }
+      const offer = floor.offer;
+      floor.grant = {
+        grantId: "b".repeat(32) + eventId.slice(32),
+        holderPubkey: actor,
+        allocationSource: offer.allocationSource,
+        turnRole: offer.turnRole,
+        selectionReason: offer.selectionReason,
+        sourceIntentId: offer.sourceIntentId,
+        sourceRequestId: offer.sourceRequestId,
+        sourceHandoffId: offer.sourceHandoffId,
+        sourceSpeechEventId: offer.sourceSpeechEventId,
+        handoffContext: offer.handoffContext,
+        createdAtMs: Date.now(),
+        softLeaseExpiresAtMs: Date.now() + 60_000,
+        hardDeadlineMs: Date.now() + 120_000,
+        progressSeq: 0,
+      };
+      floor.offer = null;
+      if (offer.sourceIntentId && snapshot.host) {
+        snapshot.host.pendingIntents = snapshot.host.pendingIntents.filter(
+          (intent) => intent.intentId !== offer.sourceIntentId,
+        );
+        snapshot.intentRevision += 1;
+      }
+      if (offer.sourceHandoffId && snapshot.host) {
+        const handoff = snapshot.host.openHandoffs.find(
+          (candidate) => candidate.handoffId === offer.sourceHandoffId,
+        );
+        if (handoff) {
+          handoff.lastGrantId = floor.grant.grantId;
+          handoff.lastAttemptOutcome = "granted";
+          handoff.attemptActive = true;
+        }
+      }
+      floor.humanQueue = floor.humanQueue.filter(
+        (request) => request.requesterPubkey !== actor,
+      );
+      snapshot.phase = "granted";
+      snapshot.currentOfferPubkey = null;
+      snapshot.currentSpeakerPubkey = actor;
+      if (snapshot.host) {
+        snapshot.host.canSelect = false;
+        snapshot.host.canClose = false;
+        snapshot.host.canRecall = true;
+      }
+      break;
+    }
+    case "offer_decline": {
+      if (!floor.offer || floor.offer.targetPubkey !== actor) {
+        throw new Error("Floor Offer is not addressed to this Human");
+      }
+      const declinedOffer = floor.offer;
+      floor.offer = null;
+      floor.humanQueue = floor.humanQueue.filter(
+        (request) => request.requesterPubkey !== actor,
+      );
+      if (declinedOffer.sourceIntentId && snapshot.host) {
+        const intent = snapshot.host.pendingIntents.find(
+          (candidate) => candidate.intentId === declinedOffer.sourceIntentId,
+        );
+        if (intent) intent.lastAttemptOutcome = "declined";
+      }
+      if (declinedOffer.sourceHandoffId && snapshot.host) {
+        const handoff = snapshot.host.openHandoffs.find(
+          (candidate) => candidate.handoffId === declinedOffer.sourceHandoffId,
+        );
+        if (handoff) {
+          handoff.attemptActive = false;
+          handoff.selectable = true;
+          handoff.lastAttemptOutcome = "declined";
+        }
+      }
+      returnMockControlToBoard(snapshot);
+      break;
+    }
+    case "grant_yield": {
+      if (!floor.grant || floor.grant.holderPubkey !== actor) {
+        throw new Error("Floor Grant is not held by this Human");
+      }
+      const yieldedGrant = floor.grant;
+      floor.grant = null;
+      if (yieldedGrant.sourceHandoffId && snapshot.host) {
+        const handoff = snapshot.host.openHandoffs.find(
+          (candidate) => candidate.handoffId === yieldedGrant.sourceHandoffId,
+        );
+        if (handoff) {
+          handoff.attemptActive = false;
+          handoff.selectable = true;
+          handoff.lastAttemptOutcome = "yielded";
+        }
+      }
+      returnMockControlToBoard(snapshot);
+      break;
+    }
+    case "speech": {
+      if (!floor.grant || floor.grant.holderPubkey !== actor) {
+        throw new Error("Floor Grant is not held by this Human");
+      }
+      const speechRevision = snapshot.speechRevision + 1;
+      seed.speeches ??= [];
+      seed.speeches.push({
+        eventId,
+        authorPubkey: actor,
+        content: input.action.content,
+        createdAt: Math.floor(Date.now() / 1_000),
+        speechRevision,
+        grantEventId: floor.grant.grantId,
+        mentions: input.action.mentions,
+      });
+      snapshot.speechRevision = speechRevision;
+      snapshot.latestSpeechAt = Math.floor(Date.now() / 1_000);
+      const completedGrant = floor.grant;
+      floor.grant = null;
+      snapshot.currentSpeakerPubkey = null;
+      if (completedGrant.sourceHandoffId && snapshot.host) {
+        snapshot.host.openHandoffs = snapshot.host.openHandoffs.filter(
+          (handoff) => handoff.handoffId !== completedGrant.sourceHandoffId,
+        );
+      }
+      const handoff = input.action.handoff;
+      if (handoff) {
+        const handoffId = `e${eventId.slice(1)}`;
+        floor.offer = {
+          offerId: "c".repeat(32) + eventId.slice(32),
+          targetPubkey: handoff.targetPubkey,
+          targetParticipantType:
+            snapshot.participants.find(
+              (item) => item.pubkey === handoff.targetPubkey,
+            )?.participantType === "agent"
+              ? "agent"
+              : "human",
+          allocationSource: "directed_handoff",
+          turnRole: "participant",
+          selectionReason: null,
+          sourceIntentId: null,
+          sourceRequestId: null,
+          sourceHandoffId: handoffId,
+          sourceSpeechEventId: eventId,
+          handoffContext: {
+            fromPubkey: actor,
+            reasonType: handoff.handoffType,
+            reasonText: handoff.reason,
+          },
+          createdAtMs: Date.now(),
+          ackDeadlineMs: Date.now() + 30_000,
+        };
+        snapshot.phase = "offered";
+        snapshot.currentOfferPubkey = handoff.targetPubkey;
+        if (snapshot.host) {
+          snapshot.host.openHandoffs.push({
+            handoffId,
+            sourceSpeechEventId: eventId,
+            fromPubkey: actor,
+            toPubkey: handoff.targetPubkey,
+            reasonType: handoff.handoffType,
+            reasonText: handoff.reason,
+            createdAtMs: Date.now(),
+            attemptCount: 1,
+            lastOfferId: floor.offer.offerId,
+            lastGrantId: null,
+            lastAttemptOutcome: "offered",
+            blockedBy: null,
+            moderatorRetryBlocked: false,
+            eligibleDecisionEpoch: snapshot.host.decisionEpoch,
+            attemptActive: true,
+            selectable: false,
+          });
+          snapshot.host.canSelect = false;
+          snapshot.host.canClose = false;
+          snapshot.host.canRecall = true;
+        }
+      } else {
+        returnMockControlToBoard(snapshot);
+      }
+      break;
+    }
+  }
+
+  snapshot.floorRevision += 1;
+  advanceMockMeetingState(snapshot);
+  const accepted = acceptedMeetingFloorResult(
+    input,
+    eventId,
+    snapshot.stateRevision,
+    false,
+  );
+  mockMeetingFloorSubmissions.set(input.submissionId, accepted);
+  if ((config?.mock?.meetingFloorIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingFloorIndeterminateResponses =
+        (config.mock.meetingFloorIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId: input.meetingId,
+      eventId,
+      action: input.action.type,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+  return accepted;
+}
+
+function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
+  if (seed.result.status === "ready") {
+    const snapshot = seed.result.snapshot;
+    return {
+      meetingId: seed.id,
+      title: seed.title,
+      lifecycle: snapshot.lifecycle,
+      phase: snapshot.phase,
+      currentSpeakerPubkey: snapshot.currentSpeakerPubkey,
+      currentOfferPubkey: snapshot.currentOfferPubkey,
+      humanFloorAttentionPubkey:
+        [snapshot.currentOfferPubkey, snapshot.currentSpeakerPubkey].find(
+          (pubkey) =>
+            pubkey !== null &&
+            snapshot.participants.some(
+              (participant) =>
+                participant.pubkey === pubkey &&
+                participant.participantType === "human",
+            ),
+        ) ?? null,
+      moderatorPubkey: snapshot.moderatorPubkey,
+      policy: snapshot.policy,
+      updatedAt:
+        snapshot.end?.endedAt ??
+        snapshot.latestSpeechAt ??
+        snapshot.board.updatedAt,
+      endedAt: snapshot.end?.endedAt ?? null,
+      latestSpeechAt: snapshot.latestSpeechAt,
+      compatibility: "ready",
+    };
+  }
+  const compatibility =
+    seed.result.status === "unsupported_relay"
+      ? "unsupported_relay"
+      : seed.result.status === "unsupported_protocol"
+        ? "unsupported_protocol"
+        : seed.result.status === "forbidden"
+          ? "forbidden"
+          : "not_found";
+  return {
+    meetingId: seed.id,
+    title: seed.title,
+    lifecycle: null,
+    phase: null,
+    currentSpeakerPubkey: null,
+    currentOfferPubkey: null,
+    humanFloorAttentionPubkey: null,
+    moderatorPubkey: null,
+    policy: null,
+    updatedAt: null,
+    endedAt: null,
+    latestSpeechAt: null,
+    compatibility,
+  };
+}
+
+async function handleCreateMeeting(
+  args: { input: CreateMeetingInput },
+  config?: E2eConfig,
+): Promise<CreateMeetingResult> {
+  const delayMs = config?.mock?.meetingCreateDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingCreateErrors?.shift();
+  if (configuredError) {
+    throw new Error(configuredError);
+  }
+
+  const input = args.input;
+  const meetingId = input.submissionId;
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const hostPubkey = getMockMemberPubkey(config).toLowerCase();
+  if ((config?.mock?.meetingCreateIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingCreateIndeterminateResponses =
+        (config.mock.meetingCreateIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId,
+      eventId,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+
+  const title = input.title.trim().replace(/^#+\s*/u, "") || "Meeting";
+  const relayAgentPubkeys = new Set(
+    (config?.mock?.relayAgents ?? []).map((agent) =>
+      normalizePubkey(agent.pubkey),
+    ),
+  );
+  const profileAgents = new Set(
+    (config?.mock?.searchProfiles ?? [])
+      .filter((profile) => profile.isAgent)
+      .map((profile) => normalizePubkey(profile.pubkey)),
+  );
+  const now = Math.floor(Date.now() / 1_000);
+  const snapshot: MeetingSnapshot = {
+    meetingId,
+    title,
+    description: input.description ?? null,
+    sourceChannelId: input.sourceChannelId ?? null,
+    schemaVersion: 3,
+    policy: "moderated-board-actions-v2",
+    hostPubkey,
+    moderatorPubkey: hostPubkey,
+    createEventId: eventId,
+    createdAt: now,
+    lifecycle: "active",
+    phase: "moderator_control",
+    stateRevision: 1,
+    floorRevision: 0,
+    intentRevision: 0,
+    speechRevision: 0,
+    currentSpeakerPubkey: null,
+    currentOfferPubkey: null,
+    floor: {
+      stateEventId: "d".repeat(64),
+      humanQueue: [],
+      offer: null,
+      grant: null,
+    },
+    host: {
+      controlToken: "e".repeat(64),
+      stateEventId: "d".repeat(64),
+      controlEpoch: 1,
+      decisionEpoch: 0,
+      decisionDeadlineMs: null,
+      nextActionAtMs: null,
+      consecutiveModeratorSpeeches: 0,
+      forcedReturnToModerator: false,
+      pendingIntents: [],
+      openHandoffs: [],
+      boardControl: {
+        phase: "board_pending",
+        controlEpoch: 1,
+        boardWindow: 1,
+        boardStartedAtMs: Date.now(),
+        boardDeadlineAtMs: Date.now() + 120_000,
+        boardCompletedAtMs: null,
+        boardOutcome: null,
+      },
+      canSelect: false,
+      canClose: false,
+      canRecall: false,
+    },
+    participants: [
+      { pubkey: hostPubkey, participantType: "human", channelRole: "owner" },
+      ...input.participantPubkeys.map((pubkey) => {
+        const normalized = normalizePubkey(pubkey);
+        return {
+          pubkey: normalized,
+          participantType:
+            relayAgentPubkeys.has(normalized) || profileAgents.has(normalized)
+              ? ("agent" as const)
+              : ("human" as const),
+          channelRole: "member",
+        };
+      }),
+    ],
+    board: {
+      eventId: "b".repeat(64),
+      format: "markdown",
+      body: input.initialBoard,
+      moderatorPubkey: hostPubkey,
+      updatedAt: now,
+      source: "create",
+    },
+    action: null,
+    end: null,
+    latestSpeechAt: null,
+  };
+  const meetings = config?.mock?.meetings;
+  if (meetings && !meetings.some((meeting) => meeting.id === meetingId)) {
+    meetings.push({
+      id: meetingId,
+      title,
+      description: input.description ?? null,
+      result: { status: "ready", snapshot },
+      speeches: [],
+    });
+  } else if (config?.mock && !meetings) {
+    config.mock.meetings = [
+      {
+        id: meetingId,
+        title,
+        description: input.description ?? null,
+        result: { status: "ready", snapshot },
+        speeches: [],
+      },
+    ];
+  }
+
+  return {
+    status: "accepted",
+    meetingId,
+    eventId,
+    hostPubkey,
+    participantPubkeys: input.participantPubkeys,
+    title,
+  };
 }
 
 function getMockChannel(channelId: string): MockChannel {
@@ -9272,11 +10553,20 @@ export function maybeInstallE2eTauriMocks() {
   resetMockUserStatuses();
   resetMockSaveSubscriptions(config);
   resetMockPendingCommunityDeepLinks(config);
+  mockMeetingFloorSubmissions.clear();
+  mockMeetingHostSubmissions.clear();
+  mockMeetingActionSubmissions.clear();
   mockWebsocketSendMutexWedged = false;
   mockWindows("main");
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
+  window.__BUZZ_E2E_PREEMPT_MEETING_BOARD__ = (input) =>
+    preemptMockMeetingBoard(
+      input.meetingId,
+      input.requesterPubkey.toLowerCase(),
+      config,
+    );
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({
@@ -10365,6 +11655,107 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "get_channels":
         return handleGetChannels(activeConfig);
+      case "get_meeting_capability":
+        return (
+          activeConfig?.mock?.meetingCapability ?? {
+            status: "readable",
+            relayPubkey: activeConfig?.mock?.relaySelf ?? "ab".repeat(32),
+            supportsDirectActions: true,
+            canCreateDirectActions: false,
+          }
+        );
+      case "create_meeting":
+        return handleCreateMeeting(
+          payload as { input: CreateMeetingInput },
+          activeConfig,
+        );
+      case "submit_meeting_floor_action":
+        return handleMeetingFloorAction(
+          payload as { input: MeetingFloorActionInput },
+          activeConfig,
+        );
+      case "submit_meeting_host_action":
+        return handleMeetingHostAction(
+          payload as { input: MeetingHostActionInput },
+          activeConfig,
+        );
+      case "submit_meeting_action_finalization":
+        return handleMeetingActionFinalization(
+          payload as { input: MeetingActionFinalizationInput },
+          activeConfig,
+        );
+      case "list_meetings": {
+        const { meetingIds } = payload as { meetingIds: string[] };
+        if (meetingIds.length > 64) {
+          throw new Error("Meeting list accepts at most 64 room IDs");
+        }
+        return meetingIds
+          .map((meetingId) => getMockMeetingSeed(meetingId, activeConfig))
+          .filter((meeting): meeting is MockMeetingSeed => meeting !== null)
+          .map(mockMeetingListItem);
+      }
+      case "get_meeting_snapshot": {
+        const snapshotDelayMs = activeConfig?.mock?.meetingSnapshotDelayMs ?? 0;
+        if (snapshotDelayMs > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, snapshotDelayMs),
+          );
+        }
+        const snapshotError =
+          activeConfig?.mock?.meetingSnapshotError ??
+          activeConfig?.mock?.meetingSnapshotErrors?.shift();
+        if (snapshotError) throw new Error(snapshotError);
+        const { meetingId } = payload as { meetingId: string };
+        return (
+          getMockMeetingSeed(meetingId, activeConfig)?.result ?? {
+            status: "not_found",
+          }
+        );
+      }
+      case "get_meeting_board": {
+        const { meetingId } = payload as { meetingId: string };
+        return (
+          getMockMeetingSeed(meetingId, activeConfig)?.result ?? {
+            status: "not_found",
+          }
+        );
+      }
+      case "get_meeting_speeches": {
+        const { meetingId, before, beforeId, limit } = payload as {
+          meetingId: string;
+          before?: number | null;
+          beforeId?: string | null;
+          limit?: number | null;
+        };
+        const pageSize = Math.max(1, Math.min(limit ?? 50, 100));
+        const ordered = [
+          ...(getMockMeetingSeed(meetingId, activeConfig)?.speeches ?? []),
+        ]
+          .filter(
+            (speech) =>
+              before == null ||
+              speech.createdAt < before ||
+              (speech.createdAt === before &&
+                beforeId != null &&
+                speech.eventId > beforeId),
+          )
+          .sort(
+            (left, right) =>
+              right.speechRevision - left.speechRevision ||
+              right.eventId.localeCompare(left.eventId),
+          );
+        const hasMore = ordered.length > pageSize;
+        const speeches = ordered.slice(0, pageSize);
+        const oldest = speeches.at(-1);
+        speeches.reverse();
+        return {
+          speeches,
+          nextCursor:
+            hasMore && oldest
+              ? { before: oldest.createdAt, beforeId: oldest.eventId }
+              : null,
+        };
+      }
       case "get_feed":
         return handleGetFeed(
           (payload as Parameters<typeof handleGetFeed>[0]) ?? {},

@@ -1367,6 +1367,57 @@ fn truncate_reason(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn ingest_rejection_status(message: &str) -> StatusCode {
+    if message.starts_with("conflict:") || message.starts_with("expired:") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+fn protocol_rejection_response(
+    status: StatusCode,
+    event_id: &str,
+    message: &str,
+) -> (StatusCode, Json<Value>) {
+    let details = message
+        .strip_prefix("conflict:")
+        .or_else(|| message.strip_prefix("expired:"))
+        .map(str::trim)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+    let Some(details) = details else {
+        return api_error(status, message);
+    };
+    let code = details
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("meeting_command_rejected");
+    (
+        status,
+        Json(serde_json::json!({
+            "event_id": event_id,
+            "accepted": false,
+            "code": code,
+            "canonical_object_id": details.get("canonical_object_id").cloned().unwrap_or(Value::Null),
+            "retry_ticket_id": details.get("retry_ticket_id").cloned().unwrap_or(Value::Null),
+            "recovery_transitions": details
+                .get("recovery_transitions")
+                .cloned()
+                .unwrap_or_else(|| Value::from(0)),
+            "message": message,
+        })),
+    )
+}
+
+fn merge_submit_response_details(response: &mut Value, details: serde_json::Map<String, Value>) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    for (key, value) in details {
+        object.entry(key).or_insert(value);
+    }
+}
+
 /// Submit a signed Nostr event via HTTP bridge (NIP-98 auth).
 pub async fn submit_event(
     State(state): State<Arc<AppState>>,
@@ -1434,11 +1485,16 @@ pub async fn submit_event(
                 "HTTP bridge request"
             );
         }
-        SubmitOutcome::Rejected { kind, reason, .. } => {
+        SubmitOutcome::Rejected {
+            kind,
+            reason,
+            status,
+            ..
+        } => {
             tracing::warn!(
                 pubkey = %pubkey_hex,
                 route = "/events",
-                status = 400u16,
+                status = status.as_u16(),
                 accepted = false,
                 kind,
                 reason = %reason,
@@ -1480,6 +1536,7 @@ enum SubmitOutcome {
     Rejected {
         kind: u32,
         reason: String,
+        status: StatusCode,
         response: (StatusCode, Json<Value>),
     },
     /// Any other error (admission, replay, membership, auth, internal) —
@@ -1582,6 +1639,7 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
+    let submitted_event_id = event.id.to_hex();
     let auth = IngestAuth::Http {
         pubkey,
         scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
@@ -1590,11 +1648,20 @@ async fn submit_event_authed(
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
         Ok(result) => {
-            let response = Json(serde_json::json!({
+            let details = result
+                .message
+                .strip_prefix("response:")
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .and_then(|value| value.as_object().cloned());
+            let mut response = serde_json::json!({
                 "event_id": result.event_id,
                 "accepted": result.accepted,
                 "message": result.message,
-            }));
+            });
+            if let Some(details) = details {
+                merge_submit_response_details(&mut response, details);
+            }
+            let response = Json(response);
             SubmitOutcome::Ok {
                 accepted: result.accepted,
                 response,
@@ -1607,10 +1674,12 @@ async fn submit_event_authed(
             // in the HTTP response body (unchanged from prior behaviour).
             let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
             crate::handlers::ingest::reject_with_transport("http", "invalid");
+            let status = ingest_rejection_status(&msg);
             SubmitOutcome::Rejected {
                 kind: kind_u32,
                 reason,
-                response: api_error(StatusCode::BAD_REQUEST, &msg),
+                status,
+                response: protocol_rejection_response(status, &submitted_event_id, &msg),
             }
         }
         Err(IngestError::AuthFailed(msg)) => {
@@ -1664,6 +1733,8 @@ pub async fn query_events(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut board_read_observation =
+        crate::meeting_observability::MeetingV2BoardReadObservation::for_raw_filters("http", &body);
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped read, identical to the WS door in `router.rs`.
     // An unmapped host or lookup failure fails closed with a generic 404 — never
@@ -1700,6 +1771,7 @@ pub async fn query_events(
         query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
     match &result {
         Ok(Json(Value::Array(events))) => {
+            board_read_observation.completed(events.len());
             tracing::info!(
                 pubkey = %pubkey_hex,
                 route = "/query",
@@ -1709,9 +1781,15 @@ pub async fn query_events(
             );
         }
         Ok(_) => {
+            board_read_observation.failed();
             tracing::info!(pubkey = %pubkey_hex, route = "/query", status = 200u16, "HTTP bridge request");
         }
         Err((status, _)) => {
+            if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                board_read_observation.denied();
+            } else {
+                board_read_observation.failed();
+            }
             tracing::warn!(
                 pubkey = %pubkey_hex,
                 route = "/query",
@@ -2099,10 +2177,27 @@ async fn query_events_authed(
     }
 
     // Get channels this user can access — same enforcement as WS REQ handler.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    let meeting_scope = crate::handlers::req::apply_meeting_read_scope(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await
+    .map_err(|error| internal_error(&format!("Meeting reader security check: {error}")))?;
+    if filters.iter().any(|filter| {
+        extract_channel_from_filter(filter)
+            .is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id))
+    }) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: meeting access revoked",
+        ));
+    }
 
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
@@ -2634,10 +2729,27 @@ async fn count_events_authed(
     }
 
     // Get channels this user can access.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    let meeting_scope = crate::handlers::req::apply_meeting_read_scope(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await
+    .map_err(|error| internal_error(&format!("Meeting reader security check: {error}")))?;
+    if filters.iter().any(|filter| {
+        extract_channel_from_filter(filter)
+            .is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id))
+    }) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: meeting access revoked",
+        ));
+    }
 
     let mut total: u64 = 0;
     for filter in &filters {
@@ -4718,6 +4830,71 @@ mod tests {
         let s = "invalid: kind 24620 rejected";
         let result = truncate_reason(s, 256);
         assert_eq!(result, s);
+    }
+
+    #[test]
+    fn meeting_terminal_conflicts_use_http_409() {
+        assert_eq!(
+            ingest_rejection_status("conflict: stale revision"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ingest_rejection_status("expired: offer timed out"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ingest_rejection_status("invalid: malformed tag"),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn meeting_conflict_response_preserves_typed_retry_evidence() {
+        let event_id = "11".repeat(32);
+        let canonical = "22".repeat(32);
+        let ticket = "33".repeat(32);
+        let message = format!(
+            "conflict: {}",
+            serde_json::json!({
+                "code": "selected_source_changed",
+                "canonical_object_id": canonical,
+                "retry_ticket_id": ticket,
+                "recovery_transitions": 0,
+            })
+        );
+        let (status, Json(body)) =
+            protocol_rejection_response(StatusCode::CONFLICT, &event_id, &message);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["event_id"], event_id);
+        assert_eq!(body["accepted"], false);
+        assert_eq!(body["code"], "selected_source_changed");
+        assert_eq!(body["canonical_object_id"], canonical);
+        assert_eq!(body["retry_ticket_id"], ticket);
+    }
+
+    #[test]
+    fn submit_response_details_cannot_override_authoritative_outcome() {
+        let mut response = serde_json::json!({
+            "event_id": "canonical-event",
+            "accepted": false,
+            "message": "canonical-message",
+        });
+        let details = serde_json::json!({
+            "event_id": "forged-event",
+            "accepted": true,
+            "message": "forged-message",
+            "attempt_id": "attempt-1",
+        })
+        .as_object()
+        .cloned()
+        .expect("test details object");
+
+        merge_submit_response_details(&mut response, details);
+
+        assert_eq!(response["event_id"], "canonical-event");
+        assert_eq!(response["accepted"], false);
+        assert_eq!(response["message"], "canonical-message");
+        assert_eq!(response["attempt_id"], "attempt-1");
     }
 
     // ──────────────────────────────────────────────────────────────────────────

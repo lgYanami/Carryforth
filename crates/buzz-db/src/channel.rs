@@ -25,6 +25,8 @@ pub struct ChannelRecord {
     pub name: String,
     /// Channel type string (e.g. `"stream"`, `"forum"`, `"dm"`).
     pub channel_type: String,
+    /// Stable domain purpose (`"standard"` or `"meeting"`).
+    pub room_kind: String,
     /// Visibility string (`"open"` or `"private"`).
     pub visibility: String,
     /// Optional channel description.
@@ -147,7 +149,8 @@ pub async fn create_channel(
 
     let row = sqlx::query(
         r#"
-        SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+        SELECT id, name, channel_type::text AS channel_type, room_kind,
+               visibility::text AS visibility,
                description, canvas,
                created_by, created_at, updated_at, archived_at, deleted_at,
                nip29_group_id, topic_required, max_members,
@@ -247,7 +250,8 @@ pub async fn create_channel_with_id(
 
     let row = sqlx::query(
         r#"
-        SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+        SELECT id, name, channel_type::text AS channel_type, room_kind,
+               visibility::text AS visibility,
                description, canvas,
                created_by, created_at, updated_at, archived_at, deleted_at,
                nip29_group_id, topic_required, max_members,
@@ -275,7 +279,8 @@ pub async fn get_channel(
 ) -> Result<ChannelRecord> {
     let row = sqlx::query(
         r#"
-        SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+        SELECT id, name, channel_type::text AS channel_type, room_kind,
+               visibility::text AS visibility,
                description, canvas,
                created_by, created_at, updated_at, archived_at, deleted_at,
                nip29_group_id, topic_required, max_members,
@@ -674,7 +679,8 @@ pub async fn list_channels(
     let rows = if let Some(vis) = visibility {
         sqlx::query(
             r#"
-            SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+            SELECT id, name, channel_type::text AS channel_type, room_kind,
+                   visibility::text AS visibility,
                    description, canvas,
                    created_by, created_at, updated_at, archived_at, deleted_at,
                    nip29_group_id, topic_required, max_members,
@@ -694,7 +700,8 @@ pub async fn list_channels(
     } else {
         sqlx::query(
             r#"
-            SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+            SELECT id, name, channel_type::text AS channel_type, room_kind,
+                   visibility::text AS visibility,
                    description, canvas,
                    created_by, created_at, updated_at, archived_at, deleted_at,
                    nip29_group_id, topic_required, max_members,
@@ -742,7 +749,8 @@ async fn get_channel_tx(
 ) -> Result<ChannelRecord> {
     let row = sqlx::query(
         r#"
-        SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+        SELECT id, name, channel_type::text AS channel_type, room_kind,
+               visibility::text AS visibility,
                description, canvas,
                created_by, created_at, updated_at, archived_at, deleted_at,
                nip29_group_id, topic_required, max_members,
@@ -844,7 +852,7 @@ pub async fn get_accessible_channels(
 
     let base = format!(
         r#"
-        SELECT c.id, c.name, c.channel_type::text AS channel_type,
+        SELECT c.id, c.name, c.channel_type::text AS channel_type, c.room_kind,
                c.visibility::text AS visibility, c.description, c.canvas,
                c.created_by, c.created_at, c.updated_at, c.archived_at, c.deleted_at,
                c.nip29_group_id, c.topic_required, c.max_members,
@@ -992,6 +1000,9 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
         id,
         name: row.try_get("name")?,
         channel_type: row.try_get("channel_type")?,
+        room_kind: row
+            .try_get("room_kind")
+            .unwrap_or_else(|_| "standard".to_string()),
         visibility: row.try_get("visibility")?,
         description: row.try_get("description")?,
         canvas: row.try_get("canvas")?,

@@ -111,6 +111,8 @@ pub struct ChannelInfo {
     pub id: String,
     pub name: String,
     pub channel_type: String,
+    /// Stable domain discriminator emitted by the Relay when present.
+    pub room_kind: Option<String>,
     pub visibility: String,
     #[serde(deserialize_with = "deserialize_null_string_as_empty")]
     pub description: String,
@@ -136,6 +138,8 @@ pub struct ChannelDetailInfo {
     pub id: String,
     pub name: String,
     pub channel_type: String,
+    /// Stable domain discriminator emitted by the Relay when present.
+    pub room_kind: Option<String>,
     pub visibility: String,
     #[serde(deserialize_with = "deserialize_null_string_as_empty")]
     pub description: String,

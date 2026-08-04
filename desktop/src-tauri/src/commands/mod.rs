@@ -28,6 +28,7 @@ mod media_download;
 mod media_gif;
 mod media_snapshot_png;
 mod media_transcode;
+mod meetings;
 #[cfg(feature = "mesh-llm")]
 pub(crate) mod mesh_llm;
 mod messages;
@@ -85,6 +86,7 @@ pub use legacy_storage::*;
 pub use link_preview::*;
 pub use media::*;
 pub use media_download::*;
+pub use meetings::*;
 #[cfg(feature = "mesh-llm")]
 pub use mesh_llm::*;
 pub use messages::*;

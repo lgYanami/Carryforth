@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-if [[ -f ".env" ]]; then
+if [[ -f ".env" && "${BUZZ_SKIP_ENV_FILE:-false}" != "true" ]]; then
   set -o allexport
   # shellcheck disable=SC1091
   source .env
@@ -85,10 +85,19 @@ ON CONFLICT (lower(host)) DO NOTHING;
 "
 
 if command -v psql >/dev/null 2>&1; then
-  PGPASSWORD="${PGPASSWORD}" psql -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 -c "${sql}"
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    PGPASSWORD="${PGPASSWORD}" psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -c "${sql}"
+  else
+    PGPASSWORD="${PGPASSWORD}" psql -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 -c "${sql}"
+  fi
 elif docker exec buzz-postgres psql --version >/dev/null 2>&1; then
-  docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
-    psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 -c "${sql}"
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
+      psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -c "${sql}"
+  else
+    docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
+      psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 -c "${sql}"
+  fi
 else
   echo "error: neither psql nor buzz-postgres docker psql is available" >&2
   exit 1

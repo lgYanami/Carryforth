@@ -40,6 +40,7 @@ buzz-sdk = { workspace = true }
 buzz-db = { workspace = true }
 buzz-project-document = { workspace = true }
 buzz-project-view = { workspace = true }
+buzz-audit = { workspace = true }
 
 [[bin]]
 name = "buzz-test-cli"

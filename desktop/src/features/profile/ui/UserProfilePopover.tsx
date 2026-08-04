@@ -8,7 +8,7 @@ import { useHuddle } from "@/features/huddle";
 import { formatHuddleActionError } from "@/features/huddle/lib/huddleError";
 import {
   channelsQueryKey,
-  useChannelsQuery,
+  useChatRooms,
   useOpenDmMutation,
 } from "@/features/channels/hooks";
 import {
@@ -274,7 +274,7 @@ export function UserProfilePopover({
   const profileDescription = profile?.about?.trim() ?? "";
   const profileSubheader = profileDescription || profile?.nip05Handle?.trim();
   const activeTurns = useAgentWorking(isBotProfile ? pubkey : null).channels;
-  const channelsQuery = useChannelsQuery();
+  const channelsQuery = useChatRooms();
   const channelIdToName = React.useMemo(() => {
     const map: Record<string, string> = {};
     for (const channel of channelsQuery.data ?? []) {

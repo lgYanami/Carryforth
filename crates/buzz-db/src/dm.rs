@@ -492,6 +492,9 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
         id,
         name: row.try_get("name")?,
         channel_type: row.try_get("channel_type")?,
+        room_kind: row
+            .try_get("room_kind")
+            .unwrap_or_else(|_| "standard".to_string()),
         visibility: row.try_get("visibility")?,
         description: row.try_get("description")?,
         canvas: row.try_get("canvas")?,

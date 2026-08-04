@@ -27,6 +27,7 @@ function makeChannel(overrides = {}) {
     memberPubkeys: ["current-user"],
     lastMessageAt: null,
     archivedAt: null,
+    roomKind: null,
     participants: [],
     participantPubkeys: [],
     isMember: true,
@@ -232,6 +233,20 @@ test("findPrivateWelcomeChannel ignores open or shared Welcome channels", () => 
   );
 });
 
+test("Meeting rooms are never reused as onboarding Welcome channels", async () => {
+  const meeting = makeChannel({ id: "meeting-welcome", roomKind: "meeting" });
+  const created = makeChannel({ id: "ordinary-welcome" });
+
+  assert.equal(findPrivateWelcomeChannel([meeting]), null);
+  assert.equal(
+    await ensureWelcomeChannel({
+      getChannels: async () => [meeting],
+      createChannel: async () => created,
+    }),
+    created,
+  );
+});
+
 test("pending Welcome channel is consumed only after it appears in the channel list", () => {
   const { restore } = installWindowSessionStorage();
   try {
@@ -329,6 +344,44 @@ test("ensureStarterChannels resumes when one starter channel is missing", async 
   assert.equal(result.generalChannel, general);
   assert.equal(result.welcomeChannel, welcomeEveryone);
   assert.deepEqual(result.channels, [general, welcomeEveryone]);
+  assert.equal(ensureCalls, 1);
+});
+
+test("Meeting names never satisfy starter Channel discovery", async () => {
+  const meetingGeneral = makeChannel({
+    id: "meeting-general",
+    name: "general",
+    roomKind: "meeting",
+    visibility: "open",
+  });
+  const meetingWelcome = makeChannel({
+    id: "meeting-welcome",
+    name: "welcome-everyone",
+    roomKind: "meeting",
+    visibility: "open",
+  });
+  const general = makeChannel({
+    id: "general-channel",
+    name: "general",
+    visibility: "open",
+  });
+  const welcomeEveryone = makeChannel({
+    id: "welcome-everyone-channel",
+    name: "welcome-everyone",
+    visibility: "open",
+  });
+  let ensureCalls = 0;
+
+  const result = await ensureStarterChannels({
+    getChannels: async () => [meetingGeneral, meetingWelcome],
+    ensureStarterChannels: async () => {
+      ensureCalls += 1;
+      return [general, welcomeEveryone];
+    },
+  });
+
+  assert.equal(result.generalChannel, general);
+  assert.equal(result.welcomeChannel, welcomeEveryone);
   assert.equal(ensureCalls, 1);
 });
 

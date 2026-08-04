@@ -386,7 +386,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 
     let check = async {
-        let (pg_ok, redis_ok, project_view_ok, project_document_ok) = tokio::join!(
+        let (pg_ok, redis_ok, project_view_ok, project_document_ok, meeting_v2_ok) = tokio::join!(
             state.db.ping(),
             async { state.redis_pool.get().await.is_ok() },
             async {
@@ -403,17 +403,38 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .await
                     .unwrap_or(false)
             },
+            async {
+                state
+                    .db
+                    .meeting_v2_deployment_ready(
+                        state.config.relay_private_key.is_some(),
+                        state.config.meeting_v2_create_enabled
+                            || state.config.meeting_v2_direct_actions_create_enabled,
+                    )
+                    .await
+                    .unwrap_or(false)
+            },
         );
-        (pg_ok, redis_ok, project_view_ok, project_document_ok)
+        (
+            pg_ok,
+            redis_ok,
+            project_view_ok,
+            project_document_ok,
+            meeting_v2_ok,
+        )
     };
 
-    let (pg_ok, redis_ok, project_view_ok, project_document_ok) =
+    let (pg_ok, redis_ok, project_view_ok, project_document_ok, meeting_v2_ok) =
         tokio::time::timeout(Duration::from_secs(2), check)
             .await
-            .unwrap_or((false, false, false, false));
+            .unwrap_or((false, false, false, false, false));
 
-    if pg_ok && redis_ok && project_view_ok && project_document_ok {
-        (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
+    if pg_ok && redis_ok && project_view_ok && project_document_ok && meeting_v2_ok {
+        (
+            StatusCode::OK,
+            Json(json!({"status": "ready", "meeting_v2": true})),
+        )
+            .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -422,7 +443,8 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                 "postgres": pg_ok,
                 "redis": redis_ok,
                 "project_view": project_view_ok,
-                "project_document": project_document_ok
+                "project_document": project_document_ok,
+                "meeting_v2": meeting_v2_ok
             })),
         )
             .into_response()

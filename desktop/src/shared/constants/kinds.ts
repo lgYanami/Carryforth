@@ -22,6 +22,23 @@ export const KIND_CHANNEL_WINDOW_BOUNDS = 39006;
 export const KIND_STREAM_MESSAGE_DIFF = 40008;
 export const KIND_REMINDER = 40007;
 export const KIND_SYSTEM_MESSAGE = 40099;
+export const KIND_MEETING_CREATE = 42100;
+export const KIND_MEETING_END = 42101;
+export const KIND_MEETING_FLOOR_CLAIM = 42102;
+export const KIND_MEETING_ROUND_STATE = 42103;
+export const KIND_MEETING_STATE = KIND_MEETING_ROUND_STATE;
+export const KIND_MEETING_FLOOR_SIGNAL = 42104;
+export const KIND_MEETING_SPEECH_INTENT = 42105;
+export const KIND_MEETING_MODERATOR_COMMAND = 42106;
+export const KIND_MEETING_HUMAN_FLOOR_REQUEST = 42107;
+export const KIND_MEETING_OFFER_RESPONSE = 42108;
+export const KIND_MEETING_GRANT_SIGNAL = 42109;
+// Relay-authored current Board projection and the two Human/Agent command
+// kinds. Keep these values pinned to buzz-core; only the projection is read in
+// Desktop stage one.
+export const KIND_MEETING_BOARD = 42110;
+export const KIND_MEETING_BOARD_COMMAND = 42111;
+export const KIND_MEETING_ACTION_COMMAND = 42112;
 export const KIND_JOB_REQUEST = 43001;
 export const KIND_JOB_ACCEPTED = 43002;
 export const KIND_JOB_PROGRESS = 43003;

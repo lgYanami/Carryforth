@@ -168,6 +168,8 @@ pub async fn handle_relay_admin_event(
     let target_hex = extract_p_tag_hex(event)
         .ok_or_else(|| "missing or invalid p tag".to_string())?
         .to_ascii_lowercase();
+    let target_bytes =
+        hex::decode(&target_hex).map_err(|error| format!("invalid target pubkey: {error}"))?;
 
     match kind {
         // kind:9030 — Add relay member
@@ -240,14 +242,23 @@ pub async fn handle_relay_admin_event(
             let remove_result = if sender_role == "admin" {
                 state
                     .db
-                    .remove_relay_member_if_role(tenant.community(), &target_hex, "member")
+                    .remove_relay_member_if_role_with_revocation(
+                        tenant.community(),
+                        &target_hex,
+                        "member",
+                        event.id.as_bytes(),
+                    )
                     .await
                     .map_err(|e| format!("database error: {e}"))?
             } else {
                 // Owner path — atomic delete that refuses to remove other owners.
                 state
                     .db
-                    .remove_relay_member(tenant.community(), &target_hex)
+                    .remove_relay_member_with_revocation(
+                        tenant.community(),
+                        &target_hex,
+                        event.id.as_bytes(),
+                    )
                     .await
                     .map_err(|e| format!("database error: {e}"))?
             };
@@ -273,6 +284,18 @@ pub async fn handle_relay_admin_event(
                     return Err("forbidden:membership:managed_agent_assignment_active".to_string());
                 }
             }
+
+            // Relay membership is a principal-wide admission boundary. Drop
+            // every cached Channel-access result for the target, and close all
+            // of its authenticated sockets in this community. Both operations
+            // are applied locally now and fanned out to every Relay pod.
+            state.invalidate_principal_access(tenant, &target_bytes);
+            state.disconnect_pubkey_clusterwide(
+                tenant,
+                &target_bytes,
+                &event.id.to_hex(),
+                "restricted: relay membership revoked",
+            );
 
             info!(
                 sender = %sender_hex,

@@ -24,6 +24,11 @@ const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
 const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
+pub(crate) const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
+pub(crate) const MEETING_V2_CREATE_EXTENSION: &str = "buzz-meeting-v2-create";
+pub(crate) const MEETING_V2_DIRECT_ACTIONS_EXTENSION: &str = "buzz-meeting-v2-direct-actions";
+pub(crate) const MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION: &str =
+    "buzz-meeting-v2-direct-actions-create";
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +286,13 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         &mut info,
         project_document_ready_for_host(state, raw_host).await,
     );
+    let meeting_v2_ready = meeting_v2_runtime_ready(state).await;
+    apply_meeting_v2_extensions(
+        &mut info,
+        meeting_v2_ready,
+        state.config.meeting_v2_create_enabled,
+        state.config.meeting_v2_direct_actions_create_enabled,
+    );
     let tenant_host = if state.config.push_gateway_delivery_url.is_some() {
         crate::tenant::bind_community(&state.db, raw_host)
             .await
@@ -358,6 +370,39 @@ async fn project_document_ready_for_host(state: &crate::state::AppState, raw_hos
                 community_id = %tenant.community(),
                 "Project Document NIP-11 readiness failed closed: {error}"
             );
+            false
+        }
+    }
+}
+
+fn apply_meeting_v2_extensions(
+    info: &mut RelayInfo,
+    runtime_ready: bool,
+    create_enabled: bool,
+    direct_actions_create_enabled: bool,
+) {
+    if !runtime_ready {
+        return;
+    }
+    let extensions = info.supported_extensions.get_or_insert_default();
+    extensions.push(MEETING_V2_EXTENSION.to_owned());
+    extensions.push(MEETING_V2_DIRECT_ACTIONS_EXTENSION.to_owned());
+    if create_enabled {
+        extensions.push(MEETING_V2_CREATE_EXTENSION.to_owned());
+    }
+    if create_enabled && direct_actions_create_enabled {
+        extensions.push(MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION.to_owned());
+    }
+}
+
+async fn meeting_v2_runtime_ready(state: &crate::state::AppState) -> bool {
+    if state.config.relay_private_key.is_none() {
+        return false;
+    }
+    match state.db.meeting_v2_schema_ready().await {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!("Meeting V2 NIP-11 readiness failed closed: {error}");
             false
         }
     }
@@ -696,6 +741,45 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn meeting_v2_runtime_and_create_capabilities_are_independent() {
+        let mut unavailable =
+            RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        apply_meeting_v2_extensions(&mut unavailable, false, true, true);
+        let unavailable_extensions = unavailable.supported_extensions.unwrap_or_default();
+        assert!(!unavailable_extensions.contains(&MEETING_V2_EXTENSION.to_owned()));
+        assert!(!unavailable_extensions.contains(&MEETING_V2_CREATE_EXTENSION.to_owned()));
+        assert!(!unavailable_extensions.contains(&MEETING_V2_DIRECT_ACTIONS_EXTENSION.to_owned()));
+        assert!(!unavailable_extensions
+            .contains(&MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION.to_owned()));
+
+        let mut drain_only =
+            RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        apply_meeting_v2_extensions(&mut drain_only, true, false, false);
+        let drain_extensions = drain_only.supported_extensions.unwrap_or_default();
+        assert!(drain_extensions.contains(&MEETING_V2_EXTENSION.to_owned()));
+        assert!(drain_extensions.contains(&MEETING_V2_DIRECT_ACTIONS_EXTENSION.to_owned()));
+        assert!(!drain_extensions.contains(&MEETING_V2_CREATE_EXTENSION.to_owned()));
+        assert!(!drain_extensions.contains(&MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION.to_owned()));
+
+        let mut creating =
+            RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        apply_meeting_v2_extensions(&mut creating, true, true, false);
+        let creating_extensions = creating.supported_extensions.unwrap_or_default();
+        assert!(creating_extensions.contains(&MEETING_V2_EXTENSION.to_owned()));
+        assert!(creating_extensions.contains(&MEETING_V2_DIRECT_ACTIONS_EXTENSION.to_owned()));
+        assert!(creating_extensions.contains(&MEETING_V2_CREATE_EXTENSION.to_owned()));
+        assert!(
+            !creating_extensions.contains(&MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION.to_owned())
+        );
+
+        let mut action_creating =
+            RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        apply_meeting_v2_extensions(&mut action_creating, true, true, true);
+        let action_extensions = action_creating.supported_extensions.unwrap_or_default();
+        assert!(action_extensions.contains(&MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION.to_owned()));
     }
 
     /// Open relay with a stable signing key (e.g. for NIP-29 group metadata

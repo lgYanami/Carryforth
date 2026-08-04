@@ -1,0 +1,38 @@
+{
+  "fixture_version": 1,
+  "protocol": {
+    "meeting_version": "3",
+    "floor_policy": "moderated-board-v1",
+    "board_format": "markdown",
+    "kinds": {
+      "create": 42100,
+      "board": 42110
+    }
+  },
+  "create": {
+    "session_id": "00000000-0000-4000-8000-000000000003",
+    "title": "# Architecture review",
+    "description": "Meeting V2 stage-one conformance fixture",
+    "source_channel_id": "00000000-0000-4000-8000-000000000001",
+    "author_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "participant_pubkeys": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ],
+    "initial_board": "# Goal\nAgree on the API.\n\n## Agenda\n1. Constraints\n2. Decision",
+    "expected_tags": [
+      ["h", "00000000-0000-4000-8000-000000000003"],
+      ["name", "Architecture review"],
+      ["v", "3"],
+      ["policy", "moderated-board-v1"],
+      ["about", "Meeting V2 stage-one conformance fixture"],
+      ["source", "00000000-0000-4000-8000-000000000001"],
+      ["p", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      ["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+    ],
+    "expected_content": {
+      "format": "markdown",
+      "body": "# Goal\nAgree on the API.\n\n## Agenda\n1. Constraints\n2. Decision"
+    }
+  }
+}

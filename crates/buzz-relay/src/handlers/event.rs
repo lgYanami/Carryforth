@@ -303,6 +303,66 @@ pub async fn filter_fanout_by_access(
     let Some(channel_id) = stored_event.channel_id else {
         return matches;
     };
+
+    // Frozen Meeting membership proves who participated, not who may still
+    // read. Run this before the visibility fast-path: even a malformed metadata
+    // transition that made a Meeting Channel non-private must not bypass its
+    // durable current-principal gate. Ordinary Channels return `None` and keep
+    // their existing visibility/membership behavior. A database failure drops
+    // every recipient for this event.
+    let is_meeting = match state
+        .is_meeting_channel_cached(community_id, channel_id)
+        .await
+    {
+        Ok(is_meeting) => is_meeting,
+        Err(error) => {
+            warn!(%channel_id, "Meeting fan-out classification failed: {error}");
+            return Vec::new();
+        }
+    };
+    let matches = if is_meeting {
+        let recipient_pubkeys: Vec<Vec<u8>> = matches
+            .iter()
+            .filter_map(|(conn_id, _)| state.conn_manager.pubkey_for_conn(*conn_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        match buzz_db::meeting::active_meeting_reader_pubkeys_for_channel(
+            &state.db,
+            community_id,
+            channel_id,
+            &recipient_pubkeys,
+        )
+        .await
+        {
+            Ok(Some(active_pubkeys)) => {
+                let active_pubkeys: HashSet<_> = active_pubkeys.into_iter().collect();
+                matches
+                    .into_iter()
+                    .filter(|(conn_id, _)| {
+                        state
+                            .conn_manager
+                            .pubkey_for_conn(*conn_id)
+                            .is_some_and(|pubkey| active_pubkeys.contains(&pubkey))
+                    })
+                    .collect()
+            }
+            Ok(None) => {
+                warn!(%channel_id, "Meeting fan-out classification changed during reader check");
+                return Vec::new();
+            }
+            Err(error) => {
+                warn!(%channel_id, "Meeting fan-out reader security check failed: {error}");
+                return Vec::new();
+            }
+        }
+    } else {
+        matches
+    };
+    if matches.is_empty() {
+        return matches;
+    }
+
     // Fence 3 (§4.8 phase-2): the threaded value is used only when it was
     // resolved under exactly this (community_id, channel_id); anything else
     // falls through to the fresh lookup. Fence 1: absence of a usable threaded
@@ -544,7 +604,7 @@ pub(crate) async fn dispatch_persistent_event_with_options(
 
     metrics::counter!("buzz_post_commit_dispatch_scheduled_total").increment(1);
     tokio::spawn(async move {
-        let recipients = dispatch_persistent_event_inner(
+        let recipients = match dispatch_persistent_event_inner(
             &tenant,
             &state,
             &stored_event,
@@ -556,7 +616,16 @@ pub(crate) async fn dispatch_persistent_event_with_options(
             },
             threaded_visibility,
         )
-        .await;
+        .await
+        {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "publish")
+                    .increment(1);
+                warn!(event_id = %event_id_hex, "post-commit dispatch failed: {error}");
+                0
+            }
+        };
         debug!(
             event_id = %event_id_hex,
             recipients,
@@ -565,6 +634,47 @@ pub(crate) async fn dispatch_persistent_event_with_options(
     });
 
     0
+}
+
+/// Deliver a durable event before acknowledging its transactional outbox row.
+///
+/// Meeting runtime events are recovered from a database-backed outbox. Unlike
+/// the normal ingest path, the worker must not mark the outbox row delivered
+/// while fan-out is still only scheduled in a detached task. Meeting outbox
+/// delivery also suppresses generic workflow execution: canonical meeting
+/// events are discussion/control records, not an implicit task-execution API.
+pub(crate) async fn dispatch_persistent_event_now(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    stored_event: &StoredEvent,
+    kind_u32: u32,
+    actor_pubkey_hex: &str,
+    threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
+) -> Result<usize, String> {
+    let event_id_hex = stored_event.event.id.to_hex();
+    let recipients = dispatch_persistent_event_inner(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        PersistentDispatchOptions {
+            audit: false,
+            workflow: false,
+        },
+        threaded_visibility,
+    )
+    .await?;
+    enqueue_event_created_audit(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        &event_id_hex,
+    )
+    .await;
+    Ok(recipients)
 }
 
 /// Run post-commit delivery/side effects for a stored event.
@@ -576,7 +686,7 @@ async fn dispatch_persistent_event_inner(
     actor_pubkey_hex: &str,
     options: PersistentDispatchOptions,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
-) -> usize {
+) -> Result<usize, String> {
     // No `crate::conformance` emit here — the spec doesn't have a
     // separate fan-out action. Acceptance was already recorded at the
     // ingest seam (`crates/buzz-relay/src/handlers/ingest.rs`'s
@@ -590,7 +700,7 @@ async fn dispatch_persistent_event_inner(
         None => EventTopic::Global,
     };
     state.mark_local_event(tenant.community(), &stored_event.event.id);
-    if let Err(e) = state
+    let publish_error = if let Err(error) = state
         .pubsub
         .publish_event(tenant, topic, &stored_event.event)
         .await
@@ -599,8 +709,11 @@ async fn dispatch_persistent_event_inner(
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
         record_private_projection_dispatch_error(kind_u32);
-        warn!(event_id = %event_id_hex, "Redis publish failed: {e}");
-    }
+        warn!(event_id = %event_id_hex, "Redis publish failed: {error}");
+        Some(format!("Redis publish failed: {error}"))
+    } else {
+        None
+    };
 
     let matches = state
         .sub_registry
@@ -628,7 +741,7 @@ async fn dispatch_persistent_event_inner(
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
             record_private_projection_dispatch_error(kind_u32);
-            return 0;
+            return Err(format!("serialize event for fan-out: {e}"));
         }
     };
     // For viewer-private events (kind:30622 DM visibility, kind:44200 agent turn
@@ -702,7 +815,11 @@ async fn dispatch_persistent_event_inner(
             .iter()
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("buzz:workflow"));
 
-    if options.workflow
+    // A transactional outbox retries this whole dispatch when Redis publish
+    // fails. Defer workflow side effects until a publish succeeds so one
+    // canonical meeting event cannot start the same workflow on every retry.
+    if publish_error.is_none()
+        && options.workflow
         && !buzz_core::kind::is_workflow_execution_kind(kind_u32)
         && !buzz_core::kind::is_command_kind(kind_u32)
         && !is_relay_workflow_msg
@@ -735,7 +852,11 @@ async fn dispatch_persistent_event_inner(
         });
     }
 
-    matches.len()
+    if let Some(error) = publish_error {
+        Err(error)
+    } else {
+        Ok(matches.len())
+    }
 }
 
 async fn enqueue_event_created_audit(
@@ -1989,7 +2110,8 @@ mod tests {
                 },
                 None,
             )
-            .await;
+            .await
+            .expect("dispatch audited event");
 
             // Flush the audit worker so the row is committed before we read it.
             audit_shutdown
@@ -2094,7 +2216,8 @@ mod tests {
                 },
                 None,
             )
-            .await;
+            .await
+            .expect("dispatch tenant A event");
             super::super::dispatch_persistent_event_inner(
                 &tb,
                 &state,
@@ -2107,7 +2230,8 @@ mod tests {
                 },
                 None,
             )
-            .await;
+            .await
+            .expect("dispatch tenant B event");
 
             audit_shutdown
                 .drain(std::time::Duration::from_secs(5))
@@ -2194,6 +2318,10 @@ mod tests {
         pub(super) async fn test_state_with_redis_url(redis_url: &str) -> Arc<AppState> {
             let mut config = test_config();
             config.redis_url = redis_url.to_string();
+            test_state_with_config(config).await
+        }
+
+        async fn test_state_with_config(config: crate::config::Config) -> Arc<AppState> {
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
             let db = buzz_db::Db::from_pool(pool.clone());
             let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -2281,6 +2409,18 @@ mod tests {
         }
 
         fn register_conn(state: &AppState, pubkey: Option<Vec<u8>>) -> Uuid {
+            register_conn_in_community(
+                state,
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                pubkey,
+            )
+        }
+
+        fn register_conn_in_community(
+            state: &AppState,
+            community_id: buzz_core::tenant::CommunityId,
+            pubkey: Option<Vec<u8>>,
+        ) -> Uuid {
             let conn_id = Uuid::new_v4();
             let (tx, _rx) = mpsc::channel(1);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
@@ -2289,7 +2429,7 @@ mod tests {
                 tx,
                 ctrl_tx,
                 CancellationToken::new(),
-                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                community_id,
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
@@ -2331,6 +2471,9 @@ mod tests {
             state
                 .channel_visibility_cache
                 .insert((community_id, channel_id), "open".to_string());
+            state
+                .meeting_channel_cache
+                .insert((community_id, channel_id), false);
             // A connection with no authenticated pubkey would be dropped on a
             // private channel; on open it must pass untouched.
             let conn = register_conn(&state, None);
@@ -2354,6 +2497,9 @@ mod tests {
             state
                 .channel_visibility_cache
                 .insert((community_id, channel_id), "private".to_string());
+            state
+                .meeting_channel_cache
+                .insert((community_id, channel_id), false);
 
             let member_pk = vec![1u8; 32];
             let non_member_pk = vec![2u8; 32];
@@ -2440,6 +2586,9 @@ mod tests {
             state
                 .channel_visibility_cache
                 .insert((community_id, channel_id), "private".to_string());
+            state
+                .meeting_channel_cache
+                .insert((community_id, channel_id), false);
 
             // Threaded value says "open" but for a DIFFERENT channel.
             let threaded = crate::state::ThreadedChannelVisibility {
@@ -2473,6 +2622,9 @@ mod tests {
             let state = test_state().await;
             let channel_id = Uuid::new_v4();
             let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+            state
+                .meeting_channel_cache
+                .insert((community_id, channel_id), false);
 
             let member_pk = vec![1u8; 32];
             let non_member_pk = vec![2u8; 32];
@@ -2512,6 +2664,9 @@ mod tests {
             let state = test_state().await;
             let channel_id = Uuid::new_v4();
             let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+            state
+                .meeting_channel_cache
+                .insert((community_id, channel_id), false);
 
             let threaded = crate::state::ThreadedChannelVisibility {
                 community_id,
@@ -2530,6 +2685,160 @@ mod tests {
             )
             .await;
             assert_eq!(out, matches);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn meeting_fanout_uses_frozen_roster_and_uncached_principal_security() {
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+            let pool = sqlx::PgPool::connect(&database_url)
+                .await
+                .expect("connect to Meeting fan-out test database");
+            buzz_db::migration::run_migrations(&pool)
+                .await
+                .expect("apply Meeting fan-out migrations");
+
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_id.as_uuid())
+                .bind(format!(
+                    "meeting-fanout-{}.example",
+                    community_id.as_uuid().simple()
+                ))
+                .execute(&pool)
+                .await
+                .expect("insert Meeting fan-out community");
+
+            let valid = vec![0x81_u8; 32];
+            let removed = vec![0x82_u8; 32];
+            let outsider = vec![0x83_u8; 32];
+            for pubkey in [&valid, &removed, &outsider] {
+                sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+                    .bind(community_id.as_uuid())
+                    .bind(pubkey)
+                    .execute(&pool)
+                    .await
+                    .expect("insert Meeting fan-out identity");
+            }
+            for pubkey in [&valid, &outsider] {
+                sqlx::query(
+                    "INSERT INTO relay_members (community_id, pubkey, role) \
+                     VALUES ($1, $2, 'member')",
+                )
+                .bind(community_id.as_uuid())
+                .bind(hex::encode(pubkey))
+                .execute(&pool)
+                .await
+                .expect("insert active Relay member");
+            }
+
+            let meeting_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO channels \
+                     (community_id, id, name, visibility, created_by, room_kind) \
+                 VALUES ($1, $2, $3, 'open', $4, 'meeting')",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .bind(format!("meeting-fanout-{meeting_id}"))
+            .bind(&valid)
+            .execute(&pool)
+            .await
+            .expect("insert deliberately open Meeting Channel");
+            sqlx::query(
+                "INSERT INTO meeting_sessions \
+                     (community_id, session_id, create_event_id, host_pubkey, \
+                      schema_version, floor_policy_version, status) \
+                 VALUES ($1, $2, $3, $4, 1, $5, 'active')",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .bind([0x84_u8; 32].as_slice())
+            .bind(&valid)
+            .bind(buzz_db::meeting_floor::FLOOR_POLICY_VERSION)
+            .execute(&pool)
+            .await
+            .expect("insert V0 Meeting Session");
+            for (pubkey, role) in [(&valid, "owner"), (&removed, "member")] {
+                sqlx::query(
+                    "INSERT INTO channel_members \
+                         (community_id, channel_id, pubkey, role, invited_by) \
+                     VALUES ($1, $2, $3, $4::member_role, $5)",
+                )
+                .bind(community_id.as_uuid())
+                .bind(meeting_id)
+                .bind(pubkey)
+                .bind(role)
+                .bind(&valid)
+                .execute(&pool)
+                .await
+                .expect("insert frozen V0 participant");
+            }
+
+            let ordinary_channel_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO channels \
+                     (community_id, id, name, visibility, created_by) \
+                 VALUES ($1, $2, $3, 'open', $4)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(ordinary_channel_id)
+            .bind(format!("ordinary-fanout-{ordinary_channel_id}"))
+            .bind(&valid)
+            .execute(&pool)
+            .await
+            .expect("insert ordinary open Channel");
+
+            let mut config = test_config();
+            config.database_url = database_url;
+            let state = test_state_with_config(config).await;
+            let valid_conn = register_conn_in_community(&state, community_id, Some(valid.clone()));
+            let removed_conn =
+                register_conn_in_community(&state, community_id, Some(removed.clone()));
+            let outsider_conn =
+                register_conn_in_community(&state, community_id, Some(outsider.clone()));
+
+            // Deliberately poison the generic membership cache. The Meeting
+            // gate must still use the durable frozen roster and uncached
+            // principal state before the open-visibility fast path.
+            for pubkey in [&valid, &removed, &outsider] {
+                state
+                    .membership_cache
+                    .insert((community_id, meeting_id, pubkey.clone()), true);
+            }
+
+            let matches = vec![
+                (valid_conn, "valid".to_string()),
+                (removed_conn, "removed".to_string()),
+                (outsider_conn, "outsider".to_string()),
+            ];
+            let meeting_out = filter_fanout_by_access(
+                &state,
+                community_id,
+                &channel_event(Some(meeting_id)),
+                matches.clone(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                meeting_out,
+                vec![(valid_conn, "valid".to_string())],
+                "only an active principal in the frozen Meeting roster may receive"
+            );
+
+            let ordinary_out = filter_fanout_by_access(
+                &state,
+                community_id,
+                &channel_event(Some(ordinary_channel_id)),
+                matches.clone(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                ordinary_out, matches,
+                "ordinary open Channel fan-out must retain existing semantics"
+            );
         }
     }
 

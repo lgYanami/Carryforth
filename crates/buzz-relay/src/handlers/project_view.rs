@@ -1443,6 +1443,9 @@ fn map_v2_write_error(error: ProjectViewV2WriteError) -> IngestError {
         }
         ProjectViewV2WriteError::Domain(error) => map_v2_domain_error(error),
         ProjectViewV2WriteError::ObjectDomain(error) => map_domain_error(error),
+        ProjectViewV2WriteError::Database(buzz_db::DbError::AccessDenied(_)) => {
+            IngestError::AuthFailed("restricted:project_view:access_denied".to_owned())
+        }
         ProjectViewV2WriteError::Database(error) => {
             IngestError::Internal(format!("error: Project View v2 database failure: {error}"))
         }

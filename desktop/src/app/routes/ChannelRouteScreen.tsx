@@ -24,6 +24,10 @@ type ChannelRouteScreenProps = {
 };
 
 const MAX_ROUTE_ANCESTOR_HOPS = 50;
+const LazyMeetingScreen = React.lazy(async () => {
+  const module = await import("@/features/meeting/ui/MeetingScreen");
+  return { default: module.MeetingScreen };
+});
 
 async function fetchRouteEvent(eventId: string): Promise<RelayEvent | null> {
   try {
@@ -94,7 +98,7 @@ async function fetchRouteTargetEvents(
   return [...eventsById.values()];
 }
 
-export function ChannelRouteScreen({
+function ConversationChannelRouteScreen({
   autoSendDraftKey,
   channelId,
   selectedPostId,
@@ -212,4 +216,36 @@ export function ChannelRouteScreen({
       targetMessageId={targetMessageId}
     />
   );
+}
+
+/**
+ * Resolve the room domain before mounting any normal Channel timeline,
+ * composer, thread, reaction, Huddle, or management behavior.
+ */
+export function ChannelRouteScreen(props: ChannelRouteScreenProps) {
+  const channelsQuery = useChannelsQuery();
+  const activeChannel =
+    channelsQuery.data?.find((channel) => channel.id === props.channelId) ??
+    null;
+
+  if (channelsQuery.isPending && !activeChannel) {
+    return (
+      <ViewLoadingFallback
+        includeHeader
+        kind={props.selectedPostId ? "forum" : "channel"}
+      />
+    );
+  }
+
+  if (activeChannel?.roomKind === "meeting") {
+    return (
+      <React.Suspense
+        fallback={<ViewLoadingFallback includeHeader kind="channel" />}
+      >
+        <LazyMeetingScreen meetingId={activeChannel.id} />
+      </React.Suspense>
+    );
+  }
+
+  return <ConversationChannelRouteScreen {...props} />;
 }

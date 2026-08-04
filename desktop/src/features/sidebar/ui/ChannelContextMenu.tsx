@@ -13,8 +13,11 @@ import {
   StarOff,
   Trash2,
   TriangleAlert,
+  UsersRound,
 } from "lucide-react";
 
+import { requestOpenCreateMeeting } from "@/features/meeting/openCreateMeetingEvent";
+import { FeatureGate } from "@/shared/features";
 import {
   useArchiveChannelMutation,
   useChannelMembersQuery,
@@ -219,6 +222,24 @@ export function ChannelContextMenuItems({
   return (
     <>
       <CopyChannelSubmenu channel={channel} />
+      {channel.channelType !== "dm" && channel.roomKind === null ? (
+        <FeatureGate feature="meeting">
+          <ContextMenuItem
+            data-testid={`start-meeting-from-channel-${channel.name}`}
+            onSelect={() =>
+              deferMenuAction(() =>
+                requestOpenCreateMeeting({ sourceChannelId: channel.id }),
+              )
+            }
+          >
+            <ContextMenuIconSlot>
+              <UsersRound className="h-4 w-4" />
+            </ContextMenuIconSlot>
+            <span>Start a Meeting</span>
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+        </FeatureGate>
+      ) : null}
       {showMove ? (
         <MoveToSectionSubmenu
           channelId={channel.id}

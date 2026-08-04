@@ -14,7 +14,7 @@ use buzz_sdk::project_view_v3::build_role_command as build_v3_role_command;
 use buzz_sdk::role_brief::render_role_brief_markdown;
 use buzz_sdk::role_brief_v3::render_role_brief_markdown_v3;
 use chrono::{Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -933,6 +933,13 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
             command.runtime_fence = None;
         }
     }
+    let responsibility = match &command.request {
+        RoleCommandRequest::SetWorkResponsibility {
+            work_id,
+            responsible_role_id,
+        } => Some((*work_id, *responsible_role_id)),
+        _ => None,
+    };
     let event = match identity.schema {
         ProjectViewSchema::V2 => {
             client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?
@@ -952,7 +959,18 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
             ));
         }
     };
-    let response = client.submit_event(event).await?;
+    let response = client.submit_event(event.clone()).await?;
+    if let Some((work_id, responsible_role_id)) = responsibility {
+        return print_responsibility_write(
+            client,
+            identity,
+            &event,
+            &response,
+            work_id,
+            responsible_role_id,
+        )
+        .await;
+    }
     println!("{}", normalize_write_response(&response));
     Ok(())
 }
@@ -1032,6 +1050,137 @@ fn assignment_read_error(error: CliError) -> CliError {
     CliError::Other(format!(
         "assignment_unavailable: current Assignment could not be verified: {error}"
     ))
+}
+
+#[derive(Deserialize)]
+struct RoleWriteResponse {
+    event_id: String,
+    accepted: bool,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct ResponsibilityReceipt {
+    #[serde(default)]
+    schema_version: Option<u16>,
+    project_revision: u64,
+    operation: String,
+    #[serde(alias = "work_objects")]
+    changed_objects: Vec<ResponsibilityChangedObject>,
+}
+
+#[derive(Deserialize)]
+struct ResponsibilityChangedObject {
+    #[serde(default)]
+    object_type: Option<String>,
+    object_id: Uuid,
+    object_revision: u64,
+    responsible_role_id: Option<Uuid>,
+}
+
+async fn print_responsibility_write(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    event: &nostr::Event,
+    raw: &str,
+    work_id: Uuid,
+    responsible_role_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    let response: RoleWriteResponse = serde_json::from_str(raw)
+        .map_err(|error| integrity_error(format!("invalid Role write response: {error}")))?;
+    if !response.accepted || response.event_id != event.id.to_hex() {
+        return Err(integrity_error(
+            "Role write response does not confirm the submitted event",
+        ));
+    }
+    let receipt: ResponsibilityReceipt = serde_json::from_str(
+        response
+            .message
+            .strip_prefix("response:")
+            .ok_or_else(|| integrity_error("Role write response has no canonical receipt"))?,
+    )
+    .map_err(|error| integrity_error(format!("invalid responsibility receipt: {error}")))?;
+    let changed = receipt
+        .changed_objects
+        .iter()
+        .find(|changed| changed.object_id == work_id)
+        .ok_or_else(|| {
+            integrity_error("responsibility receipt does not contain the target Work")
+        })?;
+    if receipt.project_revision == 0
+        || receipt.operation != "set_work_responsibility"
+        || receipt.changed_objects.len() != 1
+        || changed.responsible_role_id != responsible_role_id
+        || changed.object_revision == 0
+        || match identity.schema {
+            ProjectViewSchema::V2 => {
+                receipt.schema_version.is_some() || changed.object_type.as_deref() != Some("work")
+            }
+            ProjectViewSchema::V3 => {
+                receipt.schema_version != Some(3)
+                    || changed
+                        .object_type
+                        .as_deref()
+                        .is_some_and(|object_type| object_type != "work")
+            }
+            ProjectViewSchema::V1 => true,
+        }
+    {
+        return Err(integrity_error(
+            "responsibility receipt differs from the submitted operation",
+        ));
+    }
+    let projection_source = match identity.schema {
+        ProjectViewSchema::V2 => {
+            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let work = snapshot.active_object(work_id).ok_or_else(|| {
+                integrity_error("accepted responsibility has no verified active Work projection")
+            })?;
+            if snapshot.meta().project_revision < receipt.project_revision
+                || work.responsible_role_id != responsible_role_id
+                || work.source.change_id.to_hex() != event.id.to_hex()
+            {
+                return Err(integrity_error(
+                    "verified Work projection does not confirm the responsibility receipt",
+                ));
+            }
+            work.source
+        }
+        ProjectViewSchema::V3 => {
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            let work = snapshot.active_object(work_id).ok_or_else(|| {
+                integrity_error("accepted responsibility has no verified active v3 Work projection")
+            })?;
+            if snapshot.meta().project_revision < receipt.project_revision
+                || work.responsible_role_id != responsible_role_id
+                || work.source.change_id.to_hex() != event.id.to_hex()
+            {
+                return Err(integrity_error(
+                    "verified v3 Work projection does not confirm the responsibility receipt",
+                ));
+            }
+            work.source
+        }
+        ProjectViewSchema::V1 => {
+            return Err(integrity_error(
+                "responsibility writes require Project View schema v2 or v3",
+            ));
+        }
+    };
+    println!(
+        "{}",
+        json!({
+            "event_id": event.id.to_hex(),
+            "accepted": true,
+            "operation": receipt.operation,
+            "work_id": work_id,
+            "object_revision": changed.object_revision,
+            "responsible_role_id": responsible_role_id,
+            "accepted_project_revision": receipt.project_revision,
+            "projection_source": projection_source,
+        })
+    );
+    Ok(())
 }
 
 async fn read_snapshot(client: &BuzzClient) -> Result<RoleSnapshot, CliError> {

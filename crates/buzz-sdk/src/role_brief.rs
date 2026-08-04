@@ -673,6 +673,17 @@ impl VerifiedRoleBriefSnapshot {
         self.roles.get(&role_id).map(|head| &head.source)
     }
 
+    /// Return one active object together with its verified responsibility and
+    /// exact projection source. Tombstones intentionally have no active head.
+    #[must_use]
+    pub fn active_object(&self, object_id: Uuid) -> Option<RoleBriefObject> {
+        self.objects.get(&object_id).map(|head| RoleBriefObject {
+            object: head.object.clone(),
+            responsible_role_id: head.responsible_role_id,
+            source: head.source.clone(),
+        })
+    }
+
     /// Iterate over canonical Role definitions by stable Role ID.
     pub fn roles(&self) -> impl Iterator<Item = &RoleDefinition> {
         self.roles.values().map(|head| &head.entity)

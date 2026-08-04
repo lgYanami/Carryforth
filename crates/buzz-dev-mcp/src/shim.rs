@@ -73,6 +73,17 @@ impl Shim {
             git_env,
         })
     }
+
+    /// Absolute path to the session-scoped `buzz` multicall personality.
+    ///
+    /// Read-only tools use this instead of PATH lookup so an untrusted tool
+    /// argument can never select a different executable.
+    pub(crate) fn buzz_path(&self) -> PathBuf {
+        let path = self._dir.path().join("buzz");
+        #[cfg(windows)]
+        let path = path.with_extension("exe");
+        path
+    }
 }
 
 struct KeyInfo {
