@@ -184,8 +184,8 @@ pub enum MeetingPolicy {
     /// Meeting V2 moderator-maintained shared board.
     #[value(name = "moderated-board-v1")]
     ModeratedBoardV2,
-    /// Meeting V2 with optional action finalization before normal close.
-    #[value(name = "moderated-board-actions-v1")]
+    /// Meeting V2 with direct moderator action finalization before normal close.
+    #[value(name = "moderated-board-actions-v2")]
     ModeratedBoardActionsV2,
 }
 
@@ -1533,27 +1533,12 @@ pub enum MeetingActionsCmd {
         #[arg(long)]
         meeting: String,
     },
-    /// Freeze a validated technical action plan from a JSON file
-    Plan {
-        /// Meeting UUID
-        #[arg(long)]
-        meeting: String,
-        /// Path to a MeetingV2ActionPlan JSON document; use '-' for stdin
-        #[arg(long)]
-        input: String,
-    },
-    /// Execute and verify the next unapplied Project View step
-    Apply {
-        /// Meeting UUID
-        #[arg(long)]
-        meeting: String,
-    },
     /// Durably block the current action run with a closed reason code
     Block {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
-        /// Stable materializer failure category
+        /// Stable direct-action failure category
         #[arg(long)]
         reason_code: String,
         /// Optional bounded diagnostic
@@ -1566,13 +1551,14 @@ pub enum MeetingActionsCmd {
         #[arg(long)]
         meeting: String,
     },
-    /// Verify all action projections and make the run ready to close
-    Complete {
+    /// Confirm action outputs are recorded and close the Meeting
+    #[command(name = "confirm-recorded")]
+    ConfirmRecorded {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
     },
-    /// Return a zero-effect action run to Board maintenance
+    /// Return to Board while preserving any external effects already produced
     #[command(name = "return-to-board")]
     ReturnToBoard {
         /// Meeting UUID
@@ -3220,7 +3206,7 @@ mod tests {
             "meetings",
             "create",
             "--policy",
-            "moderated-board-actions-v1",
+            "moderated-board-actions-v2",
             "--title",
             "Action review",
             "--board",

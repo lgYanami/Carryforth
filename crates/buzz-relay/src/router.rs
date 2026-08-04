@@ -394,7 +394,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .meeting_v2_deployment_ready(
                         state.config.relay_private_key.is_some(),
                         state.config.meeting_v2_create_enabled
-                            || state.config.meeting_v2_actions_create_enabled,
+                            || state.config.meeting_v2_direct_actions_create_enabled,
                     )
                     .await
                     .unwrap_or(false)

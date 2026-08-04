@@ -514,7 +514,7 @@ async fn handle_meeting_create(
         protocol,
         state.config.meeting_v1_create_enabled,
         state.config.meeting_v2_create_enabled,
-        state.config.meeting_v2_actions_create_enabled,
+        state.config.meeting_v2_direct_actions_create_enabled,
     )?;
     if protocol == MeetingProtocol::ModeratedBoardActionsV2
         && !buzz_db::meeting_v2::action_roster_supports_capability_tx(
@@ -793,7 +793,7 @@ async fn handle_meeting_end(
     struct ParsedActionEndFence {
         action_run_id: Uuid,
         action_window_epoch: i64,
-        plan_event_id: Vec<u8>,
+        board_event_id: Vec<u8>,
     }
     let action_end_fence = if protocol.has_action_finalization()
         && v2_terminal.0 == buzz_db::meeting_v2::TerminalOutcome::Closed
@@ -820,14 +820,19 @@ async fn handle_meeting_end(
                         "invalid: Meeting action window must be positive".into(),
                     ));
                 }
-                let plan_event_id = decode_event_id(
-                    &require_single_tag(event, "action-plan")?,
-                    "Meeting action plan event id",
+                let board_event_id = decode_event_id(
+                    &require_single_tag(event, "board")?,
+                    "Meeting final Board event id",
                 )?;
+                if require_single_tag(event, "attestation")? != "actions-recorded" {
+                    return Err(IngestError::Rejected(
+                        "invalid: Meeting action close must attest actions-recorded".into(),
+                    ));
+                }
                 Ok(ParsedActionEndFence {
                     action_run_id,
                     action_window_epoch,
-                    plan_event_id,
+                    board_event_id,
                 })
             })
             .transpose()?
@@ -990,7 +995,7 @@ async fn handle_meeting_end(
                 buzz_db::meeting_v2::EndMeetingV2ActionFence {
                     action_run_id: fence.action_run_id,
                     action_window_epoch: fence.action_window_epoch,
-                    plan_event_id: &fence.plan_event_id,
+                    board_event_id: &fence.board_event_id,
                 }
             });
             let end = buzz_db::meeting_v2::end_meeting_v2_tx(
@@ -1545,7 +1550,7 @@ fn ensure_meeting_create_enabled(
     protocol: MeetingProtocol,
     meeting_v1_create_enabled: bool,
     meeting_v2_create_enabled: bool,
-    meeting_v2_actions_create_enabled: bool,
+    meeting_v2_direct_actions_create_enabled: bool,
 ) -> Result<(), IngestError> {
     if protocol == MeetingProtocol::ModeratedBatonV1 && !meeting_v1_create_enabled {
         return Err(IngestError::Rejected(
@@ -1558,7 +1563,7 @@ fn ensure_meeting_create_enabled(
         ));
     }
     if protocol == MeetingProtocol::ModeratedBoardActionsV2
-        && (!meeting_v2_create_enabled || !meeting_v2_actions_create_enabled)
+        && (!meeting_v2_create_enabled || !meeting_v2_direct_actions_create_enabled)
     {
         return Err(IngestError::Rejected(
             "restricted: action-capable Meeting V2 creation is disabled".into(),
@@ -1637,7 +1642,8 @@ fn validate_meeting_end_protocol(
                                 "outcome",
                                 "action-run",
                                 "action-window",
-                                "action-plan",
+                                "board",
+                                "attestation",
                             ],
                             &[],
                             &[],
@@ -3011,7 +3017,7 @@ mod meeting_protocol_tests {
         .is_ok());
 
         let action_run_id = Uuid::new_v4().to_string();
-        let plan_event_id = "22".repeat(32);
+        let board_event_id = "22".repeat(32);
         let v2_actions_gated_close = meeting_end(vec![
             tag(&["h", &session]),
             tag(&["v", "3"]),
@@ -3020,7 +3026,8 @@ mod meeting_protocol_tests {
             tag(&["outcome", "closed"]),
             tag(&["action-run", &action_run_id]),
             tag(&["action-window", "2"]),
-            tag(&["action-plan", &plan_event_id]),
+            tag(&["board", &board_event_id]),
+            tag(&["attestation", "actions-recorded"]),
         ]);
         assert!(validate_meeting_end_protocol(
             &v2_actions_gated_close,

@@ -1,22 +1,12 @@
 use std::collections::HashSet;
 
-use buzz_project_view::v2::{ProjectObjectCommand, RoleCommand, RoleCommandRequest};
-use buzz_project_view::{
-    CreateMutation, MutationRequest, NewProjectViewObject, ObjectRef, Priority,
-    ProjectViewObjectData, ProjectViewObjectType, RequirementStatus, WorkStatus,
-};
-use buzz_sdk::project_view_v2::{build_project_object_command, build_role_command};
-use nostr::Event;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::client::{
     extract_d_tag, extract_p_tags, extract_tag_value, normalize_write_response,
     print_create_response, BuzzClient,
-};
-use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_verified_v2_snapshot, require_v2_identity, runtime_fence_from_env,
 };
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_file_or_stdin, read_or_stdin, sdk_err, validate_hex64};
@@ -148,84 +138,9 @@ struct BatonState {
 #[derive(Debug, Clone, Deserialize)]
 struct MeetingActionRunView {
     action_run_id: Uuid,
-    plan_event_id: Option<String>,
     board_event_id: String,
     action_window_epoch: u64,
-    phase: String,
     condition: String,
-    steps: Vec<MeetingActionStepView>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MeetingActionStepView {
-    step_id: Uuid,
-    kind: String,
-    payload: Value,
-    assignee_pubkey: Option<String>,
-    resolved_role_id: Option<Uuid>,
-    resolved_assignment_id: Option<Uuid>,
-    target_object_id: Uuid,
-    status: String,
-    attempt_count: u32,
-    current_attempt: Option<MeetingActionAttemptView>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MeetingActionAttemptView {
-    attempt: u32,
-    project_event_id: Option<String>,
-    accepted_project_revision: Option<u64>,
-    status: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MeetingRequirementPayload {
-    title: String,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MeetingWorkPayload {
-    title: String,
-    requirement_id: Uuid,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeetingActionWriteResponse {
-    event_id: String,
-    accepted: bool,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeetingActionProjectReceipt {
-    project_revision: u64,
-    operation: String,
-    object_id: Option<Uuid>,
-    object_revision: Option<u64>,
-    deleted: Option<bool>,
-    #[serde(default)]
-    changed_objects: Vec<MeetingActionChangedObject>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeetingActionChangedObject {
-    object_type: String,
-    object_id: Uuid,
-    object_revision: u64,
-    responsible_role_id: Option<Uuid>,
-}
-
-fn meeting_action_project_description(title: &str, description: Option<&str>) -> String {
-    description
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(title)
-        .to_owned()
 }
 
 fn parse_baton_state(event: &serde_json::Value) -> Option<BatonState> {
@@ -1386,7 +1301,7 @@ fn meeting_action_fence<'a>(
     buzz_sdk::MeetingV2ActionRunFence {
         action_run_id: action.action_run_id,
         action_window: action.action_window_epoch,
-        plan_event_id: action.plan_event_id.as_deref(),
+        board_event_id: &action.board_event_id,
     }
 }
 
@@ -1462,38 +1377,6 @@ pub async fn cmd_meeting_actions_begin(
     Ok(())
 }
 
-pub async fn cmd_meeting_actions_plan(
-    client: &BuzzClient,
-    meeting_id: &str,
-    input: &str,
-) -> Result<(), CliError> {
-    let meeting_id = parse_uuid(meeting_id)?;
-    let (_, action) = meeting_action_context(client, meeting_id).await?;
-    if action.phase != "planning" || action.condition != "runnable" {
-        return Err(CliError::Conflict(
-            "Meeting action run is not accepting a plan".to_owned(),
-        ));
-    }
-    let plan: buzz_sdk::MeetingV2ActionPlan = serde_json::from_str(&read_file_or_stdin(input)?)
-        .map_err(|error| CliError::Usage(format!("invalid Meeting action plan JSON: {error}")))?;
-    if plan.action_run_id != action.action_run_id || plan.board_event_id != action.board_event_id {
-        return Err(CliError::Conflict(
-            "action plan does not bind the authoritative run and frozen Board".to_owned(),
-        ));
-    }
-    let builder = buzz_sdk::build_meeting_v2_action_plan(buzz_sdk::MeetingV2ActionPlanParams {
-        session_id: meeting_id,
-        fence: meeting_action_fence(&action),
-        plan: &plan,
-    })
-    .map_err(sdk_err)?;
-    println!(
-        "{}",
-        submit_meeting_action_builder(client, meeting_id, builder, "plan_event_id").await?
-    );
-    Ok(())
-}
-
 async fn cmd_meeting_actions_empty_command(
     client: &BuzzClient,
     meeting_id: &str,
@@ -1501,13 +1384,17 @@ async fn cmd_meeting_actions_empty_command(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
     let (_, action) = meeting_action_context(client, meeting_id).await?;
+    if action_name == "retry" && action.condition != "blocked" {
+        return Err(CliError::Conflict(
+            "Meeting action run is not blocked".to_owned(),
+        ));
+    }
     let params = buzz_sdk::MeetingV2ActionCommandParams {
         session_id: meeting_id,
         fence: meeting_action_fence(&action),
     };
     let builder = match action_name {
         "retry" => buzz_sdk::build_meeting_v2_action_retry(params),
-        "complete" => buzz_sdk::build_meeting_v2_action_complete(params),
         "return-to-board" => buzz_sdk::build_meeting_v2_action_return_to_board(params),
         _ => {
             return Err(CliError::Other(
@@ -1531,6 +1418,11 @@ pub async fn cmd_meeting_actions_block(
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
     let (_, action) = meeting_action_context(client, meeting_id).await?;
+    if action.condition != "runnable" {
+        return Err(CliError::Conflict(
+            "Meeting action run is not runnable".to_owned(),
+        ));
+    }
     let builder = buzz_sdk::build_meeting_v2_action_block(buzz_sdk::MeetingV2ActionBlockParams {
         session_id: meeting_id,
         fence: meeting_action_fence(&action),
@@ -1552,521 +1444,11 @@ pub async fn cmd_meeting_actions_retry(
     cmd_meeting_actions_empty_command(client, meeting_id, "retry").await
 }
 
-pub async fn cmd_meeting_actions_complete(
-    client: &BuzzClient,
-    meeting_id: &str,
-) -> Result<(), CliError> {
-    cmd_meeting_actions_empty_command(client, meeting_id, "complete").await
-}
-
 pub async fn cmd_meeting_actions_return_to_board(
     client: &BuzzClient,
     meeting_id: &str,
 ) -> Result<(), CliError> {
     cmd_meeting_actions_empty_command(client, meeting_id, "return-to-board").await
-}
-
-async fn build_meeting_action_project_event(
-    client: &BuzzClient,
-    action: &MeetingActionRunView,
-    step: &MeetingActionStepView,
-) -> Result<(Event, u64), CliError> {
-    let identity = require_v2_identity(client).await?;
-    let snapshot = read_verified_v2_snapshot(client, identity).await?;
-    let project_revision = snapshot.meta().project_revision;
-    let mut assignees = std::collections::HashMap::new();
-    for assignee in action
-        .steps
-        .iter()
-        .filter_map(|candidate| candidate.assignee_pubkey.as_deref())
-    {
-        if assignees.contains_key(assignee) {
-            continue;
-        }
-        let pubkey = nostr::PublicKey::from_hex(assignee)
-            .map_err(|error| CliError::Conflict(format!("invalid plan assignee: {error}")))?;
-        let assignment = snapshot
-            .assignments()
-            .find(|assignment| assignment.member_pubkey == pubkey && assignment.is_active())
-            .ok_or_else(|| {
-                CliError::Conflict(format!(
-                    "assignee_unresolved: {assignee} has no active Assignment"
-                ))
-            })?;
-        let role = snapshot
-            .roles()
-            .find(|role| role.role_id == assignment.role_id && role.active)
-            .ok_or_else(|| {
-                CliError::Conflict(format!(
-                    "assignee_unresolved: {assignee} has no active Role"
-                ))
-            })?;
-        assignees.insert(
-            assignee.to_owned(),
-            (assignment.assignment_id, role.role_id),
-        );
-    }
-    let acting_assignment = if is_managed_runtime() {
-        Some(
-            snapshot
-                .assignments()
-                .find(|assignment| {
-                    assignment.member_pubkey == client.public_key() && assignment.is_active()
-                })
-                .map(|assignment| assignment.assignment_id)
-                .ok_or_else(|| {
-                    CliError::Auth(
-                        "assignment_unavailable: moderator has no active Assignment".to_owned(),
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-    let runtime_fence = runtime_fence_from_env()?;
-    if snapshot.entry(step.target_object_id).is_some()
-        && matches!(
-            step.kind.as_str(),
-            "project_view.create_requirement" | "project_view.create_work"
-        )
-    {
-        return Err(CliError::Conflict(format!(
-            "object_id_conflict: {} already exists",
-            step.target_object_id
-        )));
-    }
-
-    let builder = match step.kind.as_str() {
-        "project_view.create_requirement" => {
-            let payload: MeetingRequirementPayload = serde_json::from_value(step.payload.clone())
-                .map_err(|error| {
-                CliError::Other(format!("invalid Requirement step payload: {error}"))
-            })?;
-            let mut command = ProjectObjectCommand::new(
-                project_revision,
-                acting_assignment,
-                MutationRequest::Create(CreateMutation {
-                    object: NewProjectViewObject::Requirement {
-                        id: step.target_object_id,
-                        description: meeting_action_project_description(
-                            &payload.title,
-                            payload.description.as_deref(),
-                        ),
-                        title: payload.title,
-                        status: RequirementStatus::Ready,
-                        priority: Priority::Normal,
-                        planned_in_stage_id: None,
-                    },
-                }),
-            );
-            command.runtime_fence = runtime_fence;
-            build_project_object_command(command)
-        }
-        "project_view.create_work" => {
-            let payload: MeetingWorkPayload = serde_json::from_value(step.payload.clone())
-                .map_err(|error| CliError::Other(format!("invalid Work step payload: {error}")))?;
-            if snapshot.active_object(payload.requirement_id).is_none() {
-                return Err(CliError::Conflict(format!(
-                    "missing_dependency: Requirement {} is not active",
-                    payload.requirement_id
-                )));
-            }
-            let mut command = ProjectObjectCommand::new(
-                project_revision,
-                acting_assignment,
-                MutationRequest::Create(CreateMutation {
-                    object: NewProjectViewObject::Work {
-                        id: step.target_object_id,
-                        description: meeting_action_project_description(
-                            &payload.title,
-                            payload.description.as_deref(),
-                        ),
-                        title: payload.title,
-                        status: WorkStatus::Pending,
-                        priority: Priority::Normal,
-                        handles: ObjectRef {
-                            object_type: ProjectViewObjectType::Requirement,
-                            object_id: payload.requirement_id,
-                        },
-                    },
-                }),
-            );
-            command.runtime_fence = runtime_fence;
-            build_project_object_command(command)
-        }
-        "project_view.set_work_responsibility" => {
-            let work = snapshot
-                .active_object(step.target_object_id)
-                .ok_or_else(|| {
-                    CliError::Conflict(format!(
-                        "missing_dependency: Work {} is not active",
-                        step.target_object_id
-                    ))
-                })?;
-            if !matches!(work.object.data, ProjectViewObjectData::Work(_)) {
-                return Err(CliError::Conflict(
-                    "missing_dependency: responsibility target is not a Work".to_owned(),
-                ));
-            }
-            if work.responsible_role_id.is_some() {
-                return Err(CliError::Conflict(format!(
-                    "responsibility_conflict: Work {} already has a responsible Role",
-                    step.target_object_id
-                )));
-            }
-            let assignee = step
-                .assignee_pubkey
-                .as_deref()
-                .ok_or_else(|| CliError::Other("responsibility step has no assignee".to_owned()))?;
-            let (assignment_id, role_id) = assignees.get(assignee).copied().ok_or_else(|| {
-                CliError::Conflict(format!(
-                    "assignee_unresolved: {assignee} has no active mapping"
-                ))
-            })?;
-            if step
-                .resolved_assignment_id
-                .is_some_and(|resolved| resolved != assignment_id)
-                || step
-                    .resolved_role_id
-                    .is_some_and(|resolved| resolved != role_id)
-            {
-                return Err(CliError::Conflict(format!(
-                    "assignee_mapping_changed: {assignee} changed Assignment or Role"
-                )));
-            }
-            let mut command = RoleCommand::new(
-                project_revision,
-                acting_assignment,
-                RoleCommandRequest::SetWorkResponsibility {
-                    work_id: step.target_object_id,
-                    responsible_role_id: Some(role_id),
-                },
-            );
-            command.runtime_fence = runtime_fence;
-            build_role_command(command)
-        }
-        _ => {
-            return Err(CliError::Other(format!(
-                "unsupported Meeting action step kind: {}",
-                step.kind
-            )));
-        }
-    }
-    .map_err(sdk_err)?;
-    Ok((client.sign_event_exact(builder)?, project_revision))
-}
-
-fn parse_meeting_action_project_receipt(
-    raw: &str,
-    event: &Event,
-    step: &MeetingActionStepView,
-) -> Result<MeetingActionProjectReceipt, CliError> {
-    let response: MeetingActionWriteResponse = serde_json::from_str(raw)
-        .map_err(|error| CliError::Other(format!("invalid Project View response: {error}")))?;
-    if !response.accepted || response.event_id != event.id.to_hex() {
-        return Err(CliError::Other(
-            "Project View response does not confirm the exact prepared event".to_owned(),
-        ));
-    }
-    let receipt: MeetingActionProjectReceipt = serde_json::from_str(
-        response
-            .message
-            .strip_prefix("response:")
-            .ok_or_else(|| CliError::Other("Project View response has no receipt".to_owned()))?,
-    )
-    .map_err(|error| CliError::Other(format!("invalid Project View receipt: {error}")))?;
-    let valid = match step.kind.as_str() {
-        "project_view.create_requirement" | "project_view.create_work" => {
-            receipt.operation == "create"
-                && receipt.object_id == Some(step.target_object_id)
-                && receipt.object_revision.is_some_and(|revision| revision > 0)
-                && receipt.deleted == Some(false)
-        }
-        "project_view.set_work_responsibility" => {
-            receipt.operation == "set_work_responsibility"
-                && receipt.changed_objects.len() == 1
-                && receipt.changed_objects.iter().any(|changed| {
-                    changed.object_type == "work"
-                        && changed.object_id == step.target_object_id
-                        && changed.object_revision > 0
-                        && changed.responsible_role_id == step.resolved_role_id
-                })
-        }
-        _ => false,
-    };
-    if !valid || receipt.project_revision == 0 {
-        return Err(CliError::Other(
-            "Project View receipt differs from the frozen Meeting step".to_owned(),
-        ));
-    }
-    Ok(receipt)
-}
-
-async fn verify_meeting_action_projection(
-    client: &BuzzClient,
-    step: &MeetingActionStepView,
-    event: &Event,
-    accepted_project_revision: u64,
-) -> Result<(), CliError> {
-    let identity = require_v2_identity(client).await?;
-    let snapshot = read_verified_v2_snapshot(client, identity).await?;
-    if snapshot.meta().project_revision < accepted_project_revision {
-        return Err(CliError::Other(
-            "verified Project View metadata is older than the receipt".to_owned(),
-        ));
-    }
-    let object = snapshot
-        .active_object(step.target_object_id)
-        .ok_or_else(|| {
-            CliError::Other("accepted Project View object has no active projection".to_owned())
-        })?;
-    if object.source.change_id.to_hex() != event.id.to_hex() {
-        return Err(CliError::Conflict(
-            "provenance_mismatch: projection source differs from the prepared event".to_owned(),
-        ));
-    }
-    match step.kind.as_str() {
-        "project_view.create_requirement" => {
-            let payload: MeetingRequirementPayload = serde_json::from_value(step.payload.clone())
-                .map_err(|error| {
-                CliError::Other(format!("invalid Requirement payload: {error}"))
-            })?;
-            let ProjectViewObjectData::Requirement(requirement) = &object.object.data else {
-                return Err(CliError::Other(
-                    "accepted object is not a Requirement".to_owned(),
-                ));
-            };
-            if requirement.title != payload.title
-                || requirement.description
-                    != meeting_action_project_description(
-                        &payload.title,
-                        payload.description.as_deref(),
-                    )
-                || requirement.status != RequirementStatus::Ready
-                || requirement.priority != Priority::Normal
-            {
-                return Err(CliError::Conflict(
-                    "accepted Requirement differs from the frozen step".to_owned(),
-                ));
-            }
-        }
-        "project_view.create_work" => {
-            let payload: MeetingWorkPayload = serde_json::from_value(step.payload.clone())
-                .map_err(|error| CliError::Other(format!("invalid Work payload: {error}")))?;
-            let ProjectViewObjectData::Work(work) = &object.object.data else {
-                return Err(CliError::Other("accepted object is not a Work".to_owned()));
-            };
-            if work.title != payload.title
-                || work.description
-                    != meeting_action_project_description(
-                        &payload.title,
-                        payload.description.as_deref(),
-                    )
-                || work.status != WorkStatus::Pending
-                || work.priority != Priority::Normal
-                || object.object.relations.handles
-                    != Some(ObjectRef {
-                        object_type: ProjectViewObjectType::Requirement,
-                        object_id: payload.requirement_id,
-                    })
-            {
-                return Err(CliError::Conflict(
-                    "accepted Work differs from the frozen step".to_owned(),
-                ));
-            }
-        }
-        "project_view.set_work_responsibility" => {
-            if object.responsible_role_id != step.resolved_role_id {
-                return Err(CliError::Conflict(
-                    "accepted Work responsibility differs from the resolved Role".to_owned(),
-                ));
-            }
-        }
-        _ => {
-            return Err(CliError::Other(
-                "unsupported Meeting action step kind".to_owned(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn recover_meeting_action_project_event(
-    client: &BuzzClient,
-    meeting_id: Uuid,
-    action: &MeetingActionRunView,
-    step: &MeetingActionStepView,
-    attempt: &MeetingActionAttemptView,
-) -> Result<Event, CliError> {
-    let project_event_id = attempt.project_event_id.as_deref().ok_or_else(|| {
-        CliError::Other("prepared Meeting action attempt has no Project event ID".to_owned())
-    })?;
-    let plan_event_id = action
-        .plan_event_id
-        .as_deref()
-        .ok_or_else(|| CliError::Other("Meeting action run has no frozen plan".to_owned()))?;
-    let filter = json!({
-        "kinds": [buzz_sdk::kind::KIND_MEETING_ACTION_COMMAND],
-        "#h": [meeting_id.to_string()],
-    });
-    let events = client.query_paginated(filter, 1_000).await?;
-    let outer = events
-        .into_iter()
-        .find(|event| {
-            extract_tag_value(event, "action") == "step-prepared"
-                && extract_tag_value(event, "action-run") == action.action_run_id.to_string()
-                && extract_tag_value(event, "action-plan") == plan_event_id
-                && extract_tag_value(event, "step") == step.step_id.to_string()
-                && extract_tag_value(event, "attempt") == attempt.attempt.to_string()
-                && extract_tag_value(event, "project-event") == project_event_id
-                && event.get("pubkey").and_then(Value::as_str)
-                    == Some(client.public_key().to_hex().as_str())
-        })
-        .ok_or_else(|| {
-            CliError::NotFound(
-                "the exact prepared Project View event is not available in Meeting history"
-                    .to_owned(),
-            )
-        })?;
-    let event: Event = serde_json::from_str(
-        outer
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| CliError::Other("prepared action event has no content".to_owned()))?,
-    )
-    .map_err(|error| CliError::Other(format!("invalid prepared Project event: {error}")))?;
-    if event.id.to_hex() != project_event_id || event.pubkey != client.public_key() {
-        return Err(CliError::Other(
-            "recovered Project event differs from the prepared attempt".to_owned(),
-        ));
-    }
-    Ok(event)
-}
-
-async fn submit_meeting_action_step_applied(
-    client: &BuzzClient,
-    meeting_id: Uuid,
-    action: &MeetingActionRunView,
-    step: &MeetingActionStepView,
-    project_event_id: &str,
-    accepted_project_revision: u64,
-) -> Result<Value, CliError> {
-    let builder = buzz_sdk::build_meeting_v2_action_step_applied(
-        buzz_sdk::MeetingV2ActionStepAppliedParams {
-            session_id: meeting_id,
-            fence: meeting_action_fence(action),
-            step_id: step.step_id,
-            project_event_id,
-            accepted_project_revision,
-        },
-    )
-    .map_err(sdk_err)?;
-    submit_meeting_action_builder(client, meeting_id, builder, "step_applied_event_id").await
-}
-
-pub async fn cmd_meeting_actions_apply(
-    client: &BuzzClient,
-    meeting_id: &str,
-) -> Result<(), CliError> {
-    let meeting_id = parse_uuid(meeting_id)?;
-    let (_, action) = meeting_action_context(client, meeting_id).await?;
-    if action.phase != "applying" || action.condition != "runnable" {
-        return Err(CliError::Conflict(
-            "Meeting action run is not runnable/applying".to_owned(),
-        ));
-    }
-    let step = action
-        .steps
-        .iter()
-        .find(|step| step.status != "applied")
-        .ok_or_else(|| {
-            CliError::Conflict(
-                "all action steps are applied; run `meetings actions complete`".to_owned(),
-            )
-        })?;
-
-    let (project_event, accepted_project_revision) =
-        if let Some(attempt) = step.current_attempt.as_ref().filter(|attempt| {
-            matches!(
-                attempt.status.as_deref(),
-                Some("prepared" | "published" | "indeterminate" | "accepted")
-            )
-        }) {
-            let event =
-                recover_meeting_action_project_event(client, meeting_id, &action, step, attempt)
-                    .await?;
-            let revision = if attempt.status.as_deref() == Some("accepted") {
-                attempt.accepted_project_revision.ok_or_else(|| {
-                    CliError::Other("accepted Meeting attempt has no Project revision".to_owned())
-                })?
-            } else {
-                let raw = client.submit_event(event.clone()).await?;
-                parse_meeting_action_project_receipt(&raw, &event, step)?.project_revision
-            };
-            (event, revision)
-        } else {
-            if !matches!(step.status.as_str(), "pending" | "failed") {
-                return Err(CliError::Conflict(format!(
-                    "action step {} cannot be applied from status {}",
-                    step.step_id, step.status
-                )));
-            }
-            let (event, expected_project_revision) =
-                build_meeting_action_project_event(client, &action, step).await?;
-            let project_event_id = event.id.to_hex();
-            let event_json = serde_json::to_value(&event)
-                .map_err(|error| CliError::Other(format!("serialize Project event: {error}")))?;
-            let plan_event_id = action.plan_event_id.as_deref().ok_or_else(|| {
-                CliError::Other("Meeting action run has no frozen plan".to_owned())
-            })?;
-            let builder = buzz_sdk::build_meeting_v2_action_step_prepared(
-                buzz_sdk::MeetingV2ActionStepPreparedParams {
-                    session_id: meeting_id,
-                    fence: buzz_sdk::MeetingV2ActionRunFence {
-                        action_run_id: action.action_run_id,
-                        action_window: action.action_window_epoch,
-                        plan_event_id: Some(plan_event_id),
-                    },
-                    step_id: step.step_id,
-                    attempt: step.attempt_count.saturating_add(1),
-                    project_event_id: &project_event_id,
-                    expected_project_revision,
-                    signed_project_event: &event_json,
-                },
-            )
-            .map_err(sdk_err)?;
-            submit_meeting_action_builder(client, meeting_id, builder, "step_prepared_event_id")
-                .await?;
-            let raw = client.submit_event(event.clone()).await?;
-            let receipt = parse_meeting_action_project_receipt(&raw, &event, step)?;
-            (event, receipt.project_revision)
-        };
-
-    verify_meeting_action_projection(client, step, &project_event, accepted_project_revision)
-        .await?;
-    let applied = submit_meeting_action_step_applied(
-        client,
-        meeting_id,
-        &action,
-        step,
-        &project_event.id.to_hex(),
-        accepted_project_revision,
-    )
-    .await?;
-    println!(
-        "{}",
-        json!({
-            "accepted": true,
-            "meeting_id": meeting_id,
-            "action_run_id": action.action_run_id,
-            "step_id": step.step_id,
-            "step_kind": step.kind,
-            "project_event_id": project_event.id.to_hex(),
-            "accepted_project_revision": accepted_project_revision,
-            "meeting_receipt": applied,
-        })
-    );
-    Ok(())
 }
 
 async fn cmd_intents_list(
@@ -3307,6 +2689,7 @@ async fn submit_meeting_v2_end(
     outcome: buzz_sdk::MeetingV2EndOutcome,
     reason_code: Option<&str>,
     reason: Option<&str>,
+    confirm_actions_recorded: bool,
 ) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?;
     let create = fetch_meeting_create(client, &meeting_id.to_string()).await?;
@@ -3323,7 +2706,7 @@ async fn submit_meeting_v2_end(
     struct OwnedActionEndFence {
         action_run_id: Uuid,
         action_window: u64,
-        plan_event_id: String,
+        board_event_id: String,
     }
     let action_fence = if protocol.has_action_finalization()
         && outcome == buzz_sdk::MeetingV2EndOutcome::Closed
@@ -3339,15 +2722,19 @@ async fn submit_meeting_v2_end(
             .and_then(serde_json::Value::as_str)
             == Some("finalizing_actions")
         {
+            if !confirm_actions_recorded {
+                return Err(CliError::Conflict(
+                    "Meeting is finalizing actions; use `meetings actions confirm-recorded` to attest completion and close"
+                        .into(),
+                ));
+            }
             let action = board_control
                 .get("action")
                 .and_then(serde_json::Value::as_object)
                 .ok_or_else(|| CliError::Conflict("Meeting has no active action run".into()))?;
-            if action.get("phase").and_then(serde_json::Value::as_str) != Some("ready_to_close")
-                || action.get("condition").and_then(serde_json::Value::as_str) != Some("runnable")
-            {
+            if action.get("condition").and_then(serde_json::Value::as_str) != Some("runnable") {
                 return Err(CliError::Conflict(
-                    "Meeting action run is not ready to close".into(),
+                    "Meeting action run is blocked and cannot be confirmed".into(),
                 ));
             }
             let action_run_id = action
@@ -3359,20 +2746,30 @@ async fn submit_meeting_v2_end(
                 .get("action_window_epoch")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| CliError::Other("action run has no valid window".into()))?;
-            let plan_event_id = action
-                .get("plan_event_id")
+            let board_event_id = action
+                .get("board_event_id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| CliError::Other("action run has no frozen plan".into()))?;
-            validate_hex64(plan_event_id)?;
+                .ok_or_else(|| CliError::Other("action run has no frozen Board".into()))?;
+            validate_hex64(board_event_id)?;
             Some(OwnedActionEndFence {
                 action_run_id,
                 action_window,
-                plan_event_id: plan_event_id.to_string(),
+                board_event_id: board_event_id.to_string(),
             })
         } else {
+            if confirm_actions_recorded {
+                return Err(CliError::Conflict(
+                    "Meeting is not finalizing actions".into(),
+                ));
+            }
             None
         }
     } else {
+        if confirm_actions_recorded {
+            return Err(CliError::Usage(format!(
+                "meeting {meeting_id} does not use direct action finalization"
+            )));
+        }
         None
     };
     let builder = if protocol.has_action_finalization() {
@@ -3387,7 +2784,7 @@ async fn submit_meeting_v2_end(
                 .map(|fence| buzz_sdk::MeetingV2ActionsEndFence {
                     action_run_id: fence.action_run_id,
                     action_window: fence.action_window,
-                    plan_event_id: &fence.plan_event_id,
+                    board_event_id: &fence.board_event_id,
                 }),
         })
     } else {
@@ -3414,6 +2811,22 @@ pub async fn cmd_close_meeting_v2(client: &BuzzClient, meeting_id: &str) -> Resu
         buzz_sdk::MeetingV2EndOutcome::Closed,
         None,
         None,
+        false,
+    )
+    .await
+}
+
+pub async fn cmd_meeting_actions_confirm_recorded(
+    client: &BuzzClient,
+    meeting_id: &str,
+) -> Result<(), CliError> {
+    submit_meeting_v2_end(
+        client,
+        meeting_id,
+        buzz_sdk::MeetingV2EndOutcome::Closed,
+        None,
+        None,
+        true,
     )
     .await
 }
@@ -3430,6 +2843,7 @@ pub async fn cmd_abort_meeting_v2(
         buzz_sdk::MeetingV2EndOutcome::Aborted,
         Some(reason_code),
         reason,
+        false,
     )
     .await
 }
@@ -3561,12 +2975,6 @@ pub async fn dispatch(
                 MeetingActionsCmd::Begin { meeting } => {
                     cmd_meeting_actions_begin(client, &meeting).await
                 }
-                MeetingActionsCmd::Plan { meeting, input } => {
-                    cmd_meeting_actions_plan(client, &meeting, &input).await
-                }
-                MeetingActionsCmd::Apply { meeting } => {
-                    cmd_meeting_actions_apply(client, &meeting).await
-                }
                 MeetingActionsCmd::Block {
                     meeting,
                     reason_code,
@@ -3578,8 +2986,8 @@ pub async fn dispatch(
                 MeetingActionsCmd::Retry { meeting } => {
                     cmd_meeting_actions_retry(client, &meeting).await
                 }
-                MeetingActionsCmd::Complete { meeting } => {
-                    cmd_meeting_actions_complete(client, &meeting).await
+                MeetingActionsCmd::ConfirmRecorded { meeting } => {
+                    cmd_meeting_actions_confirm_recorded(client, &meeting).await
                 }
                 MeetingActionsCmd::ReturnToBoard { meeting } => {
                     cmd_meeting_actions_return_to_board(client, &meeting).await
@@ -4130,9 +3538,10 @@ mod tests {
                     "control_epoch": 4,
                     "board_window": 9,
                     "action": {
+                        "mode": "host_direct",
                         "action_run_id": "00000000-0000-4000-8000-000000000001",
+                        "board_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "action_window_epoch": 1,
-                        "phase": "planning",
                         "condition": "runnable"
                     }
                 }
@@ -4141,8 +3550,8 @@ mod tests {
         let action_state = parse_baton_state(&action_event).expect("valid action-capable State");
         assert!(baton_is_v2(&action_state));
         assert_eq!(
-            action_state.content["board_control"]["action"]["phase"],
-            "planning"
+            action_state.content["board_control"]["action"]["mode"],
+            "host_direct"
         );
     }
 
@@ -4167,64 +3576,5 @@ mod tests {
         assert_eq!(output["canonical_object_id"], "aa".repeat(32));
         assert_eq!(output["state_revision"], 9);
         assert_eq!(output["accepted"], true);
-    }
-
-    #[test]
-    fn meeting_action_create_receipt_requires_exact_event_and_object() {
-        let keys = Keys::generate();
-        let object_id = Uuid::new_v4();
-        let event = build_project_object_command(ProjectObjectCommand::new(
-            9,
-            None,
-            MutationRequest::Create(CreateMutation {
-                object: NewProjectViewObject::Requirement {
-                    id: object_id,
-                    title: "Accepted design".to_owned(),
-                    description: "Accepted design".to_owned(),
-                    status: RequirementStatus::Ready,
-                    priority: Priority::Normal,
-                    planned_in_stage_id: None,
-                },
-            }),
-        ))
-        .expect("build Project command")
-        .sign_with_keys(&keys)
-        .expect("sign Project command");
-        let step = MeetingActionStepView {
-            step_id: Uuid::new_v4(),
-            kind: "project_view.create_requirement".to_owned(),
-            payload: json!({"title": "Accepted design"}),
-            assignee_pubkey: None,
-            resolved_role_id: None,
-            resolved_assignment_id: None,
-            target_object_id: object_id,
-            status: "prepared".to_owned(),
-            attempt_count: 1,
-            current_attempt: None,
-        };
-        let raw = json!({
-            "event_id": event.id.to_hex(),
-            "accepted": true,
-            "message": format!(
-                "response:{}",
-                json!({
-                    "project_revision": 10,
-                    "operation": "create",
-                    "object_id": object_id,
-                    "object_revision": 1,
-                    "deleted": false,
-                })
-            ),
-        })
-        .to_string();
-        assert_eq!(
-            parse_meeting_action_project_receipt(&raw, &event, &step)
-                .expect("exact Meeting Project receipt")
-                .project_revision,
-            10
-        );
-
-        let wrong = raw.replace(&object_id.to_string(), &Uuid::new_v4().to_string());
-        assert!(parse_meeting_action_project_receipt(&wrong, &event, &step).is_err());
     }
 }

@@ -250,25 +250,6 @@ impl RoleBriefResolver {
         }
     }
 
-    /// Read one complete verified v2 snapshot for deterministic protocol work
-    /// that needs object sources and Assignment mappings, without rendering a
-    /// model prompt or starting another Agent turn.
-    pub(crate) async fn verified_snapshot_bounded(
-        &self,
-    ) -> Result<(PublicKey, VerifiedRoleBriefSnapshot), String> {
-        let deadline = tokio::time::Instant::now() + ROLE_BRIEF_TIMEOUT;
-        let relay_pubkey = tokio::time::timeout_at(deadline, self.read_relay_identity())
-            .await
-            .map_err(|_| "Relay identity verification timed out".to_owned())??;
-        let meta = tokio::time::timeout_at(deadline, self.read_meta(relay_pubkey))
-            .await
-            .map_err(|_| "Project View metadata verification timed out".to_owned())??;
-        let snapshot = tokio::time::timeout_at(deadline, self.resolve_verified(relay_pubkey, meta))
-            .await
-            .map_err(|_| "Project View snapshot verification timed out".to_owned())??;
-        Ok((relay_pubkey, snapshot))
-    }
-
     async fn resolve_before(
         &self,
         deadline: tokio::time::Instant,

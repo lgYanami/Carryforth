@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 40);
+        assert_eq!(migrations.len(), 41);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1085,6 +1085,16 @@ mod tests {
         assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_runs"));
         assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_steps"));
         assert!(meeting_v2_actions.contains("CREATE TABLE meeting_v2_action_command_receipts"));
+
+        // Direct action finalization removes the unreleased Plan/Step runtime
+        // and replaces it with a moderator attestation fence.
+        assert_eq!(migrations[40].version, 41);
+        let meeting_v2_direct_actions = migrations[40].sql.as_str();
+        assert!(meeting_v2_direct_actions.contains("moderated-board-actions-v2"));
+        assert!(meeting_v2_direct_actions.contains("DROP TABLE meeting_v2_action_steps"));
+        assert!(meeting_v2_direct_actions.contains("completion_event_id"));
+        assert!(meeting_v2_direct_actions
+            .contains("action IN ('begin', 'block', 'retry', 'return-to-board')"));
     }
 
     #[test]
@@ -1147,21 +1157,32 @@ mod tests {
     }
 
     #[test]
-    fn desired_schema_contains_meeting_v2_action_finalization_state() {
+    fn desired_schema_contains_meeting_v2_direct_action_finalization_state() {
         let schema = include_str!("../../../schema/schema.sql");
 
         for required in [
-            "moderated-board-actions-v1",
+            "moderated-board-actions-v2",
             "finalizing_actions",
             "action_finalization_ms",
             "CREATE TABLE meeting_v2_action_runs",
-            "CREATE TABLE meeting_v2_action_steps",
-            "CREATE TABLE meeting_v2_action_step_attempts",
+            "completion_event_id",
             "CREATE TABLE meeting_v2_action_command_receipts",
+            "action IN ('begin', 'block', 'retry', 'return-to-board')",
         ] {
             assert!(
                 schema.contains(required),
-                "schema/schema.sql must include migration 0040 object {required}"
+                "schema/schema.sql must include migration 0041 object {required}"
+            );
+        }
+        for removed in [
+            "CREATE TABLE meeting_v2_action_steps",
+            "CREATE TABLE meeting_v2_action_step_attempts",
+            "plan_event_id",
+            "action_phase",
+        ] {
+            assert!(
+                !schema.contains(removed),
+                "schema/schema.sql must omit removed planned-action object {removed}"
             );
         }
     }
@@ -1209,6 +1230,148 @@ mod tests {
                 "schema/schema.sql is missing Project View fragment: {fragment}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn direct_action_upgrade_blocks_active_planned_session_then_removes_old_runtime() {
+        let admin_url = test_database_url();
+        let admin = PgPool::connect(&admin_url)
+            .await
+            .expect("connect database server");
+        let database_name = format!(
+            "buzz_meeting_direct_upgrade_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {database_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create direct-action migration scratch database");
+        let slash = admin_url.rfind('/').expect("database URL has path");
+        let database_url = format!("{}/{}", &admin_url[..slash], database_name);
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect direct-action migration scratch database");
+
+        MIGRATOR
+            .run_to(40, &pool)
+            .await
+            .expect("apply migrations through planned Meeting actions");
+        let community_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let action_run_id = uuid::Uuid::new_v4();
+        let host = vec![0x41_u8; 32];
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("direct-upgrade-{}.test", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("seed direct-action migration Community");
+        sqlx::query(
+            "INSERT INTO channels \
+                 (community_id, id, name, channel_type, visibility, created_by, room_kind) \
+             VALUES ($1, $2, 'planned-action-upgrade', 'stream', 'private', $3, 'meeting')",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("seed planned-action Meeting Channel");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, schema_version, \
+                  floor_policy_version, moderator_pubkey) \
+             VALUES ($1, $2, $3, $4, 3, 'moderated-board-actions-v1', $4)",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(vec![0x42_u8; 32])
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .expect("seed active planned-action Meeting");
+        sqlx::query(
+            "INSERT INTO meeting_v2_action_runs \
+                 (community_id, session_id, action_run_id, begin_event_id, board_event_id, \
+                  control_epoch, board_window, action_phase, action_condition, action_deadline_at) \
+             VALUES ($1, $2, $3, $4, $5, 1, 1, 'planning', 'runnable', \
+                     clock_timestamp() + interval '5 minutes')",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(action_run_id)
+        .bind(vec![0x43_u8; 32])
+        .bind(vec![0x44_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed active planned-action run");
+
+        let blocked = MIGRATOR.run_to(41, &pool).await;
+        assert!(
+            blocked
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains(
+                    "cannot remove Meeting planned actions while an active moderated-board-actions-v1 Session exists"
+                )),
+            "0041 must fail before mutating an active planned-action Meeting: {blocked:?}"
+        );
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
+        let old_run_survived: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM meeting_v2_action_runs \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3)",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(action_run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("verify failed migration left old run intact");
+        assert!(old_run_survived);
+
+        sqlx::query(
+            "UPDATE meeting_sessions \
+             SET status = 'ended', ended_at = clock_timestamp(), ended_by = $3, \
+                 end_event_id = $4, terminal_outcome = 'aborted', \
+                 terminal_reason_code = 'migration_fixture' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id)
+        .bind(session_id)
+        .bind(&host)
+        .bind(vec![0x45_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("end planned-action migration fixture");
+        MIGRATOR
+            .run_to(41, &pool)
+            .await
+            .expect("replace ended planned-action projections with direct runtime");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(41));
+        let direct_shape: (bool, bool, bool, i64) = sqlx::query_as(
+            "SELECT \
+                 to_regclass('meeting_v2_action_steps') IS NULL, \
+                 to_regclass('meeting_v2_action_step_attempts') IS NULL, \
+                 EXISTS (SELECT 1 FROM pg_attribute \
+                         WHERE attrelid = 'meeting_v2_action_runs'::regclass \
+                           AND attname = 'completion_event_id' AND NOT attisdropped), \
+                 (SELECT count(*) FROM meeting_v2_action_runs)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect direct action runtime after upgrade");
+        assert_eq!(direct_shape, (true, true, true, 0));
+
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database_name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop direct-action migration scratch database");
+        admin.close().await;
     }
 
     #[tokio::test]
@@ -1573,7 +1736,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(41));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -1678,8 +1841,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0040");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
+            .expect("upgrade scratch database through 0041");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(41));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -1811,7 +1974,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(40));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(41));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version IN (25, 26, 27, 28, 29, 30, 31) AND success",
@@ -1899,7 +2062,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(40));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(41));
     }
 
     #[tokio::test]

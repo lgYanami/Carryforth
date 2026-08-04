@@ -296,20 +296,12 @@ fn record_action_command_failure_metrics(action: &'static str, latency_seconds: 
         "duplicate" => "false"
     )
     .increment(1);
-    if matches!(action, "step-prepared" | "step-applied") {
-        metrics::counter!(
-            "meeting_v2_action_step_total",
-            "kind" => "unknown",
-            "outcome" => "error"
-        )
-        .increment(1);
-        metrics::histogram!(
-            "meeting_v2_action_step_latency_seconds",
-            "kind" => "unknown",
-            "outcome" => "error"
-        )
-        .record(latency_seconds);
-    }
+    metrics::histogram!(
+        "meeting_v2_action_command_latency_seconds",
+        "action" => action,
+        "outcome" => "error"
+    )
+    .record(latency_seconds);
 }
 
 fn record_action_command_metrics(
@@ -333,27 +325,17 @@ fn record_action_command_metrics(
     )
     .increment(1);
 
-    let details = &commit.response["details"];
-    if matches!(action, "step-prepared" | "step-applied") {
-        let kind =
-            action_step_metric_kind(details.get("step_kind").and_then(serde_json::Value::as_str));
-        metrics::counter!(
-            "meeting_v2_action_step_total",
-            "kind" => kind,
-            "outcome" => outcome
-        )
-        .increment(1);
-        metrics::histogram!(
-            "meeting_v2_action_step_latency_seconds",
-            "kind" => kind,
-            "outcome" => outcome
-        )
-        .record(latency_seconds);
-    }
+    metrics::histogram!(
+        "meeting_v2_action_command_latency_seconds",
+        "action" => action,
+        "outcome" => outcome
+    )
+    .record(latency_seconds);
     if !commit.accepted || commit.duplicate {
         return;
     }
 
+    let details = &commit.response["details"];
     let reason = match action {
         "block" => action_reason_metric_label(
             details
@@ -366,14 +348,12 @@ fn record_action_command_metrics(
                 .and_then(serde_json::Value::as_str),
         ),
         "begin" => "begin",
-        "plan" => "plan_frozen",
-        "complete" => "complete",
         "return-to-board" => "return_to_board",
         _ => "none",
     };
-    if let Some((from, to)) = action_phase_metric_transition(action, details) {
+    if let Some((from, to)) = action_metric_transition(action, details) {
         metrics::counter!(
-            "meeting_v2_action_phase_transition_total",
+            "meeting_v2_action_transition_total",
             "from" => from,
             "to" => to,
             "reason" => reason
@@ -394,48 +374,31 @@ fn record_action_command_metrics(
     }
 }
 
-fn action_phase_metric_transition(
+fn action_metric_transition(
     action: &str,
     details: &serde_json::Value,
 ) -> Option<(&'static str, &'static str)> {
-    let phase = details.get("phase").and_then(serde_json::Value::as_str);
     match action {
-        "begin" => Some(("floor_ready", "planning/runnable")),
-        "plan" => Some(("planning/runnable", "applying/runnable")),
-        "complete" => Some(("applying/runnable", "ready_to_close/runnable")),
-        "return-to-board" => Some(("action_active", "board_pending")),
-        "block" => Some(match phase {
-            Some("planning") => ("planning/runnable", "planning/blocked"),
-            Some("applying") => ("applying/runnable", "applying/blocked"),
-            _ => ("action/runnable", "action/blocked"),
-        }),
-        "retry" => Some(match phase {
-            Some("planning") => ("planning/blocked", "planning/runnable"),
-            Some("applying") => ("applying/blocked", "applying/runnable"),
-            _ => ("action/blocked", "action/runnable"),
-        }),
+        "begin" => Some(("floor_ready", "action/runnable")),
+        "return-to-board" => match details
+            .get("from_condition")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("blocked") => Some(("action/blocked", "board_pending")),
+            Some("runnable") => Some(("action/runnable", "board_pending")),
+            _ => None,
+        },
+        "block" => Some(("action/runnable", "action/blocked")),
+        "retry" => Some(("action/blocked", "action/runnable")),
         _ => None,
-    }
-}
-
-fn action_step_metric_kind(value: Option<&str>) -> &'static str {
-    match value {
-        Some("project_view.create_requirement") => "create_requirement",
-        Some("project_view.create_work") => "create_work",
-        Some("project_view.set_work_responsibility") => "set_work_responsibility",
-        _ => "unknown",
     }
 }
 
 fn action_reason_metric_label(value: Option<&str>) -> &'static str {
     match value {
-        Some("project_view_v2_unavailable") => "project_view_v2_unavailable",
-        Some("assignee_unresolved") => "assignee_unresolved",
-        Some("assignee_mapping_changed") => "assignee_mapping_changed",
-        Some("object_id_conflict") => "object_id_conflict",
-        Some("responsibility_conflict") => "responsibility_conflict",
-        Some("missing_dependency") => "missing_dependency",
-        Some("provenance_mismatch") => "provenance_mismatch",
+        Some("external_operation_failed") => "external_operation_failed",
+        Some("external_state_conflict") => "external_state_conflict",
+        Some("tool_unavailable") => "tool_unavailable",
         Some("provider_failure") => "provider_failure",
         Some("affinity_lost") => "affinity_lost",
         Some("action_deadline_exceeded") => "action_deadline_exceeded",
@@ -494,24 +457,6 @@ fn parse_action_command(
                     .transpose()?,
             }
         }
-        "plan" => {
-            validate_action_run_tag_schema(event, &[])?;
-            let fence = parse_action_run_fence(event)?;
-            if fence.plan_event_id.is_some() {
-                return Err(IngestError::Rejected(
-                    "invalid: Meeting action plan must use action-plan=none".into(),
-                ));
-            }
-            let plan: buzz_sdk::MeetingV2ActionPlan = serde_json::from_str(&event.content)
-                .map_err(|error| {
-                    IngestError::Rejected(format!(
-                        "invalid: malformed Meeting V2 action plan JSON: {error}"
-                    ))
-                })?;
-            buzz_sdk::validate_meeting_v2_action_plan(&plan)
-                .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
-            buzz_db::meeting_v2_actions::ActionCommand::Plan { fence, plan }
-        }
         "block" => {
             validate_action_run_tag_schema(event, &["reason-code"])?;
             validate_clean_action_text(&event.content, 1_024, true, "block reason")?;
@@ -522,81 +467,25 @@ fn parse_action_command(
                 reason_code,
             }
         }
-        "retry" | "complete" | "return-to-board" => {
-            validate_action_run_tag_schema(event, &[])?;
+        "retry" | "return-to-board" => {
+            let additional = if action == "return-to-board" {
+                &["external-effects"][..]
+            } else {
+                &[][..]
+            };
+            validate_action_run_tag_schema(event, additional)?;
             require_empty_content(event, "Meeting V2 action command")?;
             let fence = parse_action_run_fence(event)?;
             match action.as_str() {
                 "retry" => buzz_db::meeting_v2_actions::ActionCommand::Retry { fence },
-                "complete" => buzz_db::meeting_v2_actions::ActionCommand::Complete { fence },
-                _ => buzz_db::meeting_v2_actions::ActionCommand::ReturnToBoard { fence },
-            }
-        }
-        "step-prepared" => {
-            validate_action_run_tag_schema(
-                event,
-                &[
-                    "step",
-                    "attempt",
-                    "project-event",
-                    "expected-project-revision",
-                ],
-            )?;
-            let fence = parse_action_run_fence(event)?;
-            if fence.plan_event_id.is_none() {
-                return Err(IngestError::Rejected(
-                    "invalid: prepared action step requires a frozen plan".into(),
-                ));
-            }
-            let step_id = parse_non_nil_uuid_tag(event, "step", "Meeting action step id")?;
-            let attempt =
-                i32::try_from(parse_positive_i64_tag(event, "attempt")?).map_err(|_| {
-                    IngestError::Rejected("invalid: Meeting action attempt exceeds i32".into())
-                })?;
-            let project_event_id = decode_event_id(
-                &require_single_tag(event, "project-event")?,
-                "Meeting prepared Project event id",
-            )?;
-            let expected_project_revision =
-                parse_positive_i64_tag(event, "expected-project-revision")?;
-            let signed_project_event: Event =
-                serde_json::from_str(&event.content).map_err(|error| {
-                    IngestError::Rejected(format!(
-                        "invalid: malformed signed Project View event JSON: {error}"
-                    ))
-                })?;
-            buzz_db::meeting_v2_actions::ActionCommand::StepPrepared {
-                fence,
-                step_id,
-                attempt,
-                project_event_id,
-                expected_project_revision,
-                signed_project_event,
-            }
-        }
-        "step-applied" => {
-            validate_action_run_tag_schema(
-                event,
-                &["step", "project-event", "accepted-project-revision"],
-            )?;
-            require_empty_content(event, "Meeting V2 applied action step")?;
-            let fence = parse_action_run_fence(event)?;
-            if fence.plan_event_id.is_none() {
-                return Err(IngestError::Rejected(
-                    "invalid: applied action step requires a frozen plan".into(),
-                ));
-            }
-            buzz_db::meeting_v2_actions::ActionCommand::StepApplied {
-                fence,
-                step_id: parse_non_nil_uuid_tag(event, "step", "Meeting action step id")?,
-                project_event_id: decode_event_id(
-                    &require_single_tag(event, "project-event")?,
-                    "Meeting applied Project event id",
-                )?,
-                accepted_project_revision: parse_positive_i64_tag(
-                    event,
-                    "accepted-project-revision",
-                )?,
+                _ => {
+                    if require_single_tag(event, "external-effects")? != "preserved" {
+                        return Err(IngestError::Rejected(
+                            "invalid: return-to-board must preserve external effects".into(),
+                        ));
+                    }
+                    buzz_db::meeting_v2_actions::ActionCommand::ReturnToBoard { fence }
+                }
             }
         }
         _ => {
@@ -619,7 +508,7 @@ fn validate_action_run_tag_schema(
         "action",
         "action-run",
         "action-window",
-        "action-plan",
+        "board",
     ];
     required.extend_from_slice(additional_required);
     validate_meeting_tag_schema(event, &required, &[], &[])
@@ -636,28 +525,14 @@ fn parse_action_run_fence(
         ));
     }
     let action_window_epoch = parse_positive_i64_tag(event, "action-window")?;
-    let plan = require_single_tag(event, "action-plan")?;
-    let plan_event_id = if plan == "none" {
-        None
-    } else {
-        Some(decode_event_id(&plan, "Meeting action plan event id")?)
-    };
     Ok(buzz_db::meeting_v2_actions::ActionRunFence {
         action_run_id,
         action_window_epoch,
-        plan_event_id,
+        board_event_id: decode_event_id(
+            &require_single_tag(event, "board")?,
+            "Meeting final Board event id",
+        )?,
     })
-}
-
-fn parse_non_nil_uuid_tag(event: &Event, tag_name: &str, field: &str) -> Result<Uuid, IngestError> {
-    let value = Uuid::parse_str(&require_single_tag(event, tag_name)?)
-        .map_err(|_| IngestError::Rejected(format!("invalid: bad {field}")))?;
-    if value.is_nil() {
-        return Err(IngestError::Rejected(format!(
-            "invalid: {field} must not be nil"
-        )));
-    }
-    Ok(value)
 }
 
 fn validate_clean_action_text(
@@ -2022,20 +1897,22 @@ mod tests {
     }
 
     #[test]
-    fn action_metric_labels_are_closed_and_phase_aware() {
-        assert_eq!(
-            action_step_metric_kind(Some("project_view.create_work")),
-            "create_work"
-        );
-        assert_eq!(action_step_metric_kind(Some("business.text")), "unknown");
+    fn direct_action_metric_labels_are_closed() {
         assert_eq!(
             action_reason_metric_label(Some("affinity_lost")),
             "affinity_lost"
         );
         assert_eq!(action_reason_metric_label(Some("private-id")), "other");
         assert_eq!(
-            action_phase_metric_transition("block", &serde_json::json!({"phase": "applying"})),
-            Some(("applying/runnable", "applying/blocked"))
+            action_metric_transition("block", &serde_json::json!({})),
+            Some(("action/runnable", "action/blocked"))
+        );
+        assert_eq!(
+            action_metric_transition(
+                "return-to-board",
+                &serde_json::json!({"from_condition": "blocked"}),
+            ),
+            Some(("action/blocked", "board_pending"))
         );
     }
 
@@ -2108,13 +1985,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_action_commands_parse_with_the_actions_policy_only() {
+    fn v2_direct_action_commands_parse_with_the_actions_policy_only() {
         let session_id = Uuid::new_v4();
         let action_run_id = Uuid::new_v4();
         let state_event_id = "aa".repeat(32);
         let board_event_id = "bb".repeat(32);
         let moderator = Keys::generate();
-        let assignee = Keys::generate().public_key().to_hex();
 
         let board =
             buzz_sdk::build_meeting_v2_actions_board_action(buzz_sdk::MeetingV2BoardActionParams {
@@ -2153,132 +2029,73 @@ mod tests {
             })) if parsed == session_id
         ));
 
-        let action_id = Uuid::new_v4();
-        let plan = buzz_sdk::MeetingV2ActionPlan {
-            version: buzz_sdk::MEETING_V2_ACTION_PLAN_VERSION,
+        let fence = buzz_sdk::MeetingV2ActionRunFence {
             action_run_id,
-            board_event_id,
-            items: vec![buzz_sdk::MeetingV2ActionItem {
-                action_id,
-                summary: "Implement the accepted design".to_string(),
-                assignee_pubkey: assignee,
-            }],
-            steps: vec![buzz_sdk::MeetingV2ActionStep {
-                step_id: Uuid::new_v4(),
-                action_id: Some(action_id),
-                kind: buzz_sdk::MeetingV2ActionStepKind::ProjectViewCreateWork,
-                target_object_id: Uuid::new_v4(),
-                payload: serde_json::json!({"title": "Implement"}),
-            }],
+            action_window: 1,
+            board_event_id: &board_event_id,
         };
-        let plan_event =
-            buzz_sdk::build_meeting_v2_action_plan(buzz_sdk::MeetingV2ActionPlanParams {
+        let block = buzz_sdk::build_meeting_v2_action_block(buzz_sdk::MeetingV2ActionBlockParams {
+            session_id,
+            fence,
+            reason_code: "external_operation_failed",
+            reason: Some("ordinary target operation failed"),
+        })
+        .expect("build block")
+        .sign_with_keys(&moderator)
+        .expect("sign block");
+        assert!(matches!(
+            parse_action_command(&block),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Block { fence, reason_code }))
+                if parsed == session_id
+                    && fence.action_run_id == action_run_id
+                    && fence.board_event_id == hex::decode(&board_event_id).expect("board hex")
+                    && reason_code == "external_operation_failed"
+        ));
+
+        let retry =
+            buzz_sdk::build_meeting_v2_action_retry(buzz_sdk::MeetingV2ActionCommandParams {
                 session_id,
-                fence: buzz_sdk::MeetingV2ActionRunFence {
-                    action_run_id,
-                    action_window: 1,
-                    plan_event_id: None,
-                },
-                plan: &plan,
+                fence,
             })
-            .expect("build action plan")
+            .expect("build retry")
             .sign_with_keys(&moderator)
-            .expect("sign action plan");
+            .expect("sign retry");
         assert!(matches!(
-            parse_action_command(&plan_event),
-            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Plan {
-                fence,
-                plan: parsed_plan,
-            })) if parsed == session_id
-                && fence.action_run_id == action_run_id
-                && fence.action_window_epoch == 1
-                && fence.plan_event_id.is_none()
-                && parsed_plan == plan
+            parse_action_command(&retry),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Retry { .. }))
+                if parsed == session_id
         ));
 
-        let project_event = buzz_sdk::project_view_v2::build_project_object_command(
-            buzz_project_view::v2::ProjectObjectCommand::new(
-                7,
-                None,
-                buzz_project_view::MutationRequest::Create(buzz_project_view::CreateMutation {
-                    object: buzz_project_view::NewProjectViewObject::Work {
-                        id: plan.steps[0].target_object_id,
-                        title: "Implement".to_string(),
-                        description: "Apply the frozen Meeting plan".to_string(),
-                        status: buzz_project_view::WorkStatus::Pending,
-                        priority: buzz_project_view::Priority::Normal,
-                        handles: buzz_project_view::ObjectRef {
-                            object_type: buzz_project_view::ProjectViewObjectType::Requirement,
-                            object_id: Uuid::new_v4(),
-                        },
-                    },
-                }),
-            ),
+        let returned = buzz_sdk::build_meeting_v2_action_return_to_board(
+            buzz_sdk::MeetingV2ActionCommandParams { session_id, fence },
         )
-        .expect("build Project View command")
+        .expect("build return")
         .sign_with_keys(&moderator)
-        .expect("sign Project View command");
-        let project_event_json = serde_json::to_value(&project_event).expect("serialize event");
-        let plan_event_id = plan_event.id.to_hex();
-        let project_event_id = project_event.id.to_hex();
-        let prepared = buzz_sdk::build_meeting_v2_action_step_prepared(
-            buzz_sdk::MeetingV2ActionStepPreparedParams {
-                session_id,
-                fence: buzz_sdk::MeetingV2ActionRunFence {
-                    action_run_id,
-                    action_window: 1,
-                    plan_event_id: Some(&plan_event_id),
-                },
-                step_id: plan.steps[0].step_id,
-                attempt: 1,
-                project_event_id: &project_event_id,
-                expected_project_revision: 7,
-                signed_project_event: &project_event_json,
-            },
-        )
-        .expect("build prepared step")
-        .sign_with_keys(&moderator)
-        .expect("sign prepared step");
+        .expect("sign return");
         assert!(matches!(
-            parse_action_command(&prepared),
-            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::StepPrepared {
-                fence,
-                step_id,
-                attempt: 1,
-                expected_project_revision: 7,
-                signed_project_event,
-                ..
-            })) if parsed == session_id
-                && fence.action_run_id == action_run_id
-                && fence.plan_event_id.as_deref() == Some(plan_event.id.as_bytes())
-                && step_id == plan.steps[0].step_id
-                && signed_project_event == project_event
+            parse_action_command(&returned),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::ReturnToBoard { .. }))
+                if parsed == session_id
+        ));
+        assert!(matches!(
+            require_single_tag(&returned, "external-effects").as_deref(),
+            Ok("preserved")
         ));
 
-        let applied = buzz_sdk::build_meeting_v2_action_step_applied(
-            buzz_sdk::MeetingV2ActionStepAppliedParams {
-                session_id,
-                fence: buzz_sdk::MeetingV2ActionRunFence {
-                    action_run_id,
-                    action_window: 1,
-                    plan_event_id: Some(&plan_event_id),
-                },
-                step_id: plan.steps[0].step_id,
-                project_event_id: &project_event_id,
-                accepted_project_revision: 8,
-            },
-        )
-        .expect("build applied step")
-        .sign_with_keys(&moderator)
-        .expect("sign applied step");
-        assert!(matches!(
-            parse_action_command(&applied),
-            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::StepApplied {
-                step_id,
-                accepted_project_revision: 8,
-                ..
-            })) if parsed == session_id && step_id == plan.steps[0].step_id
-        ));
+        let legacy_plan = signed(
+            buzz_core::kind::KIND_MEETING_ACTION_COMMAND,
+            "{}",
+            vec![
+                Tag::parse(["h", &session_id.to_string()]).expect("h"),
+                Tag::parse(["v", buzz_sdk::MEETING_V2_SCHEMA_VERSION]).expect("v"),
+                Tag::parse(["policy", buzz_sdk::MEETING_V2_ACTIONS_POLICY]).expect("policy"),
+                Tag::parse(["action", "plan"]).expect("action"),
+                Tag::parse(["action-run", &action_run_id.to_string()]).expect("run"),
+                Tag::parse(["action-window", "1"]).expect("window"),
+                Tag::parse(["board", &board_event_id]).expect("board"),
+            ],
+        );
+        assert!(parse_action_command(&legacy_plan).is_err());
     }
 
     #[test]

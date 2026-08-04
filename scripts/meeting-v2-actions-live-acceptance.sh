@@ -2,7 +2,7 @@
 # Run one bounded real-Codex acceptance of Meeting V2 action finalization.
 #
 # This intentionally runs one scenario once. It is not a retrying qualification
-# framework: a provider, continuity, materializer, or lifecycle failure leaves a
+# framework: a provider, continuity, business-tool, or lifecycle failure leaves a
 # failed evidence record for review.
 set -euo pipefail
 umask 077
@@ -33,7 +33,7 @@ relay_url="ws://${relay_host}"
 database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 relay_private_key="0000000000000000000000000000000000000000000000000000000000000001"
 relay_pubkey="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-action_capability="meeting-v2-action-finalization-v1"
+action_capability="meeting-v2-action-finalization-v2"
 redis_url=""
 relay_pid=""
 agent_pid=""
@@ -181,7 +181,7 @@ jq -e --arg capability "${action_capability}" '
   and any(
     .meeting.protocols[];
     .schemaVersion == "3"
-      and .policy == "moderated-board-actions-v1"
+      and .policy == "moderated-board-actions-v2"
       and .capability == $capability
       and .moderatorContinuity == "exact_agent_slot_and_acp_session"
       and (.turns | index("action_finalization") != null)
@@ -264,7 +264,7 @@ env \
   BUZZ_AUTO_MIGRATE=false \
   BUZZ_MEETING_V1_CREATE_ENABLED=true \
   BUZZ_MEETING_V2_CREATE_ENABLED=true \
-  BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED=true \
+  BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED=true \
   BUZZ_REQUIRE_RELAY_MEMBERSHIP=true \
   RELAY_OWNER_PUBKEY="${supervisor_pubkey}" \
   BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
@@ -335,8 +335,8 @@ seed_identity member human "${participant_pubkey}"
 curl -fsS -H 'Accept: application/nostr+json' -H "Host: ${relay_host}" \
   "http://127.0.0.1:${relay_port}/" >"${run_dir}/preflight/relay-capabilities.json"
 jq -e '
-  (.supported_extensions | index("buzz-meeting-v2-actions") != null)
-  and (.supported_extensions | index("buzz-meeting-v2-actions-create") != null)
+  (.supported_extensions | index("buzz-meeting-v2-direct-actions") != null)
+  and (.supported_extensions | index("buzz-meeting-v2-direct-actions-create") != null)
 ' "${run_dir}/preflight/relay-capabilities.json" >/dev/null \
   || fail "Relay did not advertise action runtime and Create capabilities"
 
@@ -356,21 +356,21 @@ role_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 jq -n '{
   name: "Meeting action acceptance",
   positioning: "A disposable action-finalization target",
-  purpose: "Validate a Meeting-owned Project View materialization",
+  purpose: "Validate direct moderator use of ordinary Project View tools",
   problem: "Meeting conclusions need durable follow-up",
   scope: "Backend acceptance only"
 }' >"${secret_dir}/profile.json"
 jq -n --arg id "${goal_id}" '{
   id: $id,
   title: "Accept Meeting action finalization",
-  desired_outcome: "The Meeting closes only after its frozen plan is materialized",
+  desired_outcome: "The Meeting closes after its recorded action is carried out",
   directions: []
 }' >"${secret_dir}/goal.json"
 jq -n '{
   name: "Meeting action owner",
-  purpose: "Own the materialized acceptance Work",
-  responsibilities: ["Carry the action accepted by the Meeting"],
-  boundaries: ["Only the frozen Meeting plan"],
+  purpose: "Carry out accepted Meeting actions through ordinary tools",
+  responsibilities: ["Record actions accepted by the Meeting"],
+  boundaries: ["Only decisions on the frozen Meeting Board"],
   active: true
 }' >"${secret_dir}/role.json"
 
@@ -407,23 +407,26 @@ assignment_id="$(docker exec -e PGPASSWORD=buzz_dev "${postgres_container}" \
 board_file="${secret_dir}/board.md"
 printf '%s\n' \
   '# Goal' \
-  'Reached: validate that a Meeting-owned action is materialized before normal close.' \
+  'Reached: validate that a moderator records the accepted action before normal close.' \
   '' \
   '# Effective conclusion' \
-  'The accepted follow-up must be represented by one Requirement and one Work in this Community Project View.' \
+  'The accepted decision record must be represented by one Resource in this Community Project View.' \
   '' \
   '# Closing operation' \
-  'Requirement title: Preserve accepted Meeting outcomes.' \
-  'Work title: Implement the accepted Meeting follow-up.' \
-  "Work assignee pubkey: ${moderator_pubkey}." \
-  'No other participant has a follow-up action. Materialize exactly this operation, then close normally.' \
+  'Use the ordinary buzz project-view CLI directly; do not generate a Meeting Plan or Step.' \
+  'Create exactly one Resource named: Accepted Meeting decision record.' \
+  'Resource type: document.' \
+  'Locator type: url.' \
+  'Locator value: https://example.invalid/accepted-meeting-decision.' \
+  'Description: Decision record created by the direct Meeting action acceptance.' \
+  'After the Resource is accepted, confirm that actions are recorded and close normally.' \
   >"${board_file}"
 
 log "creating one action-capable Meeting"
 buzz_as_moderator meetings create \
-  --policy moderated-board-actions-v1 \
+  --policy moderated-board-actions-v2 \
   --title 'Meeting V2 action finalization real-provider acceptance' \
-  --description 'One bounded backend acceptance; exactly one Project View Requirement and Work.' \
+  --description 'One bounded backend acceptance using the ordinary Project View CLI.' \
   --board "${board_file}" \
   --participant "${participant_pubkey}" >"${run_dir}/logs/meeting-create.json"
 meeting_id="$(jq -r '.meeting_id // empty' "${run_dir}/logs/meeting-create.json")"
@@ -433,14 +436,15 @@ printf 'scenario\tsession_id\nreal_provider_action\t%s\n' "${meeting_id}" \
 
 team_instructions="$(printf '%s\n' \
   '这是 Meeting V2 行动收口的一次性真实 Provider 验收。你是主持 Agent。' \
-  '当前看板已经明确记录 Goal reached、Effective conclusion、一个 Requirement、一个 Work，以及该 Work 由你自己的精确 pubkey 承接。' \
+  '当前看板已经明确记录 Goal reached、Effective conclusion，以及需要创建的一个 Resource。' \
   'Board Maintenance 必须保持这些事实；若无需修正则返回 UNCHANGED。' \
   '紧接着的 Floor Decision 必须选择 FINALIZE_ACTIONS，不能 CLOSE、IDLE 或 ABORT。' \
-  'Action Finalization 必须只把最终看板记录的一个 Requirement 和一个 Work 转换为严格 Materialization Intent；assignee_pubkey 必须使用看板中的主持人 pubkey，不得给 Human 参会者分配行动。' \
-  '不得自行发布 Meeting 或 Project View 事件，不得修改文件、Git 或看板之外的任何状态；由 Harness 编译计划并机械执行。')"
+  'Action Finalization 中必须直接使用普通 buzz project-view CLI：先读取权威视图和 revision，再严格按最终看板创建一个 Resource。' \
+  '不要生成 Plan、Step 或 Materialization Intent，不要自行发布 Meeting 协议事件，也不要修改源码或 Git。Resource 被 Relay 接受后返回 COMPLETE。')"
 
 log "starting exactly one real Codex ACP moderator runtime"
 env \
+  PATH="${repo_root}/target/release:${PATH}" \
   CODEX_CONFIG='{"model_reasoning_effort":"max","features":{"multi_agent":false}}' \
   BUZZ_ACP_MODEL="${model}[max]" \
   BUZZ_ACP_AGENT_COMMAND="${codex_acp_bin}" \
@@ -500,79 +504,50 @@ db_state="$(docker exec -e PGPASSWORD=buzz_dev "${postgres_container}" \
       'terminalOutcome', session_row.terminal_outcome,
       'policy', session_row.floor_policy_version,
       'actionTerminalStatus', action_row.terminal_status,
-      'actionPhase', action_row.action_phase,
       'actionCondition', action_row.action_condition,
-      'completionProjectRevision', action_row.completion_project_revision,
-      'itemCount', jsonb_array_length(action_row.plan_json->'items'),
-      'stepCount', count(step_row.*),
-      'appliedSteps', count(step_row.*) FILTER (WHERE step_row.status='applied'),
-      'acceptedAttempts', (
-        SELECT count(*) FROM meeting_v2_action_step_attempts attempt_row
-        WHERE attempt_row.community_id=action_row.community_id
-          AND attempt_row.session_id=action_row.session_id
-          AND attempt_row.action_run_id=action_row.action_run_id
-          AND attempt_row.status='accepted'
+      'actionRunId', action_row.action_run_id,
+      'actionWindow', action_row.action_window_epoch,
+      'boardEventId', encode(action_row.board_event_id, 'hex'),
+      'completionEventId', encode(action_row.completion_event_id, 'hex'),
+      'projectRevision', (
+        SELECT project_revision FROM project_view_state
+        WHERE community_id=action_row.community_id
       ),
-      'requirementObjects', count(object_row.*) FILTER (
-        WHERE step_row.step_kind='project_view.create_requirement'
-          AND object_row.object_type='requirement' AND object_row.deleted_at IS NULL
+      'resourceObjects', (
+        SELECT count(*) FROM project_view_objects object_row
+        WHERE object_row.community_id=action_row.community_id
+          AND object_row.object_type='resource'
+          AND object_row.deleted_at IS NULL
+          AND object_row.body->>'name'='Accepted Meeting decision record'
+          AND object_row.body->>'resource_type'='document'
+          AND object_row.body->'locator'->>'locator_type'='url'
+          AND object_row.body->'locator'->>'value'=
+              'https://example.invalid/accepted-meeting-decision'
       ),
-      'workObjects', count(object_row.*) FILTER (
-        WHERE step_row.step_kind='project_view.create_work'
-          AND object_row.object_type='work' AND object_row.deleted_at IS NULL
-      ),
-      'responsibilityMatches', count(object_row.*) FILTER (
-        WHERE step_row.step_kind='project_view.set_work_responsibility'
-          AND object_row.object_type='work'
-          AND object_row.responsible_role_id='${role_id}'::uuid
-      ),
-      'workCommitments', (
-        SELECT count(*) FROM project_work_commitments commitment
-        WHERE commitment.community_id=action_row.community_id
-          AND commitment.work_id IN (
-            SELECT target_object_id FROM meeting_v2_action_steps
-            WHERE community_id=action_row.community_id
-              AND session_id=action_row.session_id
-              AND action_run_id=action_row.action_run_id
-              AND step_kind='project_view.create_work'
-          )
-      )
+      'legacyStepTablesAbsent',
+        to_regclass('meeting_v2_action_steps') IS NULL
+        AND to_regclass('meeting_v2_action_step_attempts') IS NULL
     )::text
     FROM meeting_sessions session_row
     JOIN meeting_v2_action_runs action_row
       ON action_row.community_id=session_row.community_id
      AND action_row.session_id=session_row.session_id
-    JOIN meeting_v2_action_steps step_row
-      ON step_row.community_id=action_row.community_id
-     AND step_row.session_id=action_row.session_id
-     AND step_row.action_run_id=action_row.action_run_id
-    LEFT JOIN project_view_objects object_row
-      ON object_row.community_id=step_row.community_id
-     AND object_row.object_id=step_row.target_object_id
-    WHERE session_row.session_id='${meeting_id}'::uuid
-    GROUP BY session_row.status, session_row.terminal_outcome,
-      session_row.floor_policy_version, action_row.community_id,
-      action_row.session_id, action_row.action_run_id, action_row.terminal_status,
-      action_row.action_phase, action_row.action_condition,
-      action_row.completion_project_revision, action_row.plan_json;
+    WHERE session_row.session_id='${meeting_id}'::uuid;
   ")"
-[[ -n "${db_state}" ]] || fail "could not read final Meeting action state"
+[[ -n "${db_state}" ]] || fail "could not read final Meeting direct-action state"
 jq -e '
   .meetingStatus == "ended"
   and .terminalOutcome == "closed"
-  and .policy == "moderated-board-actions-v1"
+  and .policy == "moderated-board-actions-v2"
   and .actionTerminalStatus == "completed_closed"
-  and .actionPhase == "ready_to_close"
   and .actionCondition == "runnable"
-  and (.completionProjectRevision > 0)
-  and .itemCount == 1
-  and .stepCount == 3
-  and .appliedSteps == 3
-  and .acceptedAttempts == 3
-  and .requirementObjects == 1
-  and .workObjects == 1
-  and .responsibilityMatches == 1
-  and .workCommitments == 0
+  and (.actionRunId | type == "string" and length == 36)
+  and .actionWindow == 1
+  and (.boardEventId | type == "string" and length == 64)
+  and (.completionEventId | type == "string" and length == 64)
+  and (.projectRevision > 2)
+  and .resourceObjects == 1
+  and .legacyStepTablesAbsent == true
 ' <<<"${db_state}" >/dev/null || fail "final database lifecycle invariants did not pass"
 printf '%s\n' "${db_state}" | jq . >"${run_dir}/database-invariants.json"
 
@@ -588,10 +563,9 @@ observer_summary="$(jq -sc '
         .kind == "meeting_v1_turn_started"
         and .payload.turn_type == "action_finalization"
       )] | length),
-      plansCompiled: ([.[] | select(
-        .kind == "meeting_v2_action_plan_compiled"
-        and .payload.item_count == 1
-        and .payload.step_count == 3
+      directCompletions: ([.[] | select(
+        .kind == "meeting_v2_direct_action_turn_completed"
+        and .payload.action == "COMPLETE"
       )] | length),
       formatRetries: ([.[] | select(.kind == "meeting_v2_action_format_retry")] | length),
       continuityLost: ([.[] | select(.kind == "meeting_v2_continuity_lost")] | length),
@@ -605,7 +579,7 @@ jq -e '
   .boardTurns >= 1
   and .finalizingFloors == 1
   and .actionTurns >= 1
-  and .plansCompiled == 1
+  and .directCompletions == 1
   and .formatRetries <= 1
   and .continuityLost == 0
   and (.continuityTuples | length) == 1
@@ -656,7 +630,7 @@ jq -n \
   --argjson database "${db_state}" \
   --argjson observer "${observer_summary}" '
   {
-    evidenceSchema: "buzz-meeting-v2-actions-acceptance-v1",
+    evidenceSchema: "buzz-meeting-v2-direct-actions-acceptance-v2",
     runId: $run_id,
     startedAt: $started_at,
     finishedAt: $finished_at,
@@ -664,8 +638,8 @@ jq -n \
     sourceTree: {statusSha256: $status_sha, diffSha256: $diff_sha, unchanged: true},
     protocol: {
       schemaVersion: "3",
-      policy: "moderated-board-actions-v1",
-      capability: "meeting-v2-action-finalization-v1"
+      policy: "moderated-board-actions-v2",
+      capability: "meeting-v2-action-finalization-v2"
     },
     provider: {
       real: true,

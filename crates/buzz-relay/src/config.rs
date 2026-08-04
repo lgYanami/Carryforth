@@ -147,9 +147,9 @@ pub struct Config {
     ///
     /// This second rollout gate defaults to `false` and is additive to
     /// [`Self::meeting_v2_create_enabled`]. Existing
-    /// `moderated-board-actions-v1` sessions continue to drain and recover
+    /// `moderated-board-actions-v2` sessions continue to drain and recover
     /// when either Create gate is later disabled.
-    pub meeting_v2_actions_create_enabled: bool,
+    pub meeting_v2_direct_actions_create_enabled: bool,
 
     /// Inter-relay mesh configuration (`BUZZ_MESH`, `BUZZ_MESH_BIND_ADDR`).
     /// Opt-in: mesh forms only when `BUZZ_MESH=on` is explicit. The default
@@ -525,8 +525,8 @@ impl Config {
 
         let meeting_v1_create_enabled = parse_optional_bool("BUZZ_MEETING_V1_CREATE_ENABLED")?;
         let meeting_v2_create_enabled = parse_optional_bool("BUZZ_MEETING_V2_CREATE_ENABLED")?;
-        let meeting_v2_actions_create_enabled =
-            parse_optional_bool("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED")?;
+        let meeting_v2_direct_actions_create_enabled =
+            parse_optional_bool("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED")?;
 
         // Mesh opt-in: default OFF. Strict rollout no-regression — an image
         // upgrade with untouched env must not bind a new UDP port or write a
@@ -970,7 +970,7 @@ impl Config {
             huddle_audio_available,
             meeting_v1_create_enabled,
             meeting_v2_create_enabled,
-            meeting_v2_actions_create_enabled,
+            meeting_v2_direct_actions_create_enabled,
             mesh,
             mesh_demo_echo,
             relay_owner_pubkey,
@@ -1074,7 +1074,7 @@ mod tests {
             "Meeting V2 creation must remain opt-in during the stage-one rollout"
         );
         assert!(
-            !config.meeting_v2_actions_create_enabled,
+            !config.meeting_v2_direct_actions_create_enabled,
             "action-capable Meeting V2 creation must remain separately opt-in"
         );
         assert!(
@@ -1157,28 +1157,35 @@ mod tests {
     }
 
     #[test]
-    fn meeting_v2_actions_create_gate_is_strict_and_defaults_off() {
+    fn meeting_v2_direct_actions_create_gate_is_strict_and_defaults_off() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let previous = std::env::var_os("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED");
+        let previous = std::env::var_os("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED");
+        let legacy_previous = std::env::var_os("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED");
 
-        std::env::remove_var("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED");
+        std::env::remove_var("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED");
+        std::env::set_var("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED", "true");
         assert!(
             !Config::from_env()
-                .expect("unset action gate is valid")
-                .meeting_v2_actions_create_enabled
+                .expect("unset direct action gate is valid")
+                .meeting_v2_direct_actions_create_enabled
         );
 
-        std::env::set_var("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED", "true");
+        std::env::set_var("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED", "true");
         assert!(
             Config::from_env()
                 .expect("enabled action gate is valid")
-                .meeting_v2_actions_create_enabled
+                .meeting_v2_direct_actions_create_enabled
         );
 
-        std::env::set_var("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED", "sometimes");
+        std::env::set_var("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED", "sometimes");
         let invalid = Config::from_env();
 
         if let Some(value) = previous {
+            std::env::set_var("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED");
+        }
+        if let Some(value) = legacy_previous {
             std::env::set_var("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED", value);
         } else {
             std::env::remove_var("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED");
@@ -1187,7 +1194,7 @@ mod tests {
         assert!(matches!(
             invalid,
             Err(ConfigError::InvalidValue(ref message))
-                if message.contains("BUZZ_MEETING_V2_ACTIONS_CREATE_ENABLED")
+                if message.contains("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED")
         ));
     }
 

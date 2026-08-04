@@ -734,6 +734,7 @@ async fn end_meeting_for_revocation_locked_tx(
                         community_id,
                         session_id,
                         "completed_aborted",
+                        None,
                         ended_at,
                     )
                     .await?;
