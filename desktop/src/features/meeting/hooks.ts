@@ -18,8 +18,10 @@ import {
   getMeetingSnapshot,
   getMeetingSpeeches,
   listMeetings,
+  submitMeetingActionFinalization,
   submitMeetingFloorAction,
   submitMeetingHostAction,
+  type MeetingActionFinalizationInput,
   type MeetingFloorActionInput,
   type MeetingHostActionInput,
   type MeetingSpeechCursor,
@@ -138,6 +140,7 @@ export function useMeetingSnapshot(meetingId: string) {
     queryFn: () => getMeetingSnapshot(meetingId),
     enabled: Boolean(activeCommunity && meetingId),
     staleTime: 5_000,
+    refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
 }
@@ -194,6 +197,38 @@ export function useMeetingHostActionMutation(meetingId: string) {
         }),
       ];
       if (result.action === "close" || result.action === "abort") {
+        invalidations.push(
+          queryClient.invalidateQueries({ queryKey: channelsQueryKey }),
+        );
+      }
+      await Promise.all(invalidations);
+    },
+    onError: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+      });
+    },
+  });
+}
+
+export function useMeetingActionFinalizationMutation(meetingId: string) {
+  const { activeCommunity } = useCommunities();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: MeetingActionFinalizationInput) =>
+      submitMeetingActionFinalization(input),
+    onSuccess: async (result) => {
+      if (result.status !== "accepted") return;
+      const invalidations: Promise<unknown>[] = [
+        queryClient.invalidateQueries({
+          queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: [...meetingQueryRoot(activeCommunity?.id), "directory"],
+        }),
+      ];
+      if (result.action === "confirm") {
         invalidations.push(
           queryClient.invalidateQueries({ queryKey: channelsQueryKey }),
         );

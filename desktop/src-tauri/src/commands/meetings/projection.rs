@@ -561,6 +561,48 @@ fn validate_board_control(
             "Meeting action deadline is negative",
         )));
     }
+    if action.last_error_code.as_deref().is_some_and(|code| {
+        !matches!(
+            code,
+            "external_operation_failed"
+                | "external_state_conflict"
+                | "tool_unavailable"
+                | "provider_failure"
+                | "affinity_lost"
+                | "action_deadline_exceeded"
+        )
+    }) {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action run has an unsupported block reason",
+        )));
+    }
+    match action.terminal_status.as_deref() {
+        None if control.phase == "finalizing_actions"
+            && action.completion_event_id.is_none()
+            && ((action.condition == "runnable"
+                && action.action_deadline_at_ms.is_some()
+                && action.last_error_code.is_none())
+                || (action.condition == "blocked"
+                    && action.action_deadline_at_ms.is_none()
+                    && action.last_error_code.is_some())) => {}
+        Some("returned_to_board")
+            if control.phase != "finalizing_actions"
+                && action.completion_event_id.is_none()
+                && action.action_deadline_at_ms.is_none() => {}
+        Some("completed_closed")
+            if control.phase == "ended"
+                && action.completion_event_id.is_some()
+                && action.action_deadline_at_ms.is_none() => {}
+        Some("completed_aborted")
+            if control.phase == "ended"
+                && action.completion_event_id.is_none()
+                && action.action_deadline_at_ms.is_none() => {}
+        _ => {
+            return Err(MeetingReadError::Other(integrity_error(
+                "Meeting action condition does not match its lifecycle phase",
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -434,6 +434,51 @@ export type MeetingHostActionResult =
       message: string;
     };
 
+export type MeetingActionBlockReason =
+  | "external_operation_failed"
+  | "external_state_conflict"
+  | "tool_unavailable"
+  | "provider_failure"
+  | "affinity_lost"
+  | "action_deadline_exceeded";
+
+export type MeetingActionFinalizationAction =
+  | { type: "begin" }
+  | {
+      type: "block";
+      reasonCode: MeetingActionBlockReason;
+      reason?: string;
+    }
+  | { type: "retry" }
+  | { type: "return_to_board" }
+  | { type: "confirm" };
+
+export type MeetingActionFinalizationInput = {
+  /** Stable UUID reused while an indeterminate signed command is retried. */
+  submissionId: string;
+  meetingId: string;
+  /** Opaque token binding the current discussion or action window. */
+  expectedControlToken: string;
+  action: MeetingActionFinalizationAction;
+};
+
+export type MeetingActionFinalizationResult =
+  | {
+      status: "accepted";
+      meetingId: string;
+      eventId: string;
+      action: string;
+      stateRevision: number | null;
+      duplicate: boolean;
+    }
+  | {
+      status: "indeterminate";
+      meetingId: string;
+      eventId: string;
+      action: string;
+      message: string;
+    };
+
 export async function getMeetingCapability(): Promise<MeetingCapability> {
   return invokeTauri<MeetingCapability>("get_meeting_capability");
 }
@@ -458,6 +503,15 @@ export async function submitMeetingHostAction(
   return invokeTauri<MeetingHostActionResult>("submit_meeting_host_action", {
     input,
   });
+}
+
+export async function submitMeetingActionFinalization(
+  input: MeetingActionFinalizationInput,
+): Promise<MeetingActionFinalizationResult> {
+  return invokeTauri<MeetingActionFinalizationResult>(
+    "submit_meeting_action_finalization",
+    { input },
+  );
 }
 
 export async function listMeetings(

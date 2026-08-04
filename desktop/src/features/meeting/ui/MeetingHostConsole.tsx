@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import type { MeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
+import type { MeetingActionFinalizationController } from "@/features/meeting/useMeetingActionFinalizationController";
 import type { MeetingHostActionController } from "@/features/meeting/useMeetingHostActionController";
 import {
   meetingDeadlineLabel,
@@ -38,6 +39,7 @@ function participantName(
 }
 
 export function MeetingHostConsole({
+  actionController,
   boardDraft,
   controller,
   currentPubkey,
@@ -45,6 +47,7 @@ export function MeetingHostConsole({
   profiles,
   snapshot,
 }: {
+  actionController: MeetingActionFinalizationController;
   boardDraft: MeetingBoardDraft;
   controller: MeetingHostActionController;
   currentPubkey: string;
@@ -87,6 +90,12 @@ export function MeetingHostConsole({
   const selectionEnabled = host.canSelect && !deadlineExpired;
   const noDecisionWork =
     host.pendingIntents.length === 0 && host.openHandoffs.length === 0;
+  const canFinalizeActions =
+    snapshot.policy === "moderated-board-actions-v2" &&
+    snapshot.phase === "moderator_idle" &&
+    host.canClose &&
+    noDecisionWork &&
+    !deadlineExpired;
 
   return (
     <div
@@ -306,8 +315,10 @@ export function MeetingHostConsole({
       {!boardPending ? (
         <MeetingHostEndControls
           canClose={host.canClose && !deadlineExpired}
+          canFinalizeActions={canFinalizeActions}
           disabled={controller.disabled}
           submit={controller.submit}
+          submitFinalization={actionController.submit}
         />
       ) : null}
     </div>

@@ -431,7 +431,11 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       </div>
 
       {readySnapshot.end ? (
-        <MeetingTerminalSummary end={readySnapshot.end} profiles={profiles} />
+        <MeetingTerminalSummary
+          actionStarted={readySnapshot.action !== null}
+          end={readySnapshot.end}
+          profiles={profiles}
+        />
       ) : null}
 
       <div className="flex min-h-0 min-w-0 flex-1">

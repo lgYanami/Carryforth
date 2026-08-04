@@ -61,6 +61,8 @@ import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRol
 import type {
   CreateMeetingInput,
   CreateMeetingResult,
+  MeetingActionFinalizationInput,
+  MeetingActionFinalizationResult,
   MeetingFloorActionInput,
   MeetingFloorActionResult,
   MeetingHostActionInput,
@@ -2428,6 +2430,10 @@ function getMockMeetingSeed(
 
 const mockMeetingFloorSubmissions = new Map<string, MeetingFloorActionResult>();
 const mockMeetingHostSubmissions = new Map<string, MeetingHostActionResult>();
+const mockMeetingActionSubmissions = new Map<
+  string,
+  MeetingActionFinalizationResult
+>();
 
 function nextMeetingStateEventId(revision: number): string {
   return revision.toString(16).padStart(64, "0");
@@ -2865,6 +2871,11 @@ async function handleMeetingHostAction(
       host.canRecall = false;
       break;
     case "abort":
+      if (snapshot.lifecycle === "finalizing_actions" && snapshot.action) {
+        snapshot.action.terminalStatus = "completed_aborted";
+        snapshot.action.actionDeadlineAtMs = null;
+        snapshot.action.completionEventId = null;
+      }
       snapshot.lifecycle = "aborted";
       snapshot.phase = "ended";
       snapshot.end = {
@@ -2888,6 +2899,189 @@ async function handleMeetingHostAction(
   }
   const accepted = acceptedMeetingHostResult(input, eventId, snapshot, false);
   mockMeetingHostSubmissions.set(input.submissionId, accepted);
+  if ((config?.mock?.meetingHostIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingHostIndeterminateResponses =
+        (config.mock.meetingHostIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId: input.meetingId,
+      eventId,
+      action: action.type,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+  return accepted;
+}
+
+function acceptedMeetingActionResult(
+  input: MeetingActionFinalizationInput,
+  eventId: string,
+  snapshot: MeetingSnapshot,
+  duplicate: boolean,
+): MeetingActionFinalizationResult {
+  return {
+    status: "accepted",
+    meetingId: input.meetingId,
+    eventId,
+    action: input.action.type,
+    stateRevision:
+      input.action.type === "confirm" ? null : snapshot.stateRevision,
+    duplicate,
+  };
+}
+
+async function handleMeetingActionFinalization(
+  args: { input: MeetingActionFinalizationInput },
+  config?: E2eConfig,
+): Promise<MeetingActionFinalizationResult> {
+  const input = args.input;
+  const delayMs = config?.mock?.meetingHostActionDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const configuredError = config?.mock?.meetingHostErrors?.shift();
+  if (configuredError) throw new Error(configuredError);
+
+  const prior = mockMeetingActionSubmissions.get(input.submissionId);
+  if (prior?.status === "accepted") return { ...prior, duplicate: true };
+
+  const seed = getMockMeetingSeed(input.meetingId, config);
+  if (seed?.result.status !== "ready") {
+    throw new Error("Meeting action finalization is unavailable");
+  }
+  const snapshot = seed.result.snapshot;
+  const host = snapshot.host;
+  const actor = getMockMemberPubkey(config).toLowerCase();
+  const actorParticipant = snapshot.participants.find(
+    (participant) => participant.pubkey === actor,
+  );
+  if (
+    !host ||
+    actor !== snapshot.moderatorPubkey ||
+    actorParticipant?.participantType !== "human"
+  ) {
+    throw new Error(
+      "only the frozen Human moderator can operate action finalization",
+    );
+  }
+  if (host.controlToken !== input.expectedControlToken) {
+    throw new Error(
+      "Meeting action-finalization control changed; refresh before submitting",
+    );
+  }
+
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const now = Date.now();
+  const action = input.action;
+  switch (action.type) {
+    case "begin":
+      if (
+        snapshot.lifecycle !== "active" ||
+        snapshot.phase !== "moderator_idle" ||
+        !host.canClose ||
+        host.boardControl.phase !== "floor_ready" ||
+        host.pendingIntents.length > 0 ||
+        host.openHandoffs.length > 0
+      ) {
+        throw new Error(
+          "action finalization requires an explicit final Board and idle Floor",
+        );
+      }
+      snapshot.lifecycle = "finalizing_actions";
+      snapshot.phase = "moderator_idle";
+      snapshot.currentOfferPubkey = null;
+      snapshot.currentSpeakerPubkey = null;
+      snapshot.action = {
+        actionRunId: input.submissionId,
+        boardEventId: snapshot.board.eventId,
+        actionWindowEpoch: 1,
+        condition: "runnable",
+        terminalStatus: null,
+        completionEventId: null,
+        actionDeadlineAtMs: now + 180_000,
+        lastErrorCode: null,
+      };
+      host.boardControl.phase = "finalizing_actions";
+      host.decisionDeadlineMs = null;
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      advanceMockMeetingState(snapshot);
+      break;
+    case "block":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        snapshot.action?.condition !== "runnable" ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting action run is not runnable");
+      }
+      snapshot.action.condition = "blocked";
+      snapshot.action.actionDeadlineAtMs = null;
+      snapshot.action.lastErrorCode = action.reasonCode;
+      advanceMockMeetingState(snapshot);
+      break;
+    case "retry":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        snapshot.action?.condition !== "blocked" ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting action run is not blocked");
+      }
+      snapshot.action.condition = "runnable";
+      snapshot.action.actionWindowEpoch += 1;
+      snapshot.action.actionDeadlineAtMs = now + 180_000;
+      snapshot.action.lastErrorCode = null;
+      advanceMockMeetingState(snapshot);
+      break;
+    case "return_to_board":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        !snapshot.action ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting has no active action run");
+      }
+      snapshot.action.terminalStatus = "returned_to_board";
+      snapshot.action.actionDeadlineAtMs = null;
+      snapshot.lifecycle = "active";
+      returnMockControlToBoard(snapshot);
+      advanceMockMeetingState(snapshot);
+      break;
+    case "confirm":
+      if (
+        snapshot.lifecycle !== "finalizing_actions" ||
+        snapshot.action?.condition !== "runnable" ||
+        snapshot.action.terminalStatus !== null
+      ) {
+        throw new Error("Meeting action run is not runnable");
+      }
+      snapshot.lifecycle = "closed";
+      snapshot.phase = "ended";
+      snapshot.action.terminalStatus = "completed_closed";
+      snapshot.action.completionEventId = eventId;
+      snapshot.action.actionDeadlineAtMs = null;
+      snapshot.end = {
+        eventId,
+        outcome: "closed",
+        reasonCode: null,
+        reason: null,
+        endedBy: actor,
+        endedAt: Math.floor(now / 1_000),
+        actionsAttested: true,
+      };
+      host.boardControl.phase = "ended";
+      host.canSelect = false;
+      host.canClose = false;
+      host.canRecall = false;
+      break;
+  }
+
+  const accepted = acceptedMeetingActionResult(input, eventId, snapshot, false);
+  mockMeetingActionSubmissions.set(input.submissionId, accepted);
   if ((config?.mock?.meetingHostIndeterminateResponses ?? 0) > 0) {
     if (config?.mock) {
       config.mock.meetingHostIndeterminateResponses =
@@ -10121,6 +10315,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPendingCommunityDeepLinks(config);
   mockMeetingFloorSubmissions.clear();
   mockMeetingHostSubmissions.clear();
+  mockMeetingActionSubmissions.clear();
   mockWebsocketSendMutexWedged = false;
   mockWindows("main");
   window.__BUZZ_E2E_COMMANDS__ = [];
@@ -11212,6 +11407,11 @@ export function maybeInstallE2eTauriMocks() {
       case "submit_meeting_host_action":
         return handleMeetingHostAction(
           payload as { input: MeetingHostActionInput },
+          activeConfig,
+        );
+      case "submit_meeting_action_finalization":
+        return handleMeetingActionFinalization(
+          payload as { input: MeetingActionFinalizationInput },
           activeConfig,
         );
       case "list_meetings": {

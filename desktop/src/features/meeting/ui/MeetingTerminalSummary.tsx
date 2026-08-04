@@ -16,9 +16,11 @@ function endedByLabel(
 }
 
 export function MeetingTerminalSummary({
+  actionStarted,
   end,
   profiles,
 }: {
+  actionStarted: boolean;
   end: MeetingEndState;
   profiles: Record<string, UserProfileSummary>;
 }) {
@@ -49,6 +51,8 @@ export function MeetingTerminalSummary({
         <Badge variant={end.actionsAttested ? "success" : "secondary"}>
           {end.actionsAttested ? "Actions recorded" : "Closed directly"}
         </Badge>
+      ) : actionStarted ? (
+        <Badge variant="warning">External effects may remain</Badge>
       ) : null}
     </section>
   );

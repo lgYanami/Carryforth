@@ -3,6 +3,7 @@ import { AlertTriangle, ClipboardCopy, Hand, Loader2 } from "lucide-react";
 
 import { useMeetingFloorActionMutation } from "@/features/meeting/hooks";
 import type { MeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
+import { useMeetingActionFinalizationController } from "@/features/meeting/useMeetingActionFinalizationController";
 import { useMeetingHostActionController } from "@/features/meeting/useMeetingHostActionController";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type {
@@ -15,6 +16,7 @@ import type {
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
+import { MeetingActionFinalizationCard } from "./MeetingActionFinalizationCard";
 import { MeetingOfferControls } from "./MeetingOfferControls";
 import { MeetingHostConsole } from "./MeetingHostConsole";
 import {
@@ -103,6 +105,7 @@ export function MeetingFloorDock({
     onBoardAccepted: boardDraft.markAccepted,
     snapshot,
   });
+  const actionController = useMeetingActionFinalizationController(snapshot);
 
   React.useEffect(() => {
     const currentGrantId = ownGrant?.grantId ?? null;
@@ -182,12 +185,28 @@ export function MeetingFloorDock({
     }
   }, [handleResult, mutateAsync, resetMutation, unresolved]);
 
-  const disabled = isPending || unresolved !== null || hostController.disabled;
+  const disabled =
+    isPending ||
+    unresolved !== null ||
+    hostController.disabled ||
+    actionController.disabled;
   const hostControlsDisabled =
-    hostController.disabled || isPending || unresolved !== null;
+    hostController.disabled ||
+    actionController.disabled ||
+    isPending ||
+    unresolved !== null;
+  const actionControlsDisabled =
+    actionController.disabled ||
+    hostController.disabled ||
+    isPending ||
+    unresolved !== null;
   const renderedHostController = {
     ...hostController,
     disabled: hostControlsDisabled,
+  };
+  const renderedActionController = {
+    ...actionController,
+    disabled: actionControlsDisabled,
   };
   const terminal =
     snapshot.lifecycle === "closed" || snapshot.lifecycle === "aborted";
@@ -254,6 +273,36 @@ export function MeetingFloorDock({
         </div>
       ) : null}
 
+      {actionController.unresolved ? (
+        <div
+          className="mx-auto mb-3 flex max-w-3xl items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3"
+          data-testid="meeting-action-indeterminate"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <div className="min-w-0 flex-1 text-xs">
+            <p className="font-medium">
+              The action-finalization receipt is incomplete.
+            </p>
+            <p className="mt-1 text-muted-foreground">
+              Retry republishes the exact same signed event. Meeting close and
+              recovery controls remain locked until its outcome is known.
+            </p>
+          </div>
+          <Button
+            data-testid="meeting-action-retry-exact"
+            disabled={actionController.isPending}
+            onClick={() => void actionController.retryExact()}
+            size="sm"
+            variant="outline"
+          >
+            {actionController.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : null}
+            Retry exact action
+          </Button>
+        </div>
+      ) : null}
+
       {floorError ? (
         <div
           className="mx-auto mb-3 max-w-3xl rounded-lg border border-destructive/35 bg-destructive/5 px-3 py-2 text-xs text-destructive"
@@ -271,6 +320,15 @@ export function MeetingFloorDock({
           data-testid="meeting-host-error"
         >
           {hostController.error.message}
+        </div>
+      ) : null}
+
+      {actionController.error ? (
+        <div
+          className="mx-auto mb-3 max-w-3xl rounded-lg border border-destructive/35 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          data-testid="meeting-action-error"
+        >
+          {actionController.error.message}
         </div>
       ) : null}
 
@@ -307,7 +365,26 @@ export function MeetingFloorDock({
       {terminal ? (
         <ReadOnlyFloor message="This Meeting is read-only. Its final Board and formal Speech remain available." />
       ) : snapshot.lifecycle === "finalizing_actions" ? (
-        <ReadOnlyFloor message="The discussion Floor is frozen while the host records meeting actions." />
+        normalizedPubkey === snapshot.moderatorPubkey &&
+        participant?.participantType === "human" ? (
+          <MeetingActionFinalizationCard
+            actionController={renderedActionController}
+            hostController={renderedHostController}
+            onRefresh={onRefresh}
+            profiles={profiles}
+            snapshot={snapshot}
+          />
+        ) : (
+          <ReadOnlyFloor
+            message={
+              snapshot.participants.find(
+                (candidate) => candidate.pubkey === snapshot.moderatorPubkey,
+              )?.participantType === "agent"
+                ? "The host Agent is recording actions from the frozen final Board. The discussion Floor remains read-only."
+                : "The Human host is recording actions from the frozen final Board. Only the frozen host can submit recovery or completion decisions."
+            }
+          />
+        )
       ) : !floor ? (
         <ReadOnlyFloor message="The Relay is preparing the authoritative Meeting Floor." />
       ) : participant?.participantType !== "human" ? (
@@ -379,6 +456,7 @@ export function MeetingFloorDock({
         </div>
       ) : normalizedPubkey === snapshot.moderatorPubkey ? (
         <MeetingHostConsole
+          actionController={renderedActionController}
           boardDraft={boardDraft}
           controller={renderedHostController}
           currentPubkey={normalizedPubkey}

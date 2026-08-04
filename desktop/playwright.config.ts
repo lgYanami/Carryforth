@@ -104,6 +104,7 @@ export default defineConfig({
         "**/meeting-create.spec.ts",
         "**/meeting-floor.spec.ts",
         "**/meeting-host.spec.ts",
+        "**/meeting-actions.spec.ts",
         "**/persona-model-combobox-screenshots.spec.ts",
         "**/drafts-screenshots.spec.ts",
         "**/buzz-theme-screenshots.spec.ts",

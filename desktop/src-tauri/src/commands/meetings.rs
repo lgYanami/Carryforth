@@ -6,6 +6,8 @@
 
 mod create;
 pub use create::create_meeting;
+mod actions;
+pub use actions::submit_meeting_action_finalization;
 mod floor;
 pub use floor::submit_meeting_floor_action;
 mod host;
@@ -645,13 +647,19 @@ fn host_from_projection(
                 .as_ref()
                 .and_then(|grant| grant.source_handoff_id.as_deref())
         });
-    let control_binding = if control.phase == "board_pending" {
-        format!(
+    let control_binding = match (control.phase.as_str(), control.action.as_ref()) {
+        ("board_pending", _) => format!(
             "board|{meeting_id}|{}|{}",
             control.control_epoch, control.board_window
-        )
-    } else {
-        format!("state|{meeting_id}|{}", projection.event_id)
+        ),
+        ("finalizing_actions", Some(action)) => format!(
+            "action|{meeting_id}|{}|{}|{}|{}",
+            action.action_run_id,
+            action.action_window_epoch,
+            action.board_event_id,
+            projection.event_id
+        ),
+        _ => format!("state|{meeting_id}|{}", projection.event_id),
     };
     let control_token = hex::encode(Sha256::digest(control_binding.as_bytes()));
     Some(MeetingHostState {

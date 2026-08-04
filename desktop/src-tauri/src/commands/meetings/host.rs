@@ -513,8 +513,13 @@ fn prepare_command(
     signer_pubkey: &str,
     keys: &nostr::Keys,
 ) -> Result<PendingMeetingCommand, String> {
-    if !matches!(snapshot.lifecycle, MeetingLifecycle::Active) {
-        return Err("Meeting host controls are frozen outside active discussion".to_string());
+    let action_phase_abort = matches!(snapshot.lifecycle, MeetingLifecycle::FinalizingActions)
+        && matches!(&input.action, MeetingHostAction::Abort { .. });
+    if !matches!(snapshot.lifecycle, MeetingLifecycle::Active) && !action_phase_abort {
+        return Err(
+            "Meeting host controls are frozen outside active discussion or action abort"
+                .to_string(),
+        );
     }
     let participant = snapshot
         .participants
