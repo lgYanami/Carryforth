@@ -1006,6 +1006,10 @@ jobs:
         env:
           PROJECT_DOCUMENT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
         run: just project-document-test-db
+      - name: Project Context canonical storage transactions
+        env:
+          PROJECT_CONTEXT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
+        run: just project-context-test-db
       - name: Project Document migration upgrade and schema drift
         env:
           PROJECT_DOCUMENT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst

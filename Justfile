@@ -425,12 +425,18 @@ project-context-test-unit:
           -p buzz-relay \
           --lib \
           -E 'test(project_context)'
+        cargo nextest run -p buzz-db --lib -E 'test(project_context)'
     else
         cargo test -p buzz-project-context
         cargo test -p buzz-sdk --test project_context
         cargo test -p buzz-core --lib project_context
         cargo test -p buzz-relay --lib project_context
+        cargo test -p buzz-db --lib project_context
     fi
+
+# Run isolated PostgreSQL-backed Project Context canonical storage tests.
+project-context-test-db:
+    ./scripts/test-project-context-db.sh
 
 # Run the real Relay/event-store Stage 1 privacy floor in an isolated database.
 project-context-test-e2e:
@@ -438,6 +444,9 @@ project-context-test-e2e:
 
 # Run every Project Context Stage 1 quality gate.
 project-context-stage1-test: project-context-test-unit project-context-test-e2e
+
+# Run every Project Context Stage 2 quality gate.
+project-context-stage2-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.

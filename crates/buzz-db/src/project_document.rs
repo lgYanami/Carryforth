@@ -2522,7 +2522,7 @@ async fn require_document_read_state_in_tx(
     Ok(())
 }
 
-async fn validate_actor_in_tx(
+pub(crate) async fn validate_actor_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     actor: PublicKey,
@@ -3304,6 +3304,32 @@ async fn project_document_event_by_id(
     row.map(crate::event::row_to_stored_event)
         .transpose()
         .map(Option::flatten)
+}
+
+#[cfg(test)]
+pub(crate) async fn begin_project_document_storage_test_write(
+    db: &Db,
+    community_id: CommunityId,
+    expected_projection_pubkey: PublicKey,
+) -> ProjectDocumentWriteResult<ProjectDocumentWriteTx> {
+    let mut tx = db.pool.begin().await?;
+    crate::community_lock::acquire(&mut tx, community_id, false).await?;
+    let enabled: Option<bool> = sqlx::query_scalar(
+        "SELECT project_document_enabled FROM communities \
+         WHERE id = $1 AND archived_at IS NULL FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if enabled != Some(true) {
+        return Err(ProjectDocumentWriteError::Unavailable { community_id });
+    }
+    Ok(ProjectDocumentWriteTx {
+        tx,
+        community_id,
+        expected_projection_pubkey,
+        loaded: None,
+    })
 }
 
 fn verified_current_identity(

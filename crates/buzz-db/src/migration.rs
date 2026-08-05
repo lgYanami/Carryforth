@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 46);
+        assert_eq!(migrations.len(), 47);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1157,6 +1157,62 @@ mod tests {
         assert!(meeting_v2_direct_actions.contains("completion_event_id"));
         assert!(meeting_v2_direct_actions
             .contains("action IN ('begin', 'block', 'retry', 'return-to-board')"));
+
+        // Project Context Edge lands as a separate capability-off canonical
+        // kernel. The migration owns normalized coordinate identity, durable
+        // binding tombstones, replay receipts, and commit-time parity guards.
+        assert_eq!(migrations[46].version, 47);
+        let project_context_edge = migrations[46].sql.as_str();
+        assert!(project_context_edge.contains("ADD COLUMN project_context_edge_enabled"));
+        assert!(project_context_edge.contains("DEFAULT FALSE"));
+        assert!(project_context_edge.contains("CREATE TABLE project_context_edge_state"));
+        assert!(project_context_edge.contains("CREATE TABLE project_context_edges"));
+        assert!(project_context_edge.contains("CREATE TABLE project_context_edge_coordinates"));
+        assert!(project_context_edge.contains("CREATE TABLE project_context_document_bindings"));
+        assert!(project_context_edge.contains("CREATE TABLE project_context_edge_changes"));
+        assert!(project_context_edge.contains("project_context_compute_edge_key"));
+        assert!(project_context_edge.contains("project_context_validate_community"));
+        assert!(project_context_edge.contains("project_context_validate_new_change"));
+        assert!(project_context_edge.contains("idx_project_context_bindings_active_document"));
+        assert!(project_context_edge.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(project_context_edge.contains("projection.kind = 40908"));
+        assert!(project_context_edge.contains("event.kind = 40909"));
+        assert!(project_context_edge.contains("command.kind = 44302"));
+        assert!(project_context_edge.contains("buzz.project_context_reproject"));
+        assert!(
+            project_context_edge.contains("Project Context revision-zero metadata must be a reset")
+        );
+        assert!(!project_context_edge.contains("SET project_context_edge_enabled = TRUE"));
+    }
+
+    #[test]
+    fn desired_schema_contains_project_context_edge_storage() {
+        let schema = include_str!("../../../schema/schema.sql");
+
+        for required in [
+            "project_context_edge_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE TABLE project_context_edge_state",
+            "CREATE TABLE project_context_edges",
+            "CREATE TABLE project_context_edge_coordinates",
+            "CREATE TABLE project_context_document_bindings",
+            "CREATE TABLE project_context_edge_changes",
+            "project_context_edges_exact_set_unique",
+            "project_context_compute_edge_key",
+            "project_context_validate_community",
+            "project_context_validate_new_change",
+            "active Context Document must be detached before deletion",
+            "idx_project_context_edge_coordinates_lookup",
+            "idx_project_context_bindings_active_document",
+            "projection.kind = 40908",
+            "event.kind = 40909",
+            "command.kind = 44302",
+            "buzz.project_context_reproject",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql must include migration 0047 object {required}"
+            );
+        }
     }
 
     #[test]
@@ -1484,9 +1540,14 @@ mod tests {
                 .await
                 .expect("inspect migration ledger");
         assert!(!has_ledger);
-        let (project_view_enabled, project_document_enabled): (bool, bool) = sqlx::query_as(
+        let (project_view_enabled, project_document_enabled, project_context_edge_enabled): (
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
             "INSERT INTO communities (id, host) VALUES ($1, $2) \
-             RETURNING project_view_enabled, project_document_enabled",
+             RETURNING project_view_enabled, project_document_enabled, \
+                       project_context_edge_enabled",
         )
         .bind(uuid::Uuid::new_v4())
         .bind(format!("schema-{}.test", uuid::Uuid::new_v4().simple()))
@@ -1495,6 +1556,7 @@ mod tests {
         .expect("read schema-created Project View default");
         assert!(!project_view_enabled);
         assert!(!project_document_enabled);
+        assert!(!project_context_edge_enabled);
         for relation in [
             "project_view_state",
             "project_view_objects",
@@ -1504,6 +1566,11 @@ mod tests {
             "project_document_revisions",
             "project_document_changes",
             "project_view_context_operations",
+            "project_context_edge_state",
+            "project_context_edges",
+            "project_context_edge_coordinates",
+            "project_context_document_bindings",
+            "project_context_edge_changes",
         ] {
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                 .bind(format!("public.{relation}"))
@@ -1822,7 +1889,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -1927,8 +1994,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0046");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+            .expect("upgrade scratch database through 0047");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -2064,8 +2131,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0046");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+            .expect("upgrade scratch database through 0047");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -2142,7 +2209,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(46));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(47));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -2230,7 +2297,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
     }
 
     #[tokio::test]
