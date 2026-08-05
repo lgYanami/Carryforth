@@ -136,6 +136,8 @@ Thread 和 Canvas 模拟会议。普通 Channel 标题或用途包含“会议�
 
 ### MFX-002（P0）：单场 Agent 上限仍为 4，应统一提高到 8
 
+**状态：代码修复完成，待真实 8-Agent Meeting 验收。**
+
 **现状**
 
 `crates/buzz-db/src/meeting.rs` 中：
@@ -145,13 +147,13 @@ pub const MAX_MEETING_PARTICIPANTS: usize = 12;
 pub const MAX_MEETING_AGENTS: usize = 4;
 ```
 
-`MAX_MEETING_AGENTS` 被 V0 创建路径和 V1/V2 Baton 创建路径共同使用，因此它不是只影响旧
-Meeting 的局部常量。Agent 的判断与 Relay 的实际拒绝一致。
+`MAX_MEETING_AGENTS` 被所有内部 Meeting 创建路径共同使用，因此它不是某个历史实现的局部
+常量。Agent 的判断与 Relay 的实际拒绝一致。
 
 **期望**
 
 - `MAX_MEETING_AGENTS` 从 4 改为 8；
-- V0、V1、V2 使用一致的 8-Agent 上限；
+- 所有内部创建路径使用一致的 8-Agent 上限；
 - 总 participant 上限继续为 12；
 - Agent 主持人计入 Agent 数量；
 - Desktop roster picker 在已知 participant type 时提前显示 8-Agent gate；
@@ -169,7 +171,7 @@ Meeting 的局部常量。Agent 的判断与 Relay 的实际拒绝一致。
 
 **测试与文档影响**
 
-- DB V0/V1/V2 create 边界测试；
+- DB 当前创建路径和保留兼容路径的边界测试；
 - Relay Create command 测试；
 - CLI Create 错误与帮助示例；
 - Desktop roster/capability E2E；

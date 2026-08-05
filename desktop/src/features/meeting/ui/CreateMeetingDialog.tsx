@@ -14,6 +14,7 @@ import {
   useChatRooms,
 } from "@/features/channels/hooks";
 import {
+  MAX_MEETING_AGENTS,
   MAX_MEETING_BOARD_BYTES,
   buildInitialMeetingBoard,
   checkMeetingSourceAccess,
@@ -161,6 +162,9 @@ export function CreateMeetingDialog({
     () => [currentPubkey, ...selectedCandidates.map((item) => item.pubkey)],
     [currentPubkey, selectedCandidates],
   );
+  const selectedAgentCount = selectedCandidates.filter(
+    (candidate) => candidate.isAgent,
+  ).length;
   const sourceAccess = checkMeetingSourceAccess({
     sourceVisibility: sourceChannel?.visibility ?? null,
     rosterPubkeys,
@@ -171,7 +175,7 @@ export function CreateMeetingDialog({
   const validationErrors = validateMeetingDraft({
     title,
     goal,
-    participantPubkeys: selectedCandidates.map((candidate) => candidate.pubkey),
+    participants: selectedCandidates,
     board,
   });
   const incompatibleAgents = selectedCandidates.filter(
@@ -539,6 +543,7 @@ export function CreateMeetingDialog({
               }}
               currentPubkey={currentPubkey}
               disabled={fieldsDisabled}
+              hasReachedAgentLimit={selectedAgentCount >= MAX_MEETING_AGENTS}
               hasReachedLimit={roster.hasReachedRecipientLimit}
               isLoading={roster.isDirectoryLoading}
               onDirectoryScroll={roster.handleDirectoryScroll}
@@ -555,6 +560,7 @@ export function CreateMeetingDialog({
               searchError={roster.searchError}
               searchQuery={roster.searchQuery}
               selected={selectedCandidates}
+              selectedAgentCount={selectedAgentCount}
             />
           </section>
 

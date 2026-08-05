@@ -986,7 +986,7 @@ async fn two_humans_and_two_agents_share_one_ordered_baton_timeline() {
 
 #[tokio::test]
 #[ignore = "requires a running Relay with BUZZ_MEETING_V1_CREATE_ENABLED=true, Postgres, and Redis"]
-async fn four_agents_and_two_humans_complete_repeated_rounds_at_capacity() {
+async fn eight_agent_boundary_and_repeated_rounds_are_stable() {
     let pool = test_pool().await;
     let community_id = ensure_community(&pool).await;
     let moderator = Keys::generate();
@@ -996,6 +996,10 @@ async fn four_agents_and_two_humans_complete_repeated_rounds_at_capacity() {
     let third_agent = Keys::generate();
     let fourth_agent = Keys::generate();
     let fifth_agent = Keys::generate();
+    let sixth_agent = Keys::generate();
+    let seventh_agent = Keys::generate();
+    let eighth_agent = Keys::generate();
+    let ninth_agent = Keys::generate();
     seed_identity(&pool, community_id, &moderator, "owner", None).await;
     seed_identity(&pool, community_id, &human, "member", None).await;
     for agent in [
@@ -1004,6 +1008,10 @@ async fn four_agents_and_two_humans_complete_repeated_rounds_at_capacity() {
         &third_agent,
         &fourth_agent,
         &fifth_agent,
+        &sixth_agent,
+        &seventh_agent,
+        &eighth_agent,
+        &ninth_agent,
     ] {
         seed_identity(&pool, community_id, agent, "member", Some(&moderator)).await;
     }
@@ -1015,10 +1023,60 @@ async fn four_agents_and_two_humans_complete_repeated_rounds_at_capacity() {
     let third_agent_pubkey = third_agent.public_key().to_hex();
     let fourth_agent_pubkey = fourth_agent.public_key().to_hex();
     let fifth_agent_pubkey = fifth_agent.public_key().to_hex();
+    let sixth_agent_pubkey = sixth_agent.public_key().to_hex();
+    let seventh_agent_pubkey = seventh_agent.public_key().to_hex();
+    let eighth_agent_pubkey = eighth_agent.public_key().to_hex();
+    let ninth_agent_pubkey = ninth_agent.public_key().to_hex();
 
-    // The valid scenario below deliberately fills the four-Agent capacity.
-    // Prove that registering one more Agent does not silently widen the
-    // protocol boundary.
+    let at_capacity_id = Uuid::new_v4();
+    let at_capacity_participants = [
+        human_pubkey.as_str(),
+        first_agent_pubkey.as_str(),
+        second_agent_pubkey.as_str(),
+        third_agent_pubkey.as_str(),
+        fourth_agent_pubkey.as_str(),
+        fifth_agent_pubkey.as_str(),
+        sixth_agent_pubkey.as_str(),
+        seventh_agent_pubkey.as_str(),
+        eighth_agent_pubkey.as_str(),
+    ];
+    let at_capacity_create = buzz_sdk::build_meeting_v1_create(MeetingV1CreateParams {
+        session_id: at_capacity_id,
+        title: "Eight Agent Capacity Acceptance",
+        description: Some("Eight authoritative Agent identities must be accepted"),
+        source_channel_id: None,
+        author_pubkey: &moderator_pubkey,
+        moderator_pubkey: &moderator_pubkey,
+        participant_pubkeys: &at_capacity_participants,
+    })
+    .expect("build at-capacity Meeting Create")
+    .sign_with_keys(&moderator)
+    .expect("sign at-capacity Meeting Create");
+    let (status, body) = post_event(&moderator, &at_capacity_create).await;
+    assert_accepted(status, &body);
+    let at_capacity_state =
+        wait_for_state(&moderator, at_capacity_id, 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        state_content(&at_capacity_state)["participants"]
+            .as_array()
+            .expect("at-capacity roster")
+            .iter()
+            .filter(|participant| participant["participant_type"] == "agent")
+            .count(),
+        8
+    );
+    let at_capacity_end = buzz_sdk::build_meeting_v1_end(MeetingV1EndParams {
+        session_id: at_capacity_id,
+        create_event_id: &at_capacity_create.id.to_hex(),
+    })
+    .expect("build at-capacity Meeting End")
+    .sign_with_keys(&moderator)
+    .expect("sign at-capacity Meeting End");
+    let (status, body) = post_event(&moderator, &at_capacity_end).await;
+    assert_accepted(status, &body);
+
+    // A ninth authoritative Agent must still fail before any Meeting State is
+    // published.
     let over_capacity_id = Uuid::new_v4();
     let over_capacity_participants = [
         human_pubkey.as_str(),
@@ -1027,11 +1085,15 @@ async fn four_agents_and_two_humans_complete_repeated_rounds_at_capacity() {
         third_agent_pubkey.as_str(),
         fourth_agent_pubkey.as_str(),
         fifth_agent_pubkey.as_str(),
+        sixth_agent_pubkey.as_str(),
+        seventh_agent_pubkey.as_str(),
+        eighth_agent_pubkey.as_str(),
+        ninth_agent_pubkey.as_str(),
     ];
     let over_capacity_create = buzz_sdk::build_meeting_v1_create(MeetingV1CreateParams {
         session_id: over_capacity_id,
-        title: "Five Agent Capacity Rejection",
-        description: Some("The fifth managed Agent must be rejected"),
+        title: "Nine Agent Capacity Rejection",
+        description: Some("The ninth authoritative Agent must be rejected"),
         source_channel_id: None,
         author_pubkey: &moderator_pubkey,
         moderator_pubkey: &moderator_pubkey,
@@ -1042,8 +1104,8 @@ async fn four_agents_and_two_humans_complete_repeated_rounds_at_capacity() {
     .expect("sign over-capacity Meeting V1 Create");
     let (status, body) = post_event(&moderator, &over_capacity_create).await;
     assert!(
-        !status.is_success() && body.contains("meeting supports at most 4 agents"),
-        "the fifth managed Agent must be rejected explicitly, got HTTP {status}: {body}"
+        !status.is_success() && body.contains("meeting supports at most 8 agents"),
+        "the ninth authoritative Agent must be rejected explicitly, got HTTP {status}: {body}"
     );
     assert!(
         query(

@@ -14,10 +14,10 @@ use uuid::Uuid;
 use crate::{Db, DbError, Result};
 use buzz_core::CommunityId;
 
-/// Maximum number of participants in a Meeting V0 session.
+/// Maximum number of identities in a Meeting roster.
 pub const MAX_MEETING_PARTICIPANTS: usize = 12;
-/// Maximum number of managed agents in a Meeting V0 session.
-pub const MAX_MEETING_AGENTS: usize = 4;
+/// Maximum number of Agent identities in a Meeting roster.
+pub const MAX_MEETING_AGENTS: usize = 8;
 
 /// Parameters for atomically creating a Meeting V0 session.
 pub struct CreateMeetingParams<'a> {
