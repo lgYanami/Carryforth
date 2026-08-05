@@ -223,9 +223,9 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
     "verified read path first",
   );
-  await expect(page.getByTestId("meeting-status-strip")).toContainText(
-    "has the floor",
-  );
+  const statusStrip = page.getByTestId("meeting-status-strip");
+  await expect(statusStrip).toContainText("has the floor");
+  await expect(statusStrip).not.toContainText(/Speech r\d+|State r\d+/);
   await expect(page.getByTestId("message-composer")).toHaveCount(0);
   await expect(page.getByTestId("channel-composer-overlay")).toHaveCount(0);
   await expect(page.getByTestId("channel-drop-zone")).toHaveCount(0);

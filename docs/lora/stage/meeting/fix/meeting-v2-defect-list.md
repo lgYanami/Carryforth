@@ -287,15 +287,19 @@ Contract v2 已同时包含允许的读取、禁止的写入、行动进入 Boar
 - connector reset、Session rebuild 和旧 contract ID 不会继续使用缺少新边界的旧 System；
 - Agent 质量验收包含“先只读调查、Speech 提议、主持人写 Board、最终物化”的完整场景。
 
-### MFX-006（P0）：伪会议不会安装 Meeting Contract
+### MFX-006（已解决）：伪会议不会安装 Meeting Contract
+
+**状态：已解决。Meeting Contract 的严格安装判定是正确不变量；MFX-001 已阻断 Agent 在正式
+Meeting 创建失败后用普通 Channel、Thread、Canvas 或 Huddle 进行隐式降级。**
 
 **现状**
 
 Meeting Contract 只在已经识别为 V2 Meeting channel 的 ACP Session 安装。普通 Channel 即使
 标题、purpose 或 Canvas 写着“会议”，也仍使用普通 Channel Agent 上下文。
 
-这本身是正确的 fail-closed 设计；缺陷在于 MFX-001 允许 Agent 把普通 Channel 当作降级会议
-继续运行，使用户误以为上述 Meeting 约束已经生效。
+这本身是正确的 fail-closed 设计。此前的问题来自 MFX-001：Agent 曾把普通 Channel 当作降级
+会议继续运行，使用户误以为上述 Meeting 约束已经生效。该来源现已修复，不应通过放宽 Contract
+安装判定来处理伪会议。
 
 **期望**
 
@@ -303,6 +307,8 @@ Meeting Contract 只在已经识别为 V2 Meeting channel 的 ACP Session 安装
 - 从源头禁止隐式伪会议降级；
 - Desktop 和 Agent 在必要时明确提示“这是普通 Channel，不具备 Meeting Board/Floor/终态”；
 - 真实验收必须从 kind `42100` Create 和 `room_kind=meeting` 开始，不能用普通频道对话替代。
+
+真实创建到 Desktop MeetingScreen 的跨边界证明仍归 MFX-017，不作为重新打开本项的理由。
 
 ## 6. Meeting Desktop 与 spec 的缺陷
 
@@ -341,9 +347,13 @@ Board，也没有收起后持续可见的恢复入口。
 - 收起不丢失 timeline 位置、Floor/Speech 草稿或 Board 草稿；
 - Board Maintenance 需要主持人操作时可自动打开，但不能破坏用户草稿和权威窗口绑定。
 
-### MFX-009（P2）：主状态条泄漏原始 revision
+### MFX-009（已解决）：主状态条泄漏原始 revision
 
-**现状**
+**状态：已解决。Meeting 主状态条已只保留产品状态；原始 `speechRevision` 和 `stateRevision`
+继续作为 Desktop 可信投影内部字段使用，不再显示给普通用户。专项 E2E 同时断言当前发言产品
+状态仍然可见且 `Speech r...`、`State r...` 不会出现。**
+
+**原现状**
 
 `MeetingScreen` 主状态条直接展示：
 

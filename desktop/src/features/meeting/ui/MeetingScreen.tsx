@@ -468,10 +468,6 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
           }`}
         />
         <span className="min-w-0 flex-1 truncate">{statusText}</span>
-        <span className="hidden shrink-0 text-2xs text-muted-foreground md:inline">
-          Speech r{readySnapshot.speechRevision} · State r
-          {readySnapshot.stateRevision}
-        </span>
       </div>
 
       {readySnapshot.end ? (
