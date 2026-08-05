@@ -525,7 +525,16 @@ Meeting activity 入口。
 - 不把活动记录计入 canonical Speech unread；
 - 诊断信息与普通产品活动分层展示。
 
-### MFX-015（P2）：终态摘要信息不完整
+### MFX-015（已解决）：终态摘要信息不完整
+
+**解决状态（2026-08-05）**
+
+Native Meeting End 投影已增加基于 verified signer 的 `host | relay | unknown` 终止来源，并继续保留
+Human 可读 reason。Desktop 终态摘要现在分别表达主持人判断目标达成的正常关闭、未作为目标达成
+正常结束的中止、原因类别、可读说明、结束人、结束时间和可信来源；`actions-recorded` 明确只表示
+最终 Board 的行动产出已确认登记，不表示结果 Work 已完成。权威 Action 状态存在的中止会提示外部
+效果可能保留，但不虚构 operation list、receipt 或 Relay 对外部行动的验证。终态没有 reopen 或任何
+Meeting 写入口。
 
 **现状**
 

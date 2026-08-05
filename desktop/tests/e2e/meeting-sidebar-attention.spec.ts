@@ -141,6 +141,7 @@ function snapshot(input: {
           endedBy: host,
           endedAt: input.updatedAt,
           actionsAttested: false,
+          terminationSource: "host",
         }
       : null,
     latestSpeechAt: input.unread ? input.updatedAt + 1 : null,

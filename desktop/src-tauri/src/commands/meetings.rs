@@ -432,7 +432,7 @@ async fn load_meeting_snapshot_at(
         .collect::<Result<Vec<_>, _>>()?;
     let current_state = select_current_state(states, &create)?;
     let board = parse_current_board(&events, identity, &create)?;
-    let end = parse_current_end(&events, &create)?;
+    let end = parse_current_end(&events, identity, &create)?;
 
     let (participants, phase, revisions, current_speaker, current_offer, floor, host, action) =
         if let Some(state) = &current_state {

@@ -2882,6 +2882,7 @@ async function handleMeetingHostAction(
         endedBy: actor,
         endedAt: Math.floor(now / 1_000),
         actionsAttested: false,
+        terminationSource: "host",
       };
       host.boardControl.phase = "ended";
       host.canSelect = false;
@@ -2904,6 +2905,7 @@ async function handleMeetingHostAction(
         endedBy: actor,
         endedAt: Math.floor(now / 1_000),
         actionsAttested: false,
+        terminationSource: "host",
       };
       host.boardControl.phase = "ended";
       host.canSelect = false;
@@ -3090,6 +3092,7 @@ async function handleMeetingActionFinalization(
         endedBy: actor,
         endedAt: Math.floor(now / 1_000),
         actionsAttested: true,
+        terminationSource: "host",
       };
       host.boardControl.phase = "ended";
       host.canSelect = false;

@@ -538,6 +538,8 @@ fn human_request_priority_disables_host_recall() {
 fn action_policy_end_distinguishes_direct_close_from_recorded_actions() {
     let host = Keys::generate();
     let participant = Keys::generate();
+    let relay = Keys::generate();
+    let identity = test_identity(&relay);
     let (_, create) = test_create(&host, &participant);
     let session_id = Uuid::parse_str(TEST_MEETING_ID)
         .unwrap_or_else(|error| panic!("parse test Meeting ID: {error}"));
@@ -554,10 +556,11 @@ fn action_policy_end_distinguishes_direct_close_from_recorded_actions() {
         .unwrap_or_else(|error| panic!("build direct close: {error}"))
         .sign_with_keys(&host)
         .unwrap_or_else(|error| panic!("sign direct close: {error}"));
-    let direct = parse_current_end(&[direct_close], &create)
+    let direct = parse_current_end(&[direct_close], &identity, &create)
         .unwrap_or_else(|error| panic!("parse direct close: {error:?}"))
         .unwrap_or_else(|| panic!("direct close must be present"));
     assert!(!direct.actions_attested);
+    assert_eq!(direct.termination_source, MeetingTerminationSource::Host);
 
     let board_event_id = "cd".repeat(32);
     let recorded_close =
@@ -576,10 +579,79 @@ fn action_policy_end_distinguishes_direct_close_from_recorded_actions() {
         .unwrap_or_else(|error| panic!("build recorded-actions close: {error}"))
         .sign_with_keys(&host)
         .unwrap_or_else(|error| panic!("sign recorded-actions close: {error}"));
-    let recorded = parse_current_end(&[recorded_close], &create)
+    let recorded = parse_current_end(&[recorded_close], &identity, &create)
         .unwrap_or_else(|error| panic!("parse recorded-actions close: {error:?}"))
         .unwrap_or_else(|| panic!("recorded-actions close must be present"));
     assert!(recorded.actions_attested);
+    assert_eq!(recorded.termination_source, MeetingTerminationSource::Host);
+}
+
+#[test]
+fn end_projection_preserves_abort_reason_and_classifies_only_verified_signers() {
+    let host = Keys::generate();
+    let participant = Keys::generate();
+    let relay = Keys::generate();
+    let outsider = Keys::generate();
+    let identity = test_identity(&relay);
+    let (_, create) = test_create(&host, &participant);
+    let session_id = Uuid::parse_str(TEST_MEETING_ID)
+        .unwrap_or_else(|error| panic!("parse test Meeting ID: {error}"));
+
+    let abort = |signer: &Keys, reason_code: &str, reason: Option<&str>| {
+        buzz_sdk_pkg::build_meeting_v2_actions_end(buzz_sdk_pkg::MeetingV2ActionsEndParams {
+            session_id,
+            create_event_id: &create.event_id,
+            outcome: buzz_sdk_pkg::MeetingV2EndOutcome::Aborted,
+            reason_code: Some(reason_code),
+            reason,
+            action_fence: None,
+        })
+        .unwrap_or_else(|error| panic!("build abort: {error}"))
+        .sign_with_keys(signer)
+        .unwrap_or_else(|error| panic!("sign abort: {error}"))
+    };
+
+    let host_end = parse_current_end(
+        &[abort(
+            &host,
+            "insufficient_information",
+            Some("The required evidence was not available."),
+        )],
+        &identity,
+        &create,
+    )
+    .unwrap_or_else(|error| panic!("parse host abort: {error:?}"))
+    .unwrap_or_else(|| panic!("host abort must be present"));
+    assert_eq!(host_end.termination_source, MeetingTerminationSource::Host);
+    assert_eq!(
+        host_end.reason.as_deref(),
+        Some("The required evidence was not available.")
+    );
+
+    let relay_end = parse_current_end(
+        &[abort(&relay, "participant_revoked", None)],
+        &identity,
+        &create,
+    )
+    .unwrap_or_else(|error| panic!("parse Relay abort: {error:?}"))
+    .unwrap_or_else(|| panic!("Relay abort must be present"));
+    assert_eq!(
+        relay_end.termination_source,
+        MeetingTerminationSource::Relay
+    );
+    assert!(relay_end.reason.is_none());
+
+    let unknown_end = parse_current_end(
+        &[abort(&outsider, "discussion_blocked", None)],
+        &identity,
+        &create,
+    )
+    .unwrap_or_else(|error| panic!("parse unknown abort signer: {error:?}"))
+    .unwrap_or_else(|| panic!("unknown-signer abort must be present"));
+    assert_eq!(
+        unknown_end.termination_source,
+        MeetingTerminationSource::Unknown
+    );
 }
 
 #[test]

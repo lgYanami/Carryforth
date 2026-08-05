@@ -718,6 +718,7 @@ pub(super) fn parse_current_board(
 
 pub(super) fn parse_current_end(
     events: &[Event],
+    identity: &MeetingIdentity,
     create: &CreateProjection,
 ) -> Result<Option<MeetingEndState>, MeetingReadError> {
     let mut ends = Vec::new();
@@ -758,14 +759,23 @@ pub(super) fn parse_current_end(
                 "Meeting End action attestation does not match its outcome or policy",
             )));
         }
+        let signer = event.pubkey.to_hex();
+        let termination_source = if signer == create.host_pubkey {
+            MeetingTerminationSource::Host
+        } else if event.pubkey == identity.relay_pubkey {
+            MeetingTerminationSource::Relay
+        } else {
+            MeetingTerminationSource::Unknown
+        };
         ends.push(MeetingEndState {
             event_id: event.id.to_hex(),
             outcome: outcome.to_string(),
             reason_code,
             reason: (!event.content.trim().is_empty()).then(|| event.content.clone()),
-            ended_by: event.pubkey.to_hex(),
+            ended_by: signer,
             ended_at: event.created_at.as_secs(),
             actions_attested,
+            termination_source,
         });
     }
     ends.sort_by(|left, right| {

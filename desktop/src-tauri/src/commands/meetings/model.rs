@@ -46,6 +46,15 @@ pub struct MeetingEndState {
     pub(super) ended_by: String,
     pub(super) ended_at: u64,
     pub(super) actions_attested: bool,
+    pub(super) termination_source: MeetingTerminationSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MeetingTerminationSource {
+    Host,
+    Relay,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]

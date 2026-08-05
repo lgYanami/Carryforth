@@ -206,6 +206,7 @@ export type MeetingEndState = {
   endedBy: string;
   endedAt: number;
   actionsAttested: boolean;
+  terminationSource: "host" | "relay" | "unknown";
 };
 
 export type MeetingSnapshot = {

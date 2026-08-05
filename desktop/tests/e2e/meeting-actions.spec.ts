@@ -200,7 +200,7 @@ test("Human host enters action finalization, visits Project View, and atomically
     "closed",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "Actions recorded",
+    "Action output confirmed",
   );
 
   const actions = await page.evaluate(() =>
@@ -430,6 +430,6 @@ test("aborting during action finalization warns that external effects may remain
     "aborted",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "External effects may remain",
+    "External system effects may remain",
   );
 });

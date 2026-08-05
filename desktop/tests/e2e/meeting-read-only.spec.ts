@@ -21,6 +21,7 @@ const IDS = {
   aborted: "10000000-0000-4000-8000-000000000004",
   forbidden: "10000000-0000-4000-8000-000000000005",
   unsupported: "10000000-0000-4000-8000-000000000006",
+  relayAborted: "10000000-0000-4000-8000-000000000007",
 } as const;
 
 function speech(revision: number, content: string): MeetingSpeech {
@@ -138,6 +139,11 @@ function readyMeeting(input: {
   lifecycle: MeetingLifecycle;
   phase?: string;
   outcome?: "closed" | "aborted";
+  reasonCode?: string;
+  reason?: string | null;
+  endedBy?: string;
+  terminationSource?: "host" | "relay" | "unknown";
+  actionStarted?: boolean;
 }): {
   result: MeetingLoadResult;
   speeches: MeetingSpeech[];
@@ -151,14 +157,20 @@ function readyMeeting(input: {
     ? {
         eventId: "e".repeat(64),
         outcome: input.outcome,
-        reasonCode: input.outcome === "aborted" ? "insufficient_context" : null,
+        reasonCode:
+          input.outcome === "aborted"
+            ? (input.reasonCode ?? "insufficient_information")
+            : null,
         reason:
           input.outcome === "aborted"
-            ? "The required evidence was not available."
+            ? input.reason === undefined
+              ? "The required evidence was not available."
+              : input.reason
             : null,
-        endedBy: HOST,
+        endedBy: input.endedBy ?? HOST,
         endedAt: NOW + 20,
         actionsAttested: input.outcome === "closed",
+        terminationSource: input.terminationSource ?? "host",
       }
     : null;
   const snapshot: MeetingSnapshot = {
@@ -196,15 +208,17 @@ function readyMeeting(input: {
       source: "projection",
     },
     action:
-      input.lifecycle === "finalizing_actions"
+      input.lifecycle === "finalizing_actions" || input.actionStarted
         ? {
             actionRunId: "20000000-0000-4000-8000-000000000001",
             boardEventId: "b".repeat(64),
             actionWindowEpoch: 1,
             condition: "runnable",
-            terminalStatus: null,
+            terminalStatus:
+              input.lifecycle === "aborted" ? "completed_aborted" : null,
             completionEventId: null,
-            actionDeadlineAtMs: (NOW + 600) * 1_000,
+            actionDeadlineAtMs:
+              input.lifecycle === "aborted" ? null : (NOW + 600) * 1_000,
             lastErrorCode: null,
           }
         : null,
@@ -257,6 +271,21 @@ function meetingSeeds() {
         title: "Aborted evidence review",
         lifecycle: "aborted",
         outcome: "aborted",
+        actionStarted: true,
+      }),
+    },
+    {
+      id: IDS.relayAborted,
+      title: "Access-revoked meeting",
+      ...readyMeeting({
+        id: IDS.relayAborted,
+        title: "Access-revoked meeting",
+        lifecycle: "aborted",
+        outcome: "aborted",
+        reasonCode: "participant_revoked",
+        reason: null,
+        endedBy: "f".repeat(64),
+        terminationSource: "relay",
       }),
     },
     {
@@ -414,6 +443,71 @@ test("Meeting activity is bounded, product-level, and separate from canonical Sp
   expect(reads).toHaveLength(2);
 });
 
+test("terminal summaries distinguish goal-reached close, host abort, and Relay abort", async ({
+  page,
+}) => {
+  await installMockBridge(page, { meetings: meetingSeeds() });
+  await page.goto("/");
+
+  await page.getByTestId("meeting-history-trigger").click();
+  await page
+    .getByRole("button", { name: /Completed requirements review/ })
+    .click();
+  let summary = page.getByTestId("meeting-terminal-summary");
+  await expect(summary).toContainText(
+    "The host judged that the meeting goal was reached.",
+  );
+  await expect(summary).toContainText("Action output confirmed");
+  await expect(summary).toContainText(
+    "This does not mean that the resulting work is complete.",
+  );
+  await expect(summary).toContainText("Source: Host");
+
+  await page.getByTestId("meeting-history-trigger").click();
+  await page.getByRole("button", { name: /Aborted evidence review/ }).click();
+  summary = page.getByTestId("meeting-terminal-summary");
+  await expect(summary).toContainText(
+    "The meeting did not end as a normal goal-reached close.",
+  );
+  await expect(summary).toContainText("Insufficient information");
+  await expect(summary).toContainText(
+    "The required evidence was not available.",
+  );
+  await expect(summary).toContainText("Source: Host");
+  await expect(
+    page.getByTestId("meeting-terminal-external-effects-warning"),
+  ).toContainText(
+    "External system effects may remain; Meeting does not verify or list them.",
+  );
+
+  await page.getByTestId("meeting-history-trigger").click();
+  await page.getByRole("button", { name: /Access-revoked meeting/ }).click();
+  summary = page.getByTestId("meeting-terminal-summary");
+  await expect(summary).toContainText("Participant access revoked");
+  await expect(summary).toContainText("Source: Community Relay");
+  await expect(summary).not.toContainText(
+    "The required evidence was not available.",
+  );
+  await expect(
+    page.getByTestId("meeting-terminal-external-effects-warning"),
+  ).toHaveCount(0);
+
+  await expect(page.getByRole("button", { name: /reopen/i })).toHaveCount(0);
+  for (const testId of [
+    "meeting-board-editor",
+    "meeting-board-save",
+    "meeting-speech-composer",
+    "meeting-floor-request",
+    "meeting-host-end-controls",
+    "meeting-action-finalization-card",
+  ]) {
+    await expect(page.getByTestId(testId)).toHaveCount(0);
+  }
+  await expect(page.getByTestId("meeting-screen")).not.toContainText(
+    /receipt|Relay verified all actions/i,
+  );
+});
+
 test("action, history, forbidden, and unsupported Meeting states stay read-only", async ({
   page,
 }) => {
@@ -447,7 +541,7 @@ test("action, history, forbidden, and unsupported Meeting states stay read-only"
     "final Board",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "Actions recorded",
+    "Action output confirmed",
   );
 
   await page.getByTestId("meeting-history-trigger").click();
@@ -460,7 +554,7 @@ test("action, history, forbidden, and unsupported Meeting states stay read-only"
     "required evidence was not available",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "insufficient context",
+    "Insufficient information",
   );
 
   await page.getByTestId(`meeting-row-${IDS.forbidden}`).click();
