@@ -216,6 +216,34 @@ pub struct MeetingSpeech {
     pub(super) speech_revision: u64,
     pub(super) grant_event_id: String,
     pub(super) mentions: Vec<String>,
+    pub(super) author_participant_type: MeetingParticipantType,
+    pub(super) author_is_moderator: bool,
+    pub(super) handoff: Option<MeetingSpeechHandoff>,
+}
+
+/// A verified Directed Handoff carried atomically by canonical Speech.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingSpeechHandoff {
+    pub(super) target_pubkey: String,
+    pub(super) handoff_type: MeetingSpeechHandoffType,
+    pub(super) reason: String,
+}
+
+/// Product-level Directed Handoff type accepted by Meeting V2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSpeechHandoffType {
+    /// Ask the target a question.
+    Question,
+    /// Ask the target to provide information.
+    InformationRequest,
+    /// Ask the target to clarify a point.
+    Clarification,
+    /// Ask the target to review something.
+    Review,
+    /// Explicitly request a response from the target.
+    ResponseRequested,
 }
 
 #[derive(Debug, Clone, Serialize)]

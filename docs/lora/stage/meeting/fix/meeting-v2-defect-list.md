@@ -412,9 +412,18 @@ Speaking。
 
 面板只做观察，不提供添加、移除、换主持、修改 Channel role 或把离线解释为退会的操作。
 
-### MFX-012（P1）：canonical Speech timeline 缺少身份与 Handoff 语义
+### MFX-012（已解决）：canonical Speech timeline 缺少身份与 Handoff 语义
 
-**现状**
+**解决状态（2026-08-05）**
+
+Desktop native Speech projection 现已使用同一份可信 snapshot 的冻结 roster 与 immutable moderator
+身份，为每条 canonical Speech 输出 Human/Agent 类型和 Host 标识；同时严格解析原子
+`handoff-to`、`handoff-type`、`handoff-reason`，并校验字段完整性、唯一性、协议类型、原因文本及
+target 的冻结 roster 归属。普通 mention 不会被推断为 Handoff，非法或冲突 Handoff 数据 fail
+closed。Speech timeline 直接显示上述 typed DTO，并在正文后展示 Handoff 的目标、类型和原因；
+Intent、Offer、Grant、Board command 等控制事件仍只进入 Meeting Activity，不建立普通消息旁路。
+
+**原现状**
 
 Speech row 主要显示头像、作者、时间和 Markdown 正文。Native `MeetingSpeech` DTO 也只包含 author、
 content、revision、grant 和 mentions，没有保留可供 UI 展示的 Directed Handoff 目标与原因。

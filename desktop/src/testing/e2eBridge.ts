@@ -3303,6 +3303,12 @@ async function handleMeetingFloorAction(
       if (!floor.grant || floor.grant.holderPubkey !== actor) {
         throw new Error("Floor Grant is not held by this Human");
       }
+      const author = snapshot.participants.find(
+        (participant) => participant.pubkey === actor,
+      );
+      if (!author || author.participantType === "unknown") {
+        throw new Error("Meeting Speech author has no frozen participant type");
+      }
       const speechRevision = snapshot.speechRevision + 1;
       seed.speeches ??= [];
       seed.speeches.push({
@@ -3313,6 +3319,9 @@ async function handleMeetingFloorAction(
         speechRevision,
         grantEventId: floor.grant.grantId,
         mentions: input.action.mentions,
+        authorParticipantType: author.participantType,
+        authorIsModerator: actor === snapshot.moderatorPubkey,
+        handoff: input.action.handoff ?? null,
       });
       snapshot.speechRevision = speechRevision;
       snapshot.latestSpeechAt = Math.floor(Date.now() / 1_000);

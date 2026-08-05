@@ -24,14 +24,25 @@ const IDS = {
 } as const;
 
 function speech(revision: number, content: string): MeetingSpeech {
+  const authorPubkey = revision % 2 === 0 ? HOST : HUMAN;
   return {
     eventId: revision.toString(16).padStart(64, "0"),
-    authorPubkey: revision % 2 === 0 ? HOST : AGENT,
+    authorPubkey,
     content,
     createdAt: NOW + revision,
     speechRevision: revision,
     grantEventId: "a".repeat(64),
-    mentions: [],
+    mentions: revision === 2 ? [AGENT] : [],
+    authorParticipantType: revision % 2 === 0 ? "agent" : "human",
+    authorIsModerator: authorPubkey === HOST,
+    handoff:
+      revision === 1
+        ? {
+            targetPubkey: AGENT,
+            handoffType: "review",
+            reason: "Please review the verified Desktop boundary.",
+          }
+        : null,
   };
 }
 
@@ -318,6 +329,21 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
     "verified read path first",
   );
+  await expect(page.getByTestId("meeting-speech-identity-1")).toHaveText(
+    "human",
+  );
+  await expect(page.getByTestId("meeting-speech-identity-2")).toHaveText(
+    "agent",
+  );
+  await expect(page.getByTestId("meeting-speech-host-2")).toHaveText("Host");
+  const handoff = page.getByTestId("meeting-speech-handoff-1");
+  await expect(handoff).toContainText("Directed handoff");
+  await expect(handoff).toContainText("Review");
+  await expect(handoff).toContainText("charlie");
+  await expect(handoff).toContainText(
+    "Please review the verified Desktop boundary.",
+  );
+  await expect(page.getByTestId("meeting-speech-handoff-2")).toHaveCount(0);
   const statusStrip = page.getByTestId("meeting-status-strip");
   await expect(statusStrip).toContainText("has the floor");
   await expect(statusStrip).not.toContainText(/Speech r\d+|State r\d+/);

@@ -212,6 +212,15 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
   await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
     "The exact-retry boundary is ready for review.",
   );
+  await expect(page.getByTestId("meeting-speech-identity-1")).toHaveText(
+    "human",
+  );
+  const renderedHandoff = page.getByTestId("meeting-speech-handoff-1");
+  await expect(renderedHandoff).toContainText("Question");
+  await expect(renderedHandoff).toContainText("bob");
+  await expect(renderedHandoff).toContainText(
+    "Please verify the participant-facing behavior.",
+  );
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
   const submittedSpeechInput = await page.evaluate(() =>
     (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])

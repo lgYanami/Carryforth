@@ -119,6 +119,9 @@ function meetingSpeech(revision: number): MeetingSpeech {
     speechRevision: revision,
     grantEventId: "5".repeat(64),
     mentions: [],
+    authorParticipantType: "human",
+    authorIsModerator: false,
+    handoff: null,
   };
 }
 

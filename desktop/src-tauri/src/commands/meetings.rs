@@ -194,11 +194,17 @@ pub async fn get_meeting_speeches(
     let roster = snapshot
         .participants
         .iter()
-        .map(|participant| participant.pubkey.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|participant| (participant.pubkey.clone(), participant.participant_type))
+        .collect::<BTreeMap<_, _>>();
     let mut by_revision = BTreeMap::new();
     for event in events {
-        let Some(speech) = parse_speech(&event, &meeting_id, &roster, snapshot.speech_revision)?
+        let Some(speech) = parse_speech(
+            &event,
+            &meeting_id,
+            &roster,
+            &snapshot.moderator_pubkey,
+            snapshot.speech_revision,
+        )?
         else {
             continue;
         };
@@ -512,12 +518,13 @@ async fn load_meeting_snapshot_at(
     }
     let roster = participants
         .iter()
-        .map(|participant| participant.pubkey.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|participant| (participant.pubkey.clone(), participant.participant_type))
+        .collect::<BTreeMap<_, _>>();
     let mut latest_speech_at: Option<u64> = None;
     for event in &events {
-        if let Some(speech) = parse_speech(event, meeting_id, &roster, revisions.3)
-            .map_err(MeetingReadError::Other)?
+        if let Some(speech) =
+            parse_speech(event, meeting_id, &roster, &create.host_pubkey, revisions.3)
+                .map_err(MeetingReadError::Other)?
         {
             latest_speech_at = Some(
                 latest_speech_at

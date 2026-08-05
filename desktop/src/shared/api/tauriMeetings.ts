@@ -277,6 +277,17 @@ export type MeetingSpeech = {
   speechRevision: number;
   grantEventId: string;
   mentions: string[];
+  /** Human/Agent identity frozen by the Meeting roster, not inferred by UI. */
+  authorParticipantType: "human" | "agent";
+  /** Whether the frozen author is the immutable Meeting moderator. */
+  authorIsModerator: boolean;
+  handoff: MeetingSpeechHandoff | null;
+};
+
+export type MeetingSpeechHandoff = {
+  targetPubkey: string;
+  handoffType: MeetingHandoffType;
+  reason: string;
 };
 
 export type MeetingSpeechCursor = {
