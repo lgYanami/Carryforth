@@ -64,6 +64,7 @@ import type {
   MeetingActivity,
   MeetingActionFinalizationInput,
   MeetingActionFinalizationResult,
+  MeetingAttentionReason,
   MeetingFloorActionInput,
   MeetingFloorActionResult,
   MeetingHostActionInput,
@@ -3417,9 +3418,38 @@ async function handleMeetingFloorAction(
   return accepted;
 }
 
-function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
+function mockMeetingAttentionReason(
+  snapshot: MeetingSnapshot,
+  viewerPubkey: string,
+): MeetingAttentionReason | null {
+  const viewerIsHuman = snapshot.participants.some(
+    (participant) =>
+      participant.pubkey === viewerPubkey &&
+      participant.participantType === "human",
+  );
+  if (!viewerIsHuman) return null;
+  if (snapshot.lifecycle === "aborted") return "meeting_aborted";
+  if (snapshot.currentOfferPubkey === viewerPubkey) return "floor_offer";
+  if (snapshot.currentSpeakerPubkey === viewerPubkey) return "floor_grant";
+  if (snapshot.moderatorPubkey !== viewerPubkey) return null;
+  if (snapshot.lifecycle === "finalizing_actions") {
+    if (snapshot.action?.condition === "blocked") return "host_action_blocked";
+    if (snapshot.action?.condition === "runnable") return "host_action";
+    return null;
+  }
+  if (snapshot.host?.boardControl.phase === "board_pending") {
+    return "host_board";
+  }
+  return snapshot.host?.canSelect ? "host_floor" : null;
+}
+
+function mockMeetingListItem(
+  seed: MockMeetingSeed,
+  viewerPubkey: string,
+): MeetingListItem {
   if (seed.result.status === "ready") {
     const snapshot = seed.result.snapshot;
+    const attentionReason = mockMeetingAttentionReason(snapshot, viewerPubkey);
     return {
       meetingId: seed.id,
       title: seed.title,
@@ -3427,22 +3457,16 @@ function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
       phase: snapshot.phase,
       currentSpeakerPubkey: snapshot.currentSpeakerPubkey,
       currentOfferPubkey: snapshot.currentOfferPubkey,
-      humanFloorAttentionPubkey:
-        [snapshot.currentOfferPubkey, snapshot.currentSpeakerPubkey].find(
-          (pubkey) =>
-            pubkey !== null &&
-            snapshot.participants.some(
-              (participant) =>
-                participant.pubkey === pubkey &&
-                participant.participantType === "human",
-            ),
-        ) ?? null,
+      needsAttention: attentionReason !== null,
+      attentionReason,
       moderatorPubkey: snapshot.moderatorPubkey,
       policy: snapshot.policy,
-      updatedAt:
-        snapshot.end?.endedAt ??
-        snapshot.latestSpeechAt ??
+      updatedAt: Math.max(
+        snapshot.createdAt,
+        snapshot.end?.endedAt ?? 0,
+        snapshot.latestSpeechAt ?? 0,
         snapshot.board.updatedAt,
+      ),
       endedAt: snapshot.end?.endedAt ?? null,
       latestSpeechAt: snapshot.latestSpeechAt,
       compatibility: "ready",
@@ -3463,7 +3487,8 @@ function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
     phase: null,
     currentSpeakerPubkey: null,
     currentOfferPubkey: null,
-    humanFloorAttentionPubkey: null,
+    needsAttention: false,
+    attentionReason: null,
     moderatorPubkey: null,
     policy: null,
     updatedAt: null,
@@ -11448,7 +11473,9 @@ export function maybeInstallE2eTauriMocks() {
         return meetingIds
           .map((meetingId) => getMockMeetingSeed(meetingId, activeConfig))
           .filter((meeting): meeting is MockMeetingSeed => meeting !== null)
-          .map(mockMeetingListItem);
+          .map((meeting) =>
+            mockMeetingListItem(meeting, getMockMemberPubkey(activeConfig)),
+          );
       }
       case "get_meeting_snapshot": {
         const snapshotDelayMs = activeConfig?.mock?.meetingSnapshotDelayMs ?? 0;

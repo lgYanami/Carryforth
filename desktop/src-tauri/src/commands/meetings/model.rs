@@ -148,6 +148,8 @@ pub struct MeetingSnapshot {
     pub(super) action: Option<MeetingActionState>,
     pub(super) end: Option<MeetingEndState>,
     pub(super) latest_speech_at: Option<u64>,
+    #[serde(skip)]
+    pub(super) authoritative_updated_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -187,13 +189,27 @@ pub struct MeetingListItem {
     pub(super) phase: Option<String>,
     pub(super) current_speaker_pubkey: Option<String>,
     pub(super) current_offer_pubkey: Option<String>,
-    pub(super) human_floor_attention_pubkey: Option<String>,
+    pub(super) needs_attention: bool,
+    pub(super) attention_reason: Option<MeetingAttentionReason>,
     pub(super) moderator_pubkey: Option<String>,
     pub(super) policy: Option<String>,
     pub(super) updated_at: Option<u64>,
     pub(super) ended_at: Option<u64>,
     pub(super) latest_speech_at: Option<u64>,
     pub(super) compatibility: MeetingListCompatibility,
+}
+
+/// Product-level reason the current Desktop identity must revisit a Meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingAttentionReason {
+    FloorOffer,
+    FloorGrant,
+    HostBoard,
+    HostFloor,
+    HostAction,
+    HostActionBlocked,
+    MeetingAborted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

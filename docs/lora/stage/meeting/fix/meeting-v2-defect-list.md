@@ -465,9 +465,25 @@ content、revision、grant 和 mentions，没有保留可供 UI 展示的 Direct
 - 不把 Intent、Offer、Grant、Board command 混成普通 Speech；
 - 继续禁止 Reply、Thread、Reaction 和普通消息编辑旁路。
 
-### MFX-013（P1）：Meetings 侧栏 attention 与排序不完整
+### MFX-013（已解决）：Meetings 侧栏 attention 与排序不完整
 
-**现状**
+**解决状态（2026-08-05）**
+
+Native `MeetingListItem` 现已针对当前 Desktop 冻结 Human 身份直接投影有限的
+`needsAttention` 和 `attentionReason`，覆盖当前 Human 的 Offer/Grant、Human 主持人的 Board
+Maintenance、Floor Decision、action runnable/blocked，以及需要查看的 aborted 终态。投影不再
+返回由 React 对比 pubkey 猜测的 `humanFloorAttentionPubkey`，Agent 身份和其他 participant 的待办
+不会成为当前 Human 的 attention。
+
+列表的 `updatedAt` 现在取 Create、权威 State、Board、canonical Speech 和 End 的最近时间，而非
+只看 Board/End。Desktop 使用稳定顺序：当前身份 attention、非终态 active、最近权威活动、
+Meeting ID。需要查看的 aborted Meeting 在确认前保留在主列表，查看后进入 history；确认记录按
+Community、Meeting、attention reason 和终态时间隔离，并且不写 Speech read marker。
+
+Speech unread 仍只由 `latestSpeechAt` 与共享 read marker 派生。Board、Intent、Floor、Action 或
+attention 确认不会生成、清除或修改 Speech unread。
+
+**原现状**
 
 当前 attention 只从指向 Human 的 active Offer/Grant 派生。active list 只按 `updatedAt` 排序。
 

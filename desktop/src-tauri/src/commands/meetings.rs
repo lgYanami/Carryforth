@@ -14,6 +14,8 @@ mod floor;
 pub use floor::submit_meeting_floor_action;
 mod host;
 pub use host::submit_meeting_host_action;
+mod directory;
+use directory::list_item_from_load;
 mod model;
 use model::*;
 mod pending;
@@ -143,15 +145,19 @@ pub async fn list_meetings(
     for id in meeting_ids {
         ids.insert(canonical_meeting_id(&id)?);
     }
+    let viewer_keys = state.signing_keys()?;
+    let viewer_pubkey = viewer_keys.public_key().to_hex();
+    let api_base_url = relay_api_base_url_with_override(&state);
     let identity = read_meeting_identity(&state).await?;
     let mut items = Vec::with_capacity(ids.len());
     for meeting_id in ids {
         let loaded = if let Some(identity) = &identity {
-            load_meeting_snapshot(&state, identity, &meeting_id).await
+            load_meeting_snapshot_at(&state, identity, &meeting_id, &api_base_url, &viewer_keys)
+                .await
         } else {
             Ok(MeetingLoadResult::UnsupportedRelay)
         };
-        items.push(list_item_from_load(meeting_id, loaded));
+        items.push(list_item_from_load(meeting_id, loaded, &viewer_pubkey));
     }
     Ok(items)
 }
@@ -533,6 +539,16 @@ async fn load_meeting_snapshot_at(
         }
     }
 
+    let authoritative_updated_at = current_state
+        .as_ref()
+        .map(|state| state.created_at)
+        .into_iter()
+        .chain([create.created_at, board.updated_at])
+        .chain(end.as_ref().map(|end| end.ended_at))
+        .chain(latest_speech_at)
+        .max()
+        .unwrap_or(create.created_at);
+
     Ok(MeetingLoadResult::Ready {
         snapshot: Box::new(MeetingSnapshot {
             meeting_id: create.meeting_id,
@@ -560,6 +576,7 @@ async fn load_meeting_snapshot_at(
             action,
             end,
             latest_speech_at,
+            authoritative_updated_at,
         }),
     })
 }
@@ -745,81 +762,6 @@ fn host_from_projection(
             && !state.forced_return_to_moderator
             && state.human_queue.is_empty(),
     })
-}
-
-fn list_item_from_load(
-    meeting_id: String,
-    loaded: Result<MeetingLoadResult, MeetingReadError>,
-) -> MeetingListItem {
-    match loaded {
-        Ok(MeetingLoadResult::Ready { snapshot }) => {
-            let active_floor_pubkey = snapshot
-                .current_offer_pubkey
-                .as_ref()
-                .or(snapshot.current_speaker_pubkey.as_ref());
-            let human_floor_attention_pubkey = active_floor_pubkey
-                .filter(|pubkey| {
-                    snapshot.participants.iter().any(|participant| {
-                        participant.pubkey == **pubkey
-                            && participant.participant_type == MeetingParticipantType::Human
-                    })
-                })
-                .cloned();
-            MeetingListItem {
-                meeting_id,
-                title: snapshot.title.clone(),
-                lifecycle: Some(snapshot.lifecycle),
-                phase: Some(snapshot.phase.clone()),
-                current_speaker_pubkey: snapshot.current_speaker_pubkey.clone(),
-                current_offer_pubkey: snapshot.current_offer_pubkey.clone(),
-                human_floor_attention_pubkey,
-                moderator_pubkey: Some(snapshot.moderator_pubkey.clone()),
-                policy: Some(snapshot.policy.clone()),
-                updated_at: Some(
-                    snapshot
-                        .end
-                        .as_ref()
-                        .map_or(snapshot.board.updated_at, |end| end.ended_at),
-                ),
-                ended_at: snapshot.end.as_ref().map(|end| end.ended_at),
-                latest_speech_at: snapshot.latest_speech_at,
-                compatibility: MeetingListCompatibility::Ready,
-            }
-        }
-        Ok(MeetingLoadResult::UnsupportedRelay) => {
-            empty_list_item(meeting_id, MeetingListCompatibility::UnsupportedRelay)
-        }
-        Ok(MeetingLoadResult::UnsupportedProtocol { .. }) => {
-            empty_list_item(meeting_id, MeetingListCompatibility::UnsupportedProtocol)
-        }
-        Ok(MeetingLoadResult::Forbidden) | Err(MeetingReadError::Forbidden) => {
-            empty_list_item(meeting_id, MeetingListCompatibility::Forbidden)
-        }
-        Ok(MeetingLoadResult::NotFound) => {
-            empty_list_item(meeting_id, MeetingListCompatibility::NotFound)
-        }
-        Err(MeetingReadError::Other(_)) => {
-            empty_list_item(meeting_id, MeetingListCompatibility::UnsupportedProtocol)
-        }
-    }
-}
-
-fn empty_list_item(meeting_id: String, compatibility: MeetingListCompatibility) -> MeetingListItem {
-    MeetingListItem {
-        title: meeting_id.clone(),
-        meeting_id,
-        lifecycle: None,
-        phase: None,
-        current_speaker_pubkey: None,
-        current_offer_pubkey: None,
-        human_floor_attention_pubkey: None,
-        moderator_pubkey: None,
-        policy: None,
-        updated_at: None,
-        ended_at: None,
-        latest_speech_at: None,
-        compatibility,
-    }
 }
 
 async fn query_meeting(

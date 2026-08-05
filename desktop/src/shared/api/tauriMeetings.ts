@@ -255,7 +255,8 @@ export type MeetingListItem = {
   phase: string | null;
   currentSpeakerPubkey: string | null;
   currentOfferPubkey: string | null;
-  humanFloorAttentionPubkey: string | null;
+  needsAttention: boolean;
+  attentionReason: MeetingAttentionReason | null;
   moderatorPubkey: string | null;
   policy: string | null;
   updatedAt: number | null;
@@ -268,6 +269,15 @@ export type MeetingListItem = {
     | "forbidden"
     | "not_found";
 };
+
+export type MeetingAttentionReason =
+  | "floor_offer"
+  | "floor_grant"
+  | "host_board"
+  | "host_floor"
+  | "host_action"
+  | "host_action_blocked"
+  | "meeting_aborted";
 
 export type MeetingSpeech = {
   eventId: string;

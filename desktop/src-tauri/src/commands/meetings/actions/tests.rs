@@ -1,6 +1,7 @@
+use super::super::directory::{list_item_from_load, meeting_attention_reason};
 use super::super::{
-    MeetingBoard, MeetingBoardControl, MeetingBoardSource, MeetingHostState, MeetingParticipant,
-    MeetingParticipantType,
+    MeetingAttentionReason, MeetingBoard, MeetingBoardControl, MeetingBoardSource,
+    MeetingHostState, MeetingParticipant, MeetingParticipantType,
 };
 use super::*;
 use nostr::Keys;
@@ -81,6 +82,7 @@ fn snapshot(host: &Keys, participant: &Keys) -> MeetingSnapshot {
         action: None,
         end: None,
         latest_speech_at: None,
+        authoritative_updated_at: 1,
     }
 }
 
@@ -102,6 +104,100 @@ fn enter_action_phase(snapshot: &mut MeetingSnapshot, condition: &str) {
         action_deadline_at_ms: (condition == "runnable").then_some(90_000),
         last_error_code: (condition == "blocked").then(|| "external_operation_failed".to_string()),
     });
+}
+
+#[test]
+fn meeting_list_attention_is_viewer_scoped_and_product_level() {
+    let host = Keys::generate();
+    let participant = Keys::generate();
+    let host_pubkey = host.public_key().to_hex();
+    let participant_pubkey = participant.public_key().to_hex();
+    let mut meeting = snapshot(&host, &participant);
+
+    assert_eq!(
+        meeting_attention_reason(&meeting, &host_pubkey),
+        Some(MeetingAttentionReason::HostFloor)
+    );
+    assert_eq!(
+        meeting_attention_reason(&meeting, &participant_pubkey),
+        None
+    );
+
+    meeting
+        .host
+        .as_mut()
+        .unwrap_or_else(|| panic!("host projection"))
+        .board_control
+        .phase = "board_pending".to_string();
+    assert_eq!(
+        meeting_attention_reason(&meeting, &host_pubkey),
+        Some(MeetingAttentionReason::HostBoard)
+    );
+
+    enter_action_phase(&mut meeting, "runnable");
+    assert_eq!(
+        meeting_attention_reason(&meeting, &host_pubkey),
+        Some(MeetingAttentionReason::HostAction)
+    );
+    meeting
+        .action
+        .as_mut()
+        .unwrap_or_else(|| panic!("action projection"))
+        .condition = "blocked".to_string();
+    assert_eq!(
+        meeting_attention_reason(&meeting, &host_pubkey),
+        Some(MeetingAttentionReason::HostActionBlocked)
+    );
+
+    meeting.lifecycle = MeetingLifecycle::Aborted;
+    assert_eq!(
+        meeting_attention_reason(&meeting, &host_pubkey),
+        Some(MeetingAttentionReason::MeetingAborted)
+    );
+}
+
+#[test]
+fn meeting_list_attention_does_not_expose_another_participants_floor_work() {
+    let host = Keys::generate();
+    let participant = Keys::generate();
+    let observer = Keys::generate();
+    let participant_pubkey = participant.public_key().to_hex();
+    let observer_pubkey = observer.public_key().to_hex();
+    let mut meeting = snapshot(&host, &participant);
+    meeting.participants[1].participant_type = MeetingParticipantType::Human;
+    meeting.participants.push(MeetingParticipant {
+        pubkey: observer_pubkey.clone(),
+        participant_type: MeetingParticipantType::Human,
+        channel_role: "member".to_string(),
+    });
+    meeting.current_offer_pubkey = Some(participant_pubkey.clone());
+    assert_eq!(
+        meeting_attention_reason(&meeting, &participant_pubkey),
+        Some(MeetingAttentionReason::FloorOffer)
+    );
+    assert_eq!(meeting_attention_reason(&meeting, &observer_pubkey), None);
+
+    meeting.current_offer_pubkey = None;
+    meeting.current_speaker_pubkey = Some(participant_pubkey.clone());
+    assert_eq!(
+        meeting_attention_reason(&meeting, &participant_pubkey),
+        Some(MeetingAttentionReason::FloorGrant)
+    );
+
+    meeting.authoritative_updated_at = 42;
+    let item = list_item_from_load(
+        MEETING_ID.to_string(),
+        Ok(MeetingLoadResult::Ready {
+            snapshot: Box::new(meeting),
+        }),
+        &participant_pubkey,
+    );
+    assert!(item.needs_attention);
+    assert_eq!(
+        item.attention_reason,
+        Some(MeetingAttentionReason::FloorGrant)
+    );
+    assert_eq!(item.updated_at, Some(42));
 }
 
 fn has_tag(event: &nostr::Event, key: &str, value: &str) -> bool {

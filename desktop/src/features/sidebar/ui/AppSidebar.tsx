@@ -526,7 +526,7 @@ export function AppSidebar({
                 <>
                   <FeatureGate feature="meeting">
                     <MeetingsSidebarSection
-                      currentPubkey={currentPubkey}
+                      communityId={activeCommunity?.id ?? "no-community"}
                       items={meetingItems}
                       onSelectMeeting={onSelectChannel}
                       selectedMeetingId={

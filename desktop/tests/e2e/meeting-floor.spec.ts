@@ -222,6 +222,9 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
     "Please verify the participant-facing behavior.",
   );
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
+  await expect(page.getByTestId(`meeting-attention-${MEETING_ID}`)).toHaveCount(
+    0,
+  );
   const submittedSpeechInput = await page.evaluate(() =>
     (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
       .filter((entry) => entry.command === "submit_meeting_floor_action")
