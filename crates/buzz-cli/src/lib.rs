@@ -175,7 +175,6 @@ pub enum OutputFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum MeetingPolicy {
     /// Meeting V0 uniform claim arbitration.
-    #[default]
     #[value(name = "uniform-v0")]
     UniformV0,
     /// Meeting V1 moderator-controlled baton passing.
@@ -185,6 +184,7 @@ pub enum MeetingPolicy {
     #[value(name = "moderated-board-v1")]
     ModeratedBoardV2,
     /// Meeting V2 with direct moderator action finalization before normal close.
+    #[default]
     #[value(name = "moderated-board-actions-v2")]
     ModeratedBoardActionsV2,
 }
@@ -1381,7 +1381,7 @@ pub enum ChannelsCmd {
 pub enum MeetingsCmd {
     /// Create a private meeting with a frozen initial roster
     #[command(
-        after_help = "Examples:\n  buzz meetings create --title \"Design review\" --participant <PUBKEY>\n  buzz meetings create --policy moderated-baton-v1 --moderator <PUBKEY> --title \"Design review\" --participant <PUBKEY>\n  buzz meetings create --policy moderated-board-v1 --title \"Design review\" --board - --participant <PUBKEY>"
+        after_help = "Example:\n  buzz meetings create --title \"Design review\" --board - --participant <PUBKEY>"
     )]
     Create {
         /// Meeting title
@@ -1393,13 +1393,18 @@ pub enum MeetingsCmd {
         /// Optional source channel UUID; every participant must already be able to read it
         #[arg(long)]
         source: Option<String>,
-        /// Floor-allocation protocol; defaults to the existing V0 behavior
-        #[arg(long, value_enum, default_value = "uniform-v0")]
+        /// Internal legacy protocol override
+        #[arg(
+            long,
+            value_enum,
+            default_value = "moderated-board-actions-v2",
+            hide = true
+        )]
         policy: MeetingPolicy,
-        /// V1 moderator pubkey; defaults to the creator and is invalid for V0/V2
-        #[arg(long)]
+        /// Internal legacy moderator override
+        #[arg(long, hide = true)]
         moderator: Option<String>,
-        /// Initial Meeting V2 Markdown board; use '-' to read from stdin
+        /// Initial Meeting Markdown board; use '-' to read from stdin
         #[arg(long)]
         board: Option<String>,
         /// Other participant pubkeys (repeat once per participant; the creator is implicit)
@@ -3062,13 +3067,15 @@ mod tests {
     }
 
     #[test]
-    fn meeting_create_defaults_to_v0_policy() {
+    fn meeting_create_defaults_to_current_complete_policy() {
         let cli = Cli::try_parse_from([
             "buzz",
             "meetings",
             "create",
             "--title",
             "Review",
+            "--board",
+            "# Goal",
             "--participant",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])
@@ -3079,8 +3086,36 @@ mod tests {
         else {
             panic!("expected Meeting Create");
         };
-        assert_eq!(policy, MeetingPolicy::UniformV0);
+        assert_eq!(policy, MeetingPolicy::ModeratedBoardActionsV2);
         assert!(moderator.is_none());
+    }
+
+    #[test]
+    fn meeting_create_help_exposes_only_the_current_surface() {
+        let mut command = Cli::command();
+        let create = command
+            .find_subcommand_mut("meetings")
+            .and_then(|meetings| meetings.find_subcommand_mut("create"))
+            .expect("Meeting Create command");
+        let help = create.render_long_help().to_string();
+
+        assert!(help.contains(
+            "buzz meetings create --title \"Design review\" --board - --participant <PUBKEY>"
+        ));
+        assert!(help.contains("--board"));
+        for legacy_surface in [
+            "--policy",
+            "--moderator",
+            "uniform-v0",
+            "moderated-baton-v1",
+            "moderated-board-v1",
+            "moderated-board-actions-v2",
+        ] {
+            assert!(
+                !help.contains(legacy_surface),
+                "Meeting Create help leaked internal protocol surface: {legacy_surface}"
+            );
+        }
     }
 
     #[test]
