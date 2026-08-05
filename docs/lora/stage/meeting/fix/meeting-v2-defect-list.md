@@ -180,27 +180,38 @@ pub const MAX_MEETING_AGENTS: usize = 4;
 
 ## 5. Agent System Context 与工具边界缺陷
 
-### MFX-003（已覆盖部分）：System Contract 已说明讨论阶段不得写入
+### MFX-003（代码完成）：System Contract 已说明讨论阶段不得写入
+
+**状态：代码修复完成，待真实 Provider 行为验收。既有禁止写入语义已保留，并在 Contract v2
+中补齐正向只读与角色边界。**
 
 当前 `crates/buzz-acp/src/meeting_context.rs` 的 V2 System Contract 已明确包含：
 
 - Board 是主持人维护的目标、议程、进展、结论和 follow-up actions 共享记录；
 - Board text 不是外部业务事实；
-- `Discussion, Intent, Speech, Board, and Floor Turns do not authorize persistent external effects`；
-- `Only action_finalization may use normally exposed business tools`；
+- 讨论和控制 Turn 的外部工具仅用于 `bounded read-only inspection`；
+- 明确禁止 create、update、delete、publish、assign、commit、upload、send 等持久化动作；
+- `Only the moderator's action_finalization Turn` 可以使用普通业务写工具；
 - action finalization 只能执行最终冻结 Board 已有决定，不能发明第二份 Plan/Step；
 - Project View 和其他外部引用是可选项。
 
 逐 Turn envelope 也已有以下约束：
 
-- `participant_intent` 和 `granted_speech` 允许 normally exposed Harness tools 用于
-  `gathering context or evidence`，但禁止 persistent writes 和 Meeting event publishing；
-- `board_maintenance`、`floor_decision` 禁止 persistent writes；
+- `participant_intent` 和 `granted_speech` 仅允许有界只读调查，禁止外部写入和 Meeting event
+  publishing；
+- `board_maintenance` 仅额外允许通过输出 schema 返回完整 Board；
+- `floor_decision` 仅允许有界只读调查；
 - `action_finalization` 才切换到 `direct-business-actions-v2` 并允许业务写入。
 
-因此“讨论阶段不得持久写、只有行动收口可写”的基本语义不是完全缺失。
+因此“讨论阶段不得持久写、只有行动收口可写”的基本语义不是完全缺失。Contract v2 进一步
+明确：只读限制针对外部工具和外部业务状态，不禁止 Agent 按当前输出 schema 提交 Intent、
+Speech、Board 或 Floor 结果；Board Maintenance 是讨论阶段唯一的状态编辑例外，但 Board 仍由
+Harness/Relay 发布，不因此获得外部业务写权限。
 
-### MFX-004（P0）：工具策略仍是 advisory，不能保证“不能写”
+### MFX-004（P0，prompt-only 范围收口）：工具策略仍是 advisory
+
+**状态：prompt-only 代码修复完成，待真实 Provider 行为验收。保留 `advisory-v1`，接受本阶段
+不做确定性工具隔离的风险。**
 
 **现状**
 
@@ -214,26 +225,33 @@ pub const MAX_MEETING_AGENTS: usize = 4;
 - Agent 可能在 Speech 前直接完成本应由主持人记录并在 action finalization 物化的行动；
 - Meeting 无法证明一次外部写入发生在合法阶段。
 
-**期望**
+**本阶段决策**
 
-- 普通讨论 Turn 只开放可证明的只读操作，或由 Harness 对写操作做确定性拒绝；
-- `action_finalization` 是唯一切换到可写业务工具配置的 Turn；
-- Meeting protocol event 始终由 Harness/Relay 发布，任何 Turn 都不允许模型直接发布；
-- 工具隔离不得阻止必要的小范围权威读取；
-- 如果现有通用 Shell 无法可靠区分读写，需要在阶段实现前单独讨论受限工具面、命令分类或
-  沙箱边界，不能仅把 `advisory-v1` 改名后宣称完成。
+- 本阶段只从稳定 System Contract 和逐 Turn envelope 约束 Agent 行为；
+- 不裁剪 Harness 工具、不增加 Shell/CLI 命令分类，也不增加确定性写入拒绝；
+- `participant_intent`、`granted_speech`、`board_maintenance` 和 `floor_decision` 保留
+  `advisory-v1`，但明确只能进行有界只读调查；
+- `board_maintenance` 仅允许主持人通过输出 schema 返回完整 Board，不授权外部业务写入；
+- `action_finalization` 是唯一声明可用普通业务写工具的 Turn，且只有主持人进入；
+- Meeting protocol event 始终由 Harness/Relay 发布，任何 Turn 都不允许模型直接发布。
 
-**验收**
+**prompt-only 验收**
 
-1. Intent、Speech、Board、Floor Turn 尝试 Project View create/update/delete 时确定性失败；
-2. 同一 Turn 可以读取 Project View、Document、代码、消息和仓库状态；
-3. action finalization 中同一主持 Agent 可以执行 Board 所要求的合法写入；
-4. 工具拒绝不会被误当作 Meeting BLOCK，除非 action finalization 中真实业务操作失败；
-5. 自动化验证实际工具调用边界，而不只断言 Prompt 包含某句文字。
+1. System Contract 明确讨论与控制 Turn 只允许有界只读调查；
+2. 每类 V2 Turn envelope 显式携带与角色和阶段一致的 advisory/direct policy；
+3. Board Maintenance 明确 Board UPDATE 例外不等于外部业务写权限；
+4. action finalization 明确只有主持人可按冻结 Board 直接使用业务工具；
+5. 自动化锁定 prompt 合约，但不宣称实际工具调用已被 Harness 强制隔离。
 
-### MFX-005（P1）：System Contract 对“允许读、行动写入 Board”的正向说明不够明确
+如果后续要求从“行为契约”升级为“能力保证”，需要重新开启工具隔离设计；本次状态不得作为
+Harness 已能确定性阻止写入的证据。
 
-**现状**
+### MFX-005（代码完成）：System Contract 对“允许读、行动写入 Board”的正向说明不够明确
+
+**状态：代码修复完成，待真实 Provider 行为验收。Contract v2 和全部 V2 Turn envelope 已采用
+统一角色/阶段矩阵。**
+
+**修复前现状**
 
 当前 Contract 用“no persistent external effects”和“gathering context or evidence”表达边界，
 但没有在稳定 System 层直接列出以下完整心智模型：
@@ -259,8 +277,8 @@ records agreed actions on the Board. Only action_finalization may materialize
 those frozen Board decisions.
 ```
 
-具体英文可在实现阶段调整，但必须同时包含允许的读取、禁止的写入、行动进入 Board 和最终物化
-四层含义。
+Contract v2 已同时包含允许的读取、禁止的写入、行动进入 Board 和最终物化四层含义，并明确
+普通参会 Agent 不进入物化阶段；主持 Agent 在 Intent、Speech 和 Floor Turn 中也保持外部只读。
 
 **验收**
 
