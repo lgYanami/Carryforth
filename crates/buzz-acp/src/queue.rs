@@ -2414,6 +2414,10 @@ mod tests {
             prompt.contains(crate::project_space::PROJECT_SPACE_SECTION),
             "missing [Project Space] section"
         );
+        assert!(prompt.contains("Project Context Edges"));
+        assert!(prompt.contains("`buzz project-context exact`"));
+        assert!(prompt.contains("`buzz project-context incident`"));
+        assert!(prompt.contains("`buzz project-context contains-all`"));
         assert!(prompt.contains("[Meeting]"), "missing [Meeting] section");
 
         // Stable ownership order must precede memory and turn context.
@@ -2454,6 +2458,37 @@ mod tests {
             canvas_pos < context_pos,
             "[Channel Canvas] should come before [Context]"
         );
+    }
+
+    #[test]
+    fn test_format_prompt_legacy_project_space_survives_without_base_prompt() {
+        let ch = Uuid::new_v4();
+        let event = make_event("hello");
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                has_system_prompt_support: false,
+                base_prompt: None,
+                project_space_contract: Some(crate::project_space::PROJECT_SPACE_SECTION),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(prompt.starts_with("[Project Space]\n"));
+        assert!(prompt.contains("Project Context Edges"));
+        assert!(!prompt.contains("[Base]"));
     }
 
     #[test]

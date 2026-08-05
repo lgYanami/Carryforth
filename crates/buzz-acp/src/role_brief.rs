@@ -1296,6 +1296,7 @@ mod tests {
         assert_eq!(full.mode, "full");
         assert!(full.markdown.starts_with("[Role Brief]"));
         assert!(full.markdown.contains("Project: Lora v1"));
+        assert!(!full.markdown.contains("Project Context Edge"));
         assert_eq!(full.role_directory_total, Some(0));
         assert_eq!(full.role_directory_shown, Some(0));
         assert_eq!(full.role_directory_omitted, Some(0));
@@ -1316,6 +1317,7 @@ mod tests {
         assert_eq!(compact.mode, "compact");
         assert!(compact.markdown.starts_with("[Role Binding]"));
         assert!(!compact.markdown.contains("Purpose:"));
+        assert!(!compact.markdown.contains("Project Context Edge"));
         assert!(compact.role_directory_total.is_none());
         assert!(compact.role_directory_shown.is_none());
         assert!(compact.role_directory_omitted.is_none());
@@ -1499,6 +1501,8 @@ mod tests {
         assert_eq!(initial.status, "candidate", "{}", initial.markdown);
         assert_eq!(initial.mode, "full");
         assert!(initial.markdown.contains("Context: ready."));
+        assert!(!initial.markdown.contains("Project Context Edge"));
+        assert!(!initial.markdown.contains("buzz project-context"));
         assert!(initial.markdown.contains(&fixture.resource_id.to_string()));
         assert!(initial.markdown.contains("mandatory_guide_revision: 1"));
         assert!(initial.markdown.contains("current_revision: 1"));
@@ -1519,6 +1523,8 @@ mod tests {
             .resolve_bounded(RoleContextRefresh::Incremental)
             .await;
         assert_eq!(compact.mode, "compact");
+        assert!(!compact.markdown.contains("Project Context Edge"));
+        assert!(!compact.markdown.contains("buzz project-context"));
         {
             let state = state.lock().expect("mock state");
             assert_eq!(state.document_meta_queries, 3);

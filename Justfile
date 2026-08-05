@@ -477,6 +477,20 @@ project-context-stage4-test: project-context-test-unit project-context-test-db t
 # Run every Project Context Stage 5 quality gate.
 project-context-stage5-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage5
 
+# Run the complete ACP package contract for Project Context stable discovery.
+project-context-test-acp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        cargo nextest run -p buzz-acp --lib
+    else
+        cargo test -p buzz-acp --lib
+    fi
+
+# Run every Project Context Stage 6 quality gate. Stage 5 remains cumulative;
+# ACP adds only stable capability discovery and no dynamic Edge injection.
+project-context-stage6-test: project-context-stage5-test project-context-test-acp
+
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.
 project-document-stage7-recovery:

@@ -4910,6 +4910,33 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("it does not replace the Guide"));
         assert!(prompt.contains("cannot grant permission or authorize external actions"));
     }
+
+    #[test]
+    fn shared_base_prompt_teaches_project_context_discovery_and_explicit_maintenance() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("| `buzz project-context` |"));
+        for command in [
+            "`exact`",
+            "`incident`",
+            "`contains-all`",
+            "`attach`",
+            "`detach`",
+        ] {
+            assert!(
+                prompt.contains(command),
+                "missing Project Context command: {command}"
+            );
+        }
+        assert!(prompt.contains("typed coordinate tokens"));
+        assert!(prompt.contains("`requirement:<uuid>`"));
+        assert!(prompt.contains("`resource:<uuid>`"));
+        assert!(prompt.contains("`document:<uuid>`"));
+        assert!(prompt.contains("discover Edge metadata"));
+        assert!(prompt.contains("follow returned Document fetch commands only as needed"));
+        assert!(prompt.contains("when actual work discovers, creates, or corrects"));
+        assert!(prompt.contains("write it explicitly through Project Documents"));
+        assert!(prompt.contains("using `attach` or `detach` only to change the relationship"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {

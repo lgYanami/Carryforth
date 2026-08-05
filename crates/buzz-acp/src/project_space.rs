@@ -1,8 +1,9 @@
 //! Stable, platform-owned Project Space context for every ACP session.
 //!
 //! This module deliberately has no Project, Community, Member, Role, or
-//! revision inputs. Dynamic state belongs in the per-turn Role Brief/Binding;
-//! this section only teaches an agent how to use that state.
+//! revision inputs. Dynamic Role state belongs in the per-turn Role
+//! Brief/Binding, while Project Context Edge state is discovered on demand;
+//! this section teaches only stable operating semantics.
 
 use sha2::{Digest, Sha256};
 
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 ///
 /// The content hash is also part of [`contract_id`], so changing the wording
 /// invalidates old sessions even if this version is accidentally left alone.
-pub(crate) const PROJECT_SPACE_CONTRACT_VERSION: &str = "3";
+pub(crate) const PROJECT_SPACE_CONTRACT_VERSION: &str = "4";
 
 /// Stable Project Space operating contract.
 ///
@@ -23,6 +24,8 @@ You operate inside one persistent Buzz Project Space. One Buzz Community is one 
 Project View is the shared canonical view of the Project's current direct state. A Role is a stable responsibility position. An Assignment is one Member's bounded tenure in a Role and the fence for role-bearing writes. A Member is a Human or Agent identified by a stable community identity; a Runtime is only a short-lived executor. Persona, model, session, and Runtime are not the Role.
 
 Buzz supports versioned Project Documents for durable long-form project knowledge. Documents are first-class project assets and may be referenced directly from Project View. Resources are Project View asset coordinates with a Guide Document explaining how the resource is used. When a Resource is relevant, read its Guide; when a Document is relevant, read only the needed body on demand. Project View objects may associate relevant Resources and Documents through Context References.
+
+Buzz supports undirected Project Context Edges that connect an exact, unordered set of two or more Project View or Document coordinates. Within the Project, each exact coordinate set has one Edge, and one or more Project Documents carry the explanatory context for that set. Discover relevant Edges with `buzz project-context exact`, `buzz project-context incident`, or `buzz project-context contains-all`, then read only the needed Document bodies on demand. Buzz records the structure and state; it does not infer that context is missing, stale, conflicting, or incorrect, and it does not automatically produce a Gap. When your actual work materially discovers, creates, or corrects explanatory context across coordinates, explicitly write that context back through Buzz.
 
 At the start of each complete turn you receive a full [Role Brief], a compact [Role Binding], or an unavailable state. These are verified, revision-bound projections, not separate facts or cached authorization. A Role Brief summarizes the current project and role situation; a Role Binding confirms that the same verified assignment and revision still apply. Use the Role Directory to find active responsibility boundaries and vacancies. Use `buzz project-view` and `buzz roles` to inspect details, full Role definitions, current assignments, checkpoints, and handoffs when the injected slice is insufficient. To immediately rebuild and read your own complete Role Brief, run `buzz roles brief --markdown`.
 
@@ -56,7 +59,7 @@ mod tests {
 
     #[test]
     fn contract_is_a_stable_platform_section() {
-        assert_eq!(PROJECT_SPACE_CONTRACT_VERSION, "3");
+        assert_eq!(PROJECT_SPACE_CONTRACT_VERSION, "4");
         assert!(PROJECT_SPACE_SECTION.starts_with("[Project Space]\n"));
         for required in [
             "One Buzz Community is one Project",
@@ -79,6 +82,18 @@ mod tests {
             "Guide Document",
             "read only the needed body on demand",
             "Context References",
+            "undirected Project Context Edges",
+            "an exact, unordered set of two or more Project View or Document coordinates",
+            "Within the Project, each exact coordinate set has one Edge",
+            "one or more Project Documents carry the explanatory context",
+            "`buzz project-context exact`",
+            "`buzz project-context incident`",
+            "`buzz project-context contains-all`",
+            "records the structure and state",
+            "does not infer that context is missing, stale, conflicting, or incorrect",
+            "does not automatically produce a Gap",
+            "actual work materially discovers, creates, or corrects explanatory context across coordinates",
+            "explicitly write that context back through Buzz",
             "materially changes",
             "explicitly write the change back through Buzz",
             "do not update the Project automatically",
@@ -102,12 +117,18 @@ mod tests {
         assert!(!PROJECT_SPACE_SECTION.contains("Member pubkey:"));
         assert!(!PROJECT_SPACE_SECTION.contains("Document ID:"));
         assert!(!PROJECT_SPACE_SECTION.contains("Resource ID:"));
+        assert!(!PROJECT_SPACE_SECTION.contains("Edge ID:"));
+        assert!(!PROJECT_SPACE_SECTION.contains("Edge key:"));
+        assert!(!PROJECT_SPACE_SECTION.contains("Context revision:"));
+        assert!(!PROJECT_SPACE_SECTION.contains("Revision:"));
+        assert!(!PROJECT_SPACE_SECTION.contains("Current Edge:"));
+        assert!(!PROJECT_SPACE_SECTION.contains("Document body:"));
     }
 
     #[test]
     fn contract_id_changes_with_version_or_content() {
         let current = contract_id();
-        assert_ne!(current, content_id("2", PROJECT_SPACE_SECTION.as_bytes()));
+        assert_ne!(current, content_id("3", PROJECT_SPACE_SECTION.as_bytes()));
         assert_ne!(
             current,
             content_id(PROJECT_SPACE_CONTRACT_VERSION, b"[Project Space]\nchanged")
