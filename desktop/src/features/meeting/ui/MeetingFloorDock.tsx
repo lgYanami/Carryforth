@@ -19,6 +19,7 @@ import { Button } from "@/shared/ui/button";
 import { MeetingActionFinalizationCard } from "./MeetingActionFinalizationCard";
 import { MeetingOfferControls } from "./MeetingOfferControls";
 import { MeetingHostConsole } from "./MeetingHostConsole";
+import { MeetingHostAbortDialog } from "./MeetingHostEndControls";
 import { MeetingHostObservation } from "./MeetingHostObservation";
 import {
   MeetingSpeechComposer,
@@ -39,9 +40,11 @@ type StaleDraft = {
 };
 
 type MeetingFloorDockProps = {
+  abortDialogOpen: boolean;
   authorityAvailable: boolean;
   boardDraft: MeetingBoardDraft;
   currentPubkey?: string;
+  onAbortDialogOpenChange: (open: boolean) => void;
   onRefresh: () => void;
   profiles: Record<string, UserProfileSummary>;
   snapshot: MeetingSnapshot;
@@ -70,9 +73,11 @@ function ReadOnlyFloor({ message }: { message: string }) {
 }
 
 export function MeetingFloorDock({
+  abortDialogOpen,
   authorityAvailable,
   boardDraft,
   currentPubkey,
+  onAbortDialogOpenChange,
   onRefresh,
   profiles,
   snapshot,
@@ -223,6 +228,10 @@ export function MeetingFloorDock({
   const observesAgentHost =
     moderator?.participantType === "agent" &&
     participant?.participantType === "human";
+  const controlsHumanHost =
+    normalizedPubkey === snapshot.moderatorPubkey &&
+    participant?.participantType === "human" &&
+    !terminal;
   const attentionKey = !authorityAvailable
     ? null
     : ownOffer
@@ -543,6 +552,15 @@ export function MeetingFloorDock({
           </Button>
         </div>
       )}
+      {controlsHumanHost ? (
+        <MeetingHostAbortDialog
+          actionPhase={snapshot.lifecycle === "finalizing_actions"}
+          disabled={hostControlsDisabled}
+          onOpenChange={onAbortDialogOpenChange}
+          open={abortDialogOpen}
+          submit={renderedHostController.submit}
+        />
+      ) : null}
     </section>
   );
 }

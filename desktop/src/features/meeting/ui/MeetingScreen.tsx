@@ -1,15 +1,5 @@
 import * as React from "react";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  ClipboardList,
-  ExternalLink,
-  History,
-  RefreshCw,
-  ShieldCheck,
-  UsersRound,
-  XCircle,
-} from "lucide-react";
+import { AlertTriangle, ClipboardList, RefreshCw } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -26,7 +16,6 @@ import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type {
   MeetingActivity,
-  MeetingLifecycle,
   MeetingSnapshot,
   MeetingSpeech,
 } from "@/shared/api/tauriMeetings";
@@ -35,8 +24,8 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { useMediaBreakpoint } from "@/shared/hooks/use-mobile";
 import { usePreviewFeatureWarning } from "@/shared/features";
+import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { truncatePubkey } from "@/shared/lib/pubkey";
-import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import {
   Sheet,
@@ -50,43 +39,12 @@ import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import { MeetingBoardPanel } from "./MeetingBoardPanel";
 import { MeetingActivityPanel } from "./MeetingActivityPanel";
 import { MeetingFloorDock } from "./MeetingFloorDock";
+import { MeetingHeader } from "./MeetingHeader";
 import { MeetingParticipantsPanel } from "./MeetingParticipantsPanel";
 import { MeetingSpeechTimeline } from "./MeetingSpeechTimeline";
 import { MeetingTerminalSummary } from "./MeetingTerminalSummary";
 
 const EMPTY_PROFILES: Record<string, UserProfileSummary> = {};
-
-function lifecycleLabel(lifecycle: MeetingLifecycle): string {
-  switch (lifecycle) {
-    case "initializing":
-      return "Starting";
-    case "active":
-      return "In progress";
-    case "finalizing_actions":
-      return "Recording actions";
-    case "closed":
-      return "Closed";
-    case "aborted":
-      return "Aborted";
-  }
-}
-
-function lifecycleBadgeVariant(
-  lifecycle: MeetingLifecycle,
-): "secondary" | "info" | "warning" | "success" | "destructive" {
-  switch (lifecycle) {
-    case "initializing":
-      return "secondary";
-    case "active":
-      return "info";
-    case "finalizing_actions":
-      return "warning";
-    case "closed":
-      return "success";
-    case "aborted":
-      return "destructive";
-  }
-}
 
 function profileName(
   pubkey: string | null,
@@ -219,6 +177,26 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     activitySheetState.meetingId === meetingId && activitySheetState.open;
   const setActivitySheetOpen = React.useCallback(
     (open: boolean) => setActivitySheetState({ meetingId, open }),
+    [meetingId],
+  );
+  const [participantSheetState, setParticipantSheetState] = React.useState({
+    meetingId,
+    open: false,
+  });
+  const participantSheetOpen =
+    participantSheetState.meetingId === meetingId && participantSheetState.open;
+  const setParticipantSheetOpen = React.useCallback(
+    (open: boolean) => setParticipantSheetState({ meetingId, open }),
+    [meetingId],
+  );
+  const [abortDialogState, setAbortDialogState] = React.useState({
+    meetingId,
+    open: false,
+  });
+  const abortDialogOpen =
+    abortDialogState.meetingId === meetingId && abortDialogState.open;
+  const setAbortDialogOpen = React.useCallback(
+    (open: boolean) => setAbortDialogState({ meetingId, open }),
     [meetingId],
   );
   const [boardSheetState, setBoardSheetState] = React.useState({
@@ -398,6 +376,50 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       Board
     </Button>
   );
+  const boardControl = boardPanelIsOverlay ? (
+    <Sheet onOpenChange={setBoardSheetOpen} open={boardSheetOpen}>
+      <SheetTrigger asChild>{boardTrigger}</SheetTrigger>
+      <SheetContent
+        className="p-0 sm:max-w-xl"
+        id="meeting-board-overlay-panel"
+      >
+        <SheetHeader className="sr-only">
+          <SheetTitle>Meeting board</SheetTitle>
+          <SheetDescription>
+            The current Board maintained by the host.
+          </SheetDescription>
+        </SheetHeader>
+        <MeetingBoardPanel
+          board={readySnapshot.board}
+          className="h-full"
+          editor={
+            boardEditable
+              ? {
+                  disabled: !meetingAuthority.authorityAvailable,
+                  onChange: boardDraft.setValue,
+                  value: boardDraft.value,
+                }
+              : undefined
+          }
+          onDismissStaleDraft={boardDraft.dismissStale}
+          staleDraft={boardDraft.stale}
+        />
+      </SheetContent>
+    </Sheet>
+  ) : (
+    boardTrigger
+  );
+  const canAbort = Boolean(
+    (readySnapshot.lifecycle === "active" ||
+      readySnapshot.lifecycle === "finalizing_actions") &&
+      normalizedPubkey === readySnapshot.moderatorPubkey &&
+      currentParticipant?.participantType === "human",
+  );
+  const openTerminalOutcome = () => {
+    const summary = document.getElementById("meeting-terminal-outcome");
+    summary?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    summary?.focus({ preventScroll: true });
+  };
 
   return (
     <div
@@ -407,136 +429,67 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       data-testid="meeting-screen"
     >
       <TopChromeInsetHeader flush>
-        <header
-          className="flex h-12 items-center gap-2 px-3 sm:px-5"
-          data-tauri-drag-region
-        >
-          <div className="min-w-0 flex-1">
-            <h1 className="truncate text-sm font-semibold">
-              {readySnapshot.title}
-            </h1>
-            <p className="hidden truncate text-2xs text-muted-foreground sm:block">
-              {readySnapshot.description || "Moderated Meeting"}
-            </p>
-          </div>
-          {sourceChannelId ? (
-            <Button
-              className="hidden sm:inline-flex"
-              onClick={() => void goChannel(sourceChannelId)}
-              size="sm"
-              variant="ghost"
-            >
-              <ExternalLink className="size-4" />
-              Source
-            </Button>
-          ) : null}
-          <Sheet>
-            <SheetTrigger asChild>
-              <Button
-                data-testid="meeting-participants-trigger"
-                size="sm"
-                variant="ghost"
-              >
-                <UsersRound className="size-4" />
-                <span className="hidden sm:inline">
-                  {readySnapshot.participants.length}
-                </span>
-              </Button>
-            </SheetTrigger>
-            <SheetContent className="overflow-y-auto">
-              <SheetHeader>
-                <SheetTitle>Participants</SheetTitle>
-                <SheetDescription>
-                  Frozen when the Meeting was created.
-                </SheetDescription>
-              </SheetHeader>
-              <div className="mt-5">
-                <MeetingParticipantsPanel
-                  profiles={profiles}
-                  snapshot={readySnapshot}
-                />
-              </div>
-            </SheetContent>
-          </Sheet>
-          <Sheet onOpenChange={setActivitySheetOpen} open={activitySheetOpen}>
-            <SheetTrigger asChild>
-              <Button
-                data-testid="meeting-activity-trigger"
-                size="sm"
-                title="Meeting activity"
-                variant="ghost"
-              >
-                <History className="size-4" />
-                <span className="hidden sm:inline">Activity</span>
-              </Button>
-            </SheetTrigger>
-            <SheetContent className="flex p-0 sm:max-w-lg">
-              <div className="flex min-h-0 flex-1 flex-col">
-                <SheetHeader className="border-b px-5 py-4 text-left">
-                  <SheetTitle>Meeting activity</SheetTitle>
-                  <SheetDescription>
-                    Product-level control history from the verified Meeting
-                    projection.
-                  </SheetDescription>
-                </SheetHeader>
-                <MeetingActivityPanel
-                  activities={activities}
-                  error={Boolean(activitiesQuery.error)}
-                  hasOlder={Boolean(activitiesQuery.hasNextPage)}
-                  isFetching={activitiesQuery.isFetching}
-                  isFetchingOlder={activitiesQuery.isFetchingNextPage}
-                  onFetchOlder={() => void activitiesQuery.fetchNextPage()}
-                  onRetry={() => void activitiesQuery.refetch()}
-                  profiles={profiles}
-                />
-              </div>
-            </SheetContent>
-          </Sheet>
-          {boardPanelIsOverlay ? (
-            <Sheet onOpenChange={setBoardSheetOpen} open={boardSheetOpen}>
-              <SheetTrigger asChild>{boardTrigger}</SheetTrigger>
-              <SheetContent
-                className="p-0 sm:max-w-xl"
-                id="meeting-board-overlay-panel"
-              >
-                <SheetHeader className="sr-only">
-                  <SheetTitle>Meeting board</SheetTitle>
-                  <SheetDescription>
-                    The current Board maintained by the host.
-                  </SheetDescription>
-                </SheetHeader>
-                <MeetingBoardPanel
-                  board={readySnapshot.board}
-                  className="h-full"
-                  editor={
-                    boardEditable
-                      ? {
-                          disabled: !meetingAuthority.authorityAvailable,
-                          onChange: boardDraft.setValue,
-                          value: boardDraft.value,
-                        }
-                      : undefined
-                  }
-                  onDismissStaleDraft={boardDraft.dismissStale}
-                  staleDraft={boardDraft.stale}
-                />
-              </SheetContent>
-            </Sheet>
-          ) : (
-            boardTrigger
-          )}
-          <Badge variant={lifecycleBadgeVariant(readySnapshot.lifecycle)}>
-            {readySnapshot.lifecycle === "closed" ? (
-              <CheckCircle2 className="mr-1 size-3" />
-            ) : readySnapshot.lifecycle === "aborted" ? (
-              <XCircle className="mr-1 size-3" />
-            ) : (
-              <ShieldCheck className="mr-1 size-3" />
-            )}
-            {lifecycleLabel(readySnapshot.lifecycle)}
-          </Badge>
-        </header>
+        <MeetingHeader
+          abortDisabled={
+            !meetingAuthority.authorityAvailable || !readySnapshot.host
+          }
+          boardControl={boardControl}
+          canAbort={canAbort}
+          onAbort={() => setAbortDialogOpen(true)}
+          onCopyLink={() =>
+            copyTextToClipboard(window.location.href, "Meeting link copied")
+          }
+          onOpenActivity={() => setActivitySheetOpen(true)}
+          onOpenOutcome={openTerminalOutcome}
+          onOpenParticipants={() => setParticipantSheetOpen(true)}
+          onOpenSource={
+            sourceChannelId ? () => void goChannel(sourceChannelId) : undefined
+          }
+          profiles={profiles}
+          snapshot={readySnapshot}
+        />
       </TopChromeInsetHeader>
+
+      <Sheet onOpenChange={setParticipantSheetOpen} open={participantSheetOpen}>
+        <SheetContent className="overflow-y-auto">
+          <SheetHeader>
+            <SheetTitle>Participants</SheetTitle>
+            <SheetDescription>
+              Frozen when the Meeting was created.
+            </SheetDescription>
+          </SheetHeader>
+          <div className="mt-5">
+            <MeetingParticipantsPanel
+              profiles={profiles}
+              snapshot={readySnapshot}
+            />
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      <Sheet onOpenChange={setActivitySheetOpen} open={activitySheetOpen}>
+        <SheetContent className="flex p-0 sm:max-w-lg">
+          <div className="flex min-h-0 flex-1 flex-col">
+            <SheetHeader className="border-b px-5 py-4 text-left">
+              <SheetTitle>Meeting activity</SheetTitle>
+              <SheetDescription>
+                Product-level control history from the verified Meeting
+                projection.
+              </SheetDescription>
+            </SheetHeader>
+            <MeetingActivityPanel
+              activities={activities}
+              error={Boolean(activitiesQuery.error)}
+              hasOlder={Boolean(activitiesQuery.hasNextPage)}
+              isFetching={activitiesQuery.isFetching}
+              isFetchingOlder={activitiesQuery.isFetchingNextPage}
+              onFetchOlder={() => void activitiesQuery.fetchNextPage()}
+              onRetry={() => void activitiesQuery.refetch()}
+              profiles={profiles}
+            />
+          </div>
+        </SheetContent>
+      </Sheet>
 
       {meetingAuthority.status !== "current" ? (
         <div
@@ -587,11 +540,13 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       </div>
 
       {readySnapshot.end ? (
-        <MeetingTerminalSummary
-          actionStarted={readySnapshot.action !== null}
-          end={readySnapshot.end}
-          profiles={profiles}
-        />
+        <div id="meeting-terminal-outcome" tabIndex={-1}>
+          <MeetingTerminalSummary
+            actionStarted={readySnapshot.action !== null}
+            end={readySnapshot.end}
+            profiles={profiles}
+          />
+        </div>
       ) : null}
 
       <div className="flex min-h-0 min-w-0 flex-1">
@@ -651,9 +606,11 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
         ) : null}
       </div>
       <MeetingFloorDock
+        abortDialogOpen={abortDialogOpen}
         authorityAvailable={meetingAuthority.authorityAvailable}
         boardDraft={boardDraft}
         currentPubkey={identityQuery.data?.pubkey}
+        onAbortDialogOpenChange={setAbortDialogOpen}
         onRefresh={() => void snapshotQuery.refetch()}
         profiles={profiles}
         snapshot={readySnapshot}

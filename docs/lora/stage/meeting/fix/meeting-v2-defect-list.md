@@ -315,7 +315,14 @@ Meeting Contract 只在已经识别为 V2 Meeting channel 的 ACP Session 安装
 以下缺陷针对真正进入 `MeetingScreen` 的页面。截图中的普通 Channel 不用于证明这些组件不存在，
 但代码与 spec 对照后确认仍有差距。
 
-### MFX-007（P1）：Meeting 标题栏信息与操作不完整
+### MFX-007（已解决）：Meeting 标题栏信息与操作不完整
+
+**状态：已解决。Desktop 已使用独立 `MeetingHeader` 展示 Meeting 图标、生命周期、来自可信
+snapshot 的冻结主持人身份与 Human/Agent 类型、participant 头像组合与人数，并提供持续可用的
+Board trigger。Meeting 更多菜单统一提供 participants、source context、activity、复制当前受支持
+hash route 和终态结果入口。Human 主持人的 Abort 仍通过原有受控确认流程及同一个 Floor
+controller/native fence 执行；Agent 主持、非主持人和终态没有该入口。标题栏未带回任何 Channel
+管理操作，宽屏与中窄屏专项 E2E 和不同哈希截图均已通过。**
 
 **缺少或不完整**
 

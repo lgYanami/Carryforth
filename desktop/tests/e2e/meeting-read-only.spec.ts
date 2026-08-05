@@ -7,6 +7,7 @@ import type {
   MeetingSnapshot,
   MeetingSpeech,
 } from "../../src/shared/api/tauriMeetings";
+import { waitForAnimations } from "../helpers/animations";
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
 const HOST = TEST_IDENTITIES.alice.pubkey;
@@ -406,6 +407,71 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   await expect(participants.getByRole("button")).toHaveCount(0);
 });
 
+test("Meeting Header exposes verified identity and only Meeting-scoped actions", async ({
+  page,
+}, testInfo) => {
+  await installMockBridge(page, { meetings: meetingSeeds() });
+  await page.goto("/");
+  await page.getByTestId(`meeting-row-${IDS.active}`).click();
+
+  const header = page.getByTestId("meeting-header");
+  await expect(header).toBeVisible();
+  await expect(page.getByTestId("meeting-header-icon")).toBeVisible();
+  await expect(page.getByTestId("meeting-lifecycle-badge")).toContainText(
+    "In progress",
+  );
+  await expect(page.getByTestId("meeting-host-identity")).toContainText(
+    "alice",
+  );
+  await expect(page.getByTestId("meeting-host-identity")).toContainText(
+    "agent host",
+  );
+  await expect(page.getByTestId("meeting-host-avatar")).toBeVisible();
+  await expect(
+    page.getByTestId(`meeting-header-participant-${HOST}`),
+  ).toBeVisible();
+  await expect(page.getByTestId("meeting-participants-trigger")).toContainText(
+    "3",
+  );
+  await expect(page.getByTestId("meeting-board-trigger")).toBeVisible();
+
+  await page.getByTestId("meeting-more-trigger").click();
+  const menu = page.getByTestId("meeting-more-menu");
+  await expect(menu).toContainText("View participants");
+  await expect(menu).toContainText("Open source context");
+  await expect(menu).toContainText("Meeting activity");
+  await expect(menu).toContainText("Copy Meeting link");
+  await expect(menu).not.toContainText("Abort meeting");
+  await expect(menu).not.toContainText(
+    /Add people|Create agent|Leave|Archive|Delete|Huddle|Notifications/i,
+  );
+  await page.getByTestId("meeting-menu-copy-link").click();
+  const copiedPayload = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).findLast(
+        (entry) => entry.command === "copy_text_to_clipboard",
+      )?.payload,
+  );
+  expect(copiedPayload).toEqual({
+    text: `http://127.0.0.1:4173/#/channels/${IDS.active}`,
+  });
+
+  await waitForAnimations(page);
+  const wideShot = await header.screenshot({
+    path: testInfo.outputPath("meeting-header-wide.png"),
+  });
+  await page.setViewportSize({ width: 760, height: 800 });
+  await expect(page.getByTestId("meeting-board-trigger")).toBeVisible();
+  await expect(page.getByTestId("meeting-more-trigger")).toBeVisible();
+  await expect(page.getByTestId("meeting-host-avatar")).toBeVisible();
+  await expect(page.getByTestId("meeting-lifecycle-badge")).toBeVisible();
+  await waitForAnimations(page);
+  const narrowShot = await header.screenshot({
+    path: testInfo.outputPath("meeting-header-narrow.png"),
+  });
+  expect(wideShot.equals(narrowShot)).toBe(false);
+});
+
 test("Meeting activity is bounded, product-level, and separate from canonical Speech", async ({
   page,
 }) => {
@@ -415,7 +481,8 @@ test("Meeting activity is bounded, product-level, and separate from canonical Sp
 
   const speechTimeline = page.getByTestId("meeting-speech-timeline");
   await expect(speechTimeline).toContainText("verified read path first");
-  await page.getByTestId("meeting-activity-trigger").click();
+  await page.getByTestId("meeting-more-trigger").click();
+  await page.getByTestId("meeting-menu-activity").click();
   const panel = page.getByTestId("meeting-activity-panel");
   await expect(panel).toBeVisible();
   await expect(panel).toContainText("The host updated the Meeting Board.");
@@ -462,6 +529,10 @@ test("terminal summaries distinguish goal-reached close, host abort, and Relay a
     "This does not mean that the resulting work is complete.",
   );
   await expect(summary).toContainText("Source: Host");
+  await page.getByTestId("meeting-more-trigger").click();
+  await page.getByTestId("meeting-menu-outcome").click();
+  await expect(page.locator("#meeting-terminal-outcome")).toBeFocused();
+  await expect(page.getByTestId("meeting-host-abort")).toHaveCount(0);
 
   await page.getByTestId("meeting-history-trigger").click();
   await page.getByRole("button", { name: /Aborted evidence review/ }).click();

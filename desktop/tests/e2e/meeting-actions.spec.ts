@@ -417,6 +417,7 @@ test("aborting during action finalization warns that external effects may remain
   });
   await openMeeting(page, IDS.abort);
 
+  await page.getByTestId("meeting-more-trigger").click();
   await page.getByTestId("meeting-action-abort").click();
   await expect(page.getByTestId("meeting-action-abort-dialog")).toContainText(
     "may already have occurred",

@@ -1,6 +1,6 @@
 # Meeting Desktop 缺陷修复分阶段实现计划
 
-> 状态：实施中（阶段一至八已完成；下一阶段为 `MFX-007`）
+> 状态：实施完成（阶段一至九已交付；阶段九待确认提交）
 >
 > 日期：2026-08-05
 >
@@ -544,6 +544,8 @@ attention 规则。
 
 ## 15. 阶段九：MFX-007 Meeting 标题栏收口
 
+> 状态：已完成（2026-08-05）
+
 ### 15.1 目标
 
 把前八个阶段已经可用的 Meeting 能力统一组织成符合 spec 9.2 的标题栏，并完成第 6 节最后一个
@@ -614,6 +616,21 @@ Abort 菜单只打开既有、带 reason code/说明和 destructive confirmation
 - 不出现任何普通 Channel 管理或自由消息入口；
 - 宽屏和中窄窗口均可操作，截图状态互不重复；
 - 本阶段只把 `MFX-007` 标记为已解决，并完成第 6 节全部缺陷收口。
+
+### 15.8 交付与 review 结论
+
+- 新增独立 `MeetingHeader`，统一展示 Meeting 图标、标题、生命周期、冻结的主持人身份与类型、
+  participant 头像组合和人数；
+- Board trigger 在宽屏与中窄屏均持续可用；participants、source context、activity、复制链接和终态
+  摘要统一进入 Meeting 更多菜单；
+- 复制链接复用 Desktop 当前已经支持的 hash route，不引入新的 URI 或未经支持的 deep-link 协议；
+- Human 主持人的 Abort 菜单只打开既有受控确认对话框，并继续复用同一个 Floor controller、pending
+  状态和 native fence；Agent 主持、非主持人及终态不会得到该入口；
+- 标题栏没有重新引入 Channel 成员管理、编辑、离开、归档、Huddle 或自由消息操作；
+- 新增宽屏与中窄屏专项截图和身份/状态/menu E2E；截图内容与哈希均不同，证明响应式状态没有退化为
+  重复画面；
+- 相关 TypeScript、Desktop lint、native Meeting 测试和全部 Meeting Desktop E2E 已通过；仓库级
+  `just ci` 也已完整通过。
 
 ## 16. 每阶段交付纪律
 

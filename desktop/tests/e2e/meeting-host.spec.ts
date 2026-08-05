@@ -361,6 +361,7 @@ test("indeterminate host action retries the exact event and Abort remains explic
   expect(inputs).toHaveLength(2);
   expect(inputs[1]).toEqual(inputs[0]);
 
+  await page.getByTestId("meeting-more-trigger").click();
   await page.getByTestId("meeting-host-abort").click();
   await expect(page.getByTestId("meeting-host-abort-dialog")).toContainText(
     "does not roll back external effects",

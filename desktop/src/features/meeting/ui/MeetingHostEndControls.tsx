@@ -1,5 +1,5 @@
 import * as React from "react";
-import { CheckCircle2, ClipboardCheck, OctagonX } from "lucide-react";
+import { CheckCircle2, ClipboardCheck } from "lucide-react";
 
 import type {
   MeetingAbortReason,
@@ -37,106 +37,95 @@ const ABORT_LABELS: Record<MeetingAbortReason, string> = {
   moderator_unable_to_continue: "The host cannot continue",
 };
 
-export function MeetingHostAbortControl({
+export function MeetingHostAbortDialog({
   actionPhase = false,
   disabled,
+  onOpenChange,
+  open,
   submit,
 }: {
   actionPhase?: boolean;
   disabled: boolean;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
   submit: SubmitHostAction;
 }) {
-  const [open, setOpen] = React.useState(false);
   const [reasonCode, setReasonCode] =
     React.useState<MeetingAbortReason>("goal_unreachable");
   const [reason, setReason] = React.useState("");
 
   return (
-    <>
-      <Button
+    <AlertDialog onOpenChange={onOpenChange} open={open}>
+      <AlertDialogContent
         data-testid={
-          actionPhase ? "meeting-action-abort" : "meeting-host-abort"
+          actionPhase
+            ? "meeting-action-abort-dialog"
+            : "meeting-host-abort-dialog"
         }
-        disabled={disabled}
-        onClick={() => setOpen(true)}
-        size="sm"
-        variant="ghost"
       >
-        <OctagonX className="size-4" />
-        Abort meeting…
-      </Button>
-      <AlertDialog onOpenChange={setOpen} open={open}>
-        <AlertDialogContent
-          data-testid={
-            actionPhase
-              ? "meeting-action-abort-dialog"
-              : "meeting-host-abort-dialog"
-          }
-        >
-          <AlertDialogHeader>
-            <AlertDialogTitle>Abort this meeting?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Abort is a terminal outcome for a meeting that cannot successfully
-              conclude. It does not roll back external effects
-              {actionPhase ? " that may already have occurred" : ""}.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-3">
-            <select
-              aria-label="Meeting abort category"
-              className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
-              disabled={disabled}
-              onChange={(event) =>
-                setReasonCode(event.target.value as MeetingAbortReason)
-              }
-              value={reasonCode}
-            >
-              {Object.entries(ABORT_LABELS).map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            <Textarea
-              aria-label="Meeting abort explanation"
-              disabled={disabled}
-              maxLength={1024}
-              onChange={(event) => setReason(event.target.value)}
-              placeholder="Optional explanation for participants"
-              rows={3}
-              value={reason}
-            />
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel asChild>
-              <Button type="button" variant="outline">
-                Cancel
-              </Button>
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className={buttonVariants({ variant: "destructive" })}
-              data-testid={
-                actionPhase
-                  ? "meeting-action-abort-confirm"
-                  : "meeting-host-abort-confirm"
-              }
-              disabled={disabled}
-              onClick={async (event) => {
-                event.preventDefault();
-                const result = await submit({
-                  type: "abort",
-                  reasonCode,
-                  reason: reason.trim() || undefined,
-                });
-                if (result?.status === "accepted") setOpen(false);
-              }}
-            >
-              Abort permanently
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Abort this meeting?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Abort is a terminal outcome for a meeting that cannot successfully
+            conclude. It does not roll back external effects
+            {actionPhase ? " that may already have occurred" : ""}.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <div className="space-y-3">
+          <select
+            aria-label="Meeting abort category"
+            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+            disabled={disabled}
+            onChange={(event) =>
+              setReasonCode(event.target.value as MeetingAbortReason)
+            }
+            value={reasonCode}
+          >
+            {Object.entries(ABORT_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <Textarea
+            aria-label="Meeting abort explanation"
+            disabled={disabled}
+            maxLength={1024}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Optional explanation for participants"
+            rows={3}
+            value={reason}
+          />
+        </div>
+        <AlertDialogFooter>
+          <AlertDialogCancel asChild>
+            <Button type="button" variant="outline">
+              Cancel
+            </Button>
+          </AlertDialogCancel>
+          <AlertDialogAction
+            className={buttonVariants({ variant: "destructive" })}
+            data-testid={
+              actionPhase
+                ? "meeting-action-abort-confirm"
+                : "meeting-host-abort-confirm"
+            }
+            disabled={disabled}
+            onClick={async (event) => {
+              event.preventDefault();
+              const result = await submit({
+                type: "abort",
+                reasonCode,
+                reason: reason.trim() || undefined,
+              });
+              if (result?.status === "accepted") onOpenChange(false);
+            }}
+          >
+            Abort permanently
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }
 
@@ -158,10 +147,9 @@ export function MeetingHostEndControls({
 
   return (
     <div
-      className="flex flex-wrap items-center justify-between gap-2 border-t pt-3"
+      className="flex flex-wrap items-center justify-end gap-2 border-t pt-3"
       data-testid="meeting-host-end-controls"
     >
-      <MeetingHostAbortControl disabled={disabled} submit={submit} />
       <div className="flex flex-wrap justify-end gap-2">
         {canFinalizeActions ? (
           <Button
