@@ -61,6 +61,7 @@ import type { RawProjectRoleHistoryPage } from "@/shared/api/tauriProjectViewRol
 import type {
   CreateMeetingInput,
   CreateMeetingResult,
+  MeetingActivity,
   MeetingActionFinalizationInput,
   MeetingActionFinalizationResult,
   MeetingFloorActionInput,
@@ -160,6 +161,7 @@ type MockMeetingSeed = {
   description?: string | null;
   result: MeetingLoadResult;
   speeches?: MeetingSpeech[];
+  activities?: MeetingActivity[];
 };
 
 type E2eConfig = {
@@ -11499,6 +11501,33 @@ export function maybeInstallE2eTauriMocks() {
             hasMore && oldest
               ? { before: oldest.createdAt, beforeId: oldest.eventId }
               : null,
+        };
+      }
+      case "get_meeting_activities": {
+        const { meetingId, cursor, limit } = payload as {
+          meetingId: string;
+          cursor?: string | null;
+          limit?: number | null;
+        };
+        const pageSize = Math.max(1, Math.min(limit ?? 30, 50));
+        const cursorMatch = cursor?.match(/^activity:(\d+)$/);
+        if (cursor && !cursorMatch) {
+          throw new Error("Meeting activity cursor is invalid");
+        }
+        const offset = cursorMatch ? Number(cursorMatch[1]) : 0;
+        const ordered = [
+          ...(getMockMeetingSeed(meetingId, activeConfig)?.activities ?? []),
+        ].sort(
+          (left, right) =>
+            right.occurredAtMs - left.occurredAtMs ||
+            left.activityId.localeCompare(right.activityId),
+        );
+        const activities = ordered.slice(offset, offset + pageSize);
+        const nextOffset = offset + activities.length;
+        return {
+          activities,
+          nextCursor:
+            nextOffset < ordered.length ? `activity:${nextOffset}` : null,
         };
       }
       case "get_feed":

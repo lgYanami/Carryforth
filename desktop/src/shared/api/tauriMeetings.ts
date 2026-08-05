@@ -289,6 +289,45 @@ export type MeetingSpeechPage = {
   nextCursor: MeetingSpeechCursor | null;
 };
 
+export type MeetingActivityKind =
+  | "board_updated"
+  | "board_unchanged"
+  | "board_timed_out"
+  | "board_preempted"
+  | "floor_offered"
+  | "floor_granted"
+  | "offer_declined"
+  | "offer_expired"
+  | "floor_yielded"
+  | "floor_recalled"
+  | "floor_expired"
+  | "handoff_opened"
+  | "handoff_attempted"
+  | "handoff_resolved"
+  | "action_finalization_started"
+  | "action_blocked"
+  | "action_retried"
+  | "action_returned_to_board"
+  | "action_deadline_exceeded"
+  | "meeting_closed"
+  | "meeting_aborted";
+
+export type MeetingActivity = {
+  /** Stable opaque identity; never interpreted as a Relay event ID. */
+  activityId: string;
+  kind: MeetingActivityKind;
+  occurredAtMs: number;
+  actorPubkey: string | null;
+  targetPubkey: string | null;
+  summary: string;
+};
+
+export type MeetingActivityPage = {
+  activities: MeetingActivity[];
+  /** Opaque native cursor; React must only pass it back unchanged. */
+  nextCursor: string | null;
+};
+
 export type MeetingHandoffType =
   | "question"
   | "information_request"
@@ -541,6 +580,18 @@ export async function getMeetingSpeeches(input: {
     meetingId: input.meetingId,
     before: input.before?.before ?? null,
     beforeId: input.before?.beforeId ?? null,
+    limit: input.limit ?? null,
+  });
+}
+
+export async function getMeetingActivities(input: {
+  meetingId: string;
+  cursor?: string;
+  limit?: number;
+}): Promise<MeetingActivityPage> {
+  return invokeTauri<MeetingActivityPage>("get_meeting_activities", {
+    meetingId: input.meetingId,
+    cursor: input.cursor ?? null,
     limit: input.limit ?? null,
   });
 }

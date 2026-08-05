@@ -131,6 +131,7 @@ pub(super) fn parse_state(
     validate_host_projection(&state, create)?;
     Ok(Some(StateProjection {
         event_id: event.id.to_hex(),
+        created_at: event.created_at.as_secs(),
         state,
     }))
 }

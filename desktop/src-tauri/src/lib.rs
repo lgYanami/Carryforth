@@ -725,6 +725,7 @@ pub fn run() {
             get_meeting_snapshot,
             get_meeting_board,
             get_meeting_speeches,
+            get_meeting_activities,
             create_meeting,
             submit_meeting_action_finalization,
             submit_meeting_floor_action,

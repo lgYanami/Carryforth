@@ -6,6 +6,8 @@
 
 mod create;
 pub use create::create_meeting;
+mod activity;
+pub use activity::get_meeting_activities;
 mod actions;
 pub use actions::submit_meeting_action_finalization;
 mod floor;

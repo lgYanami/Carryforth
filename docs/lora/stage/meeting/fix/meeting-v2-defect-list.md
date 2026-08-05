@@ -452,9 +452,18 @@ content、revision、grant 和 mentions，没有保留可供 UI 展示的 Direct
 - attention 独立于 unread，并随权威状态解除；
 - Native list projection 应提供足够且不泄漏隐私的产品级 attention，不由 Desktop 猜事件日志。
 
-### MFX-014（P1）：Meeting 活动记录未实现
+### MFX-014（已解决）：Meeting 活动记录未实现
 
-**现状**
+**解决状态（2026-08-05）**
+
+Desktop 已增加独立、可信且有界的 Meeting Activity 投影与 Sheet 入口。投影从签名、scope、冻结
+roster 和状态连续性均已验证的 Meeting Create/State/cause events 生成产品级活动，覆盖 Board、
+Floor、Directed Handoff、Action Finalization 与终态转换；读取使用有上限的稳定 opaque cursor，
+普通 DTO 不暴露 event ID、revision、epoch、lease、control token 或 raw State。活动按权威分页顺序
+展示，不进入 canonical Speech、不增加 Speech unread，也不带 Reply、Reaction 或普通消息操作。
+当前入口是供本阶段使用的稳定 Activity trigger；最终标题栏组织仍留给 `MFX-007`。
+
+**原现状**
 
 spec 允许把重要控制转换压缩为轻量系统行，并要求更多菜单提供“会议活动记录”。当前没有统一的
 Meeting activity 入口。

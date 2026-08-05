@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import type {
+  MeetingActivity,
   MeetingLifecycle,
   MeetingLoadResult,
   MeetingSnapshot,
@@ -34,13 +35,103 @@ function speech(revision: number, content: string): MeetingSpeech {
   };
 }
 
+function meetingActivities(): MeetingActivity[] {
+  const kinds: Array<{
+    kind: MeetingActivity["kind"];
+    summary: string;
+    actor?: string;
+    target?: string;
+  }> = [
+    {
+      kind: "meeting_closed",
+      summary: "The host closed the meeting after confirming its outcome.",
+      actor: HOST,
+    },
+    {
+      kind: "action_retried",
+      summary: "The host retried recording the meeting actions.",
+      actor: HOST,
+    },
+    {
+      kind: "action_blocked",
+      summary: "Recording the meeting actions became blocked.",
+      actor: HOST,
+    },
+    {
+      kind: "action_finalization_started",
+      summary: "The meeting entered action finalization.",
+      actor: HOST,
+    },
+    {
+      kind: "handoff_resolved",
+      summary: "A directed handoff was answered by the accepted Speech.",
+      actor: AGENT,
+    },
+    {
+      kind: "handoff_attempted",
+      summary: "The host offered the floor for a directed handoff.",
+      actor: HOST,
+      target: HUMAN,
+    },
+    {
+      kind: "floor_yielded",
+      summary: "The participant yielded the floor.",
+      actor: AGENT,
+    },
+    {
+      kind: "floor_granted",
+      summary: "The participant accepted the offer and received the floor.",
+      actor: AGENT,
+      target: AGENT,
+    },
+    {
+      kind: "offer_declined",
+      summary: "The participant declined the floor offer.",
+      actor: HUMAN,
+      target: HUMAN,
+    },
+    {
+      kind: "floor_offered",
+      summary: "The host offered the floor to a participant.",
+      actor: HOST,
+      target: AGENT,
+    },
+    {
+      kind: "board_timed_out",
+      summary: "The Board maintenance window timed out.",
+    },
+    {
+      kind: "board_updated",
+      summary: "The host updated the Meeting Board.",
+      actor: HOST,
+    },
+  ];
+  const filler = Array.from({ length: 22 }, (_, index) => ({
+    kind: "board_unchanged" as const,
+    summary: `The host completed Board maintenance without changes (${index + 1}).`,
+    actor: HOST,
+  }));
+  return [...kinds, ...filler].map((activity, index) => ({
+    activityId: `verified-activity-${index + 1}`,
+    kind: activity.kind,
+    occurredAtMs: (NOW + 200 - index) * 1_000,
+    actorPubkey: activity.actor ?? null,
+    targetPubkey: activity.target ?? null,
+    summary: activity.summary,
+  }));
+}
+
 function readyMeeting(input: {
   id: string;
   title: string;
   lifecycle: MeetingLifecycle;
   phase?: string;
   outcome?: "closed" | "aborted";
-}): { result: MeetingLoadResult; speeches: MeetingSpeech[] } {
+}): {
+  result: MeetingLoadResult;
+  speeches: MeetingSpeech[];
+  activities: MeetingActivity[];
+} {
   const speeches = [
     speech(1, "I recommend shipping the verified read path first."),
     speech(2, "Agreed. The Board captures the acceptance boundary."),
@@ -109,7 +200,11 @@ function readyMeeting(input: {
     end,
     latestSpeechAt: NOW + 2,
   };
-  return { result: { status: "ready", snapshot }, speeches };
+  return {
+    result: { status: "ready", snapshot },
+    speeches,
+    activities: meetingActivities(),
+  };
 }
 
 function meetingSeeds() {
@@ -240,6 +335,43 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   ).toBeVisible();
 });
 
+test("Meeting activity is bounded, product-level, and separate from canonical Speech", async ({
+  page,
+}) => {
+  await installMockBridge(page, { meetings: meetingSeeds() });
+  await page.goto("/");
+  await page.getByTestId(`meeting-row-${IDS.active}`).click();
+
+  const speechTimeline = page.getByTestId("meeting-speech-timeline");
+  await expect(speechTimeline).toContainText("verified read path first");
+  await page.getByTestId("meeting-activity-trigger").click();
+  const panel = page.getByTestId("meeting-activity-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("The host updated the Meeting Board.");
+  await expect(panel).toContainText(
+    "The participant accepted the offer and received the floor.",
+  );
+  await expect(panel).toContainText("The meeting entered action finalization.");
+  await expect(panel.locator("[data-activity-kind]")).toHaveCount(30);
+  await expect(panel).not.toContainText(
+    /event.?id|state.?revision|floor.?revision|control.?epoch|lease|control.?token/i,
+  );
+  await expect(panel.getByTestId("message-reactions")).toHaveCount(0);
+  await expect(speechTimeline).not.toContainText(
+    "The host updated the Meeting Board.",
+  );
+
+  await page.getByTestId("meeting-activity-load-older").click();
+  await expect(panel.locator("[data-activity-kind]")).toHaveCount(34);
+  await expect(page.getByTestId("meeting-activity-load-older")).toHaveCount(0);
+  const reads = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter(
+      (entry) => entry.command === "get_meeting_activities",
+    ),
+  );
+  expect(reads).toHaveLength(2);
+});
+
 test("action, history, forbidden, and unsupported Meeting states stay read-only", async ({
   page,
 }) => {
@@ -293,6 +425,7 @@ test("action, history, forbidden, and unsupported Meeting states stay read-only"
   await expect(page.getByTestId("meeting-load-state")).toContainText(
     "not a participant",
   );
+  await expect(page.getByTestId("meeting-activity-trigger")).toHaveCount(0);
   await expect(page.getByTestId("message-composer")).toHaveCount(0);
 
   await page.getByTestId(`meeting-row-${IDS.unsupported}`).click();

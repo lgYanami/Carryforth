@@ -232,6 +232,74 @@ pub struct MeetingSpeechPage {
     pub(super) next_cursor: Option<MeetingSpeechCursor>,
 }
 
+/// Product-level classification for one verified Meeting control transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingActivityKind {
+    /// The host published a changed Board.
+    BoardUpdated,
+    /// The host completed maintenance without changing the Board.
+    BoardUnchanged,
+    /// Board maintenance reached its deadline.
+    BoardTimedOut,
+    /// A higher-priority floor action interrupted Board maintenance.
+    BoardPreempted,
+    /// The host offered the floor.
+    FloorOffered,
+    /// An offer was acknowledged and became an active Grant.
+    FloorGranted,
+    /// The target declined an Offer.
+    OfferDeclined,
+    /// An Offer expired before acknowledgement.
+    OfferExpired,
+    /// The Grant holder yielded the floor.
+    FloorYielded,
+    /// The host recalled meeting control.
+    FloorRecalled,
+    /// An active Grant expired.
+    FloorExpired,
+    /// An accepted Speech established a Directed Handoff.
+    HandoffOpened,
+    /// The host attempted a Directed Handoff through a floor Offer.
+    HandoffAttempted,
+    /// A Directed Handoff reached a stable answered or dismissed state.
+    HandoffResolved,
+    /// The Meeting entered action finalization.
+    ActionFinalizationStarted,
+    /// Action recording became blocked.
+    ActionBlocked,
+    /// The host retried action recording.
+    ActionRetried,
+    /// Action finalization returned to Board maintenance.
+    ActionReturnedToBoard,
+    /// Action recording reached its deadline.
+    ActionDeadlineExceeded,
+    /// The Meeting closed successfully.
+    MeetingClosed,
+    /// The Meeting ended without a successful conclusion.
+    MeetingAborted,
+}
+
+/// A bounded, sanitized Meeting activity item safe for ordinary Desktop UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingActivity {
+    pub(super) activity_id: String,
+    pub(super) kind: MeetingActivityKind,
+    pub(super) occurred_at_ms: i64,
+    pub(super) actor_pubkey: Option<String>,
+    pub(super) target_pubkey: Option<String>,
+    pub(super) summary: String,
+}
+
+/// One bounded page of verified Meeting activity.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingActivityPage {
+    pub(super) activities: Vec<MeetingActivity>,
+    pub(super) next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingParticipant {
@@ -443,6 +511,23 @@ pub(super) struct OpenHandoffWire {
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct TransitionEffectWire {
+    #[serde(rename = "type")]
+    pub(super) effect_type: String,
+    pub(super) object_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct TransitionWire {
+    pub(super) primary_type: String,
+    #[serde(default)]
+    pub(super) caused_by_event_id: Option<String>,
+    pub(super) at_ms: i64,
+    #[serde(default)]
+    pub(super) effects: Vec<TransitionEffectWire>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct ActionWire {
     pub(super) action_run_id: Uuid,
     pub(super) board_event_id: String,
@@ -504,6 +589,8 @@ pub(super) struct StateWire {
     pub(super) grant: Option<GrantWire>,
     #[serde(default)]
     pub(super) board_control: Option<BoardControlWire>,
+    #[serde(default)]
+    pub(super) transition: Option<TransitionWire>,
 }
 
 #[derive(Debug)]
@@ -523,5 +610,6 @@ pub(super) struct CreateProjection {
 #[derive(Debug)]
 pub(super) struct StateProjection {
     pub(super) event_id: String,
+    pub(super) created_at: u64,
     pub(super) state: StateWire,
 }

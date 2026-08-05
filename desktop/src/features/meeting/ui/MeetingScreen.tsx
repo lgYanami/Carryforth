@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ClipboardList,
   ExternalLink,
+  History,
   RefreshCw,
   ShieldCheck,
   UsersRound,
@@ -13,6 +14,7 @@ import {
 import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
+  useMeetingActivities,
   useMeetingSnapshot,
   useMeetingSpeeches,
 } from "@/features/meeting/hooks";
@@ -23,6 +25,7 @@ import { useCommunities } from "@/features/communities/useCommunities";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type {
+  MeetingActivity,
   MeetingLifecycle,
   MeetingSnapshot,
   MeetingSpeech,
@@ -45,6 +48,7 @@ import {
 } from "@/shared/ui/sheet";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import { MeetingBoardPanel } from "./MeetingBoardPanel";
+import { MeetingActivityPanel } from "./MeetingActivityPanel";
 import { MeetingFloorDock } from "./MeetingFloorDock";
 import { MeetingParticipantsPanel } from "./MeetingParticipantsPanel";
 import { MeetingSpeechTimeline } from "./MeetingSpeechTimeline";
@@ -207,6 +211,16 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     snapshot,
   });
   const boardPanelIsOverlay = useMediaBreakpoint(1280);
+  const [activitySheetState, setActivitySheetState] = React.useState({
+    meetingId,
+    open: false,
+  });
+  const activitySheetOpen =
+    activitySheetState.meetingId === meetingId && activitySheetState.open;
+  const setActivitySheetOpen = React.useCallback(
+    (open: boolean) => setActivitySheetState({ meetingId, open }),
+    [meetingId],
+  );
   const [boardSheetState, setBoardSheetState] = React.useState({
     meetingId,
     open: false,
@@ -251,6 +265,10 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     meetingId,
     enabled: snapshot !== null,
   });
+  const activitiesQuery = useMeetingActivities({
+    meetingId,
+    enabled: snapshot !== null && activitySheetOpen,
+  });
   const participantPubkeys = React.useMemo(
     () =>
       snapshot
@@ -278,6 +296,18 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
         left.eventId.localeCompare(right.eventId),
     );
   }, [speechesQuery.data?.pages]);
+  const activities = React.useMemo(() => {
+    const ordered: MeetingActivity[] = [];
+    const seenIds = new Set<string>();
+    for (const page of activitiesQuery.data?.pages ?? []) {
+      for (const activity of page.activities) {
+        if (seenIds.has(activity.activityId)) continue;
+        seenIds.add(activity.activityId);
+        ordered.push(activity);
+      }
+    }
+    return ordered;
+  }, [activitiesQuery.data?.pages]);
 
   React.useEffect(() => {
     setVisibleChannel(meetingId);
@@ -424,6 +454,40 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
                 <MeetingParticipantsPanel
                   profiles={profiles}
                   snapshot={readySnapshot}
+                />
+              </div>
+            </SheetContent>
+          </Sheet>
+          <Sheet onOpenChange={setActivitySheetOpen} open={activitySheetOpen}>
+            <SheetTrigger asChild>
+              <Button
+                data-testid="meeting-activity-trigger"
+                size="sm"
+                title="Meeting activity"
+                variant="ghost"
+              >
+                <History className="size-4" />
+                <span className="hidden sm:inline">Activity</span>
+              </Button>
+            </SheetTrigger>
+            <SheetContent className="flex p-0 sm:max-w-lg">
+              <div className="flex min-h-0 flex-1 flex-col">
+                <SheetHeader className="border-b px-5 py-4 text-left">
+                  <SheetTitle>Meeting activity</SheetTitle>
+                  <SheetDescription>
+                    Product-level control history from the verified Meeting
+                    projection.
+                  </SheetDescription>
+                </SheetHeader>
+                <MeetingActivityPanel
+                  activities={activities}
+                  error={Boolean(activitiesQuery.error)}
+                  hasOlder={Boolean(activitiesQuery.hasNextPage)}
+                  isFetching={activitiesQuery.isFetching}
+                  isFetchingOlder={activitiesQuery.isFetchingNextPage}
+                  onFetchOlder={() => void activitiesQuery.fetchNextPage()}
+                  onRetry={() => void activitiesQuery.refetch()}
+                  profiles={profiles}
                 />
               </div>
             </SheetContent>
