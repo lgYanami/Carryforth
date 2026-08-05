@@ -1,9 +1,10 @@
-//! Project Context Stage 3 Relay, privacy, and operation-gate E2E.
+//! Project Context Stage 3/4 Relay, privacy, operation-gate, and lifecycle E2E.
 //!
 //! The isolated harness establishes Project View v3, Project Document v1, and
 //! an initialized Context Edge catalog. This test drives real signed commands
 //! through the Relay and verifies atomic projections, replay/CAS behavior,
-//! managed-agent authority, disable semantics, private reads, and fan-out.
+//! managed-agent authority, disable semantics, private reads, fan-out, and
+//! cross-domain Document/coordinate lifecycle behavior.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -20,7 +21,14 @@ use buzz_project_context::{
     ProjectContextBindingState, ProjectContextCommand, ProjectContextCoordinate,
     ProjectContextOperation, ProjectContextReceipt, PROJECT_CONTEXT_CAPABILITY,
 };
-use buzz_project_document::{DocumentCommandRequest, ProjectDocumentCommand};
+use buzz_project_document::{
+    DocumentCommandRequest, ProjectDocumentCommand, ProjectDocumentReceipt,
+};
+use buzz_project_view::v3::{
+    CreateProjectObjectV3, DeleteProjectObjectV3, DocumentReferenceMode, GoalPatchV3,
+    NewProjectViewObjectV3, ProjectContextReference, ProjectObjectCommandV3,
+    ProjectObjectRequestV3, UpdateProjectObjectV3,
+};
 use buzz_project_view::ProjectViewObjectType;
 use buzz_sdk::nip_oa;
 use buzz_sdk::project_context::{
@@ -28,6 +36,7 @@ use buzz_sdk::project_context::{
     parse_project_context_meta, verify_project_context_meta_change,
 };
 use buzz_sdk::project_document::build_document_command;
+use buzz_sdk::project_view_v3::build_project_object_command;
 use buzz_test_client::{BuzzTestClient, RelayMessage};
 use nostr::{Event, EventBuilder, Filter, Keys, Kind, Tag};
 use reqwest::{Client, StatusCode};
@@ -38,6 +47,7 @@ use url::Url;
 use uuid::Uuid;
 
 const GOAL_ID: &str = "10000000-0000-4000-8000-00000000c003";
+const BACKUP_GOAL_ID: &str = "10000000-0000-4000-8000-00000000c004";
 
 struct TestContext {
     ws_url: String,
@@ -260,6 +270,17 @@ fn receipt(response: &buzz_ws_client::OkResponse) -> ProjectContextReceipt {
     .expect("parse canonical Project Context receipt")
 }
 
+fn document_receipt(response: &buzz_ws_client::OkResponse) -> ProjectDocumentReceipt {
+    assert!(response.accepted, "{}", response.message);
+    serde_json::from_str(
+        response
+            .message
+            .strip_prefix("response:")
+            .expect("canonical Project Document receipt prefix"),
+    )
+    .expect("parse canonical Project Document receipt")
+}
+
 fn verify_bundle(
     context: &TestContext,
     events: &[Event],
@@ -340,15 +361,19 @@ async fn create_document(client: &mut BuzzTestClient, keys: &Keys, document_id: 
             content_markdown: format!("# {title}\n\nCross-coordinate context."),
         },
     );
-    let event = build_document_command(command)
-        .expect("build Project Document create")
-        .sign_with_keys(keys)
-        .expect("sign Project Document create");
+    let event = document_event(keys, command);
     let response = client
         .send_event(event)
         .await
         .expect("submit Project Document create");
     assert!(response.accepted, "{}", response.message);
+}
+
+fn document_event(keys: &Keys, command: ProjectDocumentCommand) -> Event {
+    build_document_command(command)
+        .expect("build Project Document command")
+        .sign_with_keys(keys)
+        .expect("sign Project Document command")
 }
 
 async fn context_state(pool: &PgPool, community_id: CommunityId) -> (i64, i64, i64, i64) {
@@ -362,6 +387,34 @@ async fn context_state(pool: &PgPool, community_id: CommunityId) -> (i64, i64, i
     .fetch_one(pool)
     .await
     .expect("read canonical Project Context state")
+}
+
+async fn current_project_revision(context: &TestContext) -> u64 {
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT project_revision FROM project_view_state WHERE community_id = $1",
+    )
+    .bind(context.community_id.as_uuid())
+    .fetch_one(&context.pool)
+    .await
+    .expect("read current Project revision");
+    u64::try_from(revision).expect("positive Project revision")
+}
+
+async fn submit_project_view_command(
+    client: &mut BuzzTestClient,
+    keys: &Keys,
+    command: ProjectObjectCommandV3,
+    label: &str,
+) {
+    let event = build_project_object_command(command)
+        .unwrap_or_else(|error| panic!("build {label}: {error}"))
+        .sign_with_keys(keys)
+        .unwrap_or_else(|error| panic!("sign {label}: {error}"));
+    let response = client
+        .send_event(event)
+        .await
+        .unwrap_or_else(|error| panic!("submit {label}: {error}"));
+    assert!(response.accepted, "{label}: {}", response.message);
 }
 
 fn assert_no_context_events(body: &Value) {
@@ -380,7 +433,7 @@ fn assert_no_context_events(body: &Value) {
 
 #[tokio::test]
 #[ignore = "requires isolated Project View v3, Project Document, Relay, PostgreSQL, and Redis"]
-async fn project_context_stage_three_is_atomic_private_and_operation_aware() {
+async fn project_context_stage_three_and_four_are_atomic_private_and_lifecycle_safe() {
     let context = setup().await;
     let http = Client::new();
     let db = Db::from_pool(context.pool.clone());
@@ -879,6 +932,547 @@ async fn project_context_stage_three_is_atomic_private_and_operation_aware() {
         .verify_project_context_storage(context.community_id, &context.relay.public_key())
         .await
         .expect("verify final canonical/projection parity");
+    assert_eq!(integrity.orphan_projection_count, 0);
+    assert_eq!(integrity.pointer_mismatch_count, 0);
+
+    // Stage 4: the active Context binding participates in the ordinary
+    // Project Document deletion precheck and returns the stable domain error.
+    let protected_delete = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Delete {
+                document_id: document_three,
+            },
+        ),
+    );
+    let response = writer
+        .send_event(protected_delete)
+        .await
+        .expect("receive protected Context Document delete rejection");
+    assert!(!response.accepted);
+    assert_eq!(
+        response.message,
+        "conflict:project_document:still_referenced"
+    );
+
+    // Tombstoning a Project View coordinate does not rewrite or hide the
+    // retained Edge and does not advance the independent Context revision.
+    let project_revision: i64 = sqlx::query_scalar(
+        "SELECT project_revision FROM project_view_state WHERE community_id = $1",
+    )
+    .bind(context.community_id.as_uuid())
+    .fetch_one(&context.pool)
+    .await
+    .expect("read Project revision before coordinate tombstone");
+    let delete_goal = ProjectObjectCommandV3::new(
+        u64::try_from(project_revision).expect("positive Project revision"),
+        None,
+        ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
+            object_type: ProjectViewObjectType::Goal,
+            object_id: Uuid::parse_str(GOAL_ID).expect("parse Stage 4 goal UUID"),
+        }),
+    );
+    let delete_goal_event = build_project_object_command(delete_goal)
+        .expect("build Project View coordinate tombstone")
+        .sign_with_keys(&context.writer)
+        .expect("sign Project View coordinate tombstone");
+    let response = writer
+        .send_event(delete_goal_event)
+        .await
+        .expect("tombstone Project View coordinate");
+    assert!(response.accepted, "{}", response.message);
+    let retained_after_goal_delete: (bool, i64, String, i64) = sqlx::query_as(
+        "SELECT object.deleted_at IS NOT NULL, state.context_revision, edge.state, \
+                (SELECT count(*) FROM project_context_edge_coordinates coordinate \
+                 WHERE coordinate.community_id = state.community_id \
+                   AND coordinate.coordinate_type = 'project_view_object' \
+                   AND coordinate.coordinate_subtype = 'goal' \
+                   AND coordinate.coordinate_id = $2) \
+         FROM project_view_objects object \
+         JOIN project_context_edge_state state ON state.community_id = object.community_id \
+         JOIN project_context_edges edge ON edge.community_id = state.community_id \
+         WHERE object.community_id = $1 AND object.object_id = $2",
+    )
+    .bind(context.community_id.as_uuid())
+    .bind(Uuid::parse_str(GOAL_ID).expect("parse retained goal UUID"))
+    .fetch_one(&context.pool)
+    .await
+    .expect("read retained Edge after Project View tombstone");
+    assert_eq!(
+        retained_after_goal_delete,
+        (true, 5, "active".to_owned(), 1)
+    );
+
+    // The Context Document body remains an ordinary independently versioned
+    // Project Document even after one of its Edge coordinates tombstones.
+    let update_context_document = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id: document_three,
+                title: "Context three corrected".to_owned(),
+                summary: Some("Updated after coordinate tombstone".to_owned()),
+                content_markdown: "# Context three\n\nCorrected semantic explanation.".to_owned(),
+            },
+        ),
+    );
+    let response = writer
+        .send_event(update_context_document)
+        .await
+        .expect("update Context Document after coordinate tombstone");
+    assert_eq!(document_receipt(&response).document_revision, 2);
+    assert_eq!(
+        context_state(&context.pool, context.community_id).await,
+        (5, 1, 1, 5)
+    );
+
+    let rejected_retained_attach = context_event(
+        context.community_id,
+        &context.writer,
+        5,
+        ProjectContextOperation::Attach,
+        &coordinates,
+        document_one,
+    );
+    let response = writer
+        .send_event(rejected_retained_attach)
+        .await
+        .expect("receive tombstoned-coordinate attach rejection");
+    assert!(!response.accepted);
+    assert_eq!(
+        response.message,
+        "invalid:project_context:inactive_coordinate"
+    );
+
+    let detach_after_goal_delete = context_event(
+        context.community_id,
+        &context.writer,
+        5,
+        ProjectContextOperation::Detach,
+        &coordinates,
+        document_three,
+    );
+    let response = writer
+        .send_event(detach_after_goal_delete.clone())
+        .await
+        .expect("detach Context Document after coordinate tombstone");
+    let receipt_six = receipt(&response);
+    assert_eq!(receipt_six.context_revision, 6);
+    assert_eq!(receipt_six.edge_document_count, 0);
+    verify_bundle(
+        &context,
+        &collect_live_bundle(&mut reader, &live_subscription).await,
+        &detach_after_goal_delete,
+        &receipt_six,
+        ProjectContextBindingState::Deleted,
+        0,
+        0,
+    );
+    let _ = collect_live_bundle(&mut observer, &observer_subscription).await;
+
+    let released_delete = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: document_three,
+            },
+        ),
+    );
+    let response = writer
+        .send_event(released_delete)
+        .await
+        .expect("delete detached Context Document");
+    assert_eq!(document_receipt(&response).document_revision, 3);
+
+    // Document coordinates and Context Document bindings are separate roles.
+    // A Document can occupy both roles on one Edge and remain a coordinate of
+    // an overlapping Edge without implicit propagation between them.
+    let shared_document = Uuid::new_v4();
+    let coordinate_c = Uuid::new_v4();
+    let coordinate_d = Uuid::new_v4();
+    let second_context_document = Uuid::new_v4();
+    let overlap_candidate = Uuid::new_v4();
+    for (document_id, title) in [
+        (shared_document, "Shared Context and coordinate"),
+        (coordinate_c, "Document coordinate C"),
+        (coordinate_d, "Document coordinate D"),
+        (second_context_document, "Second overlapping Context"),
+        (overlap_candidate, "Rejected overlap candidate"),
+    ] {
+        create_document(&mut writer, &context.writer, document_id, title).await;
+    }
+    let resource_id = Uuid::new_v4();
+    submit_project_view_command(
+        &mut writer,
+        &context.writer,
+        ProjectObjectCommandV3::new(
+            current_project_revision(&context).await,
+            None,
+            ProjectObjectRequestV3::Create(CreateProjectObjectV3 {
+                object: NewProjectViewObjectV3::Resource {
+                    id: resource_id,
+                    name: "Shared Context guide".to_owned(),
+                    resource_kind: "runbook".to_owned(),
+                    summary: Some("Stage 4 structural-role fixture".to_owned()),
+                    guide_document_id: shared_document,
+                    context_references: Vec::new(),
+                },
+            }),
+        ),
+        "Resource using the shared Document as its Guide",
+    )
+    .await;
+    submit_project_view_command(
+        &mut writer,
+        &context.writer,
+        ProjectObjectCommandV3::new(
+            current_project_revision(&context).await,
+            None,
+            ProjectObjectRequestV3::Update(UpdateProjectObjectV3::Goal {
+                object_id: Uuid::parse_str(BACKUP_GOAL_ID).expect("parse backup Goal UUID"),
+                patch: GoalPatchV3 {
+                    context_references: Some(vec![ProjectContextReference::Document {
+                        document_id: shared_document,
+                        mode: DocumentReferenceMode::Live,
+                        document_revision: None,
+                    }]),
+                    ..GoalPatchV3::default()
+                },
+            }),
+        ),
+        "Live Context Reference to the shared Document",
+    )
+    .await;
+    let established_independent_roles: (i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT count(*) FROM project_view_objects \
+             WHERE community_id = $1 AND object_id = $2 \
+               AND deleted_at IS NULL AND guide_document_id = $3), \
+            (SELECT count(*) FROM project_view_document_context_references \
+             WHERE community_id = $1 AND target_document_id = $3 \
+               AND reference_mode = 'live')",
+    )
+    .bind(context.community_id.as_uuid())
+    .bind(resource_id)
+    .bind(shared_document)
+    .fetch_one(&context.pool)
+    .await
+    .expect("read established Guide and Context Reference roles");
+    assert_eq!(established_independent_roles, (1, 1));
+    let first_document_coordinates = vec![
+        ProjectContextCoordinate::Document {
+            document_id: shared_document,
+        },
+        ProjectContextCoordinate::Document {
+            document_id: coordinate_c,
+        },
+    ];
+    let second_document_coordinates = vec![
+        ProjectContextCoordinate::Document {
+            document_id: shared_document,
+        },
+        ProjectContextCoordinate::Document {
+            document_id: coordinate_d,
+        },
+    ];
+    let attach_shared = context_event(
+        context.community_id,
+        &context.writer,
+        6,
+        ProjectContextOperation::Attach,
+        &first_document_coordinates,
+        shared_document,
+    );
+    let response = writer
+        .send_event(attach_shared.clone())
+        .await
+        .expect("attach Document in both structural roles");
+    let receipt_seven = receipt(&response);
+    verify_bundle(
+        &context,
+        &collect_live_bundle(&mut reader, &live_subscription).await,
+        &attach_shared,
+        &receipt_seven,
+        ProjectContextBindingState::Active,
+        1,
+        1,
+    );
+    let _ = collect_live_bundle(&mut observer, &observer_subscription).await;
+
+    let attach_overlap = context_event(
+        context.community_id,
+        &context.writer,
+        7,
+        ProjectContextOperation::Attach,
+        &second_document_coordinates,
+        second_context_document,
+    );
+    let response = writer
+        .send_event(attach_overlap.clone())
+        .await
+        .expect("attach overlapping Document-coordinate Edge");
+    let receipt_eight = receipt(&response);
+    verify_bundle(
+        &context,
+        &collect_live_bundle(&mut reader, &live_subscription).await,
+        &attach_overlap,
+        &receipt_eight,
+        ProjectContextBindingState::Active,
+        2,
+        2,
+    );
+    let _ = collect_live_bundle(&mut observer, &observer_subscription).await;
+
+    let delete_coordinate_c = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Delete {
+                document_id: coordinate_c,
+            },
+        ),
+    );
+    let response = writer
+        .send_event(delete_coordinate_c)
+        .await
+        .expect("delete coordinate-only Document");
+    assert_eq!(document_receipt(&response).document_revision, 2);
+    let update_shared = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id: shared_document,
+                title: "Shared Context corrected".to_owned(),
+                summary: None,
+                content_markdown: "# Shared Context\n\nUpdated without changing either Edge."
+                    .to_owned(),
+            },
+        ),
+    );
+    let response = writer
+        .send_event(update_shared)
+        .await
+        .expect("update shared Context Document");
+    assert_eq!(document_receipt(&response).document_revision, 2);
+    assert_eq!(
+        context_state(&context.pool, context.community_id).await,
+        (8, 2, 2, 8)
+    );
+
+    let rejected_first_overlap = context_event(
+        context.community_id,
+        &context.writer,
+        8,
+        ProjectContextOperation::Attach,
+        &first_document_coordinates,
+        overlap_candidate,
+    );
+    let response = writer
+        .send_event(rejected_first_overlap)
+        .await
+        .expect("receive deleted Document-coordinate rejection");
+    assert!(!response.accepted);
+    assert_eq!(
+        response.message,
+        "invalid:project_context:inactive_coordinate"
+    );
+
+    let detach_shared = context_event(
+        context.community_id,
+        &context.writer,
+        8,
+        ProjectContextOperation::Detach,
+        &first_document_coordinates,
+        shared_document,
+    );
+    let response = writer
+        .send_event(detach_shared.clone())
+        .await
+        .expect("detach shared Context role");
+    let receipt_nine = receipt(&response);
+    verify_bundle(
+        &context,
+        &collect_live_bundle(&mut reader, &live_subscription).await,
+        &detach_shared,
+        &receipt_nine,
+        ProjectContextBindingState::Deleted,
+        1,
+        1,
+    );
+    let _ = collect_live_bundle(&mut observer, &observer_subscription).await;
+
+    let independently_protected_delete = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: shared_document,
+            },
+        ),
+    );
+    let response = writer
+        .send_event(independently_protected_delete)
+        .await
+        .expect("receive non-Edge deletion protection");
+    assert!(!response.accepted);
+    assert_eq!(
+        response.message,
+        "conflict:project_document:still_referenced"
+    );
+    assert_eq!(
+        context_state(&context.pool, context.community_id).await,
+        (9, 1, 1, 9)
+    );
+
+    // Context Edge detach does not mutate the independent Guide or Context
+    // Reference. Remove both explicitly, then the same Document may tombstone
+    // even though it is still a coordinate of the other retained Edge.
+    submit_project_view_command(
+        &mut writer,
+        &context.writer,
+        ProjectObjectCommandV3::new(
+            current_project_revision(&context).await,
+            None,
+            ProjectObjectRequestV3::Update(UpdateProjectObjectV3::Goal {
+                object_id: Uuid::parse_str(BACKUP_GOAL_ID).expect("parse backup Goal UUID"),
+                patch: GoalPatchV3 {
+                    context_references: Some(Vec::new()),
+                    ..GoalPatchV3::default()
+                },
+            }),
+        ),
+        "remove independent Live Context Reference",
+    )
+    .await;
+    submit_project_view_command(
+        &mut writer,
+        &context.writer,
+        ProjectObjectCommandV3::new(
+            current_project_revision(&context).await,
+            None,
+            ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
+                object_type: ProjectViewObjectType::Resource,
+                object_id: resource_id,
+            }),
+        ),
+        "delete independent Resource Guide owner",
+    )
+    .await;
+    let delete_shared = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: shared_document,
+            },
+        ),
+    );
+    let response = writer
+        .send_event(delete_shared)
+        .await
+        .expect("delete Document that remains only an Edge coordinate");
+    assert_eq!(document_receipt(&response).document_revision, 3);
+
+    let update_second_context = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id: second_context_document,
+                title: "Second Context corrected".to_owned(),
+                summary: Some("Shared coordinate is now tombstoned".to_owned()),
+                content_markdown: "# Second Context\n\nStill editable after tombstone.".to_owned(),
+            },
+        ),
+    );
+    let response = writer
+        .send_event(update_second_context)
+        .await
+        .expect("update Context on retained overlapping Edge");
+    assert_eq!(document_receipt(&response).document_revision, 2);
+    let rejected_second_overlap = context_event(
+        context.community_id,
+        &context.writer,
+        9,
+        ProjectContextOperation::Attach,
+        &second_document_coordinates,
+        overlap_candidate,
+    );
+    let response = writer
+        .send_event(rejected_second_overlap)
+        .await
+        .expect("receive shared tombstoned-coordinate rejection");
+    assert!(!response.accepted);
+    assert_eq!(
+        response.message,
+        "invalid:project_context:inactive_coordinate"
+    );
+
+    let detach_second_overlap = context_event(
+        context.community_id,
+        &context.writer,
+        9,
+        ProjectContextOperation::Detach,
+        &second_document_coordinates,
+        second_context_document,
+    );
+    let response = writer
+        .send_event(detach_second_overlap.clone())
+        .await
+        .expect("detach retained overlapping Edge");
+    let receipt_ten = receipt(&response);
+    verify_bundle(
+        &context,
+        &collect_live_bundle(&mut reader, &live_subscription).await,
+        &detach_second_overlap,
+        &receipt_ten,
+        ProjectContextBindingState::Deleted,
+        0,
+        0,
+    );
+    let _ = collect_live_bundle(&mut observer, &observer_subscription).await;
+    let delete_second_context = document_event(
+        &context.writer,
+        ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: second_context_document,
+            },
+        ),
+    );
+    let response = writer
+        .send_event(delete_second_context)
+        .await
+        .expect("delete released second Context Document");
+    assert_eq!(document_receipt(&response).document_revision, 3);
+
+    assert_eq!(
+        context_state(&context.pool, context.community_id).await,
+        (10, 0, 0, 10)
+    );
+    let role_independence: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT count(*) FROM project_context_edges \
+             WHERE community_id = $1), \
+            (SELECT count(*) FROM project_context_document_bindings \
+             WHERE community_id = $1), \
+            (SELECT count(*) FROM project_context_edge_coordinates \
+             WHERE community_id = $1 AND coordinate_id = $2)",
+    )
+    .bind(context.community_id.as_uuid())
+    .bind(shared_document)
+    .fetch_one(&context.pool)
+    .await
+    .expect("read independent structural roles");
+    assert_eq!(role_independence, (3, 5, 2));
+    let integrity = db
+        .verify_project_context_storage(context.community_id, &context.relay.public_key())
+        .await
+        .expect("verify lifecycle canonical/projection parity");
     assert_eq!(integrity.orphan_projection_count, 0);
     assert_eq!(integrity.pointer_mismatch_count, 0);
 

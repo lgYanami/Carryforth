@@ -20,7 +20,7 @@ pub struct DocumentChangeContext {
     pub change_id: EventId,
     /// Monotonic PostgreSQL canonical time.
     pub canonical_at: DateTime<Utc>,
-    /// Whether an active Resource Guide or Live Document reference blocks delete.
+    /// Whether any active cross-domain reference blocks delete.
     pub deletion_blocked: bool,
 }
 

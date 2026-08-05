@@ -101,7 +101,7 @@ pub enum DocumentError {
     /// An update supplied the exact current full snapshot.
     #[error("Project Document update does not change the current snapshot")]
     NoChange,
-    /// A delete was blocked by an active Guide or Live Document reference.
+    /// A delete was blocked by an active cross-domain reference.
     #[error("Project Document {document_id} is still referenced")]
     StillReferenced {
         /// Referenced Document identity.

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Exercise Project Context Stage 3 against a direct Project View v3 Community:
+# Exercise Project Context Stages 3 and 4 against a direct Project View v3 Community:
 # controlled bootstrap, real Relay writes, private reads/fan-out, disable
-# semantics, managed authority, and final canonical-state preservation.
+# semantics, managed authority, cross-domain lifecycle, and final canonical
+# state preservation.
 
 set -euo pipefail
 
@@ -325,12 +326,20 @@ jq -n \
         problem: "Cross-coordinate knowledge needs explicit Context Documents",
         scope: "One isolated backend Community"
       },
-      goals: [{
-        id: "10000000-0000-4000-8000-00000000c003",
-        title: "Deliver Project Context Stage 3",
-        desired_outcome: "Verified private atomic Edge writes",
-        directions: ["Keep Context owned by acting Humans and Agents"]
-      }],
+      goals: [
+        {
+          id: "10000000-0000-4000-8000-00000000c003",
+          title: "Deliver Project Context Stage 3",
+          desired_outcome: "Verified private atomic Edge writes",
+          directions: ["Keep Context owned by acting Humans and Agents"]
+        },
+        {
+          id: "10000000-0000-4000-8000-00000000c004",
+          title: "Preserve Project lifecycle invariants",
+          desired_outcome: "Keep one active Goal while testing coordinate tombstones",
+          directions: ["Do not weaken Project View lifecycle rules"]
+        }
+      ],
       initial_roles: [{
         role_id: "20000000-0000-4000-8000-00000000c003",
         name: "Community owner",
@@ -362,6 +371,14 @@ project_document_admin verify \
   --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
 project_document_admin enable \
   --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
+
+# Keep the pre-existing Project View Context Reference capability active in
+# the lifecycle fixture. Stage 4 proves that its Live references and Resource
+# Guides remain independent from the new Context Edge binding.
+project_view_admin context enable \
+  --community "${test_host}" \
+  --idempotency-key "project-context-stage4-reference-${database_name}" \
+  --operator-pubkey "${member_pubkey}" >/dev/null
 
 bootstrap="$(project_context_admin bootstrap \
   --community "${test_host}" --expected-pubkey "${relay_pubkey}")"
@@ -403,12 +420,12 @@ final_enabled_status="$(project_context_admin status --community "${test_host}")
 jq -e '
   length == 1
   and .[0].enabled == true
-  and .[0].context_revision == 5
-  and .[0].active_edge_count == 1
-  and .[0].bound_document_count == 1
-  and .[0].edge_row_count == 1
-  and .[0].binding_row_count == 3
-  and .[0].change_count == 5
+  and .[0].context_revision == 10
+  and .[0].active_edge_count == 0
+  and .[0].bound_document_count == 0
+  and .[0].edge_row_count == 3
+  and .[0].binding_row_count == 5
+  and .[0].change_count == 10
   and .[0].projection_parity == true
   and .[0].advertised_ready == true
 ' <<<"${final_enabled_status}" >/dev/null
@@ -432,7 +449,7 @@ disabled_status="$(project_context_admin status --community "${test_host}")"
 jq -e '
   length == 1
   and .[0].enabled == false
-  and .[0].context_revision == 5
+  and .[0].context_revision == 10
   and .[0].structural_read_ready == true
   and .[0].advertised_ready == false
   and .[0].projection_parity == true
@@ -448,4 +465,4 @@ if (( control_audits < 5 )); then
   exit 1
 fi
 
-echo "Project Context Stage 3 Relay, privacy, authority, and operation-gate E2E passed."
+echo "Project Context Stage 3/4 Relay, privacy, authority, and lifecycle E2E passed."

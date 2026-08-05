@@ -448,6 +448,11 @@ project-context-test-e2e:
 project-context-test-e2e-stage3:
     ./scripts/test-project-context-stage3-e2e.sh
 
+# Run the real Project Context cross-domain lifecycle E2E. The Stage 3
+# protocol path remains part of this cumulative acceptance scenario.
+project-context-test-e2e-stage4:
+    ./scripts/test-project-context-stage3-e2e.sh
+
 # Run every Project Context Stage 1 quality gate.
 project-context-stage1-test: project-context-test-unit project-context-test-e2e
 
@@ -456,6 +461,9 @@ project-context-stage2-test: project-context-test-unit project-context-test-db t
 
 # Run every Project Context Stage 3 quality gate.
 project-context-stage3-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage3
+
+# Run every Project Context Stage 4 quality gate.
+project-context-stage4-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage4
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.

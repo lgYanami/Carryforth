@@ -102,7 +102,7 @@ pub struct ProjectDocumentWriteContext {
     pub current: Option<CurrentDocument>,
     /// Monotonic canonical time to pass to the pure reducer.
     pub canonical_time: DateTime<Utc>,
-    /// Whether a locked incoming Live/Guide reference blocks deletion.
+    /// Whether any locked active cross-domain reference blocks deletion.
     pub deletion_blocked: bool,
 }
 
@@ -2136,7 +2136,8 @@ impl ProjectDocumentWriteTx {
         .await?;
 
         // The shared Community lock serializes Document deletion with Project
-        // View Resource/Context mutation. Guides and Live references protect
+        // View Resource/Context mutation and Project Context attach/detach.
+        // Guides, Live references, and active Context Edge bindings protect
         // the current Document; Pinned references deliberately preserve only
         // an immutable historical revision and do not block ordinary delete.
         let deletion_blocked: bool = sqlx::query_scalar(
@@ -2152,6 +2153,11 @@ impl ProjectDocumentWriteTx {
                     WHERE reference.community_id = $1 \
                       AND reference.target_document_id = $2 \
                       AND reference.reference_mode = 'live' \
+                ) OR EXISTS ( \
+                    SELECT 1 FROM project_context_document_bindings binding \
+                    WHERE binding.community_id = $1 \
+                      AND binding.context_document_id = $2 \
+                      AND binding.state = 'active' \
                 )",
         )
         .bind(self.community_id.as_uuid())

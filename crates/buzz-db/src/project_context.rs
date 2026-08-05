@@ -2326,7 +2326,7 @@ mod tests {
     use buzz_project_context::{ProjectContextChangeContext, ProjectContextProjectionPlan};
     use buzz_project_document::{
         reduce_document, DocumentCatalog, DocumentChangeContext, DocumentCommandRequest,
-        DocumentProjectionPlan, ProjectDocumentCommand,
+        DocumentError, DocumentProjectionPlan, ProjectDocumentCommand,
     };
     use buzz_sdk::project_context::{
         build_project_context_binding_projection, build_project_context_command,
@@ -2341,6 +2341,7 @@ mod tests {
 
     use crate::project_document::{
         PreparedProjectDocumentBootstrap, PreparedProjectDocumentCommit,
+        ProjectDocumentCommitOutcome, ProjectDocumentWriteContext, ProjectDocumentWriteTx,
     };
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
@@ -2453,21 +2454,22 @@ mod tests {
                 content_markdown: "# Context\n\nCanonical fixture.".to_owned(),
             },
         );
-        let command_event = build_document_command(command.clone())
+        commit_document_command(db, community_id, command, actor, relay).await;
+    }
+
+    fn document_command_event(command: &ProjectDocumentCommand, actor: &Keys) -> Event {
+        build_document_command(command.clone())
             .expect("build Document command")
             .sign_with_keys(actor)
-            .expect("sign Document command");
-        let mut write = crate::project_document::begin_project_document_storage_test_write(
-            db,
-            community_id,
-            relay.public_key(),
-        )
-        .await
-        .expect("begin Document fixture write");
-        let context = write
-            .load_current(document_id)
-            .await
-            .expect("load empty Document identity");
+            .expect("sign Document command")
+    }
+
+    fn prepare_document_commit(
+        context: &ProjectDocumentWriteContext,
+        command: ProjectDocumentCommand,
+        command_event: Event,
+        relay: &Keys,
+    ) -> Result<PreparedProjectDocumentCommit, DocumentError> {
         let transition = reduce_document(
             &context.catalog,
             context.current.as_ref(),
@@ -2478,8 +2480,7 @@ mod tests {
                 context.canonical_time,
             )
             .with_deletion_blocked(context.deletion_blocked),
-        )
-        .expect("reduce Document create");
+        )?;
         let revision_projection = build_document_revision_projection(transition.projection_plan())
             .expect("build Document revision")
             .sign_with_keys(relay)
@@ -2500,17 +2501,53 @@ mod tests {
                 .expect("build Document metadata")
                 .sign_with_keys(relay)
                 .expect("sign Document metadata");
-        write
-            .commit(PreparedProjectDocumentCommit {
-                command_event,
-                command,
-                transition,
-                revision_projection,
-                head_projection,
-                meta_projection,
-            })
+        Ok(PreparedProjectDocumentCommit {
+            command_event,
+            command,
+            transition,
+            revision_projection,
+            head_projection,
+            meta_projection,
+        })
+    }
+
+    async fn prepare_document_storage_commit(
+        db: &Db,
+        community_id: CommunityId,
+        command: ProjectDocumentCommand,
+        actor: &Keys,
+        relay: &Keys,
+    ) -> (ProjectDocumentWriteTx, PreparedProjectDocumentCommit) {
+        let command_event = document_command_event(&command, actor);
+        let mut write = crate::project_document::begin_project_document_storage_test_write(
+            db,
+            community_id,
+            relay.public_key(),
+        )
+        .await
+        .expect("begin Document fixture write");
+        let context = write
+            .load_current(command.document_id())
             .await
-            .expect("commit Document fixture");
+            .expect("load Document fixture identity");
+        let prepared = prepare_document_commit(&context, command, command_event, relay)
+            .expect("reduce Document fixture command");
+        (write, prepared)
+    }
+
+    async fn commit_document_command(
+        db: &Db,
+        community_id: CommunityId,
+        command: ProjectDocumentCommand,
+        actor: &Keys,
+        relay: &Keys,
+    ) -> ProjectDocumentCommitOutcome {
+        let (write, prepared) =
+            prepare_document_storage_commit(db, community_id, command, actor, relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit Document fixture")
     }
 
     fn context_bootstrap(
@@ -2663,6 +2700,65 @@ mod tests {
             .expect("load Context reducer basis");
         let prepared = prepare_context_commit(&context, command, command_event, relay);
         (write, prepared)
+    }
+
+    async fn assert_inactive_coordinate_attach(
+        db: &Db,
+        community_id: CommunityId,
+        expected_revision: u64,
+        coordinates: Vec<ProjectContextCoordinate>,
+        context_document_id: Uuid,
+        actor: &Keys,
+        relay: &Keys,
+    ) {
+        let command = ProjectContextCommand::new(
+            expected_revision,
+            ProjectContextOperation::Attach,
+            coordinates,
+            context_document_id,
+        )
+        .expect("build inactive-coordinate attach");
+        let command_event = context_command_event(community_id, &command, actor);
+        let mut write = begin_storage_test_write(
+            db,
+            community_id,
+            relay.public_key(),
+            ProjectContextOperation::Attach,
+        )
+        .await
+        .expect("begin inactive-coordinate attach");
+        assert_eq!(
+            write
+                .prepare_command(&command_event, &command)
+                .await
+                .expect("prepare inactive-coordinate attach"),
+            ProjectContextPrepareOutcome::New
+        );
+        let context = write
+            .load_current(&command)
+            .await
+            .expect("load inactive-coordinate basis");
+        assert!(!context.all_coordinates_active);
+        assert!(matches!(
+            reduce_project_context(
+                &context.catalog,
+                context.current_edge.as_ref(),
+                context.active_document_edge,
+                &command,
+                ProjectContextChangeContext::active(
+                    command_event.pubkey,
+                    command_event.id,
+                    context.canonical_time,
+                )
+                .with_coordinates_active(context.all_coordinates_active)
+                .with_context_document_active(context.context_document_active),
+            ),
+            Err(ProjectContextError::InactiveCoordinate)
+        ));
+        write
+            .rollback()
+            .await
+            .expect("rollback inactive-coordinate attach");
     }
 
     #[tokio::test]
@@ -3035,6 +3131,577 @@ mod tests {
         db.verify_project_context_storage(community_id, &relay.public_key())
             .await
             .expect("verify final Context storage");
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn document_and_coordinate_lifecycles_are_independent_and_non_cascading() {
+        let scratch = ScratchDatabase::create("buzz_project_context_lifecycle").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let actor = Keys::generate();
+        let relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        bootstrap_documents(&db, community_id, &relay).await;
+        let bootstrap = context_bootstrap(community_id, &relay, whole_second_now());
+        assert_eq!(
+            store_context_bootstrap(&db, &bootstrap).await,
+            ProjectContextBootstrapOutcome { replayed: false }
+        );
+
+        let coordinate_a = Uuid::new_v4();
+        let coordinate_b = Uuid::new_v4();
+        let context_document_id = Uuid::new_v4();
+        let rejected_candidate_id = Uuid::new_v4();
+        for document_id in [
+            coordinate_a,
+            coordinate_b,
+            context_document_id,
+            rejected_candidate_id,
+        ] {
+            create_document(&db, community_id, document_id, &actor, &relay).await;
+        }
+        let coordinates = vec![
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_a,
+            },
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_b,
+            },
+        ];
+        let attach = ProjectContextCommand::new(
+            0,
+            ProjectContextOperation::Attach,
+            coordinates.clone(),
+            context_document_id,
+        )
+        .expect("build lifecycle attach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, attach, &actor, &relay).await;
+        let attached = write
+            .commit(prepared)
+            .await
+            .expect("commit lifecycle attach");
+        assert_eq!(attached.receipt.context_revision, 1);
+
+        // The user-facing Document reducer sees the active Context binding,
+        // instead of relying on the lower commit-time trigger to surface an
+        // internal database error.
+        let delete = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Delete {
+                document_id: context_document_id,
+            },
+        );
+        let delete_event = document_command_event(&delete, &actor);
+        let mut document_write =
+            crate::project_document::begin_project_document_storage_test_write(
+                &db,
+                community_id,
+                relay.public_key(),
+            )
+            .await
+            .expect("begin protected Document delete");
+        let delete_context = document_write
+            .load_current(context_document_id)
+            .await
+            .expect("load protected Context Document");
+        assert!(delete_context.deletion_blocked);
+        assert!(matches!(
+            prepare_document_commit(&delete_context, delete, delete_event, &relay),
+            Err(DocumentError::StillReferenced { document_id })
+                if document_id == context_document_id
+        ));
+        document_write
+            .rollback()
+            .await
+            .expect("rollback protected Document delete");
+
+        let binding_projection_before: Vec<u8> = sqlx::query_scalar(
+            "SELECT current_projection_event_id \
+             FROM project_context_document_bindings \
+             WHERE community_id = $1 AND context_document_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(context_document_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read binding projection before Document update");
+        let update = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id: context_document_id,
+                title: "Corrected Context".to_owned(),
+                summary: Some("Semantic correction".to_owned()),
+                content_markdown: "# Corrected Context\n\nThe Edge is unchanged.".to_owned(),
+            },
+        );
+        let updated = commit_document_command(&db, community_id, update, &actor, &relay).await;
+        assert_eq!(updated.receipt.document_revision, 2);
+        let after_update: (i64, Vec<u8>) = sqlx::query_as(
+            "SELECT state.context_revision, binding.current_projection_event_id \
+             FROM project_context_edge_state state \
+             JOIN project_context_document_bindings binding \
+               ON binding.community_id = state.community_id \
+             WHERE state.community_id = $1 AND binding.context_document_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(context_document_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read Context state after Document update");
+        assert_eq!(after_update.0, 1);
+        assert_eq!(after_update.1, binding_projection_before);
+
+        // A Document used only as a coordinate can tombstone without changing
+        // the retained Edge, binding head, normalized coordinate rows, or the
+        // independent Context revision.
+        let delete_coordinate = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Delete {
+                document_id: coordinate_a,
+            },
+        );
+        commit_document_command(&db, community_id, delete_coordinate, &actor, &relay).await;
+        let retained: (i64, String, String, i64) = sqlx::query_as(
+            "SELECT state.context_revision, edge.state, binding.state, \
+                    (SELECT count(*) FROM project_context_edge_coordinates coordinate \
+                     WHERE coordinate.community_id = state.community_id) \
+             FROM project_context_edge_state state \
+             JOIN project_context_edges edge ON edge.community_id = state.community_id \
+             JOIN project_context_document_bindings binding \
+               ON binding.community_id = edge.community_id AND binding.edge_key = edge.edge_key \
+             WHERE state.community_id = $1 AND binding.context_document_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(context_document_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read retained Edge after coordinate tombstone");
+        assert_eq!(retained, (1, "active".to_owned(), "active".to_owned(), 2));
+        assert_inactive_coordinate_attach(
+            &db,
+            community_id,
+            1,
+            coordinates.clone(),
+            rejected_candidate_id,
+            &actor,
+            &relay,
+        )
+        .await;
+
+        let detach = ProjectContextCommand::new(
+            1,
+            ProjectContextOperation::Detach,
+            coordinates,
+            context_document_id,
+        )
+        .expect("build lifecycle detach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach, &actor, &relay).await;
+        let detached = write.commit(prepared).await.expect("detach retained Edge");
+        assert_eq!(detached.receipt.context_revision, 2);
+        assert_eq!(detached.receipt.edge_document_count, 0);
+        let delete_context_document = ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: context_document_id,
+            },
+        );
+        let deleted =
+            commit_document_command(&db, community_id, delete_context_document, &actor, &relay)
+                .await;
+        assert_eq!(deleted.receipt.document_revision, 3);
+
+        // One Document may independently be an Edge coordinate and that same
+        // Edge's Context Document, while also remaining a coordinate of a
+        // second overlapping Edge. Detaching one relation never rewrites the
+        // other relation.
+        let shared_document = Uuid::new_v4();
+        let coordinate_c = Uuid::new_v4();
+        let coordinate_d = Uuid::new_v4();
+        let second_context_document = Uuid::new_v4();
+        let overlap_candidate = Uuid::new_v4();
+        for document_id in [
+            shared_document,
+            coordinate_c,
+            coordinate_d,
+            second_context_document,
+            overlap_candidate,
+        ] {
+            create_document(&db, community_id, document_id, &actor, &relay).await;
+        }
+        let first_overlap = vec![
+            ProjectContextCoordinate::Document {
+                document_id: shared_document,
+            },
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_c,
+            },
+        ];
+        let second_overlap = vec![
+            ProjectContextCoordinate::Document {
+                document_id: shared_document,
+            },
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_d,
+            },
+        ];
+        let attach_shared = ProjectContextCommand::new(
+            2,
+            ProjectContextOperation::Attach,
+            first_overlap.clone(),
+            shared_document,
+        )
+        .expect("attach same-role Document");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, attach_shared, &actor, &relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit same-role Document attach");
+        let attach_overlap = ProjectContextCommand::new(
+            3,
+            ProjectContextOperation::Attach,
+            second_overlap.clone(),
+            second_context_document,
+        )
+        .expect("attach overlapping Edge");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, attach_overlap, &actor, &relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit overlapping Edge");
+
+        let delete_coordinate_c = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Delete {
+                document_id: coordinate_c,
+            },
+        );
+        commit_document_command(&db, community_id, delete_coordinate_c, &actor, &relay).await;
+        let update_shared = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id: shared_document,
+                title: "Shared Context corrected".to_owned(),
+                summary: None,
+                content_markdown: "# Shared Context\n\nCorrected after tombstone.".to_owned(),
+            },
+        );
+        commit_document_command(&db, community_id, update_shared, &actor, &relay).await;
+        let context_revision_after_independent_writes: i64 = sqlx::query_scalar(
+            "SELECT context_revision FROM project_context_edge_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read independent Context revision");
+        assert_eq!(context_revision_after_independent_writes, 4);
+        assert_inactive_coordinate_attach(
+            &db,
+            community_id,
+            4,
+            first_overlap.clone(),
+            overlap_candidate,
+            &actor,
+            &relay,
+        )
+        .await;
+
+        let detach_shared = ProjectContextCommand::new(
+            4,
+            ProjectContextOperation::Detach,
+            first_overlap,
+            shared_document,
+        )
+        .expect("detach same-role Document");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach_shared, &actor, &relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit same-role detach");
+        let delete_shared = ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: shared_document,
+            },
+        );
+        commit_document_command(&db, community_id, delete_shared, &actor, &relay).await;
+        let retained_overlap: (i64, i64, String) = sqlx::query_as(
+            "SELECT state.context_revision, \
+                    (SELECT count(*) FROM project_context_edges edge \
+                     WHERE edge.community_id = state.community_id AND edge.state = 'active'), \
+                    binding.state \
+             FROM project_context_edge_state state \
+             JOIN project_context_document_bindings binding \
+               ON binding.community_id = state.community_id \
+             WHERE state.community_id = $1 AND binding.context_document_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(second_context_document)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read unaffected overlapping Edge");
+        assert_eq!(retained_overlap, (5, 1, "active".to_owned()));
+
+        let update_second_context = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Update {
+                document_id: second_context_document,
+                title: "Second Context corrected".to_owned(),
+                summary: Some("Tombstoned coordinate retained".to_owned()),
+                content_markdown: "# Second Context\n\nStill editable.".to_owned(),
+            },
+        );
+        commit_document_command(&db, community_id, update_second_context, &actor, &relay).await;
+        assert_inactive_coordinate_attach(
+            &db,
+            community_id,
+            5,
+            second_overlap.clone(),
+            overlap_candidate,
+            &actor,
+            &relay,
+        )
+        .await;
+        let detach_second = ProjectContextCommand::new(
+            5,
+            ProjectContextOperation::Detach,
+            second_overlap,
+            second_context_document,
+        )
+        .expect("detach second overlapping Edge");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach_second, &actor, &relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit second overlap detach");
+        let delete_second_context = ProjectDocumentCommand::new(
+            2,
+            DocumentCommandRequest::Delete {
+                document_id: second_context_document,
+            },
+        );
+        commit_document_command(&db, community_id, delete_second_context, &actor, &relay).await;
+
+        let final_context: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT context_revision, active_edge_count, bound_document_count, \
+                    (SELECT count(*) FROM project_context_edges edge \
+                     WHERE edge.community_id = state.community_id), \
+                    (SELECT count(*) FROM project_context_edge_coordinates coordinate \
+                     WHERE coordinate.community_id = state.community_id), \
+                    (SELECT count(*) FROM project_context_document_bindings binding \
+                     WHERE binding.community_id = state.community_id) \
+             FROM project_context_edge_state state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read final lifecycle Context state");
+        assert_eq!(final_context, (6, 0, 0, 3, 6, 3));
+        db.verify_project_context_storage(community_id, &relay.public_key())
+            .await
+            .expect("verify final lifecycle parity");
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn context_attach_and_document_delete_share_one_community_lock() {
+        let scratch = ScratchDatabase::create("buzz_project_context_delete_race").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let actor = Keys::generate();
+        let relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        bootstrap_documents(&db, community_id, &relay).await;
+        let bootstrap = context_bootstrap(community_id, &relay, whole_second_now());
+        assert_eq!(
+            store_context_bootstrap(&db, &bootstrap).await,
+            ProjectContextBootstrapOutcome { replayed: false }
+        );
+
+        let coordinate_a = Uuid::new_v4();
+        let coordinate_b = Uuid::new_v4();
+        let context_document_id = Uuid::new_v4();
+        for document_id in [coordinate_a, coordinate_b, context_document_id] {
+            create_document(&db, community_id, document_id, &actor, &relay).await;
+        }
+        let coordinates = vec![
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_a,
+            },
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_b,
+            },
+        ];
+
+        // Hold the shared lock in attach. The competing delete cannot observe
+        // an unbound Document and commit before the binding becomes visible.
+        let attach = ProjectContextCommand::new(
+            0,
+            ProjectContextOperation::Attach,
+            coordinates.clone(),
+            context_document_id,
+        )
+        .expect("build attach-wins command");
+        let (attach_write, prepared_attach) =
+            prepare_storage_commit(&db, community_id, attach, &actor, &relay).await;
+        let delete_db = db.clone();
+        let delete_actor = actor.clone();
+        let delete_relay = relay.clone();
+        let mut delete_task = tokio::spawn(async move {
+            let command = ProjectDocumentCommand::new(
+                1,
+                DocumentCommandRequest::Delete {
+                    document_id: context_document_id,
+                },
+            );
+            let event = document_command_event(&command, &delete_actor);
+            let mut write = crate::project_document::begin_project_document_storage_test_write(
+                &delete_db,
+                community_id,
+                delete_relay.public_key(),
+            )
+            .await
+            .expect("begin delete behind attach");
+            let context = write
+                .load_current(context_document_id)
+                .await
+                .expect("load delete behind attach");
+            let result = prepare_document_commit(&context, command, event, &delete_relay);
+            write
+                .rollback()
+                .await
+                .expect("rollback delete behind attach");
+            result.map(|_| ())
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut delete_task)
+                .await
+                .is_err(),
+            "Document delete bypassed the held Context attach lock"
+        );
+        attach_write
+            .commit(prepared_attach)
+            .await
+            .expect("commit attach before competing delete");
+        assert!(matches!(
+            delete_task.await.expect("join attach-wins delete"),
+            Err(DocumentError::StillReferenced { document_id })
+                if document_id == context_document_id
+        ));
+
+        let detach = ProjectContextCommand::new(
+            1,
+            ProjectContextOperation::Detach,
+            coordinates,
+            context_document_id,
+        )
+        .expect("build race cleanup detach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach, &actor, &relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit race cleanup detach");
+
+        // Reverse the order: once Document delete owns the same lock, attach
+        // waits and then observes the committed tombstone. Both operations can
+        // never succeed against the same active Document snapshot.
+        let doomed_document = Uuid::new_v4();
+        create_document(&db, community_id, doomed_document, &actor, &relay).await;
+        let delete = ProjectDocumentCommand::new(
+            1,
+            DocumentCommandRequest::Delete {
+                document_id: doomed_document,
+            },
+        );
+        let (delete_write, prepared_delete) =
+            prepare_document_storage_commit(&db, community_id, delete, &actor, &relay).await;
+        let attach_db = db.clone();
+        let attach_actor = actor.clone();
+        let attach_relay = relay.clone();
+        let second_coordinates = vec![
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_a,
+            },
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_b,
+            },
+        ];
+        let mut attach_task = tokio::spawn(async move {
+            let command = ProjectContextCommand::new(
+                2,
+                ProjectContextOperation::Attach,
+                second_coordinates,
+                doomed_document,
+            )
+            .expect("build delete-wins attach");
+            let event = context_command_event(community_id, &command, &attach_actor);
+            let mut write = begin_storage_test_write(
+                &attach_db,
+                community_id,
+                attach_relay.public_key(),
+                ProjectContextOperation::Attach,
+            )
+            .await
+            .expect("begin attach behind delete");
+            assert_eq!(
+                write
+                    .prepare_command(&event, &command)
+                    .await
+                    .expect("prepare attach behind delete"),
+                ProjectContextPrepareOutcome::New
+            );
+            let context = write
+                .load_current(&command)
+                .await
+                .expect("load attach behind delete");
+            let result = reduce_project_context(
+                &context.catalog,
+                context.current_edge.as_ref(),
+                context.active_document_edge,
+                &command,
+                ProjectContextChangeContext::active(event.pubkey, event.id, context.canonical_time)
+                    .with_coordinates_active(context.all_coordinates_active)
+                    .with_context_document_active(context.context_document_active),
+            );
+            write
+                .rollback()
+                .await
+                .expect("rollback attach behind delete");
+            result.map(|_| ())
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut attach_task)
+                .await
+                .is_err(),
+            "Context attach bypassed the held Document delete lock"
+        );
+        delete_write
+            .commit(prepared_delete)
+            .await
+            .expect("commit delete before competing attach");
+        assert!(matches!(
+            attach_task.await.expect("join delete-wins attach"),
+            Err(ProjectContextError::InactiveContextDocument { document_id })
+                if document_id == doomed_document
+        ));
+        let final_context: (i64, i64, i64) = sqlx::query_as(
+            "SELECT context_revision, active_edge_count, bound_document_count \
+             FROM project_context_edge_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read final race Context state");
+        assert_eq!(final_context, (2, 0, 0));
 
         scratch.cleanup().await;
     }
