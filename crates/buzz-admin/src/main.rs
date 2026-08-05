@@ -20,6 +20,7 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod project_context;
 mod project_document;
 mod project_runtime;
 mod project_view;
@@ -95,6 +96,11 @@ enum Command {
         #[command(subcommand)]
         command: project_document::ProjectDocumentCommand,
     },
+    /// Bootstrap, inspect, verify, enable, or disable Project Context Edge.
+    ProjectContext {
+        #[command(subcommand)]
+        command: project_context::ProjectContextCommand,
+    },
     /// Inspect, bind, or revoke managed Runtime supervision.
     ProjectRuntime {
         #[command(subcommand)]
@@ -168,6 +174,7 @@ async fn run(cli: Cli) -> Result<i32> {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
         Command::ProjectView { command } => project_view::run(command).await,
+        Command::ProjectContext { command } => project_context::run(command).await,
         Command::ProjectDocument { command } => project_document::run(command).await,
         Command::ProjectRuntime { command } => project_runtime::run(command).await,
         Command::ReconcileChannels { relay_key } => {

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{
     KIND_PROJECT_CONTEXT_COMMAND, KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META,
 };
@@ -38,6 +39,9 @@ pub enum ProjectContextWriteError {
     /// Direct SQL failure.
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    /// Tamper-evident operator-control audit append failed.
+    #[error(transparent)]
+    Audit(#[from] buzz_audit::AuditError),
     /// The pure Project Context kernel rejected the transition.
     #[error(transparent)]
     Domain(#[from] ProjectContextError),
@@ -314,6 +318,27 @@ impl Db {
         Ok(stable_signer_configured && self.project_context_schema_ready().await?)
     }
 
+    /// Context readers use the same current Human / managed-owner and active
+    /// ban policy as Project View and Project Document.
+    pub async fn project_context_authorized_pubkey(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) -> crate::Result<bool> {
+        self.project_view_authorized_pubkey(community_id, pubkey)
+            .await
+    }
+
+    /// Set-based form used by local and Redis fan-out recipient filtering.
+    pub async fn project_context_authorized_pubkeys(
+        &self,
+        community_id: CommunityId,
+        pubkeys: &[Vec<u8>],
+    ) -> crate::Result<std::collections::HashSet<Vec<u8>>> {
+        self.project_view_authorized_pubkeys(community_id, pubkeys)
+            .await
+    }
+
     /// Return a PostgreSQL-derived timestamp for empty-catalog signing.
     pub async fn project_context_canonical_now(&self) -> crate::Result<DateTime<Utc>> {
         Ok(sqlx::query_scalar("SELECT clock_timestamp()")
@@ -472,6 +497,30 @@ impl Db {
         Ok(result)
     }
 
+    /// Return structural read readiness independently of the attach gate.
+    pub async fn project_context_structural_read_ready(
+        &self,
+        community_id: CommunityId,
+        expected_pubkey: &PublicKey,
+    ) -> crate::Result<bool> {
+        Ok(self
+            .project_context_preflight(community_id, expected_pubkey)
+            .await?
+            .structural_read_ready)
+    }
+
+    /// Return whether NIP-11 may advertise the Context Edge capability.
+    pub async fn project_context_advertised_ready(
+        &self,
+        community_id: CommunityId,
+        expected_pubkey: &PublicKey,
+    ) -> crate::Result<bool> {
+        Ok(self
+            .project_context_preflight(community_id, expected_pubkey)
+            .await?
+            .advertised_ready)
+    }
+
     /// Return indexed pointer/orphan diagnostics without mutating state.
     pub async fn project_context_integrity_status(
         &self,
@@ -516,6 +565,106 @@ impl Db {
         Ok(status)
     }
 
+    /// Enable or disable Context Edge under the shared Community writer lock.
+    ///
+    /// Disable preserves every canonical row and projection. Enable requires
+    /// an active Community, matching stable signer, healthy Project View v3
+    /// and Project Document prerequisites, and full Context projection parity.
+    pub async fn set_project_context_edge_enabled_checked(
+        &self,
+        community_id: CommunityId,
+        enabled: bool,
+        expected_pubkey: Option<&PublicKey>,
+    ) -> ProjectContextWriteResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        let community = sqlx::query(
+            "SELECT archived_at IS NULL AS active, project_view_schema_version, \
+                    project_view_enabled, project_document_enabled \
+             FROM communities WHERE id = $1 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(community) = community else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if enabled {
+            let expected_pubkey = expected_pubkey.ok_or_else(|| {
+                DbError::InvalidData(
+                    "a stable Relay signer is required to enable Project Context Edge".to_owned(),
+                )
+            })?;
+            let active: bool = community.try_get("active")?;
+            let schema_version: i16 = community.try_get("project_view_schema_version")?;
+            let view_enabled: bool = community.try_get("project_view_enabled")?;
+            let document_enabled: bool = community.try_get("project_document_enabled")?;
+            if !active || schema_version != 3 || !view_enabled || !document_enabled {
+                return Err(DbError::InvalidData(
+                    "Project Context Edge requires active Project View v3 and Project Document"
+                        .to_owned(),
+                )
+                .into());
+            }
+            let signer: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT projection_pubkey FROM project_context_edge_state \
+                 WHERE community_id = $1 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if signer.as_deref() != Some(expected_pubkey.as_bytes()) {
+                return Err(DbError::InvalidData(
+                    "Project Context Edge stable signer does not match initialized state"
+                        .to_owned(),
+                )
+                .into());
+            }
+            require_bootstrap_prerequisites(&mut tx, community_id, expected_pubkey).await?;
+            sqlx::query("SELECT project_context_validate_community($1)")
+                .bind(community_id.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+            if !context_projection_parity(&mut tx, community_id, expected_pubkey).await? {
+                return Err(DbError::InvalidData(
+                    "Project Context Edge canonical/projection parity is not ready".to_owned(),
+                )
+                .into());
+            }
+            let integrity = context_integrity_status_in_tx(&mut tx, community_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::InvalidData(
+                        "Project Context Edge must be initialized before enable".to_owned(),
+                    )
+                })?;
+            if integrity.pointer_mismatch_count != 0 || integrity.orphan_projection_count != 0 {
+                return Err(DbError::InvalidData(
+                    "Project Context Edge projections contain mismatches or live orphans"
+                        .to_owned(),
+                )
+                .into());
+            }
+        }
+        let result =
+            sqlx::query("UPDATE communities SET project_context_edge_enabled = $2 WHERE id = $1")
+                .bind(community_id.as_uuid())
+                .bind(enabled)
+                .execute(&mut *tx)
+                .await?;
+        if result.rows_affected() == 1 {
+            append_context_control_audit(
+                &mut tx,
+                community_id,
+                if enabled { "enable" } else { "disable" },
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Atomically store a signed generation-one, revision-zero empty catalog.
     ///
     /// An exact retry is idempotent. Any occupied but non-identical state is
@@ -531,6 +680,9 @@ impl Db {
         crate::community_lock::acquire(&mut tx, community_id, false).await?;
         require_bootstrap_prerequisites(&mut tx, community_id, &expected_pubkey).await?;
         let outcome = store_empty_project_context_catalog_in_tx(&mut tx, &prepared).await?;
+        if !outcome.replayed {
+            append_context_control_audit(&mut tx, community_id, "bootstrap").await?;
+        }
         sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
             .execute(&mut *tx)
             .await?;
@@ -1449,6 +1601,25 @@ async fn context_integrity_status_in_tx(
             "pointer_mismatch_count",
         )?,
     }))
+}
+
+async fn append_context_control_audit(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    operation: &'static str,
+) -> ProjectContextWriteResult<()> {
+    buzz_audit::append_in_transaction(
+        tx,
+        NewAuditEntry {
+            community_id,
+            action: AuditAction::ProjectContextEdgeControl,
+            actor_pubkey: None,
+            object_id: Some(community_id.to_string()),
+            detail: serde_json::json!({ "operation": operation }),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn public_key_from_bytes(bytes: &[u8], field: &str) -> ProjectContextWriteResult<PublicKey> {

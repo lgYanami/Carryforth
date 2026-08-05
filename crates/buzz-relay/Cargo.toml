@@ -60,6 +60,7 @@ sqlx = { workspace = true }
 reqwest = { workspace = true }
 base64 = "0.22"
 buzz-sdk = { workspace = true }
+buzz-project-context = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-project-document = { workspace = true }
 buzz-workflow = { workspace = true, features = ["reqwest"] }

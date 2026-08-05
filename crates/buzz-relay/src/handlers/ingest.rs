@@ -1799,14 +1799,21 @@ async fn ingest_event_inner(
         ));
     }
 
-    // Stage one freezes the Project Context command wire and all ordinary
-    // credential/global/moderation gates, but deliberately has no canonical DB
-    // writer yet. Fail closed here so kind:44302 can never fall through into
-    // generic command or event persistence before the transaction adapter ships.
+    // Project Context commands use their own operation-aware, Community-locked
+    // transaction and private projection fan-out. They must never enter generic
+    // command or event persistence.
     if is_project_context_command_kind(kind_u32) {
-        return Err(IngestError::Unavailable(
-            "unavailable:project_context:not_ready".to_owned(),
-        ));
+        let project_context_event_id = event.id.to_bytes();
+        let result = super::project_context::handle_command(tenant, state, event, &auth).await?;
+        emit(
+            tracer,
+            TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(&project_context_event_id),
+                claimed_community: None,
+            },
+            state_for_request(tenant, auth.pubkey()),
+        );
+        return Ok(result);
     }
 
     // Project Document commands use their own Community-locked transaction and

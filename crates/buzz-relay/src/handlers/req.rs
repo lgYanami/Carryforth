@@ -159,10 +159,62 @@ pub async fn handle_req(
         }
     };
 
-    if super::community_private::filters_are_exclusively_project_context(&filters) {
+    let project_context_can_match = filters
+        .iter()
+        .any(super::community_private::filter_can_match_project_context);
+    let project_context_exclusive =
+        super::community_private::filters_are_exclusively_project_context(&filters);
+    let project_context_decision = if project_context_can_match {
+        match super::community_private::project_context_read_decision(
+            &state,
+            conn.tenant.community(),
+            &pubkey_bytes,
+            &auth_scopes,
+            token_channel_ids.as_deref(),
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(conn_id = %conn_id, "Project Context read authorization failed: {error}");
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "error:project_context:database",
+                ));
+                return;
+            }
+        }
+    } else {
+        super::community_private::ProjectContextReadDecision::Restricted
+    };
+    if project_context_exclusive {
+        match project_context_decision {
+            super::community_private::ProjectContextReadDecision::Allowed => {}
+            super::community_private::ProjectContextReadDecision::Restricted => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted:project_context:membership_required",
+                ));
+                return;
+            }
+            super::community_private::ProjectContextReadDecision::Unavailable(reason) => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    &format!("unavailable:project_context:{reason}"),
+                ));
+                return;
+            }
+        }
+    }
+    let project_context_read_allowed = project_context_decision.allowed();
+    if project_context_read_allowed
+        && filters
+            .iter()
+            .any(super::community_private::filter_is_project_context_search)
+    {
         conn.send(RelayMessage::closed(
             &sub_id,
-            "unavailable:project_context:not_ready",
+            "unsupported:project_context:search",
         ));
         return;
     }
@@ -520,7 +572,11 @@ pub async fn handle_req(
                 filter,
                 project_document_read_allowed,
             );
-            super::community_private::exclude_project_context_kinds(&mut params, filter);
+            super::community_private::exclude_project_context_kinds(
+                &mut params,
+                filter,
+                project_context_read_allowed,
+            );
             (idx, per_filter_channel, params)
         })
         .collect();
@@ -621,6 +677,7 @@ pub async fn handle_req(
             if !super::community_private::event_is_visible(
                 stored.event.kind.as_u16() as u32,
                 project_document_read_allowed,
+                project_context_read_allowed,
             ) {
                 continue;
             }
@@ -955,6 +1012,7 @@ async fn handle_search_req(
                     // hit Document text in the shared FTS index.
                     if !super::community_private::event_is_visible(
                         stored.event.kind.as_u16() as u32,
+                        false,
                         false,
                     ) {
                         continue;

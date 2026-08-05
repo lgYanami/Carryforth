@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use buzz_project_context::PROJECT_CONTEXT_CAPABILITY;
+
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_FRAME_BYTES;
 
@@ -282,6 +284,11 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         PROJECT_CONTEXT_EXTENSION,
         project_context_ready_for_host(state, raw_host).await,
     );
+    append_extension(
+        &mut info,
+        PROJECT_CONTEXT_CAPABILITY,
+        project_context_edge_ready_for_host(state, raw_host).await,
+    );
     append_project_document_extension(
         &mut info,
         project_document_ready_for_host(state, raw_host).await,
@@ -346,6 +353,32 @@ async fn project_context_ready_for_host(state: &crate::state::AppState, raw_host
             tracing::warn!(
                 community_id = %tenant.community(),
                 "Project Context NIP-11 readiness failed closed: {error}"
+            );
+            false
+        }
+    }
+}
+
+async fn project_context_edge_ready_for_host(
+    state: &crate::state::AppState,
+    raw_host: &str,
+) -> bool {
+    if state.config.relay_private_key.is_none() {
+        return false;
+    }
+    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
+        return false;
+    };
+    match state
+        .db
+        .project_context_advertised_ready(tenant.community(), &state.relay_keypair.public_key())
+        .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Project Context Edge NIP-11 readiness failed closed: {error}"
             );
             false
         }
@@ -738,6 +771,23 @@ mod tests {
             extensions
                 .iter()
                 .filter(|value| value.as_str() == PROJECT_DOCUMENT_EXTENSION)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn project_context_edge_extension_is_distinct_and_idempotent() {
+        let mut info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        append_extension(&mut info, PROJECT_CONTEXT_CAPABILITY, false);
+        append_extension(&mut info, PROJECT_CONTEXT_CAPABILITY, true);
+        append_extension(&mut info, PROJECT_CONTEXT_CAPABILITY, true);
+        let extensions = info.supported_extensions.expect("extensions");
+        assert_ne!(PROJECT_CONTEXT_EXTENSION, PROJECT_CONTEXT_CAPABILITY);
+        assert_eq!(
+            extensions
+                .iter()
+                .filter(|value| value.as_str() == PROJECT_CONTEXT_CAPABILITY)
                 .count(),
             1
         );

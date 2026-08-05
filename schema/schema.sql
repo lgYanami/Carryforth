@@ -9359,7 +9359,7 @@ BEGIN
             payload := payload || decode('01', 'hex') || uuid_send(coordinate_row.coordinate_id);
         END IF;
     END LOOP;
-    RETURN digest(payload, 'sha256');
+    RETURN sha256(payload);
 END
 $$;
 

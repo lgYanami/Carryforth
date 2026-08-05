@@ -426,12 +426,14 @@ project-context-test-unit:
           --lib \
           -E 'test(project_context)'
         cargo nextest run -p buzz-db --lib -E 'test(project_context)'
+        cargo nextest run -p buzz-admin -E 'test(project_context)'
     else
         cargo test -p buzz-project-context
         cargo test -p buzz-sdk --test project_context
         cargo test -p buzz-core --lib project_context
         cargo test -p buzz-relay --lib project_context
         cargo test -p buzz-db --lib project_context
+        cargo test -p buzz-admin project_context
     fi
 
 # Run isolated PostgreSQL-backed Project Context canonical storage tests.
@@ -442,11 +444,18 @@ project-context-test-db:
 project-context-test-e2e:
     PROJECT_CONTEXT_STAGE1_ONLY=1 ./scripts/test-project-document-e2e.sh
 
+# Run the real direct-v3 Relay, private protocol, and operation-gate E2E.
+project-context-test-e2e-stage3:
+    ./scripts/test-project-context-stage3-e2e.sh
+
 # Run every Project Context Stage 1 quality gate.
 project-context-stage1-test: project-context-test-unit project-context-test-e2e
 
 # Run every Project Context Stage 2 quality gate.
 project-context-stage2-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e
+
+# Run every Project Context Stage 3 quality gate.
+project-context-stage3-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage3
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.
