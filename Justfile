@@ -462,6 +462,11 @@ project-context-test-e2e-stage4:
 project-context-test-e2e-stage5:
     ./scripts/test-project-context-stage3-e2e.sh
 
+# Run the cumulative real Relay scenario plus disabled-only reprojection,
+# recovery verification, checked re-enable, and Context Reference regression.
+project-context-test-e2e-stage7:
+    PROJECT_CONTEXT_E2E_STAGE7=1 ./scripts/test-project-context-stage3-e2e.sh
+
 # Run every Project Context Stage 1 quality gate.
 project-context-stage1-test: project-context-test-unit project-context-test-e2e
 
@@ -490,6 +495,11 @@ project-context-test-acp:
 # Run every Project Context Stage 6 quality gate. Stage 5 remains cumulative;
 # ACP adds only stable capability discovery and no dynamic Edge injection.
 project-context-stage6-test: project-context-stage5-test project-context-test-acp
+
+# Run the complete Project Context backend/Agent acceptance gate. The Stage 7
+# Relay scenario is cumulative through Stages 3-5; ACP remains a separate
+# stable-contract regression gate.
+project-context-stage7-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage7 project-context-test-acp
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.

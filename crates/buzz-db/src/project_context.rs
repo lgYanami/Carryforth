@@ -5,7 +5,7 @@
 //! and commits command/event/canonical rows atomically. Signing and fan-out
 //! remain Relay responsibilities.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{
@@ -13,9 +13,10 @@ use buzz_core::kind::{
 };
 use buzz_core::{CommunityId, EventId, PublicKey, StoredEvent};
 use buzz_project_context::{
-    reduce_project_context, EdgeKey, ProjectContextBindingState, ProjectContextCatalog,
-    ProjectContextCommand, ProjectContextCoordinate, ProjectContextEdge, ProjectContextError,
-    ProjectContextOperation, ProjectContextReceipt, ProjectContextTransition, MAX_SAFE_REVISION,
+    reduce_project_context, EdgeKey, ProjectContextBindingProjection, ProjectContextBindingState,
+    ProjectContextCatalog, ProjectContextCommand, ProjectContextCoordinate, ProjectContextEdge,
+    ProjectContextError, ProjectContextOperation, ProjectContextReceipt, ProjectContextTransition,
+    MAX_SAFE_REVISION, PROJECT_CONTEXT_SCHEMA_VERSION,
 };
 use buzz_project_view::ProjectViewObjectType;
 use buzz_sdk::project_context::{
@@ -213,6 +214,8 @@ pub struct ProjectContextPreflight {
     pub signer_matches: bool,
     /// Whether canonical rows and signed Context projections agree.
     pub projection_parity: bool,
+    /// Whether every canonical projection pointer resolves and no live orphan remains.
+    pub integrity_ready: bool,
     /// Whether the Context Edge capability flag is on.
     pub enabled: bool,
     /// Whether all structural read prerequisites pass.
@@ -230,6 +233,41 @@ pub struct ProjectContextIntegrityStatus {
     pub pointer_mismatch_count: u64,
 }
 
+/// Locked canonical basis for one disabled-only signer reprojection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectContextReprojectContext {
+    /// Catalog observation rebuilt at the next projection generation.
+    pub catalog: ProjectContextCatalog,
+    /// Projection generation visible before this maintenance operation.
+    pub source_generation: u64,
+    /// Projection signer visible before this maintenance operation.
+    pub source_pubkey: PublicKey,
+    /// Exact current active and deleted binding heads rebuilt for the target generation.
+    pub bindings: Vec<ProjectContextBindingProjection>,
+}
+
+/// Fully signed replacement generation prepared by operator tooling.
+#[derive(Debug, Clone)]
+pub struct PreparedProjectContextReprojection {
+    /// One new Relay-signed head for every durable binding identity.
+    pub binding_projections: Vec<Event>,
+    /// New Relay-signed reset metadata head.
+    pub meta_projection: Event,
+}
+
+/// Result of one atomically committed Project Context reprojection.
+#[derive(Debug, Clone)]
+pub struct ProjectContextReprojectOutcome {
+    /// New binding heads followed by the reset metadata head.
+    pub events: Vec<Event>,
+    /// Projection generation replaced by this operation.
+    pub source_generation: u64,
+    /// Newly committed projection generation.
+    pub projection_generation: u64,
+    /// Unchanged business Context revision.
+    pub context_revision: u64,
+}
+
 /// Caller-owned transaction holding the Community exclusive advisory lock.
 pub struct ProjectContextWriteTx {
     tx: Transaction<'static, Postgres>,
@@ -237,6 +275,14 @@ pub struct ProjectContextWriteTx {
     expected_projection_pubkey: PublicKey,
     operation: ProjectContextOperation,
     loaded: Option<LoadedBasis>,
+}
+
+/// Caller-owned disabled-only reprojection transaction.
+pub struct ProjectContextReprojectTx {
+    tx: Transaction<'static, Postgres>,
+    community_id: CommunityId,
+    target_pubkey: PublicKey,
+    loaded: Option<ProjectContextReprojectContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +306,16 @@ impl std::fmt::Debug for ProjectContextWriteTx {
             .debug_struct("ProjectContextWriteTx")
             .field("community_id", &self.community_id)
             .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ProjectContextReprojectTx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectContextReprojectTx")
+            .field("community_id", &self.community_id)
+            .field("target_pubkey", &self.target_pubkey)
             .finish_non_exhaustive()
     }
 }
@@ -391,6 +447,7 @@ impl Db {
                 initialized: false,
                 signer_matches: false,
                 projection_parity: false,
+                integrity_ready: false,
                 enabled: false,
                 structural_read_ready: false,
                 advertised_ready: false,
@@ -425,6 +482,7 @@ impl Db {
                 initialized: false,
                 signer_matches: false,
                 projection_parity: false,
+                integrity_ready: false,
                 enabled: false,
                 structural_read_ready: false,
                 advertised_ready: false,
@@ -476,11 +534,17 @@ impl Db {
         } else {
             false
         };
+        let integrity_ready = context_integrity_status_in_tx(&mut tx, community_id)
+            .await?
+            .is_some_and(|status| {
+                status.pointer_mismatch_count == 0 && status.orphan_projection_count == 0
+            });
         let structural_read_ready = project_view_ready
             && project_document_ready
             && initialized
             && signer_matches
-            && projection_parity;
+            && projection_parity
+            && integrity_ready;
         let result = ProjectContextPreflight {
             community_id,
             schema_ready,
@@ -489,6 +553,7 @@ impl Db {
             initialized,
             signer_matches,
             projection_parity,
+            integrity_ready,
             enabled,
             structural_read_ready,
             advertised_ready: enabled && structural_read_ready,
@@ -690,6 +755,43 @@ impl Db {
         Ok(outcome)
     }
 
+    /// Begin one disabled-only signer reprojection under the Community lock.
+    ///
+    /// Project View v3 and Project Document must already be enabled, healthy,
+    /// and materialized by `target_pubkey`. The Context capability itself must
+    /// remain disabled until the replacement generation has been verified.
+    pub async fn begin_project_context_reproject(
+        &self,
+        community_id: CommunityId,
+        target_pubkey: PublicKey,
+    ) -> ProjectContextWriteResult<ProjectContextReprojectTx> {
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT project_context_edge_enabled FROM communities \
+             WHERE id = $1 AND archived_at IS NULL FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        match enabled {
+            Some(false) => {}
+            Some(true) => {
+                return Err(ProjectContextWriteError::InvalidCommit(
+                    "Project Context Edge must be disabled before reprojection".to_owned(),
+                ));
+            }
+            None => return Err(ProjectContextWriteError::Unavailable { community_id }),
+        }
+        require_bootstrap_prerequisites(&mut tx, community_id, &target_pubkey).await?;
+        Ok(ProjectContextReprojectTx {
+            tx,
+            community_id,
+            target_pubkey,
+            loaded: None,
+        })
+    }
+
     /// Begin one operation-aware business write under the Community lock.
     ///
     /// Attach requires the capability flag. Detach remains available while
@@ -879,6 +981,412 @@ const PROJECT_CONTEXT_STATUS_SQL: &str =
      FROM communities c \
      JOIN project_view_maintenance maintenance ON maintenance.community_id = c.id \
      LEFT JOIN project_context_edge_state state ON state.community_id = c.id";
+
+impl ProjectContextReprojectTx {
+    /// Return the Community protected by this maintenance transaction.
+    #[must_use]
+    pub const fn community_id(&self) -> CommunityId {
+        self.community_id
+    }
+
+    /// Explicitly roll back and release the Community lock.
+    pub async fn rollback(self) -> ProjectContextWriteResult<()> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+
+    /// Reconstruct every durable binding head at the next projection generation.
+    ///
+    /// This reads canonical rows rather than trusting the current signed event
+    /// pointers, allowing the subsequent commit to recover missing pointers or
+    /// live orphan projections while still rejecting canonical corruption.
+    pub async fn load_current(
+        &mut self,
+    ) -> ProjectContextWriteResult<ProjectContextReprojectContext> {
+        if self.loaded.is_some() {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "this transaction already loaded a Project Context reprojection basis".to_owned(),
+            ));
+        }
+        let state_row = sqlx::query(
+            "SELECT context_revision, active_edge_count, bound_document_count, \
+                    last_change_id, last_actor_pubkey, projection_pubkey, \
+                    projection_generation, meta_projection_event_id, initialized_at, updated_at \
+             FROM project_context_edge_state WHERE community_id = $1 FOR UPDATE",
+        )
+        .bind(self.community_id.as_uuid())
+        .fetch_optional(&mut *self.tx)
+        .await?
+        .ok_or_else(|| {
+            ProjectContextWriteError::InvalidCommit(
+                "Project Context Edge must be initialized before reprojection".to_owned(),
+            )
+        })?;
+        let metadata = state_metadata_from_row(&state_row)?;
+        let projection_generation = metadata
+            .projection_generation
+            .checked_add(1)
+            .filter(|value| *value <= MAX_SAFE_REVISION)
+            .ok_or_else(|| {
+                ProjectContextWriteError::InvalidCommit(
+                    "projection generation overflow during Project Context reprojection".to_owned(),
+                )
+            })?;
+        let catalog = ProjectContextCatalog::from_snapshot(
+            self.community_id,
+            metadata.context_revision,
+            metadata.active_edge_count,
+            metadata.bound_document_count,
+            projection_generation,
+            metadata.initialized_at,
+            metadata.updated_at,
+        )?;
+
+        let edge_rows = sqlx::query(
+            "SELECT edge_key, state, canonical_coordinates \
+             FROM project_context_edges WHERE community_id = $1 \
+             ORDER BY edge_key FOR UPDATE",
+        )
+        .bind(self.community_id.as_uuid())
+        .fetch_all(&mut *self.tx)
+        .await?;
+        let mut edges = BTreeMap::new();
+        for row in edge_rows {
+            let edge_key = edge_key_from_bytes(&row.try_get::<Vec<u8>, _>("edge_key")?)?;
+            let state: String = row.try_get("state")?;
+            if !matches!(state.as_str(), "active" | "deleted") {
+                return Err(ProjectContextWriteError::InvalidCommit(
+                    "canonical Edge has an unsupported lifecycle state".to_owned(),
+                ));
+            }
+            let coordinates: Vec<ProjectContextCoordinate> = serde_json::from_value(
+                row.try_get::<Value, _>("canonical_coordinates")?,
+            )
+            .map_err(|error| {
+                ProjectContextWriteError::InvalidCommit(format!(
+                    "invalid canonical Project Context coordinates: {error}"
+                ))
+            })?;
+            if EdgeKey::derive(*self.community_id.as_uuid(), &coordinates)? != edge_key {
+                return Err(ProjectContextWriteError::InvalidCommit(
+                    "canonical Edge key does not match its coordinate set".to_owned(),
+                ));
+            }
+            let normalized =
+                load_normalized_coordinates(&mut self.tx, self.community_id, edge_key).await?;
+            if normalized != coordinates {
+                return Err(ProjectContextWriteError::InvalidCommit(
+                    "canonical Edge JSON and normalized coordinates disagree".to_owned(),
+                ));
+            }
+            if edges.insert(edge_key, (state, coordinates)).is_some() {
+                return Err(ProjectContextWriteError::InvalidCommit(
+                    "duplicate canonical Project Context Edge identity".to_owned(),
+                ));
+            }
+        }
+
+        let binding_rows = sqlx::query(
+            "SELECT context_document_id, edge_key, state, binding_context_revision, \
+                    current_source_change_id, updated_at \
+             FROM project_context_document_bindings WHERE community_id = $1 \
+             ORDER BY context_document_id FOR UPDATE",
+        )
+        .bind(self.community_id.as_uuid())
+        .fetch_all(&mut *self.tx)
+        .await?;
+        let mut bindings = Vec::with_capacity(binding_rows.len());
+        let mut binding_ids = BTreeSet::new();
+        let mut active_members_by_edge: BTreeMap<EdgeKey, u64> = BTreeMap::new();
+        let mut active_binding_count = 0_u64;
+        for row in binding_rows {
+            let context_document_id: Uuid = row.try_get("context_document_id")?;
+            if !binding_ids.insert(context_document_id) {
+                return Err(ProjectContextWriteError::InvalidCommit(format!(
+                    "duplicate canonical binding for Document {context_document_id}"
+                )));
+            }
+            let edge_key = edge_key_from_bytes(&row.try_get::<Vec<u8>, _>("edge_key")?)?;
+            let (edge_state, coordinates) = edges.get(&edge_key).ok_or_else(|| {
+                ProjectContextWriteError::InvalidCommit(format!(
+                    "binding for Document {context_document_id} references a missing Edge"
+                ))
+            })?;
+            let state_text: String = row.try_get("state")?;
+            let state = binding_state_from_str(&state_text).ok_or_else(|| {
+                ProjectContextWriteError::InvalidCommit(format!(
+                    "binding for Document {context_document_id} has an unsupported state"
+                ))
+            })?;
+            if state == ProjectContextBindingState::Active {
+                if edge_state != "active" {
+                    return Err(ProjectContextWriteError::InvalidCommit(format!(
+                        "active binding for Document {context_document_id} belongs to a deleted Edge"
+                    )));
+                }
+                active_binding_count = active_binding_count.checked_add(1).ok_or_else(|| {
+                    ProjectContextWriteError::InvalidCommit(
+                        "active Project Context binding count overflow".to_owned(),
+                    )
+                })?;
+                let count = active_members_by_edge.entry(edge_key).or_default();
+                *count = count.checked_add(1).ok_or_else(|| {
+                    ProjectContextWriteError::InvalidCommit(
+                        "Project Context Edge membership count overflow".to_owned(),
+                    )
+                })?;
+            }
+            let projection = ProjectContextBindingProjection {
+                schema_version: PROJECT_CONTEXT_SCHEMA_VERSION,
+                projection_type:
+                    buzz_project_context::ProjectContextProjectionType::ContextEdgeBinding,
+                project_id: *self.community_id.as_uuid(),
+                projection_generation,
+                context_revision: db_positive_revision(
+                    row.try_get("binding_context_revision")?,
+                    "binding_context_revision",
+                )?,
+                edge_key,
+                coordinates: coordinates.clone(),
+                context_document_id,
+                state,
+                source_event_id: event_id_from_bytes(
+                    &row.try_get::<Vec<u8>, _>("current_source_change_id")?,
+                    "current_source_change_id",
+                )?,
+                updated_at: row.try_get("updated_at")?,
+            };
+            projection.validate()?;
+            if projection.context_revision > catalog.context_revision() {
+                return Err(ProjectContextWriteError::InvalidCommit(format!(
+                    "binding for Document {context_document_id} is ahead of the catalog"
+                )));
+            }
+            bindings.push(projection);
+        }
+
+        let active_edge_count = edges
+            .iter()
+            .filter(|(_, (state, _))| state == "active")
+            .count();
+        let edge_lifecycles_valid = edges.iter().all(|(edge_key, (state, _))| {
+            let active_members = active_members_by_edge.get(edge_key).copied().unwrap_or(0);
+            (state == "active" && active_members > 0) || (state == "deleted" && active_members == 0)
+        });
+        if !edge_lifecycles_valid
+            || u64::try_from(active_edge_count).ok() != Some(catalog.active_edge_count())
+            || active_binding_count != catalog.bound_document_count()
+        {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "canonical Project Context counts or Edge lifecycles disagree".to_owned(),
+            ));
+        }
+
+        let context = ProjectContextReprojectContext {
+            catalog,
+            source_generation: metadata.projection_generation,
+            source_pubkey: metadata.projection_pubkey,
+            bindings,
+        };
+        self.loaded = Some(context.clone());
+        Ok(context)
+    }
+
+    /// Atomically replace every current binding and metadata projection head.
+    ///
+    /// The commit retires every live Context projection, including orphans,
+    /// then rebinds canonical pointers under the migration's narrow reproject
+    /// guard. No business revision or domain row is modified.
+    pub async fn commit_reprojection(
+        mut self,
+        prepared: PreparedProjectContextReprojection,
+    ) -> ProjectContextWriteResult<ProjectContextReprojectOutcome> {
+        let loaded = self.loaded.as_ref().ok_or_else(|| {
+            ProjectContextWriteError::InvalidCommit(
+                "reprojection must be prepared from load_current on the same transaction"
+                    .to_owned(),
+            )
+        })?;
+        let meta = parse_project_context_meta(
+            &prepared.meta_projection,
+            &self.target_pubkey,
+            self.community_id,
+        )
+        .map_err(|error| ProjectContextWriteError::InvalidCommit(error.to_string()))?;
+        if meta.projection.project_id != *self.community_id.as_uuid()
+            || meta.projection.projection_generation != loaded.catalog.projection_generation()
+            || meta.projection.context_revision != loaded.catalog.context_revision()
+            || meta.projection.active_edge_count != loaded.catalog.active_edge_count()
+            || meta.projection.bound_document_count != loaded.catalog.bound_document_count()
+            || !meta.projection.reset
+            || !meta.projection.changed_bindings.is_empty()
+            || meta.projection.source_event_id.is_some()
+            || meta.projection.updated_at != loaded.catalog.updated_at()
+        {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "replacement metadata does not exactly represent the locked reset catalog"
+                    .to_owned(),
+            ));
+        }
+
+        let expected_bindings = loaded
+            .bindings
+            .iter()
+            .map(|binding| (binding.context_document_id, binding))
+            .collect::<BTreeMap<_, _>>();
+        let mut prepared_bindings = BTreeMap::new();
+        for event in &prepared.binding_projections {
+            let verified =
+                parse_project_context_binding(event, &self.target_pubkey, self.community_id)
+                    .map_err(|error| ProjectContextWriteError::InvalidCommit(error.to_string()))?;
+            let document_id = verified.projection.context_document_id;
+            if expected_bindings.get(&document_id).copied() != Some(&verified.projection) {
+                return Err(ProjectContextWriteError::InvalidCommit(format!(
+                    "replacement binding for Document {document_id} differs from canonical state"
+                )));
+            }
+            verify_project_context_binding_observation(&meta, &verified)
+                .map_err(|error| ProjectContextWriteError::InvalidCommit(error.to_string()))?;
+            if prepared_bindings
+                .insert(document_id, event.clone())
+                .is_some()
+            {
+                return Err(ProjectContextWriteError::InvalidCommit(format!(
+                    "duplicate replacement binding for Document {document_id}"
+                )));
+            }
+        }
+        if prepared_bindings.keys().copied().collect::<BTreeSet<_>>()
+            != expected_bindings.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "reprojection must exactly cover every active and deleted binding head".to_owned(),
+            ));
+        }
+
+        sqlx::query("SELECT set_config('buzz.project_context_reproject', 'on', true)")
+            .execute(&mut *self.tx)
+            .await?;
+        sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND kind = ANY($2) AND deleted_at IS NULL",
+        )
+        .bind(self.community_id.as_uuid())
+        .bind([
+            KIND_PROJECT_CONTEXT_EDGE_BINDING as i32,
+            KIND_PROJECT_CONTEXT_META as i32,
+        ])
+        .execute(&mut *self.tx)
+        .await?;
+
+        let mut published_events = Vec::with_capacity(prepared_bindings.len() + 1);
+        for (document_id, event) in prepared_bindings {
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut self.tx, self.community_id, &event, None)
+                    .await?;
+            if !inserted {
+                return Err(ProjectContextWriteError::InvalidCommit(format!(
+                    "replacement binding for Document {document_id} already exists"
+                )));
+            }
+            let update = sqlx::query(
+                "UPDATE project_context_document_bindings \
+                 SET current_projection_event_id = $3 \
+                 WHERE community_id = $1 AND context_document_id = $2",
+            )
+            .bind(self.community_id.as_uuid())
+            .bind(document_id)
+            .bind(event.id.as_bytes().as_slice())
+            .execute(&mut *self.tx)
+            .await?;
+            if update.rows_affected() != 1 {
+                return Err(ProjectContextWriteError::InvalidCommit(format!(
+                    "canonical binding pointer for Document {document_id} was not updated"
+                )));
+            }
+            published_events.push(event);
+        }
+
+        let (_, meta_inserted) = crate::event::insert_event_in_tx(
+            &mut self.tx,
+            self.community_id,
+            &prepared.meta_projection,
+            None,
+        )
+        .await?;
+        if !meta_inserted {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "replacement Project Context metadata already exists".to_owned(),
+            ));
+        }
+        let state_update = sqlx::query(
+            "UPDATE project_context_edge_state \
+             SET projection_pubkey = $2, projection_generation = $3, \
+                 meta_projection_event_id = $4 \
+             WHERE community_id = $1 AND projection_pubkey = $5 \
+               AND projection_generation = $6 AND context_revision = $7",
+        )
+        .bind(self.community_id.as_uuid())
+        .bind(self.target_pubkey.as_bytes())
+        .bind(revision_to_i64(
+            loaded.catalog.projection_generation(),
+            "projection_generation",
+        )?)
+        .bind(prepared.meta_projection.id.as_bytes().as_slice())
+        .bind(loaded.source_pubkey.as_bytes())
+        .bind(revision_to_i64(
+            loaded.source_generation,
+            "source_projection_generation",
+        )?)
+        .bind(revision_to_i64(
+            loaded.catalog.context_revision(),
+            "context_revision",
+        )?)
+        .execute(&mut *self.tx)
+        .await?;
+        if state_update.rows_affected() != 1 {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "canonical Project Context state changed during reprojection".to_owned(),
+            ));
+        }
+
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *self.tx)
+            .await?;
+        sqlx::query("SELECT project_context_validate_community($1)")
+            .bind(self.community_id.as_uuid())
+            .execute(&mut *self.tx)
+            .await?;
+        if !context_projection_parity(&mut self.tx, self.community_id, &self.target_pubkey).await? {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "replacement Project Context generation failed cryptographic parity".to_owned(),
+            ));
+        }
+        let integrity = context_integrity_status_in_tx(&mut self.tx, self.community_id)
+            .await?
+            .ok_or_else(|| {
+                ProjectContextWriteError::InvalidCommit(
+                    "replacement Project Context generation is not initialized".to_owned(),
+                )
+            })?;
+        if integrity.pointer_mismatch_count != 0 || integrity.orphan_projection_count != 0 {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "replacement Project Context generation contains pointer mismatches or live orphans"
+                    .to_owned(),
+            ));
+        }
+        append_context_control_audit(&mut self.tx, self.community_id, "reproject").await?;
+        published_events.push(prepared.meta_projection);
+        let outcome = ProjectContextReprojectOutcome {
+            events: published_events,
+            source_generation: loaded.source_generation,
+            projection_generation: loaded.catalog.projection_generation(),
+            context_revision: loaded.catalog.context_revision(),
+        };
+        self.tx.commit().await?;
+        Ok(outcome)
+    }
+}
 
 impl ProjectContextWriteTx {
     /// Explicitly roll back and release the Community lock.
@@ -1311,6 +1819,63 @@ impl ProjectContextWriteTx {
             replayed: false,
         })
     }
+}
+
+async fn load_normalized_coordinates(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    edge_key: EdgeKey,
+) -> ProjectContextWriteResult<Vec<ProjectContextCoordinate>> {
+    let rows = sqlx::query(
+        "SELECT ordinal, coordinate_type, coordinate_subtype, coordinate_id, canonical_key \
+         FROM project_context_edge_coordinates \
+         WHERE community_id = $1 AND edge_key = $2 ORDER BY ordinal FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(edge_key.as_bytes().as_slice())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut coordinates = Vec::with_capacity(rows.len());
+    for (expected_ordinal, row) in rows.into_iter().enumerate() {
+        let ordinal: i32 = row.try_get("ordinal")?;
+        if usize::try_from(ordinal).ok() != Some(expected_ordinal) {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "normalized Project Context coordinate ordinals are not contiguous".to_owned(),
+            ));
+        }
+        let coordinate_type: String = row.try_get("coordinate_type")?;
+        let coordinate_subtype: Option<String> = row.try_get("coordinate_subtype")?;
+        let coordinate_id: Uuid = row.try_get("coordinate_id")?;
+        let coordinate = match (coordinate_type.as_str(), coordinate_subtype.as_deref()) {
+            ("project_view_object", Some(subtype)) => {
+                let object_type = project_view_object_type_from_str(subtype).ok_or_else(|| {
+                    ProjectContextWriteError::InvalidCommit(format!(
+                        "unsupported Project View coordinate subtype '{subtype}'"
+                    ))
+                })?;
+                ProjectContextCoordinate::ProjectViewObject {
+                    object_type,
+                    object_id: coordinate_id,
+                }
+            }
+            ("document", None) => ProjectContextCoordinate::Document {
+                document_id: coordinate_id,
+            },
+            _ => {
+                return Err(ProjectContextWriteError::InvalidCommit(
+                    "normalized Project Context coordinate has an invalid closed shape".to_owned(),
+                ));
+            }
+        };
+        let canonical_key: String = row.try_get("canonical_key")?;
+        if canonical_key != coordinate.tag_value(*community_id.as_uuid()) {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "normalized Project Context coordinate key is not canonical".to_owned(),
+            ));
+        }
+        coordinates.push(coordinate);
+    }
+    Ok(coordinates)
 }
 
 async fn coordinate_active_in_tx(
@@ -2329,14 +2894,15 @@ mod tests {
         DocumentError, DocumentProjectionPlan, ProjectDocumentCommand,
     };
     use buzz_sdk::project_context::{
-        build_project_context_binding_projection, build_project_context_command,
-        build_project_context_meta_projection, changed_project_context_binding_for,
+        build_project_context_binding_projection, build_project_context_binding_reprojection,
+        build_project_context_command, build_project_context_meta_projection,
+        changed_project_context_binding_for,
     };
     use buzz_sdk::project_document::{
         build_document_command, build_document_head_projection, build_document_meta_projection,
         build_document_revision_projection, changed_head_for,
     };
-    use nostr::Keys;
+    use nostr::{EventBuilder, Keys, Kind};
     use sqlx::{Executor, PgPool};
 
     use crate::project_document::{
@@ -2622,6 +3188,57 @@ mod tests {
         })
     }
 
+    async fn begin_reproject_test_write(
+        db: &Db,
+        community_id: CommunityId,
+        target_pubkey: PublicKey,
+    ) -> ProjectContextWriteResult<ProjectContextReprojectTx> {
+        let mut tx = db.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT project_context_edge_enabled FROM communities \
+             WHERE id = $1 AND archived_at IS NULL FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if enabled != Some(false) {
+            return Err(ProjectContextWriteError::Unavailable { community_id });
+        }
+        Ok(ProjectContextReprojectTx {
+            tx,
+            community_id,
+            target_pubkey,
+            loaded: None,
+        })
+    }
+
+    fn prepare_context_reprojection(
+        context: &ProjectContextReprojectContext,
+        relay: &Keys,
+    ) -> PreparedProjectContextReprojection {
+        let binding_projections = context
+            .bindings
+            .iter()
+            .map(|binding| {
+                build_project_context_binding_reprojection(binding)
+                    .expect("build Context binding reprojection")
+                    .sign_with_keys(relay)
+                    .expect("sign Context binding reprojection")
+            })
+            .collect();
+        let plan = ProjectContextProjectionPlan::for_reset(&context.catalog)
+            .expect("Context reprojection reset plan");
+        let meta_projection = build_project_context_meta_projection(&plan, &[])
+            .expect("build Context reprojection metadata")
+            .sign_with_keys(relay)
+            .expect("sign Context reprojection metadata");
+        PreparedProjectContextReprojection {
+            binding_projections,
+            meta_projection,
+        }
+    }
+
     fn context_command_event(
         community_id: CommunityId,
         command: &ProjectContextCommand,
@@ -2759,6 +3376,45 @@ mod tests {
             .rollback()
             .await
             .expect("rollback inactive-coordinate attach");
+    }
+
+    async fn context_business_snapshot(pool: &PgPool, community_id: CommunityId) -> Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object( \
+                'context_state', ( \
+                    SELECT to_jsonb(state) - 'projection_pubkey' \
+                           - 'projection_generation' - 'meta_projection_event_id' \
+                    FROM project_context_edge_state state WHERE community_id = $1), \
+                'edges', COALESCE(( \
+                    SELECT jsonb_agg(to_jsonb(edge) ORDER BY encode(edge.edge_key, 'hex')) \
+                    FROM project_context_edges edge WHERE community_id = $1), '[]'::jsonb), \
+                'coordinates', COALESCE(( \
+                    SELECT jsonb_agg(to_jsonb(coordinate) \
+                        ORDER BY encode(coordinate.edge_key, 'hex'), coordinate.ordinal) \
+                    FROM project_context_edge_coordinates coordinate \
+                    WHERE community_id = $1), '[]'::jsonb), \
+                'bindings', COALESCE(( \
+                    SELECT jsonb_agg( \
+                        to_jsonb(binding) - 'current_projection_event_id' \
+                        ORDER BY binding.context_document_id) \
+                    FROM project_context_document_bindings binding \
+                    WHERE community_id = $1), '[]'::jsonb), \
+                'changes', COALESCE(( \
+                    SELECT jsonb_agg(to_jsonb(change) ORDER BY change.context_revision) \
+                    FROM project_context_edge_changes change \
+                    WHERE community_id = $1), '[]'::jsonb), \
+                'document_state', ( \
+                    SELECT to_jsonb(state) FROM project_document_state state \
+                    WHERE community_id = $1), \
+                'documents', COALESCE(( \
+                    SELECT jsonb_agg(to_jsonb(document) ORDER BY document.document_id) \
+                    FROM project_documents document WHERE community_id = $1), '[]'::jsonb) \
+             )",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("snapshot Project Context business state")
     }
 
     #[tokio::test]
@@ -3131,6 +3787,178 @@ mod tests {
         db.verify_project_context_storage(community_id, &relay.public_key())
             .await
             .expect("verify final Context storage");
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn signer_reproject_rebuilds_all_heads_and_preserves_business_state() {
+        let scratch = ScratchDatabase::create("buzz_project_context_reproject").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let actor = Keys::generate();
+        let source_relay = Keys::generate();
+        let target_relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        bootstrap_documents(&db, community_id, &source_relay).await;
+        let bootstrap = context_bootstrap(community_id, &source_relay, whole_second_now());
+        assert_eq!(
+            store_context_bootstrap(&db, &bootstrap).await,
+            ProjectContextBootstrapOutcome { replayed: false }
+        );
+
+        let coordinate_a = Uuid::new_v4();
+        let coordinate_b = Uuid::new_v4();
+        let context_document_a = Uuid::new_v4();
+        let context_document_b = Uuid::new_v4();
+        for document_id in [
+            coordinate_a,
+            coordinate_b,
+            context_document_a,
+            context_document_b,
+        ] {
+            create_document(&db, community_id, document_id, &actor, &source_relay).await;
+        }
+        let coordinates = vec![
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_a,
+            },
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_b,
+            },
+        ];
+        for (revision, document_id) in [(0, context_document_a), (1, context_document_b)] {
+            let attach = ProjectContextCommand::new(
+                revision,
+                ProjectContextOperation::Attach,
+                coordinates.clone(),
+                document_id,
+            )
+            .expect("build reproject attach");
+            let (write, prepared) =
+                prepare_storage_commit(&db, community_id, attach, &actor, &source_relay).await;
+            write
+                .commit(prepared)
+                .await
+                .expect("commit reproject attach");
+        }
+        let detach = ProjectContextCommand::new(
+            2,
+            ProjectContextOperation::Detach,
+            coordinates,
+            context_document_a,
+        )
+        .expect("build deleted-head fixture");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach, &actor, &source_relay).await;
+        write
+            .commit(prepared)
+            .await
+            .expect("commit deleted-head fixture");
+
+        let orphan =
+            EventBuilder::new(Kind::Custom(KIND_PROJECT_CONTEXT_EDGE_BINDING as u16), "{}")
+                .sign_with_keys(&source_relay)
+                .expect("sign orphan Context projection fixture");
+        let (_, inserted) = crate::event::insert_event(&scratch.pool, community_id, &orphan, None)
+            .await
+            .expect("insert orphan Context projection fixture");
+        assert!(inserted);
+        let unhealthy = db
+            .project_context_integrity_status(community_id)
+            .await
+            .expect("read unhealthy Context integrity")
+            .expect("initialized Context integrity");
+        assert_eq!(unhealthy.orphan_projection_count, 1);
+        let business_before = context_business_snapshot(&scratch.pool, community_id).await;
+
+        let mut write = begin_reproject_test_write(&db, community_id, target_relay.public_key())
+            .await
+            .expect("begin Context signer reprojection");
+        let context = write
+            .load_current()
+            .await
+            .expect("load Context signer reprojection");
+        assert_eq!(context.source_generation, 1);
+        assert_eq!(context.catalog.projection_generation(), 2);
+        assert_eq!(context.catalog.context_revision(), 3);
+        assert_eq!(context.bindings.len(), 2);
+        assert_eq!(
+            context
+                .bindings
+                .iter()
+                .filter(|binding| binding.state == ProjectContextBindingState::Active)
+                .count(),
+            1
+        );
+        assert_eq!(
+            context
+                .bindings
+                .iter()
+                .filter(|binding| binding.state == ProjectContextBindingState::Deleted)
+                .count(),
+            1
+        );
+        let prepared = prepare_context_reprojection(&context, &target_relay);
+        let outcome = write
+            .commit_reprojection(prepared)
+            .await
+            .expect("commit Context signer reprojection");
+        assert_eq!(outcome.source_generation, 1);
+        assert_eq!(outcome.projection_generation, 2);
+        assert_eq!(outcome.context_revision, 3);
+        assert_eq!(outcome.events.len(), 3);
+
+        assert_eq!(
+            context_business_snapshot(&scratch.pool, community_id).await,
+            business_before,
+            "reprojection changed Project Context or Document business state"
+        );
+        assert_eq!(
+            db.verify_project_context_storage(community_id, &target_relay.public_key())
+                .await
+                .expect("verify reprojected Context storage"),
+            ProjectContextIntegrityStatus {
+                orphan_projection_count: 0,
+                pointer_mismatch_count: 0,
+            }
+        );
+        let generation: (i64, Vec<u8>, i64) = sqlx::query_as(
+            "SELECT projection_generation, projection_pubkey, context_revision \
+             FROM project_context_edge_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read reprojected Context generation");
+        assert_eq!(generation.0, 2);
+        assert_eq!(generation.1, target_relay.public_key().to_bytes());
+        assert_eq!(generation.2, 3);
+        let live_projection_state: (i64, bool) = sqlx::query_as(
+            "SELECT count(*)::bigint, bool_and(pubkey = $2) \
+             FROM events WHERE community_id = $1 AND kind = ANY($3) \
+               AND deleted_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(target_relay.public_key().as_bytes())
+        .bind([
+            KIND_PROJECT_CONTEXT_EDGE_BINDING as i32,
+            KIND_PROJECT_CONTEXT_META as i32,
+        ])
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read live replacement projections");
+        assert_eq!(live_projection_state, (3, true));
+        let reproject_audits: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM audit_log \
+             WHERE community_id = $1 AND action = 'project_context_edge_control' \
+               AND detail->>'operation' = 'reproject'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read Context reproject audit");
+        assert_eq!(reproject_audits, 1);
 
         scratch.cleanup().await;
     }

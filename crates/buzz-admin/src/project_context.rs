@@ -5,14 +5,16 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use buzz_core::tenant::normalize_host;
 use buzz_db::project_context::{
-    PreparedProjectContextBootstrap, ProjectContextFeatureStatus, ProjectContextIntegrityStatus,
-    ProjectContextPreflight,
+    PreparedProjectContextBootstrap, PreparedProjectContextReprojection,
+    ProjectContextFeatureStatus, ProjectContextIntegrityStatus, ProjectContextPreflight,
 };
 use buzz_db::Db;
 use buzz_project_context::{
     ProjectContextCatalog, ProjectContextProjectionPlan, PROJECT_CONTEXT_CAPABILITY,
 };
-use buzz_sdk::project_context::build_project_context_meta_projection;
+use buzz_sdk::project_context::{
+    build_project_context_binding_reprojection, build_project_context_meta_projection,
+};
 use clap::Subcommand;
 use nostr::{Keys, PublicKey};
 
@@ -36,6 +38,18 @@ pub(crate) enum ProjectContextCommand {
     },
     /// Create the signed revision-zero empty catalog while the gate is off.
     Bootstrap {
+        /// Exact normalized Community host.
+        #[arg(long)]
+        community: String,
+        /// File containing the Relay private key; must not be group/world readable.
+        #[arg(long)]
+        relay_key_file: Option<PathBuf>,
+        /// Expected public key of the supplied stable Relay signer.
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Re-sign every current active/deleted binding and reset metadata head.
+    Reproject {
         /// Exact normalized Community host.
         #[arg(long)]
         community: String,
@@ -91,6 +105,11 @@ pub(crate) async fn run(command: ProjectContextCommand) -> Result<i32> {
             relay_key_file,
             expected_pubkey,
         } => bootstrap(&db, &community, relay_key_file.as_deref(), &expected_pubkey).await?,
+        ProjectContextCommand::Reproject {
+            community,
+            relay_key_file,
+            expected_pubkey,
+        } => reproject(&db, &community, relay_key_file.as_deref(), &expected_pubkey).await?,
         ProjectContextCommand::Verify {
             community,
             expected_pubkey,
@@ -177,6 +196,13 @@ async fn verify(db: &Db, community: &str, expected_pubkey: &str) -> Result<()> {
             "community_id": status.community_id.to_string(),
             "host": status.host,
             "verified": true,
+            "context_revision": status.context_revision,
+            "active_edge_count": status.active_edge_count,
+            "bound_document_count": status.bound_document_count,
+            "projection_generation": status.projection_generation,
+            "projection_pubkey": status.projection_pubkey.map(|key| key.to_hex()),
+            "projection_parity": report.projection_parity,
+            "integrity_ready": report.integrity_ready,
             "structural_read_ready": report.structural_read_ready,
             "orphan_projection_count": integrity.orphan_projection_count,
             "pointer_mismatch_count": integrity.pointer_mismatch_count,
@@ -211,6 +237,7 @@ async fn bootstrap(
         if report.initialized
             && report.signer_matches
             && report.projection_parity
+            && report.integrity_ready
             && status.context_revision == Some(0)
             && status.active_edge_count == Some(0)
             && status.bound_document_count == Some(0)
@@ -284,6 +311,76 @@ async fn enable(
     Ok(())
 }
 
+async fn reproject(
+    db: &Db,
+    community: &str,
+    relay_key_file: Option<&std::path::Path>,
+    expected_pubkey: &str,
+) -> Result<()> {
+    let status = status_for_host(db, community).await?;
+    if status.archived || status.enabled || status.projection_pubkey.is_none() {
+        bail!("Project Context Edge reproject requires an active, initialized, disabled Community");
+    }
+    let keys = checked_relay_keys(relay_key_file, expected_pubkey)?;
+    let mut write = db
+        .begin_project_context_reproject(status.community_id, keys.public_key())
+        .await?;
+    let context = write.load_current().await?;
+    let mut binding_projections = Vec::with_capacity(context.bindings.len());
+    for binding in &context.bindings {
+        let event = build_project_context_binding_reprojection(binding)?
+            .sign_with_keys(&keys)
+            .map_err(|error| {
+                anyhow::anyhow!("sign Project Context binding reprojection: {error}")
+            })?;
+        binding_projections.push(event);
+    }
+    let plan = ProjectContextProjectionPlan::for_reset(&context.catalog)?;
+    let meta_projection = build_project_context_meta_projection(&plan, &[])?
+        .sign_with_keys(&keys)
+        .map_err(|error| anyhow::anyhow!("sign Project Context metadata reprojection: {error}"))?;
+    let source_pubkey = context.source_pubkey;
+    let binding_count = context.bindings.len();
+    let outcome = write
+        .commit_reprojection(PreparedProjectContextReprojection {
+            binding_projections,
+            meta_projection,
+        })
+        .await?;
+    let integrity = db
+        .verify_project_context_storage(status.community_id, &keys.public_key())
+        .await?;
+    let report = db
+        .project_context_preflight(status.community_id, &keys.public_key())
+        .await?;
+    if !report.structural_read_ready || !report.integrity_ready {
+        bail!(
+            "Project Context Edge reprojection committed but final readiness verification failed"
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "community_id": status.community_id.to_string(),
+            "host": status.host,
+            "reprojected": true,
+            "enabled": report.enabled,
+            "source_projection_generation": outcome.source_generation,
+            "projection_generation": outcome.projection_generation,
+            "source_projection_pubkey": source_pubkey.to_hex(),
+            "projection_pubkey": keys.public_key().to_hex(),
+            "context_revision": outcome.context_revision,
+            "binding_count": binding_count,
+            "business_state_preserved": true,
+            "projection_parity": report.projection_parity,
+            "integrity_ready": report.integrity_ready,
+            "orphan_projection_count": integrity.orphan_projection_count,
+            "pointer_mismatch_count": integrity.pointer_mismatch_count,
+        }))?
+    );
+    Ok(())
+}
+
 async fn disable(db: &Db, community: &str) -> Result<()> {
     let status = status_for_host(db, community).await?;
     if !db
@@ -351,8 +448,16 @@ fn status_json(
         "binding_row_count": status.binding_row_count,
         "change_count": status.change_count,
         "projection_parity": report.is_some_and(|value| value.projection_parity),
+        "integrity_ready": report.is_some_and(|value| value.integrity_ready),
         "structural_read_ready": report.is_some_and(|value| value.structural_read_ready),
         "advertised_ready": report.is_some_and(|value| value.advertised_ready),
+        "reproject_required": report.is_some_and(|value| value.initialized && (
+            !value.project_view_ready
+                || !value.project_document_ready
+                || !value.signer_matches
+                || !value.projection_parity
+                || !value.integrity_ready
+        )),
         "orphan_projection_count": integrity.map(|value| value.orphan_projection_count),
         "pointer_mismatch_count": integrity.map(|value| value.pointer_mismatch_count),
     })
@@ -374,6 +479,7 @@ fn preflight_json(
         "initialized": report.initialized,
         "signer_matches": report.signer_matches,
         "projection_parity": report.projection_parity,
+        "integrity_ready": report.integrity_ready,
         "structural_read_ready": report.structural_read_ready,
         "advertised_ready": report.advertised_ready,
     })
@@ -420,6 +526,20 @@ mod tests {
         assert!(matches!(
             bootstrap.command,
             ProjectContextCommand::Bootstrap { .. }
+        ));
+
+        let reproject = TestCli::try_parse_from([
+            "test",
+            "reproject",
+            "--community",
+            "relay.example",
+            "--expected-pubkey",
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        ])
+        .expect("parse reproject");
+        assert!(matches!(
+            reproject.command,
+            ProjectContextCommand::Reproject { .. }
         ));
 
         let disable = TestCli::try_parse_from(["test", "disable", "--community", "relay.example"])

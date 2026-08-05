@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Exercise Project Context Stages 3 through 5 against a direct Project View v3 Community:
+# Exercise Project Context Stages 3 through 5, plus the optional Stage 7
+# recovery gate, against a direct Project View v3 Community:
 # controlled bootstrap, real Relay writes, private reads/fan-out, disable
 # semantics, managed authority, cross-domain lifecycle, verified CLI queries,
 # metadata-only hydration, and final canonical state preservation.
@@ -283,6 +284,52 @@ project_context_admin() {
     DATABASE_URL="${database_url}" \
     BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
     "${bin_dir}/buzz-admin" project-context "$@"
+}
+
+context_business_fingerprint() {
+  docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d "${database_name}" -Atc \
+    "SELECT md5(jsonb_build_object(
+       'state', (SELECT to_jsonb(state) - 'projection_pubkey'
+                        - 'projection_generation' - 'meta_projection_event_id'
+                 FROM project_context_edge_state state
+                 WHERE community_id = '${community_id}'),
+       'edges', COALESCE((SELECT jsonb_agg(to_jsonb(edge) ORDER BY edge.edge_key)
+                          FROM project_context_edges edge
+                          WHERE community_id = '${community_id}'), '[]'::jsonb),
+       'coordinates', COALESCE((SELECT jsonb_agg(to_jsonb(coordinate)
+                                      ORDER BY coordinate.edge_key, coordinate.ordinal)
+                                FROM project_context_edge_coordinates coordinate
+                                WHERE community_id = '${community_id}'), '[]'::jsonb),
+       'bindings', COALESCE((SELECT jsonb_agg(
+                                      to_jsonb(binding) - 'current_projection_event_id'
+                                      ORDER BY binding.context_document_id)
+                             FROM project_context_document_bindings binding
+                             WHERE community_id = '${community_id}'), '[]'::jsonb),
+       'changes', COALESCE((SELECT jsonb_agg(to_jsonb(change)
+                                   ORDER BY change.context_revision)
+                            FROM project_context_edge_changes change
+                            WHERE community_id = '${community_id}'), '[]'::jsonb),
+       'document_state', (SELECT to_jsonb(state)
+                          FROM project_document_state state
+                          WHERE community_id = '${community_id}'),
+       'documents', COALESCE((SELECT jsonb_agg(to_jsonb(document)
+                                     ORDER BY document.document_id)
+                              FROM project_documents document
+                              WHERE community_id = '${community_id}'), '[]'::jsonb),
+       'resource_context_references', COALESCE((SELECT jsonb_agg(to_jsonb(reference)
+                                               ORDER BY reference.source_object_id,
+                                                        reference.target_resource_id)
+                                        FROM project_view_resource_context_references reference
+                                        WHERE community_id = '${community_id}'), '[]'::jsonb),
+       'document_context_references', COALESCE((SELECT jsonb_agg(to_jsonb(reference)
+                                               ORDER BY reference.source_object_id,
+                                                        reference.target_document_id,
+                                                        reference.reference_mode,
+                                                        reference.revision_key)
+                                        FROM project_view_document_context_references reference
+                                        WHERE community_id = '${community_id}'), '[]'::jsonb)
+     )::text);"
 }
 
 export DATABASE_URL="${database_url}"
@@ -712,7 +759,78 @@ jq -e '
   and .[0].structural_read_ready == true
   and .[0].advertised_ready == false
   and .[0].projection_parity == true
+  and .[0].integrity_ready == true
 ' <<<"${final_disabled_status}" >/dev/null
+
+if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
+  # Rebuild every retained deleted binding head plus reset metadata at a new
+  # generation. This real admin path complements the DB integration fixture,
+  # which rotates to a distinct signer, while keeping this direct-v3 system's
+  # already healthy Project View and Project Document signer unchanged.
+  business_before_reproject="$(context_business_fingerprint)"
+  reproject="$(project_context_admin reproject \
+    --community "${test_host}" --expected-pubkey "${relay_pubkey}")"
+  jq -e --arg signer "${relay_pubkey}" '
+    .reprojected == true
+    and .enabled == false
+    and .source_projection_generation == 1
+    and .projection_generation == 2
+    and .source_projection_pubkey == $signer
+    and .projection_pubkey == $signer
+    and .context_revision == 14
+    and .binding_count == 7
+    and .business_state_preserved == true
+    and .projection_parity == true
+    and .integrity_ready == true
+    and .orphan_projection_count == 0
+    and .pointer_mismatch_count == 0
+  ' <<<"${reproject}" >/dev/null
+  business_after_reproject="$(context_business_fingerprint)"
+  [[ "${business_before_reproject}" == "${business_after_reproject}" ]]
+
+  replacement_projection_state="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d "${database_name}" -Atc \
+    "SELECT
+       count(*) FILTER (WHERE kind = 40908),
+       count(*) FILTER (WHERE kind = 40909),
+       bool_and(pubkey = decode('${relay_pubkey}', 'hex')),
+       bool_and((content::jsonb->>'projection_generation')::bigint = 2),
+       bool_and(CASE WHEN kind = 40909 THEN
+         (content::jsonb->>'reset')::boolean
+         AND jsonb_array_length(content::jsonb->'changed_bindings') = 0
+         AND NOT content::jsonb ? 'source_event_id'
+       ELSE true END)
+     FROM events
+     WHERE community_id = '${community_id}'
+       AND kind IN (40908, 40909) AND deleted_at IS NULL;")"
+  [[ "${replacement_projection_state}" == "7|1|t|t|t" ]]
+
+  recovered_status="$(project_context_admin status --community "${test_host}")"
+  jq -e '
+    length == 1
+    and .[0].enabled == false
+    and .[0].context_revision == 14
+    and .[0].projection_generation == 2
+    and .[0].projection_parity == true
+    and .[0].integrity_ready == true
+    and .[0].structural_read_ready == true
+    and .[0].advertised_ready == false
+    and .[0].reproject_required == false
+  ' <<<"${recovered_status}" >/dev/null
+  project_context_admin enable \
+    --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
+  start_relay
+  recovered_empty="$(buzz_as_member --format compact project-context contains-all)"
+  jq -e '
+    .context_revision == 14
+    and .projection_generation == 2
+    and (.edges | length) == 0
+  ' <<<"${recovered_empty}" >/dev/null
+  stop_relay
+  project_context_admin disable --community "${test_host}" >/dev/null
+  project_context_admin verify \
+    --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
+fi
 
 control_audits="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -Atc \
@@ -722,6 +840,17 @@ control_audits="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
 if (( control_audits < 5 )); then
   echo "Project Context Stage 3 E2E: expected bootstrap/enable/disable audit records" >&2
   exit 1
+fi
+
+if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
+  reproject_audits="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+    psql -U buzz -d "${database_name}" -Atc \
+    "SELECT count(*) FROM audit_log
+     WHERE community_id = '${community_id}'
+       AND action = 'project_context_edge_control'
+       AND detail->>'operation' = 'reproject'")"
+  [[ "${reproject_audits}" == "1" ]]
+  echo "Project Context Stage 7 reprojection, recovery, re-enable, and regression E2E passed."
 fi
 
 echo "Project Context Stage 3/4/5 Relay, privacy, authority, lifecycle, and Agent CLI E2E passed."
