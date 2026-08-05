@@ -1,6 +1,9 @@
 import { expect, type Page, test } from "@playwright/test";
 
-import type { MeetingSnapshot } from "../../src/shared/api/tauriMeetings";
+import type {
+  MeetingSnapshot,
+  MeetingSpeech,
+} from "../../src/shared/api/tauriMeetings";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
@@ -19,7 +22,12 @@ type RelayConnectionState =
   | "reconnecting"
   | "stalled";
 
-function meetingSeed(id: string, title: string, boardBody: string) {
+function meetingSeed(
+  id: string,
+  title: string,
+  boardBody: string,
+  speeches: MeetingSpeech[] = [],
+) {
   const now = Date.now();
   const snapshot: MeetingSnapshot = {
     meetingId: id,
@@ -37,7 +45,7 @@ function meetingSeed(id: string, title: string, boardBody: string) {
     stateRevision: 1,
     floorRevision: 1,
     intentRevision: 0,
-    speechRevision: 0,
+    speechRevision: speeches.length,
     currentSpeakerPubkey: null,
     currentOfferPubkey: null,
     floor: {
@@ -92,13 +100,25 @@ function meetingSeed(id: string, title: string, boardBody: string) {
     },
     action: null,
     end: null,
-    latestSpeechAt: null,
+    latestSpeechAt: speeches.at(-1)?.createdAt ?? null,
   };
   return {
     id,
     title,
     result: { status: "ready" as const, snapshot },
-    speeches: [],
+    speeches,
+  };
+}
+
+function meetingSpeech(revision: number): MeetingSpeech {
+  return {
+    eventId: revision.toString(16).padStart(64, "0"),
+    authorPubkey: PARTICIPANT,
+    content: `Formal Speech ${revision}: preserve the current timeline position while the Board view changes.`,
+    createdAt: 1_785_800_000 + revision,
+    speechRevision: revision,
+    grantEventId: "5".repeat(64),
+    mentions: [],
   };
 }
 
@@ -202,6 +222,65 @@ test("Meeting stays visible but non-authoritative until reconnect snapshot succe
   await expect(page.getByTestId("meeting-authority-banner")).toHaveCount(0);
   await expect(editor).toBeEnabled();
   await expect(editor).toHaveValue("# Goal\nKeep this unsent draft");
+});
+
+test("wide Meeting Board collapse preserves its draft, width, and timeline position", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await installMockBridge(page, {
+    meetings: [
+      meetingSeed(
+        MEETING_A,
+        "Wide Board review",
+        "# Wide Board",
+        Array.from({ length: 36 }, (_, index) => meetingSpeech(index + 1)),
+      ),
+    ],
+  });
+  await page.goto("/");
+  await openMeeting(page, MEETING_A);
+
+  const boardTrigger = page.getByTestId("meeting-board-trigger");
+  const timelineScroll = page.getByTestId("meeting-timeline-scroll");
+  await expect(boardTrigger).toHaveAttribute("aria-expanded", "true");
+  await page.getByTestId("meeting-board-resize-handle").press("ArrowLeft");
+  await expect(page.getByTestId("meeting-board-wide")).toHaveCSS(
+    "width",
+    "416px",
+  );
+  await page
+    .getByTestId("meeting-board-editor")
+    .fill("# Wide unsent Board draft");
+  await timelineScroll.evaluate((element) => {
+    element.scrollTop = 300;
+  });
+  await expect
+    .poll(() => timelineScroll.evaluate((element) => element.scrollTop))
+    .toBe(300);
+
+  await boardTrigger.click();
+  await expect(boardTrigger).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("meeting-board-wide")).toBeHidden();
+  await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
+    "Formal Speech 36",
+  );
+  await expect
+    .poll(() => timelineScroll.evaluate((element) => element.scrollTop))
+    .toBe(300);
+
+  await boardTrigger.click();
+  await expect(boardTrigger).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByTestId("meeting-board-wide")).toHaveCSS(
+    "width",
+    "416px",
+  );
+  await expect(page.getByTestId("meeting-board-editor")).toHaveValue(
+    "# Wide unsent Board draft",
+  );
+  await expect
+    .poll(() => timelineScroll.evaluate((element) => element.scrollTop))
+    .toBe(300);
 });
 
 test("Meeting rooms, drafts, and panel preferences stay Community scoped", async ({

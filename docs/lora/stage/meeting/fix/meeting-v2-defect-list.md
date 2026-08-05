@@ -333,9 +333,13 @@ Meeting Contract 只在已经识别为 V2 Meeting channel 的 ACP Session 安装
 
 遵循 spec 9.2；不得重新带回普通 Channel 的成员增删、归档、可见性、类型编辑或 Huddle 主操作。
 
-### MFX-008（P1）：宽屏 Board 无法收起
+### MFX-008（已解决）：宽屏 Board 无法收起
 
-**现状**
+**状态：已解决。宽屏 Board 现在默认打开，并可通过持续可见的 Board trigger 收起和恢复；
+可见性按 Meeting 隔离，收起和恢复不会丢失 Board/Speech 草稿、timeline 位置或已调整宽度。
+新的 Board Maintenance control token 会在对应宽屏或中窄屏模式中安全自动打开一次。**
+
+**原现状**
 
 宽屏 Board 默认展示且支持调整宽度，但 Board trigger 只在 `xl` 以下显示。宽屏用户不能收起
 Board，也没有收起后持续可见的恢复入口。

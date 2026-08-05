@@ -190,9 +190,18 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
   await expect(page.getByTestId("meeting-speech-composer")).toBeVisible();
 
-  await page
-    .getByTestId("meeting-speech-input")
-    .fill("The exact-retry boundary is ready for review.");
+  const speechInput = page.getByTestId("meeting-speech-input");
+  await speechInput.fill("The exact-retry boundary is ready for review.");
+  await page.getByTestId("meeting-board-trigger").click();
+  await expect(page.getByTestId("meeting-board-wide")).toBeHidden();
+  await expect(speechInput).toHaveValue(
+    "The exact-retry boundary is ready for review.",
+  );
+  await page.getByTestId("meeting-board-trigger").click();
+  await expect(page.getByTestId("meeting-board-wide")).toBeVisible();
+  await expect(speechInput).toHaveValue(
+    "The exact-retry boundary is ready for review.",
+  );
   await page.getByTestId("meeting-handoff-toggle").click();
   await page.getByTestId("meeting-handoff-target").selectOption(HUMAN);
   await page
@@ -204,13 +213,13 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
     "The exact-retry boundary is ready for review.",
   );
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
-  const speechInput = await page.evaluate(() =>
+  const submittedSpeechInput = await page.evaluate(() =>
     (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
       .filter((entry) => entry.command === "submit_meeting_floor_action")
       .map((entry) => entry.payload.input)
       .find((input) => input.action.type === "speech"),
   );
-  expect(speechInput.action.handoff).toEqual({
+  expect(submittedSpeechInput.action.handoff).toEqual({
     targetPubkey: HUMAN,
     handoffType: "question",
     reason: "Please verify the participant-facing behavior.",

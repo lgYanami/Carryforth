@@ -207,12 +207,46 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     snapshot,
   });
   const boardPanelIsOverlay = useMediaBreakpoint(1280);
-  const [boardSheetOpen, setBoardSheetOpen] = React.useState(false);
+  const [boardSheetState, setBoardSheetState] = React.useState({
+    meetingId,
+    open: false,
+  });
+  const boardSheetOpen =
+    boardSheetState.meetingId === meetingId && boardSheetState.open;
+  const setBoardSheetOpen = React.useCallback(
+    (open: boolean) => setBoardSheetState({ meetingId, open }),
+    [meetingId],
+  );
+  const [wideBoardState, setWideBoardState] = React.useState({
+    meetingId,
+    open: true,
+  });
+  const wideBoardOpen =
+    wideBoardState.meetingId === meetingId ? wideBoardState.open : true;
+  const setWideBoardOpen = React.useCallback(
+    (open: boolean) => setWideBoardState({ meetingId, open }),
+    [meetingId],
+  );
+  const autoOpenedBoardKeyRef = React.useRef<string | null>(null);
+
   React.useEffect(() => {
-    if (boardEditable && boardPanelIsOverlay && boardDraft.controlToken) {
+    if (!boardEditable || !boardDraft.controlToken) return;
+    const autoOpenKey = `${meetingId}:${boardDraft.controlToken}:${boardPanelIsOverlay ? "overlay" : "wide"}`;
+    if (autoOpenedBoardKeyRef.current === autoOpenKey) return;
+    autoOpenedBoardKeyRef.current = autoOpenKey;
+    if (boardPanelIsOverlay) {
       setBoardSheetOpen(true);
+    } else {
+      setWideBoardOpen(true);
     }
-  }, [boardDraft.controlToken, boardEditable, boardPanelIsOverlay]);
+  }, [
+    boardDraft.controlToken,
+    boardEditable,
+    boardPanelIsOverlay,
+    meetingId,
+    setBoardSheetOpen,
+    setWideBoardOpen,
+  ]);
   const speechesQuery = useMeetingSpeeches({
     meetingId,
     enabled: snapshot !== null,
@@ -313,6 +347,27 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     readySnapshot.lifecycle === "aborted";
   const statusText = meetingStatusText(readySnapshot, profiles);
   const sourceChannelId = readySnapshot.sourceChannelId;
+  const boardOpen = boardPanelIsOverlay ? boardSheetOpen : wideBoardOpen;
+  const boardTrigger = (
+    <Button
+      aria-controls={
+        boardPanelIsOverlay
+          ? "meeting-board-overlay-panel"
+          : "meeting-board-wide-panel"
+      }
+      aria-expanded={boardOpen}
+      data-testid="meeting-board-trigger"
+      onClick={
+        boardPanelIsOverlay ? undefined : () => setWideBoardOpen(!wideBoardOpen)
+      }
+      size="sm"
+      title={boardOpen ? "Hide Meeting board" : "Show Meeting board"}
+      variant="outline"
+    >
+      <ClipboardList className="size-4" />
+      Board
+    </Button>
+  );
 
   return (
     <div
@@ -373,42 +428,39 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
               </div>
             </SheetContent>
           </Sheet>
-          <Sheet onOpenChange={setBoardSheetOpen} open={boardSheetOpen}>
-            <SheetTrigger asChild>
-              <Button
-                className="xl:hidden"
-                data-testid="meeting-board-trigger"
-                size="sm"
-                variant="outline"
+          {boardPanelIsOverlay ? (
+            <Sheet onOpenChange={setBoardSheetOpen} open={boardSheetOpen}>
+              <SheetTrigger asChild>{boardTrigger}</SheetTrigger>
+              <SheetContent
+                className="p-0 sm:max-w-xl"
+                id="meeting-board-overlay-panel"
               >
-                <ClipboardList className="size-4" />
-                Board
-              </Button>
-            </SheetTrigger>
-            <SheetContent className="p-0 sm:max-w-xl">
-              <SheetHeader className="sr-only">
-                <SheetTitle>Meeting board</SheetTitle>
-                <SheetDescription>
-                  The current Board maintained by the host.
-                </SheetDescription>
-              </SheetHeader>
-              <MeetingBoardPanel
-                board={readySnapshot.board}
-                className="h-full"
-                editor={
-                  boardEditable
-                    ? {
-                        disabled: !meetingAuthority.authorityAvailable,
-                        onChange: boardDraft.setValue,
-                        value: boardDraft.value,
-                      }
-                    : undefined
-                }
-                onDismissStaleDraft={boardDraft.dismissStale}
-                staleDraft={boardDraft.stale}
-              />
-            </SheetContent>
-          </Sheet>
+                <SheetHeader className="sr-only">
+                  <SheetTitle>Meeting board</SheetTitle>
+                  <SheetDescription>
+                    The current Board maintained by the host.
+                  </SheetDescription>
+                </SheetHeader>
+                <MeetingBoardPanel
+                  board={readySnapshot.board}
+                  className="h-full"
+                  editor={
+                    boardEditable
+                      ? {
+                          disabled: !meetingAuthority.authorityAvailable,
+                          onChange: boardDraft.setValue,
+                          value: boardDraft.value,
+                        }
+                      : undefined
+                  }
+                  onDismissStaleDraft={boardDraft.dismissStale}
+                  staleDraft={boardDraft.stale}
+                />
+              </SheetContent>
+            </Sheet>
+          ) : (
+            boardTrigger
+          )}
           <Badge variant={lifecycleBadgeVariant(readySnapshot.lifecycle)}>
             {readySnapshot.lifecycle === "closed" ? (
               <CheckCircle2 className="mr-1 size-3" />
@@ -479,7 +531,10 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       ) : null}
 
       <div className="flex min-h-0 min-w-0 flex-1">
-        <main className="min-w-0 flex-1 overflow-y-auto">
+        <main
+          className="min-w-0 flex-1 overflow-y-auto"
+          data-testid="meeting-timeline-scroll"
+        >
           <MeetingSpeechTimeline
             hasOlder={Boolean(speechesQuery.hasNextPage)}
             isFetchingOlder={speechesQuery.isFetchingNextPage}
@@ -493,40 +548,43 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
             </div>
           ) : null}
         </main>
-        <aside
-          aria-label="Meeting board panel"
-          className="relative hidden shrink-0 xl:flex"
-          data-testid="meeting-board-wide"
-          style={{ width: boardWidth.widthPx }}
-        >
-          <button
-            aria-label="Resize Meeting board"
-            className="group absolute inset-y-0 left-0 z-40 w-3 -translate-x-1/2 cursor-col-resize"
-            data-testid="meeting-board-resize-handle"
-            onDoubleClick={boardWidth.reset}
-            onKeyDown={boardWidth.onResizeKeyDown}
-            onPointerDown={boardWidth.onResizeStart}
-            title="Drag or use arrow keys to resize. Press Home or double-click to reset."
-            type="button"
+        {!boardPanelIsOverlay && wideBoardOpen ? (
+          <aside
+            aria-label="Meeting board panel"
+            className="relative flex shrink-0"
+            data-testid="meeting-board-wide"
+            id="meeting-board-wide-panel"
+            style={{ width: boardWidth.widthPx }}
           >
-            <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/80 group-focus-visible:bg-ring" />
-          </button>
-          <MeetingBoardPanel
-            board={readySnapshot.board}
-            className="h-full w-full border-l"
-            editor={
-              boardEditable
-                ? {
-                    disabled: !meetingAuthority.authorityAvailable,
-                    onChange: boardDraft.setValue,
-                    value: boardDraft.value,
-                  }
-                : undefined
-            }
-            onDismissStaleDraft={boardDraft.dismissStale}
-            staleDraft={boardDraft.stale}
-          />
-        </aside>
+            <button
+              aria-label="Resize Meeting board"
+              className="group absolute inset-y-0 left-0 z-40 w-3 -translate-x-1/2 cursor-col-resize"
+              data-testid="meeting-board-resize-handle"
+              onDoubleClick={boardWidth.reset}
+              onKeyDown={boardWidth.onResizeKeyDown}
+              onPointerDown={boardWidth.onResizeStart}
+              title="Drag or use arrow keys to resize. Press Home or double-click to reset."
+              type="button"
+            >
+              <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/80 group-focus-visible:bg-ring" />
+            </button>
+            <MeetingBoardPanel
+              board={readySnapshot.board}
+              className="h-full w-full border-l"
+              editor={
+                boardEditable
+                  ? {
+                      disabled: !meetingAuthority.authorityAvailable,
+                      onChange: boardDraft.setValue,
+                      value: boardDraft.value,
+                    }
+                  : undefined
+              }
+              onDismissStaleDraft={boardDraft.dismissStale}
+              staleDraft={boardDraft.stale}
+            />
+          </aside>
+        ) : null}
       </div>
       <MeetingFloorDock
         authorityAvailable={meetingAuthority.authorityAvailable}

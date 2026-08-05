@@ -295,6 +295,10 @@ test("runnable and blocked action runs can return to a new Board window", async 
 
   for (const meetingId of [IDS.returnRunnable, IDS.returnBlocked]) {
     await openMeeting(page, meetingId);
+    const boardTrigger = page.getByTestId("meeting-board-trigger");
+    await expect(boardTrigger).toHaveAttribute("aria-expanded", "true");
+    await boardTrigger.click();
+    await expect(page.getByTestId("meeting-board-wide")).toBeHidden();
     await page.getByTestId("meeting-action-return-board").click();
     await expect(
       page.getByTestId("meeting-action-return-dialog"),
@@ -304,6 +308,7 @@ test("runnable and blocked action runs can return to a new Board window", async 
       "data-meeting-lifecycle",
       "active",
     );
+    await expect(boardTrigger).toHaveAttribute("aria-expanded", "true");
     await expect(page.getByTestId("meeting-board-editor")).toBeVisible();
   }
 });
