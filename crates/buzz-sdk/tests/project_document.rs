@@ -7,8 +7,8 @@ use buzz_project_document::{
 use buzz_sdk::project_document::{
     build_document_command, build_document_head_projection, build_document_meta_projection,
     build_document_revision_projection, changed_head_for, parse_document_command,
-    parse_document_head, parse_document_meta, parse_document_revision, verify_document_meta_change,
-    VerifiedCurrentDocument,
+    parse_document_head, parse_document_meta, parse_document_revision,
+    verify_document_head_observation, verify_document_meta_change, VerifiedCurrentDocument,
 };
 use buzz_sdk::SdkError;
 use chrono::{DateTime, Utc};
@@ -187,7 +187,20 @@ fn sdk_rebuilds_the_shared_command_and_projection_event_ids() {
     let current =
         VerifiedCurrentDocument::new(verified_head, verified_revision).expect("bind current");
     let verified_meta = parse_document_meta(&meta, &relay.public_key()).expect("verify meta");
+    verify_document_head_observation(&verified_meta, &current.head)
+        .expect("lightweight head observation");
     verify_document_meta_change(&verified_meta, &current).expect("bind metadata");
+
+    let mut future_head = current.head;
+    match &mut future_head.projection {
+        buzz_project_document::DocumentHeadProjection::Active {
+            catalog_revision, ..
+        }
+        | buzz_project_document::DocumentHeadProjection::Deleted {
+            catalog_revision, ..
+        } => *catalog_revision = verified_meta.projection.catalog_revision + 1,
+    }
+    assert!(verify_document_head_observation(&verified_meta, &future_head).is_err());
 }
 
 #[test]

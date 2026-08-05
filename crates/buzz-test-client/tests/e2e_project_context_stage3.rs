@@ -1,4 +1,4 @@
-//! Project Context Stage 3/4 Relay, privacy, operation-gate, and lifecycle E2E.
+//! Project Context Stage 3/4/5 Relay, privacy, query, and lifecycle E2E.
 //!
 //! The isolated harness establishes Project View v3, Project Document v1, and
 //! an initialized Context Edge catalog. This test drives real signed commands
@@ -33,7 +33,8 @@ use buzz_project_view::ProjectViewObjectType;
 use buzz_sdk::nip_oa;
 use buzz_sdk::project_context::{
     build_project_context_command, parse_project_context_binding, parse_project_context_command,
-    parse_project_context_meta, verify_project_context_meta_change,
+    parse_project_context_meta, project_context_edge_coordinate,
+    verify_project_context_meta_change,
 };
 use buzz_sdk::project_document::build_document_command;
 use buzz_sdk::project_view_v3::build_project_object_command;
@@ -188,6 +189,28 @@ async fn expect_closed(client: &mut BuzzTestClient, subscription_id: &str, reaso
                     "private Project Context event leaked before CLOSED: {}",
                     event.id
                 )
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn expect_count(client: &mut BuzzTestClient, subscription_id: &str, expected: u64) {
+    loop {
+        match client
+            .recv_event(Duration::from_secs(5))
+            .await
+            .expect("receive Project Context COUNT response")
+        {
+            RelayMessage::Count {
+                subscription_id: actual,
+                count,
+            } if actual == subscription_id => {
+                assert_eq!(count, expected);
+                return;
+            }
+            RelayMessage::Event { event, .. } => {
+                panic!("unexpected event while awaiting COUNT: {}", event.id)
             }
             _ => {}
         }
@@ -433,7 +456,7 @@ fn assert_no_context_events(body: &Value) {
 
 #[tokio::test]
 #[ignore = "requires isolated Project View v3, Project Document, Relay, PostgreSQL, and Redis"]
-async fn project_context_stage_three_and_four_are_atomic_private_and_lifecycle_safe() {
+async fn project_context_stages_three_through_five_are_atomic_private_and_queryable() {
     let context = setup().await;
     let http = Client::new();
     let db = Db::from_pool(context.pool.clone());
@@ -705,6 +728,71 @@ async fn project_context_stage_three_and_four_are_atomic_private_and_lifecycle_s
         2,
     );
     let _ = collect_live_bundle(&mut observer, &observer_subscription).await;
+
+    // Stage 5: the binding projection's custom coordinate, edge, and state
+    // tags are pushed through both HTTP and WebSocket query/count paths.
+    // The `limit: 1` query is intentionally narrower than the two matching
+    // binding heads; count must still report the complete match set.
+    let coordinate_tag = coordinates[0].tag_value(*context.community_id.as_uuid());
+    let edge_tag = project_context_edge_coordinate(context.community_id, receipt_one.edge_key);
+    let custom_tag_filter = json!({
+        "kinds": [KIND_PROJECT_CONTEXT_EDGE_BINDING],
+        "#c": [coordinate_tag],
+        "#g": [edge_tag],
+        "#s": ["active"],
+        "limit": 1
+    });
+    let (status, body) = post_json(
+        &http,
+        &context,
+        &context.reader,
+        "/query",
+        &json!([custom_tag_filter.clone()]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        body[0]["kind"].as_u64(),
+        Some(u64::from(KIND_PROJECT_CONTEXT_EDGE_BINDING))
+    );
+
+    let mut count_filter = custom_tag_filter.clone();
+    count_filter
+        .as_object_mut()
+        .expect("custom tag filter object")
+        .remove("limit");
+    let (status, count) = post_json(
+        &http,
+        &context,
+        &context.reader,
+        "/count",
+        &json!([count_filter.clone()]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{count}");
+    assert_eq!(count["count"].as_u64(), Some(2));
+
+    let ws_custom_req = format!("pce-custom-req-{}", Uuid::new_v4());
+    reader
+        .subscribe(
+            &ws_custom_req,
+            vec![serde_json::from_value(custom_tag_filter).expect("deserialize custom-tag Filter")],
+        )
+        .await
+        .expect("send custom-tag Project Context REQ");
+    let ws_events = reader
+        .collect_until_eose(&ws_custom_req, Duration::from_secs(5))
+        .await
+        .expect("collect custom-tag Project Context REQ");
+    assert_eq!(ws_events.len(), 1);
+
+    let ws_custom_count = format!("pce-custom-count-{}", Uuid::new_v4());
+    reader
+        .send_raw(&json!(["COUNT", ws_custom_count, count_filter]))
+        .await
+        .expect("send custom-tag Project Context COUNT");
+    expect_count(&mut reader, &ws_custom_count, 2).await;
 
     let all_context = json!([{
         "kinds": [

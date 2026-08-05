@@ -909,6 +909,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",

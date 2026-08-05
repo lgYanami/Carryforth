@@ -70,6 +70,16 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict Project Context binding projections by canonical `c` tag.
+    ///
+    /// Populated only when the Relay has proved that the Nostr filter
+    /// exclusively targets kind 40908. Values within this tag key are ORed;
+    /// this field is ANDed with the `g` and `s` fields below.
+    pub project_context_c_tags: Option<Vec<String>>,
+    /// Restrict Project Context binding projections by canonical `g` tag.
+    pub project_context_g_tags: Option<Vec<String>>,
+    /// Restrict Project Context binding projections by canonical `s` tag.
+    pub project_context_s_tags: Option<Vec<String>>,
     /// Restrict results to events in any of these channels, while retaining
     /// channel-less global events. Applied before SQL `LIMIT` so access-filtered
     /// historical pages have exact exhaustion semantics.
@@ -120,6 +130,9 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            project_context_c_tags: None,
+            project_context_g_tags: None,
+            project_context_s_tags: None,
             channel_ids: None,
             max_limit: None,
             persona_reader: None,
@@ -409,6 +422,18 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(vec![]);
     }
+    if q.project_context_c_tags
+        .as_deref()
+        .is_some_and(|values| values.is_empty())
+        || q.project_context_g_tags
+            .as_deref()
+            .is_some_and(|values| values.is_empty())
+        || q.project_context_s_tags
+            .as_deref()
+            .is_some_and(|values| values.is_empty())
+    {
+        return Ok(vec![]);
+    }
 
     let clamp = q.max_limit.unwrap_or(1000);
     let limit_val = q.limit.unwrap_or(100).min(clamp);
@@ -538,6 +563,25 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
             qb.push(")");
         }
     }
+
+    push_project_context_tag_filter(
+        &mut qb,
+        col_prefix,
+        "c",
+        q.project_context_c_tags.as_deref(),
+    );
+    push_project_context_tag_filter(
+        &mut qb,
+        col_prefix,
+        "g",
+        q.project_context_g_tags.as_deref(),
+    );
+    push_project_context_tag_filter(
+        &mut qb,
+        col_prefix,
+        "s",
+        q.project_context_s_tags.as_deref(),
+    );
 
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
@@ -683,6 +727,18 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(0);
     }
+    if q.project_context_c_tags
+        .as_deref()
+        .is_some_and(|values| values.is_empty())
+        || q.project_context_g_tags
+            .as_deref()
+            .is_some_and(|values| values.is_empty())
+        || q.project_context_s_tags
+            .as_deref()
+            .is_some_and(|values| values.is_empty())
+    {
+        return Ok(0);
+    }
 
     let mut qb: QueryBuilder<sqlx::Postgres> = if let Some(ref p_hex) = q.p_tag_hex {
         let mut b = QueryBuilder::new(
@@ -789,6 +845,25 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
         }
     }
 
+    push_project_context_tag_filter(
+        &mut qb,
+        col_prefix,
+        "c",
+        q.project_context_c_tags.as_deref(),
+    );
+    push_project_context_tag_filter(
+        &mut qb,
+        col_prefix,
+        "g",
+        q.project_context_g_tags.as_deref(),
+    );
+    push_project_context_tag_filter(
+        &mut qb,
+        col_prefix,
+        "s",
+        q.project_context_s_tags.as_deref(),
+    );
+
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
             .push_bind(s);
@@ -816,6 +891,34 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
     let cnt: i64 = row.try_get("cnt")?;
 
     Ok(cnt)
+}
+
+/// Push one Project Context custom-tag predicate before ordering, limiting, or
+/// counting. NIP-01 values within one tag key are alternatives, while separate
+/// tag keys compose with AND.
+///
+/// Binding projections are Relay-authored and strictly parsed before storage,
+/// so JSONB containment by the canonical two-element tag is equivalent to an
+/// exact `c`, `g`, or `s` match. The shared `idx_events_tags_gin` index serves
+/// these predicates.
+fn push_project_context_tag_filter(
+    query: &mut QueryBuilder<Postgres>,
+    column_prefix: &str,
+    tag_name: &str,
+    values: Option<&[String]>,
+) {
+    let Some(values) = values.filter(|values| !values.is_empty()) else {
+        return;
+    };
+    query.push(" AND (");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query.push(format!("{column_prefix}tags @> "));
+        query.push_bind(serde_json::json!([[tag_name, value]]));
+    }
+    query.push(")");
 }
 
 /// Soft-delete an event by setting `deleted_at = NOW()`.
@@ -1590,7 +1693,8 @@ pub async fn release_due_reminder(
 mod tests {
     use super::*;
     use buzz_core::kind::{
-        KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION, KIND_PROJECT_VIEW_OBJECT,
+        KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
+        KIND_PROJECT_VIEW_OBJECT,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -2035,6 +2139,72 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.id, target.id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn project_context_custom_tags_are_applied_before_query_limit_and_count() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let keys = Keys::generate();
+        let base = 1_800_200_000;
+        let coordinate = format!("pv:{community_uuid}:requirement:{}", Uuid::new_v4());
+        let edge = format!("project-context-edge:{community_uuid}:{}", "a".repeat(64));
+
+        let target = EventBuilder::new(
+            Kind::Custom(KIND_PROJECT_CONTEXT_EDGE_BINDING as u16),
+            "target binding",
+        )
+        .tags(vec![
+            Tag::parse(["c", coordinate.as_str()]).expect("target c tag"),
+            Tag::parse(["g", edge.as_str()]).expect("target g tag"),
+            Tag::parse(["s", "active"]).expect("target s tag"),
+        ])
+        .custom_created_at(nostr::Timestamp::from(base))
+        .sign_with_keys(&keys)
+        .expect("sign target binding");
+        insert_event(&pool, community, &target, None)
+            .await
+            .expect("insert target binding");
+
+        for offset in 10..13 {
+            let distractor = EventBuilder::new(
+                Kind::Custom(KIND_PROJECT_CONTEXT_EDGE_BINDING as u16),
+                "newer deleted binding",
+            )
+            .tags(vec![
+                Tag::parse(["c", coordinate.as_str()]).expect("distractor c tag"),
+                Tag::parse(["g", edge.as_str()]).expect("distractor g tag"),
+                Tag::parse(["s", "deleted"]).expect("distractor s tag"),
+            ])
+            .custom_created_at(nostr::Timestamp::from(base + offset))
+            .sign_with_keys(&keys)
+            .expect("sign distractor binding");
+            insert_event(&pool, community, &distractor, None)
+                .await
+                .expect("insert distractor binding");
+        }
+
+        let query = EventQuery {
+            kinds: Some(vec![KIND_PROJECT_CONTEXT_EDGE_BINDING as i32]),
+            project_context_c_tags: Some(vec![coordinate]),
+            project_context_g_tags: Some(vec![edge]),
+            project_context_s_tags: Some(vec!["active".to_owned()]),
+            limit: Some(1),
+            ..EventQuery::for_community(community)
+        };
+        let events = query_events(&pool, &query)
+            .await
+            .expect("query active binding through custom-tag pushdown");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.id, target.id);
+        assert_eq!(
+            count_events(&pool, &query)
+                .await
+                .expect("count active binding through custom-tag pushdown"),
+            1
+        );
     }
 
     fn make_text_event(content: &str) -> nostr::Event {

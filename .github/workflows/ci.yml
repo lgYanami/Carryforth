@@ -1026,7 +1026,7 @@ jobs:
         run: just project-document-test-e2e
 
   project-context-integration:
-    name: Project Context Stage 4 Integration
+    name: Project Context Stage 5 Integration
     runs-on: ubuntu-latest
     timeout-minutes: 35
     needs: [changes, desktop-e2e-relay]
@@ -1052,7 +1052,7 @@ jobs:
           PROJECT_CONTEXT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
           PROJECT_CONTEXT_E2E_PROFILE: ci
           PROJECT_CONTEXT_E2E_NO_BUILD: "1"
-        run: just project-context-test-e2e-stage4
+        run: just project-context-test-e2e-stage5
 
   project-view-pre-feature-rollback:
     name: Project View Rollback Boundaries

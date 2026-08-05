@@ -1,5 +1,7 @@
 //! Project Context Edge v1 command and Relay projection builders/verifiers.
 
+use std::collections::{BTreeMap, HashSet};
+
 use buzz_core::kind::{
     KIND_PROJECT_CONTEXT_COMMAND, KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META,
 };
@@ -8,10 +10,11 @@ use buzz_project_context::{
     context_binding_coordinate as domain_binding_coordinate,
     context_edge_coordinate as domain_edge_coordinate,
     context_meta_coordinate as domain_meta_coordinate, ChangedContextBinding, EdgeKey,
-    ProjectContextBindingProjection, ProjectContextCommand, ProjectContextCoordinate,
-    ProjectContextMetaProjection, ProjectContextOperation, ProjectContextProjectionPlan,
-    ProjectContextProjectionType, MAX_PROJECTION_CONTENT_BYTES, MAX_SAFE_REVISION,
-    PROJECT_CONTEXT_COMMAND_TAG, PROJECT_CONTEXT_PROJECTION_TAG, PROJECT_CONTEXT_SCHEMA_VERSION,
+    ProjectContextBindingProjection, ProjectContextBindingState, ProjectContextCommand,
+    ProjectContextCoordinate, ProjectContextEdge, ProjectContextMetaProjection,
+    ProjectContextOperation, ProjectContextProjectionPlan, ProjectContextProjectionType,
+    MAX_PROJECTION_CONTENT_BYTES, MAX_SAFE_REVISION, PROJECT_CONTEXT_COMMAND_TAG,
+    PROJECT_CONTEXT_PROJECTION_TAG, PROJECT_CONTEXT_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, JsonUtil, Kind, Tag, Timestamp};
@@ -463,6 +466,73 @@ pub fn verify_project_context_binding_observation(
         verify_project_context_meta_change(meta, binding)?;
     }
     Ok(())
+}
+
+/// Aggregate verified active binding heads into canonical, deterministic
+/// Project Context Edges within one signed metadata observation.
+///
+/// Callers must complete their transport pagination and perform the metadata
+/// double-read around this function. Set `complete_catalog` only when the input
+/// contains every active binding in the Project; in that case signed global
+/// counts are also checked.
+pub fn aggregate_project_context_edges(
+    meta: &VerifiedProjectContextMeta,
+    bindings: &[VerifiedProjectContextBinding],
+    complete_catalog: bool,
+) -> Result<Vec<ProjectContextEdge>, SdkError> {
+    let project_id = meta.projection.project_id;
+    let mut event_ids = HashSet::with_capacity(bindings.len());
+    let mut document_ids = HashSet::with_capacity(bindings.len());
+    let mut grouped: BTreeMap<EdgeKey, (Vec<ProjectContextCoordinate>, Vec<Uuid>)> =
+        BTreeMap::new();
+
+    for binding in bindings {
+        verify_project_context_binding_observation(meta, binding)?;
+        if binding.projection.state != ProjectContextBindingState::Active {
+            return Err(invalid_projection(
+                "active Edge aggregation received a deleted binding head",
+            ));
+        }
+        if !event_ids.insert(binding.event_id) {
+            return Err(invalid_projection(
+                "active Edge aggregation contains a duplicate binding event",
+            ));
+        }
+        if !document_ids.insert(binding.projection.context_document_id) {
+            return Err(invalid_projection(
+                "one Context Document appears in multiple active binding heads",
+            ));
+        }
+
+        let entry = grouped
+            .entry(binding.projection.edge_key)
+            .or_insert_with(|| (binding.projection.coordinates.clone(), Vec::new()));
+        if entry.0 != binding.projection.coordinates {
+            return Err(invalid_projection(
+                "one edge_key aggregates bindings with different coordinate sets",
+            ));
+        }
+        entry.1.push(binding.projection.context_document_id);
+    }
+
+    let mut edges = Vec::with_capacity(grouped.len());
+    for (_, (coordinates, mut context_document_ids)) in grouped {
+        context_document_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        let edge = ProjectContextEdge::from_snapshot(project_id, coordinates, context_document_ids)
+            .map_err(|error| invalid_projection(error.to_string()))?;
+        edges.push(edge);
+    }
+    edges.sort_by_key(ProjectContextEdge::key);
+
+    if complete_catalog
+        && (u64::try_from(edges.len()).ok() != Some(meta.projection.active_edge_count)
+            || u64::try_from(bindings.len()).ok() != Some(meta.projection.bound_document_count))
+    {
+        return Err(invalid_projection(
+            "complete active binding catalog disagrees with signed metadata counts",
+        ));
+    }
+    Ok(edges)
 }
 
 /// Strictly verify a complete Relay-signed ordinary projection bundle.

@@ -136,7 +136,7 @@ const RETRY_IN_MAX_SECS: u64 = 30;
 pub(crate) enum ProjectCommandDelivery {
     Accepted {
         raw: String,
-        receipt: buzz_project_document::ProjectDocumentReceipt,
+        receipt: serde_json::Value,
     },
     Ambiguous {
         reason: String,
@@ -222,7 +222,7 @@ fn parse_project_command_success(
     raw: &str,
     expected_event_id: &str,
     expected_change_id: nostr::EventId,
-) -> Result<buzz_project_document::ProjectDocumentReceipt, String> {
+) -> Result<serde_json::Value, String> {
     let response: ProjectCommandHttpResponse = serde_json::from_str(raw)
         .map_err(|_| "successful Project command returned invalid JSON".to_owned())?;
     if !response.accepted || response.event_id != expected_event_id {
@@ -232,27 +232,34 @@ fn parse_project_command_success(
         .message
         .strip_prefix("response:")
         .ok_or_else(|| "successful Project command response has no canonical receipt".to_owned())?;
-    let receipt: buzz_project_document::ProjectDocumentReceipt = serde_json::from_str(receipt_json)
+    let receipt: serde_json::Value = serde_json::from_str(receipt_json)
         .map_err(|_| "successful Project command receipt is invalid".to_owned())?;
-    if receipt.change_id != expected_change_id {
+    let expected_change_id = expected_change_id.to_hex();
+    if receipt.get("change_id").and_then(serde_json::Value::as_str)
+        != Some(expected_change_id.as_str())
+    {
         return Err("successful Project command receipt names another command".to_owned());
     }
     Ok(receipt)
 }
 
 fn map_project_command_response(status: u16, message: String) -> CliError {
-    if status == 409 && message.starts_with("conflict:project_document:") {
+    let is_project_protocol = |class: &str| {
+        message.starts_with(&format!("{class}:project_document:"))
+            || message.starts_with(&format!("{class}:project_context:"))
+    };
+    if status == 409 && is_project_protocol("conflict") {
         return CliError::Conflict(message);
     }
     if status == 401 || status == 403 {
         return CliError::Auth(message);
     }
-    if status == 400 && message.starts_with("invalid:project_document:") {
+    if status == 400 && is_project_protocol("invalid") {
         return CliError::Usage(message);
     }
-    if (status == 503 && message.starts_with("unavailable:project_document:"))
-        || message.starts_with("error:project_document:")
-        || message.starts_with("unsupported:project_document:")
+    if (status == 503 && is_project_protocol("unavailable"))
+        || is_project_protocol("error")
+        || is_project_protocol("unsupported")
     {
         return CliError::Other(message);
     }
@@ -986,7 +993,7 @@ impl BuzzClient {
     }
 
     /// Submit one idempotent Project command using stable event bytes and an
-    /// ambiguity-preserving policy. Canonical Project Document 409, 503, and
+    /// ambiguity-preserving policy. Canonical Project protocol 409, 503, and
     /// internal responses are definitive only before any attempt may have
     /// reached the Relay.
     pub(crate) async fn submit_project_command(
@@ -1936,6 +1943,23 @@ mod retry_policy_tests {
         let event = make_stored_event(client.keys());
         let error = client.submit_project_command(&event).await.unwrap_err();
         assert!(matches!(error, CliError::Conflict(_)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn project_context_conflict_is_not_retried_and_uses_exit_five() {
+        let (url, attempts) = test_server(|_| {
+            (
+                StatusCode::CONFLICT,
+                r#"{"error":"conflict:project_context:revision_conflict"}"#.to_owned(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_stored_event(client.keys());
+        let error = client.submit_project_command(&event).await.unwrap_err();
+        assert!(matches!(error, CliError::Conflict(_)));
+        assert_eq!(crate::error::exit_code(&error), 5);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 

@@ -700,6 +700,47 @@ pub fn verify_document_meta_change(
     Ok(())
 }
 
+/// Verify that one lightweight current head is visible within a signed
+/// Document catalog observation without fetching its Markdown revision body.
+///
+/// Older heads only need to share the Project, signer, and projection
+/// generation and remain at or before the observed catalog revision. When an
+/// incremental metadata event and head share the current revision, the exact
+/// changed-head pointer must bind that head.
+pub fn verify_document_head_observation(
+    meta: &VerifiedDocumentMeta,
+    head: &VerifiedDocumentHead,
+) -> Result<(), SdkError> {
+    let common = head_common(&head.projection);
+    if meta.signer != head.signer
+        || meta.projection.project_id != common.project_id
+        || meta.projection.projection_generation != common.projection_generation
+        || common.catalog_revision > meta.projection.catalog_revision
+    {
+        return Err(invalid_projection(
+            "Document head is outside the supplied metadata observation boundary",
+        ));
+    }
+    if !meta.projection.reset && common.catalog_revision == meta.projection.catalog_revision {
+        let expected = ChangedDocumentHead {
+            head_coordinate: domain_head_coordinate(common.project_id, common.document_id),
+            head_event_id: head.event_id,
+            document_id: common.document_id,
+            document_revision: common.document_revision,
+            revision_event_id: head_revision_event_id(&head.projection),
+            deleted: common.state == DocumentState::Deleted,
+        };
+        if meta.projection.source_event_id != Some(common.source_event_id)
+            || meta.projection.changed_heads.as_slice() != [expected]
+        {
+            return Err(invalid_projection(
+                "Document metadata changed-head entry does not bind the supplied head",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Strictly verify a complete Relay-signed mutation projection bundle against
 /// the deterministic pure-domain plan that produced it.
 ///

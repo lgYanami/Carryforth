@@ -420,6 +420,7 @@ project-context-test-unit:
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-project-context
         cargo nextest run -p buzz-sdk --test project_context
+        cargo nextest run -p buzz-sdk --test project_document
         cargo nextest run \
           -p buzz-core \
           -p buzz-relay \
@@ -427,13 +428,16 @@ project-context-test-unit:
           -E 'test(project_context)'
         cargo nextest run -p buzz-db --lib -E 'test(project_context)'
         cargo nextest run -p buzz-admin -E 'test(project_context)'
+        cargo nextest run -p buzz-cli -E 'test(project_context)'
     else
         cargo test -p buzz-project-context
         cargo test -p buzz-sdk --test project_context
+        cargo test -p buzz-sdk --test project_document
         cargo test -p buzz-core --lib project_context
         cargo test -p buzz-relay --lib project_context
         cargo test -p buzz-db --lib project_context
         cargo test -p buzz-admin project_context
+        cargo test -p buzz-cli project_context
     fi
 
 # Run isolated PostgreSQL-backed Project Context canonical storage tests.
@@ -453,6 +457,11 @@ project-context-test-e2e-stage3:
 project-context-test-e2e-stage4:
     ./scripts/test-project-context-stage3-e2e.sh
 
+# Run the cumulative Project Context scenario through verified query and Agent
+# CLI delivery. Earlier protocol and lifecycle stages remain part of the gate.
+project-context-test-e2e-stage5:
+    ./scripts/test-project-context-stage3-e2e.sh
+
 # Run every Project Context Stage 1 quality gate.
 project-context-stage1-test: project-context-test-unit project-context-test-e2e
 
@@ -464,6 +473,9 @@ project-context-stage3-test: project-context-test-unit project-context-test-db t
 
 # Run every Project Context Stage 4 quality gate.
 project-context-stage4-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage4
+
+# Run every Project Context Stage 5 quality gate.
+project-context-stage5-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage5
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.

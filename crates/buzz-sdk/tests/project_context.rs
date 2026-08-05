@@ -7,11 +7,12 @@ use buzz_project_context::{
 };
 use buzz_project_view::ProjectViewObjectType;
 use buzz_sdk::project_context::{
-    build_project_context_binding_projection, build_project_context_command,
-    build_project_context_meta_projection, changed_project_context_binding_for,
-    parse_project_context_binding, parse_project_context_command, parse_project_context_meta,
-    validate_signed_event_frame_size, verify_project_context_binding_observation,
-    verify_project_context_meta_change, verify_project_context_projection_bundle,
+    aggregate_project_context_edges, build_project_context_binding_projection,
+    build_project_context_command, build_project_context_meta_projection,
+    changed_project_context_binding_for, parse_project_context_binding,
+    parse_project_context_command, parse_project_context_meta, validate_signed_event_frame_size,
+    verify_project_context_binding_observation, verify_project_context_meta_change,
+    verify_project_context_projection_bundle,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Keys, Tag, Timestamp};
@@ -355,6 +356,50 @@ fn complete_signed_event_frame_has_an_explicit_precommit_limit() {
         .expect("signed binding");
     validate_signed_event_frame_size(&event, 512 * 1024).expect("ordinary frame");
     assert!(validate_signed_event_frame_size(&event, 32).is_err());
+}
+
+#[test]
+fn verified_binding_aggregation_is_deterministic_and_fail_closed() {
+    let (_, transition) = command_and_transition();
+    let relay = keys(1);
+    let binding_event = build_project_context_binding_projection(transition.projection_plan())
+        .expect("binding")
+        .sign_with_keys(&relay)
+        .expect("signed binding");
+    let changed = changed_project_context_binding_for(transition.projection_plan(), &binding_event)
+        .expect("changed binding");
+    let meta_event =
+        build_project_context_meta_projection(transition.projection_plan(), &[changed])
+            .expect("meta")
+            .sign_with_keys(&relay)
+            .expect("signed meta");
+    let binding = parse_project_context_binding(&binding_event, &relay.public_key(), project_id())
+        .expect("verified binding");
+    let meta = parse_project_context_meta(&meta_event, &relay.public_key(), project_id())
+        .expect("verified meta");
+
+    let edges = aggregate_project_context_edges(&meta, std::slice::from_ref(&binding), true)
+        .expect("complete one-edge catalog");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].coordinates(), coordinates());
+    assert_eq!(
+        edges[0].context_document_ids(),
+        &[Uuid::parse_str(CONTEXT_DOCUMENT).expect("Document UUID")]
+    );
+
+    assert!(
+        aggregate_project_context_edges(&meta, &[binding.clone(), binding.clone()], false,)
+            .is_err()
+    );
+
+    let mut wrong_counts = meta;
+    wrong_counts.projection.bound_document_count = 2;
+    assert!(
+        aggregate_project_context_edges(&wrong_counts, std::slice::from_ref(&binding), true,)
+            .is_err()
+    );
+    aggregate_project_context_edges(&wrong_counts, &[binding], false)
+        .expect("subset queries must not apply global catalog counts");
 }
 
 #[test]

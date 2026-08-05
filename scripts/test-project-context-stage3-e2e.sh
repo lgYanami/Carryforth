@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Exercise Project Context Stages 3 and 4 against a direct Project View v3 Community:
+# Exercise Project Context Stages 3 through 5 against a direct Project View v3 Community:
 # controlled bootstrap, real Relay writes, private reads/fan-out, disable
-# semantics, managed authority, cross-domain lifecycle, and final canonical
-# state preservation.
+# semantics, managed authority, cross-domain lifecycle, verified CLI queries,
+# metadata-only hydration, and final canonical state preservation.
 
 set -euo pipefail
 
@@ -412,6 +412,204 @@ jq -e '
 
 start_relay
 run_e2e_binary e2e_project_context_stage3
+
+# Stage 5 drives the public Agent CLI only. Build one binary Edge and one
+# overlapping hyperedge, then prove exact/incident/contains-all, metadata-first
+# output, body-on-demand, independent Document revisions, and tombstone
+# hydration without reaching into canonical storage for the behavior itself.
+profile_coordinate="project_profile:${community_id}"
+goal_coordinate="goal:10000000-0000-4000-8000-00000000c004"
+binary_context_document="60000000-0000-4000-8000-00000000c005"
+hyper_context_document="60000000-0000-4000-8000-00000000c006"
+coordinate_document="70000000-0000-4000-8000-00000000c005"
+document_coordinate="document:${coordinate_document}"
+binary_body_marker="STAGE5_BINARY_CONTEXT_BODY_MUST_BE_FETCHED_EXPLICITLY"
+hyper_body_marker="STAGE5_HYPER_CONTEXT_BODY_MUST_BE_FETCHED_EXPLICITLY"
+corrected_hyper_body_marker="STAGE5_CORRECTED_HYPER_BODY_MUST_BE_FETCHED_EXPLICITLY"
+
+create_binary_document="$(buzz_as_member --format compact documents create \
+  --document-id "${binary_context_document}" \
+  --title "Binary Context" \
+  --summary "Explains the profile and lifecycle goal" \
+  --content "${binary_body_marker}")"
+jq -e --arg id "${binary_context_document}" '
+  .accepted == true
+  and .document_id == $id
+  and .document_revision == 1
+' <<<"${create_binary_document}" >/dev/null
+
+create_hyper_document="$(buzz_as_member --format compact documents create \
+  --document-id "${hyper_context_document}" \
+  --title "Hyper Context" \
+  --summary "Explains the profile, goal, and supporting Document" \
+  --content "${hyper_body_marker}")"
+jq -e --arg id "${hyper_context_document}" '
+  .accepted == true
+  and .document_id == $id
+  and .document_revision == 1
+' <<<"${create_hyper_document}" >/dev/null
+
+create_coordinate_document="$(buzz_as_member --format compact documents create \
+  --document-id "${coordinate_document}" \
+  --title "Supporting Document coordinate" \
+  --summary "A coordinate, not the explanatory Context Document" \
+  --content "Supporting coordinate body")"
+jq -e --arg id "${coordinate_document}" '
+  .accepted == true
+  and .document_id == $id
+  and .document_revision == 1
+' <<<"${create_coordinate_document}" >/dev/null
+
+attach_binary="$(buzz_as_member --format compact project-context attach \
+  --context-document "${binary_context_document}" \
+  --coordinate "${goal_coordinate}" \
+  --coordinate "${profile_coordinate}")"
+jq -e --arg id "${binary_context_document}" '
+  .accepted == true
+  and .confirmation == "receipt"
+  and .receipt.operation == "attach"
+  and .receipt.context_revision == 11
+  and .receipt.edge_state == "active"
+  and .receipt.edge_document_count == 1
+  and .receipt.context_document_id == $id
+' <<<"${attach_binary}" >/dev/null
+
+attach_hyper="$(buzz_as_member --format compact project-context attach \
+  --context-document "${hyper_context_document}" \
+  --coordinate "${document_coordinate}" \
+  --coordinate "${profile_coordinate}" \
+  --coordinate "${goal_coordinate}")"
+jq -e --arg id "${hyper_context_document}" '
+  .accepted == true
+  and .receipt.operation == "attach"
+  and .receipt.context_revision == 12
+  and .receipt.edge_state == "active"
+  and .receipt.edge_document_count == 1
+  and .receipt.context_document_id == $id
+' <<<"${attach_hyper}" >/dev/null
+
+exact_binary="$(buzz_as_member --format compact project-context exact \
+  --coordinate "${goal_coordinate}" \
+  --coordinate "${profile_coordinate}")"
+jq -e --arg id "${binary_context_document}" '
+  .context_revision == 12
+  and .query.query_type == "exact"
+  and (.edges | length) == 1
+  and (.edges[0].coordinates | length) == 2
+  and (.edges[0].context_documents | length) == 1
+  and .edges[0].context_documents[0].document_id == $id
+  and .edges[0].context_documents[0].document_revision == 1
+  and .edges[0].context_documents[0].fetch_command == ("buzz documents get " + $id + " --content-only")
+  and (.edges[0].context_documents[0] | has("content_markdown") | not)
+' <<<"${exact_binary}" >/dev/null
+if grep -Fq "${binary_body_marker}" <<<"${exact_binary}"; then
+  echo "Project Context Stage 5 E2E: exact output leaked a Document body" >&2
+  exit 1
+fi
+
+incident_profile="$(buzz_as_member --format compact project-context incident \
+  "${profile_coordinate}")"
+jq -e '
+  .query.query_type == "incident"
+  and (.edges | length) == 2
+  and ([.edges[].coordinates | length] | sort) == [2, 3]
+' <<<"${incident_profile}" >/dev/null
+
+contains_pair="$(buzz_as_member --format compact project-context contains-all \
+  --coordinate "${profile_coordinate}" \
+  --coordinate "${goal_coordinate}")"
+jq -e '
+  .query.query_type == "contains_all"
+  and (.edges | length) == 2
+  and ([.edges[].coordinates | length] | sort) == [2, 3]
+' <<<"${contains_pair}" >/dev/null
+
+contains_everything="$(buzz_as_member --format compact project-context contains-all)"
+jq -e '
+  .query.query_type == "contains_all"
+  and (.query.coordinates | length) == 0
+  and (.edges | length) == 2
+' <<<"${contains_everything}" >/dev/null
+
+incident_document="$(buzz_as_member --format compact project-context incident \
+  "${document_coordinate}")"
+jq -e --arg id "${hyper_context_document}" '
+  (.edges | length) == 1
+  and (.edges[0].coordinates | length) == 3
+  and .edges[0].context_documents[0].document_id == $id
+' <<<"${incident_document}" >/dev/null
+
+update_hyper="$(buzz_as_member --format compact documents update \
+  "${hyper_context_document}" \
+  --expected-revision 1 \
+  --title "Hyper Context corrected" \
+  --summary "Corrected after practical discovery" \
+  --content "${corrected_hyper_body_marker}")"
+jq -e --arg id "${hyper_context_document}" '
+  .accepted == true
+  and .document_id == $id
+  and .document_revision == 2
+' <<<"${update_hyper}" >/dev/null
+
+delete_coordinate="$(buzz_as_member --format compact documents delete \
+  "${coordinate_document}" --expected-revision 1)"
+jq -e --arg id "${coordinate_document}" '
+  .accepted == true
+  and .document_id == $id
+  and .document_revision == 2
+' <<<"${delete_coordinate}" >/dev/null
+
+tombstoned_hyper="$(buzz_as_member --format compact project-context incident \
+  "${document_coordinate}")"
+jq -e --arg coordinate_id "${coordinate_document}" --arg context_id "${hyper_context_document}" '
+  .context_revision == 12
+  and (.edges | length) == 1
+  and any(.edges[0].coordinates[];
+    .coordinate.coordinate_type == "document"
+    and .coordinate.document_id == $coordinate_id
+    and .state == "tombstoned"
+    and .document_revision == 2)
+  and .edges[0].context_documents[0].document_id == $context_id
+  and .edges[0].context_documents[0].title == "Hyper Context corrected"
+  and .edges[0].context_documents[0].document_revision == 2
+  and (.edges[0].context_documents[0] | has("content_markdown") | not)
+' <<<"${tombstoned_hyper}" >/dev/null
+if grep -Fq "${corrected_hyper_body_marker}" <<<"${tombstoned_hyper}"; then
+  echo "Project Context Stage 5 E2E: hydrated Edge output leaked a Document body" >&2
+  exit 1
+fi
+fetched_hyper_body="$(buzz_as_member documents get \
+  "${hyper_context_document}" --content-only)"
+[[ "${fetched_hyper_body}" == "${corrected_hyper_body_marker}" ]]
+
+set +e
+protected_delete="$(buzz_as_member --format compact documents delete \
+  "${binary_context_document}" --expected-revision 1 2>&1)"
+protected_delete_status=$?
+set -e
+[[ "${protected_delete_status}" == "5" ]]
+grep -Fq "conflict:project_document:still_referenced" <<<"${protected_delete}"
+
+detach_hyper="$(buzz_as_member --format compact project-context detach \
+  --context-document "${hyper_context_document}" \
+  --coordinate "${profile_coordinate}" \
+  --coordinate "${goal_coordinate}" \
+  --coordinate "${document_coordinate}")"
+jq -e '
+  .accepted == true
+  and .receipt.operation == "detach"
+  and .receipt.context_revision == 13
+  and .receipt.edge_state == "deleted"
+  and .receipt.edge_document_count == 0
+' <<<"${detach_hyper}" >/dev/null
+
+post_detach_all="$(buzz_as_member --format compact project-context contains-all)"
+jq -e '
+  .context_revision == 13
+  and (.edges | length) == 1
+  and (.edges[0].coordinates | length) == 2
+' <<<"${post_detach_all}" >/dev/null
+
 stop_relay
 
 project_context_admin verify \
@@ -420,12 +618,12 @@ final_enabled_status="$(project_context_admin status --community "${test_host}")
 jq -e '
   length == 1
   and .[0].enabled == true
-  and .[0].context_revision == 10
-  and .[0].active_edge_count == 0
-  and .[0].bound_document_count == 0
-  and .[0].edge_row_count == 3
-  and .[0].binding_row_count == 5
-  and .[0].change_count == 10
+  and .[0].context_revision == 13
+  and .[0].active_edge_count == 1
+  and .[0].bound_document_count == 1
+  and .[0].edge_row_count == 5
+  and .[0].binding_row_count == 7
+  and .[0].change_count == 13
   and .[0].projection_parity == true
   and .[0].advertised_ready == true
 ' <<<"${final_enabled_status}" >/dev/null
@@ -449,11 +647,72 @@ disabled_status="$(project_context_admin status --community "${test_host}")"
 jq -e '
   length == 1
   and .[0].enabled == false
-  and .[0].context_revision == 10
+  and .[0].context_revision == 13
+  and .[0].active_edge_count == 1
+  and .[0].bound_document_count == 1
   and .[0].structural_read_ready == true
   and .[0].advertised_ready == false
   and .[0].projection_parity == true
 ' <<<"${disabled_status}" >/dev/null
+
+# Capability-off removes discovery from NIP-11 but not verified structural
+# reads or cleanup. The CLI must therefore read and detach the retained Edge,
+# while refusing a new attach before submission.
+start_relay
+disabled_exact="$(buzz_as_member --format compact project-context exact \
+  --coordinate "${profile_coordinate}" \
+  --coordinate "${goal_coordinate}")"
+jq -e --arg id "${binary_context_document}" '
+  .context_revision == 13
+  and (.edges | length) == 1
+  and .edges[0].context_documents[0].document_id == $id
+' <<<"${disabled_exact}" >/dev/null
+
+set +e
+disabled_attach="$(buzz_as_member --format compact project-context attach \
+  --context-document "${hyper_context_document}" \
+  --coordinate "${profile_coordinate}" \
+  --coordinate "${goal_coordinate}" 2>&1)"
+disabled_attach_status=$?
+set -e
+[[ "${disabled_attach_status}" == "4" ]]
+grep -Fq "unavailable:project_context:capability_disabled" <<<"${disabled_attach}"
+
+disabled_detach="$(buzz_as_member --format compact project-context detach \
+  --context-document "${binary_context_document}" \
+  --coordinate "${goal_coordinate}" \
+  --coordinate "${profile_coordinate}")"
+jq -e '
+  .accepted == true
+  and .receipt.operation == "detach"
+  and .receipt.context_revision == 14
+  and .receipt.edge_state == "deleted"
+  and .receipt.edge_document_count == 0
+' <<<"${disabled_detach}" >/dev/null
+
+disabled_empty="$(buzz_as_member --format compact project-context contains-all)"
+jq -e '
+  .context_revision == 14
+  and (.edges | length) == 0
+' <<<"${disabled_empty}" >/dev/null
+stop_relay
+
+project_context_admin verify \
+  --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
+final_disabled_status="$(project_context_admin status --community "${test_host}")"
+jq -e '
+  length == 1
+  and .[0].enabled == false
+  and .[0].context_revision == 14
+  and .[0].active_edge_count == 0
+  and .[0].bound_document_count == 0
+  and .[0].edge_row_count == 5
+  and .[0].binding_row_count == 7
+  and .[0].change_count == 14
+  and .[0].structural_read_ready == true
+  and .[0].advertised_ready == false
+  and .[0].projection_parity == true
+' <<<"${final_disabled_status}" >/dev/null
 
 control_audits="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -Atc \
@@ -465,4 +724,4 @@ if (( control_audits < 5 )); then
   exit 1
 fi
 
-echo "Project Context Stage 3/4 Relay, privacy, authority, and lifecycle E2E passed."
+echo "Project Context Stage 3/4/5 Relay, privacy, authority, lifecycle, and Agent CLI E2E passed."
