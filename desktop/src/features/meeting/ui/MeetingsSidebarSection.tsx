@@ -8,7 +8,17 @@ import {
 } from "lucide-react";
 
 import { requestOpenCreateMeeting } from "@/features/meeting/openCreateMeetingEvent";
+import {
+  readMeetingAttentionAcknowledgements,
+  writeMeetingAttentionAcknowledgements,
+} from "@/features/meeting/meetingAttentionAcknowledgement";
+import {
+  meetingNeedsVisibleAttention,
+  meetingSidebarItems,
+  terminalMeetingAttentionKey,
+} from "@/features/meeting/meetingSidebarModel";
 import type {
+  MeetingAttentionReason,
   MeetingLifecycle,
   MeetingListItem,
 } from "@/shared/api/tauriMeetings";
@@ -32,7 +42,7 @@ import {
 } from "@/shared/ui/sidebar";
 
 type MeetingsSidebarSectionProps = {
-  currentPubkey?: string;
+  communityId: string;
   items: MeetingListItem[];
   selectedMeetingId: string | null;
   unreadMeetingIds: ReadonlySet<string>;
@@ -67,6 +77,27 @@ function meetingStatus(item: MeetingListItem): string {
     return `Speaking · ${truncatePubkey(item.currentSpeakerPubkey)}`;
   }
   return lifecycleLabel(item.lifecycle);
+}
+
+function attentionLabel(reason: MeetingAttentionReason | null): string {
+  switch (reason) {
+    case "floor_offer":
+      return "Respond to the Floor offer";
+    case "floor_grant":
+      return "Use or yield your Floor grant";
+    case "host_board":
+      return "Complete Board maintenance";
+    case "host_floor":
+      return "Make the next Floor decision";
+    case "host_action":
+      return "Record and confirm meeting actions";
+    case "host_action_blocked":
+      return "Recover blocked action recording";
+    case "meeting_aborted":
+      return "Review the aborted Meeting";
+    default:
+      return "Meeting needs your attention";
+  }
 }
 
 function MeetingRow({
@@ -115,7 +146,7 @@ function MeetingRow({
           ) : null}
           {needsAttention ? (
             <span
-              aria-label="Meeting needs your attention"
+              aria-label={attentionLabel(item.attentionReason)}
               className="size-2 rounded-full bg-amber-500"
               data-testid={`meeting-attention-${item.meetingId}`}
               role="status"
@@ -128,7 +159,7 @@ function MeetingRow({
 }
 
 export function MeetingsSidebarSection({
-  currentPubkey,
+  communityId,
   items,
   selectedMeetingId,
   unreadMeetingIds,
@@ -138,24 +169,36 @@ export function MeetingsSidebarSection({
   const [historyOpen, setHistoryOpen] = React.useState(false);
   const [activeLimit, setActiveLimit] = React.useState(ACTIVE_PAGE_SIZE);
   const [historyLimit, setHistoryLimit] = React.useState(HISTORY_PAGE_SIZE);
-  const activeItems = React.useMemo(
-    () =>
-      items
-        .filter(
-          (item) => item.lifecycle !== "closed" && item.lifecycle !== "aborted",
-        )
-        .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0)),
-    [items],
+  const [acknowledgedTerminalAttention, setAcknowledgedTerminalAttention] =
+    React.useState<Set<string>>(() =>
+      readMeetingAttentionAcknowledgements(communityId),
+    );
+  React.useEffect(() => {
+    setAcknowledgedTerminalAttention(
+      readMeetingAttentionAcknowledgements(communityId),
+    );
+  }, [communityId]);
+  const { active: activeItems, history: historyItems } = React.useMemo(
+    () => meetingSidebarItems(items, acknowledgedTerminalAttention),
+    [acknowledgedTerminalAttention, items],
   );
-  const historyItems = React.useMemo(
-    () =>
-      items
-        .filter(
-          (item) => item.lifecycle === "closed" || item.lifecycle === "aborted",
-        )
-        .sort((left, right) => (right.endedAt ?? 0) - (left.endedAt ?? 0)),
-    [items],
+  const acknowledgeTerminalAttention = React.useCallback(
+    (item: MeetingListItem) => {
+      const key = terminalMeetingAttentionKey(item);
+      if (!key) return;
+      setAcknowledgedTerminalAttention((current) => {
+        if (current.has(key)) return current;
+        const next = new Set(current).add(key);
+        writeMeetingAttentionAcknowledgements(communityId, next);
+        return next;
+      });
+    },
+    [communityId],
   );
+  React.useEffect(() => {
+    const selected = items.find((item) => item.meetingId === selectedMeetingId);
+    if (selected) acknowledgeTerminalAttention(selected);
+  }, [acknowledgeTerminalAttention, items, selectedMeetingId]);
   const visibleActiveItems = activeItems.slice(0, activeLimit);
   const visibleHistoryItems = historyItems.slice(0, historyLimit);
 
@@ -213,11 +256,14 @@ export function MeetingsSidebarSection({
                   isUnread={unreadMeetingIds.has(item.meetingId)}
                   item={item}
                   key={item.meetingId}
-                  needsAttention={
-                    Boolean(currentPubkey) &&
-                    item.humanFloorAttentionPubkey === currentPubkey
-                  }
-                  onSelect={() => onSelectMeeting(item.meetingId)}
+                  needsAttention={meetingNeedsVisibleAttention(
+                    item,
+                    acknowledgedTerminalAttention,
+                  )}
+                  onSelect={() => {
+                    acknowledgeTerminalAttention(item);
+                    onSelectMeeting(item.meetingId);
+                  }}
                 />
               ))}
               {activeItems.length === 0 ? (
@@ -272,6 +318,7 @@ export function MeetingsSidebarSection({
                   className="h-auto w-full justify-start gap-3 px-3 py-2 text-left"
                   key={item.meetingId}
                   onClick={() => {
+                    acknowledgeTerminalAttention(item);
                     setHistoryOpen(false);
                     onSelectMeeting(item.meetingId);
                   }}
@@ -289,6 +336,17 @@ export function MeetingsSidebarSection({
                         : ""}
                     </span>
                   </span>
+                  {meetingNeedsVisibleAttention(
+                    item,
+                    acknowledgedTerminalAttention,
+                  ) ? (
+                    <span
+                      aria-label={attentionLabel(item.attentionReason)}
+                      className="size-2 shrink-0 rounded-full bg-amber-500"
+                      data-testid={`meeting-history-attention-${item.meetingId}`}
+                      role="status"
+                    />
+                  ) : null}
                 </Button>
               ))
             )}

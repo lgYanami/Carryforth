@@ -81,6 +81,7 @@ fn snapshot(host: &Keys, participant: &Keys) -> MeetingSnapshot {
         action: None,
         end: None,
         latest_speech_at: None,
+        authoritative_updated_at: 1,
     }
 }
 

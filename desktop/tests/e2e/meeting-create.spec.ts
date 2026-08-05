@@ -5,6 +5,10 @@ import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const HUMAN = TEST_IDENTITIES.bob.pubkey;
 const AGENT = "42".repeat(32);
+const CAPACITY_AGENTS = Array.from({ length: 9 }, (_, index) => ({
+  pubkey: (index + 80).toString(16).padStart(64, "0"),
+  displayName: `Capacity Agent ${index + 1}`,
+}));
 const ACTION_CAPABILITY = "meeting-v2-action-finalization-v2";
 
 const creatableCapability = {
@@ -37,6 +41,29 @@ function directorySeed(agentCapabilities = [ACTION_CAPABILITY]) {
         status: "online" as const,
       },
     ],
+  };
+}
+
+function capacityDirectorySeed() {
+  return {
+    searchProfiles: [
+      {
+        pubkey: HUMAN,
+        displayName: "Bob Human",
+        isAgent: false,
+      },
+      ...CAPACITY_AGENTS.map((agent) => ({
+        ...agent,
+        ownerPubkey: TEST_IDENTITIES.tyler.pubkey,
+        isAgent: true,
+      })),
+    ],
+    relayAgents: CAPACITY_AGENTS.map((agent) => ({
+      pubkey: agent.pubkey,
+      name: agent.displayName,
+      capabilities: [ACTION_CAPABILITY],
+      status: "online" as const,
+    })),
   };
 }
 
@@ -193,4 +220,38 @@ test("closed Relay create gate and incompatible Agent are explicit blockers", as
     "Missing action capability",
   );
   await expect(page.getByTestId("meeting-create-submit")).toBeDisabled();
+});
+
+test("eight selected Agents disable only further Agent candidates", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetingCapability: creatableCapability,
+    meetings: [],
+    ...capacityDirectorySeed(),
+  });
+  await page.goto("/");
+  await page.getByTestId("meeting-create-trigger").click();
+  await fillRequiredDraft(page);
+
+  for (const agent of CAPACITY_AGENTS.slice(0, 8)) {
+    await selectParticipant(page, agent.displayName, agent.pubkey);
+  }
+  await expect(page.getByTestId("meeting-roster-capacity")).toContainText(
+    "8 / 8 Agents",
+  );
+
+  const ninth = CAPACITY_AGENTS[8];
+  await page.getByTestId("meeting-roster-search").fill(ninth.displayName);
+  await expect(
+    page.getByTestId(`meeting-roster-candidate-${ninth.pubkey}`),
+  ).toBeDisabled();
+
+  await page.getByTestId("meeting-roster-search").fill("Bob Human");
+  const humanCandidate = page.getByTestId(`meeting-roster-candidate-${HUMAN}`);
+  await expect(humanCandidate).toBeEnabled();
+  await humanCandidate.click();
+  await expect(page.getByTestId("meeting-roster-capacity")).toContainText(
+    "10 / 12 participants",
+  );
 });

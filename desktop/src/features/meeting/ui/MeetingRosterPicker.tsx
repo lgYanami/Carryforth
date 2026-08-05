@@ -1,7 +1,11 @@
 import { Bot, Check, Search, UserRound } from "lucide-react";
 import type { UIEventHandler } from "react";
 
-import type { MeetingAgentCapability } from "@/features/meeting/createMeetingModel";
+import {
+  MAX_MEETING_AGENTS,
+  MAX_MEETING_PARTICIPANTS,
+  type MeetingAgentCapability,
+} from "@/features/meeting/createMeetingModel";
 import { formatOwnerLabel } from "@/features/profile/lib/identity";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
@@ -47,6 +51,7 @@ export function MeetingRosterPicker({
   currentHost,
   currentPubkey,
   disabled,
+  hasReachedAgentLimit,
   hasReachedLimit,
   isLoading,
   onDirectoryScroll,
@@ -57,11 +62,13 @@ export function MeetingRosterPicker({
   searchError,
   searchQuery,
   selected,
+  selectedAgentCount,
 }: {
   candidates: MeetingRosterDisplayCandidate[];
   currentHost: { displayName: string; avatarUrl: string | null };
   currentPubkey: string;
   disabled: boolean;
+  hasReachedAgentLimit: boolean;
   hasReachedLimit: boolean;
   isLoading: boolean;
   onDirectoryScroll: UIEventHandler<HTMLDivElement>;
@@ -72,6 +79,7 @@ export function MeetingRosterPicker({
   searchError: Error | null;
   searchQuery: string;
   selected: MeetingRosterDisplayCandidate[];
+  selectedAgentCount: number;
 }) {
   return (
     <div className="space-y-3" data-testid="meeting-roster-picker">
@@ -132,6 +140,14 @@ export function MeetingRosterPicker({
         </p>
       )}
 
+      <p
+        className="text-xs text-muted-foreground"
+        data-testid="meeting-roster-capacity"
+      >
+        {selected.length + 1} / {MAX_MEETING_PARTICIPANTS} participants ·{" "}
+        {selectedAgentCount} / {MAX_MEETING_AGENTS} Agents
+      </p>
+
       <div className="relative">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
@@ -174,7 +190,11 @@ export function MeetingRosterPicker({
               <button
                 className="flex min-h-14 w-full items-center gap-3 border-b px-3 py-2 text-left last:border-b-0 hover:bg-muted/50 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 data-testid={`meeting-roster-candidate-${candidate.pubkey}`}
-                disabled={disabled || hasReachedLimit}
+                disabled={
+                  disabled ||
+                  hasReachedLimit ||
+                  (candidate.isAgent && hasReachedAgentLimit)
+                }
                 key={candidate.pubkey}
                 onClick={() => onSelect(candidate)}
                 type="button"

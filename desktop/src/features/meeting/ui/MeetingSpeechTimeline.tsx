@@ -1,9 +1,10 @@
-import { MessageSquareText } from "lucide-react";
+import { CornerDownRight, MessageSquareText } from "lucide-react";
 
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type { MeetingSpeech } from "@/shared/api/tauriMeetings";
 import { truncatePubkey } from "@/shared/lib/pubkey";
+import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Markdown } from "@/shared/ui/markdown";
 import { Spinner } from "@/shared/ui/spinner";
@@ -17,6 +18,14 @@ function speechAuthorName(
     truncatePubkey(pubkey)
   );
 }
+
+const handoffTypeLabels = {
+  question: "Question",
+  information_request: "Information request",
+  clarification: "Clarification",
+  review: "Review",
+  response_requested: "Response requested",
+} as const;
 
 export function MeetingSpeechTimeline({
   hasOlder,
@@ -68,6 +77,12 @@ export function MeetingSpeechTimeline({
         speeches.map((speech) => {
           const profile = profiles[speech.authorPubkey.toLowerCase()];
           const authorName = speechAuthorName(speech.authorPubkey, profiles);
+          const handoffProfile = speech.handoff
+            ? profiles[speech.handoff.targetPubkey.toLowerCase()]
+            : undefined;
+          const handoffTargetName = speech.handoff
+            ? speechAuthorName(speech.handoff.targetPubkey, profiles)
+            : null;
           return (
             <article
               className="group flex gap-3 rounded-xl px-2 py-3 hover:bg-muted/35"
@@ -81,10 +96,28 @@ export function MeetingSpeechTimeline({
                 label={authorName}
               />
               <div className="min-w-0 flex-1">
-                <div className="mb-1 flex min-w-0 items-baseline gap-2">
+                <div className="mb-1 flex min-w-0 flex-wrap items-center gap-1.5">
                   <span className="truncate text-sm font-semibold">
                     {authorName}
                   </span>
+                  <Badge
+                    data-testid={`meeting-speech-identity-${speech.speechRevision}`}
+                    variant={
+                      speech.authorParticipantType === "agent"
+                        ? "info"
+                        : "outline"
+                    }
+                  >
+                    {speech.authorParticipantType}
+                  </Badge>
+                  {speech.authorIsModerator ? (
+                    <Badge
+                      data-testid={`meeting-speech-host-${speech.speechRevision}`}
+                      variant="warning"
+                    >
+                      Host
+                    </Badge>
+                  ) : null}
                   <time
                     className="shrink-0 text-2xs text-muted-foreground"
                     dateTime={new Date(speech.createdAt * 1_000).toISOString()}
@@ -100,6 +133,35 @@ export function MeetingSpeechTimeline({
                   content={speech.content}
                   interactive
                 />
+                {speech.handoff && handoffTargetName ? (
+                  <div
+                    className="mt-3 flex gap-2.5 rounded-lg border border-border/70 bg-muted/25 px-3 py-2.5"
+                    data-testid={`meeting-speech-handoff-${speech.speechRevision}`}
+                  >
+                    <CornerDownRight className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-xs font-semibold">
+                          Directed handoff
+                        </span>
+                        <Badge variant="outline">
+                          {handoffTypeLabels[speech.handoff.handoffType]}
+                        </Badge>
+                      </div>
+                      <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <ProfileAvatar
+                          avatarUrl={handoffProfile?.avatarUrl ?? null}
+                          className="size-4"
+                          label={handoffTargetName}
+                        />
+                        <span className="truncate">To {handoffTargetName}</span>
+                      </div>
+                      <p className="mt-1.5 whitespace-pre-wrap text-sm leading-5">
+                        {speech.handoff.reason}
+                      </p>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </article>
           );

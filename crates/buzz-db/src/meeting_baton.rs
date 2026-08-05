@@ -2673,6 +2673,98 @@ mod tests {
         seed_relay_member(pool, community_id, pubkey, relay_role).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_capacity_uses_authoritative_identity_and_counts_the_host() {
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let human_host = vec![0x80_u8; 32];
+        let agent_host = vec![0x81_u8; 32];
+        let agents = (0x82_u8..=0x89)
+            .map(|value| vec![value; 32])
+            .collect::<Vec<_>>();
+        let humans = (0x90_u8..=0x93)
+            .map(|value| vec![value; 32])
+            .collect::<Vec<_>>();
+
+        seed_identity(&pool, community_id, &human_host, "owner", None, "anyone").await;
+        seed_identity(
+            &pool,
+            community_id,
+            &agent_host,
+            "member",
+            Some(&human_host),
+            "owner_only",
+        )
+        .await;
+        for agent in &agents {
+            seed_identity(
+                &pool,
+                community_id,
+                agent,
+                "member",
+                Some(&human_host),
+                "anyone",
+            )
+            .await;
+        }
+        for human in &humans {
+            seed_identity(&pool, community_id, human, "member", None, "anyone").await;
+        }
+
+        let mut agent_host_roster = vec![agent_host.clone()];
+        agent_host_roster.extend(agents.iter().take(7).cloned());
+        agent_host_roster.extend(humans.iter().cloned());
+        assert_eq!(agent_host_roster.len(), MAX_MEETING_PARTICIPANTS);
+        let mut tx = pool.begin().await.expect("begin Agent-host capacity check");
+        let resolved =
+            resolve_participants_tx(&mut tx, community_id, &agent_host, &agent_host_roster)
+                .await
+                .expect("Agent host plus seven Agent participants is valid");
+        assert_eq!(
+            resolved
+                .iter()
+                .filter(|participant| participant.participant_type == ParticipantType::Agent)
+                .count(),
+            MAX_MEETING_AGENTS
+        );
+        tx.rollback()
+            .await
+            .expect("rollback Agent-host capacity check");
+
+        let mut human_host_roster = vec![human_host.clone()];
+        human_host_roster.extend(agents.iter().cloned());
+        human_host_roster.extend(humans.iter().take(3).cloned());
+        assert_eq!(human_host_roster.len(), MAX_MEETING_PARTICIPANTS);
+        let mut tx = pool.begin().await.expect("begin Human-host capacity check");
+        let resolved =
+            resolve_participants_tx(&mut tx, community_id, &human_host, &human_host_roster)
+                .await
+                .expect("Human host plus eight Agent participants is valid");
+        assert_eq!(
+            resolved
+                .iter()
+                .filter(|participant| participant.participant_type == ParticipantType::Agent)
+                .count(),
+            MAX_MEETING_AGENTS
+        );
+        tx.rollback()
+            .await
+            .expect("rollback Human-host capacity check");
+
+        let mut over_capacity_roster = vec![agent_host.clone()];
+        over_capacity_roster.extend(agents);
+        let mut tx = pool.begin().await.expect("begin over-capacity check");
+        let error =
+            resolve_participants_tx(&mut tx, community_id, &agent_host, &over_capacity_roster)
+                .await
+                .expect_err("Agent host plus eight Agent participants must be rejected");
+        assert!(error
+            .to_string()
+            .contains("meeting supports at most 8 agents"));
+        tx.rollback().await.expect("rollback over-capacity check");
+    }
+
     async fn insert_command_event_tx(
         tx: &mut Transaction<'_, Postgres>,
         community_id: CommunityId,

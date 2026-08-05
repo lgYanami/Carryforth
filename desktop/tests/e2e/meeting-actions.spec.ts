@@ -200,7 +200,7 @@ test("Human host enters action finalization, visits Project View, and atomically
     "closed",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "Actions recorded",
+    "Action output confirmed",
   );
 
   const actions = await page.evaluate(() =>
@@ -295,6 +295,10 @@ test("runnable and blocked action runs can return to a new Board window", async 
 
   for (const meetingId of [IDS.returnRunnable, IDS.returnBlocked]) {
     await openMeeting(page, meetingId);
+    const boardTrigger = page.getByTestId("meeting-board-trigger");
+    await expect(boardTrigger).toHaveAttribute("aria-expanded", "true");
+    await boardTrigger.click();
+    await expect(page.getByTestId("meeting-board-wide")).toBeHidden();
     await page.getByTestId("meeting-action-return-board").click();
     await expect(
       page.getByTestId("meeting-action-return-dialog"),
@@ -304,6 +308,7 @@ test("runnable and blocked action runs can return to a new Board window", async 
       "data-meeting-lifecycle",
       "active",
     );
+    await expect(boardTrigger).toHaveAttribute("aria-expanded", "true");
     await expect(page.getByTestId("meeting-board-editor")).toBeVisible();
   }
 });
@@ -370,6 +375,17 @@ test("Agent-hosted action finalization remains read-only for Human participants"
   });
   await openMeeting(page, IDS.agentHost);
 
+  const observation = page.getByTestId("meeting-host-observation");
+  await expect(observation).toBeVisible();
+  await expect(
+    page.getByTestId("meeting-host-observation-phase"),
+  ).toContainText("Action finalization");
+  await expect(
+    page.getByTestId("meeting-host-observation-action"),
+  ).toContainText("Ready to record actions");
+  await expect(
+    observation.locator("button, input, select, textarea"),
+  ).toHaveCount(0);
   await expect(page.getByTestId("meeting-read-only-floor")).toContainText(
     "host Agent is recording actions",
   );
@@ -401,6 +417,7 @@ test("aborting during action finalization warns that external effects may remain
   });
   await openMeeting(page, IDS.abort);
 
+  await page.getByTestId("meeting-more-trigger").click();
   await page.getByTestId("meeting-action-abort").click();
   await expect(page.getByTestId("meeting-action-abort-dialog")).toContainText(
     "may already have occurred",
@@ -414,6 +431,6 @@ test("aborting during action finalization warns that external effects may remain
     "aborted",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "External effects may remain",
+    "External system effects may remain",
   );
 });

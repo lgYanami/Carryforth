@@ -1,4 +1,4 @@
-//! Deterministic three-Agent proof for direct Meeting V2 action finalization.
+//! Deterministic eight-Agent proof for direct Meeting V2 action finalization.
 //!
 //! Requires a disposable Relay database and a Relay started with both
 //! `BUZZ_MEETING_V2_CREATE_ENABLED=true` and
@@ -196,7 +196,7 @@ async fn latest_state(keys: &Keys, meeting_id: Uuid) -> Value {
 
 #[tokio::test]
 #[ignore = "requires a disposable Relay with direct-action Meeting V2 creation enabled"]
-async fn three_agents_complete_one_direct_action_lifecycle() {
+async fn eight_agents_complete_one_direct_action_lifecycle() {
     let pool = test_pool().await;
     let community = ensure_community(&pool).await;
     let db = buzz_db::Db::from_pool(pool.clone());
@@ -204,6 +204,7 @@ async fn three_agents_complete_one_direct_action_lifecycle() {
     let moderator = Keys::generate();
     let participant_a = Keys::generate();
     let participant_b = Keys::generate();
+    let additional_agents = (0..6).map(|_| Keys::generate()).collect::<Vec<_>>();
 
     seed_user(&pool, community, &owner).await;
     db.bootstrap_owner(community, &owner.public_key().to_hex())
@@ -212,6 +213,9 @@ async fn three_agents_complete_one_direct_action_lifecycle() {
     seed_agent(&pool, &db, community, &moderator, &owner, "admin").await;
     seed_agent(&pool, &db, community, &participant_a, &owner, "member").await;
     seed_agent(&pool, &db, community, &participant_b, &owner, "member").await;
+    for agent in &additional_agents {
+        seed_agent(&pool, &db, community, agent, &owner, "member").await;
+    }
 
     sqlx::query(
         "UPDATE users SET capabilities = NULL \
@@ -226,6 +230,10 @@ async fn three_agents_complete_one_direct_action_lifecycle() {
     let moderator_hex = moderator.public_key().to_hex();
     let participant_a_hex = participant_a.public_key().to_hex();
     let participant_b_hex = participant_b.public_key().to_hex();
+    let additional_agent_hex = additional_agents
+        .iter()
+        .map(|agent| agent.public_key().to_hex())
+        .collect::<Vec<_>>();
     let capability_probe = buzz_sdk::build_meeting_v2_actions_create(MeetingV2CreateParams {
         session_id: Uuid::new_v4(),
         title: "Incomplete direct-action capability roster",
@@ -258,14 +266,65 @@ async fn three_agents_complete_one_direct_action_lifecycle() {
     let (status, body) = post_event(&participant_b, &capability_profile).await;
     assert_accepted(status, &body);
 
+    let at_capacity_participants = [
+        participant_a_hex.as_str(),
+        participant_b_hex.as_str(),
+        additional_agent_hex[0].as_str(),
+        additional_agent_hex[1].as_str(),
+        additional_agent_hex[2].as_str(),
+        additional_agent_hex[3].as_str(),
+        additional_agent_hex[4].as_str(),
+    ];
+    let over_capacity_id = Uuid::new_v4();
+    let over_capacity_participants = [
+        participant_a_hex.as_str(),
+        participant_b_hex.as_str(),
+        additional_agent_hex[0].as_str(),
+        additional_agent_hex[1].as_str(),
+        additional_agent_hex[2].as_str(),
+        additional_agent_hex[3].as_str(),
+        additional_agent_hex[4].as_str(),
+        additional_agent_hex[5].as_str(),
+    ];
+    let over_capacity = buzz_sdk::build_meeting_v2_actions_create(MeetingV2CreateParams {
+        session_id: over_capacity_id,
+        title: "Nine-Agent direct-action rejection",
+        description: None,
+        source_channel_id: None,
+        author_pubkey: &moderator_hex,
+        participant_pubkeys: &over_capacity_participants,
+        initial_board: "# Goal\nReject the ninth authoritative Agent.",
+    })
+    .expect("build nine-Agent direct-action Create")
+    .sign_with_keys(&moderator)
+    .expect("sign nine-Agent direct-action Create");
+    let (status, body) = post_event(&moderator, &over_capacity).await;
+    assert!(
+        !status.is_success() && body.contains("meeting supports at most 8 agents"),
+        "expected the ninth Agent to be rejected, got HTTP {status}: {body}"
+    );
+    assert!(
+        query(
+            &moderator,
+            json!([{
+                "kinds": [KIND_MEETING_STATE],
+                "#h": [over_capacity_id.to_string()],
+                "limit": 10
+            }])
+        )
+        .await
+        .is_empty(),
+        "a rejected over-capacity Create must not publish Meeting State"
+    );
+
     let meeting_id = Uuid::new_v4();
     let create = buzz_sdk::build_meeting_v2_actions_create(MeetingV2CreateParams {
         session_id: meeting_id,
-        title: "Three-Agent direct-action lifecycle",
+        title: "Eight-Agent direct-action lifecycle",
         description: Some("deterministic backend acceptance"),
         source_channel_id: None,
         author_pubkey: &moderator_hex,
-        participant_pubkeys: &[participant_a_hex.as_str(), participant_b_hex.as_str()],
+        participant_pubkeys: &at_capacity_participants,
         initial_board: "# Goal\nReach a conclusion.\n\n## Closing actions\n- Record the accepted result using the appropriate ordinary business tool.",
     })
     .expect("build direct-action Meeting Create")
@@ -278,6 +337,7 @@ async fn three_agents_complete_one_direct_action_lifecycle() {
         create_response["floor_policy_version"],
         buzz_sdk::MEETING_V2_ACTIONS_POLICY
     );
+    assert_eq!(create_response["participant_count"].as_u64(), Some(8));
     let board_event_id = create_response["board_event_id"]
         .as_str()
         .expect("initial Board event id")

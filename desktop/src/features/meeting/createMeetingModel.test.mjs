@@ -36,7 +36,7 @@ test("validates roster bounds, canonical identities and UTF-8 Board bytes", () =
     validateMeetingDraft({
       title: "Review",
       goal: "Decide",
-      participantPubkeys: [HUMAN],
+      participants: [{ pubkey: HUMAN, isAgent: false }],
       board: "# Review",
     }),
     [],
@@ -44,13 +44,48 @@ test("validates roster bounds, canonical identities and UTF-8 Board bytes", () =
   const errors = validateMeetingDraft({
     title: "",
     goal: "",
-    participantPubkeys: [HUMAN, HUMAN],
+    participants: [
+      { pubkey: HUMAN, isAgent: false },
+      { pubkey: HUMAN, isAgent: false },
+    ],
     board: `# Goal\n${"界".repeat(MAX_MEETING_BOARD_BYTES)}`,
   });
   assert.ok(errors.some((error) => error.includes("name is required")));
   assert.ok(errors.some((error) => error.includes("goal is required")));
   assert.ok(errors.some((error) => error.includes("duplicate")));
   assert.ok(errors.some((error) => error.includes("byte limit")));
+});
+
+test("allows eight Agents and rejects a ninth without consuming Human capacity", () => {
+  const agents = Array.from({ length: 8 }, (_, index) => ({
+    pubkey: (index + 10).toString(16).padStart(64, "0"),
+    isAgent: true,
+  }));
+  const base = {
+    title: "Capacity",
+    goal: "Confirm the roster boundary",
+    board: "# Capacity",
+  };
+
+  assert.deepEqual(validateMeetingDraft({ ...base, participants: agents }), []);
+  const errors = validateMeetingDraft({
+    ...base,
+    participants: [...agents, { pubkey: "ff".repeat(32), isAgent: true }],
+  });
+  assert.ok(errors.some((error) => error.includes("at most 8 Agents")));
+
+  assert.deepEqual(
+    validateMeetingDraft({
+      ...base,
+      participants: [
+        ...agents,
+        { pubkey: HUMAN, isAgent: false },
+        { pubkey: "6".repeat(64), isAgent: false },
+        { pubkey: "7".repeat(64), isAgent: false },
+      ],
+    }),
+    [],
+  );
 });
 
 test("deduplicates roster sources and classifies Agent capability tri-state", () => {

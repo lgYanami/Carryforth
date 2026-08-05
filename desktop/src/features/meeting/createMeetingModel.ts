@@ -3,7 +3,9 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export const MEETING_ACTION_CAPABILITY = "meeting-v2-action-finalization-v2";
 export const MAX_MEETING_BOARD_BYTES = 65_536;
-export const MAX_OTHER_MEETING_PARTICIPANTS = 11;
+export const MAX_MEETING_PARTICIPANTS = 12;
+export const MAX_OTHER_MEETING_PARTICIPANTS = MAX_MEETING_PARTICIPANTS - 1;
+export const MAX_MEETING_AGENTS = 8;
 
 export type MeetingAgentCapability =
   | "not_applicable"
@@ -26,7 +28,7 @@ export type InitialMeetingBoardInput = {
 export type MeetingDraftValidationInput = {
   title: string;
   goal: string;
-  participantPubkeys: readonly string[];
+  participants: readonly Pick<UserSearchResult, "isAgent" | "pubkey">[];
   board: string;
 };
 
@@ -87,7 +89,9 @@ export function validateMeetingDraft(
     errors.push("Discussion goal is required.");
   }
 
-  const normalizedParticipants = input.participantPubkeys.map(normalizePubkey);
+  const normalizedParticipants = input.participants.map((participant) =>
+    normalizePubkey(participant.pubkey),
+  );
   if (
     normalizedParticipants.length < 1 ||
     normalizedParticipants.length > MAX_OTHER_MEETING_PARTICIPANTS
@@ -103,6 +107,12 @@ export function validateMeetingDraft(
     normalizedParticipants.some((pubkey) => !/^[0-9a-f]{64}$/u.test(pubkey))
   ) {
     errors.push("Every Meeting participant must have a valid public key.");
+  }
+  if (
+    input.participants.filter((participant) => participant.isAgent).length >
+    MAX_MEETING_AGENTS
+  ) {
+    errors.push(`A Meeting can include at most ${MAX_MEETING_AGENTS} Agents.`);
   }
 
   if (!input.board.trim()) {

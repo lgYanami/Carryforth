@@ -1,11 +1,13 @@
 import { expect, test } from "@playwright/test";
 
 import type {
+  MeetingActivity,
   MeetingLifecycle,
   MeetingLoadResult,
   MeetingSnapshot,
   MeetingSpeech,
 } from "../../src/shared/api/tauriMeetings";
+import { waitForAnimations } from "../helpers/animations";
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
 const HOST = TEST_IDENTITIES.alice.pubkey;
@@ -20,18 +22,116 @@ const IDS = {
   aborted: "10000000-0000-4000-8000-000000000004",
   forbidden: "10000000-0000-4000-8000-000000000005",
   unsupported: "10000000-0000-4000-8000-000000000006",
+  relayAborted: "10000000-0000-4000-8000-000000000007",
 } as const;
 
 function speech(revision: number, content: string): MeetingSpeech {
+  const authorPubkey = revision % 2 === 0 ? HOST : HUMAN;
   return {
     eventId: revision.toString(16).padStart(64, "0"),
-    authorPubkey: revision % 2 === 0 ? HOST : AGENT,
+    authorPubkey,
     content,
     createdAt: NOW + revision,
     speechRevision: revision,
     grantEventId: "a".repeat(64),
-    mentions: [],
+    mentions: revision === 2 ? [AGENT] : [],
+    authorParticipantType: revision % 2 === 0 ? "agent" : "human",
+    authorIsModerator: authorPubkey === HOST,
+    handoff:
+      revision === 1
+        ? {
+            targetPubkey: AGENT,
+            handoffType: "review",
+            reason: "Please review the verified Desktop boundary.",
+          }
+        : null,
   };
+}
+
+function meetingActivities(): MeetingActivity[] {
+  const kinds: Array<{
+    kind: MeetingActivity["kind"];
+    summary: string;
+    actor?: string;
+    target?: string;
+  }> = [
+    {
+      kind: "meeting_closed",
+      summary: "The host closed the meeting after confirming its outcome.",
+      actor: HOST,
+    },
+    {
+      kind: "action_retried",
+      summary: "The host retried recording the meeting actions.",
+      actor: HOST,
+    },
+    {
+      kind: "action_blocked",
+      summary: "Recording the meeting actions became blocked.",
+      actor: HOST,
+    },
+    {
+      kind: "action_finalization_started",
+      summary: "The meeting entered action finalization.",
+      actor: HOST,
+    },
+    {
+      kind: "handoff_resolved",
+      summary: "A directed handoff was answered by the accepted Speech.",
+      actor: AGENT,
+    },
+    {
+      kind: "handoff_attempted",
+      summary: "The host offered the floor for a directed handoff.",
+      actor: HOST,
+      target: HUMAN,
+    },
+    {
+      kind: "floor_yielded",
+      summary: "The participant yielded the floor.",
+      actor: AGENT,
+    },
+    {
+      kind: "floor_granted",
+      summary: "The participant accepted the offer and received the floor.",
+      actor: AGENT,
+      target: AGENT,
+    },
+    {
+      kind: "offer_declined",
+      summary: "The participant declined the floor offer.",
+      actor: HUMAN,
+      target: HUMAN,
+    },
+    {
+      kind: "floor_offered",
+      summary: "The host offered the floor to a participant.",
+      actor: HOST,
+      target: AGENT,
+    },
+    {
+      kind: "board_timed_out",
+      summary: "The Board maintenance window timed out.",
+    },
+    {
+      kind: "board_updated",
+      summary: "The host updated the Meeting Board.",
+      actor: HOST,
+    },
+  ];
+  const filler = Array.from({ length: 22 }, (_, index) => ({
+    kind: "board_unchanged" as const,
+    summary: `The host completed Board maintenance without changes (${index + 1}).`,
+    actor: HOST,
+  }));
+  return [...kinds, ...filler].map((activity, index) => ({
+    activityId: `verified-activity-${index + 1}`,
+    kind: activity.kind,
+    occurredAtMs: (NOW + 200 - index) * 1_000,
+    actorPubkey: activity.actor ?? null,
+    targetPubkey: activity.target ?? null,
+    summary: activity.summary,
+  }));
 }
 
 function readyMeeting(input: {
@@ -40,7 +140,16 @@ function readyMeeting(input: {
   lifecycle: MeetingLifecycle;
   phase?: string;
   outcome?: "closed" | "aborted";
-}): { result: MeetingLoadResult; speeches: MeetingSpeech[] } {
+  reasonCode?: string;
+  reason?: string | null;
+  endedBy?: string;
+  terminationSource?: "host" | "relay" | "unknown";
+  actionStarted?: boolean;
+}): {
+  result: MeetingLoadResult;
+  speeches: MeetingSpeech[];
+  activities: MeetingActivity[];
+} {
   const speeches = [
     speech(1, "I recommend shipping the verified read path first."),
     speech(2, "Agreed. The Board captures the acceptance boundary."),
@@ -49,14 +158,20 @@ function readyMeeting(input: {
     ? {
         eventId: "e".repeat(64),
         outcome: input.outcome,
-        reasonCode: input.outcome === "aborted" ? "insufficient_context" : null,
+        reasonCode:
+          input.outcome === "aborted"
+            ? (input.reasonCode ?? "insufficient_information")
+            : null,
         reason:
           input.outcome === "aborted"
-            ? "The required evidence was not available."
+            ? input.reason === undefined
+              ? "The required evidence was not available."
+              : input.reason
             : null,
-        endedBy: HOST,
+        endedBy: input.endedBy ?? HOST,
         endedAt: NOW + 20,
         actionsAttested: input.outcome === "closed",
+        terminationSource: input.terminationSource ?? "host",
       }
     : null;
   const snapshot: MeetingSnapshot = {
@@ -94,22 +209,28 @@ function readyMeeting(input: {
       source: "projection",
     },
     action:
-      input.lifecycle === "finalizing_actions"
+      input.lifecycle === "finalizing_actions" || input.actionStarted
         ? {
             actionRunId: "20000000-0000-4000-8000-000000000001",
             boardEventId: "b".repeat(64),
             actionWindowEpoch: 1,
             condition: "runnable",
-            terminalStatus: null,
+            terminalStatus:
+              input.lifecycle === "aborted" ? "completed_aborted" : null,
             completionEventId: null,
-            actionDeadlineAtMs: (NOW + 600) * 1_000,
+            actionDeadlineAtMs:
+              input.lifecycle === "aborted" ? null : (NOW + 600) * 1_000,
             lastErrorCode: null,
           }
         : null,
     end,
     latestSpeechAt: NOW + 2,
   };
-  return { result: { status: "ready", snapshot }, speeches };
+  return {
+    result: { status: "ready", snapshot },
+    speeches,
+    activities: meetingActivities(),
+  };
 }
 
 function meetingSeeds() {
@@ -151,6 +272,21 @@ function meetingSeeds() {
         title: "Aborted evidence review",
         lifecycle: "aborted",
         outcome: "aborted",
+        actionStarted: true,
+      }),
+    },
+    {
+      id: IDS.relayAborted,
+      title: "Access-revoked meeting",
+      ...readyMeeting({
+        id: IDS.relayAborted,
+        title: "Access-revoked meeting",
+        lifecycle: "aborted",
+        outcome: "aborted",
+        reasonCode: "participant_revoked",
+        reason: null,
+        endedBy: "f".repeat(64),
+        terminationSource: "relay",
       }),
     },
     {
@@ -223,9 +359,24 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
     "verified read path first",
   );
-  await expect(page.getByTestId("meeting-status-strip")).toContainText(
-    "has the floor",
+  await expect(page.getByTestId("meeting-speech-identity-1")).toHaveText(
+    "human",
   );
+  await expect(page.getByTestId("meeting-speech-identity-2")).toHaveText(
+    "agent",
+  );
+  await expect(page.getByTestId("meeting-speech-host-2")).toHaveText("Host");
+  const handoff = page.getByTestId("meeting-speech-handoff-1");
+  await expect(handoff).toContainText("Directed handoff");
+  await expect(handoff).toContainText("Review");
+  await expect(handoff).toContainText("charlie");
+  await expect(handoff).toContainText(
+    "Please review the verified Desktop boundary.",
+  );
+  await expect(page.getByTestId("meeting-speech-handoff-2")).toHaveCount(0);
+  const statusStrip = page.getByTestId("meeting-status-strip");
+  await expect(statusStrip).toContainText("has the floor");
+  await expect(statusStrip).not.toContainText(/Speech r\d+|State r\d+/);
   await expect(page.getByTestId("message-composer")).toHaveCount(0);
   await expect(page.getByTestId("channel-composer-overlay")).toHaveCount(0);
   await expect(page.getByTestId("channel-drop-zone")).toHaveCount(0);
@@ -234,10 +385,198 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   await expect(page.getByTestId("channel-management-trigger")).toHaveCount(0);
 
   await page.getByTestId("meeting-participants-trigger").click();
-  await expect(page.getByTestId("meeting-participants")).toContainText("alice");
+  const participants = page.getByTestId("meeting-participants");
+  await expect(participants).toContainText("alice");
+  await expect(participants.getByLabel("Host")).toBeVisible();
   await expect(
-    page.getByTestId("meeting-participants").getByLabel("Host"),
+    page.getByTestId("meeting-participant-group-host"),
+  ).toContainText("Host");
+  await expect(
+    page.getByTestId("meeting-participant-group-human"),
+  ).toContainText("Human participants");
+  await expect(
+    page.getByTestId("meeting-participant-group-agent"),
+  ).toContainText("Agent participants");
+  await expect(page.getByTestId(`meeting-participant-${HOST}`)).toHaveCount(1);
+  await expect(
+    page.getByTestId(`meeting-participant-status-${AGENT}`),
+  ).toHaveText("Speaking");
+  await expect(
+    page.getByTestId(`meeting-participant-status-${HUMAN}`),
+  ).toHaveText("Idle");
+  await expect(participants.getByRole("button")).toHaveCount(0);
+});
+
+test("Meeting Header exposes verified identity and only Meeting-scoped actions", async ({
+  page,
+}, testInfo) => {
+  await installMockBridge(page, { meetings: meetingSeeds() });
+  await page.goto("/");
+  await page.getByTestId(`meeting-row-${IDS.active}`).click();
+
+  const header = page.getByTestId("meeting-header");
+  await expect(header).toBeVisible();
+  await expect(page.getByTestId("meeting-header-icon")).toBeVisible();
+  await expect(page.getByTestId("meeting-lifecycle-badge")).toContainText(
+    "In progress",
+  );
+  await expect(page.getByTestId("meeting-host-identity")).toContainText(
+    "alice",
+  );
+  await expect(page.getByTestId("meeting-host-identity")).toContainText(
+    "agent host",
+  );
+  await expect(page.getByTestId("meeting-host-avatar")).toBeVisible();
+  await expect(
+    page.getByTestId(`meeting-header-participant-${HOST}`),
   ).toBeVisible();
+  await expect(page.getByTestId("meeting-participants-trigger")).toContainText(
+    "3",
+  );
+  await expect(page.getByTestId("meeting-board-trigger")).toBeVisible();
+
+  await page.getByTestId("meeting-more-trigger").click();
+  const menu = page.getByTestId("meeting-more-menu");
+  await expect(menu).toContainText("View participants");
+  await expect(menu).toContainText("Open source context");
+  await expect(menu).toContainText("Meeting activity");
+  await expect(menu).toContainText("Copy Meeting link");
+  await expect(menu).not.toContainText("Abort meeting");
+  await expect(menu).not.toContainText(
+    /Add people|Create agent|Leave|Archive|Delete|Huddle|Notifications/i,
+  );
+  await page.getByTestId("meeting-menu-copy-link").click();
+  const copiedPayload = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).findLast(
+        (entry) => entry.command === "copy_text_to_clipboard",
+      )?.payload,
+  );
+  expect(copiedPayload).toEqual({
+    text: `http://127.0.0.1:4173/#/channels/${IDS.active}`,
+  });
+
+  await waitForAnimations(page);
+  const wideShot = await header.screenshot({
+    path: testInfo.outputPath("meeting-header-wide.png"),
+  });
+  await page.setViewportSize({ width: 760, height: 800 });
+  await expect(page.getByTestId("meeting-board-trigger")).toBeVisible();
+  await expect(page.getByTestId("meeting-more-trigger")).toBeVisible();
+  await expect(page.getByTestId("meeting-host-avatar")).toBeVisible();
+  await expect(page.getByTestId("meeting-lifecycle-badge")).toBeVisible();
+  await waitForAnimations(page);
+  const narrowShot = await header.screenshot({
+    path: testInfo.outputPath("meeting-header-narrow.png"),
+  });
+  expect(wideShot.equals(narrowShot)).toBe(false);
+});
+
+test("Meeting activity is bounded, product-level, and separate from canonical Speech", async ({
+  page,
+}) => {
+  await installMockBridge(page, { meetings: meetingSeeds() });
+  await page.goto("/");
+  await page.getByTestId(`meeting-row-${IDS.active}`).click();
+
+  const speechTimeline = page.getByTestId("meeting-speech-timeline");
+  await expect(speechTimeline).toContainText("verified read path first");
+  await page.getByTestId("meeting-more-trigger").click();
+  await page.getByTestId("meeting-menu-activity").click();
+  const panel = page.getByTestId("meeting-activity-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("The host updated the Meeting Board.");
+  await expect(panel).toContainText(
+    "The participant accepted the offer and received the floor.",
+  );
+  await expect(panel).toContainText("The meeting entered action finalization.");
+  await expect(panel.locator("[data-activity-kind]")).toHaveCount(30);
+  await expect(panel).not.toContainText(
+    /event.?id|state.?revision|floor.?revision|control.?epoch|lease|control.?token/i,
+  );
+  await expect(panel.getByTestId("message-reactions")).toHaveCount(0);
+  await expect(speechTimeline).not.toContainText(
+    "The host updated the Meeting Board.",
+  );
+
+  await page.getByTestId("meeting-activity-load-older").click();
+  await expect(panel.locator("[data-activity-kind]")).toHaveCount(34);
+  await expect(page.getByTestId("meeting-activity-load-older")).toHaveCount(0);
+  const reads = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter(
+      (entry) => entry.command === "get_meeting_activities",
+    ),
+  );
+  expect(reads).toHaveLength(2);
+});
+
+test("terminal summaries distinguish goal-reached close, host abort, and Relay abort", async ({
+  page,
+}) => {
+  await installMockBridge(page, { meetings: meetingSeeds() });
+  await page.goto("/");
+
+  await page.getByTestId("meeting-history-trigger").click();
+  await page
+    .getByRole("button", { name: /Completed requirements review/ })
+    .click();
+  let summary = page.getByTestId("meeting-terminal-summary");
+  await expect(summary).toContainText(
+    "The host judged that the meeting goal was reached.",
+  );
+  await expect(summary).toContainText("Action output confirmed");
+  await expect(summary).toContainText(
+    "This does not mean that the resulting work is complete.",
+  );
+  await expect(summary).toContainText("Source: Host");
+  await page.getByTestId("meeting-more-trigger").click();
+  await page.getByTestId("meeting-menu-outcome").click();
+  await expect(page.locator("#meeting-terminal-outcome")).toBeFocused();
+  await expect(page.getByTestId("meeting-host-abort")).toHaveCount(0);
+
+  await page.getByTestId("meeting-history-trigger").click();
+  await page.getByRole("button", { name: /Aborted evidence review/ }).click();
+  summary = page.getByTestId("meeting-terminal-summary");
+  await expect(summary).toContainText(
+    "The meeting did not end as a normal goal-reached close.",
+  );
+  await expect(summary).toContainText("Insufficient information");
+  await expect(summary).toContainText(
+    "The required evidence was not available.",
+  );
+  await expect(summary).toContainText("Source: Host");
+  await expect(
+    page.getByTestId("meeting-terminal-external-effects-warning"),
+  ).toContainText(
+    "External system effects may remain; Meeting does not verify or list them.",
+  );
+
+  await page.getByTestId("meeting-history-trigger").click();
+  await page.getByRole("button", { name: /Access-revoked meeting/ }).click();
+  summary = page.getByTestId("meeting-terminal-summary");
+  await expect(summary).toContainText("Participant access revoked");
+  await expect(summary).toContainText("Source: Community Relay");
+  await expect(summary).not.toContainText(
+    "The required evidence was not available.",
+  );
+  await expect(
+    page.getByTestId("meeting-terminal-external-effects-warning"),
+  ).toHaveCount(0);
+
+  await expect(page.getByRole("button", { name: /reopen/i })).toHaveCount(0);
+  for (const testId of [
+    "meeting-board-editor",
+    "meeting-board-save",
+    "meeting-speech-composer",
+    "meeting-floor-request",
+    "meeting-host-end-controls",
+    "meeting-action-finalization-card",
+  ]) {
+    await expect(page.getByTestId(testId)).toHaveCount(0);
+  }
+  await expect(page.getByTestId("meeting-screen")).not.toContainText(
+    /receipt|Relay verified all actions/i,
+  );
 });
 
 test("action, history, forbidden, and unsupported Meeting states stay read-only", async ({
@@ -273,7 +612,7 @@ test("action, history, forbidden, and unsupported Meeting states stay read-only"
     "final Board",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "Actions recorded",
+    "Action output confirmed",
   );
 
   await page.getByTestId("meeting-history-trigger").click();
@@ -286,13 +625,14 @@ test("action, history, forbidden, and unsupported Meeting states stay read-only"
     "required evidence was not available",
   );
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
-    "insufficient context",
+    "Insufficient information",
   );
 
   await page.getByTestId(`meeting-row-${IDS.forbidden}`).click();
   await expect(page.getByTestId("meeting-load-state")).toContainText(
     "not a participant",
   );
+  await expect(page.getByTestId("meeting-activity-trigger")).toHaveCount(0);
   await expect(page.getByTestId("message-composer")).toHaveCount(0);
 
   await page.getByTestId(`meeting-row-${IDS.unsupported}`).click();

@@ -190,9 +190,18 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
   await expect(page.getByTestId("meeting-speech-composer")).toBeVisible();
 
-  await page
-    .getByTestId("meeting-speech-input")
-    .fill("The exact-retry boundary is ready for review.");
+  const speechInput = page.getByTestId("meeting-speech-input");
+  await speechInput.fill("The exact-retry boundary is ready for review.");
+  await page.getByTestId("meeting-board-trigger").click();
+  await expect(page.getByTestId("meeting-board-wide")).toBeHidden();
+  await expect(speechInput).toHaveValue(
+    "The exact-retry boundary is ready for review.",
+  );
+  await page.getByTestId("meeting-board-trigger").click();
+  await expect(page.getByTestId("meeting-board-wide")).toBeVisible();
+  await expect(speechInput).toHaveValue(
+    "The exact-retry boundary is ready for review.",
+  );
   await page.getByTestId("meeting-handoff-toggle").click();
   await page.getByTestId("meeting-handoff-target").selectOption(HUMAN);
   await page
@@ -203,14 +212,26 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
   await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
     "The exact-retry boundary is ready for review.",
   );
+  await expect(page.getByTestId("meeting-speech-identity-1")).toHaveText(
+    "human",
+  );
+  const renderedHandoff = page.getByTestId("meeting-speech-handoff-1");
+  await expect(renderedHandoff).toContainText("Question");
+  await expect(renderedHandoff).toContainText("bob");
+  await expect(renderedHandoff).toContainText(
+    "Please verify the participant-facing behavior.",
+  );
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
-  const speechInput = await page.evaluate(() =>
+  await expect(page.getByTestId(`meeting-attention-${MEETING_ID}`)).toHaveCount(
+    0,
+  );
+  const submittedSpeechInput = await page.evaluate(() =>
     (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
       .filter((entry) => entry.command === "submit_meeting_floor_action")
       .map((entry) => entry.payload.input)
       .find((input) => input.action.type === "speech"),
   );
-  expect(speechInput.action.handoff).toEqual({
+  expect(submittedSpeechInput.action.handoff).toEqual({
     targetPubkey: HUMAN,
     handoffType: "question",
     reason: "Please verify the participant-facing behavior.",
@@ -228,6 +249,17 @@ test("queued Human request can be withdrawn without interrupting a Grant", async
   await expect(page.getByTestId("meeting-status-strip")).toContainText(
     "has the floor",
   );
+  await page.getByTestId("meeting-participants-trigger").click();
+  await expect(
+    page.getByTestId(`meeting-participant-status-${CURRENT}`),
+  ).toHaveText("Floor requested");
+  await expect(
+    page.getByTestId(`meeting-participant-${CURRENT}`),
+  ).toContainText("Queue 1");
+  await expect(
+    page.getByTestId(`meeting-participant-status-${AGENT}`),
+  ).toHaveText("Speaking");
+  await page.keyboard.press("Escape");
   await page.getByTestId("meeting-floor-withdraw").click();
   await expect(page.getByTestId("meeting-floor-request")).toBeVisible();
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
@@ -239,6 +271,11 @@ test("Human can decline an addressed Offer with a bounded reason", async ({
   await installMockBridge(page, { meetings: [meetingSeed("offer_self")] });
   await openMeeting(page);
 
+  await page.getByTestId("meeting-participants-trigger").click();
+  await expect(
+    page.getByTestId(`meeting-participant-status-${CURRENT}`),
+  ).toHaveText("Waiting for ACK");
+  await page.keyboard.press("Escape");
   await page.getByTestId("meeting-offer-decline").click();
   await page
     .getByTestId("meeting-offer-decline-reason")

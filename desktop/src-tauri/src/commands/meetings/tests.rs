@@ -538,6 +538,8 @@ fn human_request_priority_disables_host_recall() {
 fn action_policy_end_distinguishes_direct_close_from_recorded_actions() {
     let host = Keys::generate();
     let participant = Keys::generate();
+    let relay = Keys::generate();
+    let identity = test_identity(&relay);
     let (_, create) = test_create(&host, &participant);
     let session_id = Uuid::parse_str(TEST_MEETING_ID)
         .unwrap_or_else(|error| panic!("parse test Meeting ID: {error}"));
@@ -554,10 +556,11 @@ fn action_policy_end_distinguishes_direct_close_from_recorded_actions() {
         .unwrap_or_else(|error| panic!("build direct close: {error}"))
         .sign_with_keys(&host)
         .unwrap_or_else(|error| panic!("sign direct close: {error}"));
-    let direct = parse_current_end(&[direct_close], &create)
+    let direct = parse_current_end(&[direct_close], &identity, &create)
         .unwrap_or_else(|error| panic!("parse direct close: {error:?}"))
         .unwrap_or_else(|| panic!("direct close must be present"));
     assert!(!direct.actions_attested);
+    assert_eq!(direct.termination_source, MeetingTerminationSource::Host);
 
     let board_event_id = "cd".repeat(32);
     let recorded_close =
@@ -576,33 +579,117 @@ fn action_policy_end_distinguishes_direct_close_from_recorded_actions() {
         .unwrap_or_else(|error| panic!("build recorded-actions close: {error}"))
         .sign_with_keys(&host)
         .unwrap_or_else(|error| panic!("sign recorded-actions close: {error}"));
-    let recorded = parse_current_end(&[recorded_close], &create)
+    let recorded = parse_current_end(&[recorded_close], &identity, &create)
         .unwrap_or_else(|error| panic!("parse recorded-actions close: {error:?}"))
         .unwrap_or_else(|| panic!("recorded-actions close must be present"));
     assert!(recorded.actions_attested);
+    assert_eq!(recorded.termination_source, MeetingTerminationSource::Host);
+}
+
+#[test]
+fn end_projection_preserves_abort_reason_and_classifies_only_verified_signers() {
+    let host = Keys::generate();
+    let participant = Keys::generate();
+    let relay = Keys::generate();
+    let outsider = Keys::generate();
+    let identity = test_identity(&relay);
+    let (_, create) = test_create(&host, &participant);
+    let session_id = Uuid::parse_str(TEST_MEETING_ID)
+        .unwrap_or_else(|error| panic!("parse test Meeting ID: {error}"));
+
+    let abort = |signer: &Keys, reason_code: &str, reason: Option<&str>| {
+        buzz_sdk_pkg::build_meeting_v2_actions_end(buzz_sdk_pkg::MeetingV2ActionsEndParams {
+            session_id,
+            create_event_id: &create.event_id,
+            outcome: buzz_sdk_pkg::MeetingV2EndOutcome::Aborted,
+            reason_code: Some(reason_code),
+            reason,
+            action_fence: None,
+        })
+        .unwrap_or_else(|error| panic!("build abort: {error}"))
+        .sign_with_keys(signer)
+        .unwrap_or_else(|error| panic!("sign abort: {error}"))
+    };
+
+    let host_end = parse_current_end(
+        &[abort(
+            &host,
+            "insufficient_information",
+            Some("The required evidence was not available."),
+        )],
+        &identity,
+        &create,
+    )
+    .unwrap_or_else(|error| panic!("parse host abort: {error:?}"))
+    .unwrap_or_else(|| panic!("host abort must be present"));
+    assert_eq!(host_end.termination_source, MeetingTerminationSource::Host);
+    assert_eq!(
+        host_end.reason.as_deref(),
+        Some("The required evidence was not available.")
+    );
+
+    let relay_end = parse_current_end(
+        &[abort(&relay, "participant_revoked", None)],
+        &identity,
+        &create,
+    )
+    .unwrap_or_else(|error| panic!("parse Relay abort: {error:?}"))
+    .unwrap_or_else(|| panic!("Relay abort must be present"));
+    assert_eq!(
+        relay_end.termination_source,
+        MeetingTerminationSource::Relay
+    );
+    assert!(relay_end.reason.is_none());
+
+    let unknown_end = parse_current_end(
+        &[abort(&outsider, "discussion_blocked", None)],
+        &identity,
+        &create,
+    )
+    .unwrap_or_else(|error| panic!("parse unknown abort signer: {error:?}"))
+    .unwrap_or_else(|| panic!("unknown-signer abort must be present"));
+    assert_eq!(
+        unknown_end.termination_source,
+        MeetingTerminationSource::Unknown
+    );
 }
 
 #[test]
 fn speech_requires_signature_roster_scope_and_authoritative_revision() {
     let participant = Keys::generate();
+    let mentioned = Keys::generate();
     let outsider = Keys::generate();
     let participant_pubkey = participant.public_key().to_hex();
-    let roster = BTreeSet::from([participant_pubkey]);
+    let mentioned_pubkey = mentioned.public_key().to_hex();
+    let roster = BTreeMap::from([
+        (participant_pubkey.clone(), MeetingParticipantType::Human),
+        (mentioned_pubkey.clone(), MeetingParticipantType::Agent),
+    ]);
     let speech = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "Ready")
         .tags([
             tag(["h", TEST_MEETING_ID]),
             tag(["v", buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION]),
             tag(["meeting-grant", &"ab".repeat(32)]),
             tag(["speech-revision", "1"]),
+            tag(["p", &mentioned_pubkey]),
         ])
         .sign_with_keys(&participant)
         .unwrap_or_else(|error| panic!("sign test Speech: {error}"));
-    assert!(parse_speech(&speech, TEST_MEETING_ID, &roster, 1)
+    let parsed = parse_speech(&speech, TEST_MEETING_ID, &roster, &participant_pubkey, 1)
         .unwrap_or_else(|error| panic!("valid Speech: {error}"))
-        .is_some());
-    assert!(parse_speech(&speech, TEST_MEETING_ID, &roster, 0)
-        .unwrap_or_else(|error| panic!("future Speech is ignored: {error}"))
-        .is_none());
+        .unwrap_or_else(|| panic!("canonical Speech"));
+    assert!(matches!(
+        parsed.author_participant_type,
+        MeetingParticipantType::Human
+    ));
+    assert!(parsed.author_is_moderator);
+    assert_eq!(parsed.mentions, vec![mentioned_pubkey]);
+    assert!(parsed.handoff.is_none());
+    assert!(
+        parse_speech(&speech, TEST_MEETING_ID, &roster, &participant_pubkey, 0)
+            .unwrap_or_else(|error| panic!("future Speech is ignored: {error}"))
+            .is_none()
+    );
 
     let outside_speech = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "No")
         .tags([
@@ -613,16 +700,119 @@ fn speech_requires_signature_roster_scope_and_authoritative_revision() {
         ])
         .sign_with_keys(&outsider)
         .unwrap_or_else(|error| panic!("sign outsider Speech: {error}"));
-    assert!(parse_speech(&outside_speech, TEST_MEETING_ID, &roster, 1)
-        .unwrap_or_else(|error| panic!("outsider Speech is ignored: {error}"))
-        .is_none());
+    assert!(parse_speech(
+        &outside_speech,
+        TEST_MEETING_ID,
+        &roster,
+        &participant_pubkey,
+        1
+    )
+    .unwrap_or_else(|error| panic!("outsider Speech is ignored: {error}"))
+    .is_none());
 
     let mut tampered = serde_json::to_value(&speech)
         .unwrap_or_else(|error| panic!("serialize test Speech: {error}"));
     tampered["content"] = json!("Tampered");
     let tampered: Event = serde_json::from_value(tampered)
         .unwrap_or_else(|error| panic!("deserialize tampered Speech: {error}"));
-    assert!(parse_speech(&tampered, TEST_MEETING_ID, &roster, 1).is_err());
+    assert!(parse_speech(&tampered, TEST_MEETING_ID, &roster, &participant_pubkey, 1).is_err());
+}
+
+#[test]
+fn speech_handoff_requires_atomic_valid_frozen_semantics() {
+    let speaker = Keys::generate();
+    let target = Keys::generate();
+    let outsider = Keys::generate();
+    let speaker_pubkey = speaker.public_key().to_hex();
+    let target_pubkey = target.public_key().to_hex();
+    let outsider_pubkey = outsider.public_key().to_hex();
+    let roster = BTreeMap::from([
+        (speaker_pubkey.clone(), MeetingParticipantType::Agent),
+        (target_pubkey.clone(), MeetingParticipantType::Human),
+    ]);
+    let valid = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "Please review")
+        .tags([
+            tag(["h", TEST_MEETING_ID]),
+            tag(["v", buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION]),
+            tag(["meeting-grant", &"ab".repeat(32)]),
+            tag(["speech-revision", "1"]),
+            tag(["handoff-to", &target_pubkey]),
+            tag(["handoff-type", "review"]),
+            tag(["handoff-reason", "Verify the read boundary."]),
+        ])
+        .sign_with_keys(&speaker)
+        .unwrap_or_else(|error| panic!("sign valid Handoff Speech: {error}"));
+    let parsed = parse_speech(&valid, TEST_MEETING_ID, &roster, &target_pubkey, 1)
+        .unwrap_or_else(|error| panic!("valid Handoff Speech: {error}"))
+        .unwrap_or_else(|| panic!("canonical Handoff Speech"));
+    assert!(matches!(
+        parsed.author_participant_type,
+        MeetingParticipantType::Agent
+    ));
+    assert!(!parsed.author_is_moderator);
+    let handoff = parsed
+        .handoff
+        .unwrap_or_else(|| panic!("structured Directed Handoff"));
+    assert_eq!(handoff.target_pubkey, target_pubkey);
+    assert_eq!(handoff.handoff_type, MeetingSpeechHandoffType::Review);
+    assert_eq!(handoff.reason, "Verify the read boundary.");
+
+    let partial = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "Partial")
+        .tags([
+            tag(["h", TEST_MEETING_ID]),
+            tag(["v", buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION]),
+            tag(["meeting-grant", &"bc".repeat(32)]),
+            tag(["speech-revision", "1"]),
+            tag(["handoff-to", &target_pubkey]),
+            tag(["handoff-type", "question"]),
+        ])
+        .sign_with_keys(&speaker)
+        .unwrap_or_else(|error| panic!("sign partial Handoff Speech: {error}"));
+    assert!(parse_speech(&partial, TEST_MEETING_ID, &roster, &target_pubkey, 1).is_err());
+
+    let invalid_type = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "Invalid")
+        .tags([
+            tag(["h", TEST_MEETING_ID]),
+            tag(["v", buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION]),
+            tag(["meeting-grant", &"cd".repeat(32)]),
+            tag(["speech-revision", "1"]),
+            tag(["handoff-to", &target_pubkey]),
+            tag(["handoff-type", "delegate"]),
+            tag(["handoff-reason", "Take over."]),
+        ])
+        .sign_with_keys(&speaker)
+        .unwrap_or_else(|error| panic!("sign invalid-type Handoff Speech: {error}"));
+    assert!(parse_speech(&invalid_type, TEST_MEETING_ID, &roster, &target_pubkey, 1).is_err());
+
+    let outside_target =
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "Outside target")
+            .tags([
+                tag(["h", TEST_MEETING_ID]),
+                tag(["v", buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION]),
+                tag(["meeting-grant", &"de".repeat(32)]),
+                tag(["speech-revision", "1"]),
+                tag(["handoff-to", &outsider_pubkey]),
+                tag(["handoff-type", "question"]),
+                tag(["handoff-reason", "Can you answer?"]),
+            ])
+            .sign_with_keys(&speaker)
+            .unwrap_or_else(|error| panic!("sign outside-target Handoff Speech: {error}"));
+    assert!(parse_speech(&outside_target, TEST_MEETING_ID, &roster, &target_pubkey, 1).is_err());
+
+    let duplicate = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "Duplicate")
+        .tags([
+            tag(["h", TEST_MEETING_ID]),
+            tag(["v", buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION]),
+            tag(["meeting-grant", &"ef".repeat(32)]),
+            tag(["speech-revision", "1"]),
+            tag(["handoff-to", &target_pubkey]),
+            tag(["handoff-to", &outsider_pubkey]),
+            tag(["handoff-type", "question"]),
+            tag(["handoff-reason", "Which target?"]),
+        ])
+        .sign_with_keys(&speaker)
+        .unwrap_or_else(|error| panic!("sign duplicate Handoff Speech: {error}"));
+    assert!(parse_speech(&duplicate, TEST_MEETING_ID, &roster, &target_pubkey, 1).is_err());
 }
 
 #[test]

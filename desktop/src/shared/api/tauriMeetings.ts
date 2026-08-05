@@ -206,6 +206,7 @@ export type MeetingEndState = {
   endedBy: string;
   endedAt: number;
   actionsAttested: boolean;
+  terminationSource: "host" | "relay" | "unknown";
 };
 
 export type MeetingSnapshot = {
@@ -255,7 +256,8 @@ export type MeetingListItem = {
   phase: string | null;
   currentSpeakerPubkey: string | null;
   currentOfferPubkey: string | null;
-  humanFloorAttentionPubkey: string | null;
+  needsAttention: boolean;
+  attentionReason: MeetingAttentionReason | null;
   moderatorPubkey: string | null;
   policy: string | null;
   updatedAt: number | null;
@@ -269,6 +271,15 @@ export type MeetingListItem = {
     | "not_found";
 };
 
+export type MeetingAttentionReason =
+  | "floor_offer"
+  | "floor_grant"
+  | "host_board"
+  | "host_floor"
+  | "host_action"
+  | "host_action_blocked"
+  | "meeting_aborted";
+
 export type MeetingSpeech = {
   eventId: string;
   authorPubkey: string;
@@ -277,6 +288,17 @@ export type MeetingSpeech = {
   speechRevision: number;
   grantEventId: string;
   mentions: string[];
+  /** Human/Agent identity frozen by the Meeting roster, not inferred by UI. */
+  authorParticipantType: "human" | "agent";
+  /** Whether the frozen author is the immutable Meeting moderator. */
+  authorIsModerator: boolean;
+  handoff: MeetingSpeechHandoff | null;
+};
+
+export type MeetingSpeechHandoff = {
+  targetPubkey: string;
+  handoffType: MeetingHandoffType;
+  reason: string;
 };
 
 export type MeetingSpeechCursor = {
@@ -287,6 +309,45 @@ export type MeetingSpeechCursor = {
 export type MeetingSpeechPage = {
   speeches: MeetingSpeech[];
   nextCursor: MeetingSpeechCursor | null;
+};
+
+export type MeetingActivityKind =
+  | "board_updated"
+  | "board_unchanged"
+  | "board_timed_out"
+  | "board_preempted"
+  | "floor_offered"
+  | "floor_granted"
+  | "offer_declined"
+  | "offer_expired"
+  | "floor_yielded"
+  | "floor_recalled"
+  | "floor_expired"
+  | "handoff_opened"
+  | "handoff_attempted"
+  | "handoff_resolved"
+  | "action_finalization_started"
+  | "action_blocked"
+  | "action_retried"
+  | "action_returned_to_board"
+  | "action_deadline_exceeded"
+  | "meeting_closed"
+  | "meeting_aborted";
+
+export type MeetingActivity = {
+  /** Stable opaque identity; never interpreted as a Relay event ID. */
+  activityId: string;
+  kind: MeetingActivityKind;
+  occurredAtMs: number;
+  actorPubkey: string | null;
+  targetPubkey: string | null;
+  summary: string;
+};
+
+export type MeetingActivityPage = {
+  activities: MeetingActivity[];
+  /** Opaque native cursor; React must only pass it back unchanged. */
+  nextCursor: string | null;
 };
 
 export type MeetingHandoffType =
@@ -541,6 +602,18 @@ export async function getMeetingSpeeches(input: {
     meetingId: input.meetingId,
     before: input.before?.before ?? null,
     beforeId: input.before?.beforeId ?? null,
+    limit: input.limit ?? null,
+  });
+}
+
+export async function getMeetingActivities(input: {
+  meetingId: string;
+  cursor?: string;
+  limit?: number;
+}): Promise<MeetingActivityPage> {
+  return invokeTauri<MeetingActivityPage>("get_meeting_activities", {
+    meetingId: input.meetingId,
+    cursor: input.cursor ?? null,
     limit: input.limit ?? null,
   });
 }

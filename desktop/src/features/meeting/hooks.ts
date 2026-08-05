@@ -14,6 +14,7 @@ import {
 import { relayClient } from "@/shared/api/relayClient";
 import {
   createMeeting,
+  getMeetingActivities,
   getMeetingCapability,
   getMeetingSnapshot,
   getMeetingSpeeches,
@@ -68,6 +69,11 @@ export const meetingSpeechesQueryKey = (
   communityId: string | undefined,
   meetingId: string,
 ) => [...meetingQueryRoot(communityId), "speeches", meetingId] as const;
+
+export const meetingActivitiesQueryKey = (
+  communityId: string | undefined,
+  meetingId: string,
+) => [...meetingQueryRoot(communityId), "activities", meetingId] as const;
 
 export function useMeetingCapability() {
   const { activeCommunity } = useCommunities();
@@ -272,6 +278,25 @@ export function useMeetingSpeeches(input: {
         before: pageParam,
       }),
     initialPageParam: undefined as MeetingSpeechCursor | undefined,
+    getNextPageParam: (page) => page.nextCursor ?? undefined,
+    enabled: Boolean(activeCommunity && input.meetingId && input.enabled),
+    staleTime: 5_000,
+  });
+}
+
+export function useMeetingActivities(input: {
+  meetingId: string;
+  enabled: boolean;
+}) {
+  const { activeCommunity } = useCommunities();
+  return useInfiniteQuery({
+    queryKey: meetingActivitiesQueryKey(activeCommunity?.id, input.meetingId),
+    queryFn: ({ pageParam }) =>
+      getMeetingActivities({
+        meetingId: input.meetingId,
+        cursor: pageParam,
+      }),
+    initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => page.nextCursor ?? undefined,
     enabled: Boolean(activeCommunity && input.meetingId && input.enabled),
     staleTime: 5_000,

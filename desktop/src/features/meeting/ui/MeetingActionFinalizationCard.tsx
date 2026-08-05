@@ -35,7 +35,6 @@ import {
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Textarea } from "@/shared/ui/textarea";
-import { MeetingHostAbortControl } from "./MeetingHostEndControls";
 
 const BLOCK_LABELS: Record<MeetingActionBlockReason, string> = {
   external_operation_failed: "An external operation failed",
@@ -195,12 +194,7 @@ export function MeetingActionFinalizationCard({
         </div>
       ) : null}
 
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t pt-3">
-        <MeetingHostAbortControl
-          actionPhase
-          disabled={actionController.disabled || hostController.disabled}
-          submit={hostController.submit}
-        />
+      <div className="mt-4 flex flex-wrap items-center justify-end gap-2 border-t pt-3">
         <div className="flex flex-wrap justify-end gap-2">
           <Button
             data-testid="meeting-action-return-board"

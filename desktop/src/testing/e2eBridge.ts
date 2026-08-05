@@ -69,8 +69,10 @@ import type {
 import type {
   CreateMeetingInput,
   CreateMeetingResult,
+  MeetingActivity,
   MeetingActionFinalizationInput,
   MeetingActionFinalizationResult,
+  MeetingAttentionReason,
   MeetingFloorActionInput,
   MeetingFloorActionResult,
   MeetingHostActionInput,
@@ -175,6 +177,7 @@ type MockMeetingSeed = {
   description?: string | null;
   result: MeetingLoadResult;
   speeches?: MeetingSpeech[];
+  activities?: MeetingActivity[];
 };
 
 type E2eConfig = {
@@ -2917,6 +2920,7 @@ async function handleMeetingHostAction(
         endedBy: actor,
         endedAt: Math.floor(now / 1_000),
         actionsAttested: false,
+        terminationSource: "host",
       };
       host.boardControl.phase = "ended";
       host.canSelect = false;
@@ -2939,6 +2943,7 @@ async function handleMeetingHostAction(
         endedBy: actor,
         endedAt: Math.floor(now / 1_000),
         actionsAttested: false,
+        terminationSource: "host",
       };
       host.boardControl.phase = "ended";
       host.canSelect = false;
@@ -3125,6 +3130,7 @@ async function handleMeetingActionFinalization(
         endedBy: actor,
         endedAt: Math.floor(now / 1_000),
         actionsAttested: true,
+        terminationSource: "host",
       };
       host.boardControl.phase = "ended";
       host.canSelect = false;
@@ -3339,6 +3345,12 @@ async function handleMeetingFloorAction(
       if (!floor.grant || floor.grant.holderPubkey !== actor) {
         throw new Error("Floor Grant is not held by this Human");
       }
+      const author = snapshot.participants.find(
+        (participant) => participant.pubkey === actor,
+      );
+      if (!author || author.participantType === "unknown") {
+        throw new Error("Meeting Speech author has no frozen participant type");
+      }
       const speechRevision = snapshot.speechRevision + 1;
       seed.speeches ??= [];
       seed.speeches.push({
@@ -3349,6 +3361,9 @@ async function handleMeetingFloorAction(
         speechRevision,
         grantEventId: floor.grant.grantId,
         mentions: input.action.mentions,
+        authorParticipantType: author.participantType,
+        authorIsModerator: actor === snapshot.moderatorPubkey,
+        handoff: input.action.handoff ?? null,
       });
       snapshot.speechRevision = speechRevision;
       snapshot.latestSpeechAt = Math.floor(Date.now() / 1_000);
@@ -3444,9 +3459,38 @@ async function handleMeetingFloorAction(
   return accepted;
 }
 
-function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
+function mockMeetingAttentionReason(
+  snapshot: MeetingSnapshot,
+  viewerPubkey: string,
+): MeetingAttentionReason | null {
+  const viewerIsHuman = snapshot.participants.some(
+    (participant) =>
+      participant.pubkey === viewerPubkey &&
+      participant.participantType === "human",
+  );
+  if (!viewerIsHuman) return null;
+  if (snapshot.lifecycle === "aborted") return "meeting_aborted";
+  if (snapshot.currentOfferPubkey === viewerPubkey) return "floor_offer";
+  if (snapshot.currentSpeakerPubkey === viewerPubkey) return "floor_grant";
+  if (snapshot.moderatorPubkey !== viewerPubkey) return null;
+  if (snapshot.lifecycle === "finalizing_actions") {
+    if (snapshot.action?.condition === "blocked") return "host_action_blocked";
+    if (snapshot.action?.condition === "runnable") return "host_action";
+    return null;
+  }
+  if (snapshot.host?.boardControl.phase === "board_pending") {
+    return "host_board";
+  }
+  return snapshot.host?.canSelect ? "host_floor" : null;
+}
+
+function mockMeetingListItem(
+  seed: MockMeetingSeed,
+  viewerPubkey: string,
+): MeetingListItem {
   if (seed.result.status === "ready") {
     const snapshot = seed.result.snapshot;
+    const attentionReason = mockMeetingAttentionReason(snapshot, viewerPubkey);
     return {
       meetingId: seed.id,
       title: seed.title,
@@ -3454,22 +3498,16 @@ function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
       phase: snapshot.phase,
       currentSpeakerPubkey: snapshot.currentSpeakerPubkey,
       currentOfferPubkey: snapshot.currentOfferPubkey,
-      humanFloorAttentionPubkey:
-        [snapshot.currentOfferPubkey, snapshot.currentSpeakerPubkey].find(
-          (pubkey) =>
-            pubkey !== null &&
-            snapshot.participants.some(
-              (participant) =>
-                participant.pubkey === pubkey &&
-                participant.participantType === "human",
-            ),
-        ) ?? null,
+      needsAttention: attentionReason !== null,
+      attentionReason,
       moderatorPubkey: snapshot.moderatorPubkey,
       policy: snapshot.policy,
-      updatedAt:
-        snapshot.end?.endedAt ??
-        snapshot.latestSpeechAt ??
+      updatedAt: Math.max(
+        snapshot.createdAt,
+        snapshot.end?.endedAt ?? 0,
+        snapshot.latestSpeechAt ?? 0,
         snapshot.board.updatedAt,
+      ),
       endedAt: snapshot.end?.endedAt ?? null,
       latestSpeechAt: snapshot.latestSpeechAt,
       compatibility: "ready",
@@ -3490,7 +3528,8 @@ function mockMeetingListItem(seed: MockMeetingSeed): MeetingListItem {
     phase: null,
     currentSpeakerPubkey: null,
     currentOfferPubkey: null,
-    humanFloorAttentionPubkey: null,
+    needsAttention: false,
+    attentionReason: null,
     moderatorPubkey: null,
     policy: null,
     updatedAt: null,
@@ -11692,7 +11731,9 @@ export function maybeInstallE2eTauriMocks() {
         return meetingIds
           .map((meetingId) => getMockMeetingSeed(meetingId, activeConfig))
           .filter((meeting): meeting is MockMeetingSeed => meeting !== null)
-          .map(mockMeetingListItem);
+          .map((meeting) =>
+            mockMeetingListItem(meeting, getMockMemberPubkey(activeConfig)),
+          );
       }
       case "get_meeting_snapshot": {
         const snapshotDelayMs = activeConfig?.mock?.meetingSnapshotDelayMs ?? 0;
@@ -11754,6 +11795,33 @@ export function maybeInstallE2eTauriMocks() {
             hasMore && oldest
               ? { before: oldest.createdAt, beforeId: oldest.eventId }
               : null,
+        };
+      }
+      case "get_meeting_activities": {
+        const { meetingId, cursor, limit } = payload as {
+          meetingId: string;
+          cursor?: string | null;
+          limit?: number | null;
+        };
+        const pageSize = Math.max(1, Math.min(limit ?? 30, 50));
+        const cursorMatch = cursor?.match(/^activity:(\d+)$/);
+        if (cursor && !cursorMatch) {
+          throw new Error("Meeting activity cursor is invalid");
+        }
+        const offset = cursorMatch ? Number(cursorMatch[1]) : 0;
+        const ordered = [
+          ...(getMockMeetingSeed(meetingId, activeConfig)?.activities ?? []),
+        ].sort(
+          (left, right) =>
+            right.occurredAtMs - left.occurredAtMs ||
+            left.activityId.localeCompare(right.activityId),
+        );
+        const activities = ordered.slice(offset, offset + pageSize);
+        const nextOffset = offset + activities.length;
+        return {
+          activities,
+          nextCursor:
+            nextOffset < ordered.length ? `activity:${nextOffset}` : null,
         };
       }
       case "get_feed":
