@@ -589,11 +589,58 @@ test("Agent-hosted Meeting exposes no Human host mutations", async ({
         title: "Agent hosted",
         agentHost: true,
         boardPhase: "floor_ready",
+        boardOutcome: "preempted",
+        priorityRequest: true,
+        pendingIntents: [
+          {
+            ...pendingIntent({
+              id: "f".repeat(64),
+              authorPubkey: HUMAN,
+              summary: "Verify the participant-facing evidence.",
+            }),
+            selectable: false,
+          },
+        ],
+        openHandoffs: [
+          {
+            ...openHandoff({
+              id: "e".repeat(64),
+              fromPubkey: HUMAN,
+              toPubkey: CURRENT,
+              reason: "Confirm the read-only observation boundary.",
+            }),
+            selectable: false,
+          },
+        ],
       }),
     ],
   });
   await openMeeting(page, IDS.agentHost);
 
+  const observation = page.getByTestId("meeting-host-observation");
+  await expect(observation).toBeVisible();
+  await expect(observation).toContainText("Agent host progress");
+  await expect(
+    page.getByTestId("meeting-host-observation-phase"),
+  ).toContainText("Waiting for Floor acknowledgement");
+  await expect(
+    page.getByTestId("meeting-host-observation-phase"),
+  ).toContainText("Board maintenance preempted by Floor priority");
+  await expect(
+    page.getByTestId("meeting-host-observation-floor"),
+  ).toContainText("bob");
+  await expect(
+    page.getByTestId("meeting-host-observation-floor"),
+  ).toContainText("Waiting for ACK");
+  await expect(
+    page.getByTestId("meeting-host-observation-intents"),
+  ).toContainText("Verify the participant-facing evidence.");
+  await expect(
+    page.getByTestId("meeting-host-observation-handoffs"),
+  ).toContainText("Confirm the read-only observation boundary.");
+  await expect(
+    observation.locator("button, input, select, textarea"),
+  ).toHaveCount(0);
   await expect(page.getByTestId("meeting-host-console")).toHaveCount(0);
   await expect(page.getByTestId("meeting-board-editor")).toHaveCount(0);
   await expect(page.getByTestId("meeting-host-close")).toHaveCount(0);

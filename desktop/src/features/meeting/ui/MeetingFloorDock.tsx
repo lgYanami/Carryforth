@@ -19,6 +19,7 @@ import { Button } from "@/shared/ui/button";
 import { MeetingActionFinalizationCard } from "./MeetingActionFinalizationCard";
 import { MeetingOfferControls } from "./MeetingOfferControls";
 import { MeetingHostConsole } from "./MeetingHostConsole";
+import { MeetingHostObservation } from "./MeetingHostObservation";
 import {
   MeetingSpeechComposer,
   type MeetingSpeechDraft,
@@ -216,6 +217,12 @@ export function MeetingFloorDock({
   };
   const terminal =
     snapshot.lifecycle === "closed" || snapshot.lifecycle === "aborted";
+  const moderator = snapshot.participants.find(
+    (candidate) => candidate.pubkey === snapshot.moderatorPubkey,
+  );
+  const observesAgentHost =
+    moderator?.participantType === "agent" &&
+    participant?.participantType === "human";
   const attentionKey = !authorityAvailable
     ? null
     : ownOffer
@@ -392,6 +399,15 @@ export function MeetingFloorDock({
             Dismiss
           </Button>
         </div>
+      ) : null}
+
+      {observesAgentHost ? (
+        <MeetingHostObservation
+          authorityAvailable={authorityAvailable}
+          onRefresh={onRefresh}
+          profiles={profiles}
+          snapshot={snapshot}
+        />
       ) : null}
 
       {!authorityAvailable ? (

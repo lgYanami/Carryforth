@@ -4,12 +4,11 @@ import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import {
   meetingParticipantGroups,
   type MeetingParticipantPresentation,
-  type MeetingParticipantStatusKind,
 } from "@/features/meeting/participantPresentation";
 import type { UserProfileSummary } from "@/shared/api/types";
 import type { MeetingSnapshot } from "@/shared/api/tauriMeetings";
 import { truncatePubkey } from "@/shared/lib/pubkey";
-import { Badge } from "@/shared/ui/badge";
+import { MeetingParticipantStatusBadge } from "./MeetingParticipantStatusBadge";
 
 function participantName(
   pubkey: string,
@@ -20,17 +19,6 @@ function participantName(
     truncatePubkey(pubkey)
   );
 }
-
-const statusVariants: Record<
-  MeetingParticipantStatusKind,
-  "info" | "warning" | "outline" | "secondary"
-> = {
-  speaking: "info",
-  waiting_for_ack: "warning",
-  floor_requested: "outline",
-  intent_pending: "outline",
-  idle: "secondary",
-};
 
 function ParticipantRow({
   presentation,
@@ -76,19 +64,10 @@ function ParticipantRow({
           <span className="truncate">{participant.channelRole}</span>
         </div>
       </div>
-      <div className="flex shrink-0 flex-col items-end gap-1">
-        <Badge
-          data-testid={`meeting-participant-status-${participant.pubkey}`}
-          variant={statusVariants[status.kind]}
-        >
-          {status.label}
-        </Badge>
-        {status.detail ? (
-          <span className="text-2xs text-muted-foreground">
-            {status.detail}
-          </span>
-        ) : null}
-      </div>
+      <MeetingParticipantStatusBadge
+        status={status}
+        testId={`meeting-participant-status-${participant.pubkey}`}
+      />
     </div>
   );
 }

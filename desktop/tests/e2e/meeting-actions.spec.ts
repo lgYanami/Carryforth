@@ -375,6 +375,17 @@ test("Agent-hosted action finalization remains read-only for Human participants"
   });
   await openMeeting(page, IDS.agentHost);
 
+  const observation = page.getByTestId("meeting-host-observation");
+  await expect(observation).toBeVisible();
+  await expect(
+    page.getByTestId("meeting-host-observation-phase"),
+  ).toContainText("Action finalization");
+  await expect(
+    page.getByTestId("meeting-host-observation-action"),
+  ).toContainText("Ready to record actions");
+  await expect(
+    observation.locator("button, input, select, textarea"),
+  ).toHaveCount(0);
   await expect(page.getByTestId("meeting-read-only-floor")).toContainText(
     "host Agent is recording actions",
   );

@@ -373,9 +373,21 @@ Speech r{speechRevision} · State r{stateRevision}
 - revision 仅可放入明确的诊断/活动记录入口；
 - 普通用户不需要理解 revision 才能操作会议。
 
-### MFX-010（P1）：Agent 主持时缺少完整只读主持观察面
+### MFX-010（已解决）：Agent 主持时缺少完整只读主持观察面
 
-**现状**
+**解决状态（2026-08-05）**
+
+Desktop 现已为 Agent 主持、Human 参会的 Meeting 提供独立只读观察面。观察面直接组合可信
+Meeting snapshot 中的 Board control、pending Intent、open Directed Handoff、Floor 和 Action
+状态，展示当前主持阶段、稳定结果与有效期限；它不建立第二份主持状态机，也不展示 reasoning、
+草稿、工具日志、ACP slot/session 或 opaque protocol fence。
+
+观察面使用与 Participant 面板相同的状态表达，但其 DOM 不包含按钮、输入框或 Human Host
+Console handler。Human 无法通过 Desktop 代理 Agent 更新 Board、选择 Intent/Handoff、关闭会议
+或确认行动产出；当前 Human 自己的 Floor Request、Offer response、Speech 与 Yield 仍由既有
+Floor Dock 按冻结身份提供。
+
+**原现状**
 
 当前 Human 不是主持人时主要看到自己的 Floor Dock 和简要状态。Agent 主持的 Meeting 中，Human
 无法完整查看：
