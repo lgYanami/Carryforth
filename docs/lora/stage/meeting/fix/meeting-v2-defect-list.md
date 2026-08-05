@@ -392,9 +392,21 @@ Speech r{speechRevision} · State r{stateRevision}
 - Human 自己的 Floor Request、Offer、Grant 控件仍按冻结 participant type 正常工作；
 - 不展示模型隐藏推理、草稿或工具日志。
 
-### MFX-011（P1）：Participant 面板没有表达冻结 roster 的会议状态
+### MFX-011（已解决）：Participant 面板没有表达冻结 roster 的会议状态
 
-**现状**
+**解决状态（2026-08-05）**
+
+Desktop Participant 面板现已按 Host、Human participants、Agent participants 分组；初始化阶段尚未
+得到 Relay 冻结分类的非主持成员进入独立 Pending classification 分组，不会被猜测为 Human。Host
+只出现一次并保留其冻结 Human/Agent 类型。
+
+面板直接从可信 Meeting snapshot 派生唯一主状态，固定优先级为 Speaking、Waiting for ACK、Floor
+request、Pending Intent、Idle。状态随权威 snapshot 更新，不依赖 raw event arrival order；Profile
+只补充名称和头像。当前没有带明确 freshness 的可靠 Agent runtime 来源，因此不展示 online/offline，
+也不把未知 runtime 解释为离会或释放 roster。面板保持纯只读，不包含 roster 管理、身份代操作或
+Channel role 修改入口。
+
+**原现状**
 
 Participant 面板是平铺列表，当前主要显示头像、Human/Agent、Channel role、host crown 和
 Speaking。

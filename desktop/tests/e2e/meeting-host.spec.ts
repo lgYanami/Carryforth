@@ -249,6 +249,14 @@ test("Human host completes Board, self Intent, Offer, Grant, Speech and direct C
   );
   await expect(page.getByText(/Board ·/)).toBeVisible();
   await expect(page.getByTestId("meeting-host-close")).toHaveCount(0);
+  await page.getByTestId("meeting-participants-trigger").click();
+  await expect(
+    page.getByTestId(`meeting-participant-status-${AGENT}`),
+  ).toHaveText("Intent pending");
+  await expect(
+    page.getByTestId(`meeting-participant-status-${CURRENT}`),
+  ).toHaveText("Idle");
+  await page.keyboard.press("Escape");
 
   await page
     .getByTestId("meeting-board-editor")

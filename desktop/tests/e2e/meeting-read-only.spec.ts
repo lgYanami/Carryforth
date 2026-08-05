@@ -355,10 +355,26 @@ test("Meeting rooms are isolated and render verified Board and Speech", async ({
   await expect(page.getByTestId("channel-management-trigger")).toHaveCount(0);
 
   await page.getByTestId("meeting-participants-trigger").click();
-  await expect(page.getByTestId("meeting-participants")).toContainText("alice");
+  const participants = page.getByTestId("meeting-participants");
+  await expect(participants).toContainText("alice");
+  await expect(participants.getByLabel("Host")).toBeVisible();
   await expect(
-    page.getByTestId("meeting-participants").getByLabel("Host"),
-  ).toBeVisible();
+    page.getByTestId("meeting-participant-group-host"),
+  ).toContainText("Host");
+  await expect(
+    page.getByTestId("meeting-participant-group-human"),
+  ).toContainText("Human participants");
+  await expect(
+    page.getByTestId("meeting-participant-group-agent"),
+  ).toContainText("Agent participants");
+  await expect(page.getByTestId(`meeting-participant-${HOST}`)).toHaveCount(1);
+  await expect(
+    page.getByTestId(`meeting-participant-status-${AGENT}`),
+  ).toHaveText("Speaking");
+  await expect(
+    page.getByTestId(`meeting-participant-status-${HUMAN}`),
+  ).toHaveText("Idle");
+  await expect(participants.getByRole("button")).toHaveCount(0);
 });
 
 test("Meeting activity is bounded, product-level, and separate from canonical Speech", async ({

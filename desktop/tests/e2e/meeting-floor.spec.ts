@@ -246,6 +246,17 @@ test("queued Human request can be withdrawn without interrupting a Grant", async
   await expect(page.getByTestId("meeting-status-strip")).toContainText(
     "has the floor",
   );
+  await page.getByTestId("meeting-participants-trigger").click();
+  await expect(
+    page.getByTestId(`meeting-participant-status-${CURRENT}`),
+  ).toHaveText("Floor requested");
+  await expect(
+    page.getByTestId(`meeting-participant-${CURRENT}`),
+  ).toContainText("Queue 1");
+  await expect(
+    page.getByTestId(`meeting-participant-status-${AGENT}`),
+  ).toHaveText("Speaking");
+  await page.keyboard.press("Escape");
   await page.getByTestId("meeting-floor-withdraw").click();
   await expect(page.getByTestId("meeting-floor-request")).toBeVisible();
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
@@ -257,6 +268,11 @@ test("Human can decline an addressed Offer with a bounded reason", async ({
   await installMockBridge(page, { meetings: [meetingSeed("offer_self")] });
   await openMeeting(page);
 
+  await page.getByTestId("meeting-participants-trigger").click();
+  await expect(
+    page.getByTestId(`meeting-participant-status-${CURRENT}`),
+  ).toHaveText("Waiting for ACK");
+  await page.keyboard.press("Escape");
   await page.getByTestId("meeting-offer-decline").click();
   await page
     .getByTestId("meeting-offer-decline-reason")
