@@ -15,6 +15,8 @@
 pub mod builders;
 pub mod mentions;
 pub mod nip_oa;
+/// Project Context Edge v1 command and verified Relay projection wire format.
+pub mod project_context;
 /// Project Document v1 command and verified Relay projection wire format.
 pub mod project_document;
 pub mod project_view;

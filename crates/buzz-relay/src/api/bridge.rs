@@ -1343,6 +1343,7 @@ fn exclude_private_protocols_if_unauthorized(
         filter,
         project_document_read_allowed,
     );
+    crate::handlers::community_private::exclude_project_context_kinds(query, filter);
 }
 
 /// Hard cap on the `reason` field logged for a rejected `/events` request.
@@ -1844,6 +1845,13 @@ async fn query_events_authed(
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    if crate::handlers::community_private::filters_are_exclusively_project_context(&filters) {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:project_context:not_ready",
+        ));
+    }
 
     let project_document_can_match = filters
         .iter()
@@ -2622,6 +2630,13 @@ async fn count_events_authed(
 
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    if crate::handlers::community_private::filters_are_exclusively_project_context(&filters) {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:project_context:not_ready",
+        ));
+    }
 
     let project_document_can_match = filters
         .iter()

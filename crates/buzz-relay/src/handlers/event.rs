@@ -10,10 +10,11 @@ use tracing::{debug, error, info, warn};
 
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
-    event_kind_u32, is_ephemeral, is_project_document_protocol_kind, is_project_view_protocol_kind,
-    is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP,
-    KIND_PRESENCE_UPDATE, KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
-    KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
+    event_kind_u32, is_ephemeral, is_project_context_protocol_kind,
+    is_project_document_protocol_kind, is_project_view_protocol_kind, is_unshared_persona_event,
+    AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META, KIND_PROJECT_DOCUMENT_REVISION,
+    KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -45,11 +46,11 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         20000..=29999 => kind.to_string(),
         30023 | 30315 | 39000..=39003 => kind.to_string(),
         40002..=40100 => kind.to_string(),
-        40903..=40907 => kind.to_string(),
+        40903..=40909 => kind.to_string(),
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
-        44200 | 44300..=44301 => kind.to_string(),
+        44200 | 44300..=44302 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
@@ -155,6 +156,13 @@ pub async fn filter_fanout_by_access(
             state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
         })
         .collect();
+
+    // Stage one has no canonical Project Context catalog/readiness authority.
+    // Even relay-internal fixture insertion or stale Redis traffic must not
+    // make a registered Context kind observable through live subscriptions.
+    if is_project_context_protocol_kind(kind) {
+        return Vec::new();
+    }
 
     // Project View is Community-global but never public. Revalidate both
     // halves of its read gate at the final send chokepoint: the connection's
@@ -2461,6 +2469,28 @@ mod tests {
             )
             .await;
             assert_eq!(out, matches);
+        }
+
+        #[tokio::test]
+        async fn project_context_live_fanout_is_closed_before_readiness() {
+            let state = test_state().await;
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+            let conn = register_conn_in_community(&state, community_id, Some(vec![1u8; 32]));
+
+            for kind in [
+                buzz_core::kind::KIND_PROJECT_CONTEXT_COMMAND,
+                buzz_core::kind::KIND_PROJECT_CONTEXT_EDGE_BINDING,
+                buzz_core::kind::KIND_PROJECT_CONTEXT_META,
+            ] {
+                let event = EventBuilder::new(Kind::Custom(kind as u16), "{}")
+                    .sign_with_keys(&Keys::generate())
+                    .expect("sign Project Context fixture");
+                let stored = StoredEvent::new(event, None);
+                let matches = vec![(conn, format!("context-{kind}"))];
+                let out =
+                    filter_fanout_by_access(&state, community_id, &stored, matches, None).await;
+                assert!(out.is_empty(), "kind {kind} escaped live fan-out");
+            }
         }
 
         #[tokio::test]

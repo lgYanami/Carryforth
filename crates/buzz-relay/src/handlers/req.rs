@@ -159,6 +159,14 @@ pub async fn handle_req(
         }
     };
 
+    if super::community_private::filters_are_exclusively_project_context(&filters) {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unavailable:project_context:not_ready",
+        ));
+        return;
+    }
+
     let project_document_can_match = filters
         .iter()
         .any(super::community_private::filter_can_match_project_document);
@@ -512,6 +520,7 @@ pub async fn handle_req(
                 filter,
                 project_document_read_allowed,
             );
+            super::community_private::exclude_project_context_kinds(&mut params, filter);
             (idx, per_filter_channel, params)
         })
         .collect();

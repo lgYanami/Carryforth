@@ -90,6 +90,7 @@ jobs:
               - '.github/workflows/sprig.yml'
             project-document:
               - 'crates/buzz-project-document/**'
+              - 'crates/buzz-project-context/**'
               - 'crates/buzz-core/src/kind.rs'
               - 'crates/buzz-db/**'
               - 'crates/buzz-relay/**'
@@ -98,6 +99,7 @@ jobs:
               - 'crates/buzz-acp/**'
               - 'crates/buzz-admin/**'
               - 'crates/buzz-test-client/tests/e2e_project_document_*.rs'
+              - 'crates/buzz-test-client/tests/e2e_project_context_stage1.rs'
               - 'migrations/**'
               - 'schema/**'
               - 'scripts/test-project-document-*.sh'
@@ -105,7 +107,10 @@ jobs:
               - 'scripts/test-project-view-migrations.sh'
               - 'scripts/run-tests.sh'
               - 'docs/nips/NIP-PD.md'
+              - 'docs/nips/NIP-PCE.md'
+              - 'docs/nips/fixtures/project-context-edge-v1/**'
               - 'docs/lora/stage/document/**'
+              - 'docs/lora/stage/project-context/**'
               - 'Dockerfile'
               - 'Justfile'
               - '.github/workflows/ci.yml'
@@ -416,6 +421,7 @@ jobs:
             --test e2e_event_reminder \
             --test e2e_project_document_disabled \
             --test e2e_project_document_enabled \
+            --test e2e_project_context_stage1 \
             --test e2e_meeting \
             --test e2e_meeting_floor \
             --test e2e_meeting_baton \

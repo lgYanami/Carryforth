@@ -233,6 +233,12 @@ jq -e '
 # Disabled remains an independently tested security state.
 start_relay
 buzz_cli channels list >/dev/null
+run_e2e_binary e2e_project_context_stage1
+if [[ "${PROJECT_CONTEXT_STAGE1_ONLY:-0}" == "1" ]]; then
+  stop_relay
+  echo "Project Context Stage 1 E2E passed."
+  exit 0
+fi
 run_e2e_binary e2e_project_document_disabled
 stop_relay
 

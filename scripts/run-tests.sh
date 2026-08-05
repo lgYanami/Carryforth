@@ -186,6 +186,19 @@ run_unit_tests() {
   run_test_step "Project Document admin tests" \
     cargo test -p buzz-admin project_document -- --nocapture
 
+  # Keep the fallback path equivalent to `just project-context-test-unit`.
+  run_test_step "Project Context domain tests" \
+    cargo test -p buzz-project-context -- --nocapture
+
+  run_test_step "Project Context SDK tests" \
+    cargo test -p buzz-sdk --test project_context -- --nocapture
+
+  run_test_step "Project Context core protocol tests" \
+    cargo test -p buzz-core --lib project_context -- --nocapture
+
+  run_test_step "Project Context Relay privacy tests" \
+    cargo test -p buzz-relay --lib project_context -- --nocapture
+
   run_test_step "buzz-push-gateway tests" \
     cargo test -p buzz-push-gateway -- --nocapture
 

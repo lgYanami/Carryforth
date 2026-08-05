@@ -12,32 +12,32 @@ use uuid::Uuid;
 use buzz_auth::Scope;
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
-    is_project_document_command_kind, is_project_view_mutation_kind, is_relay_admin_kind,
-    KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC, KIND_APPROVAL_DENY,
-    KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET, KIND_CANVAS,
-    KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
-    KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT,
-    KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-    KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE,
-    KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
-    KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
-    KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEETING_ACTION_COMMAND,
-    KIND_MEETING_BOARD_COMMAND, KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM,
-    KIND_MEETING_FLOOR_SIGNAL, KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST,
-    KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
-    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
-    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
-    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
-    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    is_project_context_command_kind, is_project_document_command_kind,
+    is_project_view_mutation_kind, is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE,
+    KIND_AGENT_TURN_METRIC, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST,
+    KIND_BOOKMARK_SET, KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
+    KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
+    KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
+    KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+    KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES,
+    KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED,
+    KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEETING_ACTION_COMMAND, KIND_MEETING_BOARD_COMMAND, KIND_MEETING_CREATE, KIND_MEETING_END,
+    KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL, KIND_MEETING_GRANT_SIGNAL,
+    KIND_MEETING_HUMAN_FLOOR_REQUEST, KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE,
+    KIND_MEETING_SPEECH_INTENT, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
+    KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP,
+    KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA,
+    KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
     KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
-    KIND_PRESENCE_UPDATE, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT_DOCUMENT_COMMAND,
-    KIND_PROJECT_VIEW_MUTATION, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
-    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
-    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
-    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
-    KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    KIND_PRESENCE_UPDATE, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT_CONTEXT_COMMAND,
+    KIND_PROJECT_DOCUMENT_COMMAND, KIND_PROJECT_VIEW_MUTATION, KIND_REACTION, KIND_READ_STATE,
+    KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
+    KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
+    KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
     RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
@@ -216,9 +216,10 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
             Ok(Scope::UsersWrite)
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
-        KIND_AGENT_TURN_METRIC | KIND_PROJECT_VIEW_MUTATION | KIND_PROJECT_DOCUMENT_COMMAND => {
-            Ok(Scope::MessagesWrite)
-        }
+        KIND_AGENT_TURN_METRIC
+        | KIND_PROJECT_VIEW_MUTATION
+        | KIND_PROJECT_DOCUMENT_COMMAND
+        | KIND_PROJECT_CONTEXT_COMMAND => Ok(Scope::MessagesWrite),
         // NIP-56 reports are ordinary member writes into the mod-only queue.
         // Ingest persists them to `moderation_reports` and suppresses public
         // storage/fanout; reports are signals, never enforcement triggers.
@@ -480,6 +481,10 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // private handler runs only after global-token validation, and a
             // stray client-selected h tag cannot alter scope.
             | KIND_PROJECT_DOCUMENT_COMMAND
+            // Project Context commands share the Community-global private
+            // command seam. Stage one registers the transport while the
+            // business-state adapter remains intentionally unavailable.
+            | KIND_PROJECT_CONTEXT_COMMAND
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
     )
@@ -1596,6 +1601,7 @@ async fn ingest_event_inner(
     if buzz_core::kind::is_command_kind(kind_u32)
         && !is_project_view_mutation_kind(kind_u32)
         && !is_project_document_command_kind(kind_u32)
+        && !is_project_context_command_kind(kind_u32)
     {
         return super::command_executor::handle_command(tenant, state, event, auth).await;
     }
@@ -1790,6 +1796,16 @@ async fn ingest_event_inner(
         // without an h-tag, which would auto-assign a server UUID).
         return Err(IngestError::AuthFailed(
             "restricted: channel-scoped tokens cannot publish global events".into(),
+        ));
+    }
+
+    // Stage one freezes the Project Context command wire and all ordinary
+    // credential/global/moderation gates, but deliberately has no canonical DB
+    // writer yet. Fail closed here so kind:44302 can never fall through into
+    // generic command or event persistence before the transaction adapter ships.
+    if is_project_context_command_kind(kind_u32) {
+        return Err(IngestError::Unavailable(
+            "unavailable:project_context:not_ready".to_owned(),
         ));
     }
 
@@ -3008,6 +3024,26 @@ mod tests {
         assert!(!is_project_view_mutation_kind(
             KIND_PROJECT_DOCUMENT_COMMAND
         ));
+    }
+
+    #[test]
+    fn project_context_command_uses_the_closed_global_write_seam() {
+        let event = make_dummy_event();
+        assert_eq!(
+            required_scope_for_kind(KIND_PROJECT_CONTEXT_COMMAND, &event),
+            Ok(Scope::MessagesWrite)
+        );
+        assert!(is_global_only_kind(KIND_PROJECT_CONTEXT_COMMAND));
+        assert!(is_project_context_command_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(buzz_core::kind::is_command_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(!is_project_document_command_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(!is_project_view_mutation_kind(KIND_PROJECT_CONTEXT_COMMAND));
     }
 
     #[test]

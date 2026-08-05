@@ -1,13 +1,15 @@
 //! Shared fail-closed helpers for Community-private protocol families.
 //!
-//! Project View and Project Document share the same credential baseline and
+//! Project View, Project Document, and Project Context share the same credential baseline and
 //! current-principal concept. Protocol-specific capability readiness remains
 //! separate so either family can fail closed without hiding the other.
 
 use buzz_auth::Scope;
 use buzz_core::kind::{
-    is_project_document_protocol_kind, KIND_PROJECT_DOCUMENT_COMMAND, KIND_PROJECT_DOCUMENT_HEAD,
-    KIND_PROJECT_DOCUMENT_META, KIND_PROJECT_DOCUMENT_REVISION,
+    is_project_context_protocol_kind, is_project_document_protocol_kind,
+    KIND_PROJECT_CONTEXT_COMMAND, KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META,
+    KIND_PROJECT_DOCUMENT_COMMAND, KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
+    KIND_PROJECT_DOCUMENT_REVISION,
 };
 use nostr::Filter;
 
@@ -19,6 +21,39 @@ const PROJECT_DOCUMENT_KINDS: [i32; 4] = [
     KIND_PROJECT_DOCUMENT_REVISION as i32,
     KIND_PROJECT_DOCUMENT_META as i32,
 ];
+
+const PROJECT_CONTEXT_KINDS: [i32; 3] = [
+    KIND_PROJECT_CONTEXT_COMMAND as i32,
+    KIND_PROJECT_CONTEXT_EDGE_BINDING as i32,
+    KIND_PROJECT_CONTEXT_META as i32,
+];
+
+/// Return whether a filter could match any Project Context protocol kind.
+#[must_use]
+pub(crate) fn filter_can_match_project_context(filter: &Filter) -> bool {
+    filter.kinds.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| is_project_context_protocol_kind(kind.as_u16() as u32))
+    })
+}
+
+/// Return whether a filter explicitly targets only Project Context kinds.
+#[must_use]
+pub(crate) fn filter_is_exclusively_project_context(filter: &Filter) -> bool {
+    filter.kinds.as_ref().is_some_and(|kinds| {
+        !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|kind| is_project_context_protocol_kind(kind.as_u16() as u32))
+    })
+}
+
+/// Return whether every supplied filter explicitly targets only Project Context.
+#[must_use]
+pub(crate) fn filters_are_exclusively_project_context(filters: &[Filter]) -> bool {
+    !filters.is_empty() && filters.iter().all(filter_is_exclusively_project_context)
+}
 
 /// Return whether a filter could match any Project Document protocol kind.
 #[must_use]
@@ -148,9 +183,30 @@ pub(crate) fn exclude_project_document_kinds(
     }
 }
 
+/// Add all Project Context protocol kinds to a query's deny set.
+///
+/// Stage one has no canonical Context catalog/readiness adapter. Therefore all
+/// non-exclusive wildcard, mixed-kind, kindless, and IDs-only candidate paths
+/// exclude these kinds unconditionally. Exclusive requests are rejected as
+/// unavailable by their transport before querying.
+pub(crate) fn exclude_project_context_kinds(query: &mut buzz_db::EventQuery, filter: &Filter) {
+    if !filter_can_match_project_context(filter) {
+        return;
+    }
+    let excluded = query.excluded_kinds.get_or_insert_with(Vec::new);
+    for kind in PROJECT_CONTEXT_KINDS {
+        if !excluded.contains(&kind) {
+            excluded.push(kind);
+        }
+    }
+}
+
 /// Result-level guard, including by-ID reads that bypass kind filters.
 #[must_use]
 pub(crate) fn event_is_visible(kind: u32, document_read_allowed: bool) -> bool {
+    if is_project_context_protocol_kind(kind) {
+        return false;
+    }
     !is_project_document_protocol_kind(kind) || document_read_allowed
 }
 
@@ -196,5 +252,39 @@ mod tests {
         assert!(PROJECT_DOCUMENT_KINDS
             .iter()
             .all(|kind| excluded.contains(kind)));
+    }
+
+    #[test]
+    fn project_context_stage_one_is_unconditionally_fail_closed() {
+        let wildcard = Filter::new();
+        assert!(filter_can_match_project_context(&wildcard));
+        assert!(!filter_is_exclusively_project_context(&wildcard));
+
+        let context_only =
+            Filter::new().kind(Kind::Custom(KIND_PROJECT_CONTEXT_EDGE_BINDING as u16));
+        assert!(filter_is_exclusively_project_context(&context_only));
+        assert!(filters_are_exclusively_project_context(&[context_only]));
+
+        let mixed = Filter::new().kinds([
+            Kind::Custom(KIND_PROJECT_CONTEXT_META as u16),
+            Kind::TextNote,
+        ]);
+        assert!(filter_can_match_project_context(&mixed));
+        assert!(!filter_is_exclusively_project_context(&mixed));
+
+        let mut query = buzz_db::EventQuery::for_community(buzz_core::CommunityId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
+        query.excluded_kinds = Some(vec![KIND_PROJECT_DOCUMENT_HEAD as i32]);
+        exclude_project_context_kinds(&mut query, &wildcard);
+        let excluded = query.excluded_kinds.expect("excluded kinds");
+        assert!(excluded.contains(&(KIND_PROJECT_DOCUMENT_HEAD as i32)));
+        assert!(PROJECT_CONTEXT_KINDS
+            .iter()
+            .all(|kind| excluded.contains(kind)));
+        for kind in PROJECT_CONTEXT_KINDS {
+            assert!(!event_is_visible(kind as u32, true));
+            assert!(!event_is_visible(kind as u32, false));
+        }
     }
 }

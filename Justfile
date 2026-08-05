@@ -309,6 +309,9 @@ test-unit:
         # private read/write surface, agent CLI, ACP guidance, and admin control
         # plane. Keep its complete no-infrastructure slice in the ordinary gate.
         just project-document-test-unit
+        # Project Context Stage 1 freezes the pure domain, wire contract, and
+        # fail-closed Relay registration before canonical storage exists.
+        just project-context-test-unit
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
@@ -409,6 +412,32 @@ project-document-test-e2e:
 
 # Run every Project Document Stage 2 quality gate.
 project-document-test: project-document-test-unit project-document-test-db test-migrations project-document-test-e2e
+
+# Run the complete no-infrastructure Project Context Stage 1 contract.
+project-context-test-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        cargo nextest run -p buzz-project-context
+        cargo nextest run -p buzz-sdk --test project_context
+        cargo nextest run \
+          -p buzz-core \
+          -p buzz-relay \
+          --lib \
+          -E 'test(project_context)'
+    else
+        cargo test -p buzz-project-context
+        cargo test -p buzz-sdk --test project_context
+        cargo test -p buzz-core --lib project_context
+        cargo test -p buzz-relay --lib project_context
+    fi
+
+# Run the real Relay/event-store Stage 1 privacy floor in an isolated database.
+project-context-test-e2e:
+    PROJECT_CONTEXT_STAGE1_ONLY=1 ./scripts/test-project-document-e2e.sh
+
+# Run every Project Context Stage 1 quality gate.
+project-context-stage1-test: project-context-test-unit project-context-test-e2e
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.
