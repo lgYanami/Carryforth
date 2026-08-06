@@ -4,14 +4,18 @@ import type {
   ProjectContextErrorPayload,
   ProjectContextQueryResult,
 } from "../../src/shared/api/tauriProjectContext";
+import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
 const PROJECT_ID = "10000000-0000-4000-8000-000000000001";
 const REQUIREMENT_ID = "20000000-0000-4000-8000-000000000001";
 const RESOURCE_ID = "30000000-0000-4000-8000-000000000001";
+const GOAL_ID = "30000000-0000-4000-8000-000000000002";
+const ROLE_ID = "30000000-0000-4000-8000-000000000003";
 const DOCUMENT_COORDINATE_ID = "40000000-0000-4000-8000-000000000001";
 const CONTEXT_DOCUMENT_A_ID = "40000000-0000-4000-8000-000000000002";
 const CONTEXT_DOCUMENT_B_ID = "40000000-0000-4000-8000-000000000003";
+const CONTEXT_DOCUMENT_C_ID = "40000000-0000-4000-8000-000000000004";
 const RELAY = "b".repeat(64);
 const ACTOR = "a".repeat(64);
 const COMMUNITY_A = {
@@ -155,6 +159,128 @@ function contextResult(input?: {
   };
 }
 
+function twoIslandResult(): ProjectContextQueryResult {
+  const base = contextResult();
+  return {
+    ...base,
+    context: {
+      ...base.context,
+      activeEdgeCount: 3,
+      boundDocumentCount: 3,
+    },
+    edges: [
+      {
+        edgeKey: "1".repeat(64),
+        coordinateKeys: [
+          `requirement:${REQUIREMENT_ID}`,
+          `resource:${RESOURCE_ID}`,
+        ],
+        contextDocumentIds: [CONTEXT_DOCUMENT_A_ID],
+      },
+      {
+        edgeKey: "2".repeat(64),
+        coordinateKeys: [
+          `goal:${GOAL_ID}`,
+          `requirement:${REQUIREMENT_ID}`,
+          `resource:${RESOURCE_ID}`,
+        ],
+        contextDocumentIds: [CONTEXT_DOCUMENT_B_ID],
+      },
+      {
+        edgeKey: "3".repeat(64),
+        coordinateKeys: [
+          `role:${ROLE_ID}`,
+          `document:${CONTEXT_DOCUMENT_A_ID}`,
+        ],
+        contextDocumentIds: [CONTEXT_DOCUMENT_C_ID],
+      },
+    ],
+    coordinateDetails: [
+      {
+        coordinateKey: `goal:${GOAL_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "goal",
+          objectId: GOAL_ID,
+        },
+        state: "active",
+        title: "Ship the trusted project workspace",
+        objectRevision: 5,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `requirement:${REQUIREMENT_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId: REQUIREMENT_ID,
+        },
+        state: "active",
+        title: "Keep Context relationships verifiable",
+        objectRevision: 4,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `resource:${RESOURCE_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "resource",
+          objectId: RESOURCE_ID,
+        },
+        state: "tombstoned",
+        title: "Legacy relay contract",
+        objectRevision: 7,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `role:${ROLE_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "role",
+          objectId: ROLE_ID,
+        },
+        state: "unavailable",
+        unavailableReason: "Role details are temporarily unavailable.",
+      },
+      {
+        coordinateKey: `document:${CONTEXT_DOCUMENT_A_ID}`,
+        coordinate: {
+          type: "document",
+          documentId: CONTEXT_DOCUMENT_A_ID,
+        },
+        state: "active",
+        title: "Cross-team architecture record",
+        documentRevision: 8,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+    ],
+    documentDetails: [
+      {
+        documentId: CONTEXT_DOCUMENT_A_ID,
+        state: "active",
+        title: "Context rationale A",
+        documentRevision: 8,
+      },
+      {
+        documentId: CONTEXT_DOCUMENT_B_ID,
+        state: "active",
+        title: "Context rationale B",
+        documentRevision: 2,
+      },
+      {
+        documentId: CONTEXT_DOCUMENT_C_ID,
+        state: "active",
+        title: "Context rationale C",
+        documentRevision: 1,
+      },
+    ],
+  };
+}
+
 async function openProjectContext(page: import("@playwright/test").Page) {
   await page.goto("/");
   await page.getByTestId("open-project-context").click();
@@ -204,6 +330,114 @@ test("sidebar order, active route, and default All query reach the trusted graph
     input: {
       query: { type: "contains_all", coordinates: [] },
     },
+  });
+});
+
+test("All Context renders binary, hyperedge overlap, and two labelled Islands", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await installMockBridge(page, { projectContext: twoIslandResult() });
+  await openProjectContext(page);
+
+  await expect(
+    page.getByTestId("project-context-island-summary"),
+  ).toContainText(
+    "2 context islands · 5 coordinates · 3 edges · 3 context docs",
+  );
+  await expect(page.getByText("2 disconnected components")).toBeVisible();
+  await expect(
+    page.locator('[data-testid^="project-context-island-"][data-island]'),
+  ).toHaveCount(2);
+  await expect(page.getByTestId("project-context-island-1")).toContainText(
+    "3 coordinates · 2 edges · 2 context docs",
+  );
+  await expect(page.getByTestId("project-context-island-2")).toContainText(
+    "2 coordinates · 1 edge · 1 context doc",
+  );
+  await expect(
+    page.locator('[data-testid^="project-context-edge-"]'),
+  ).toHaveCount(3);
+  await expect(page.locator(".project-context-spoke")).toHaveCount(7);
+  await expect(
+    page.locator('[data-testid^="project-context-coordinate-"]'),
+  ).toHaveCount(5);
+
+  await expect(
+    page.getByTestId(`project-context-coordinate-resource:${RESOURCE_ID}`),
+  ).toHaveAttribute("data-lifecycle", "tombstoned");
+  await expect(
+    page.getByTestId(`project-context-coordinate-role:${ROLE_ID}`),
+  ).toHaveAttribute("data-lifecycle", "unavailable");
+  await expect(
+    page.getByTestId(
+      `project-context-coordinate-document:${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toHaveCount(1);
+  await expect(
+    page.getByTestId(
+      `project-context-coordinate-document:${CONTEXT_DOCUMENT_B_ID}`,
+    ),
+  ).toHaveCount(0);
+
+  await page.getByTestId(`project-context-edge-${"2".repeat(64)}`).click();
+  await expect(
+    page.getByTestId(`project-context-edge-${"2".repeat(64)}`),
+  ).toHaveAttribute("data-emphasis", "active");
+  await expect(
+    page.getByTestId(`project-context-edge-${"1".repeat(64)}`),
+  ).toHaveAttribute("data-emphasis", "dimmed");
+  const selectedSpokes = page.locator(
+    `.project-context-spoke[data-edge-key="${"2".repeat(64)}"]`,
+  );
+  await expect(selectedSpokes).toHaveCount(3);
+  for (let index = 0; index < 3; index += 1) {
+    await expect(selectedSpokes.nth(index)).toHaveAttribute(
+      "data-emphasis",
+      "active",
+    );
+  }
+  const overlapSpokes = page.locator(
+    `.project-context-spoke[data-edge-key="${"1".repeat(64)}"]`,
+  );
+  await expect(overlapSpokes).toHaveCount(2);
+  for (let index = 0; index < 2; index += 1) {
+    await expect(overlapSpokes.nth(index)).toHaveAttribute(
+      "data-emphasis",
+      "dimmed",
+    );
+  }
+  await expect(
+    page.getByTestId("project-context-selection-status"),
+  ).toContainText("3 coordinates · 1 doc");
+
+  const binarySpokeId = `spoke:${"1".repeat(64)}:requirement:${REQUIREMENT_ID}`;
+  const binarySpoke = page.locator(
+    `.react-flow__edge[data-id="${binarySpokeId}"] .react-flow__edge-interaction`,
+  );
+  await expect(binarySpoke).toHaveCount(1);
+  await binarySpoke.dispatchEvent("click");
+  await expect(
+    page.getByTestId(`project-context-edge-${"1".repeat(64)}`),
+  ).toHaveAttribute("data-emphasis", "active");
+  for (let index = 0; index < 2; index += 1) {
+    await expect(overlapSpokes.nth(index)).toHaveAttribute(
+      "data-emphasis",
+      "active",
+    );
+  }
+  await expect(
+    page.getByTestId("project-context-selection-status"),
+  ).toContainText("2 coordinates · 1 doc");
+
+  await page.getByTestId(`project-context-edge-${"2".repeat(64)}`).click();
+
+  await page.getByTestId("project-context-fit-island-2").click();
+  await page.getByTestId("project-context-fit-all").click();
+  await page.waitForTimeout(300);
+  await waitForAnimations(page);
+  await page.getByTestId("project-context-graph-slot").screenshot({
+    path: "test-results/project-context/project-context-two-islands.png",
   });
 });
 

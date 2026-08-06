@@ -14,6 +14,7 @@ import {
   ProjectContextFailureState,
   ProjectContextLoadingState,
 } from "@/features/project-context/ui/ProjectContextStates";
+import { ProjectContextGraph } from "@/features/project-context/ui/ProjectContextGraph";
 import type { ProjectContextQueryResult } from "@/shared/api/tauriProjectContext";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { Badge } from "@/shared/ui/badge";
@@ -58,22 +59,12 @@ function ProjectContextGraphSlot({
             <div className="mt-1 text-xl font-semibold">{documentCount}</div>
           </div>
         </section>
-        <section
-          className="flex min-h-72 flex-1 items-center justify-center rounded-2xl border border-dashed border-border/80 bg-card/30 p-8 text-center"
+        <div
+          className="flex min-h-96 flex-1"
           data-testid="project-context-graph-slot"
         >
-          <div className="max-w-md">
-            <Network className="mx-auto h-10 w-10 text-muted-foreground" />
-            <h1 className="mt-3 text-base font-semibold">
-              Verified Context graph data is ready
-            </h1>
-            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-              Desktop has verified the complete Edge topology and lightweight
-              source metadata. The relationship canvas will render inside this
-              trusted result boundary.
-            </p>
-          </div>
-        </section>
+          <ProjectContextGraph result={result} />
+        </div>
       </div>
     </main>
   );
