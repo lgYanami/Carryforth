@@ -156,7 +156,7 @@ export function ProjectViewContextSection({
       <div className="flex items-center justify-between gap-2">
         <div>
           <h3 className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Context
+            Context References
           </h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
             Verified coordinates only. References do not grant permission or run

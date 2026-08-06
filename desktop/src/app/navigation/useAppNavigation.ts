@@ -124,6 +124,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goProjectContext = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/project-context",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProject = React.useCallback(
     (
       projectId: string,
@@ -337,6 +348,7 @@ export function useAppNavigation() {
     goHome,
     goNewMessage,
     goProject,
+    goProjectContext,
     goProjects,
     goPulse,
     goSettings,

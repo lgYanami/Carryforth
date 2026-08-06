@@ -102,7 +102,7 @@ export type ProjectContextErrorCode =
   | "verification_failed"
   | "internal";
 
-type ProjectContextErrorPayload = {
+export type ProjectContextErrorPayload = {
   code: ProjectContextErrorCode;
   message: string;
   status?: number;

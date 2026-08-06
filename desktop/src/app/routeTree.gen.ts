@@ -11,6 +11,7 @@ import { Route as settingsRouteImport } from "./routes/settings";
 import { Route as remindersRouteImport } from "./routes/reminders";
 import { Route as pulseRouteImport } from "./routes/pulse";
 import { Route as projectsRouteImport } from "./routes/projects";
+import { Route as projectContextRouteImport } from "./routes/project-context";
 import { Route as documentsRouteImport } from "./routes/documents";
 import { Route as communityRouteImport } from "./routes/community";
 import { Route as agentsRouteImport } from "./routes/agents";
@@ -49,6 +50,11 @@ const pulseRoute = pulseRouteImport.update({
 const projectsRoute = projectsRouteImport.update({
   id: "/projects",
   path: "/projects",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const projectContextRoute = projectContextRouteImport.update({
+  id: "/project-context",
+  path: "/project-context",
   getParentRoute: () => rootRouteImport,
 } as any);
 const documentsRoute = documentsRouteImport.update({
@@ -103,6 +109,7 @@ export interface FileRoutesByFullPath {
   "/agents": typeof agentsRoute;
   "/community": typeof communityRoute;
   "/documents": typeof documentsRoute;
+  "/project-context": typeof projectContextRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
@@ -120,6 +127,7 @@ export interface FileRoutesByTo {
   "/agents": typeof agentsRoute;
   "/community": typeof communityRoute;
   "/documents": typeof documentsRoute;
+  "/project-context": typeof projectContextRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
@@ -138,6 +146,7 @@ export interface FileRoutesById {
   "/agents": typeof agentsRoute;
   "/community": typeof communityRoute;
   "/documents": typeof documentsRoute;
+  "/project-context": typeof projectContextRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
   "/reminders": typeof remindersRoute;
@@ -157,6 +166,7 @@ export interface FileRouteTypes {
     | "/agents"
     | "/community"
     | "/documents"
+    | "/project-context"
     | "/projects"
     | "/pulse"
     | "/reminders"
@@ -174,6 +184,7 @@ export interface FileRouteTypes {
     | "/agents"
     | "/community"
     | "/documents"
+    | "/project-context"
     | "/projects"
     | "/pulse"
     | "/reminders"
@@ -191,6 +202,7 @@ export interface FileRouteTypes {
     | "/agents"
     | "/community"
     | "/documents"
+    | "/project-context"
     | "/projects"
     | "/pulse"
     | "/reminders"
@@ -209,6 +221,7 @@ export interface RootRouteChildren {
   agentsRoute: typeof agentsRoute;
   communityRoute: typeof communityRoute;
   documentsRoute: typeof documentsRoute;
+  projectContextRoute: typeof projectContextRoute;
   projectsRoute: typeof projectsRoute;
   pulseRoute: typeof pulseRoute;
   remindersRoute: typeof remindersRoute;
@@ -264,6 +277,13 @@ declare module "@tanstack/react-router" {
       path: "/projects";
       fullPath: "/projects";
       preLoaderRoute: typeof projectsRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/project-context": {
+      id: "/project-context";
+      path: "/project-context";
+      fullPath: "/project-context";
+      preLoaderRoute: typeof projectContextRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/documents": {
@@ -337,6 +357,7 @@ const rootRouteChildren: RootRouteChildren = {
   agentsRoute: agentsRoute,
   communityRoute: communityRoute,
   documentsRoute: documentsRoute,
+  projectContextRoute: projectContextRoute,
   projectsRoute: projectsRoute,
   pulseRoute: pulseRoute,
   remindersRoute: remindersRoute,

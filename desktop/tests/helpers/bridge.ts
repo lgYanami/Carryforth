@@ -11,6 +11,10 @@ import type {
   RawProjectViewRoleMutationResult,
 } from "../../src/shared/api/tauriProjectView";
 import type { ProjectDocumentMutationResult } from "../../src/shared/api/tauriProjectDocument";
+import type {
+  ProjectContextErrorPayload,
+  ProjectContextQueryResult,
+} from "../../src/shared/api/tauriProjectContext";
 import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
@@ -184,6 +188,11 @@ type MockBridgeOptions = {
   projectViewRoleMutationResult?: RawProjectViewRoleMutationResult;
   projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
   projectViewAfterRoleMutation?: RawProjectViewLoadResult;
+  projectContext?: ProjectContextQueryResult;
+  projectContextsByRelayUrl?: Record<string, ProjectContextQueryResult>;
+  projectContextReadDelayMs?: number;
+  projectContextReadDelayMsByRelayUrl?: Record<string, number>;
+  projectContextReadError?: ProjectContextErrorPayload;
   projectDocument?: MockProjectDocumentState;
   projectDocumentsByRelayUrl?: Record<string, MockProjectDocumentState>;
   projectDocumentReadDelayMs?: number;

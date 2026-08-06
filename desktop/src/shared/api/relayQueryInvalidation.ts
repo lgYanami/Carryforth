@@ -17,6 +17,7 @@ const RELAY_QUERY_ROOTS = new Set<string>([
   "presence",
   "profile",
   "project-view",
+  "project-context",
   "pulse-note",
   "pulse-reactions",
   "pulse-timeline",

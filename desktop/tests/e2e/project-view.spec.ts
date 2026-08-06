@@ -1093,6 +1093,7 @@ test("v3 Role Context picker submits canonical coordinates and Resource sources 
     .getByRole("button", { name: "Inspect Role Context steward" })
     .click();
   const context = page.getByTestId("project-view-context");
+  await expect(context).toContainText("Context References");
   await expect(context).toContainText("Verified coordinates only");
   await expect(context).toContainText("Ready");
   await page
