@@ -296,11 +296,12 @@ export function ProjectContextQueryBar({
     >
       <div className="mx-auto flex max-w-6xl flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <fieldset className="flex flex-wrap gap-1 rounded-xl border border-border/70 bg-muted/25 p-1">
+          <fieldset className="flex max-w-full flex-nowrap gap-1 overflow-x-auto rounded-xl border border-border/70 bg-muted/25 p-1">
             <legend className="sr-only">Project Context query mode</legend>
             {MODES.map((candidate) => (
               <Button
                 aria-pressed={draft.mode === candidate.mode}
+                className="shrink-0"
                 data-testid={`project-context-mode-${candidate.mode}`}
                 key={candidate.mode}
                 onClick={() =>

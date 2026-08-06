@@ -35,6 +35,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_PROJECT_CONTEXT_META,
   KIND_PROJECT_DOCUMENT_META,
   KIND_PROJECT_VIEW_META,
   KIND_REPO_ANNOUNCEMENT,
@@ -1290,6 +1291,11 @@ declare global {
     __BUZZ_E2E_SET_PROJECT_CONTEXT_ERROR__?: (
       error?: ProjectContextErrorPayload,
     ) => void;
+    /** Emit an untrusted Context projection hint through the mock live socket. */
+    __BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__?: (input?: {
+      kind?: number;
+    }) => RelayEvent;
+    __BUZZ_E2E_HAS_PROJECT_CONTEXT_SUBSCRIPTION__?: () => boolean;
     /** Replace the next trusted Project View command result. */
     __BUZZ_E2E_SET_PROJECT_VIEW__?: (
       result: RawProjectViewLoadResult,
@@ -10764,6 +10770,24 @@ export function maybeInstallE2eTauriMocks() {
       ? structuredClone(error)
       : undefined;
   };
+  window.__BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__ = (input) => {
+    const result =
+      config.mock?.projectContextsByRelayUrl?.[mockAppliedRelayUrl] ??
+      config.mock?.projectContext;
+    const event = createMockEvent(
+      input?.kind ?? KIND_PROJECT_CONTEXT_META,
+      "untrusted-live-context-must-not-render",
+      [],
+      result?.relayPubkey ?? "b".repeat(64),
+    );
+    emitMockGlobalEvent(event);
+    return event;
+  };
+  window.__BUZZ_E2E_HAS_PROJECT_CONTEXT_SUBSCRIPTION__ = () =>
+    hasMockLiveSubscription(
+      GLOBAL_MOCK_SUBSCRIPTION,
+      KIND_PROJECT_CONTEXT_META,
+    );
   window.__BUZZ_E2E_SET_PROJECT_DOCUMENT_STATE__ = (state, relayUrl) => {
     if (!config.mock) {
       throw new Error("Mock Project Documents are unavailable in relay mode.");
@@ -12707,13 +12731,17 @@ export function maybeInstallE2eTauriMocks() {
         }
         return activeConfig?.mock?.relaySelf ?? null;
       case "query_project_context": {
+        // Mirror the native command's community fence: an in-flight read stays
+        // bound to the Relay active when it started, even if the test switches
+        // Communities before the delayed response completes.
+        const requestRelayUrl = mockAppliedRelayUrl;
         window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.push({
           payload: structuredClone(payload),
-          relayUrl: mockAppliedRelayUrl,
+          relayUrl: requestRelayUrl,
         });
         const delayMs =
           activeConfig?.mock?.projectContextReadDelayMsByRelayUrl?.[
-            mockAppliedRelayUrl
+            requestRelayUrl
           ] ??
           activeConfig?.mock?.projectContextReadDelayMs ??
           0;
@@ -12731,9 +12759,7 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig?.mock?.projectContextsByQuery?.[
             JSON.stringify(input.query)
           ] ??
-          activeConfig?.mock?.projectContextsByRelayUrl?.[
-            mockAppliedRelayUrl
-          ] ??
+          activeConfig?.mock?.projectContextsByRelayUrl?.[requestRelayUrl] ??
           activeConfig?.mock?.projectContext;
         if (!result) {
           throw {

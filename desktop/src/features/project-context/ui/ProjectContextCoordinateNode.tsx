@@ -58,6 +58,7 @@ export function ProjectContextCoordinateNode({
         isUnavailable && "project-context-coordinate--unavailable",
       )}
       data-coordinate-key={data.coordinate.coordinateKey}
+      data-context-graph-kind="coordinate"
       data-emphasis={data.emphasis}
       data-island={data.islandIndex}
       data-lifecycle={data.coordinate.state}
@@ -72,7 +73,8 @@ export function ProjectContextCoordinateNode({
         </span>
       ) : null}
       <button
-        aria-label={`${data.queryAnchor ? "Query anchor, " : ""}Select ${data.coordinate.typeLabel} ${data.coordinate.displayTitle}`}
+        aria-label={`${data.queryAnchor ? "Query anchor, " : ""}${isTombstoned ? "Tombstoned, " : isUnavailable ? "Unavailable, " : ""}Select ${data.coordinate.typeLabel} ${data.coordinate.displayTitle}`}
+        aria-pressed={data.selected}
         className="nodrag nopan flex h-full w-full items-start gap-3 rounded-xl px-3 py-3 text-left outline-none"
         type="button"
       >

@@ -34,13 +34,20 @@ import {
   ProjectContextFailureState,
   ProjectContextLoadingState,
 } from "@/features/project-context/ui/ProjectContextStates";
-import { useProjectContextQuery } from "@/features/project-context/hooks";
+import {
+  useProjectContextLiveSync,
+  useProjectContextQuery,
+} from "@/features/project-context/hooks";
 import { useProjectViewQuery } from "@/features/project-view/hooks";
 import { indexProjectViewObjects } from "@/features/project-view/model";
 import type {
   ProjectContextQuery,
   ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
+import {
+  isRelayConnectionDegraded,
+  useRelayConnection,
+} from "@/shared/api/useRelayConnection";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -66,12 +73,14 @@ function ProjectContextHeader({
   onRefresh,
   refreshing,
   result,
-  stale,
+  syncBadge,
+  syncState,
 }: {
   onRefresh?: () => void;
   refreshing?: boolean;
   result?: ProjectContextQueryResult;
-  stale?: boolean;
+  syncBadge?: string;
+  syncState?: "live" | "refreshing" | "stale";
 }) {
   return (
     <TopChromeInsetHeader flush>
@@ -100,7 +109,28 @@ function ProjectContextHeader({
             Revision {result.context.contextRevision}
           </Badge>
         ) : null}
-        {stale ? <Badge variant="warning">Stale</Badge> : null}
+        {syncState ? (
+          <Badge
+            data-testid="project-context-sync-status"
+            variant={
+              syncState === "stale"
+                ? "warning"
+                : syncState === "live"
+                  ? "success"
+                  : "secondary"
+            }
+          >
+            {syncState === "refreshing" ? (
+              <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+            ) : null}
+            {syncBadge ??
+              (syncState === "stale"
+                ? "Stale"
+                : syncState === "live"
+                  ? "Live"
+                  : "Syncing")}
+          </Badge>
+        ) : null}
         {onRefresh ? (
           <Button
             aria-label="Refresh Project Context"
@@ -203,17 +233,55 @@ function ValidProjectContextScreen({
 }: ValidProjectContextScreenProps) {
   const [focusSelectionRequest, setFocusSelectionRequest] = React.useState(0);
   const contextQuery = useProjectContextQuery(appliedQuery);
+  const liveStatus = useProjectContextLiveSync(contextQuery.data);
+  const relayConnection = useRelayConnection();
   const projectViewQuery = useProjectViewQuery();
   const documentMetaQuery = useProjectDocumentMeta();
   const documentsQuery = useProjectDocuments(documentMetaQuery.data);
-  const result = contextQuery.data;
+  const failureKind = contextQuery.isError
+    ? projectContextFailureKind(contextQuery.error)
+    : undefined;
+  const verificationFailure = failureKind === "verification_failed";
+  const result = verificationFailure ? undefined : contextQuery.data;
   const fatalError =
-    contextQuery.isError && !result ? contextQuery.error : undefined;
+    contextQuery.isError && (!contextQuery.data || verificationFailure)
+      ? contextQuery.error
+      : undefined;
   const refreshError =
-    contextQuery.isError && result ? contextQuery.error : undefined;
+    contextQuery.isError && contextQuery.data && !verificationFailure
+      ? contextQuery.error
+      : undefined;
   const refreshMessage = refreshError
     ? projectContextErrorMessage(refreshError)
     : undefined;
+  const relayDegraded = isRelayConnectionDegraded(relayConnection);
+  const syncState: "live" | "refreshing" | "stale" | undefined = result
+    ? relayDegraded || refreshMessage || liveStatus === "retrying"
+      ? "stale"
+      : contextQuery.isFetching || liveStatus === "connecting"
+        ? "refreshing"
+        : liveStatus === "live"
+          ? "live"
+          : undefined
+    : undefined;
+  const syncBadge = relayDegraded
+    ? "Reconnecting"
+    : liveStatus === "retrying"
+      ? "Live reconnecting"
+      : syncState === "stale"
+        ? "Stale"
+        : undefined;
+  const syncMessage = !result
+    ? undefined
+    : relayDegraded
+      ? `Showing verified Context revision ${result.context.contextRevision}. It may be stale while the Relay connection recovers.`
+      : refreshMessage
+        ? `Showing verified Context revision ${result.context.contextRevision}. The latest refresh failed: ${refreshMessage}`
+        : liveStatus === "retrying"
+          ? `Showing verified Context revision ${result.context.contextRevision} while the live update subscription reconnects.`
+          : syncState === "refreshing"
+            ? `Keeping verified Context revision ${result.context.contextRevision} visible while a new complete snapshot is verified.`
+            : undefined;
   const projectViewObjects = React.useMemo(
     () =>
       projectViewQuery.data?.status === "ready"
@@ -280,29 +348,30 @@ function ValidProjectContextScreen({
         onRefresh={() => void contextQuery.refetch()}
         refreshing={contextQuery.isFetching}
         result={result}
-        stale={Boolean(refreshMessage)}
+        syncBadge={syncBadge}
+        syncState={syncState}
       />
 
-      {refreshMessage && result ? (
+      {syncState === "stale" && syncMessage && result ? (
         <div
+          aria-live="polite"
+          aria-atomic="true"
           className="flex items-start gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-xs text-muted-foreground"
           data-testid="project-context-stale-message"
           role="status"
         >
           <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>
-            Showing verified Context revision {result.context.contextRevision}.
-            The latest refresh failed: {refreshMessage}
-          </span>
+          <span>{syncMessage}</span>
         </div>
-      ) : result && contextQuery.isFetching ? (
+      ) : syncState === "refreshing" && syncMessage ? (
         <div
+          aria-live="polite"
+          aria-atomic="true"
           className="border-b border-border/70 bg-muted/20 px-4 py-2 text-xs text-muted-foreground"
           data-testid="project-context-refreshing"
           role="status"
         >
-          Keeping verified Context revision {result.context.contextRevision}
-          visible while a new complete snapshot is verified.
+          {syncMessage}
         </div>
       ) : null}
 
@@ -318,7 +387,7 @@ function ValidProjectContextScreen({
       {fatalError ? (
         <ProjectContextFailureState
           diagnostic={projectContextErrorMessage(fatalError)}
-          kind={projectContextFailureKind(fatalError)}
+          kind={failureKind ?? projectContextFailureKind(fatalError)}
           onRetry={() => void contextQuery.refetch()}
           retrying={contextQuery.isFetching}
         />

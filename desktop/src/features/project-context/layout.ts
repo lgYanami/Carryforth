@@ -71,24 +71,24 @@ function nodeKind(id: string): ProjectContextLayoutNode["kind"] {
 }
 
 function adjacencyForIsland(
-  graph: ProjectContextGraphModel,
   island: ProjectContextGraphIsland,
+  spokesByEdgeKey: ReadonlyMap<string, ProjectContextGraphModel["spokes"]>,
 ) {
   const nodeIds = new Set<string>();
   const adjacency = new Map<string, Set<string>>();
-  const edgeKeys = new Set(island.edgeKeys);
 
   function ensure(id: string) {
     nodeIds.add(id);
     if (!adjacency.has(id)) adjacency.set(id, new Set());
   }
 
-  for (const spoke of graph.spokes) {
-    if (!edgeKeys.has(spoke.edgeKey)) continue;
-    ensure(spoke.sourceId);
-    ensure(spoke.targetId);
-    adjacency.get(spoke.sourceId)?.add(spoke.targetId);
-    adjacency.get(spoke.targetId)?.add(spoke.sourceId);
+  for (const edgeKey of island.edgeKeys) {
+    for (const spoke of spokesByEdgeKey.get(edgeKey) ?? []) {
+      ensure(spoke.sourceId);
+      ensure(spoke.targetId);
+      adjacency.get(spoke.sourceId)?.add(spoke.targetId);
+      adjacency.get(spoke.targetId)?.add(spoke.sourceId);
+    }
   }
 
   return { adjacency, nodeIds };
@@ -113,10 +113,11 @@ function layeredNodeIds(
   if (!root) return [];
   const distance = new Map([[root, 0]]);
   const queue = [root];
+  let queueIndex = 0;
 
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) continue;
+  while (queueIndex < queue.length) {
+    const current = queue[queueIndex];
+    queueIndex += 1;
     const nextDistance = (distance.get(current) ?? 0) + 1;
     for (const neighbor of [...(adjacency.get(current) ?? [])].sort(
       compareText,
@@ -163,11 +164,11 @@ function layeredNodeIds(
 }
 
 function layoutOneIsland(
-  graph: ProjectContextGraphModel,
   island: ProjectContextGraphIsland,
+  spokesByEdgeKey: ReadonlyMap<string, ProjectContextGraphModel["spokes"]>,
   scale: number,
 ) {
-  const { adjacency, nodeIds } = adjacencyForIsland(graph, island);
+  const { adjacency, nodeIds } = adjacencyForIsland(island, spokesByEdgeKey);
   const layers = layeredNodeIds(nodeIds, adjacency);
   const rowGap = BASE_ROW_GAP * scale;
   const layerGap = BASE_LAYER_GAP * scale;
@@ -372,8 +373,14 @@ export function layoutProjectContextGraph(
     };
   }
 
+  const spokesByEdgeKey = new Map<string, ProjectContextGraphModel["spokes"]>();
+  for (const spoke of graph.spokes) {
+    const spokes = spokesByEdgeKey.get(spoke.edgeKey) ?? [];
+    spokes.push(spoke);
+    spokesByEdgeKey.set(spoke.edgeKey, spokes);
+  }
   const layouts = graph.islands.map((island) =>
-    layoutOneIsland(graph, island, scale),
+    layoutOneIsland(island, spokesByEdgeKey, scale),
   );
   const columnCount = Math.ceil(Math.sqrt(layouts.length));
   const rowCount = Math.ceil(layouts.length / columnCount);
@@ -388,18 +395,18 @@ export function layoutProjectContextGraph(
 
   const gap = BASE_ISLAND_GAP * scale;
   const outer = BASE_OUTER_PADDING * scale;
-  const columnX = columnWidths.map(
-    (_, index) =>
-      outer +
-      columnWidths.slice(0, index).reduce((sum, width) => sum + width, 0) +
-      index * gap,
-  );
-  const rowY = rowHeights.map(
-    (_, index) =>
-      outer +
-      rowHeights.slice(0, index).reduce((sum, height) => sum + height, 0) +
-      index * gap,
-  );
+  const columnX: number[] = [];
+  let nextColumnX = outer;
+  for (const width of columnWidths) {
+    columnX.push(nextColumnX);
+    nextColumnX += width + gap;
+  }
+  const rowY: number[] = [];
+  let nextRowY = outer;
+  for (const height of rowHeights) {
+    rowY.push(nextRowY);
+    nextRowY += height + gap;
+  }
   const nodes: ProjectContextLayoutNode[] = [];
   const islands: ProjectContextIslandLayout[] = [];
 

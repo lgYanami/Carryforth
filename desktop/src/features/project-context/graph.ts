@@ -154,18 +154,24 @@ function deriveIslands(
     }
   }
 
+  for (const incident of edgeKeysByCoordinate.values()) {
+    incident.sort(compareText);
+  }
+
   const components: Omit<ProjectContextGraphIsland, "index">[] = [];
-  while (unvisited.size > 0) {
-    const seed = [...unvisited].sort(compareText)[0];
+  const orderedSeeds = [...hubsByKey.keys()].sort(compareText);
+  for (const seed of orderedSeeds) {
+    if (!unvisited.has(seed)) continue;
     const queue = [seed];
+    let queueIndex = 0;
     const edgeKeys = new Set<string>();
     const coordinateKeys = new Set<string>();
     const contextDocumentIds = new Set<string>();
     unvisited.delete(seed);
 
-    while (queue.length > 0) {
-      const edgeKey = queue.shift();
-      if (!edgeKey) continue;
+    while (queueIndex < queue.length) {
+      const edgeKey = queue[queueIndex];
+      queueIndex += 1;
       const hub = hubsByKey.get(edgeKey);
       if (!hub) continue;
       edgeKeys.add(edgeKey);

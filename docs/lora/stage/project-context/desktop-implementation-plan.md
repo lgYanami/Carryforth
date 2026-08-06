@@ -1,6 +1,6 @@
 # Project Context Desktop 分阶段实现计划
 
-> 状态：实施中；阶段一至阶段四已提交，阶段五已交付，待 Human 确认。
+> 状态：实施中；阶段一至阶段五已提交，阶段六已交付，待 Human 确认。
 >
 > 产品规格：[Project Context Desktop 产品规格](./desktop-spec.md)。
 >
@@ -1152,17 +1152,18 @@ size、file-size override、lint disable 或降低测试门槛绕过仓库规则
 | 2. 页面纵向链路与状态外壳 | 已提交（`f2823ed22`） | `/project-context` route、sidebar、default All query、Community/Relay cache fence、完整只读状态外壳与 Context References 命名；Desktop 3557 tests、check、typecheck/build；Project Context E2E 10 + Context References 回归 E2E 1 通过 |
 | 3. 完整图、超边与 Context Islands | 已提交（`6451ebc61`） | lazy `@xyflow/react` 只读 viewport、canonical graph adapter、确定性 incidence layout / Island packing、Coordinate / Hub / Spoke / Island UI、选中与 fit controls；graph / layout / presentation 纯测试 18、Desktop 3575 tests、check、production build、Project Context E2E 11 与双 Island 截图通过 |
 | 4. 三类查询、URL 状态与跨页面深链 | 已提交（`c7eedb6a4`） | draft-first Query Bar、分组 Coordinate picker、closed canonical URL query / selection、focused Anchor layout 与 no-match、Project View / Document Incident deep link；route / query / graph 纯测试 35、Desktop 3586 tests、typecheck/check、production/E2E build、Project Context E2E 15 + deep link E2E 2 通过 |
-| 5. Coordinate / Edge Inspector 与按需正文 | 已交付，待确认 | responsive read-only Inspector、Project View / Document Coordinate detail、完整 hyperedge 与多 Document 切换、verified identity 下的 lazy Markdown、tombstone / unavailable / body-error 隔离、View / Documents 往返与 focus restoration；Inspector model 纯测试 5、Desktop 3591 tests、typecheck/check、production/E2E build、Project Context E2E 21、Project Context / View / Documents 联合 E2E 67 通过 |
-| 6. 实时恢复、视觉收口、响应式与可访问性 | 待实施 | — |
+| 5. Coordinate / Edge Inspector 与按需正文 | 已提交（`7a1081004`） | responsive read-only Inspector、Project View / Document Coordinate detail、完整 hyperedge 与多 Document 切换、verified identity 下的 lazy Markdown、tombstone / unavailable / body-error 隔离、View / Documents 往返与 focus restoration；Inspector model 纯测试 5、Desktop 3591 tests、typecheck/check、production/E2E build、Project Context E2E 21、Project Context / View / Documents 联合 E2E 67 通过 |
+| 6. 实时恢复、视觉收口、响应式与可访问性 | 已交付，待确认 | Context / Project View / Document 组合 live invalidation、subscribe 后 trusted re-read、burst coalescing 与 running/trailing refresh；last verified stale/reconnect、verification fail-closed、Community A→B→A 隔离；light/dark Island palette、reduced-motion、resizable Inspector、Fit Selection、独立 text/graph zoom、键盘与 ARIA；O(nodes + spokes) graph/layout、viewport culling 与 100/500/1000 Edge 完整性；Project Context 纯测试 43、Desktop 3599 tests、typecheck/check、production/E2E build、Project Context E2E 27 通过 |
 | 7. E2E、真实数据验收与质量收口 | 待实施 | — |
 
 状态只记录开发交付，不代表发布阶段。每个阶段提交后记录 commit 与实际通过的测试，不用
 “已写代码”代替完成证据。
 
 阶段一已在 `e8e1b29fe` 提交，阶段二已在 `f2823ed22` 提交，阶段三已在 `6451ebc61`
-提交，阶段四已在 `c7eedb6a4` 提交。阶段五当前尚未提交；Human 确认后再提交并进入阶段六。
-阶段五没有增加 Context write、内联业务编辑、Document history、live subscription、持久化布局、
-Island 领域身份或前端本地 query 模拟。
+提交，阶段四已在 `c7eedb6a4` 提交，阶段五已在 `7a1081004` 提交。阶段六当前尚未提交；
+Human 确认后再提交并进入阶段七。阶段六没有增加 Context write、协议语义、持久化布局、
+Island 领域身份、Gap 推断或前端本地 query 模拟；live event 始终只作为 trusted read 的
+invalidation hint。
 
 ## 11. 整体完成定义
 

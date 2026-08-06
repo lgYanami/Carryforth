@@ -136,7 +136,8 @@
   color: hsl(var(--project-context-island-hue) 78% 76%);
 }
 
-.project-context-coordinate[data-emphasis="active"] {
+.project-context-coordinate[data-emphasis="active"],
+.project-context-coordinate[data-hover-emphasis="active"] {
   border-color: hsl(var(--project-context-island-hue) 76% 48% / 0.92);
   box-shadow:
     0 0 0 3px hsl(var(--project-context-island-hue) 76% 52% / 0.16),
@@ -170,7 +171,8 @@
   color: hsl(var(--project-context-island-hue) 78% 78%);
 }
 
-.project-context-coordinate[data-emphasis="dimmed"] {
+.project-context-coordinate[data-emphasis="dimmed"],
+.project-context-coordinate[data-hover-emphasis="dimmed"] {
   opacity: 0.38;
 }
 
@@ -221,18 +223,22 @@
     transform 160ms ease;
 }
 
-.project-context-hub[data-emphasis="active"] {
+.project-context-hub[data-emphasis="active"],
+.project-context-hub[data-hover-emphasis="active"] {
   transform: scale(1.06);
 }
 
-.project-context-hub[data-emphasis="active"] .project-context-hub__diamond {
+.project-context-hub[data-emphasis="active"] .project-context-hub__diamond,
+.project-context-hub[data-hover-emphasis="active"]
+  .project-context-hub__diamond {
   border-color: hsl(var(--project-context-island-hue) 78% 46%);
   box-shadow:
     0 0 0 4px hsl(var(--project-context-island-hue) 76% 52% / 0.17),
     0 14px 28px -16px hsl(var(--project-context-island-hue) 76% 36% / 0.9);
 }
 
-.project-context-hub[data-emphasis="dimmed"] {
+.project-context-hub[data-emphasis="dimmed"],
+.project-context-hub[data-hover-emphasis="dimmed"] {
   opacity: 0.34;
 }
 
@@ -255,16 +261,19 @@
   stroke: hsl(var(--project-context-island-hue) 74% 72% / 0.54);
 }
 
-.project-context-spoke[data-emphasis="active"] {
+.project-context-spoke[data-emphasis="active"],
+.project-context-spoke[data-hover-emphasis="active"] {
   stroke: hsl(var(--project-context-island-hue) 78% 45% / 0.96);
   stroke-width: 3;
 }
 
-.dark .project-context-spoke[data-emphasis="active"] {
+.dark .project-context-spoke[data-emphasis="active"],
+.dark .project-context-spoke[data-hover-emphasis="active"] {
   stroke: hsl(var(--project-context-island-hue) 82% 76% / 0.96);
 }
 
-.project-context-spoke[data-emphasis="dimmed"] {
+.project-context-spoke[data-emphasis="dimmed"],
+.project-context-spoke[data-hover-emphasis="dimmed"] {
   opacity: 0.2;
   stroke-width: 1.5;
 }

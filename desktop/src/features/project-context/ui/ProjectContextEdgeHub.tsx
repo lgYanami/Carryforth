@@ -17,6 +17,7 @@ export function ProjectContextEdgeHub({
   return (
     <div
       className="project-context-hub h-full w-full"
+      data-context-graph-kind="edge"
       data-edge-key={data.hub.edgeKey}
       data-emphasis={data.emphasis}
       data-island={data.islandIndex}
@@ -25,7 +26,8 @@ export function ProjectContextEdgeHub({
     >
       <ProjectContextNodeHandles type="source" />
       <button
-        aria-label={`Select Context Edge with ${data.hub.coordinateKeys.length} coordinates and ${documentCount} Context Documents`}
+        aria-label={`Context Edge connecting ${data.hub.coordinateKeys.length} coordinates with ${documentCount} documents`}
+        aria-pressed={data.selected}
         className="nodrag nopan relative flex h-full w-full items-center justify-center rounded-full outline-none"
         type="button"
       >

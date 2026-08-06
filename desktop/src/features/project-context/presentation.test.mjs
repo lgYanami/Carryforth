@@ -79,6 +79,10 @@ test("no target leaves every graph element in its normal presentation", () => {
       assert.equal(element.data?.emphasis, "normal");
     }
   }
+  for (const edge of elements.edges) {
+    assert.equal(edge.focusable, false);
+    assert.equal(edge.domAttributes?.["aria-hidden"], true);
+  }
 });
 
 test("Edge focus highlights one exact Hub, all of its Spokes, and no overlap Edge", () => {
@@ -129,10 +133,18 @@ test("Coordinate focus highlights its incident Hubs but only its own Spokes", ()
   }
 });
 
-test("Island hues are stable and wrap without becoming domain identity", () => {
+test("Island hues stay stable and avoid immediate palette repetition", () => {
   assert.equal(projectContextIslandHue(1), 267);
   assert.equal(projectContextIslandHue(2), 196);
-  assert.equal(projectContextIslandHue(9), 267);
+  assert.equal(projectContextIslandHue(9), 290);
+  assert.equal(
+    new Set(
+      Array.from({ length: 16 }, (_, index) =>
+        projectContextIslandHue(index + 1),
+      ),
+    ).size,
+    16,
+  );
 });
 
 test("focused Coordinates carry a non-domain Query Anchor presentation flag", () => {

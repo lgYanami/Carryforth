@@ -83,6 +83,11 @@ export const KIND_PROJECT_VIEW_META = 40904;
 export const KIND_PROJECT_DOCUMENT_HEAD = 40905;
 export const KIND_PROJECT_DOCUMENT_REVISION = 40906;
 export const KIND_PROJECT_DOCUMENT_META = 40907;
+// Relay-authored Project Context projections. Like Project View and Project
+// Document projection events, these are invalidation signals only; React must
+// re-enter the native verified query boundary before replacing graph state.
+export const KIND_PROJECT_CONTEXT_EDGE_BINDING = 40908;
+export const KIND_PROJECT_CONTEXT_META = 40909;
 export const KIND_REPO_ANNOUNCEMENT = 30617;
 export const KIND_REPO_STATE = 30618;
 export const KIND_GIT_PATCH = 1617;

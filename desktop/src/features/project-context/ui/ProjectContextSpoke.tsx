@@ -30,6 +30,8 @@ export function ProjectContextSpoke({
   return (
     <BaseEdge
       className="project-context-spoke"
+      data-context-graph-kind="spoke"
+      data-coordinate-key={data?.coordinateKey}
       data-edge-key={data?.edgeKey}
       data-emphasis={data?.emphasis ?? "normal"}
       data-testid={`project-context-spoke-${id}`}

@@ -29,6 +29,7 @@ export type ProjectContextCoordinateNodeData = {
   islandIndex: number;
   hue: number;
   queryAnchor: boolean;
+  selected: boolean;
 };
 
 export type ProjectContextHubNodeData = {
@@ -37,6 +38,7 @@ export type ProjectContextHubNodeData = {
   emphasis: ProjectContextEmphasis;
   islandIndex: number;
   hue: number;
+  selected: boolean;
 };
 
 export type ProjectContextSpokeData = {
@@ -75,10 +77,17 @@ export type ProjectContextFlowElements = {
 };
 
 const ISLAND_HUES = [267, 196, 151, 32, 338, 224, 12, 178];
+const ISLAND_CYCLE_OFFSET = 23;
 
 /** Stable, presentation-only hue for the current deterministic Island order. */
 export function projectContextIslandHue(index: number): number {
-  return ISLAND_HUES[(Math.max(index, 1) - 1) % ISLAND_HUES.length];
+  const normalized = Math.max(index, 1) - 1;
+  const cycle = Math.floor(normalized / ISLAND_HUES.length);
+  return (
+    (ISLAND_HUES[normalized % ISLAND_HUES.length] +
+      cycle * ISLAND_CYCLE_OFFSET) %
+    360
+  );
 }
 
 function emphasis(active: boolean, target: ProjectContextGraphTarget | null) {
@@ -86,36 +95,27 @@ function emphasis(active: boolean, target: ProjectContextGraphTarget | null) {
   return active ? "active" : "dimmed";
 }
 
-function coordinateIsActive(
-  coordinateKey: string,
-  hubsByKey: Map<string, ProjectContextGraphHub>,
+function activeKeys(
+  graph: ProjectContextGraphModel,
   target: ProjectContextGraphTarget | null,
 ) {
-  if (!target) return false;
-  if (target.kind === "coordinate") return target.key === coordinateKey;
-  return (
-    hubsByKey.get(target.key)?.coordinateKeys.includes(coordinateKey) ?? false
-  );
-}
-
-function hubIsActive(
-  hub: ProjectContextGraphHub,
-  target: ProjectContextGraphTarget | null,
-) {
-  if (!target) return false;
-  if (target.kind === "edge") return target.key === hub.edgeKey;
-  return hub.coordinateKeys.includes(target.key);
-}
-
-function spokeIsActive(
-  edgeKey: string,
-  coordinateKey: string,
-  target: ProjectContextGraphTarget | null,
-) {
-  if (!target) return false;
-  return target.kind === "edge"
-    ? target.key === edgeKey
-    : target.key === coordinateKey;
+  const coordinates = new Set<string>();
+  const hubs = new Set<string>();
+  if (!target) return { coordinates, hubs };
+  if (target.kind === "edge") {
+    hubs.add(target.key);
+    for (const coordinateKey of graph.hubs.find(
+      (hub) => hub.edgeKey === target.key,
+    )?.coordinateKeys ?? []) {
+      coordinates.add(coordinateKey);
+    }
+    return { coordinates, hubs };
+  }
+  coordinates.add(target.key);
+  for (const hub of graph.hubs) {
+    if (hub.coordinateKeys.includes(target.key)) hubs.add(hub.edgeKey);
+  }
+  return { coordinates, hubs };
 }
 
 /**
@@ -131,7 +131,7 @@ export function buildProjectContextFlowElements(
     graph.coordinates.map((coordinate) => [coordinate.id, coordinate]),
   );
   const hubById = new Map(graph.hubs.map((hub) => [hub.id, hub]));
-  const hubsByKey = new Map(graph.hubs.map((hub) => [hub.edgeKey, hub]));
+  const active = activeKeys(graph, target);
   const layoutNodeById = new Map(layout.nodes.map((node) => [node.id, node]));
   const layoutSpokeById = new Map(
     layout.spokes.map((spoke) => [spoke.id, spoke]),
@@ -168,12 +168,15 @@ export function buildProjectContextFlowElements(
           kind: "coordinate",
           coordinate,
           emphasis: emphasis(
-            coordinateIsActive(coordinate.coordinateKey, hubsByKey, target),
+            active.coordinates.has(coordinate.coordinateKey),
             target,
           ),
           islandIndex: layoutNode.islandIndex,
           hue,
           queryAnchor: anchorKeys.has(coordinate.coordinateKey),
+          selected:
+            target?.kind === "coordinate" &&
+            target.key === coordinate.coordinateKey,
         },
         draggable: false,
         selectable: false,
@@ -193,9 +196,10 @@ export function buildProjectContextFlowElements(
       data: {
         kind: "hub",
         hub,
-        emphasis: emphasis(hubIsActive(hub, target), target),
+        emphasis: emphasis(active.hubs.has(hub.edgeKey), target),
         islandIndex: layoutNode.islandIndex,
         hue,
+        selected: target?.kind === "edge" && target.key === hub.edgeKey,
       },
       draggable: false,
       selectable: false,
@@ -221,17 +225,19 @@ export function buildProjectContextFlowElements(
           edgeKey: spoke.edgeKey,
           coordinateKey: spoke.coordinateKey,
           emphasis: emphasis(
-            spokeIsActive(spoke.edgeKey, spoke.coordinateKey, target),
+            target?.kind === "edge"
+              ? active.hubs.has(spoke.edgeKey)
+              : active.coordinates.has(spoke.coordinateKey),
             target,
           ),
           islandIndex: hubLayout.islandIndex,
           hue: projectContextIslandHue(hubLayout.islandIndex),
         },
-        ariaLabel: `Context Edge ${spoke.edgeKey} incidence`,
         deletable: false,
+        domAttributes: { "aria-hidden": true },
         reconnectable: false,
         selectable: false,
-        focusable: true,
+        focusable: false,
         interactionWidth: 28,
         zIndex: 1,
       },

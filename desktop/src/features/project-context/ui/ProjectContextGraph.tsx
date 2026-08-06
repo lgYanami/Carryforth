@@ -89,15 +89,58 @@ function sameTarget(
   return left?.kind === right?.kind && left?.key === right?.key;
 }
 
+function clearGraphHover(root: HTMLElement | null) {
+  for (const element of root?.querySelectorAll("[data-context-graph-kind]") ??
+    []) {
+    element.removeAttribute("data-hover-emphasis");
+  }
+}
+
+function applyGraphHover(
+  root: HTMLElement | null,
+  graph: ReturnType<typeof buildProjectContextGraph>,
+  target: ProjectContextGraphTarget,
+) {
+  if (!root) return;
+  const activeCoordinateKeys = new Set<string>();
+  const activeEdgeKeys = new Set<string>();
+  if (target.kind === "edge") {
+    activeEdgeKeys.add(target.key);
+    for (const key of graph.hubs.find((hub) => hub.edgeKey === target.key)
+      ?.coordinateKeys ?? []) {
+      activeCoordinateKeys.add(key);
+    }
+  } else {
+    activeCoordinateKeys.add(target.key);
+    for (const hub of graph.hubs) {
+      if (hub.coordinateKeys.includes(target.key)) {
+        activeEdgeKeys.add(hub.edgeKey);
+      }
+    }
+  }
+
+  for (const element of root.querySelectorAll("[data-context-graph-kind]")) {
+    const kind = element.getAttribute("data-context-graph-kind");
+    const coordinateKey = element.getAttribute("data-coordinate-key");
+    const edgeKey = element.getAttribute("data-edge-key");
+    const active =
+      kind === "coordinate"
+        ? coordinateKey !== null && activeCoordinateKeys.has(coordinateKey)
+        : kind === "edge"
+          ? edgeKey !== null && activeEdgeKeys.has(edgeKey)
+          : target.kind === "edge"
+            ? edgeKey === target.key
+            : coordinateKey === target.key;
+    element.setAttribute("data-hover-emphasis", active ? "active" : "dimmed");
+  }
+}
+
 type ProjectContextGraphInnerProps = {
   elements: ProjectContextFlowElements;
   focusSelectionRequest: number;
   graph: ReturnType<typeof buildProjectContextGraph>;
   layout: ReturnType<typeof layoutProjectContextGraph>;
   selection: ProjectContextGraphTarget | null;
-  setHovered: React.Dispatch<
-    React.SetStateAction<ProjectContextGraphTarget | null>
-  >;
   onSelectionChange: (selection: ProjectContextGraphTarget | null) => void;
 };
 
@@ -108,26 +151,39 @@ function ProjectContextGraphInner({
   layout,
   onSelectionChange,
   selection,
-  setHovered,
 }: ProjectContextGraphInnerProps) {
   const shouldReduceMotion = useReducedMotion();
   const nodesInitialized = useNodesInitialized();
   const handledFocusSelectionRequest = React.useRef(0);
+  const graphRootRef = React.useRef<HTMLElement>(null);
   const { fitBounds, fitView, zoomIn, zoomOut } = useReactFlow<
     ProjectContextFlowNode,
     ProjectContextFlowEdge
   >();
   const duration = shouldReduceMotion ? 0 : 220;
-  const layoutKey = layout.nodes
-    .map(
-      (node) => `${node.id}:${node.x}:${node.y}:${node.width}:${node.height}`,
-    )
-    .join(";");
+  const layoutKey = React.useMemo(
+    () =>
+      layout.nodes
+        .map(
+          (node) =>
+            `${node.id}:${node.x}:${node.y}:${node.width}:${node.height}`,
+        )
+        .join(";"),
+    [layout.nodes],
+  );
+  const hoverResetKey = `${layoutKey}:${selection?.kind ?? "none"}:${selection?.key ?? "none"}`;
+  const previousHoverResetKey = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     if (!nodesInitialized || layoutKey.length === 0) return;
     void fitView({ padding: 0.08, duration: 0, maxZoom: 1.15 });
   }, [fitView, layoutKey, nodesInitialized]);
+
+  React.useEffect(() => {
+    if (previousHoverResetKey.current === hoverResetKey) return;
+    previousHoverResetKey.current = hoverResetKey;
+    clearGraphHover(graphRootRef.current);
+  }, [hoverResetKey]);
 
   React.useEffect(() => {
     if (
@@ -181,19 +237,17 @@ function ProjectContextGraphInner({
   >(
     (_event, node) => {
       const target = targetForNode(node);
-      if (target) setHovered(target);
+      if (target && !selection) {
+        applyGraphHover(graphRootRef.current, graph, target);
+      }
     },
-    [setHovered],
+    [graph, selection],
   );
   const handleNodeMouseLeave = React.useCallback<
     NodeMouseHandler<ProjectContextFlowNode>
-  >(
-    (_event, node) => {
-      const target = targetForNode(node);
-      setHovered((current) => (sameTarget(current, target) ? null : current));
-    },
-    [setHovered],
-  );
+  >(() => {
+    clearGraphHover(graphRootRef.current);
+  }, []);
   const handleEdgeClick = React.useCallback<
     EdgeMouseHandler<ProjectContextFlowEdge>
   >(
@@ -209,21 +263,21 @@ function ProjectContextGraphInner({
   >(
     (_event, edge) => {
       if (edge.data) {
-        setHovered({ kind: "edge", key: edge.data.edgeKey });
+        if (!selection) {
+          applyGraphHover(graphRootRef.current, graph, {
+            kind: "edge",
+            key: edge.data.edgeKey,
+          });
+        }
       }
     },
-    [setHovered],
+    [graph, selection],
   );
   const handleEdgeMouseLeave = React.useCallback<
     EdgeMouseHandler<ProjectContextFlowEdge>
-  >(
-    (_event, edge) => {
-      if (!edge.data) return;
-      const target = { kind: "edge", key: edge.data.edgeKey } as const;
-      setHovered((current) => (sameTarget(current, target) ? null : current));
-    },
-    [setHovered],
-  );
+  >(() => {
+    clearGraphHover(graphRootRef.current);
+  }, []);
   const selectedLabel = React.useMemo(() => {
     if (!selection) return undefined;
     if (selection.kind === "coordinate") {
@@ -241,15 +295,17 @@ function ProjectContextGraphInner({
 
   return (
     <section
+      aria-describedby="project-context-graph-description"
       aria-label="Project Context graph canvas"
       className="project-context-graph relative min-h-0 flex-1 overflow-hidden bg-background/35"
       data-testid="project-context-graph"
+      ref={graphRootRef}
     >
       <ReactFlow<ProjectContextFlowNode, ProjectContextFlowEdge>
         connectOnClick={false}
         deleteKeyCode={null}
         edges={elements.edges}
-        edgesFocusable
+        edgesFocusable={false}
         edgesReconnectable={false}
         edgeTypes={EDGE_TYPES}
         elementsSelectable
@@ -269,6 +325,7 @@ function ProjectContextGraphInner({
         onNodeMouseEnter={handleNodeMouseEnter}
         onNodeMouseLeave={handleNodeMouseLeave}
         onPaneClick={() => onSelectionChange(null)}
+        onlyRenderVisibleElements
         panOnDrag
         proOptions={{ hideAttribution: true }}
         selectionOnDrag={false}
@@ -315,6 +372,37 @@ function ProjectContextGraphInner({
           >
             <Maximize2 />
           </Button>
+          {selection ? (
+            <Button
+              aria-label="Fit selected graph item"
+              data-testid="project-context-fit-selection"
+              onClick={() => {
+                const nodeId =
+                  selection.kind === "coordinate"
+                    ? `coordinate:${selection.key}`
+                    : `edge-hub:${selection.key}`;
+                const node = layout.nodes.find(
+                  (candidate) => candidate.id === nodeId,
+                );
+                if (!node) return;
+                focusProjectContextGraphTarget(selection);
+                void fitBounds(
+                  {
+                    x: node.x,
+                    y: node.y,
+                    width: node.width,
+                    height: node.height,
+                  },
+                  { padding: 0.8, duration },
+                ).then(() => focusProjectContextGraphTarget(selection));
+              }}
+              size="icon-xs"
+              type="button"
+              variant="ghost"
+            >
+              <Focus />
+            </Button>
+          ) : null}
         </div>
         {selectedLabel ? (
           <div
@@ -326,7 +414,7 @@ function ProjectContextGraphInner({
           </div>
         ) : null}
       </ReactFlow>
-      <span className="sr-only">
+      <span className="sr-only" id="project-context-graph-description">
         This is an undirected incidence graph. Node placement does not express
         source, target, order, importance, or causality.
       </span>
@@ -335,11 +423,11 @@ function ProjectContextGraphInner({
           Pan to explore · Scroll to zoom · Undirected relationships
         </span>
       </div>
-      <div className="sr-only" aria-live="polite">
-        {selection
-          ? `${selection.kind === "edge" ? "Context Edge" : "Coordinate"} selected.`
-          : "Graph selection cleared."}
-      </div>
+      {selection ? (
+        <div className="sr-only" aria-live="polite" aria-atomic="true">
+          {selection.kind === "edge" ? "Context Edge" : "Coordinate"} selected.
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -365,29 +453,13 @@ export function ProjectContextGraph({
     () => layoutProjectContextGraph(graph, textScale),
     [graph, textScale],
   );
-  const [hovered, setHovered] =
-    React.useState<ProjectContextGraphTarget | null>(null);
-  const activeTarget = selection ?? hovered;
   const elements = React.useMemo(
-    () => buildProjectContextFlowElements(graph, layout, activeTarget),
-    [activeTarget, graph, layout],
+    () => buildProjectContextFlowElements(graph, layout, selection),
+    [graph, layout, selection],
   );
   const contextDocumentCount = new Set(
     graph.hubs.flatMap((hub) => hub.contextDocumentIds),
   ).size;
-
-  React.useEffect(() => {
-    setHovered((current) => {
-      if (!current) return current;
-      const remainsVisible =
-        current.kind === "edge"
-          ? graph.hubs.some((hub) => hub.edgeKey === current.key)
-          : graph.coordinates.some(
-              (coordinate) => coordinate.coordinateKey === current.key,
-            );
-      return remainsVisible ? current : null;
-    });
-  }, [graph]);
 
   return (
     <ReactFlowProvider>
@@ -454,7 +526,6 @@ export function ProjectContextGraph({
           layout={layout}
           onSelectionChange={onSelectionChange}
           selection={selection}
-          setHovered={setHovered}
         />
       </section>
     </ReactFlowProvider>
