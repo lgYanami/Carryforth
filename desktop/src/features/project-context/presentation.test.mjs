@@ -134,3 +134,54 @@ test("Island hues are stable and wrap without becoming domain identity", () => {
   assert.equal(projectContextIslandHue(2), 196);
   assert.equal(projectContextIslandHue(9), 267);
 });
+
+test("focused Coordinates carry a non-domain Query Anchor presentation flag", () => {
+  const objectId = "60000000-0000-4000-8000-000000000001";
+  const graph = buildProjectContextGraph({
+    communityKey: "community-0",
+    projectId: "project",
+    relayPubkey: "a".repeat(64),
+    context: {
+      contextRevision: 1,
+      projectionGeneration: 1,
+      activeEdgeCount: 1,
+      boundDocumentCount: 1,
+      updatedAt: "2026-08-06T00:00:00Z",
+      metaEventId: "b".repeat(64),
+      capabilityEnabled: true,
+    },
+    query: {
+      type: "incident",
+      coordinate: {
+        type: "project_view_object",
+        objectType: "requirement",
+        objectId,
+      },
+    },
+    projectViewObservation: { state: "observed" },
+    documentObservation: { state: "observed" },
+    edges: [],
+    coordinateDetails: [
+      {
+        coordinateKey: `requirement:${objectId}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId,
+        },
+        state: "active",
+        title: "Anchor",
+      },
+    ],
+    documentDetails: [],
+  });
+  const elements = buildProjectContextFlowElements(
+    graph,
+    layoutProjectContextGraph(graph),
+    null,
+  );
+
+  assert.equal(elements.nodes.length, 1);
+  assert.equal(elements.nodes[0].data.kind, "coordinate");
+  assert.equal(elements.nodes[0].data.queryAnchor, true);
+});

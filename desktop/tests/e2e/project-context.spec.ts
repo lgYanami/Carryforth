@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import type {
   ProjectContextErrorPayload,
+  ProjectContextQuery,
   ProjectContextQueryResult,
 } from "../../src/shared/api/tauriProjectContext";
 import { waitForAnimations } from "../helpers/animations";
@@ -281,6 +282,35 @@ function twoIslandResult(): ProjectContextQueryResult {
   };
 }
 
+function queryKey(query: ProjectContextQuery): string {
+  return JSON.stringify(query);
+}
+
+function focusedResult(
+  query: ProjectContextQuery,
+  input?: { noMatch?: boolean },
+): ProjectContextQueryResult {
+  const base = contextResult();
+  if (!input?.noMatch) return { ...base, query };
+  const coordinates =
+    query.type === "incident" ? [query.coordinate] : query.coordinates;
+  return {
+    ...base,
+    query,
+    edges: [],
+    coordinateDetails: coordinates.map((coordinate) => ({
+      coordinateKey:
+        coordinate.type === "document"
+          ? `document:${coordinate.documentId}`
+          : `${coordinate.objectType}:${coordinate.objectId}`,
+      coordinate,
+      state: "active",
+      title: "Unmatched query anchor",
+    })),
+    documentDetails: [],
+  };
+}
+
 async function openProjectContext(page: import("@playwright/test").Page) {
   await page.goto("/");
   await page.getByTestId("open-project-context").click();
@@ -333,6 +363,197 @@ test("sidebar order, active route, and default All query reach the trusted graph
   });
 });
 
+test("Query Bar keeps a draft until Run and URL history restores query and selection", async ({
+  page,
+}) => {
+  const incident: ProjectContextQuery = {
+    type: "incident",
+    coordinate: {
+      type: "project_view_object",
+      objectType: "requirement",
+      objectId: REQUIREMENT_ID,
+    },
+  };
+  await installMockBridge(page, {
+    projectContext: contextResult(),
+    projectContextsByQuery: {
+      [queryKey(incident)]: focusedResult(incident),
+    },
+  });
+  await openProjectContext(page);
+
+  await page.getByTestId("project-context-mode-incident").click();
+  await page.getByTestId("project-context-coordinate-picker").click();
+  const search = page.getByTestId("project-context-coordinate-search");
+  await search.fill("Verified requirement");
+  await search.press("Enter");
+  await expect(page.getByTestId("project-context-query-bar")).toHaveAttribute(
+    "data-draft-dirty",
+    "true",
+  );
+  expect(
+    await page.evaluate(
+      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
+    ),
+  ).toBe(1);
+
+  await page.getByTestId("project-context-run-query").click();
+  await expect(page).toHaveURL(/mode=incident/);
+  await expect(page).toHaveURL(
+    new RegExp(`coordinates=requirement(%3A|:)${REQUIREMENT_ID}`),
+  );
+  await expect(page.getByTestId("project-context-query-summary")).toContainText(
+    "1 matching edge",
+  );
+  expect(
+    await page.evaluate(
+      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
+    ),
+  ).toBe(2);
+
+  await page
+    .getByTestId(`project-context-coordinate-requirement:${REQUIREMENT_ID}`)
+    .click();
+  await expect(page).toHaveURL(/selected=coordinate/);
+  expect(
+    await page.evaluate(
+      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
+    ),
+  ).toBe(2);
+
+  await page.goBack();
+  await expect(page).not.toHaveURL(/selected=/);
+  await page.goBack();
+  await expect(page).toHaveURL(/#\/project-context$/);
+  await expect(
+    page.getByTestId("project-context-island-summary"),
+  ).toBeVisible();
+  await page.goForward();
+  await expect(page).toHaveURL(/mode=incident/);
+  await expect(page.getByTestId("project-context-query-summary")).toBeVisible();
+  await page.goForward();
+  await expect(page).toHaveURL(/selected=coordinate/);
+});
+
+test("Exact and Contains all enforce arity and submit canonical typed queries", async ({
+  page,
+}) => {
+  const requirement = {
+    type: "project_view_object" as const,
+    objectType: "requirement" as const,
+    objectId: REQUIREMENT_ID,
+  };
+  const resource = {
+    type: "project_view_object" as const,
+    objectType: "resource" as const,
+    objectId: RESOURCE_ID,
+  };
+  const exact: ProjectContextQuery = {
+    type: "exact",
+    coordinates: [requirement, resource],
+  };
+  const containsAll: ProjectContextQuery = {
+    type: "contains_all",
+    coordinates: [requirement],
+  };
+  await installMockBridge(page, {
+    projectContext: contextResult(),
+    projectContextsByQuery: {
+      [queryKey(exact)]: focusedResult(exact),
+      [queryKey(containsAll)]: focusedResult(containsAll),
+    },
+  });
+  await openProjectContext(page);
+
+  await page.getByTestId("project-context-mode-exact").click();
+  await page.getByTestId("project-context-coordinate-picker").click();
+  await page
+    .getByTestId("project-context-coordinate-search")
+    .fill("Verified requirement");
+  await page.getByTestId("project-context-coordinate-search").press("Enter");
+  await expect(page.getByTestId("project-context-run-query")).toBeDisabled();
+  await page
+    .getByTestId("project-context-coordinate-search")
+    .fill("Verified resource");
+  await page.getByTestId("project-context-coordinate-search").press("Enter");
+  await expect(page.getByTestId("project-context-run-query")).toBeEnabled();
+  await page.getByTestId("project-context-run-query").click();
+  await expect(page.getByTestId("project-context-query-summary")).toContainText(
+    "1 matching edge",
+  );
+
+  let calls = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__,
+  );
+  expect(calls?.at(-1)?.payload).toMatchObject({
+    input: { query: exact },
+  });
+
+  await page.getByTestId("project-context-mode-contains_all").click();
+  await page.getByRole("button", { name: "Remove Verified resource" }).click();
+  await page.getByTestId("project-context-run-query").click();
+  await expect(page).toHaveURL(/mode=contains_all/);
+  calls = await page.evaluate(() => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__);
+  expect(calls?.at(-1)?.payload).toMatchObject({
+    input: { query: containsAll },
+  });
+
+  await page.getByTestId("project-context-mode-all").click();
+  await page.getByTestId("project-context-run-query").click();
+  await expect(page).toHaveURL(/#\/project-context$/);
+  await expect(
+    page.getByTestId("project-context-island-summary"),
+  ).toBeVisible();
+});
+
+test("focused no-match shows Anchors, clears stale selection, and claims no Island or Gap", async ({
+  page,
+}) => {
+  const incident: ProjectContextQuery = {
+    type: "incident",
+    coordinate: { type: "document", documentId: DOCUMENT_COORDINATE_ID },
+  };
+  await installMockBridge(page, {
+    projectContext: contextResult(),
+    projectContextsByQuery: {
+      [queryKey(incident)]: focusedResult(incident, { noMatch: true }),
+    },
+  });
+  await page.goto(
+    `/#/project-context?mode=incident&coordinates=document:${DOCUMENT_COORDINATE_ID}&selected=edge:${"1".repeat(64)}`,
+  );
+
+  await expect(page.getByTestId("project-context-query-summary")).toContainText(
+    "0 matching edges",
+  );
+  await expect(
+    page.getByTestId(
+      `project-context-coordinate-document:${DOCUMENT_COORDINATE_ID}`,
+    ),
+  ).toHaveAttribute("data-query-anchor", "true");
+  await expect(page.getByTestId("project-context-island-summary")).toHaveCount(
+    0,
+  );
+  await expect(page.getByText(/Context Gap/i)).toHaveCount(0);
+  await expect(page).not.toHaveURL(/selected=/);
+});
+
+test("invalid copied route is rejected before the trusted query boundary", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectContext: contextResult() });
+  await page.goto("/#/project-context?mode=exact&coordinates=not-a-coordinate");
+  await expect(page.getByTestId("project-context-invalid-route")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
+    ),
+  ).toBe(0);
+  await page.getByTestId("project-context-reset-invalid-route").click();
+  await expect(page).toHaveURL(/#\/project-context$/);
+  await expect(page.getByTestId("project-context-graph-slot")).toBeVisible();
+});
+
 test("All Context renders binary, hyperedge overlap, and two labelled Islands", async ({
   page,
 }) => {
@@ -359,9 +580,7 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
     page.locator('[data-testid^="project-context-edge-"]'),
   ).toHaveCount(3);
   await expect(page.locator(".project-context-spoke")).toHaveCount(7);
-  await expect(
-    page.locator('[data-testid^="project-context-coordinate-"]'),
-  ).toHaveCount(5);
+  await expect(page.locator(".project-context-coordinate")).toHaveCount(5);
 
   await expect(
     page.getByTestId(`project-context-coordinate-resource:${RESOURCE_ID}`),

@@ -202,7 +202,39 @@ function coordinateRank(coordinate: ProjectContextCoordinate): number {
     : OBJECT_TYPE_RANK[coordinate.objectType];
 }
 
-function canonicalCoordinateSet(
+/** Parse one canonical Coordinate token without accepting unknown object types. */
+export function projectContextCoordinateFromKey(
+  coordinateKey: string,
+): ProjectContextCoordinate {
+  const separator = coordinateKey.indexOf(":");
+  if (separator <= 0 || separator === coordinateKey.length - 1) {
+    throw new ProjectContextError({
+      code: "invalid_input",
+      message: "Project Context Coordinate token is malformed.",
+      retryable: false,
+    });
+  }
+  const type = coordinateKey.slice(0, separator);
+  const id = coordinateKey.slice(separator + 1);
+  if (type === "document") {
+    return canonicalCoordinate({ type: "document", documentId: id });
+  }
+  if (!(type in OBJECT_TYPE_RANK)) {
+    throw new ProjectContextError({
+      code: "invalid_input",
+      message: "Project Context Coordinate token has an unknown type.",
+      retryable: false,
+    });
+  }
+  return canonicalCoordinate({
+    type: "project_view_object",
+    objectType: type as ProjectViewObjectType,
+    objectId: id,
+  });
+}
+
+/** Validate, deduplicate, and stably order one Coordinate set. */
+export function canonicalizeProjectContextCoordinates(
   coordinates: ProjectContextCoordinate[],
 ): ProjectContextCoordinate[] {
   const canonical = coordinates.map(canonicalCoordinate).sort((left, right) => {
@@ -236,7 +268,7 @@ export function canonicalizeProjectContextQuery(
       coordinate: canonicalCoordinate(query.coordinate),
     };
   }
-  const coordinates = canonicalCoordinateSet(query.coordinates);
+  const coordinates = canonicalizeProjectContextCoordinates(query.coordinates);
   if (query.type === "exact" && coordinates.length < 2) {
     throw new ProjectContextError({
       code: "invalid_input",

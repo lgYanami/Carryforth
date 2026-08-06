@@ -28,6 +28,7 @@ export type ProjectContextCoordinateNodeData = {
   emphasis: ProjectContextEmphasis;
   islandIndex: number;
   hue: number;
+  queryAnchor: boolean;
 };
 
 export type ProjectContextHubNodeData = {
@@ -131,9 +132,6 @@ export function buildProjectContextFlowElements(
   );
   const hubById = new Map(graph.hubs.map((hub) => [hub.id, hub]));
   const hubsByKey = new Map(graph.hubs.map((hub) => [hub.edgeKey, hub]));
-  const islandByKey = new Map(
-    layout.islands.map((island) => [island.stableKey, island]),
-  );
   const layoutNodeById = new Map(layout.nodes.map((node) => [node.id, node]));
   const layoutSpokeById = new Map(
     layout.spokes.map((spoke) => [spoke.id, spoke]),
@@ -154,11 +152,10 @@ export function buildProjectContextFlowElements(
     zIndex: -10,
     className: "pointer-events-none",
   }));
+  const anchorKeys = new Set(graph.anchorCoordinateKeys);
 
   for (const layoutNode of layout.nodes) {
-    const island = islandByKey.get(layoutNode.islandKey);
-    if (!island) continue;
-    const hue = projectContextIslandHue(island.index);
+    const hue = projectContextIslandHue(layoutNode.islandIndex);
     if (layoutNode.kind === "coordinate") {
       const coordinate = coordinateById.get(layoutNode.id);
       if (!coordinate) continue;
@@ -174,8 +171,9 @@ export function buildProjectContextFlowElements(
             coordinateIsActive(coordinate.coordinateKey, hubsByKey, target),
             target,
           ),
-          islandIndex: island.index,
+          islandIndex: layoutNode.islandIndex,
           hue,
+          queryAnchor: anchorKeys.has(coordinate.coordinateKey),
         },
         draggable: false,
         selectable: false,
@@ -196,7 +194,7 @@ export function buildProjectContextFlowElements(
         kind: "hub",
         hub,
         emphasis: emphasis(hubIsActive(hub, target), target),
-        islandIndex: island.index,
+        islandIndex: layoutNode.islandIndex,
         hue,
       },
       draggable: false,

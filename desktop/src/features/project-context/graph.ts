@@ -4,6 +4,7 @@ import type {
   ProjectContextDetailState,
   ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
+import { projectContextCoordinateKey } from "@/shared/api/tauriProjectContext";
 
 export type ProjectContextGraphCoordinate = {
   id: string;
@@ -41,8 +42,10 @@ export type ProjectContextGraphIsland = {
 };
 
 export type ProjectContextGraphModel = {
+  anchorCoordinateKeys: string[];
   coordinates: ProjectContextGraphCoordinate[];
   hubs: ProjectContextGraphHub[];
+  isAllContext: boolean;
   spokes: ProjectContextGraphSpoke[];
   islands: ProjectContextGraphIsland[];
 };
@@ -204,7 +207,14 @@ export function buildProjectContextGraph(
   const detailByKey = new Map(
     result.coordinateDetails.map((detail) => [detail.coordinateKey, detail]),
   );
-  const coordinateKeys = new Set<string>();
+  const queryCoordinates =
+    result.query.type === "incident"
+      ? [result.query.coordinate]
+      : result.query.coordinates;
+  const anchorCoordinateKeys = queryCoordinates
+    .map(projectContextCoordinateKey)
+    .sort(compareText);
+  const coordinateKeys = new Set<string>(anchorCoordinateKeys);
   const hubs = [...result.edges]
     .sort((left, right) => compareText(left.edgeKey, right.edgeKey))
     .map((edge) => {
@@ -241,8 +251,12 @@ export function buildProjectContextGraph(
   );
 
   return {
+    anchorCoordinateKeys,
     coordinates,
     hubs,
+    isAllContext:
+      result.query.type === "contains_all" &&
+      result.query.coordinates.length === 0,
     spokes,
     islands: deriveIslands(hubs),
   };

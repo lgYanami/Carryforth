@@ -96,18 +96,16 @@ type ProjectContextGraphInnerProps = {
   setHovered: React.Dispatch<
     React.SetStateAction<ProjectContextGraphTarget | null>
   >;
-  setSelection: React.Dispatch<
-    React.SetStateAction<ProjectContextGraphTarget | null>
-  >;
+  onSelectionChange: (selection: ProjectContextGraphTarget | null) => void;
 };
 
 function ProjectContextGraphInner({
   elements,
   graph,
   layout,
+  onSelectionChange,
   selection,
   setHovered,
-  setSelection,
 }: ProjectContextGraphInnerProps) {
   const shouldReduceMotion = useReducedMotion();
   const nodesInitialized = useNodesInitialized();
@@ -116,10 +114,9 @@ function ProjectContextGraphInner({
     ProjectContextFlowEdge
   >();
   const duration = shouldReduceMotion ? 0 : 220;
-  const layoutKey = layout.islands
+  const layoutKey = layout.nodes
     .map(
-      (island) =>
-        `${island.stableKey}:${island.bounds.x}:${island.bounds.y}:${island.bounds.width}:${island.bounds.height}`,
+      (node) => `${node.id}:${node.x}:${node.y}:${node.width}:${node.height}`,
     )
     .join(";");
 
@@ -134,9 +131,9 @@ function ProjectContextGraphInner({
     (_event, node) => {
       const target = targetForNode(node);
       if (!target) return;
-      setSelection((current) => (sameTarget(current, target) ? null : target));
+      onSelectionChange(sameTarget(selection, target) ? null : target);
     },
-    [setSelection],
+    [onSelectionChange, selection],
   );
   const handleNodeMouseEnter = React.useCallback<
     NodeMouseHandler<ProjectContextFlowNode>
@@ -162,9 +159,9 @@ function ProjectContextGraphInner({
     (_event, edge) => {
       if (!edge.data) return;
       const target = { kind: "edge", key: edge.data.edgeKey } as const;
-      setSelection((current) => (sameTarget(current, target) ? null : target));
+      onSelectionChange(sameTarget(selection, target) ? null : target);
     },
-    [setSelection],
+    [onSelectionChange, selection],
   );
   const handleEdgeMouseEnter = React.useCallback<
     EdgeMouseHandler<ProjectContextFlowEdge>
@@ -230,7 +227,7 @@ function ProjectContextGraphInner({
         onNodeClick={handleNodeClick}
         onNodeMouseEnter={handleNodeMouseEnter}
         onNodeMouseLeave={handleNodeMouseLeave}
-        onPaneClick={() => setSelection(null)}
+        onPaneClick={() => onSelectionChange(null)}
         panOnDrag
         proOptions={{ hideAttribution: true }}
         selectionOnDrag={false}
@@ -262,7 +259,11 @@ function ProjectContextGraphInner({
             <Plus />
           </Button>
           <Button
-            aria-label="Fit all Context Islands"
+            aria-label={
+              graph.isAllContext
+                ? "Fit all Context Islands"
+                : "Fit query result"
+            }
             data-testid="project-context-fit-all-canvas"
             onClick={() =>
               void fitView({ padding: 0.08, duration, maxZoom: 1.15 })
@@ -302,11 +303,18 @@ function ProjectContextGraphInner({
   );
 }
 
-/** Complete read-only All Context graph with Island navigation. */
+/** Read-only query result graph; stable selection is owned by route state. */
 export function ProjectContextGraph({
+  onSelectionChange,
   result,
+  selection,
 }: {
+  onSelectionChange: (
+    selection: ProjectContextGraphTarget | null,
+    options?: { replace?: boolean },
+  ) => void;
   result: ProjectContextQueryResult;
+  selection: ProjectContextGraphTarget | null;
 }) {
   const textScale = useProjectContextTextScale();
   const graph = React.useMemo(() => buildProjectContextGraph(result), [result]);
@@ -314,8 +322,6 @@ export function ProjectContextGraph({
     () => layoutProjectContextGraph(graph, textScale),
     [graph, textScale],
   );
-  const [selection, setSelection] =
-    React.useState<ProjectContextGraphTarget | null>(null);
   const [hovered, setHovered] =
     React.useState<ProjectContextGraphTarget | null>(null);
   const activeTarget = selection ?? hovered;
@@ -324,24 +330,20 @@ export function ProjectContextGraph({
     [activeTarget, graph, layout],
   );
   const contextDocumentCount = new Set(
-    graph.islands.flatMap((island) => island.contextDocumentIds),
+    graph.hubs.flatMap((hub) => hub.contextDocumentIds),
   ).size;
 
   React.useEffect(() => {
     setHovered(null);
-    setSelection((current) => {
-      if (!current) return null;
-      return current.kind === "edge"
-        ? graph.hubs.some((hub) => hub.edgeKey === current.key)
-          ? current
-          : null
+    if (!selection) return;
+    const remainsVisible =
+      selection.kind === "edge"
+        ? graph.hubs.some((hub) => hub.edgeKey === selection.key)
         : graph.coordinates.some(
-              (coordinate) => coordinate.coordinateKey === current.key,
-            )
-          ? current
-          : null;
-    });
-  }, [graph]);
+            (coordinate) => coordinate.coordinateKey === selection.key,
+          );
+    if (!remainsVisible) onSelectionChange(null, { replace: true });
+  }, [graph, onSelectionChange, selection]);
 
   return (
     <ReactFlowProvider>
@@ -349,35 +351,65 @@ export function ProjectContextGraph({
         <div className="border-b border-border/70 bg-background/55 px-3 py-2.5 sm:px-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <div
-                className="text-sm font-semibold"
-                data-testid="project-context-island-summary"
-              >
-                {graph.islands.length} context{" "}
-                {graph.islands.length === 1 ? "island" : "islands"} ·{" "}
-                {graph.coordinates.length}{" "}
-                {graph.coordinates.length === 1 ? "coordinate" : "coordinates"}{" "}
-                · {graph.hubs.length}{" "}
-                {graph.hubs.length === 1 ? "edge" : "edges"} ·{" "}
-                {contextDocumentCount} context{" "}
-                {contextDocumentCount === 1 ? "doc" : "docs"}
-              </div>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {graph.islands.length > 1
-                  ? `The current Project Context contains ${graph.islands.length} disconnected components.`
-                  : "All visible Context Edges form one connected component."}
-              </p>
+              {graph.isAllContext ? (
+                <>
+                  <div
+                    className="text-sm font-semibold"
+                    data-testid="project-context-island-summary"
+                  >
+                    {graph.islands.length} context{" "}
+                    {graph.islands.length === 1 ? "island" : "islands"} ·{" "}
+                    {graph.coordinates.length}{" "}
+                    {graph.coordinates.length === 1
+                      ? "coordinate"
+                      : "coordinates"}{" "}
+                    · {graph.hubs.length}{" "}
+                    {graph.hubs.length === 1 ? "edge" : "edges"} ·{" "}
+                    {contextDocumentCount} context{" "}
+                    {contextDocumentCount === 1 ? "doc" : "docs"}
+                  </div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    {graph.islands.length > 1
+                      ? `The current Project Context contains ${graph.islands.length} disconnected components.`
+                      : "All visible Context Edges form one connected component."}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div
+                    className="text-sm font-semibold"
+                    data-testid="project-context-query-summary"
+                  >
+                    {graph.hubs.length} matching{" "}
+                    {graph.hubs.length === 1 ? "edge" : "edges"} ·{" "}
+                    {graph.coordinates.length}{" "}
+                    {graph.coordinates.length === 1
+                      ? "coordinate"
+                      : "coordinates"}{" "}
+                    · {contextDocumentCount} context{" "}
+                    {contextDocumentCount === 1 ? "doc" : "docs"}
+                  </div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    {graph.hubs.length === 0
+                      ? "The query Anchors are shown for orientation. They are not a Context Island or a Gap."
+                      : "This focused result shares its Query Anchors; it is not a project-level Island count."}
+                  </p>
+                </>
+              )}
             </div>
-            <IslandNavigation layout={layout} />
+            <IslandNavigation
+              layout={layout}
+              showIslands={graph.isAllContext}
+            />
           </div>
         </div>
         <ProjectContextGraphInner
           elements={elements}
           graph={graph}
           layout={layout}
+          onSelectionChange={onSelectionChange}
           selection={selection}
           setHovered={setHovered}
-          setSelection={setSelection}
         />
       </section>
     </ReactFlowProvider>
@@ -386,8 +418,10 @@ export function ProjectContextGraph({
 
 function IslandNavigation({
   layout,
+  showIslands,
 }: {
   layout: ReturnType<typeof layoutProjectContextGraph>;
+  showIslands: boolean;
 }) {
   const shouldReduceMotion = useReducedMotion();
   const { fitBounds, fitView } = useReactFlow<
@@ -397,23 +431,25 @@ function IslandNavigation({
   const duration = shouldReduceMotion ? 0 : 220;
   return (
     <div className="flex max-w-full items-center gap-1.5 overflow-x-auto pb-0.5">
-      {layout.islands.map((island) => (
-        <Button
-          aria-label={`Fit Island ${island.index}`}
-          data-testid={`project-context-fit-island-${island.index}`}
-          key={island.stableKey}
-          onClick={() =>
-            void fitBounds(island.bounds, { padding: 0.14, duration })
-          }
-          size="xs"
-          type="button"
-          variant="outline"
-        >
-          <Focus />
-          Island {island.index} · {island.edgeKeys.length}{" "}
-          {island.edgeKeys.length === 1 ? "edge" : "edges"}
-        </Button>
-      ))}
+      {showIslands
+        ? layout.islands.map((island) => (
+            <Button
+              aria-label={`Fit Island ${island.index}`}
+              data-testid={`project-context-fit-island-${island.index}`}
+              key={island.stableKey}
+              onClick={() =>
+                void fitBounds(island.bounds, { padding: 0.14, duration })
+              }
+              size="xs"
+              type="button"
+              variant="outline"
+            >
+              <Focus />
+              Island {island.index} · {island.edgeKeys.length}{" "}
+              {island.edgeKeys.length === 1 ? "edge" : "edges"}
+            </Button>
+          ))
+        : null}
       <Button
         data-testid="project-context-fit-all"
         onClick={() => void fitView({ padding: 0.08, duration, maxZoom: 1.15 })}
@@ -422,7 +458,7 @@ function IslandNavigation({
         variant="ghost"
       >
         <Maximize2 />
-        Fit all
+        {showIslands ? "Fit all" : "Fit query"}
       </Button>
     </div>
   );

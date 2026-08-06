@@ -6,6 +6,7 @@ import type {
   RawProjectViewObjectV3,
   ProjectViewObjectType,
 } from "../../src/shared/api/tauriProjectView";
+import type { ProjectContextQueryResult } from "../../src/shared/api/tauriProjectContext";
 import type {
   ProjectDocument,
   ProjectDocumentMeta,
@@ -882,6 +883,85 @@ async function seedCommunities(
 async function openFullProjectView(page: import("@playwright/test").Page) {
   await page.goto("/#/view");
 }
+
+function projectViewContextResult(): ProjectContextQueryResult {
+  return {
+    communityKey: "fixture",
+    projectId: "40000000-0000-4000-8000-000000000001",
+    relayPubkey: "b".repeat(64),
+    context: {
+      contextRevision: 1,
+      projectionGeneration: 1,
+      activeEdgeCount: 0,
+      boundDocumentCount: 0,
+      updatedAt: NOW,
+      metaEventId: "c".repeat(64),
+      capabilityEnabled: true,
+    },
+    query: { type: "contains_all", coordinates: [] },
+    projectViewObservation: { state: "observed" },
+    documentObservation: { state: "not_requested" },
+    edges: [],
+    coordinateDetails: [
+      {
+        coordinateKey: `requirement:${IDS.requirement}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId: IDS.requirement,
+        },
+        state: "active",
+        title: "Verified snapshot",
+      },
+    ],
+    documentDetails: [],
+  };
+}
+
+test("active Project View object opens Incident Context independent of Context References", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: projectViewContextResult(),
+    projectView: V3_READY_VIEW,
+  });
+  await page.goto(`/#/view?object=${IDS.requirement}`);
+  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+  await expect(
+    page.getByTestId("project-view-show-in-project-context"),
+  ).toBeVisible();
+  await page.getByTestId("project-view-show-in-project-context").click();
+
+  await expect(page).toHaveURL(/project-context/);
+  await expect(page).toHaveURL(/mode=incident/);
+  await expect(page).toHaveURL(
+    new RegExp(`coordinates=requirement(%3A|:)${IDS.requirement}`),
+  );
+  await expect(page.getByTestId("project-context-query-summary")).toContainText(
+    "0 matching edges",
+  );
+  const calls = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__,
+  );
+  expect(calls?.at(-1)?.payload).toMatchObject({
+    input: {
+      query: {
+        type: "incident",
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId: IDS.requirement,
+        },
+      },
+    },
+  });
+
+  await page.goBack();
+  await expect(page).toHaveURL(
+    new RegExp(`/view\\?object=${IDS.requirement}$`),
+  );
+  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+});
 
 test("Community overview presents Project View and Role context before the full map", async ({
   page,

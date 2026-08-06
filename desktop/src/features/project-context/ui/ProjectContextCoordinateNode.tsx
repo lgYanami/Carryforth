@@ -61,12 +61,18 @@ export function ProjectContextCoordinateNode({
       data-emphasis={data.emphasis}
       data-island={data.islandIndex}
       data-lifecycle={data.coordinate.state}
+      data-query-anchor={data.queryAnchor}
       data-testid={`project-context-coordinate-${data.coordinate.coordinateKey}`}
       style={style}
     >
       <ProjectContextNodeHandles type="target" />
+      {data.queryAnchor ? (
+        <span className="project-context-coordinate__anchor absolute -top-2.5 right-2 z-10 rounded-full px-2 py-0.5 text-3xs font-bold uppercase tracking-wider">
+          Query anchor
+        </span>
+      ) : null}
       <button
-        aria-label={`Select ${data.coordinate.typeLabel} ${data.coordinate.displayTitle}`}
+        aria-label={`${data.queryAnchor ? "Query anchor, " : ""}Select ${data.coordinate.typeLabel} ${data.coordinate.displayTitle}`}
         className="nodrag nopan flex h-full w-full items-start gap-3 rounded-xl px-3 py-3 text-left outline-none"
         type="button"
       >

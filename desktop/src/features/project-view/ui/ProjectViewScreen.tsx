@@ -69,6 +69,7 @@ import { Button } from "@/shared/ui/button";
 type ProjectViewScreenProps = {
   onOpenOverview?: () => void;
   onSelectObject: (objectId: string | undefined) => void;
+  onShowInProjectContext?: (object: ProjectViewObject) => void;
   selectedObjectId?: string;
 };
 
@@ -393,6 +394,7 @@ function ReadyProjectView({
   initializationDraft,
   onDiscardInitializationDraft,
   onSelectObject,
+  onShowInProjectContext,
   projectRevision,
   projectionGeneration,
   relayPubkey,
@@ -605,6 +607,7 @@ function ReadyProjectView({
           onEdit={(object) => setEditor({ mode: "edit", object })}
           onRefresh={onRefresh}
           onSelectObject={selectObject}
+          onShowInProjectContext={onShowInProjectContext}
           projectionGeneration={projectionGeneration}
           projectRevision={projectRevision}
           schemaVersion={schemaVersion}
@@ -683,6 +686,7 @@ function ReadyProjectView({
 export function ProjectViewScreen({
   onOpenOverview,
   onSelectObject,
+  onShowInProjectContext,
   selectedObjectId,
 }: ProjectViewScreenProps) {
   const { activeCommunity } = useCommunities();
@@ -864,6 +868,7 @@ export function ProjectViewScreen({
             await query.refetch();
           }}
           onSelectObject={onSelectObject}
+          onShowInProjectContext={onShowInProjectContext}
           selectedObjectId={selectedObjectId}
           syncMessage={syncMessage}
           syncState={syncState}

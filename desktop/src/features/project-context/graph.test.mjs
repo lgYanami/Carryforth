@@ -279,3 +279,32 @@ test("shuffled trusted arrays produce the same canonical graph", () => {
     buildProjectContextGraph(canonicalResult),
   );
 });
+
+test("focused no-match keeps Query Anchors without inventing an Edge or Island", () => {
+  const objectId = "60000000-0000-4000-8000-000000000001";
+  const coordinateKey = `requirement:${objectId}`;
+  const fixture = result(
+    [],
+    [projectViewDetail(coordinateKey, "requirement", "unavailable")],
+  );
+  fixture.context.activeEdgeCount = 4;
+  fixture.query = {
+    type: "incident",
+    coordinate: {
+      type: "project_view_object",
+      objectType: "requirement",
+      objectId,
+    },
+  };
+
+  const graph = buildProjectContextGraph(fixture);
+  assert.equal(graph.isAllContext, false);
+  assert.deepEqual(graph.anchorCoordinateKeys, [coordinateKey]);
+  assert.deepEqual(
+    graph.coordinates.map((coordinate) => coordinate.coordinateKey),
+    [coordinateKey],
+  );
+  assert.equal(graph.hubs.length, 0);
+  assert.equal(graph.spokes.length, 0);
+  assert.equal(graph.islands.length, 0);
+});

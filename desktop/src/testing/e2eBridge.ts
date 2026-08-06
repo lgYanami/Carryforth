@@ -378,6 +378,8 @@ type E2eConfig = {
     projectContext?: ProjectContextQueryResult;
     /** Community-isolated Context results keyed by applied Relay URL. */
     projectContextsByRelayUrl?: Record<string, ProjectContextQueryResult>;
+    /** Query-specific Context results keyed by canonical query JSON. */
+    projectContextsByQuery?: Record<string, ProjectContextQueryResult>;
     projectContextReadDelayMs?: number;
     projectContextReadDelayMsByRelayUrl?: Record<string, number>;
     projectContextReadError?: ProjectContextErrorPayload;
@@ -12721,10 +12723,18 @@ export function maybeInstallE2eTauriMocks() {
         if (activeConfig?.mock?.projectContextReadError) {
           throw structuredClone(activeConfig.mock.projectContextReadError);
         }
+        const input = ((payload as { input?: unknown }).input ?? payload) as {
+          communityKey: string;
+          query: ProjectContextQueryResult["query"];
+        };
         const result =
+          activeConfig?.mock?.projectContextsByQuery?.[
+            JSON.stringify(input.query)
+          ] ??
           activeConfig?.mock?.projectContextsByRelayUrl?.[
             mockAppliedRelayUrl
-          ] ?? activeConfig?.mock?.projectContext;
+          ] ??
+          activeConfig?.mock?.projectContext;
         if (!result) {
           throw {
             code: "unsupported",
@@ -12732,10 +12742,6 @@ export function maybeInstallE2eTauriMocks() {
             retryable: false,
           } satisfies ProjectContextErrorPayload;
         }
-        const input = ((payload as { input?: unknown }).input ?? payload) as {
-          communityKey: string;
-          query: ProjectContextQueryResult["query"];
-        };
         return {
           ...structuredClone(result),
           communityKey: input.communityKey,

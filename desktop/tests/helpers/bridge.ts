@@ -190,6 +190,7 @@ type MockBridgeOptions = {
   projectViewAfterRoleMutation?: RawProjectViewLoadResult;
   projectContext?: ProjectContextQueryResult;
   projectContextsByRelayUrl?: Record<string, ProjectContextQueryResult>;
+  projectContextsByQuery?: Record<string, ProjectContextQueryResult>;
   projectContextReadDelayMs?: number;
   projectContextReadDelayMsByRelayUrl?: Record<string, number>;
   projectContextReadError?: ProjectContextErrorPayload;

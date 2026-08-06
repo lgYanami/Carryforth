@@ -1,6 +1,7 @@
 import {
   FileClock,
   History,
+  Network,
   Pencil,
   RotateCcw,
   ShieldCheck,
@@ -37,6 +38,7 @@ export function DocumentViewer({
   onDeleted,
   onEdit,
   onSelectRevision,
+  onShowInProjectContext,
   selectedRevision,
 }: {
   currentRevision: number;
@@ -45,6 +47,7 @@ export function DocumentViewer({
   onDeleted: () => void;
   onEdit: () => void;
   onSelectRevision: (revision: number | undefined) => void;
+  onShowInProjectContext?: (documentId: string) => void;
   selectedRevision?: number;
 }) {
   const [showHistory, setShowHistory] = React.useState(false);
@@ -110,6 +113,18 @@ export function DocumentViewer({
               </div>
             </div>
             <div className="flex shrink-0 flex-wrap gap-2">
+              {document.state === "active" && onShowInProjectContext ? (
+                <Button
+                  data-testid="document-show-in-project-context"
+                  onClick={() => onShowInProjectContext(document.documentId)}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  <Network className="h-4 w-4" />
+                  Show in Project Context
+                </Button>
+              ) : null}
               {pinned ? (
                 <Button
                   data-testid="document-return-current"

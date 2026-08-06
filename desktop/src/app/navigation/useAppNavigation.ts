@@ -8,6 +8,11 @@ import {
 
 import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { resolveSearchHitDestination } from "@/app/navigation/resolveSearchHitDestination";
+import {
+  projectContextRouteSearchForState,
+  type ProjectContextRouteSelection,
+} from "@/features/project-context/routeState";
+import type { ProjectContextQuery } from "@/shared/api/tauriProjectContext";
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
@@ -125,10 +130,21 @@ export function useAppNavigation() {
   );
 
   const goProjectContext = React.useCallback(
-    (behavior?: NavigationBehavior) =>
+    (
+      behavior?: NavigationBehavior & {
+        query?: ProjectContextQuery;
+        selection?: ProjectContextRouteSelection | null;
+      },
+    ) =>
       commitNavigation(
         {
           to: "/project-context",
+          search: behavior?.query
+            ? projectContextRouteSearchForState(
+                behavior.query,
+                behavior.selection,
+              )
+            : {},
         },
         behavior,
       ),

@@ -30,7 +30,7 @@ export const Route = createFileRoute("/view")({
 
 function ViewRouteComponent() {
   usePreviewFeatureWarning("projectView");
-  const { goCommunity } = useAppNavigation();
+  const { goCommunity, goProjectContext } = useAppNavigation();
   const search = Route.useSearch();
   const navigate = Route.useNavigate();
 
@@ -44,6 +44,18 @@ function ViewRouteComponent() {
               ...previous,
               object,
             }),
+          })
+        }
+        onShowInProjectContext={(object) =>
+          void goProjectContext({
+            query: {
+              type: "incident",
+              coordinate: {
+                type: "project_view_object",
+                objectType: object.objectType,
+                objectId: object.id,
+              },
+            },
           })
         }
         selectedObjectId={search.object}

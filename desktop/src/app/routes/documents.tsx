@@ -1,6 +1,7 @@
 import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { usePreviewFeatureWarning } from "@/shared/features";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
@@ -46,6 +47,7 @@ function DocumentsRouteComponent() {
   usePreviewFeatureWarning("projectView");
   const search = Route.useSearch();
   const navigate = Route.useNavigate();
+  const { goProjectContext } = useAppNavigation();
   return (
     <React.Suspense fallback={<ViewLoadingFallback kind="documents" />}>
       <ProjectDocumentsScreen
@@ -54,6 +56,14 @@ function DocumentsRouteComponent() {
             search: {
               document,
               revision: document ? revision : undefined,
+            },
+          })
+        }
+        onShowInProjectContext={(documentId) =>
+          void goProjectContext({
+            query: {
+              type: "incident",
+              coordinate: { type: "document", documentId },
             },
           })
         }

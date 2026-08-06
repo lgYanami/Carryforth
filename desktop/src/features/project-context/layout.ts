@@ -220,6 +220,92 @@ function layoutOneIsland(
   return { island, nodes, width, height };
 }
 
+function layoutFocusedGraph(
+  graph: ProjectContextGraphModel,
+  scale: number,
+): ProjectContextLayout {
+  const anchorKeys = new Set(graph.anchorCoordinateKeys);
+  const coordinateIds = graph.coordinates.map((coordinate) => coordinate.id);
+  const anchorIds = graph.coordinates
+    .filter((coordinate) => anchorKeys.has(coordinate.coordinateKey))
+    .map((coordinate) => coordinate.id);
+  const extraCoordinateIds = graph.coordinates
+    .filter((coordinate) => !anchorKeys.has(coordinate.coordinateKey))
+    .map((coordinate) => coordinate.id);
+  const hubIds = graph.hubs.map((hub) => hub.id);
+  const columns = [anchorIds, hubIds, extraCoordinateIds].filter(
+    (column) => column.length > 0,
+  );
+  if (columns.length === 0 && coordinateIds.length === 0) {
+    return {
+      nodes: [],
+      spokes: [],
+      islands: [],
+      bounds: { x: 0, y: 0, width: 0, height: 0 },
+    };
+  }
+
+  const rowGap = BASE_ROW_GAP * scale;
+  const columnGap = BASE_LAYER_GAP * scale;
+  const outer = BASE_OUTER_PADDING * scale;
+  const columnWidths = columns.map((column) =>
+    Math.max(...column.map((id) => dimensions(nodeKind(id), scale).width)),
+  );
+  const columnHeights = columns.map((column) =>
+    column.reduce(
+      (height, id, index) =>
+        height +
+        dimensions(nodeKind(id), scale).height +
+        (index === 0 ? 0 : rowGap),
+      0,
+    ),
+  );
+  const innerHeight = Math.max(...columnHeights);
+  const nodes: ProjectContextLayoutNode[] = [];
+  let columnX = outer;
+  columns.forEach((column, columnIndex) => {
+    let nodeY = outer + (innerHeight - columnHeights[columnIndex]) / 2;
+    for (const id of column) {
+      const kind = nodeKind(id);
+      const size = dimensions(kind, scale);
+      nodes.push({
+        id,
+        kind,
+        islandKey: "query-focus",
+        islandIndex: 1,
+        x: columnX + (columnWidths[columnIndex] - size.width) / 2,
+        y: nodeY,
+        ...size,
+      });
+      nodeY += size.height + rowGap;
+    }
+    columnX += columnWidths[columnIndex] + columnGap;
+  });
+
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const spokes = graph.spokes.map((spoke) => {
+    const source = nodeById.get(spoke.sourceId);
+    const target = nodeById.get(spoke.targetId);
+    const port = source && target ? sourcePort(source, target) : "right";
+    return {
+      id: spoke.id,
+      sourceHandle: port,
+      targetHandle: oppositePort(port),
+    };
+  });
+  const width =
+    outer * 2 +
+    columnWidths.reduce((sum, value) => sum + value, 0) +
+    Math.max(0, columns.length - 1) * columnGap;
+  const height = outer * 2 + innerHeight;
+  return {
+    nodes,
+    spokes,
+    islands: [],
+    bounds: { x: 0, y: 0, width, height },
+  };
+}
+
 function oppositePort(port: ProjectContextPort): ProjectContextPort {
   switch (port) {
     case "top":
@@ -274,6 +360,9 @@ export function layoutProjectContextGraph(
   const scale = Number.isFinite(requestedScale)
     ? Math.min(Math.max(requestedScale, 0.75), 1.5)
     : 1;
+  if (graph.isAllContext === false) {
+    return layoutFocusedGraph(graph, scale);
+  }
   if (graph.islands.length === 0) {
     return {
       nodes: [],

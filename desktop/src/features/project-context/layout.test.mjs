@@ -169,3 +169,51 @@ test("empty graph has a closed zero layout", () => {
     },
   );
 });
+
+test("focused no-match lays out standalone Anchors without Island bounds", () => {
+  const objectId = "60000000-0000-4000-8000-000000000001";
+  const graph = buildProjectContextGraph({
+    communityKey: "community-0",
+    projectId: "project",
+    relayPubkey: "a".repeat(64),
+    context: {
+      contextRevision: 1,
+      projectionGeneration: 1,
+      activeEdgeCount: 3,
+      boundDocumentCount: 3,
+      updatedAt: "2026-08-06T00:00:00Z",
+      metaEventId: "b".repeat(64),
+      capabilityEnabled: true,
+    },
+    query: {
+      type: "incident",
+      coordinate: {
+        type: "project_view_object",
+        objectType: "requirement",
+        objectId,
+      },
+    },
+    projectViewObservation: { state: "unavailable" },
+    documentObservation: { state: "not_requested" },
+    edges: [],
+    coordinateDetails: [
+      {
+        coordinateKey: `requirement:${objectId}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId,
+        },
+        state: "unavailable",
+      },
+    ],
+    documentDetails: [],
+  });
+  const layout = layoutProjectContextGraph(graph);
+
+  assert.equal(layout.nodes.length, 1);
+  assert.equal(layout.nodes[0].id, `coordinate:requirement:${objectId}`);
+  assert.deepEqual(layout.islands, []);
+  assert.ok(layout.bounds.width > 0);
+  assert.ok(layout.bounds.height > 0);
+});
