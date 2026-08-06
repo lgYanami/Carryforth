@@ -18,6 +18,7 @@ import {
 } from "@xyflow/react";
 
 import { buildProjectContextGraph } from "@/features/project-context/graph";
+import { focusProjectContextGraphTarget } from "@/features/project-context/focus";
 import { layoutProjectContextGraph } from "@/features/project-context/layout";
 import {
   buildProjectContextFlowElements,
@@ -90,6 +91,7 @@ function sameTarget(
 
 type ProjectContextGraphInnerProps = {
   elements: ProjectContextFlowElements;
+  focusSelectionRequest: number;
   graph: ReturnType<typeof buildProjectContextGraph>;
   layout: ReturnType<typeof layoutProjectContextGraph>;
   selection: ProjectContextGraphTarget | null;
@@ -101,6 +103,7 @@ type ProjectContextGraphInnerProps = {
 
 function ProjectContextGraphInner({
   elements,
+  focusSelectionRequest,
   graph,
   layout,
   onSelectionChange,
@@ -109,7 +112,8 @@ function ProjectContextGraphInner({
 }: ProjectContextGraphInnerProps) {
   const shouldReduceMotion = useReducedMotion();
   const nodesInitialized = useNodesInitialized();
-  const { fitView, zoomIn, zoomOut } = useReactFlow<
+  const handledFocusSelectionRequest = React.useRef(0);
+  const { fitBounds, fitView, zoomIn, zoomOut } = useReactFlow<
     ProjectContextFlowNode,
     ProjectContextFlowEdge
   >();
@@ -124,6 +128,43 @@ function ProjectContextGraphInner({
     if (!nodesInitialized || layoutKey.length === 0) return;
     void fitView({ padding: 0.08, duration: 0, maxZoom: 1.15 });
   }, [fitView, layoutKey, nodesInitialized]);
+
+  React.useEffect(() => {
+    if (
+      !nodesInitialized ||
+      focusSelectionRequest === 0 ||
+      focusSelectionRequest === handledFocusSelectionRequest.current ||
+      !selection
+    ) {
+      return;
+    }
+    const nodeId =
+      selection.kind === "coordinate"
+        ? `coordinate:${selection.key}`
+        : `edge-hub:${selection.key}`;
+    const node = layout.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    handledFocusSelectionRequest.current = focusSelectionRequest;
+    let cancelled = false;
+    const focusTarget = () => {
+      if (!cancelled) focusProjectContextGraphTarget(selection);
+    };
+    focusTarget();
+    void fitBounds(
+      { x: node.x, y: node.y, width: node.width, height: node.height },
+      { padding: 0.8, duration },
+    ).then(focusTarget);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    duration,
+    fitBounds,
+    focusSelectionRequest,
+    layout.nodes,
+    nodesInitialized,
+    selection,
+  ]);
 
   const handleNodeClick = React.useCallback<
     NodeMouseHandler<ProjectContextFlowNode>
@@ -305,10 +346,12 @@ function ProjectContextGraphInner({
 
 /** Read-only query result graph; stable selection is owned by route state. */
 export function ProjectContextGraph({
+  focusSelectionRequest = 0,
   onSelectionChange,
   result,
   selection,
 }: {
+  focusSelectionRequest?: number;
   onSelectionChange: (
     selection: ProjectContextGraphTarget | null,
     options?: { replace?: boolean },
@@ -334,16 +377,17 @@ export function ProjectContextGraph({
   ).size;
 
   React.useEffect(() => {
-    setHovered(null);
-    if (!selection) return;
-    const remainsVisible =
-      selection.kind === "edge"
-        ? graph.hubs.some((hub) => hub.edgeKey === selection.key)
-        : graph.coordinates.some(
-            (coordinate) => coordinate.coordinateKey === selection.key,
-          );
-    if (!remainsVisible) onSelectionChange(null, { replace: true });
-  }, [graph, onSelectionChange, selection]);
+    setHovered((current) => {
+      if (!current) return current;
+      const remainsVisible =
+        current.kind === "edge"
+          ? graph.hubs.some((hub) => hub.edgeKey === current.key)
+          : graph.coordinates.some(
+              (coordinate) => coordinate.coordinateKey === current.key,
+            );
+      return remainsVisible ? current : null;
+    });
+  }, [graph]);
 
   return (
     <ReactFlowProvider>
@@ -405,6 +449,7 @@ export function ProjectContextGraph({
         </div>
         <ProjectContextGraphInner
           elements={elements}
+          focusSelectionRequest={focusSelectionRequest}
           graph={graph}
           layout={layout}
           onSelectionChange={onSelectionChange}

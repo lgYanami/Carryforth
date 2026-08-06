@@ -15,6 +15,7 @@ import {
   buildProjectContextCoordinateOptions,
   type ProjectContextCoordinateOption,
 } from "@/features/project-context/queryModel";
+import { focusProjectContextGraphTarget } from "@/features/project-context/focus";
 import type { ProjectContextRouteSelection } from "@/features/project-context/routeState";
 import { isAllProjectContextQuery } from "@/features/project-context/routeState";
 import {
@@ -23,6 +24,7 @@ import {
   visibleContextDocumentCount,
 } from "@/features/project-context/state";
 import { ProjectContextGraph } from "@/features/project-context/ui/ProjectContextGraph";
+import { ProjectContextInspector } from "@/features/project-context/ui/ProjectContextInspector";
 import {
   type ProjectContextPickerSourceState,
   ProjectContextQueryBar,
@@ -46,6 +48,8 @@ import { Button } from "@/shared/ui/button";
 type ValidProjectContextScreenProps = {
   appliedQuery: ProjectContextQuery;
   onApplyQuery: (query: ProjectContextQuery) => void;
+  onOpenDocument: (documentId: string) => void;
+  onOpenProjectView: (objectId: string) => void;
   onSelectionChange: (
     selection: ProjectContextRouteSelection | null,
     options?: { replace?: boolean },
@@ -118,17 +122,19 @@ function ProjectContextHeader({
 }
 
 function ProjectContextGraphSlot({
+  focusSelectionRequest,
   onSelectionChange,
   result,
   selection,
 }: {
+  focusSelectionRequest: number;
   onSelectionChange: ValidProjectContextScreenProps["onSelectionChange"];
   result: ProjectContextQueryResult;
   selection: ProjectContextRouteSelection | null;
 }) {
   const documentCount = visibleContextDocumentCount(result);
   return (
-    <main className="min-h-0 flex-1 overflow-auto p-4 sm:p-6">
+    <main className="min-h-0 min-w-0 flex-1 overflow-auto p-4 sm:p-6">
       <div className="mx-auto flex h-full min-h-80 max-w-6xl flex-col gap-4">
         <section
           className="grid gap-3 sm:grid-cols-3"
@@ -165,6 +171,7 @@ function ProjectContextGraphSlot({
           data-testid="project-context-graph-slot"
         >
           <ProjectContextGraph
+            focusSelectionRequest={focusSelectionRequest}
             onSelectionChange={onSelectionChange}
             result={result}
             selection={selection}
@@ -189,9 +196,12 @@ function pickerSourceState(input: {
 function ValidProjectContextScreen({
   appliedQuery,
   onApplyQuery,
+  onOpenDocument,
+  onOpenProjectView,
   onSelectionChange,
   selection,
 }: ValidProjectContextScreenProps) {
+  const [focusSelectionRequest, setFocusSelectionRequest] = React.useState(0);
   const contextQuery = useProjectContextQuery(appliedQuery);
   const projectViewQuery = useProjectViewQuery();
   const documentMetaQuery = useProjectDocumentMeta();
@@ -237,6 +247,29 @@ function ValidProjectContextScreen({
     ready: Boolean(documentMetaQuery.data && documentsQuery.data),
   });
   const allContext = isAllProjectContextQuery(appliedQuery);
+
+  React.useEffect(() => {
+    if (!result || !selection) return;
+    const remainsVisible =
+      selection.kind === "edge"
+        ? result.edges.some((edge) => edge.edgeKey === selection.key)
+        : result.coordinateDetails.some(
+            (detail) => detail.coordinateKey === selection.key,
+          ) ||
+          result.edges.some((edge) =>
+            edge.coordinateKeys.includes(selection.key),
+          );
+    if (!remainsVisible) onSelectionChange(null, { replace: true });
+  }, [onSelectionChange, result, selection]);
+
+  const closeInspector = React.useCallback(() => {
+    const closingSelection = selection;
+    onSelectionChange(null);
+    if (!closingSelection) return;
+    window.requestAnimationFrame(() => {
+      focusProjectContextGraphTarget(closingSelection);
+    });
+  }, [onSelectionChange, selection]);
 
   return (
     <div
@@ -294,11 +327,32 @@ function ValidProjectContextScreen({
         <ProjectContextEmptyState />
       ) : null}
       {result && (!allContext || result.context.activeEdgeCount > 0) ? (
-        <ProjectContextGraphSlot
-          onSelectionChange={onSelectionChange}
-          result={result}
-          selection={selection}
-        />
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <ProjectContextGraphSlot
+            focusSelectionRequest={focusSelectionRequest}
+            onSelectionChange={onSelectionChange}
+            result={result}
+            selection={selection}
+          />
+          {selection ? (
+            <ProjectContextInspector
+              onClose={closeInspector}
+              onFocusSelection={() => {
+                focusProjectContextGraphTarget(selection);
+                setFocusSelectionRequest((current) => current + 1);
+              }}
+              onOpenDocument={onOpenDocument}
+              onOpenProjectView={onOpenProjectView}
+              onSelect={(nextSelection) => onSelectionChange(nextSelection)}
+              onShowIncident={(coordinate) =>
+                onApplyQuery({ type: "incident", coordinate })
+              }
+              projectViewResult={projectViewQuery.data}
+              result={result}
+              selection={selection}
+            />
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

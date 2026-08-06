@@ -5,6 +5,15 @@ import type {
   ProjectContextQuery,
   ProjectContextQueryResult,
 } from "../../src/shared/api/tauriProjectContext";
+import type {
+  ProjectDocument,
+  ProjectDocumentMeta,
+} from "../../src/shared/api/tauriProjectDocument";
+import type {
+  RawProjectViewLoadResult,
+  RawProjectViewObjectV3,
+} from "../../src/shared/api/tauriProjectView";
+import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
@@ -13,6 +22,7 @@ const REQUIREMENT_ID = "20000000-0000-4000-8000-000000000001";
 const RESOURCE_ID = "30000000-0000-4000-8000-000000000001";
 const GOAL_ID = "30000000-0000-4000-8000-000000000002";
 const ROLE_ID = "30000000-0000-4000-8000-000000000003";
+const VIEW_GOAL_ID = "30000000-0000-4000-8000-000000000004";
 const DOCUMENT_COORDINATE_ID = "40000000-0000-4000-8000-000000000001";
 const CONTEXT_DOCUMENT_A_ID = "40000000-0000-4000-8000-000000000002";
 const CONTEXT_DOCUMENT_B_ID = "40000000-0000-4000-8000-000000000003";
@@ -157,6 +167,337 @@ function contextResult(input?: {
             : []),
         ]
       : [],
+  };
+}
+
+const inspectorProfile = {
+  id: PROJECT_ID,
+  object_type: "project_profile",
+  object_revision: 3,
+  project_revision: 11,
+  created_at: "2026-08-01T08:00:00Z",
+  updated_at: "2026-08-06T08:00:00Z",
+  created_by: ACTOR,
+  updated_by: ACTOR,
+  data: {
+    object_type: "project_profile",
+    data: {
+      name: "Trusted Context workspace",
+      positioning: "A verified map of cross-coordinate explanations.",
+      purpose: "Keep project relationships understandable.",
+      problem: "Relevant reasoning otherwise remains fragmented.",
+      scope: "Project View objects and Documents.",
+    },
+  },
+  relations: {},
+  context_references: [],
+} satisfies RawProjectViewObjectV3;
+
+const inspectorRequirement = {
+  id: REQUIREMENT_ID,
+  object_type: "requirement",
+  object_revision: 4,
+  project_revision: 11,
+  created_at: "2026-08-01T08:00:00Z",
+  updated_at: "2026-08-06T08:00:00Z",
+  created_by: ACTOR,
+  updated_by: ACTOR,
+  data: {
+    object_type: "requirement",
+    data: {
+      title: "Keep Context relationships verifiable",
+      description:
+        "Every visible relationship must come from one complete verified Edge.",
+      status: "ready",
+      priority: "high",
+    },
+  },
+  relations: {
+    about: { object_type: "resource", object_id: RESOURCE_ID },
+  },
+  context_references: [],
+} satisfies RawProjectViewObjectV3;
+
+const inspectorGoal = {
+  id: VIEW_GOAL_ID,
+  object_type: "goal",
+  object_revision: 1,
+  project_revision: 11,
+  created_at: "2026-08-01T08:00:00Z",
+  updated_at: "2026-08-06T08:00:00Z",
+  created_by: ACTOR,
+  updated_by: ACTOR,
+  data: {
+    object_type: "goal",
+    data: {
+      title: "Make project reasoning inspectable",
+      desired_outcome: "Humans and Agents can inspect verified Context.",
+      directions: ["Keep the graph body-free until selection"],
+    },
+  },
+  relations: {},
+  context_references: [],
+} satisfies RawProjectViewObjectV3;
+
+const inspectorResource = {
+  id: RESOURCE_ID,
+  object_type: "resource",
+  object_revision: 2,
+  project_revision: 11,
+  created_at: "2026-08-01T08:00:00Z",
+  updated_at: "2026-08-06T08:00:00Z",
+  created_by: ACTOR,
+  updated_by: ACTOR,
+  data: {
+    object_type: "resource",
+    data: {
+      name: "Project Context contract",
+      resource_kind: "document",
+      summary: "The reviewed Project Context domain contract.",
+      guide_document_id: CONTEXT_DOCUMENT_A_ID,
+    },
+  },
+  relations: {},
+  context_references: [],
+} satisfies RawProjectViewObjectV3;
+
+function inspectorProjectView(): RawProjectViewLoadResult {
+  return {
+    status: "ready",
+    relay_pubkey: RELAY,
+    project_context_supported: true,
+    schema_version: 3,
+    project_revision: 11,
+    projection_generation: 3,
+    active_object_count: 4,
+    updated_at: "2026-08-06T08:00:00Z",
+    objects_v3: [
+      inspectorProfile,
+      inspectorGoal,
+      inspectorRequirement,
+      inspectorResource,
+    ],
+    role_continuity: {
+      roles: [],
+      proposals: [],
+      assignments: [],
+      commitments: [],
+      workResponsibilities: [],
+      checkpoints: [],
+      handoffs: [],
+      members: [],
+      briefs: [],
+    },
+  };
+}
+
+function contextDocumentSnapshot(input: {
+  contentMarkdown: string;
+  documentId: string;
+  eventDigit: string;
+  revision: number;
+  summary: string;
+  title: string;
+}): ProjectDocument {
+  return {
+    communityKey: "fixture",
+    projectId: PROJECT_ID,
+    relayPubkey: RELAY,
+    projectionGeneration: 2,
+    documentId: input.documentId,
+    documentRevision: input.revision,
+    state: "active",
+    title: input.title,
+    summary: input.summary,
+    contentMarkdown: input.contentMarkdown,
+    createdAt: "2026-08-01T08:00:00Z",
+    createdBy: ACTOR,
+    revisionAt: "2026-08-06T08:00:00Z",
+    revisionBy: ACTOR,
+    revisionEventId: input.eventDigit.repeat(64),
+    headEventId: input.eventDigit.repeat(64),
+    sourceEventId: input.eventDigit.repeat(64),
+  };
+}
+
+function inspectorDocumentState(): MockProjectDocumentState {
+  const documents = [
+    contextDocumentSnapshot({
+      contentMarkdown:
+        "# Architecture rationale A\n\nOnly the first Context body is rendered.",
+      documentId: CONTEXT_DOCUMENT_A_ID,
+      eventDigit: "1",
+      revision: 8,
+      summary: "Current summary for the architecture rationale.",
+      title: "Current architecture rationale",
+    }),
+    contextDocumentSnapshot({
+      contentMarkdown:
+        "# Operational rationale B\n\nThis body is fetched only after switching Documents.",
+      documentId: CONTEXT_DOCUMENT_B_ID,
+      eventDigit: "2",
+      revision: 2,
+      summary: "Current summary for the operational rationale.",
+      title: "Current operational rationale",
+    }),
+    contextDocumentSnapshot({
+      contentMarkdown:
+        "# Ownership rationale C\n\nThe second Edge owns this Context Document.",
+      documentId: CONTEXT_DOCUMENT_C_ID,
+      eventDigit: "3",
+      revision: 1,
+      summary: "Current summary for the ownership rationale.",
+      title: "Current ownership rationale",
+    }),
+  ];
+  const meta: ProjectDocumentMeta = {
+    communityKey: "fixture",
+    projectId: PROJECT_ID,
+    relayPubkey: RELAY,
+    projectionGeneration: 2,
+    catalogRevision: 8,
+    activeDocumentCount: documents.length,
+    updatedAt: "2026-08-06T08:00:00Z",
+    metaEventId: "4".repeat(64),
+  };
+  return {
+    meta,
+    documents: documents.map((document) => ({
+      documentId: document.documentId,
+      title: document.title ?? "Context Document",
+      summary: document.summary,
+      documentRevision: document.documentRevision,
+      updatedAt: document.revisionAt,
+      updatedBy: document.revisionBy,
+      headEventId: document.headEventId ?? document.revisionEventId,
+    })),
+    revisions: Object.fromEntries(
+      documents.map((document) => [document.documentId, [document]]),
+    ),
+  };
+}
+
+function inspectorResult(): ProjectContextQueryResult {
+  const base = contextResult({ edgeCount: 2 });
+  return {
+    ...base,
+    context: {
+      ...base.context,
+      activeEdgeCount: 2,
+      boundDocumentCount: 3,
+    },
+    edges: [
+      {
+        edgeKey: "1".repeat(64),
+        coordinateKeys: [
+          `goal:${GOAL_ID}`,
+          `requirement:${REQUIREMENT_ID}`,
+          `resource:${RESOURCE_ID}`,
+        ],
+        contextDocumentIds: [CONTEXT_DOCUMENT_A_ID, CONTEXT_DOCUMENT_B_ID],
+      },
+      {
+        edgeKey: "2".repeat(64),
+        coordinateKeys: [
+          `document:${CONTEXT_DOCUMENT_A_ID}`,
+          `requirement:${REQUIREMENT_ID}`,
+          `role:${ROLE_ID}`,
+        ],
+        contextDocumentIds: [CONTEXT_DOCUMENT_C_ID],
+      },
+    ],
+    coordinateDetails: [
+      {
+        coordinateKey: `goal:${GOAL_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "goal",
+          objectId: GOAL_ID,
+        },
+        state: "tombstoned",
+        title: "Retired Context milestone",
+        objectRevision: 6,
+        updatedAt: "2026-08-05T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `requirement:${REQUIREMENT_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId: REQUIREMENT_ID,
+        },
+        state: "active",
+        title: "Verified requirement Coordinate",
+        objectRevision: 4,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `resource:${RESOURCE_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "resource",
+          objectId: RESOURCE_ID,
+        },
+        state: "active",
+        title: "Verified resource Coordinate",
+        objectRevision: 2,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `document:${CONTEXT_DOCUMENT_A_ID}`,
+        coordinate: {
+          type: "document",
+          documentId: CONTEXT_DOCUMENT_A_ID,
+        },
+        state: "active",
+        title: "Architecture record Coordinate",
+        documentRevision: 8,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        coordinateKey: `role:${ROLE_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "role",
+          objectId: ROLE_ID,
+        },
+        state: "unavailable",
+        unavailableReason: "Role details are temporarily unavailable.",
+      },
+    ],
+    documentDetails: [
+      {
+        documentId: CONTEXT_DOCUMENT_A_ID,
+        state: "active",
+        title: "Context binding A",
+        summary: "Observed summary for the first binding.",
+        documentRevision: 8,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        documentId: CONTEXT_DOCUMENT_B_ID,
+        state: "active",
+        title: "Context binding B",
+        summary: "Observed summary for the second binding.",
+        documentRevision: 2,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+      {
+        documentId: CONTEXT_DOCUMENT_C_ID,
+        state: "active",
+        title: "Context binding C",
+        summary: "Observed summary for the independent Edge binding.",
+        documentRevision: 1,
+        updatedAt: "2026-08-06T08:00:00Z",
+        updatedBy: ACTOR,
+      },
+    ],
   };
 }
 
@@ -330,6 +671,14 @@ async function seedCommunities(page: import("@playwright/test").Page) {
   );
 }
 
+async function documentBodyCalls(page: import("@playwright/test").Page) {
+  return page.evaluate(() =>
+    window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__?.filter(
+      (call) => call.command === "get_project_document",
+    ),
+  );
+}
+
 test("sidebar order, active route, and default All query reach the trusted graph slot", async ({
   page,
 }) => {
@@ -361,6 +710,350 @@ test("sidebar order, active route, and default All query reach the trusted graph
       query: { type: "contains_all", coordinates: [] },
     },
   });
+});
+
+test("Project View Coordinate Inspector is read-only, responsive, and restores graph focus", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await installMockBridge(page, {
+    projectContext: inspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+  const requirementNode = page.getByTestId(
+    `project-context-coordinate-requirement:${REQUIREMENT_ID}`,
+  );
+  await requirementNode.click();
+
+  const inspector = page.getByTestId("project-context-inspector");
+  await expect(inspector).toBeVisible();
+  await expect(
+    inspector.getByTestId("project-context-project-view-detail"),
+  ).toContainText("Keep Context relationships verifiable");
+  await expect(inspector).toContainText(
+    "Every visible relationship must come from one complete verified Edge.",
+  );
+  await expect(inspector).toContainText("Ready");
+  await expect(inspector).toContainText("High");
+  await expect(inspector).toContainText("Project Context contract");
+  await expect(inspector.getByRole("button", { name: /edit/i })).toHaveCount(0);
+  await expect(inspector.getByRole("button", { name: /delete/i })).toHaveCount(
+    0,
+  );
+  await expect(page).toHaveURL(/selected=coordinate/);
+  await expect(page).not.toHaveURL(/mode=/);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+
+  expect(
+    await inspector.evaluate((element) => getComputedStyle(element).position),
+  ).toBe("relative");
+  await page.setViewportSize({ width: 560, height: 800 });
+  await expect
+    .poll(() =>
+      inspector.evaluate((element) => getComputedStyle(element).position),
+    )
+    .toBe("fixed");
+  const narrowBox = await inspector.boundingBox();
+  expect(narrowBox?.width).toBeGreaterThan(400);
+  expect(
+    await page.evaluate(
+      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
+    ),
+  ).toBe(1);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await inspector.getByTestId("project-context-open-project-view").click();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${REQUIREMENT_ID}$`));
+  await page.goBack();
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await expect(page).toHaveURL(/selected=coordinate/);
+
+  await page.getByTestId("project-context-show-incident").click();
+  await expect(page).toHaveURL(/mode=incident/);
+  await expect(page).toHaveURL(
+    new RegExp(`coordinates=requirement(%3A|:)${REQUIREMENT_ID}`),
+  );
+  await expect(page).not.toHaveURL(/selected=/);
+  await requirementNode.click();
+  await page.getByTestId("project-context-focus-selection").click();
+  await expect(requirementNode.locator("button")).toBeFocused();
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("project-context-inspector")).toHaveCount(0);
+  await expect(page).not.toHaveURL(/selected=/);
+  await expect(requirementNode.locator("button")).toBeFocused();
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+});
+
+test("Document Coordinate lazily reads current Markdown and returns from Documents", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: inspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+
+  await page
+    .getByTestId(`project-context-coordinate-document:${CONTEXT_DOCUMENT_A_ID}`)
+    .click();
+  const inspector = page.getByTestId("project-context-inspector");
+  await expect(inspector).toBeVisible();
+  await expect(inspector).toContainText("Current architecture rationale");
+  await expect(
+    inspector.getByTestId(
+      `project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Only the first Context body is rendered.");
+  await expect(inspector).toContainText("Revision 8");
+  await expect(inspector.getByRole("button", { name: /edit/i })).toHaveCount(0);
+  await expect(inspector.getByRole("button", { name: /delete/i })).toHaveCount(
+    0,
+  );
+  let bodyCalls = await documentBodyCalls(page);
+  expect(bodyCalls).toHaveLength(1);
+  expect(bodyCalls?.[0]?.payload).toMatchObject({
+    input: { documentId: CONTEXT_DOCUMENT_A_ID },
+  });
+
+  await inspector
+    .getByTestId(`project-context-open-document-${CONTEXT_DOCUMENT_A_ID}`)
+    .click();
+  await expect(page).toHaveURL(
+    new RegExp(`/documents\\?document=${CONTEXT_DOCUMENT_A_ID}$`),
+  );
+  await expect(page.getByTestId("document-viewer")).toBeVisible();
+  await page.goBack();
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await expect(page).toHaveURL(/selected=coordinate/);
+  bodyCalls = await documentBodyCalls(page);
+  expect(bodyCalls).toHaveLength(1);
+});
+
+test("a Spoke opens the complete Edge and multi-Document bodies stay independent", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: inspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+
+  const firstEdgeKey = "1".repeat(64);
+  const firstSpokeId = `spoke:${firstEdgeKey}:goal:${GOAL_ID}`;
+  const firstSpoke = page.locator(
+    `.react-flow__edge[data-id="${firstSpokeId}"] .react-flow__edge-interaction`,
+  );
+  await expect(firstSpoke).toHaveCount(1);
+  await firstSpoke.dispatchEvent("click");
+
+  const inspector = page.getByTestId("project-context-inspector");
+  const edgeInspector = inspector.getByTestId("project-context-edge-inspector");
+  await expect(edgeInspector).toBeVisible();
+  await expect(inspector.locator("h2")).toHaveText("Context Edge");
+  await expect(
+    edgeInspector.locator('[data-testid^="project-context-edge-coordinate-"]'),
+  ).toHaveCount(3);
+  await expect(
+    edgeInspector.getByTestId(
+      `project-context-edge-document-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toBeVisible();
+  await expect(
+    edgeInspector.getByTestId(
+      `project-context-edge-document-${CONTEXT_DOCUMENT_B_ID}`,
+    ),
+  ).toBeVisible();
+  await expect(
+    edgeInspector.getByTestId("project-context-edge-key"),
+  ).toHaveText(firstEdgeKey);
+  await expect(
+    edgeInspector.getByTestId(
+      `project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Only the first Context body is rendered.");
+
+  await edgeInspector
+    .getByTestId(`project-context-edge-document-${CONTEXT_DOCUMENT_B_ID}`)
+    .click();
+  await expect(
+    edgeInspector.getByTestId(
+      `project-context-document-body-${CONTEXT_DOCUMENT_B_ID}`,
+    ),
+  ).toContainText("fetched only after switching Documents");
+  await expect(
+    edgeInspector.getByTestId(
+      `project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toHaveCount(0);
+  let bodyCalls = await documentBodyCalls(page);
+  expect(
+    bodyCalls?.map(
+      (call) =>
+        (call.payload as { input?: { documentId?: string } }).input?.documentId,
+    ),
+  ).toEqual([CONTEXT_DOCUMENT_A_ID, CONTEXT_DOCUMENT_B_ID]);
+
+  await edgeInspector
+    .getByTestId(`project-context-open-document-${CONTEXT_DOCUMENT_B_ID}`)
+    .click();
+  await expect(page).toHaveURL(
+    new RegExp(`/documents\\?document=${CONTEXT_DOCUMENT_B_ID}$`),
+  );
+  await page.goBack();
+  await expect(
+    page.getByTestId("project-context-edge-inspector"),
+  ).toBeVisible();
+
+  await page.getByTestId("auxiliary-panel-close").click();
+  const secondEdgeKey = "2".repeat(64);
+  const secondSpokeId = `spoke:${secondEdgeKey}:role:${ROLE_ID}`;
+  await page
+    .locator(
+      `.react-flow__edge[data-id="${secondSpokeId}"] .react-flow__edge-interaction`,
+    )
+    .dispatchEvent("click");
+  const secondEdgeInspector = page.getByTestId(
+    "project-context-edge-inspector",
+  );
+  await expect(
+    secondEdgeInspector.getByTestId(
+      `project-context-edge-coordinate-document:${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Architecture record Coordinate");
+  await expect(
+    secondEdgeInspector.getByTestId(
+      `project-context-edge-document-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toHaveCount(0);
+  await expect(
+    secondEdgeInspector.getByTestId(
+      `project-context-edge-document-${CONTEXT_DOCUMENT_C_ID}`,
+    ),
+  ).toBeVisible();
+  await expect(
+    secondEdgeInspector.getByTestId(
+      `project-context-document-body-${CONTEXT_DOCUMENT_C_ID}`,
+    ),
+  ).toContainText("second Edge owns this Context Document");
+
+  await secondEdgeInspector
+    .getByTestId(
+      `project-context-edge-coordinate-document:${CONTEXT_DOCUMENT_A_ID}`,
+    )
+    .click();
+  await expect(
+    page.getByTestId("project-context-coordinate-inspector"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId(`project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`),
+  ).toContainText("Only the first Context body is rendered.");
+  bodyCalls = await documentBodyCalls(page);
+  expect(bodyCalls).toHaveLength(3);
+});
+
+test("tombstoned and unavailable Coordinates remain distinct Edge members", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: inspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  const tombstoneSelection = encodeURIComponent(`coordinate:goal:${GOAL_ID}`);
+  await page.goto(`/#/project-context?selected=${tombstoneSelection}`);
+  const inspector = page.getByTestId("project-context-inspector");
+  await expect(
+    inspector.getByTestId("project-context-coordinate-tombstoned"),
+  ).toBeVisible();
+  await expect(inspector).toContainText("Known revision");
+  await expect(
+    inspector.getByTestId(`project-context-coordinate-edge-${"1".repeat(64)}`),
+  ).toBeVisible();
+  await expect(
+    inspector.getByTestId("project-context-open-project-view"),
+  ).toHaveCount(0);
+
+  const unavailableSelection = encodeURIComponent(`coordinate:role:${ROLE_ID}`);
+  await page.goto(`/#/project-context?selected=${unavailableSelection}`);
+  await expect(
+    page.getByTestId("project-context-coordinate-unavailable"),
+  ).toContainText("Role details are temporarily unavailable.");
+  await expect(page.getByText(/Context Gap/i)).toHaveCount(0);
+  await expect(
+    page.getByTestId(`project-context-coordinate-edge-${"2".repeat(64)}`),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("project-context-open-project-view"),
+  ).toHaveCount(0);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+});
+
+test("an unavailable Document observation never issues an identity-free body read", async ({
+  page,
+}) => {
+  const result = inspectorResult();
+  result.documentObservation = {
+    state: "unavailable",
+    reason: "Document catalog is reconnecting.",
+  };
+  await installMockBridge(page, {
+    projectContext: result,
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+  await page.getByTestId(`project-context-edge-${"1".repeat(64)}`).click();
+  await expect(
+    page.getByTestId("project-context-document-source-unavailable"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("project-context-edge-inspector"),
+  ).toBeVisible();
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+});
+
+test("a current Document body error does not hide the verified Edge", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: inspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectDocumentReadError: "Current Document verification failed.",
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  await page.getByTestId(`project-context-edge-${"1".repeat(64)}`).click();
+
+  const edgeInspector = page.getByTestId("project-context-edge-inspector");
+  await expect(edgeInspector).toBeVisible();
+  await expect(
+    edgeInspector.locator('[data-testid^="project-context-edge-coordinate-"]'),
+  ).toHaveCount(3);
+  await expect(
+    edgeInspector.getByTestId("project-context-document-error"),
+  ).toContainText("Current Document verification failed.");
+  await expect(
+    edgeInspector.getByTestId("project-context-edge-key"),
+  ).toHaveText("1".repeat(64));
+  const bodyCalls = await documentBodyCalls(page);
+  expect(bodyCalls?.length).toBeGreaterThan(0);
+  expect(
+    bodyCalls?.every(
+      (call) =>
+        (call.payload as { input?: { documentId?: string } }).input
+          ?.documentId === CONTEXT_DOCUMENT_A_ID,
+    ),
+  ).toBe(true);
 });
 
 test("Query Bar keeps a draft until Run and URL history restores query and selection", async ({

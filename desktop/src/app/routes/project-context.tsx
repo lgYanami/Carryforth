@@ -1,6 +1,7 @@
 import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
   projectContextRouteSearchForState,
   projectContextRouteStateFromSearch,
@@ -35,6 +36,7 @@ function ProjectContextRouteComponent() {
   usePreviewFeatureWarning("projectView");
   const search = Route.useSearch();
   const navigate = Route.useNavigate();
+  const { goDocuments, goView } = useAppNavigation();
   if (search.invalid) {
     return (
       <React.Suspense fallback={<ViewLoadingFallback kind="view" />}>
@@ -55,6 +57,8 @@ function ProjectContextRouteComponent() {
             search: projectContextRouteSearchForState(query),
           })
         }
+        onOpenDocument={(documentId) => void goDocuments({ documentId })}
+        onOpenProjectView={(objectId) => void goView({ objectId })}
         onSelectionChange={(selection, options) =>
           void navigate({
             search: projectContextRouteSearchForState(state.query, selection),

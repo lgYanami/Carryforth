@@ -119,10 +119,11 @@ export function useAppNavigation() {
   );
 
   const goDocuments = React.useCallback(
-    (behavior?: NavigationBehavior) =>
+    (behavior?: NavigationBehavior & { documentId?: string }) =>
       commitNavigation(
         {
           to: "/documents",
+          search: behavior?.documentId ? { document: behavior.documentId } : {},
         },
         behavior,
       ),

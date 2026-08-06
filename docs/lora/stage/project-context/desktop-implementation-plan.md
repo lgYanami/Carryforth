@@ -1,6 +1,6 @@
 # Project Context Desktop 分阶段实现计划
 
-> 状态：实施中；阶段一、阶段二、阶段三已提交，阶段四已交付，待 Human 确认。
+> 状态：实施中；阶段一至阶段四已提交，阶段五已交付，待 Human 确认。
 >
 > 产品规格：[Project Context Desktop 产品规格](./desktop-spec.md)。
 >
@@ -1151,8 +1151,8 @@ size、file-size override、lint disable 或降低测试门槛绕过仓库规则
 | 1. 可信 Context 查询边界 | 已提交（`e8e1b29fe`） | trusted Tauri query、typed TS API；Rust 14 + SDK 9 + Project View 回归 24；Desktop 3551 tests、typecheck、check、build、Tauri fmt/clippy 通过 |
 | 2. 页面纵向链路与状态外壳 | 已提交（`f2823ed22`） | `/project-context` route、sidebar、default All query、Community/Relay cache fence、完整只读状态外壳与 Context References 命名；Desktop 3557 tests、check、typecheck/build；Project Context E2E 10 + Context References 回归 E2E 1 通过 |
 | 3. 完整图、超边与 Context Islands | 已提交（`6451ebc61`） | lazy `@xyflow/react` 只读 viewport、canonical graph adapter、确定性 incidence layout / Island packing、Coordinate / Hub / Spoke / Island UI、选中与 fit controls；graph / layout / presentation 纯测试 18、Desktop 3575 tests、check、production build、Project Context E2E 11 与双 Island 截图通过 |
-| 4. 三类查询、URL 状态与跨页面深链 | 已交付，待确认 | draft-first Query Bar、分组 Coordinate picker、closed canonical URL query / selection、focused Anchor layout 与 no-match、Project View / Document Incident deep link；route / query / graph 纯测试 35、Desktop 3586 tests、typecheck/check、production/E2E build、Project Context E2E 15 + deep link E2E 2 通过 |
-| 5. Coordinate / Edge Inspector 与按需正文 | 待实施 | — |
+| 4. 三类查询、URL 状态与跨页面深链 | 已提交（`c7eedb6a4`） | draft-first Query Bar、分组 Coordinate picker、closed canonical URL query / selection、focused Anchor layout 与 no-match、Project View / Document Incident deep link；route / query / graph 纯测试 35、Desktop 3586 tests、typecheck/check、production/E2E build、Project Context E2E 15 + deep link E2E 2 通过 |
+| 5. Coordinate / Edge Inspector 与按需正文 | 已交付，待确认 | responsive read-only Inspector、Project View / Document Coordinate detail、完整 hyperedge 与多 Document 切换、verified identity 下的 lazy Markdown、tombstone / unavailable / body-error 隔离、View / Documents 往返与 focus restoration；Inspector model 纯测试 5、Desktop 3591 tests、typecheck/check、production/E2E build、Project Context E2E 21、Project Context / View / Documents 联合 E2E 67 通过 |
 | 6. 实时恢复、视觉收口、响应式与可访问性 | 待实施 | — |
 | 7. E2E、真实数据验收与质量收口 | 待实施 | — |
 
@@ -1160,9 +1160,9 @@ size、file-size override、lint disable 或降低测试门槛绕过仓库规则
 “已写代码”代替完成证据。
 
 阶段一已在 `e8e1b29fe` 提交，阶段二已在 `f2823ed22` 提交，阶段三已在 `6451ebc61`
-提交。阶段四当前尚未提交；Human 确认后补记 commit，再进入阶段五。阶段四没有增加
-Inspector、Document body、live subscription、持久化布局、Island 领域身份、前端本地 query
-模拟或 Context write surface。
+提交，阶段四已在 `c7eedb6a4` 提交。阶段五当前尚未提交；Human 确认后再提交并进入阶段六。
+阶段五没有增加 Context write、内联业务编辑、Document history、live subscription、持久化布局、
+Island 领域身份或前端本地 query 模拟。
 
 ## 11. 整体完成定义
 
