@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Exercise Project Context Stages 3 through 5, plus the optional Stage 7
-# recovery gate, against a direct Project View v3 Community:
+# reprojection and Desktop trusted-read acceptance gate, against a direct
+# Project View v3 Community:
 # controlled bootstrap, real Relay writes, private reads/fan-out, disable
 # semantics, managed authority, cross-domain lifecycle, verified CLI queries,
 # metadata-only hydration, and final canonical state preservation.
@@ -254,6 +255,19 @@ run_e2e_binary() {
       --nocapture \
       --test-threads=1
   fi
+}
+
+desktop_context_probe() {
+  local mode="$1"
+  local expected_revision="$2"
+  env \
+    PROJECT_CONTEXT_DESKTOP_E2E_RELAY_URL="http://${test_host}" \
+    PROJECT_CONTEXT_DESKTOP_E2E_PRIVATE_KEY="${member_private_key}" \
+    PROJECT_CONTEXT_DESKTOP_E2E_MODE="${mode}" \
+    PROJECT_CONTEXT_DESKTOP_E2E_EXPECTED_REVISION="${expected_revision}" \
+    cargo test --manifest-path desktop/src-tauri/Cargo.toml \
+      real_relay_stage7_matches_cli_and_desktop_trusted_read -- \
+      --ignored --nocapture --test-threads=1
 }
 
 buzz_as_member() {
@@ -826,10 +840,230 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     and .projection_generation == 2
     and (.edges | length) == 0
   ' <<<"${recovered_empty}" >/dev/null
+
+  # Build a deterministic read-only Desktop acceptance fixture. CLI remains
+  # the only writer: two disjoint Edges first, then one bridging Edge. Desktop
+  # reads the same signed revision through its native trusted boundary.
+  stage7_context_a="80000000-0000-4000-8000-00000000c701"
+  stage7_context_b="80000000-0000-4000-8000-00000000c702"
+  stage7_context_bridge="80000000-0000-4000-8000-00000000c703"
+  stage7_coordinate_document="80000000-0000-4000-8000-00000000c704"
+  stage7_document_coordinate="document:${stage7_coordinate_document}"
+  stage7_role_coordinate="role:20000000-0000-4000-8000-00000000c003"
+  stage7_body_a="STAGE7_CONTEXT_BODY_A_MUST_STAY_OUT_OF_GRAPH_RESULTS"
+  stage7_body_a_corrected="STAGE7_CONTEXT_BODY_A_CORRECTED_MUST_BE_LAZY"
+
+  create_stage7_a="$(buzz_as_member --format compact documents create \
+    --document-id "${stage7_context_a}" \
+    --title "Stage 7 Context A" \
+    --summary "Explains the profile and lifecycle goal island" \
+    --content "${stage7_body_a}")"
+  jq -e --arg id "${stage7_context_a}" '
+    .accepted == true and .document_id == $id and .document_revision == 1
+  ' <<<"${create_stage7_a}" >/dev/null
+
+  create_stage7_b="$(buzz_as_member --format compact documents create \
+    --document-id "${stage7_context_b}" \
+    --title "Stage 7 Context B" \
+    --summary "Explains the role and Document island" \
+    --content "STAGE7_CONTEXT_BODY_B_MUST_STAY_LAZY")"
+  jq -e --arg id "${stage7_context_b}" '
+    .accepted == true and .document_id == $id and .document_revision == 1
+  ' <<<"${create_stage7_b}" >/dev/null
+
+  create_stage7_bridge="$(buzz_as_member --format compact documents create \
+    --document-id "${stage7_context_bridge}" \
+    --title "Stage 7 bridge Context" \
+    --summary "Connects the two Context islands" \
+    --content "STAGE7_BRIDGE_BODY_MUST_STAY_LAZY")"
+  jq -e --arg id "${stage7_context_bridge}" '
+    .accepted == true and .document_id == $id and .document_revision == 1
+  ' <<<"${create_stage7_bridge}" >/dev/null
+
+  create_stage7_coordinate="$(buzz_as_member --format compact documents create \
+    --document-id "${stage7_coordinate_document}" \
+    --title "Stage 7 Coordinate Document" \
+    --summary "Acts as a graph Coordinate, not a Context binding" \
+    --content "Stage 7 Coordinate body")"
+  jq -e --arg id "${stage7_coordinate_document}" '
+    .accepted == true and .document_id == $id and .document_revision == 1
+  ' <<<"${create_stage7_coordinate}" >/dev/null
+
+  stage7_attach_a="$(buzz_as_member --format compact project-context attach \
+    --context-document "${stage7_context_a}" \
+    --coordinate "${goal_coordinate}" \
+    --coordinate "${profile_coordinate}")"
+  jq -e '
+    .accepted == true
+    and .receipt.context_revision == 15
+    and .receipt.edge_state == "active"
+  ' <<<"${stage7_attach_a}" >/dev/null
+
+  stage7_attach_b="$(buzz_as_member --format compact project-context attach \
+    --context-document "${stage7_context_b}" \
+    --coordinate "${stage7_role_coordinate}" \
+    --coordinate "${stage7_document_coordinate}")"
+  jq -e '
+    .accepted == true
+    and .receipt.context_revision == 16
+    and .receipt.edge_state == "active"
+  ' <<<"${stage7_attach_b}" >/dev/null
+
+  stage7_all_split="$(buzz_as_member --format compact project-context contains-all)"
+  jq -e --arg a "${stage7_context_a}" --arg b "${stage7_context_b}" '
+    .context_revision == 16
+    and .projection_generation == 2
+    and (.edges | length) == 2
+    and ([.edges[].context_documents[].document_id] | sort) == ([$a, $b] | sort)
+  ' <<<"${stage7_all_split}" >/dev/null
+  if grep -Fq "STAGE7_CONTEXT_BODY" <<<"${stage7_all_split}"; then
+    echo "Project Context Stage 7 E2E: All leaked a Context Document body" >&2
+    exit 1
+  fi
+
+  stage7_exact="$(buzz_as_member --format compact project-context exact \
+    --coordinate "${profile_coordinate}" \
+    --coordinate "${goal_coordinate}")"
+  jq -e --arg id "${stage7_context_a}" '
+    .context_revision == 16
+    and .query.query_type == "exact"
+    and (.edges | length) == 1
+    and .edges[0].context_documents[0].document_id == $id
+  ' <<<"${stage7_exact}" >/dev/null
+
+  stage7_incident="$(buzz_as_member --format compact project-context incident \
+    "${goal_coordinate}")"
+  jq -e --arg id "${stage7_context_a}" '
+    .context_revision == 16
+    and .query.query_type == "incident"
+    and (.edges | length) == 1
+    and .edges[0].context_documents[0].document_id == $id
+  ' <<<"${stage7_incident}" >/dev/null
+
+  stage7_contains="$(buzz_as_member --format compact project-context contains-all \
+    --coordinate "${stage7_role_coordinate}")"
+  jq -e --arg id "${stage7_context_b}" '
+    .context_revision == 16
+    and .query.query_type == "contains_all"
+    and (.edges | length) == 1
+    and .edges[0].context_documents[0].document_id == $id
+  ' <<<"${stage7_contains}" >/dev/null
+  desktop_context_probe split 16
+
+  stage7_attach_bridge="$(buzz_as_member --format compact project-context attach \
+    --context-document "${stage7_context_bridge}" \
+    --coordinate "${goal_coordinate}" \
+    --coordinate "${stage7_role_coordinate}")"
+  jq -e '
+    .accepted == true
+    and .receipt.context_revision == 17
+    and .receipt.edge_state == "active"
+  ' <<<"${stage7_attach_bridge}" >/dev/null
+  stage7_all_merged="$(buzz_as_member --format compact project-context contains-all)"
+  jq -e '
+    .context_revision == 17
+    and (.edges | length) == 3
+  ' <<<"${stage7_all_merged}" >/dev/null
+  desktop_context_probe merged 17
+
+  stage7_update_a="$(buzz_as_member --format compact documents update \
+    "${stage7_context_a}" \
+    --expected-revision 1 \
+    --title "Stage 7 Context A corrected" \
+    --summary "Corrected without changing Edge membership" \
+    --content "${stage7_body_a_corrected}")"
+  jq -e --arg id "${stage7_context_a}" '
+    .accepted == true and .document_id == $id and .document_revision == 2
+  ' <<<"${stage7_update_a}" >/dev/null
+  stage7_after_update="$(buzz_as_member --format compact project-context exact \
+    --coordinate "${profile_coordinate}" \
+    --coordinate "${goal_coordinate}")"
+  jq -e '
+    .context_revision == 17
+    and .edges[0].context_documents[0].title == "Stage 7 Context A corrected"
+    and .edges[0].context_documents[0].document_revision == 2
+  ' <<<"${stage7_after_update}" >/dev/null
+  if grep -Fq "${stage7_body_a_corrected}" <<<"${stage7_after_update}"; then
+    echo "Project Context Stage 7 E2E: updated query leaked the current body" >&2
+    exit 1
+  fi
+  desktop_context_probe updated 17
+
+  stage7_delete_coordinate="$(buzz_as_member --format compact documents delete \
+    "${stage7_coordinate_document}" --expected-revision 1)"
+  jq -e --arg id "${stage7_coordinate_document}" '
+    .accepted == true and .document_id == $id and .document_revision == 2
+  ' <<<"${stage7_delete_coordinate}" >/dev/null
+  stage7_tombstoned="$(buzz_as_member --format compact project-context incident \
+    "${stage7_document_coordinate}")"
+  jq -e --arg id "${stage7_coordinate_document}" '
+    .context_revision == 17
+    and (.edges | length) == 1
+    and any(.edges[0].coordinates[];
+      .coordinate.coordinate_type == "document"
+      and .coordinate.document_id == $id
+      and .state == "tombstoned"
+      and .document_revision == 2)
+  ' <<<"${stage7_tombstoned}" >/dev/null
+  desktop_context_probe tombstoned 17
+
+  set +e
+  stage7_protected_delete="$(buzz_as_member --format compact documents delete \
+    "${stage7_context_a}" --expected-revision 2 2>&1)"
+  stage7_protected_delete_status=$?
+  set -e
+  [[ "${stage7_protected_delete_status}" == "5" ]]
+  grep -Fq "conflict:project_document:still_referenced" <<<"${stage7_protected_delete}"
+
   stop_relay
   project_context_admin disable --community "${test_host}" >/dev/null
+  start_relay
+  stage7_capability_off="$(buzz_as_member --format compact project-context contains-all)"
+  jq -e '
+    .context_revision == 17
+    and .projection_generation == 2
+    and (.edges | length) == 3
+  ' <<<"${stage7_capability_off}" >/dev/null
+  desktop_context_probe capability_off 17
+
+  stage7_detach_bridge="$(buzz_as_member --format compact project-context detach \
+    --context-document "${stage7_context_bridge}" \
+    --coordinate "${goal_coordinate}" \
+    --coordinate "${stage7_role_coordinate}")"
+  jq -e '.accepted == true and .receipt.context_revision == 18' \
+    <<<"${stage7_detach_bridge}" >/dev/null
+  stage7_detach_a="$(buzz_as_member --format compact project-context detach \
+    --context-document "${stage7_context_a}" \
+    --coordinate "${profile_coordinate}" \
+    --coordinate "${goal_coordinate}")"
+  jq -e '.accepted == true and .receipt.context_revision == 19' \
+    <<<"${stage7_detach_a}" >/dev/null
+  stage7_detach_b="$(buzz_as_member --format compact project-context detach \
+    --context-document "${stage7_context_b}" \
+    --coordinate "${stage7_role_coordinate}" \
+    --coordinate "${stage7_document_coordinate}")"
+  jq -e '.accepted == true and .receipt.context_revision == 20' \
+    <<<"${stage7_detach_b}" >/dev/null
+  stage7_clean="$(buzz_as_member --format compact project-context contains-all)"
+  jq -e '.context_revision == 20 and (.edges | length) == 0' \
+    <<<"${stage7_clean}" >/dev/null
+  stop_relay
   project_context_admin verify \
     --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
+  stage7_final_status="$(project_context_admin status --community "${test_host}")"
+  jq -e '
+    length == 1
+    and .[0].enabled == false
+    and .[0].context_revision == 20
+    and .[0].active_edge_count == 0
+    and .[0].bound_document_count == 0
+    and .[0].projection_generation == 2
+    and .[0].edge_row_count == 7
+    and .[0].binding_row_count == 10
+    and .[0].change_count == 20
+    and .[0].projection_parity == true
+    and .[0].integrity_ready == true
+  ' <<<"${stage7_final_status}" >/dev/null
 fi
 
 control_audits="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
@@ -850,7 +1084,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
        AND action = 'project_context_edge_control'
        AND detail->>'operation' = 'reproject'")"
   [[ "${reproject_audits}" == "1" ]]
-  echo "Project Context Stage 7 reprojection, recovery, re-enable, and regression E2E passed."
+  echo "Project Context Stage 7 reprojection, Desktop read parity, lifecycle, and regression E2E passed."
 fi
 
 echo "Project Context Stage 3/4/5 Relay, privacy, authority, lifecycle, and Agent CLI E2E passed."

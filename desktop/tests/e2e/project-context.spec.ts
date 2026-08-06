@@ -798,6 +798,10 @@ test("Project View Coordinate Inspector is read-only, responsive, and restores g
     .toBe("fixed");
   const narrowBox = await inspector.boundingBox();
   expect(narrowBox?.width).toBeGreaterThan(400);
+  await waitForAnimations(page);
+  await page.screenshot({
+    path: "test-results/project-context/project-context-narrow-sheet.png",
+  });
   expect(
     await page.evaluate(
       () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
@@ -940,6 +944,10 @@ test("a Spoke opens the complete Edge and multi-Document bodies stay independent
         (call.payload as { input?: { documentId?: string } }).input?.documentId,
     ),
   ).toEqual([CONTEXT_DOCUMENT_A_ID, CONTEXT_DOCUMENT_B_ID]);
+  await waitForAnimations(page);
+  await edgeInspector.screenshot({
+    path: "test-results/project-context/project-context-edge-inspector-multi-document.png",
+  });
 
   await edgeInspector
     .getByTestId(`project-context-open-document-${CONTEXT_DOCUMENT_B_ID}`)
@@ -1034,6 +1042,10 @@ test("tombstoned and unavailable Coordinates remain distinct Edge members", asyn
     page.getByTestId("project-context-open-project-view"),
   ).toHaveCount(0);
   expect(await documentBodyCalls(page)).toHaveLength(0);
+  await waitForAnimations(page);
+  await page.getByTestId("project-context-screen").screenshot({
+    path: "test-results/project-context/project-context-tombstone-unavailable.png",
+  });
 });
 
 test("an unavailable Document observation never issues an identity-free body read", async ({
@@ -1148,11 +1160,23 @@ test("Query Bar keeps a draft until Run and URL history restores query and selec
   await expect(page.getByTestId("project-context-query-summary")).toContainText(
     "1 matching edge",
   );
-  expect(
-    await page.evaluate(
-      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
-    ),
-  ).toBe(callsBeforeDraft + 1);
+  await expect(page.getByTestId("project-context-sync-status")).toHaveText(
+    "Live",
+  );
+  const callsAfterRun = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ ?? [],
+  );
+  expect(callsAfterRun.length).toBeGreaterThan(callsBeforeDraft);
+  for (const call of callsAfterRun.slice(callsBeforeDraft)) {
+    expect(call.payload).toMatchObject({ input: { query: incident } });
+  }
+  await waitForAnimations(page);
+  await page.getByTestId("project-context-graph-slot").screenshot({
+    path: "test-results/project-context/project-context-incident-anchor.png",
+  });
+  await page.evaluate(() => {
+    window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ = [];
+  });
 
   await page
     .getByTestId(`project-context-coordinate-requirement:${REQUIREMENT_ID}`)
@@ -1162,7 +1186,7 @@ test("Query Bar keeps a draft until Run and URL history restores query and selec
     await page.evaluate(
       () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
     ),
-  ).toBe(callsBeforeDraft + 1);
+  ).toBe(0);
 
   await page.goBack();
   await expect(page).not.toHaveURL(/selected=/);
@@ -1402,6 +1426,10 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
   await expect(
     page.getByTestId("project-context-selection-status"),
   ).toContainText("3 coordinates · 1 doc");
+  await waitForAnimations(page);
+  await page.getByTestId("project-context-graph-slot").screenshot({
+    path: "test-results/project-context/project-context-overlapping-edges.png",
+  });
 
   const binarySpokeId = `spoke:${"1".repeat(64)}:requirement:${REQUIREMENT_ID}`;
   const binarySpoke = page.locator(
@@ -1422,7 +1450,7 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
     page.getByTestId("project-context-selection-status"),
   ).toContainText("2 coordinates · 1 doc");
 
-  await page.getByTestId(`project-context-edge-${"2".repeat(64)}`).click();
+  await page.keyboard.press("Escape");
 
   await page.getByTestId("project-context-fit-island-2").click();
   await page.getByTestId("project-context-fit-all").click();
@@ -1430,6 +1458,17 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
   await waitForAnimations(page);
   await page.getByTestId("project-context-graph-slot").screenshot({
     path: "test-results/project-context/project-context-two-islands.png",
+  });
+
+  await page.evaluate(() => {
+    window.localStorage.setItem("buzz-theme", "buzz-dark");
+  });
+  await page.reload();
+  await expect(page.getByTestId("project-context-graph-slot")).toBeVisible();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await waitForAnimations(page);
+  await page.getByTestId("project-context-graph-slot").screenshot({
+    path: "test-results/project-context/project-context-dark-islands.png",
   });
 });
 
@@ -1922,24 +1961,43 @@ test("capability-off verified projection remains explicitly read-only", async ({
   await expect(page.getByTestId("project-context-unsupported")).toHaveCount(0);
 });
 
-test("refresh failure keeps the same verified result and marks it stale", async ({
+test("sequenced refresh failure keeps stale data and the next read recovers", async ({
   page,
 }) => {
   await installMockBridge(page, { projectContext: contextResult() });
   await page.goto("/#/project-context");
   await expect(page.getByTestId("project-context-graph-slot")).toBeVisible();
-  await page.evaluate(() => {
-    window.__BUZZ_E2E_SET_PROJECT_CONTEXT_ERROR__?.({
-      code: "unavailable",
-      message: "Relay temporarily unavailable.",
-      retryable: true,
-    });
-  });
+  const recovered = contextResult({ edgeCount: 2, revision: 9 });
+  await page.evaluate((result) => {
+    window.__BUZZ_E2E_SET_PROJECT_CONTEXT_READ_SEQUENCE__?.([
+      {
+        delayMs: 25,
+        error: {
+          code: "unavailable",
+          message: "Relay temporarily unavailable.",
+          retryable: true,
+        },
+      },
+      { delayMs: 25, result },
+    ]);
+  }, recovered);
   await page.getByTestId("project-context-refresh").click();
   await expect(page.getByTestId("project-context-stale-message")).toContainText(
     "Relay temporarily unavailable",
   );
   await expect(page.getByTestId("project-context-graph-slot")).toBeVisible();
+  await expect(
+    page.getByTestId("project-context-result-counts"),
+  ).toHaveAttribute("data-edge-count", "1");
+
+  await page.getByTestId("project-context-refresh").click();
+  await expect(page.getByText("Revision 9", { exact: true })).toBeVisible();
+  await expect(
+    page.getByTestId("project-context-result-counts"),
+  ).toHaveAttribute("data-edge-count", "2");
+  await expect(page.getByTestId("project-context-stale-message")).toHaveCount(
+    0,
+  );
 });
 
 test("Community switch never paints the previous Project Context result", async ({

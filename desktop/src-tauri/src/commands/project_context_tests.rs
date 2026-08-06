@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -27,6 +28,13 @@ const PROJECT_ID: &str = "3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77";
 const REQUIREMENT_ID: &str = "0fd3a16e-4da4-48c1-aa6a-63b3661091d0";
 const RESOURCE_ID: &str = "e0a286dd-4391-4a45-b843-62b2c57b014a";
 const DOCUMENT_ID: &str = "9c23f672-a397-42d1-b933-104ba2674f26";
+const STAGE7_PROJECT_ID: &str = "00000000-0000-4000-8000-00000000c003";
+const STAGE7_GOAL_ID: &str = "10000000-0000-4000-8000-00000000c004";
+const STAGE7_ROLE_ID: &str = "20000000-0000-4000-8000-00000000c003";
+const STAGE7_CONTEXT_DOCUMENT_A_ID: &str = "80000000-0000-4000-8000-00000000c701";
+const STAGE7_CONTEXT_DOCUMENT_B_ID: &str = "80000000-0000-4000-8000-00000000c702";
+const STAGE7_CONTEXT_DOCUMENT_BRIDGE_ID: &str = "80000000-0000-4000-8000-00000000c703";
+const STAGE7_COORDINATE_DOCUMENT_ID: &str = "80000000-0000-4000-8000-00000000c704";
 
 fn uuid(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("fixture UUID")
@@ -774,3 +782,73 @@ async fn context_capture_cannot_be_retargeted_by_a_community_switch() {
     assert_eq!(context.keys.public_key(), original_signer.public_key());
     assert_eq!(context.identity.relay_pubkey, relay.public_key());
 }
+
+fn stage7_project_view_coordinate(
+    object_type: ProjectViewObjectType,
+    object_id: &str,
+) -> ProjectContextCoordinateDto {
+    ProjectContextCoordinateDto::ProjectViewObject {
+        object_type,
+        object_id: uuid(object_id),
+    }
+}
+
+fn stage7_membership(result: &ProjectContextQueryResult) -> Vec<(String, Vec<String>, Vec<Uuid>)> {
+    let mut membership = result
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.edge_key.clone(),
+                edge.coordinate_keys.clone(),
+                edge.context_document_ids.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    membership.sort();
+    membership
+}
+
+fn stage7_connected_component_count(result: &ProjectContextQueryResult) -> usize {
+    let mut components = Vec::<BTreeSet<String>>::new();
+    for edge in &result.edges {
+        let mut component = edge
+            .coordinate_keys
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let connected = components
+            .iter()
+            .enumerate()
+            .filter_map(|(index, existing)| (!existing.is_disjoint(&component)).then_some(index))
+            .collect::<Vec<_>>();
+        if connected.is_empty() {
+            components.push(component);
+            continue;
+        }
+        for index in connected.into_iter().rev() {
+            component.extend(components.remove(index));
+        }
+        components.push(component);
+    }
+    components.len()
+}
+
+async fn stage7_live_query(
+    state: &AppState,
+    query: ProjectContextQueryDto,
+) -> ProjectContextQueryResult {
+    let query = canonicalize_query(query).expect("canonical Stage 7 query");
+    let context = capture_context("project-context-stage7".to_owned(), state)
+        .await
+        .expect("capture real Relay Context boundary");
+    let snapshot = read_edge_snapshot(state, &context, &query)
+        .await
+        .expect("read real Relay Context snapshot");
+    build_result(state, &context, &query, snapshot)
+        .await
+        .expect("hydrate real Relay Context result")
+}
+
+#[path = "project_context_live_tests.rs"]
+mod live;

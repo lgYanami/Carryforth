@@ -174,6 +174,15 @@ export type MockProjectDocumentState = {
   revisions: Record<string, ProjectDocument[]>;
 };
 
+export type MockProjectContextReadStep = {
+  /** Per-read latency, overriding the persistent Relay or global delay. */
+  delayMs?: number;
+  /** A structured native failure for this read; null explicitly succeeds. */
+  error?: ProjectContextErrorPayload | null;
+  /** A trusted result for this read, overriding query and Relay fixtures. */
+  result?: ProjectContextQueryResult;
+};
+
 type MockMeetingSeed = {
   id: string;
   title: string;
@@ -384,6 +393,8 @@ type E2eConfig = {
     projectContextReadDelayMs?: number;
     projectContextReadDelayMsByRelayUrl?: Record<string, number>;
     projectContextReadError?: ProjectContextErrorPayload;
+    /** Success/failure sequence for successive trusted Context reads. */
+    projectContextReadSequence?: MockProjectContextReadStep[];
     /** Verified Project Document catalog and immutable revision fixtures. */
     projectDocument?: MockProjectDocumentState;
     /** Community-isolated Document fixtures keyed by applied Relay URL. */
@@ -1290,6 +1301,10 @@ declare global {
     /** Set or clear the structured Project Context native read error. */
     __BUZZ_E2E_SET_PROJECT_CONTEXT_ERROR__?: (
       error?: ProjectContextErrorPayload,
+    ) => void;
+    /** Replace and rewind the trusted Project Context read sequence. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT_READ_SEQUENCE__?: (
+      sequence: MockProjectContextReadStep[],
     ) => void;
     /** Emit an untrusted Context projection hint through the mock live socket. */
     __BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__?: (input?: {
@@ -10373,6 +10388,7 @@ function disconnectMockSocket(id: number) {
   sendWsClose(socket.handler);
 }
 
+let mockProjectContextReadSequenceIndex = 0;
 let mockProjectDocumentSequence = 1;
 
 function projectDocumentState(
@@ -10718,6 +10734,7 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__ = [];
   window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ = [];
   window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ = [];
+  mockProjectContextReadSequenceIndex = 0;
   mockProjectDocumentSequence = 1;
   window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
     if (!config.mock) {
@@ -10769,6 +10786,13 @@ export function maybeInstallE2eTauriMocks() {
     config.mock.projectContextReadError = error
       ? structuredClone(error)
       : undefined;
+  };
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT_READ_SEQUENCE__ = (sequence) => {
+    if (!config.mock) {
+      throw new Error("Mock Project Context is unavailable in relay mode.");
+    }
+    config.mock.projectContextReadSequence = structuredClone(sequence);
+    mockProjectContextReadSequenceIndex = 0;
   };
   window.__BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__ = (input) => {
     const result =
@@ -12739,7 +12763,20 @@ export function maybeInstallE2eTauriMocks() {
           payload: structuredClone(payload),
           relayUrl: requestRelayUrl,
         });
+        const readSequence = activeConfig?.mock?.projectContextReadSequence;
+        const readStep = readSequence?.length
+          ? readSequence[
+              Math.min(
+                mockProjectContextReadSequenceIndex,
+                readSequence.length - 1,
+              )
+            ]
+          : undefined;
+        if (readStep) {
+          mockProjectContextReadSequenceIndex += 1;
+        }
         const delayMs =
+          readStep?.delayMs ??
           activeConfig?.mock?.projectContextReadDelayMsByRelayUrl?.[
             requestRelayUrl
           ] ??
@@ -12748,7 +12785,10 @@ export function maybeInstallE2eTauriMocks() {
         if (delayMs > 0) {
           await new Promise((resolve) => window.setTimeout(resolve, delayMs));
         }
-        if (activeConfig?.mock?.projectContextReadError) {
+        if (readStep?.error) {
+          throw structuredClone(readStep.error);
+        }
+        if (!readStep && activeConfig?.mock?.projectContextReadError) {
           throw structuredClone(activeConfig.mock.projectContextReadError);
         }
         const input = ((payload as { input?: unknown }).input ?? payload) as {
@@ -12756,6 +12796,7 @@ export function maybeInstallE2eTauriMocks() {
           query: ProjectContextQueryResult["query"];
         };
         const result =
+          readStep?.result ??
           activeConfig?.mock?.projectContextsByQuery?.[
             JSON.stringify(input.query)
           ] ??
