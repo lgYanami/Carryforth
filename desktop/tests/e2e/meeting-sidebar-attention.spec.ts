@@ -36,7 +36,7 @@ function snapshot(input: {
     description: "Sidebar attention acceptance fixture",
     sourceChannelId: null,
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey: host,
     moderatorPubkey: host,
     createEventId: "1".repeat(64),

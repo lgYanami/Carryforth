@@ -1,7 +1,7 @@
 import type { RelayAgent, UserSearchResult } from "@/shared/api/types";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 
-export const MEETING_ACTION_CAPABILITY = "meeting-v2-action-finalization-v2";
+export const MEETING_ACTION_CAPABILITY = "meeting-v2-action-finalization-v3";
 export const MAX_MEETING_BOARD_BYTES = 65_536;
 export const MAX_MEETING_PARTICIPANTS = 12;
 export const MAX_OTHER_MEETING_PARTICIPANTS = MAX_MEETING_PARTICIPANTS - 1;
@@ -37,6 +37,33 @@ export type MeetingSourceAccess =
   | { status: "loading"; missingPubkeys: [] }
   | { status: "unavailable"; missingPubkeys: [] }
   | { status: "blocked"; missingPubkeys: string[] };
+
+/** Translate the Relay's stable roster-capability rejection into named UI copy. */
+export function describeMeetingCapabilityRejection(
+  message: string,
+  candidates: readonly Pick<UserSearchResult, "displayName" | "pubkey">[],
+): string | null {
+  if (!message.includes("restricted:meeting:roster_capability_missing")) {
+    return null;
+  }
+  const encoded = message.match(/missing_agent_pubkeys=([0-9a-f,]+)/iu)?.[1];
+  if (!encoded) {
+    return "The Relay rejected this roster because at least one Agent no longer advertises the required Meeting capability. Refresh and try again.";
+  }
+  const byPubkey = new Map(
+    candidates.map((candidate) => [
+      normalizePubkey(candidate.pubkey),
+      candidate,
+    ]),
+  );
+  const names = encoded
+    .split(",")
+    .map(normalizePubkey)
+    .map(
+      (pubkey) => byPubkey.get(pubkey)?.displayName || truncatePubkey(pubkey),
+    );
+  return `The Relay rejected this roster because ${names.join(", ")} ${names.length === 1 ? "no longer advertises" : "no longer advertise"} the required Meeting capability. Refresh and try again.`;
+}
 
 function nonemptyLines(value: string): string[] {
   return value

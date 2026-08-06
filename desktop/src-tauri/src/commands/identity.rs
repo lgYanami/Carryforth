@@ -202,6 +202,7 @@ pub async fn import_identity(
         // this import.
         let state = app_handle.state::<AppState>();
         let _mutation_guard = state.identity_mutation.lock().map_err(|e| e.to_string())?;
+        state.meeting_action_renewals.cancel_all();
 
         let data_dir = app_handle
             .path()
@@ -340,6 +341,8 @@ pub async fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
                 .to_string(),
         );
     }
+
+    app.state::<AppState>().meeting_action_renewals.cancel_all();
 
     // Stop all managed agents before restart so they don't race the wipe.
     if let Err(e) = crate::shutdown::shutdown_managed_agents(&app) {

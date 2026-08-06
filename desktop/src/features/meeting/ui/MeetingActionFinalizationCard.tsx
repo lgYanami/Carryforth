@@ -45,6 +45,20 @@ const BLOCK_LABELS: Record<MeetingActionBlockReason, string> = {
   action_deadline_exceeded: "The action window expired",
 };
 
+const BLOCKED_STATUS_LABELS: Record<string, string> = {
+  ...BLOCK_LABELS,
+  action_lease_expired: "The action host stopped renewing its lease",
+  action_operator_deadline_exceeded: "The operator safety limit was reached",
+};
+
+const PROGRESS_LABELS = {
+  reasoning: "Reasoning",
+  tool_call: "Calling a tool",
+  tool_result: "Processing a tool result",
+  finalizing: "Preparing completion",
+  waiting_human: "Waiting for the Human host",
+} as const;
+
 function hostName(
   pubkey: string,
   profiles: Record<string, UserProfileSummary>,
@@ -125,10 +139,31 @@ export function MeetingActionFinalizationCard({
         {runnable && action.actionDeadlineAtMs !== null ? (
           <Badge variant={deadlineExpired ? "warning" : "outline"}>
             <Clock3 className="mr-1 size-3" />
-            Action · {meetingDeadlineLabel(remainingMs)}
+            Lease · {meetingDeadlineLabel(remainingMs)}
           </Badge>
         ) : null}
       </div>
+
+      {snapshot.policy === "moderated-board-actions-v3" ? (
+        <div
+          className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground"
+          data-testid="meeting-action-progress"
+        >
+          <span>
+            Stage:{" "}
+            {action.lastProgressStage
+              ? PROGRESS_LABELS[action.lastProgressStage]
+              : "Starting"}
+          </span>
+          <span>Renewals: {action.progressSeq}</span>
+          {action.lastProgressAtMs !== null ? (
+            <span>
+              Last progress:{" "}
+              {new Date(action.lastProgressAtMs).toLocaleTimeString()}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="mt-4 rounded-lg border bg-muted/20 p-3">
         <p className="text-sm font-medium">Final Board is frozen</p>
@@ -169,8 +204,9 @@ export function MeetingActionFinalizationCard({
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium">
-              {action.lastErrorCode && action.lastErrorCode in BLOCK_LABELS
-                ? BLOCK_LABELS[action.lastErrorCode as MeetingActionBlockReason]
+              {action.lastErrorCode &&
+              action.lastErrorCode in BLOCKED_STATUS_LABELS
+                ? BLOCKED_STATUS_LABELS[action.lastErrorCode]
                 : "The current action window cannot continue"}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">

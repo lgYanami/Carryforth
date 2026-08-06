@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 46);
+        assert_eq!(migrations.len(), 47);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1157,6 +1157,17 @@ mod tests {
         assert!(meeting_v2_direct_actions.contains("completion_event_id"));
         assert!(meeting_v2_direct_actions
             .contains("action IN ('begin', 'block', 'retry', 'return-to-board')"));
+
+        // Renewable action leases are a one-shot v3 cutover. Ended v2 rows
+        // remain history while all new runnable action Meetings use v3.
+        assert_eq!(migrations[46].version, 47);
+        let meeting_v2_action_leases = migrations[46].sql.as_str();
+        assert!(meeting_v2_action_leases.contains("moderated-board-actions-v3"));
+        assert!(meeting_v2_action_leases.contains("progress_seq"));
+        assert!(meeting_v2_action_leases.contains("operator_hard_deadline"));
+        assert!(meeting_v2_action_leases.contains("CREATE TABLE meeting_v2_action_lease_renewals"));
+        assert!(meeting_v2_action_leases
+            .contains("action IN ('begin', 'renew', 'block', 'retry', 'return-to-board')"));
     }
 
     #[test]
@@ -1223,13 +1234,16 @@ mod tests {
         let schema = include_str!("../../../schema/schema.sql");
 
         for required in [
-            "moderated-board-actions-v2",
+            "moderated-board-actions-v3",
             "finalizing_actions",
             "action_finalization_ms",
             "CREATE TABLE meeting_v2_action_runs",
             "completion_event_id",
             "CREATE TABLE meeting_v2_action_command_receipts",
-            "action IN ('begin', 'block', 'retry', 'return-to-board')",
+            "action IN ('begin', 'renew', 'block', 'retry', 'return-to-board')",
+            "CREATE TABLE meeting_v2_action_lease_renewals",
+            "progress_seq",
+            "operator_hard_deadline",
         ] {
             assert!(
                 schema.contains(required),
@@ -1443,6 +1457,33 @@ mod tests {
         .await
         .expect("inspect direct action runtime after upgrade");
         assert_eq!(direct_shape, (true, true, true, 0));
+
+        // A successful sqlx migrator run retains its session advisory lock on
+        // the pooled connection. Reconnect before exercising the next staged
+        // deployment exactly as two separate Relay versions would.
+        pool.close().await;
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("reconnect renewable-action migration scratch database");
+        MIGRATOR
+            .run_to(47, &pool)
+            .await
+            .expect("cut ended direct-action history over to renewable leases");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
+        let renewable_shape: (bool, bool, bool) = sqlx::query_as(
+            "SELECT \
+                 EXISTS (SELECT 1 FROM pg_attribute \
+                         WHERE attrelid = 'meeting_v2_action_runs'::regclass \
+                           AND attname = 'progress_seq' AND NOT attisdropped), \
+                 EXISTS (SELECT 1 FROM pg_attribute \
+                         WHERE attrelid = 'meeting_v2_action_runs'::regclass \
+                           AND attname = 'operator_hard_deadline' AND NOT attisdropped), \
+                 to_regclass('meeting_v2_action_lease_renewals') IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect renewable Action runtime after upgrade");
+        assert_eq!(renewable_shape, (true, true, true));
 
         pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1822,7 +1863,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -1927,8 +1968,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0046");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+            .expect("upgrade scratch database through 0047");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
         let flags: Vec<(uuid::Uuid, bool)> =
             sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
                 .fetch_all(&pool)
@@ -2064,8 +2105,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0046");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+            .expect("upgrade scratch database through 0047");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -2142,7 +2183,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(46));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(47));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -2230,7 +2271,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(46));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
     }
 
     #[tokio::test]

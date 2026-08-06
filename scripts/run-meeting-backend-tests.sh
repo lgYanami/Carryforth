@@ -123,12 +123,12 @@ jq -e '
     and (.currentBoard == "authoritative_read_before_each_semantic_turn")
 ' "${ACP_CAPABILITY_FILE}" >/dev/null
 jq -e '
-  (.meeting.capabilities | index("meeting-v2-action-finalization-v2") != null)
+  (.meeting.capabilities | index("meeting-v2-action-finalization-v3") != null)
   and any(
     .meeting.protocols[];
     .schemaVersion == "3"
-      and .policy == "moderated-board-actions-v2"
-      and .capability == "meeting-v2-action-finalization-v2"
+      and .policy == "moderated-board-actions-v3"
+      and .capability == "meeting-v2-action-finalization-v3"
       and (.turns | index("action_finalization") != null)
       and .moderatorContinuity == "exact_agent_slot_and_acp_session"
   )

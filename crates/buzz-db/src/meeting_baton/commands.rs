@@ -973,6 +973,8 @@ fn validate_command_input(command: &BatonCommand) -> Result<()> {
                         | "cas_churn"
                         | "source_changed"
                         | "runtime_replaced"
+                        | "invalid_output"
+                        | "provider_failure"
                 ),
             };
             if !supported {
@@ -2997,6 +2999,158 @@ async fn fallback_candidate_tx(
     }))
 }
 
+#[derive(Debug)]
+struct InvalidAttemptRecovery {
+    target: StateTarget,
+    delta: RevisionDelta,
+    effects: Vec<Value>,
+    object_id: Option<Vec<u8>>,
+}
+
+async fn recover_invalid_moderator_attempt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    state: &StateRow,
+    attempt: &ModeratorAttemptRow,
+    now: DateTime<Utc>,
+) -> Result<InvalidAttemptRecovery> {
+    let config = load_config_tx(tx, community_id, session_id).await?;
+    let mut effects = Vec::new();
+
+    if let Some(request) = earliest_queued_human_tx(tx, community_id, session_id).await? {
+        let (mut target, offer_id) =
+            offer_human_request_tx(tx, community_id, session_id, state, &request, &config, now)
+                .await?;
+        target.active_decision_attempt_id = None;
+        effects.push(effect(
+            "human_offered",
+            "human_request",
+            &request.request_id,
+            Some("queued"),
+            Some("offered"),
+        ));
+        effects.push(effect(
+            "offer_created",
+            "offer",
+            &offer_id,
+            None,
+            Some("pending"),
+        ));
+        effects.push(phase_effect(session_id, state.phase, target.phase));
+        return Ok(InvalidAttemptRecovery {
+            target,
+            delta: RevisionDelta::FLOOR_INTENT,
+            effects,
+            object_id: Some(offer_id),
+        });
+    }
+
+    // Match deadline fallback's handoff-only behavior: an invalid model result
+    // must not leave the same frozen handoff cohort spinning until the old
+    // deadline. The fingerprint is the exact registered candidate snapshot.
+    let encoded_snapshot = serde_json::to_vec(&attempt.candidate_snapshot_json)?;
+    let candidate_snapshot_hash = Sha256::digest(encoded_snapshot).to_vec();
+    let suppressed = suppress_handoff_cohort_tx(
+        tx,
+        community_id,
+        session_id,
+        attempt.decision_epoch,
+        &candidate_snapshot_hash,
+        now + Duration::milliseconds(config.moderator_decision_ms),
+    )
+    .await?;
+    for handoff_id in suppressed {
+        effects.push(effect(
+            "handoff_moderator_retry_suppressed",
+            "handoff",
+            &handoff_id,
+            None,
+            Some("suppressed"),
+        ));
+    }
+
+    let fallback =
+        fallback_candidate_tx(tx, community_id, session_id, state, attempt.decision_epoch).await?;
+    let (mut target, object_id, delta) = if let Some(candidate) = fallback {
+        let moderator = load_moderator_tx(tx, community_id, session_id).await?;
+        let offer_id = random_object_id();
+        let draft = OfferDraft {
+            offer_id: offer_id.clone(),
+            target_pubkey: candidate.author_pubkey.clone(),
+            allocation_source: "fallback",
+            turn_role: if candidate.author_pubkey == moderator {
+                "moderator_self"
+            } else {
+                "participant"
+            },
+            allocation_event_id: None,
+            selection_reason: Some("moderator output was invalid".to_string()),
+            source_intent_id: Some(candidate.intent_id.clone()),
+            source_request_id: None,
+            source_handoff_id: None,
+            source_speech_event_id: None,
+            reason_type: None,
+            reason_text: None,
+            basis_speech_revision: state.speech_revision,
+            depth_mode: "reset",
+            previous_handoff_depth: state.handoff_depth,
+            requested_handoff_depth: 0,
+        };
+        let deadline = insert_offer_tx(tx, community_id, session_id, &draft, &config, now).await?;
+        sqlx::query(
+            "INSERT INTO meeting_baton_fallback_attempts \
+                 (community_id, session_id, intent_id, current_intent_event_id, \
+                  speech_revision, offer_id, attempted_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(&candidate.intent_id)
+        .bind(&candidate.current_event_id)
+        .bind(state.speech_revision)
+        .bind(&offer_id)
+        .bind(now)
+        .execute(tx.as_mut())
+        .await?;
+        effects.push(effect(
+            "intent_attempted",
+            "intent",
+            &candidate.intent_id,
+            Some("pending"),
+            Some("pending"),
+        ));
+        effects.push(effect(
+            "offer_created",
+            "offer",
+            &offer_id,
+            None,
+            Some("pending"),
+        ));
+        effects.push(control_effect(session_id, "fallback_attempt_recorded"));
+        (
+            StateTarget::offered(state, offer_id.clone(), deadline),
+            Some(offer_id),
+            RevisionDelta::FLOOR_INTENT,
+        )
+    } else {
+        let mut target = StateTarget::from_state(state);
+        target.phase = BatonPhase::ModeratorIdle;
+        target.moderator_decision_started_at = None;
+        target.moderator_decision_deadline = None;
+        target.next_action_at = None;
+        (target, None, RevisionDelta::FLOOR)
+    };
+    target.active_decision_attempt_id = None;
+    effects.push(phase_effect(session_id, state.phase, target.phase));
+    Ok(InvalidAttemptRecovery {
+        target,
+        delta,
+        effects,
+        object_id,
+    })
+}
+
 fn next_decision_epoch(current: i64) -> Result<i64> {
     current
         .checked_add(1)
@@ -4391,7 +4545,10 @@ pub async fn recover_meeting_v1(
     }
     if matches!(
         session.protocol,
-        BatonProtocol::V1 | BatonProtocol::V2 | BatonProtocol::V2Actions
+        BatonProtocol::V1
+            | BatonProtocol::V2
+            | BatonProtocol::V2ActionsLegacy
+            | BatonProtocol::V2Actions
     ) {
         if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
             &mut tx,
@@ -4545,7 +4702,10 @@ pub async fn execute_baton_command(
     if session.status == "active"
         && matches!(
             session.protocol,
-            BatonProtocol::V1 | BatonProtocol::V2 | BatonProtocol::V2Actions
+            BatonProtocol::V1
+                | BatonProtocol::V2
+                | BatonProtocol::V2ActionsLegacy
+                | BatonProtocol::V2Actions
         )
     {
         if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
@@ -4642,7 +4802,10 @@ pub async fn execute_baton_command(
         if session.status == "active"
             && matches!(
                 session.protocol,
-                BatonProtocol::V1 | BatonProtocol::V2 | BatonProtocol::V2Actions
+                BatonProtocol::V1
+                    | BatonProtocol::V2
+                    | BatonProtocol::V2ActionsLegacy
+                    | BatonProtocol::V2Actions
             )
         {
             if let Some(snapshot) = crate::meeting_revocation::recover_revoked_roster_v1_tx(
@@ -6127,6 +6290,56 @@ async fn apply_moderator_attempt_finish_tx(
     .bind(now)
     .execute(tx.as_mut())
     .await?;
+    let attempt_effect = effect(
+        if *outcome == BatonDecisionAttemptFinishOutcome::Completed {
+            "moderator_decision_attempt_completed"
+        } else {
+            "moderator_decision_attempt_discarded"
+        },
+        "moderator_decision_attempt",
+        attempt_id,
+        Some("running"),
+        Some(outcome.as_str()),
+    );
+
+    if *outcome == BatonDecisionAttemptFinishOutcome::Discarded
+        && matches!(reason_code.as_str(), "invalid_output" | "provider_failure")
+    {
+        let mut recovery = recover_invalid_moderator_attempt_tx(
+            tx,
+            community_id,
+            session_id,
+            state,
+            &attempt,
+            now,
+        )
+        .await?;
+        recovery.effects.insert(0, attempt_effect);
+        recovery.effects.push(control_effect(
+            session_id,
+            "moderator_invalid_output_recovered",
+        ));
+        let transition = TransitionSpec::command(
+            "moderator_invalid_output_recovered",
+            recovery.object_id.clone(),
+            event.id.as_bytes().as_slice(),
+            recovery.effects,
+        );
+        return finish_accepted_tx(
+            tx,
+            community_id,
+            session_id,
+            event,
+            relay_keys,
+            state,
+            recovery.target,
+            recovery.delta,
+            transition,
+            recovery.object_id,
+            now,
+        )
+        .await;
+    }
     let mut target = StateTarget::from_state(state);
     if target.active_decision_attempt_id.as_deref() == Some(attempt_id) {
         target.active_decision_attempt_id = None;
@@ -6135,17 +6348,7 @@ async fn apply_moderator_attempt_finish_tx(
         "moderator_decision_attempt_finished",
         Some(attempt_id.clone()),
         event.id.as_bytes().as_slice(),
-        vec![effect(
-            if *outcome == BatonDecisionAttemptFinishOutcome::Completed {
-                "moderator_decision_attempt_completed"
-            } else {
-                "moderator_decision_attempt_discarded"
-            },
-            "moderator_decision_attempt",
-            attempt_id,
-            Some("running"),
-            Some(outcome.as_str()),
-        )],
+        vec![attempt_effect],
     );
     finish_accepted_tx(
         tx,

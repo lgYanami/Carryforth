@@ -85,6 +85,8 @@ const BOARD_LOAD_MAX_ATTEMPTS: u8 = 3;
 const BOARD_TURN_RELAY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 const V2_IDLE_FLOOR_MAX_DURATION: Duration = Duration::from_secs(3 * 60);
 const MAX_DIRECT_ACTION_OUTPUT_BYTES: usize = 4 * 1024;
+const ACTION_LEASE_RENEW_CADENCE: Duration = Duration::from_secs(25);
+const ACTION_LEASE_RENEW_RETRY: Duration = Duration::from_secs(2);
 
 const PARTICIPANT_INTENT_PROMPT: &str = include_str!("meeting_participant_intent_prompt.md");
 const GRANTED_SPEECH_PROMPT: &str = include_str!("meeting_granted_speech_prompt.md");
@@ -397,6 +399,14 @@ struct ActionRunView {
     terminal_status: Option<String>,
     completion_event_id: Option<String>,
     action_deadline_at_ms: Option<i64>,
+    #[serde(default)]
+    progress_seq: u64,
+    #[serde(default)]
+    last_progress_stage: Option<String>,
+    #[serde(default)]
+    last_progress_at_ms: Option<i64>,
+    #[serde(default)]
+    operator_hard_deadline_ms: Option<i64>,
     last_error_code: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
@@ -488,6 +498,15 @@ struct ControlOutput {
     #[serde(default)]
     deferrals: Vec<ModeratorDeferral>,
     next_action: ModeratorNextAction,
+    #[serde(skip)]
+    terminal_cleanup_superseded: Option<TerminalCleanupCounts>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalCleanupCounts {
+    rejections: usize,
+    handoff_dismissals: usize,
+    deferrals: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,14 +538,11 @@ struct DirectActionOutput {
 fn reconcile_action_deadline(
     current_window: u64,
     current_deadline_unix_ms: i64,
-    authoritative_window: u64,
+    _authoritative_window: u64,
     authoritative_deadline_unix_ms: i64,
 ) -> i64 {
-    if current_window == authoritative_window {
-        current_deadline_unix_ms.min(authoritative_deadline_unix_ms)
-    } else {
-        authoritative_deadline_unix_ms
-    }
+    let _ = (current_window, current_deadline_unix_ms);
+    authoritative_deadline_unix_ms
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -630,6 +646,18 @@ struct V2ActionFinalizationRecord {
     board_event_id: String,
     action_window_epoch: u64,
     hard_deadline_unix_ms: i64,
+    #[serde(default)]
+    progress_seq: u64,
+    #[serde(default)]
+    last_progress_stage: Option<String>,
+    #[serde(default)]
+    next_renewal_at_ms: i64,
+    #[serde(default)]
+    prepared_renewal_event: Option<Value>,
+    #[serde(default)]
+    prepared_renewal_event_id: Option<String>,
+    #[serde(default)]
+    prepared_renewal_seq: Option<u64>,
     state: String,
     #[serde(default)]
     turn_id: Option<String>,
@@ -902,6 +930,11 @@ enum ProtocolSubmissionKey {
         session_id: Uuid,
         event_id: String,
     },
+    ActionRenew {
+        session_id: Uuid,
+        action_run_id: Uuid,
+        action_window_epoch: u64,
+    },
 }
 
 impl ProtocolSubmissionKey {
@@ -910,7 +943,8 @@ impl ProtocolSubmissionKey {
             Self::Offer { session_id, .. }
             | Self::Intent { session_id, .. }
             | Self::GrantTerminal { session_id, .. }
-            | Self::Moderator { session_id, .. } => *session_id,
+            | Self::Moderator { session_id, .. }
+            | Self::ActionRenew { session_id, .. } => *session_id,
         }
     }
 }
@@ -977,6 +1011,11 @@ enum ProtocolSubmissionContext {
         #[cfg(feature = "meeting-acceptance")]
         barrier: Option<Box<(PathBuf, PreSubmitBarrierFrame)>>,
     },
+    ActionRenew {
+        action_run_id: Uuid,
+        action_window_epoch: u64,
+        progress_seq: u64,
+    },
 }
 
 struct ProtocolTaskResult {
@@ -984,6 +1023,7 @@ struct ProtocolTaskResult {
     session_epoch: u64,
     submission_id: u64,
     event_id: String,
+    request_started_at: tokio::time::Instant,
     context: ProtocolSubmissionContext,
     result: std::result::Result<Value, ProtocolSubmitFailure>,
 }
@@ -993,6 +1033,14 @@ struct ProtocolInFlight {
     session_epoch: u64,
     submission_id: u64,
     event_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActionDeadlineHint {
+    action_run_id: Uuid,
+    action_window_epoch: u64,
+    board_event_id: String,
+    local_deadline: tokio::time::Instant,
 }
 
 /// Participant and moderator V1 controller.
@@ -1035,6 +1083,8 @@ pub(super) struct MeetingV1Coordinator {
     progress_waiting_for_state: HashMap<(Uuid, String), u64>,
     progress_result_tx: tokio::sync::mpsc::UnboundedSender<ProgressTaskResult>,
     progress_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProgressTaskResult>,
+    action_deadline_senders: HashMap<String, tokio::sync::watch::Sender<tokio::time::Instant>>,
+    action_deadline_hints: HashMap<Uuid, ActionDeadlineHint>,
     #[cfg(feature = "meeting-acceptance")]
     acceptance_barrier: PreSubmitAcceptanceBarrier,
 }
@@ -1111,6 +1161,8 @@ impl MeetingV1Coordinator {
             progress_waiting_for_state: HashMap::new(),
             progress_result_tx,
             progress_result_rx,
+            action_deadline_senders: HashMap::new(),
+            action_deadline_hints: HashMap::new(),
             #[cfg(feature = "meeting-acceptance")]
             acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
         }
@@ -1375,6 +1427,10 @@ impl MeetingV1Coordinator {
                 {
                     record.state = "running".to_string();
                     record.turn_id = Some(turn_id.clone());
+                    if record.next_renewal_at_ms <= 0 {
+                        record.next_renewal_at_ms =
+                            now_ms().saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64);
+                    }
                 }
             }
             MeetingTurnKind::V0Intent | MeetingTurnKind::V0Granted => {}
@@ -1454,6 +1510,39 @@ impl MeetingV1Coordinator {
 
     pub(super) fn take_continuity_directives(&mut self) -> Vec<MeetingContinuityDirective> {
         self.continuity_directives.drain(..).collect()
+    }
+
+    pub(super) fn attach_action_deadline_sender(
+        &mut self,
+        turn_id: &str,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+    ) {
+        if self
+            .in_flight
+            .get(turn_id)
+            .is_some_and(|request| request.kind == MeetingTurnKind::V2ActionFinalization)
+        {
+            self.action_deadline_senders
+                .insert(turn_id.to_string(), sender);
+        }
+    }
+
+    pub(super) fn action_deadline_for_request(
+        &self,
+        request: &MeetingTurnRequest,
+    ) -> Option<tokio::time::Instant> {
+        if request.kind != MeetingTurnKind::V2ActionFinalization {
+            return None;
+        }
+        let action_run_id = Uuid::parse_str(&request.basis_id).ok()?;
+        self.action_deadline_hints
+            .get(&request.session_id)
+            .filter(|hint| {
+                hint.action_run_id == action_run_id
+                    && hint.action_window_epoch == request.floor_revision
+                    && request.board_event_id.as_deref() == Some(hint.board_event_id.as_str())
+            })
+            .map(|hint| hint.local_deadline)
     }
 
     pub(super) fn clear_continuity_binding(&mut self, session_id: Uuid) {
@@ -1572,6 +1661,7 @@ impl MeetingV1Coordinator {
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
         self.progress_waiting_for_state
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
+        self.action_deadline_hints.remove(&session_id);
         self.meetings.remove(&session_id);
         if let Some(ledger) = self.ledger_for_mut(session_id) {
             // Membership/subscription removal tears down only ephemeral runtime
@@ -1625,6 +1715,7 @@ impl MeetingV1Coordinator {
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
         self.progress_waiting_for_state
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
+        self.action_deadline_hints.remove(&session_id);
         self.external_reclaimable_turns.remove(&session_id);
         if let Some(pending) = deferred_turn_result {
             self.discard_deferred_turn_result(pending, Some("meeting_ended"));
@@ -1673,6 +1764,7 @@ impl MeetingV1Coordinator {
     pub(super) async fn tick(&mut self) {
         self.retry_terminal_ledger_cleanup_if_due();
         self.drain_protocol_results().await;
+        self.maintain_action_lease_renewals();
         self.drain_board_load_results().await;
         self.drain_progress_results();
         let now = Instant::now();
@@ -1732,6 +1824,118 @@ impl MeetingV1Coordinator {
             .next();
         if let Some(session_id) = due {
             self.request_full_sync(session_id);
+        }
+    }
+
+    fn maintain_action_lease_renewals(&mut self) {
+        let now = now_ms();
+        let due: Vec<_> = self
+            .ledger
+            .meetings
+            .values()
+            .filter_map(|ledger| {
+                let session_id = Uuid::parse_str(&ledger.session_id).ok()?;
+                let record = ledger.v2_action_finalization.as_ref()?;
+                let turn_id = record.turn_id.as_ref()?;
+                let request = self.in_flight.get(turn_id)?;
+                let view = self.meetings.get(&session_id)?.view.as_ref()?;
+                let action = view.baton.board_control.as_ref()?.action.as_ref()?;
+                (view.protocol == MeetingBatonProtocol::V2Actions
+                    && request.kind == MeetingTurnKind::V2ActionFinalization
+                    && record.state == "running"
+                    && record.next_renewal_at_ms <= now
+                    && action.condition == "runnable"
+                    && action.action_run_id == record.action_run_id
+                    && action.action_window_epoch == record.action_window_epoch
+                    && action.board_event_id == record.board_event_id)
+                    .then_some((session_id, record.clone()))
+            })
+            .collect();
+
+        for (session_id, record) in due {
+            let key = ProtocolSubmissionKey::ActionRenew {
+                session_id,
+                action_run_id: record.action_run_id,
+                action_window_epoch: record.action_window_epoch,
+            };
+            if self.protocol_in_flight.contains_key(&key) {
+                continue;
+            }
+            let (event, progress_seq) = match (
+                record.prepared_renewal_event.clone(),
+                record.prepared_renewal_seq,
+            ) {
+                (Some(value), Some(seq)) => match serde_json::from_value::<Event>(value) {
+                    Ok(event) => (event, seq),
+                    Err(error) => {
+                        tracing::warn!(meeting = %session_id, "discarding malformed prepared Action renewal: {error}");
+                        if let Some(current) = self
+                            .ledger_for_mut(session_id)
+                            .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                        {
+                            current.prepared_renewal_event = None;
+                            current.prepared_renewal_event_id = None;
+                            current.prepared_renewal_seq = None;
+                            current.next_renewal_at_ms =
+                                now.saturating_add(ACTION_LEASE_RENEW_RETRY.as_millis() as i64);
+                        }
+                        continue;
+                    }
+                },
+                _ => {
+                    let Some(progress_seq) = record.progress_seq.checked_add(1) else {
+                        continue;
+                    };
+                    let event = match buzz_sdk::build_meeting_v2_action_lease_renew(
+                        buzz_sdk::MeetingV2ActionLeaseRenewParams {
+                            session_id,
+                            fence: buzz_sdk::MeetingV2ActionRunFence {
+                                action_run_id: record.action_run_id,
+                                action_window: record.action_window_epoch,
+                                board_event_id: &record.board_event_id,
+                            },
+                            progress_seq,
+                            stage: buzz_sdk::MeetingV2ActionProgressStage::Reasoning,
+                            last_activity_seq: 0,
+                        },
+                    )
+                    .map_err(|error| anyhow!(error.to_string()))
+                    .and_then(|builder| sign_builder(builder, &self.keys))
+                    {
+                        Ok(event) => event,
+                        Err(error) => {
+                            tracing::warn!(meeting = %session_id, "could not prepare Action lease renewal: {error}");
+                            continue;
+                        }
+                    };
+                    if let Some(current) = self
+                        .ledger_for_mut(session_id)
+                        .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                    {
+                        current.prepared_renewal_event = serde_json::to_value(&event).ok();
+                        current.prepared_renewal_event_id = Some(event.id.to_hex());
+                        current.prepared_renewal_seq = Some(progress_seq);
+                    }
+                    (event, progress_seq)
+                }
+            };
+            if let Some(current) = self
+                .ledger_for_mut(session_id)
+                .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+            {
+                current.next_renewal_at_ms =
+                    now.saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64);
+            }
+            self.persist_ledger_best_effort();
+            self.submit_protocol_in_background(
+                key,
+                ProtocolSubmissionContext::ActionRenew {
+                    action_run_id: record.action_run_id,
+                    action_window_epoch: record.action_window_epoch,
+                    progress_seq,
+                },
+                event,
+            );
         }
     }
 
@@ -2299,6 +2503,7 @@ impl MeetingV1Coordinator {
         raw_output: String,
         succeeded: bool,
     ) {
+        self.action_deadline_senders.remove(turn_id);
         let Some(request) = self.in_flight.remove(turn_id) else {
             return;
         };
@@ -2407,6 +2612,42 @@ impl MeetingV1Coordinator {
         if let Some(replaced) = self.deferred_turn_results.insert(session_id, deferred) {
             self.discard_deferred_turn_result(replaced, None);
         }
+    }
+
+    pub(super) fn handle_action_lease_expired(&mut self, turn_id: &str) {
+        self.action_deadline_senders.remove(turn_id);
+        let Some(request) = self.in_flight.remove(turn_id) else {
+            return;
+        };
+        self.in_flight_epochs.remove(turn_id);
+        if request.kind != MeetingTurnKind::V2ActionFinalization {
+            return;
+        }
+        if let Some(runtime) = self.meetings.get_mut(&request.session_id) {
+            if runtime.in_flight_turn.as_deref() == Some(turn_id) {
+                runtime.in_flight_turn = None;
+            }
+            runtime.queued = false;
+        }
+        if let Some(record) = self
+            .ledger_for_mut(request.session_id)
+            .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+            .filter(|record| record.action_run_id.to_string() == request.basis_id)
+        {
+            record.state = "lease_expired_local".to_string();
+            record.turn_id = None;
+        }
+        self.persist_ledger_best_effort();
+        self.request_full_sync(request.session_id);
+        self.emit(
+            "meeting_v2_action_local_lease_expired",
+            request.session_id,
+            Some(turn_id.to_string()),
+            json!({
+                "action_run_id": request.basis_id,
+                "action_window_epoch": request.floor_revision,
+            }),
+        );
     }
 
     pub(super) fn take_preemptions(&mut self) -> Vec<Uuid> {
@@ -2578,23 +2819,31 @@ impl MeetingV1Coordinator {
                 } = &context
                 {
                     let (socket_path, frame) = barrier.as_ref();
-                    meeting_acceptance::await_pre_submit_release(socket_path, frame)
-                        .await
-                        .map_err(|error| {
-                            ProtocolSubmitFailure::Uncertain(format!(
+                    if let Err(error) =
+                        meeting_acceptance::await_pre_submit_release(socket_path, frame).await
+                    {
+                        return (
+                            tokio::time::Instant::now(),
+                            Err(ProtocolSubmitFailure::Uncertain(format!(
                                 "acceptance barrier failed before protocol submit: {error}"
-                            ))
-                        })?;
+                            ))),
+                        );
+                    }
                 }
-                submit_protocol_event(&rest, &event).await
+                let request_started_at = tokio::time::Instant::now();
+                let result = submit_protocol_event(&rest, &event).await;
+                (request_started_at, result)
             })
             .catch_unwind()
             .await;
-            let result = match attempt {
+            let (request_started_at, result) = match attempt {
                 Ok(result) => result,
-                Err(_) => Err(ProtocolSubmitFailure::Uncertain(
-                    "background protocol submission task panicked".to_string(),
-                )),
+                Err(_) => (
+                    tokio::time::Instant::now(),
+                    Err(ProtocolSubmitFailure::Uncertain(
+                        "background protocol submission task panicked".to_string(),
+                    )),
+                ),
             };
             if result_tx
                 .send(ProtocolTaskResult {
@@ -2602,6 +2851,7 @@ impl MeetingV1Coordinator {
                     session_epoch,
                     submission_id,
                     event_id,
+                    request_started_at,
                     context,
                     result,
                 })
@@ -2893,6 +3143,126 @@ impl MeetingV1Coordinator {
                     self.request_fast_backfill(session_id);
                 }
             }
+            ProtocolSubmissionContext::ActionRenew {
+                action_run_id,
+                action_window_epoch,
+                progress_seq,
+            } => {
+                let session_id = completed.key.session_id();
+                let event_matches = self
+                    .ledger_for(session_id)
+                    .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                    .is_some_and(|record| {
+                        record.action_run_id == action_run_id
+                            && record.action_window_epoch == action_window_epoch
+                            && record.prepared_renewal_seq == Some(progress_seq)
+                            && record.prepared_renewal_event_id.as_deref()
+                                == Some(completed.event_id.as_str())
+                    });
+                if event_matches {
+                    match &completed.result {
+                        Ok(response) => {
+                            let timing = action_timing_receipt(
+                                response,
+                                action_run_id,
+                                action_window_epoch,
+                                progress_seq,
+                            );
+                            let safe_deadline = timing.as_ref().and_then(|timing| {
+                                action_local_deadline(completed.request_started_at, timing)
+                            });
+                            if timing.is_none() {
+                                if let Some(record) = self
+                                    .ledger_for_mut(session_id)
+                                    .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                                {
+                                    record.next_renewal_at_ms =
+                                        now_ms().saturating_add(
+                                            ACTION_LEASE_RENEW_RETRY.as_millis() as i64,
+                                        );
+                                }
+                                tracing::warn!(
+                                    meeting = %session_id,
+                                    action_run = %action_run_id,
+                                    action_window = action_window_epoch,
+                                    progress_seq,
+                                    "Action renewal response could not be verified; replaying the same signed event"
+                                );
+                                self.persist_ledger_best_effort();
+                                self.request_fast_backfill(session_id);
+                                return;
+                            }
+                            let mut turn_id = None;
+                            let mut board_event_id = None;
+                            if let Some(record) = self
+                                .ledger_for_mut(session_id)
+                                .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                            {
+                                record.progress_seq = progress_seq;
+                                record.last_progress_stage = Some("reasoning".to_string());
+                                record.prepared_renewal_event = None;
+                                record.prepared_renewal_event_id = None;
+                                record.prepared_renewal_seq = None;
+                                record.next_renewal_at_ms = now_ms()
+                                    .saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64);
+                                turn_id = record.turn_id.clone();
+                                board_event_id = Some(record.board_event_id.clone());
+                            }
+                            if let (Some(turn_id), Some(deadline)) = (turn_id, safe_deadline) {
+                                if let Some(sender) = self.action_deadline_senders.get(&turn_id) {
+                                    let _ = sender.send(deadline);
+                                }
+                                if let Some(board_event_id) = board_event_id {
+                                    self.action_deadline_hints.insert(
+                                        session_id,
+                                        ActionDeadlineHint {
+                                            action_run_id,
+                                            action_window_epoch,
+                                            board_event_id,
+                                            local_deadline: deadline,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        Err(ProtocolSubmitFailure::Uncertain(_)) => {
+                            if let Some(record) = self
+                                .ledger_for_mut(session_id)
+                                .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                            {
+                                record.next_renewal_at_ms = now_ms()
+                                    .saturating_add(ACTION_LEASE_RENEW_RETRY.as_millis() as i64);
+                            }
+                        }
+                        Err(ProtocolSubmitFailure::Rejected(_)) => {
+                            if let Some(record) = self
+                                .ledger_for_mut(session_id)
+                                .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                            {
+                                record.prepared_renewal_event = None;
+                                record.prepared_renewal_event_id = None;
+                                record.prepared_renewal_seq = None;
+                                record.next_renewal_at_ms = now_ms()
+                                    .saturating_add(ACTION_LEASE_RENEW_RETRY.as_millis() as i64);
+                            }
+                        }
+                    }
+                }
+                self.persist_ledger_best_effort();
+                self.emit(
+                    "meeting_v2_action_renewal",
+                    session_id,
+                    None,
+                    json!({
+                        "action_run_id": action_run_id,
+                        "action_window_epoch": action_window_epoch,
+                        "progress_seq": progress_seq,
+                        "outcome": protocol_submission_label(&completed.result),
+                        "rejection_code": protocol_rejection_code(&completed.result),
+                    }),
+                );
+                self.request_fast_backfill(session_id);
+            }
             ProtocolSubmissionContext::Moderator {
                 action_kind,
                 object_id,
@@ -2908,6 +3278,32 @@ impl MeetingV1Coordinator {
                     .ledger_for(session_id)
                     .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
                     .is_some_and(|prepared| prepared.event_id == completed.event_id);
+                if action_kind == "action_begin" && !meeting_ended {
+                    if let Ok(response) = &completed.result {
+                        if let Some((action_run_id, action_window_epoch, timing)) =
+                            action_begin_timing_receipt(response, &object_id)
+                        {
+                            if let Some(local_deadline) =
+                                action_local_deadline(completed.request_started_at, &timing)
+                            {
+                                self.action_deadline_hints.insert(
+                                    session_id,
+                                    ActionDeadlineHint {
+                                        action_run_id,
+                                        action_window_epoch,
+                                        board_event_id: object_id.clone(),
+                                        local_deadline,
+                                    },
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                meeting = %session_id,
+                                "Action Begin response did not contain a verifiable lease timing receipt"
+                            );
+                        }
+                    }
+                }
                 if event_matches && !meeting_ended {
                     self.handle_moderator_protocol_outcome(
                         session_id,
@@ -4178,6 +4574,13 @@ impl MeetingV1Coordinator {
                                 board_event_id: action.board_event_id.clone(),
                                 action_window_epoch: action.action_window_epoch,
                                 hard_deadline_unix_ms,
+                                progress_seq: action.progress_seq,
+                                last_progress_stage: action.last_progress_stage.clone(),
+                                next_renewal_at_ms: now_ms()
+                                    .saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64),
+                                prepared_renewal_event: None,
+                                prepared_renewal_event_id: None,
+                                prepared_renewal_seq: None,
                                 state: if action.condition == "blocked" {
                                     "blocked"
                                 } else {
@@ -4199,6 +4602,18 @@ impl MeetingV1Coordinator {
                                 hard_deadline_unix_ms,
                             );
                             record.action_window_epoch = action.action_window_epoch;
+                            record.progress_seq = action.progress_seq;
+                            record.last_progress_stage = action.last_progress_stage.clone();
+                            // A canonical State may win the WebSocket/HTTP
+                            // delivery race. Keep the exact prepared event
+                            // until its timing receipt is verified; otherwise
+                            // State would erase the only event that can be
+                            // replayed to recover a monotonic TTL safely.
+                            // The State projection carries database wall-clock
+                            // timestamps for canonical diagnostics. It must not
+                            // extend an in-flight monotonic deadline: only a
+                            // verified Begin/Renew receipt can do that without
+                            // assuming the host and database clocks agree.
                             if action.condition == "blocked" {
                                 record.state = "blocked".to_string();
                                 record.turn_id = None;
@@ -4208,6 +4623,11 @@ impl MeetingV1Coordinator {
                                 record.format_attempts = 0;
                                 record.prepared_end_event = None;
                                 record.prepared_end_event_id = None;
+                                record.prepared_renewal_event = None;
+                                record.prepared_renewal_event_id = None;
+                                record.prepared_renewal_seq = None;
+                                record.next_renewal_at_ms = now_ms()
+                                    .saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64);
                             }
                         }
                         if ledger
@@ -5816,30 +6236,77 @@ impl MeetingV1Coordinator {
             );
             return;
         }
-        let mut output = if succeeded {
-            parse_control_output(raw_output, &view, &decision.attempt, &self.agent_pubkey).ok()
+        let parsed = if succeeded {
+            classify_control_output(raw_output, &view, &decision.attempt, &self.agent_pubkey)
         } else {
-            None
+            Err((
+                "provider_failure",
+                "moderator provider did not complete successfully".to_string(),
+            ))
         };
-        let Some(mut output) = output.take() else {
-            if continuity_sensitive {
-                self.continuity_directives.push_back(
-                    MeetingContinuityDirective::ReleaseFinalControl {
-                        session_id: request.session_id,
-                    },
+        let mut output = match parsed {
+            Ok(output) => output,
+            Err((parse_code, detail)) => {
+                let finish_reason = if parse_code == "provider_failure" {
+                    "provider_failure"
+                } else {
+                    "invalid_output"
+                };
+                tracing::warn!(
+                    meeting = %request.session_id,
+                    attempt = %decision.attempt.attempt_id,
+                    parse_code,
+                    error = %detail,
+                    "Meeting moderator output rejected before protocol execution"
                 );
+                self.emit_moderator_decision_event(
+                    "meeting_v1_moderator_decision_validated",
+                    request.session_id,
+                    Some(turn_id.to_string()),
+                    ("invalid", parse_code),
+                    None,
+                    json!({
+                        "attempt_id": decision.attempt.attempt_id,
+                        "parse_code": parse_code,
+                    }),
+                );
+                self.mark_moderator_result_stale(request.session_id, finish_reason);
+                if continuity_sensitive {
+                    self.continuity_directives.push_back(
+                        MeetingContinuityDirective::ReleaseFinalControl {
+                            session_id: request.session_id,
+                        },
+                    );
+                }
+                return;
             }
-            self.emit_moderator_decision_event(
-                "meeting_v1_moderator_decision_validated",
+        };
+        if let Some(counts) = output.terminal_cleanup_superseded {
+            let output_hash = hex::encode(Sha256::digest(raw_output.as_bytes()));
+            tracing::info!(
+                meeting = %request.session_id,
+                attempt = %decision.attempt.attempt_id,
+                action = %output.next_action.action,
+                rejections = counts.rejections,
+                handoff_dismissals = counts.handoff_dismissals,
+                deferrals = counts.deferrals,
+                output_hash,
+                "terminal moderator cleanup superseded by existing terminal transaction"
+            );
+            self.emit(
+                "meeting_floor_terminal_cleanup_superseded",
                 request.session_id,
                 Some(turn_id.to_string()),
-                ("invalid", "no_action"),
-                None,
-                json!({}),
+                json!({
+                    "attempt_id": decision.attempt.attempt_id,
+                    "action": output.next_action.action,
+                    "rejections": counts.rejections,
+                    "handoff_dismissals": counts.handoff_dismissals,
+                    "deferrals": counts.deferrals,
+                    "output_hash": output_hash,
+                }),
             );
-            self.mark_moderator_result_stale(request.session_id, "no_action");
-            return;
-        };
+        }
         if output.next_action.action == "finalize_actions" {
             let Some(board_event_id) = request.board_event_id.clone() else {
                 self.continuity_directives.push_back(
@@ -6799,7 +7266,7 @@ impl MeetingV1Coordinator {
             "moderator_changed" => "moderator_changed",
             "cas_churn" => "cas_churn",
             "source_changed" => "source_changed",
-            "no_action" | "idle_wait_fallback" => reason,
+            "no_action" | "idle_wait_fallback" | "invalid_output" | "provider_failure" => reason,
             _ => "control_changed",
         };
         if !self.claim_moderator_disposition(session_id, None, "discarded") {
@@ -9063,6 +9530,93 @@ async fn submit_protocol_event(
     }
 }
 
+fn action_timing_receipt(
+    response: &Value,
+    action_run_id: Uuid,
+    action_window_epoch: u64,
+    progress_seq: u64,
+) -> Option<Value> {
+    let timing = action_timing_envelope(response)?;
+    let expected_run = action_run_id.to_string();
+    let expected_window = i64::try_from(action_window_epoch).ok()?;
+    let expected_progress = i64::try_from(progress_seq).ok()?;
+    (timing.get("accepted").and_then(Value::as_bool) == Some(true)
+        && timing.get("outcome").and_then(Value::as_str) == Some("action_lease_renewed")
+        && timing.get("action_run_id").and_then(Value::as_str) == Some(expected_run.as_str())
+        && timing.get("action_window_epoch").and_then(Value::as_i64) == Some(expected_window)
+        && timing.get("accepted_progress_seq").and_then(Value::as_i64) == Some(expected_progress)
+        && timing
+            .get("lease_ttl_ms")
+            .and_then(Value::as_i64)
+            .is_some_and(|ttl| ttl > 0)
+        && action_timing_fields_are_valid(&timing))
+    .then_some(timing)
+}
+
+fn action_begin_timing_receipt(
+    response: &Value,
+    expected_board_event_id: &str,
+) -> Option<(Uuid, u64, Value)> {
+    let timing = action_timing_envelope(response)?;
+    let action_run_id = timing
+        .get("action_run_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    let action_window_epoch = timing.get("action_window_epoch").and_then(Value::as_u64)?;
+    (timing.get("accepted").and_then(Value::as_bool) == Some(true)
+        && timing.get("outcome").and_then(Value::as_str) == Some("action_finalization_began")
+        && timing
+            .get("details")
+            .and_then(|details| details.get("board_event_id"))
+            .and_then(Value::as_str)
+            == Some(expected_board_event_id)
+        && action_timing_fields_are_valid(&timing))
+    .then_some((action_run_id, action_window_epoch, timing))
+}
+
+fn action_timing_envelope(response: &Value) -> Option<Value> {
+    if response.get("lease_ttl_ms").is_some() {
+        return Some(response.clone());
+    }
+    response
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(|message| message.strip_prefix("response:"))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+fn action_timing_fields_are_valid(timing: &Value) -> bool {
+    let Some(server_now_ms) = timing.get("server_now_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(lease_expires_at_ms) = timing.get("lease_expires_at_ms").and_then(Value::as_i64)
+    else {
+        return false;
+    };
+    let Some(lease_ttl_ms) = timing.get("lease_ttl_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    lease_ttl_ms > 0
+        && lease_expires_at_ms > server_now_ms
+        && lease_ttl_ms <= lease_expires_at_ms.saturating_sub(server_now_ms)
+        && timing
+            .get("operator_hard_remaining_ms")
+            .is_none_or(|value| {
+                value.is_null() || value.as_i64().is_some_and(|remaining| remaining >= 0)
+            })
+}
+
+fn action_local_deadline(
+    request_started_at: tokio::time::Instant,
+    timing: &Value,
+) -> Option<tokio::time::Instant> {
+    let ttl_ms = timing.get("lease_ttl_ms").and_then(Value::as_i64)?;
+    let usable_ms = ttl_ms
+        .saturating_sub(MODERATOR_DEADLINE_SAFETY_MARGIN.as_millis() as i64)
+        .max(0) as u64;
+    request_started_at.checked_add(Duration::from_millis(usable_ms))
+}
+
 fn protocol_submission_label<T>(
     result: &std::result::Result<T, ProtocolSubmitFailure>,
 ) -> &'static str {
@@ -9840,6 +10394,24 @@ fn validate_action_run(action: &ActionRunView, board: &BoardControlView) -> Resu
         || action.board_window != board.board_window
         || !matches!(action.condition.as_str(), "runnable" | "blocked")
         || action.updated_at_ms < action.created_at_ms
+        || (action.progress_seq == 0)
+            != (action.last_progress_stage.is_none() && action.last_progress_at_ms.is_none())
+        || action.last_progress_stage.as_deref().is_some_and(|stage| {
+            !matches!(
+                stage,
+                "reasoning" | "tool_call" | "tool_result" | "finalizing" | "waiting_human"
+            )
+        })
+        || action
+            .last_progress_at_ms
+            .is_some_and(|at| at < action.created_at_ms || at > action.updated_at_ms)
+        || action
+            .operator_hard_deadline_ms
+            .is_some_and(|deadline| deadline <= action.created_at_ms)
+        || action
+            .action_deadline_at_ms
+            .zip(action.operator_hard_deadline_ms)
+            .is_some_and(|(lease, operator)| lease > operator)
     {
         return Err(anyhow!(
             "Meeting V2 direct action projection has invalid authority fields"
@@ -11370,12 +11942,16 @@ fn build_moderator_control_prompt(
                     "reason": "required explanation"
                 }],
                 "next_action": next_action_schema
+            },
+            "output_constraints": {
+                "terminal_cleanup_rule": "When next_action.action is close, finalize_actions, or abort, rejections, handoff_dismissals, and deferrals MUST all be empty arrays. The terminal transition itself ends every remaining live Floor object.",
+                "idle_semantics": "IDLE alone means intentionally wait for the current deadline."
             }
         });
         let policy = if view.protocol.has_action_finalization() {
-            "This is a Floor Decision. Choose only from the Relay-frozen Candidate Cohort. Do not invent a participant or grant speech directly. Close only when board_control has an explicit updated/unchanged outcome and the latest authoritative Board records both that the meeting goal was reached and an effective conclusion. Choose finalize_actions only when that same Board records concrete closing actions that you, the moderator, must now carry out with ordinary business tools before the Meeting closes. Those actions are not limited to Project View or to particular object types. Choose close when no moderator action remains. Abort only when the meeting cannot continue successfully, using a supported reason code. The Harness will append the latest authoritative Board after this context."
+            "This is a Floor Decision. Choose only from the Relay-frozen Candidate Cohort. Do not invent a participant or grant speech directly. Close only when board_control has an explicit updated/unchanged outcome and the latest authoritative Board records both that the meeting goal was reached and an effective conclusion. Choose finalize_actions only when that same Board records concrete closing actions that you, the moderator, must now carry out with ordinary business tools before the Meeting closes. Those actions are not limited to Project View or to particular object types. Choose close when no moderator action remains. Abort only when the meeting cannot continue successfully, using a supported reason code. For close, finalize_actions, or abort, return empty rejections, handoff_dismissals, and deferrals; the terminal transition ends all remaining Floor objects, so cleanup is neither required nor allowed. IDLE means intentionally wait. The Harness will append the latest authoritative Board after this context."
         } else {
-            "This is a Floor Decision. Choose only from the Relay-frozen Candidate Cohort. Do not invent a participant or grant speech directly. Normally close only when board_control has an explicit updated/unchanged outcome and the latest authoritative Board records both that the meeting goal was reached and an effective conclusion. Abort only when the meeting cannot continue successfully, using a supported reason code. The Harness will append the latest authoritative Board after this context."
+            "This is a Floor Decision. Choose only from the Relay-frozen Candidate Cohort. Do not invent a participant or grant speech directly. Normally close only when board_control has an explicit updated/unchanged outcome and the latest authoritative Board records both that the meeting goal was reached and an effective conclusion. Abort only when the meeting cannot continue successfully, using a supported reason code. For close or abort, return empty rejections, handoff_dismissals, and deferrals; the terminal transition ends all remaining Floor objects. IDLE means intentionally wait. The Harness will append the latest authoritative Board after this context."
         };
         return v2_envelope_prompt(policy, &envelope);
     }
@@ -11737,7 +12313,7 @@ fn parse_control_output(
     attempt: &ActiveDecisionAttemptView,
     moderator_pubkey: &str,
 ) -> Result<ControlOutput> {
-    let output: ControlOutput = serde_json::from_str(raw.trim())
+    let mut output: ControlOutput = serde_json::from_str(raw.trim())
         .context("V1 moderator control output is not exact JSON")?;
     if output.rejections.len() > MAX_MODERATOR_CLEANUPS
         || output.handoff_dismissals.len() > MAX_MODERATOR_CLEANUPS
@@ -11752,6 +12328,29 @@ fn parse_control_output(
     )?;
     if output.next_action.action != "abort" && output.next_action.reason_code.is_some() {
         return Err(anyhow!("only Meeting V2 abort can carry a reason code"));
+    }
+
+    // Existing Action Begin and Meeting End transactions already end every
+    // live Floor object. Treat cleanup attached to an otherwise valid terminal
+    // decision as superseded instead of rejecting the whole decision and
+    // waiting for the moderator deadline. We deliberately validate neither the
+    // referenced cleanup objects nor their reasons because they are not
+    // executed or persisted.
+    if matches!(
+        output.next_action.action.as_str(),
+        "close" | "finalize_actions" | "abort"
+    ) && (!output.rejections.is_empty()
+        || !output.handoff_dismissals.is_empty()
+        || !output.deferrals.is_empty())
+    {
+        output.terminal_cleanup_superseded = Some(TerminalCleanupCounts {
+            rejections: output.rejections.len(),
+            handoff_dismissals: output.handoff_dismissals.len(),
+            deferrals: output.deferrals.len(),
+        });
+        output.rejections.clear();
+        output.handoff_dismissals.clear();
+        output.deferrals.clear();
     }
     let mut rejected = BTreeSet::new();
     for rejection in &output.rejections {
@@ -11961,6 +12560,19 @@ fn parse_control_output(
         }
     }
     Ok(output)
+}
+
+fn classify_control_output(
+    raw: &str,
+    view: &MeetingView,
+    attempt: &ActiveDecisionAttemptView,
+    moderator_pubkey: &str,
+) -> std::result::Result<ControlOutput, (&'static str, String)> {
+    if let Err(error) = serde_json::from_str::<ControlOutput>(raw.trim()) {
+        return Err(("invalid_json", error.to_string()));
+    }
+    parse_control_output(raw, view, attempt, moderator_pubkey)
+        .map_err(|error| ("invalid_semantics", error.to_string()))
 }
 
 fn parse_rejection_reason(value: &str) -> Result<MeetingV1IntentRejectionReason> {
@@ -12450,6 +13062,10 @@ mod tests {
             terminal_status: None,
             completion_event_id: None,
             action_deadline_at_ms: Some(relay_deadline_ms),
+            progress_seq: 0,
+            last_progress_stage: None,
+            last_progress_at_ms: None,
+            operator_hard_deadline_ms: Some(relay_deadline_ms.saturating_add(3_600_000)),
             last_error_code: None,
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),
@@ -12673,6 +13289,8 @@ mod tests {
             progress_waiting_for_state: HashMap::new(),
             progress_result_tx,
             progress_result_rx,
+            action_deadline_senders: HashMap::new(),
+            action_deadline_hints: HashMap::new(),
             #[cfg(feature = "meeting-acceptance")]
             acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
         }
@@ -14570,6 +15188,7 @@ mod tests {
                 session_epoch: 1,
                 submission_id: current.submission_id,
                 event_id: current.event_id.clone(),
+                request_started_at: tokio::time::Instant::now(),
                 context: ProtocolSubmissionContext::Offer {
                     offer_id: offer_id.clone(),
                     action: OfferSubmissionAction::Ack,
@@ -15958,6 +16577,12 @@ mod tests {
             board_event_id: pubkey(78),
             action_window_epoch: 1,
             hard_deadline_unix_ms: deadline,
+            progress_seq: 0,
+            last_progress_stage: None,
+            next_renewal_at_ms: 0,
+            prepared_renewal_event: None,
+            prepared_renewal_event_id: None,
+            prepared_renewal_seq: None,
             state: "pending".to_string(),
             turn_id: None,
             format_attempts: 0,
@@ -16412,6 +17037,96 @@ mod tests {
     }
 
     #[test]
+    fn terminal_moderator_cleanup_is_normalized_before_reference_validation() {
+        let relay = Keys::generate();
+        let moderator = pubkey(97);
+        let other = pubkey(98);
+        let mut view = meeting_v2_actions_view(Uuid::new_v4(), &other, &moderator, &relay);
+        view.baton.moderator_pubkey = moderator.clone();
+        view.baton.phase = "moderator_control".to_string();
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(
+                &pubkey(99),
+                &pubkey(100),
+                &other,
+                false,
+                view.baton.decision_epoch,
+            )],
+        );
+        let raw = json!({
+            "rejections": [{
+                "intent_id": pubkey(101),
+                "reason_code": "unsupported",
+                "reason_text": "This cleanup is superseded by Action Begin."
+            }],
+            "handoff_dismissals": [],
+            "deferrals": [],
+            "next_action": {
+                "action": "finalize_actions",
+                "id": null,
+                "reason": "The frozen Board contains closing actions."
+            }
+        })
+        .to_string();
+
+        let output = parse_control_output(&raw, &view, &attempt, &moderator)
+            .expect("terminal cleanup should be normalized");
+        assert!(output.rejections.is_empty());
+        assert!(output.handoff_dismissals.is_empty());
+        assert!(output.deferrals.is_empty());
+        let counts = output
+            .terminal_cleanup_superseded
+            .expect("normalization diagnostics");
+        assert_eq!(counts.rejections, 1);
+        assert_eq!(counts.handoff_dismissals, 0);
+        assert_eq!(counts.deferrals, 0);
+        assert_eq!(output.next_action.action, "finalize_actions");
+    }
+
+    #[test]
+    fn moderator_parse_outcome_distinguishes_json_and_semantic_failures() {
+        let moderator = pubkey(102);
+        let other = pubkey(103);
+        let mut view = meeting_view(Uuid::new_v4(), &moderator, &other);
+        view.baton.moderator_pubkey = moderator.clone();
+        let attempt = decision_attempt(
+            &view,
+            vec![intent_candidate(
+                &pubkey(104),
+                &pubkey(105),
+                &other,
+                false,
+                view.baton.decision_epoch,
+            )],
+        );
+
+        assert_eq!(
+            classify_control_output("{malformed", &view, &attempt, &moderator)
+                .expect_err("malformed JSON")
+                .0,
+            "invalid_json"
+        );
+        let semantic = json!({
+            "rejections": [],
+            "handoff_dismissals": [],
+            "deferrals": [],
+            "next_action": {
+                "action": "select_intent",
+                "id": pubkey(106),
+                "reason": "Not in the frozen cohort."
+            }
+        })
+        .to_string();
+        assert_eq!(
+            classify_control_output(&semantic, &view, &attempt, &moderator)
+                .expect_err("invalid semantic reference")
+                .0,
+            "invalid_semantics"
+        );
+    }
+
+    #[test]
     fn late_intent_does_not_change_the_authoritative_candidate_cohort() {
         let moderator = pubkey(101);
         let other = pubkey(102);
@@ -16794,6 +17509,7 @@ mod tests {
                     session_epoch: 1,
                     submission_id: 1,
                     event_id: event_id.clone(),
+                    request_started_at: tokio::time::Instant::now(),
                     context: ProtocolSubmissionContext::Moderator {
                         action_kind: action_kind.to_string(),
                         object_id,
@@ -16961,7 +17677,7 @@ mod tests {
                     decision.state.as_str(),
                     decision.pending_finish_reason.as_deref()
                 )),
-            Some(("result_stale", Some("no_action")))
+            Some(("result_stale", Some("invalid_output")))
         );
         assert!(coordinator.pending.is_empty());
     }
@@ -18388,9 +19104,163 @@ mod tests {
     }
 
     #[test]
-    fn action_retry_window_replaces_the_expired_local_deadline() {
-        assert_eq!(reconcile_action_deadline(1, 1_000, 1, 2_000), 1_000);
+    fn action_renewal_and_retry_replace_the_local_deadline() {
+        assert_eq!(reconcile_action_deadline(1, 1_000, 1, 2_000), 2_000);
         assert_eq!(reconcile_action_deadline(1, 1_000, 2, 2_000), 2_000);
+    }
+
+    #[test]
+    fn action_timing_receipts_use_request_start_and_reject_incomplete_envelopes() {
+        let action_run_id = Uuid::new_v4();
+        let board_event_id = pubkey(86);
+        let begin = json!({
+            "accepted": true,
+            "outcome": "action_finalization_began",
+            "action_run_id": action_run_id,
+            "action_window_epoch": 1,
+            "server_now_ms": 1_000,
+            "lease_expires_at_ms": 91_000,
+            "lease_ttl_ms": 90_000,
+            "operator_hard_remaining_ms": 3_600_000,
+            "details": { "board_event_id": board_event_id },
+        });
+        let (parsed_run, parsed_window, timing) =
+            action_begin_timing_receipt(&begin, &board_event_id).expect("valid Begin receipt");
+        assert_eq!(parsed_run, action_run_id);
+        assert_eq!(parsed_window, 1);
+        let request_started_at = tokio::time::Instant::now();
+        let deadline =
+            action_local_deadline(request_started_at, &timing).expect("monotonic local deadline");
+        assert_eq!(
+            deadline.duration_since(request_started_at),
+            Duration::from_secs(75),
+            "the safety margin is deducted from the request-started TTL"
+        );
+
+        let renewal = json!({
+            "accepted": true,
+            "outcome": "action_lease_renewed",
+            "action_run_id": action_run_id,
+            "action_window_epoch": 1,
+            "accepted_progress_seq": 1,
+            "server_now_ms": 2_000,
+            "lease_expires_at_ms": 92_000,
+            "lease_ttl_ms": 90_000,
+            "operator_hard_remaining_ms": null,
+        });
+        assert!(action_timing_receipt(&renewal, action_run_id, 1, 1).is_some());
+
+        let mut incomplete = renewal;
+        incomplete
+            .as_object_mut()
+            .expect("renewal object")
+            .remove("server_now_ms");
+        assert!(action_timing_receipt(&incomplete, action_run_id, 1, 1).is_none());
+    }
+
+    #[test]
+    fn canonical_action_state_does_not_extend_the_monotonic_turn_deadline() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let moderator = Keys::generate();
+        let moderator_pubkey = moderator.public_key().to_hex();
+        let participant_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
+        let board_event_id = pubkey(87);
+        let mut coordinator = test_coordinator(
+            moderator,
+            directory.path().join("meeting-v2-action-deadline.json"),
+            None,
+        );
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
+        let mut view =
+            meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
+        make_v2_local_moderator(&mut view, &moderator_pubkey);
+        set_v2_direct_action(
+            &mut view,
+            action_run_id,
+            board_event_id.clone(),
+            now_ms().saturating_add(90_000),
+        );
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view.clone()),
+            SyncApplyResult::Applied
+        );
+
+        let request = MeetingTurnRequest {
+            session_id,
+            prompt: "finalize actions".to_string(),
+            hard_deadline_unix_ms: now_ms().saturating_add(75_000),
+            kind: MeetingTurnKind::V2ActionFinalization,
+            format_retry: false,
+            basis_id: action_run_id.to_string(),
+            round_number: view.baton.control_epoch,
+            speech_cursor: None,
+            expected_speech_revision: None,
+            floor_revision: 1,
+            grant_event_id: None,
+            queued_at_unix_ms: now_ms(),
+            moderator_observer_snapshot: None,
+            baton_protocol: Some(MeetingBatonProtocol::V2Actions),
+            board_event_id: Some(board_event_id.clone()),
+        };
+        let receipt_deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+        coordinator.action_deadline_hints.insert(
+            session_id,
+            ActionDeadlineHint {
+                action_run_id,
+                action_window_epoch: 1,
+                board_event_id,
+                local_deadline: receipt_deadline,
+            },
+        );
+        assert_eq!(
+            coordinator.action_deadline_for_request(&request),
+            Some(receipt_deadline)
+        );
+        coordinator.mark_dispatched("action-turn".to_string(), request);
+        let (sender, receiver) = tokio::sync::watch::channel(receipt_deadline);
+        coordinator.attach_action_deadline_sender("action-turn", sender);
+        let record = coordinator
+            .ledger_for_mut(session_id)
+            .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+            .expect("action record");
+        record.prepared_renewal_event = Some(json!({ "id": "prepared-renewal" }));
+        record.prepared_renewal_event_id = Some("prepared-renewal".to_string());
+        record.prepared_renewal_seq = Some(1);
+
+        view.baton.state_revision = view.baton.state_revision.saturating_add(1);
+        let action = view
+            .baton
+            .board_control
+            .as_mut()
+            .and_then(|board| board.action.as_mut())
+            .expect("action projection");
+        action.progress_seq = 1;
+        action.action_deadline_at_ms = Some(now_ms().saturating_add(180_000));
+        assert_eq!(
+            coordinator.apply_synced_view(session_id, view),
+            SyncApplyResult::Applied
+        );
+        assert_eq!(
+            *receiver.borrow(),
+            receipt_deadline,
+            "absolute State timestamps are diagnostic and cannot extend a running turn"
+        );
+        let record = coordinator
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+            .expect("action record after State");
+        assert_eq!(record.prepared_renewal_seq, Some(1));
+        assert_eq!(
+            record.prepared_renewal_event_id.as_deref(),
+            Some("prepared-renewal"),
+            "State-before-receipt must preserve the exact replay event"
+        );
     }
 
     #[test]
@@ -18432,6 +19302,10 @@ mod tests {
             terminal_status: None,
             completion_event_id: None,
             action_deadline_at_ms: None,
+            progress_seq: 0,
+            last_progress_stage: None,
+            last_progress_at_ms: None,
+            operator_hard_deadline_ms: Some(now_ms().saturating_add(3_600_000)),
             last_error_code: Some("action_deadline_exceeded".to_string()),
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),

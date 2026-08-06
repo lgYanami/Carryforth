@@ -41,6 +41,17 @@ pub enum ActionCommand {
         /// Exact running moderator DecisionAttempt for a candidate Floor result.
         expected_decision_attempt_id: Option<Vec<u8>>,
     },
+    /// Renew the exact runnable action window without granting business authority.
+    Renew {
+        /// Current run/window/Board fences.
+        fence: ActionRunFence,
+        /// Exact next per-window progress sequence.
+        progress_seq: i64,
+        /// Low-cardinality cooperative host stage.
+        stage: ActionProgressStage,
+        /// Monotonic provider/tool activity sequence observed by the host.
+        last_activity_seq: i64,
+    },
     /// Durably block a direct action run.
     Block {
         /// Current run/window/Board fences.
@@ -65,9 +76,38 @@ impl ActionCommand {
     pub fn action(&self) -> &'static str {
         match self {
             Self::Begin { .. } => "begin",
+            Self::Renew { .. } => "renew",
             Self::Block { .. } => "block",
             Self::Retry { .. } => "retry",
             Self::ReturnToBoard { .. } => "return-to-board",
+        }
+    }
+}
+
+/// Closed diagnostic vocabulary carried by action lease renewals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionProgressStage {
+    /// The host is reasoning over canonical state.
+    Reasoning,
+    /// The host is invoking a tool or business command.
+    ToolCall,
+    /// The host is processing a tool or business-command result.
+    ToolResult,
+    /// The host is preparing the final attestation.
+    Finalizing,
+    /// A Human-hosted action is intentionally waiting for input.
+    WaitingHuman,
+}
+
+impl ActionProgressStage {
+    /// Stable wire/storage label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::Finalizing => "finalizing",
+            Self::WaitingHuman => "waiting_human",
         }
     }
 }
@@ -102,6 +142,7 @@ pub struct ActionCommandCommit {
 #[derive(Debug)]
 struct ActionReceipt {
     author_pubkey: Vec<u8>,
+    action: String,
     accepted: bool,
     outcome_code: String,
     response: Value,
@@ -116,6 +157,9 @@ struct ActionRunRow {
     action_condition: String,
     terminal_status: Option<String>,
     last_error_code: Option<String>,
+    progress_seq: i64,
+    action_deadline_at: Option<DateTime<Utc>>,
+    operator_hard_deadline: Option<DateTime<Utc>>,
 }
 
 /// Block one action window whose independent database deadline has elapsed.
@@ -129,11 +173,15 @@ pub(crate) async fn recover_due_action_locked_tx(
     relay_keys: &Keys,
     now: DateTime<Utc>,
 ) -> Result<Option<crate::meeting_baton::BatonTransitionResult>> {
-    let action_run_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT action_run_id FROM meeting_v2_action_runs \
+    let due: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT action_run_id, \
+                (operator_hard_deadline IS NOT NULL AND operator_hard_deadline <= $3) \
+                    AS operator_expired \
+         FROM meeting_v2_action_runs \
          WHERE community_id = $1 AND session_id = $2 \
            AND terminal_status IS NULL AND action_condition = 'runnable' \
-           AND action_deadline_at IS NOT NULL AND action_deadline_at <= $3 \
+           AND ((action_deadline_at IS NOT NULL AND action_deadline_at <= $3) \
+             OR (operator_hard_deadline IS NOT NULL AND operator_hard_deadline <= $3)) \
          FOR UPDATE",
     )
     .bind(community_id.as_uuid())
@@ -141,19 +189,25 @@ pub(crate) async fn recover_due_action_locked_tx(
     .bind(now)
     .fetch_optional(tx.as_mut())
     .await?;
-    let Some(action_run_id) = action_run_id else {
+    let Some((action_run_id, operator_expired)) = due else {
         return Ok(None);
+    };
+    let reason_code = if operator_expired {
+        "action_operator_deadline_exceeded"
+    } else {
+        "action_lease_expired"
     };
     let updated = sqlx::query(
         "UPDATE meeting_v2_action_runs \
          SET action_condition = 'blocked', action_deadline_at = NULL, \
-             last_error_code = 'action_deadline_exceeded', updated_at = $4 \
+             last_error_code = $4, updated_at = $5 \
          WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
            AND terminal_status IS NULL AND action_condition = 'runnable'",
     )
     .bind(community_id.as_uuid())
     .bind(session_id)
     .bind(action_run_id)
+    .bind(reason_code)
     .bind(now)
     .execute(tx.as_mut())
     .await?;
@@ -166,7 +220,7 @@ pub(crate) async fn recover_due_action_locked_tx(
         session_id,
         action_run_id,
         relay_keys,
-        "action_deadline_exceeded",
+        reason_code,
         "action",
         "runnable",
         "blocked",
@@ -281,12 +335,20 @@ pub async fn execute_action_command(
                 "not authorized for this private Meeting action receipt".to_string(),
             ));
         }
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(tx.as_mut())
+            .await?;
+        let mut response = receipt.response;
+        if matches!(receipt.action.as_str(), "begin" | "renew") && receipt.accepted {
+            decorate_action_timing_response_tx(&mut tx, params.community_id, &mut response, now)
+                .await?;
+        }
         tx.commit().await?;
         return Ok(ActionCommandCommit {
             accepted: receipt.accepted,
             duplicate: true,
             outcome_code: receipt.outcome_code,
-            response: receipt.response,
+            response,
         });
     }
 
@@ -314,7 +376,7 @@ pub async fn execute_action_command(
     } else {
         apply_command_tx(&mut tx, &params, now).await?
     };
-    let response = json!({
+    let mut response = json!({
         "meeting_id": params.session_id,
         "accepted": applied.accepted,
         "outcome": applied.outcome_code,
@@ -323,6 +385,15 @@ pub async fn execute_action_command(
         "state_revision": applied.state_revision,
         "details": applied.extra,
     });
+    if applied.accepted
+        && matches!(
+            &params.command,
+            ActionCommand::Begin { .. } | ActionCommand::Renew { .. }
+        )
+    {
+        decorate_action_timing_response_tx(&mut tx, params.community_id, &mut response, now)
+            .await?;
+    }
     insert_receipt_tx(&mut tx, &params, &applied, &response).await?;
     tx.commit().await?;
     Ok(ActionCommandCommit {
@@ -354,6 +425,23 @@ async fn apply_command_tx(
                 expected_state_event_id,
                 board_event_id,
                 expected_decision_attempt_id.as_deref(),
+                now,
+            )
+            .await
+        }
+        ActionCommand::Renew {
+            fence,
+            progress_seq,
+            stage,
+            last_activity_seq,
+        } => {
+            apply_renew_tx(
+                tx,
+                params,
+                fence,
+                *progress_seq,
+                *stage,
+                *last_activity_seq,
                 now,
             )
             .await
@@ -550,15 +638,18 @@ async fn apply_begin_tx(
         None
     };
 
-    let duration_ms = action_duration_ms_tx(tx, params.community_id, params.session_id).await?;
+    let (duration_ms, operator_hard_cap_ms) =
+        action_lease_config_tx(tx, params.community_id, params.session_id).await?;
     let deadline = now + Duration::milliseconds(duration_ms);
+    let operator_hard_deadline =
+        operator_hard_cap_ms.map(|cap_ms| now + Duration::milliseconds(cap_ms));
     let action_run_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO meeting_v2_action_runs \
              (community_id, session_id, action_run_id, begin_event_id, board_event_id, \
               control_epoch, board_window, action_window_epoch, action_condition, \
-              action_deadline_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, 'runnable', $8, $9, $9)",
+              action_deadline_at, operator_hard_deadline, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, 'runnable', $8, $9, $10, $10)",
     )
     .bind(params.community_id.as_uuid())
     .bind(params.session_id)
@@ -568,6 +659,7 @@ async fn apply_begin_tx(
     .bind(expected_control_epoch)
     .bind(board_window)
     .bind(deadline)
+    .bind(operator_hard_deadline)
     .bind(now)
     .execute(tx.as_mut())
     .await?;
@@ -611,9 +703,143 @@ async fn apply_begin_tx(
         json!({
             "board_event_id": hex::encode(board_event_id),
             "action_deadline_at_ms": deadline.timestamp_millis(),
+            "operator_hard_deadline_ms": operator_hard_deadline.map(|value| value.timestamp_millis()),
             "decision_attempt_id": expected_decision_attempt_id.map(hex::encode),
             "frozen_intent_count": frozen_floor.map(|counts| counts.0).unwrap_or(0),
             "frozen_handoff_count": frozen_floor.map(|counts| counts.1).unwrap_or(0),
+        }),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_renew_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    params: &ActionCommandTxParams<'_>,
+    fence: &ActionRunFence,
+    progress_seq: i64,
+    stage: ActionProgressStage,
+    last_activity_seq: i64,
+    now: DateTime<Utc>,
+) -> Result<AppliedCommand> {
+    if progress_seq <= 0 || last_activity_seq < 0 {
+        return Err(DbError::InvalidData(
+            "Meeting V2 action renewal sequences are malformed".to_string(),
+        ));
+    }
+    let Some(run) = load_active_run_tx(tx, params.community_id, params.session_id, true).await?
+    else {
+        return Ok(AppliedCommand::rejected("no_active_action_run", None));
+    };
+    if let Some(rejection) = validate_run_fence(&run, fence) {
+        return Ok(AppliedCommand::rejected(rejection, Some(&run)));
+    }
+    if run.action_condition != "runnable" {
+        return Ok(AppliedCommand::rejected("action_not_runnable", Some(&run)));
+    }
+    if run
+        .action_deadline_at
+        .is_none_or(|deadline| now >= deadline)
+        || run
+            .operator_hard_deadline
+            .is_some_and(|deadline| now >= deadline)
+    {
+        // `execute_action_command` performs lazy recovery before dispatch. Reaching
+        // this guard means the row changed unexpectedly inside this transaction.
+        return Ok(AppliedCommand::rejected("action_lease_expired", Some(&run)));
+    }
+    let expected_progress_seq = run
+        .progress_seq
+        .checked_add(1)
+        .ok_or_else(|| DbError::InvalidData("Meeting V2 action progress overflow".to_string()))?;
+    if progress_seq != expected_progress_seq {
+        return Ok(AppliedCommand::rejected(
+            "progress_sequence_conflict",
+            Some(&run),
+        ));
+    }
+
+    let (duration_ms, _) =
+        action_lease_config_tx(tx, params.community_id, params.session_id).await?;
+    let requested_deadline = now + Duration::milliseconds(duration_ms);
+    let deadline = run
+        .operator_hard_deadline
+        .map_or(requested_deadline, |operator| {
+            requested_deadline.min(operator)
+        });
+    if deadline <= now {
+        return Ok(AppliedCommand::rejected(
+            "action_operator_deadline_exceeded",
+            Some(&run),
+        ));
+    }
+
+    let updated = sqlx::query(
+        "UPDATE meeting_v2_action_runs \
+         SET progress_seq = $4, last_progress_stage = $5, last_progress_at = $6, \
+             action_deadline_at = $7, updated_at = $6 \
+         WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
+           AND action_window_epoch = $8 AND terminal_status IS NULL \
+           AND action_condition = 'runnable' AND progress_seq = $9",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .bind(progress_seq)
+    .bind(stage.as_str())
+    .bind(now)
+    .bind(deadline)
+    .bind(run.action_window_epoch)
+    .bind(run.progress_seq)
+    .execute(tx.as_mut())
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(DbError::InvalidData(
+            "Meeting V2 action changed while renewing its lease".to_string(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO meeting_v2_action_lease_renewals \
+             (community_id, session_id, action_run_id, action_window_epoch, progress_seq, \
+              renewal_event_id, stage, last_activity_seq, accepted_at, lease_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .bind(run.action_run_id)
+    .bind(run.action_window_epoch)
+    .bind(progress_seq)
+    .bind(params.event.id.as_bytes().as_slice())
+    .bind(stage.as_str())
+    .bind(last_activity_seq)
+    .bind(now)
+    .bind(deadline)
+    .execute(tx.as_mut())
+    .await?;
+
+    let transition = crate::meeting_baton::publish_v2_action_transition_tx(
+        tx,
+        params.community_id,
+        params.session_id,
+        run.action_run_id,
+        params.relay_keys,
+        "action_lease_renewed",
+        params.event.id.as_bytes(),
+        "runnable",
+        "runnable",
+        None,
+        now,
+    )
+    .await?;
+    Ok(AppliedCommand::accepted(
+        "action_lease_renewed",
+        run.action_run_id,
+        run.action_window_epoch,
+        transition.state_revision,
+        json!({
+            "accepted_progress_seq": progress_seq,
+            "stage": stage.as_str(),
+            "last_activity_seq": last_activity_seq,
+            "action_deadline_at_ms": deadline.timestamp_millis(),
         }),
     ))
 }
@@ -698,12 +924,28 @@ async fn apply_retry_tx(
         .checked_add(1)
         .ok_or_else(|| DbError::InvalidData("Meeting V2 action window overflow".to_string()))?;
     let retry_reason = run.last_error_code.as_deref().unwrap_or("unspecified");
-    let duration_ms = action_duration_ms_tx(tx, params.community_id, params.session_id).await?;
-    let deadline = now + Duration::milliseconds(duration_ms);
+    if run
+        .operator_hard_deadline
+        .is_some_and(|deadline| now >= deadline)
+    {
+        return Ok(AppliedCommand::rejected(
+            "action_operator_deadline_exceeded",
+            Some(&run),
+        ));
+    }
+    let (duration_ms, _) =
+        action_lease_config_tx(tx, params.community_id, params.session_id).await?;
+    let requested_deadline = now + Duration::milliseconds(duration_ms);
+    let deadline = run
+        .operator_hard_deadline
+        .map_or(requested_deadline, |operator| {
+            requested_deadline.min(operator)
+        });
     let updated = sqlx::query(
         "UPDATE meeting_v2_action_runs \
          SET action_window_epoch = $4, action_condition = 'runnable', \
-             action_deadline_at = $5, last_error_code = NULL, updated_at = $6 \
+             action_deadline_at = $5, last_error_code = NULL, progress_seq = 0, \
+             last_progress_stage = NULL, last_progress_at = NULL, updated_at = $6 \
          WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3 \
            AND terminal_status IS NULL AND action_condition = 'blocked'",
     )
@@ -836,13 +1078,15 @@ async fn load_active_run_tx(
 ) -> Result<Option<ActionRunRow>> {
     let sql = if for_update {
         "SELECT action_run_id, board_event_id, control_epoch, action_window_epoch, \
-                action_condition, terminal_status, last_error_code \
+                action_condition, terminal_status, last_error_code, progress_seq, \
+                action_deadline_at, operator_hard_deadline \
          FROM meeting_v2_action_runs \
          WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL \
          FOR UPDATE"
     } else {
         "SELECT action_run_id, board_event_id, control_epoch, action_window_epoch, \
-                action_condition, terminal_status, last_error_code \
+                action_condition, terminal_status, last_error_code, progress_seq, \
+                action_deadline_at, operator_hard_deadline \
          FROM meeting_v2_action_runs \
          WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL"
     };
@@ -863,6 +1107,9 @@ fn action_run_from_row(row: sqlx::postgres::PgRow) -> Result<ActionRunRow> {
         action_condition: row.try_get("action_condition")?,
         terminal_status: row.try_get("terminal_status")?,
         last_error_code: row.try_get("last_error_code")?,
+        progress_seq: row.try_get("progress_seq")?,
+        action_deadline_at: row.try_get("action_deadline_at")?,
+        operator_hard_deadline: row.try_get("operator_hard_deadline")?,
     })
 }
 
@@ -942,13 +1189,14 @@ async fn freeze_floor_work_for_actions_tx(
     Ok((intents.rows_affected(), handoffs.rows_affected()))
 }
 
-async fn action_duration_ms_tx(
+async fn action_lease_config_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     session_id: Uuid,
-) -> Result<i64> {
-    sqlx::query_scalar(
-        "SELECT action_finalization_ms FROM meeting_v2_config \
+) -> Result<(i64, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT action_finalization_ms, action_operator_hard_cap_ms \
+         FROM meeting_v2_config \
          WHERE community_id = $1 AND session_id = $2",
     )
     .bind(community_id.as_uuid())
@@ -971,6 +1219,8 @@ fn is_block_reason(reason: &str) -> bool {
             | "provider_failure"
             | "affinity_lost"
             | "action_deadline_exceeded"
+            | "action_lease_expired"
+            | "action_operator_deadline_exceeded"
     )
 }
 
@@ -980,7 +1230,7 @@ async fn load_receipt_tx(
     event_id: &[u8],
 ) -> Result<Option<ActionReceipt>> {
     let row = sqlx::query(
-        "SELECT author_pubkey, accepted, outcome_code, response_json \
+        "SELECT author_pubkey, action, accepted, outcome_code, response_json \
          FROM meeting_v2_action_command_receipts \
          WHERE community_id = $1 AND command_event_id = $2",
     )
@@ -991,6 +1241,7 @@ async fn load_receipt_tx(
     row.map(|row| {
         Ok(ActionReceipt {
             author_pubkey: row.try_get("author_pubkey")?,
+            action: row.try_get("action")?,
             accepted: row.try_get("accepted")?,
             outcome_code: row.try_get("outcome_code")?,
             response: row.try_get("response_json")?,
@@ -1026,6 +1277,75 @@ async fn insert_receipt_tx(
     Ok(())
 }
 
+async fn decorate_action_timing_response_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    response: &mut Value,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let Some(object) = response.as_object_mut() else {
+        return Err(DbError::InvalidData(
+            "Meeting V2 action receipt response is not an object".to_string(),
+        ));
+    };
+    let run_id = object
+        .get("action_run_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let window = object.get("action_window_epoch").and_then(Value::as_i64);
+    let timing = if let (Some(run_id), Some(window)) = (run_id, window) {
+        sqlx::query(
+            "SELECT action_deadline_at, operator_hard_deadline, progress_seq \
+             FROM meeting_v2_action_runs \
+             WHERE community_id = $1 AND action_run_id = $2 \
+               AND action_window_epoch = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .bind(window)
+        .fetch_optional(tx.as_mut())
+        .await?
+    } else {
+        None
+    };
+    let (lease_expires_at, operator_hard_deadline, progress_seq) = timing
+        .map(|row| {
+            Ok::<_, sqlx::Error>((
+                row.try_get::<Option<DateTime<Utc>>, _>("action_deadline_at")?,
+                row.try_get::<Option<DateTime<Utc>>, _>("operator_hard_deadline")?,
+                row.try_get::<i64, _>("progress_seq")?,
+            ))
+        })
+        .transpose()?
+        .unwrap_or((None, None, 0));
+    let remaining_ms = |deadline: Option<DateTime<Utc>>| {
+        deadline.map(|value| (value - now).num_milliseconds().max(0))
+    };
+    object.insert("server_now_ms".to_string(), json!(now.timestamp_millis()));
+    object.insert(
+        "lease_expires_at_ms".to_string(),
+        json!(lease_expires_at.map(|value| value.timestamp_millis())),
+    );
+    object.insert(
+        "lease_ttl_ms".to_string(),
+        json!(remaining_ms(lease_expires_at)),
+    );
+    object.insert(
+        "operator_hard_remaining_ms".to_string(),
+        json!(remaining_ms(operator_hard_deadline)),
+    );
+    let accepted_progress_seq = object
+        .get("details")
+        .and_then(|details| details.get("accepted_progress_seq"))
+        .and_then(Value::as_i64)
+        .unwrap_or(progress_seq);
+    object.insert(
+        "accepted_progress_seq".to_string(),
+        json!(accepted_progress_seq),
+    );
+    Ok(())
+}
+
 pub(crate) async fn action_state_json_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -1034,7 +1354,8 @@ pub(crate) async fn action_state_json_tx(
     let row = sqlx::query(
         "SELECT action_run_id, board_event_id, control_epoch, board_window, \
                 action_window_epoch, action_condition, terminal_status, \
-                completion_event_id, action_deadline_at, last_error_code, \
+                completion_event_id, action_deadline_at, last_error_code, progress_seq, \
+                last_progress_stage, last_progress_at, operator_hard_deadline, \
                 created_at, updated_at, terminal_at \
          FROM meeting_v2_action_runs \
          WHERE community_id = $1 AND session_id = $2 \
@@ -1050,6 +1371,8 @@ pub(crate) async fn action_state_json_tx(
     let board_event_id: Vec<u8> = row.try_get("board_event_id")?;
     let completion_event_id: Option<Vec<u8>> = row.try_get("completion_event_id")?;
     let deadline: Option<DateTime<Utc>> = row.try_get("action_deadline_at")?;
+    let last_progress_at: Option<DateTime<Utc>> = row.try_get("last_progress_at")?;
+    let operator_hard_deadline: Option<DateTime<Utc>> = row.try_get("operator_hard_deadline")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
     let terminal_at: Option<DateTime<Utc>> = row.try_get("terminal_at")?;
@@ -1064,6 +1387,10 @@ pub(crate) async fn action_state_json_tx(
         "terminal_status": row.try_get::<Option<String>, _>("terminal_status")?,
         "completion_event_id": completion_event_id.map(hex::encode),
         "action_deadline_at_ms": deadline.map(|value| value.timestamp_millis()),
+        "progress_seq": row.try_get::<i64, _>("progress_seq")?,
+        "last_progress_stage": row.try_get::<Option<String>, _>("last_progress_stage")?,
+        "last_progress_at_ms": last_progress_at.map(|value| value.timestamp_millis()),
+        "operator_hard_deadline_ms": operator_hard_deadline.map(|value| value.timestamp_millis()),
         "last_error_code": row.try_get::<Option<String>, _>("last_error_code")?,
         "created_at_ms": created_at.timestamp_millis(),
         "updated_at_ms": updated_at.timestamp_millis(),
@@ -1156,6 +1483,8 @@ pub(crate) async fn validate_close_gate_tx(
                AND run.board_event_id = $5 AND run.terminal_status IS NULL \
                AND run.action_condition = 'runnable' \
                AND run.action_deadline_at > clock_timestamp() \
+               AND (run.operator_hard_deadline IS NULL \
+                    OR run.operator_hard_deadline > clock_timestamp()) \
          )",
     )
     .bind(community_id.as_uuid())
@@ -1201,6 +1530,8 @@ mod tests {
             "provider_failure",
             "affinity_lost",
             "action_deadline_exceeded",
+            "action_lease_expired",
+            "action_operator_deadline_exceeded",
         ] {
             assert!(is_block_reason(reason));
         }

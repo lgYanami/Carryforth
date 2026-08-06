@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod agent_profile;
 mod child_registry;
 mod config;
 mod engram_fetch;
@@ -1574,6 +1575,11 @@ async fn tokio_main(
 
     tracing::info!("connected to relay at {}", config.relay_url);
 
+    // The Relay's action-capable Meeting gate reads the durable Agent profile,
+    // not process presence. Advertise from the authenticated harness itself so
+    // every current and future runtime converges without per-Agent DB repair.
+    agent_profile::spawn_meeting_capability_reconciliation(relay.rest_client(), "startup");
+
     child_registry::reap_previous_generation()
         .await
         .map_err(|error| anyhow::anyhow!("owned Agent cleanup failed closed: {error}"))?;
@@ -2840,6 +2846,10 @@ async fn tokio_main(
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 break MainLoopExit::Abnormal("Relay reconnect failed");
                             }
+                            agent_profile::spawn_meeting_capability_reconciliation(
+                                relay.rest_client(),
+                                "reconnect",
+                            );
                             meeting_controller.mark_all_for_resync();
                         }
                     }
@@ -2930,6 +2940,8 @@ async fn tokio_main(
                 let continuity_info = meeting_controller.turn_continuity_info(&result.turn_id);
                 let meeting_output = meeting_turn.then(|| result.agent.acp.take_agent_message());
                 let mut meeting_succeeded = matches!(&result.outcome, PromptOutcome::Ok(_));
+                let meeting_action_lease_expired =
+                    matches!(&result.outcome, PromptOutcome::LeaseExpired);
                 if let Some(info) = continuity_info {
                     let agent_index = result.agent.index;
                     let resolved_session_id = result.resolved_session_id.as_deref();
@@ -3046,7 +3058,9 @@ async fn tokio_main(
                     observer.clone(),
                     Some(&ctx.rest_client),
                 );
-                if let Some(output) = meeting_output {
+                if meeting_action_lease_expired {
+                    meeting_controller.handle_action_lease_expired(&meeting_turn_id);
+                } else if let Some(output) = meeting_output {
                     meeting_controller
                         .handle_turn_result(&meeting_turn_id, output, meeting_succeeded)
                         .await;
@@ -3859,7 +3873,7 @@ fn prompt_outcome_replaces_agent(outcome: &PromptOutcome) -> bool {
                 | acp::AcpError::Timeout(_)
                 | acp::AcpError::Protocol(_)
         ),
-        PromptOutcome::Ok(_) | PromptOutcome::Cancelled => false,
+        PromptOutcome::Ok(_) | PromptOutcome::Cancelled | PromptOutcome::LeaseExpired => false,
     }
 }
 
@@ -4052,8 +4066,19 @@ fn dispatch_meeting_pending(
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
-        let absolute_hard_deadline =
-            tokio::time::Instant::now() + meeting::remaining_before(request.hard_deadline_unix_ms);
+        let absolute_hard_deadline = controller
+            .action_deadline_for_request(&request)
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + meeting::remaining_before(request.hard_deadline_unix_ms)
+            });
+        let (action_deadline_tx, action_deadline_rx) =
+            if request.kind == meeting::MeetingTurnKind::V2ActionFinalization {
+                let (tx, rx) = tokio::sync::watch::channel(absolute_hard_deadline);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
                 agent,
@@ -4064,6 +4089,7 @@ fn dispatch_meeting_pending(
                 pool::PromptExecution {
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: Some(absolute_hard_deadline),
+                    deadline_updates: action_deadline_rx,
                     turn_id: task_turn_id,
                     defer_session_rotation: action_host_turn,
                 },
@@ -4081,7 +4107,10 @@ fn dispatch_meeting_pending(
                 steer_tx: Some(steer_tx),
             },
         );
-        controller.mark_dispatched(turn_id, request);
+        controller.mark_dispatched(turn_id.clone(), request);
+        if let Some(sender) = action_deadline_tx {
+            controller.attach_action_deadline_sender(&turn_id, sender);
+        }
         controller.set_exact_meeting_slots(pool.idle_bound_meeting_ids());
         controller.set_available_agent_slots(pool.claimable_unleased_count());
         tracing::info!(
@@ -4172,6 +4201,7 @@ fn dispatch_pending(
                 pool::PromptExecution {
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: None,
+                    deadline_updates: None,
                     turn_id: task_turn_id,
                     defer_session_rotation: false,
                 },
@@ -4421,6 +4451,7 @@ fn handle_prompt_result(
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::LeaseExpired => "action_lease_expired",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
     };
     let agent_index = result.agent.index;
@@ -4476,7 +4507,7 @@ fn handle_prompt_result(
 
     match result.outcome {
         // Successful prompt — return agent to pool.
-        PromptOutcome::Ok(_) => {
+        PromptOutcome::Ok(_) | PromptOutcome::LeaseExpired => {
             tracing::debug!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -4853,6 +4884,7 @@ fn dispatch_heartbeat(
             pool::PromptExecution {
                 control_rx: None,
                 absolute_hard_deadline: None,
+                deadline_updates: None,
                 turn_id: task_turn_id,
                 defer_session_rotation: false,
             },

@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::app_state::AppState;
 
+mod managed_agent_profile;
+pub use managed_agent_profile::sync_managed_agent_capabilities;
+
 const DEFAULT_RELAY_WS_URL: &str = "ws://localhost:3000";
 
 // A reached-but-malformed 2xx body is NOT a connectivity failure, so this
@@ -451,29 +454,19 @@ fn build_profile_event(
         .map_err(|e| format!("failed to sign profile event: {e}"))
 }
 
-// ── Managed-agent profile sync ──────────────────────────────────────────────
-
-/// Sync a managed agent's kind:0 profile event to the relay using NIP-98 auth.
-///
-/// The agent signs its own profile event and the NIP-98 HTTP-auth event, so no
-/// API token is required.
-pub async fn sync_managed_agent_profile(
+async fn post_managed_agent_event(
     state: &AppState,
     relay_url: &str,
     agent_keys: &nostr::Keys,
-    display_name: &str,
-    avatar_url: Option<&str>,
-    auth_tag: Option<&str>, // NIP-OA auth tag JSON
+    event: &nostr::Event,
+    auth_tag: Option<&str>,
+    failure_context: &str,
 ) -> Result<(), String> {
     crate::relay_admission::wait_for_rate_limit().await;
-    // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
-    let event = build_profile_event(agent_keys, display_name, avatar_url, auth_tag)?;
     let event_json = event.as_json();
     let body_bytes = event_json.into_bytes();
-
     let url = format!("{}/events", relay_http_base_url(relay_url));
     let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &url, &body_bytes)?;
-
     let mut request = state
         .http_client
         .post(&url)
@@ -486,16 +479,41 @@ pub async fn sync_managed_agent_profile(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| classify_request_error(&e))?;
-
+        .map_err(|error| classify_request_error(&error))?;
     if !response.status().is_success() {
-        let msg = relay_error_message(response).await;
-        return Err(format!(
-            "Could not sync the agent's profile metadata: {msg}"
-        ));
+        let message = relay_error_message(response).await;
+        return Err(format!("{failure_context}: {message}"));
     }
-
     Ok(())
+}
+
+// ── Managed-agent profile sync ──────────────────────────────────────────────
+
+/// Sync a managed agent's kind:0 metadata profile to the relay using NIP-98
+/// auth.
+///
+/// The agent signs its own profile event and the NIP-98 HTTP-auth event, so no
+/// API token is required. Runtime capability reconciliation is deliberately a
+/// separate operation because it requires an exact ACP harness probe.
+pub async fn sync_managed_agent_profile(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: &nostr::Keys,
+    display_name: &str,
+    avatar_url: Option<&str>,
+    auth_tag: Option<&str>, // NIP-OA auth tag JSON
+) -> Result<(), String> {
+    // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
+    let event = build_profile_event(agent_keys, display_name, avatar_url, auth_tag)?;
+    post_managed_agent_event(
+        state,
+        relay_url,
+        agent_keys,
+        &event,
+        auth_tag,
+        "Could not sync the agent's profile metadata",
+    )
+    .await
 }
 
 // ── Agent profile query ─────────────────────────────────────────────────────

@@ -147,7 +147,7 @@ pub struct Config {
     ///
     /// This second rollout gate defaults to `false` and is additive to
     /// [`Self::meeting_v2_create_enabled`]. Existing
-    /// `moderated-board-actions-v2` sessions continue to drain and recover
+    /// `moderated-board-actions-v3` sessions continue to drain and recover
     /// when either Create gate is later disabled.
     pub meeting_v2_direct_actions_create_enabled: bool,
 

@@ -9,6 +9,7 @@ mod events;
 mod huddle;
 mod managed_agents;
 mod media_proxy;
+mod meeting_runtime;
 #[cfg(feature = "mesh-llm")]
 mod mesh_llm;
 #[cfg(not(feature = "mesh-llm"))]
@@ -733,6 +734,7 @@ pub fn run() {
             get_meeting_speeches,
             get_meeting_activities,
             create_meeting,
+            ensure_meeting_action_renewal,
             submit_meeting_action_finalization,
             submit_meeting_floor_action,
             submit_meeting_host_action,

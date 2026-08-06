@@ -35,6 +35,7 @@ pub const MAX_BATON_DURATION_MS: i64 = 86_400_000;
 pub(crate) enum BatonProtocol {
     V1,
     V2,
+    V2ActionsLegacy,
     V2Actions,
 }
 
@@ -48,6 +49,9 @@ impl BatonProtocol {
             (crate::meeting_v2::SCHEMA_VERSION, crate::meeting_v2::ACTIONS_POLICY_VERSION) => {
                 Ok(Self::V2Actions)
             }
+            (crate::meeting_v2::SCHEMA_VERSION, buzz_sdk::MEETING_V2_ACTIONS_V2_POLICY) => {
+                Ok(Self::V2ActionsLegacy)
+            }
             _ => Err(DbError::InvalidData(format!(
                 "meeting {session_id} is not a supported moderated Baton session"
             ))),
@@ -57,7 +61,9 @@ impl BatonProtocol {
     pub(crate) const fn schema_tag(self) -> &'static str {
         match self {
             Self::V1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
-            Self::V2 | Self::V2Actions => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
+            Self::V2 | Self::V2ActionsLegacy | Self::V2Actions => {
+                buzz_sdk::MEETING_V2_SCHEMA_VERSION
+            }
         }
     }
 
@@ -65,16 +71,17 @@ impl BatonProtocol {
         match self {
             Self::V1 => BATON_POLICY_VERSION,
             Self::V2 => crate::meeting_v2::BOARD_POLICY_VERSION,
+            Self::V2ActionsLegacy => buzz_sdk::MEETING_V2_ACTIONS_V2_POLICY,
             Self::V2Actions => crate::meeting_v2::ACTIONS_POLICY_VERSION,
         }
     }
 
     pub(crate) const fn is_v2(self) -> bool {
-        matches!(self, Self::V2 | Self::V2Actions)
+        matches!(self, Self::V2 | Self::V2ActionsLegacy | Self::V2Actions)
     }
 
     pub(crate) const fn has_action_finalization(self) -> bool {
-        matches!(self, Self::V2Actions)
+        matches!(self, Self::V2ActionsLegacy | Self::V2Actions)
     }
 }
 

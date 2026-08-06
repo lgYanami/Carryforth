@@ -75,6 +75,8 @@ const ATTEMPT_DISCARDED_REASON_CODES: &[&str] = &[
     "cas_churn",
     "source_changed",
     "runtime_replaced",
+    "invalid_output",
+    "provider_failure",
 ];
 
 /// Parse and execute one participant-authored moderated control command.
@@ -348,6 +350,11 @@ fn record_action_command_metrics(
                 .and_then(serde_json::Value::as_str),
         ),
         "begin" => "begin",
+        "renew" => details
+            .get("stage")
+            .and_then(serde_json::Value::as_str)
+            .and_then(action_progress_stage_metric_label)
+            .unwrap_or("reasoning"),
         "return-to-board" => "return_to_board",
         _ => "none",
     };
@@ -371,6 +378,9 @@ fn record_action_command_metrics(
         }
     } else if action == "retry" {
         metrics::counter!("meeting_v2_action_retry_total", "reason" => reason).increment(1);
+    } else if action == "renew" {
+        metrics::counter!("meeting_action_renewal_total", "stage" => reason, "outcome" => "accepted")
+            .increment(1);
     }
 }
 
@@ -390,6 +400,7 @@ fn action_metric_transition(
         },
         "block" => Some(("action/runnable", "action/blocked")),
         "retry" => Some(("action/blocked", "action/runnable")),
+        "renew" => Some(("action/runnable", "action/runnable")),
         _ => None,
     }
 }
@@ -402,8 +413,21 @@ fn action_reason_metric_label(value: Option<&str>) -> &'static str {
         Some("provider_failure") => "provider_failure",
         Some("affinity_lost") => "affinity_lost",
         Some("action_deadline_exceeded") => "action_deadline_exceeded",
+        Some("action_lease_expired") => "action_lease_expired",
+        Some("action_operator_deadline_exceeded") => "action_operator_deadline_exceeded",
         Some("unspecified") | None => "unspecified",
         Some(_) => "other",
+    }
+}
+
+fn action_progress_stage_metric_label(value: &str) -> Option<&'static str> {
+    match value {
+        "reasoning" => Some("reasoning"),
+        "tool_call" => Some("tool_call"),
+        "tool_result" => Some("tool_result"),
+        "finalizing" => Some("finalizing"),
+        "waiting_human" => Some("waiting_human"),
+        _ => None,
     }
 }
 
@@ -465,6 +489,28 @@ fn parse_action_command(
             buzz_db::meeting_v2_actions::ActionCommand::Block {
                 fence: parse_action_run_fence(event)?,
                 reason_code,
+            }
+        }
+        "renew" => {
+            validate_action_run_tag_schema(event, &["progress-seq", "stage", "last-activity-seq"])?;
+            require_empty_content(event, "Meeting V2 action lease renewal")?;
+            let stage = match require_single_tag(event, "stage")?.as_str() {
+                "reasoning" => buzz_db::meeting_v2_actions::ActionProgressStage::Reasoning,
+                "tool_call" => buzz_db::meeting_v2_actions::ActionProgressStage::ToolCall,
+                "tool_result" => buzz_db::meeting_v2_actions::ActionProgressStage::ToolResult,
+                "finalizing" => buzz_db::meeting_v2_actions::ActionProgressStage::Finalizing,
+                "waiting_human" => buzz_db::meeting_v2_actions::ActionProgressStage::WaitingHuman,
+                _ => {
+                    return Err(IngestError::Rejected(
+                        "invalid: unsupported Meeting action progress stage".into(),
+                    ));
+                }
+            };
+            buzz_db::meeting_v2_actions::ActionCommand::Renew {
+                fence: parse_action_run_fence(event)?,
+                progress_seq: parse_positive_i64_tag(event, "progress-seq")?,
+                stage,
+                last_activity_seq: parse_nonnegative_i64_tag(event, "last-activity-seq")?,
             }
         }
         "retry" | "return-to-board" => {
@@ -950,6 +996,7 @@ fn record_command_metrics(
     let protocol = match protocol {
         MeetingProtocol::ModeratedBatonV1 => "v1",
         MeetingProtocol::ModeratedBoardV2 => "v2",
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => "v2-actions-legacy",
         MeetingProtocol::ModeratedBoardActionsV2 => "v2-actions",
         MeetingProtocol::UniformV0 => "v0",
     };
@@ -1595,9 +1642,9 @@ fn parse_speech(
 fn parse_baton_session(event: &Event, protocol: MeetingProtocol) -> Result<Uuid, IngestError> {
     let expected_version = match protocol {
         MeetingProtocol::ModeratedBatonV1 => buzz_sdk::MEETING_V1_SCHEMA_VERSION,
-        MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
-            buzz_sdk::MEETING_V2_SCHEMA_VERSION
-        }
+        MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2Legacy
+        | MeetingProtocol::ModeratedBoardActionsV2 => buzz_sdk::MEETING_V2_SCHEMA_VERSION,
         MeetingProtocol::UniformV0 => {
             return Err(IngestError::Rejected(
                 "invalid: uniform Meeting does not accept Baton commands".into(),
@@ -2065,6 +2112,46 @@ mod tests {
             Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Retry { .. }))
                 if parsed == session_id
         ));
+
+        let renewal = buzz_sdk::build_meeting_v2_action_lease_renew(
+            buzz_sdk::MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence,
+                progress_seq: 2,
+                stage: buzz_sdk::MeetingV2ActionProgressStage::ToolCall,
+                last_activity_seq: 7,
+            },
+        )
+        .expect("build renewal")
+        .sign_with_keys(&moderator)
+        .expect("sign renewal");
+        assert!(matches!(
+            parse_action_command(&renewal),
+            Ok((parsed, buzz_db::meeting_v2_actions::ActionCommand::Renew {
+                progress_seq: 2,
+                stage: buzz_db::meeting_v2_actions::ActionProgressStage::ToolCall,
+                last_activity_seq: 7,
+                ..
+            })) if parsed == session_id
+        ));
+
+        let malformed_renewal = signed(
+            buzz_core::kind::KIND_MEETING_ACTION_COMMAND,
+            "",
+            vec![
+                Tag::parse(["h", &session_id.to_string()]).expect("h"),
+                Tag::parse(["v", buzz_sdk::MEETING_V2_SCHEMA_VERSION]).expect("v"),
+                Tag::parse(["policy", buzz_sdk::MEETING_V2_ACTIONS_POLICY]).expect("policy"),
+                Tag::parse(["action", "renew"]).expect("action"),
+                Tag::parse(["action-run", &action_run_id.to_string()]).expect("run"),
+                Tag::parse(["action-window", "1"]).expect("window"),
+                Tag::parse(["board", &board_event_id]).expect("board"),
+                Tag::parse(["progress-seq", "0"]).expect("sequence"),
+                Tag::parse(["stage", "busy"]).expect("stage"),
+                Tag::parse(["last-activity-seq", "0"]).expect("activity"),
+            ],
+        );
+        assert!(parse_action_command(&malformed_renewal).is_err());
 
         let returned = buzz_sdk::build_meeting_v2_action_return_to_board(
             buzz_sdk::MeetingV2ActionCommandParams { session_id, fence },

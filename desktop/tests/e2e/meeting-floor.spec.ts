@@ -86,7 +86,7 @@ function meetingSeed(
     description: "Exercise the verified Desktop Floor boundary.",
     sourceChannelId: null,
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey: host,
     moderatorPubkey: host,
     createEventId: "c".repeat(64),

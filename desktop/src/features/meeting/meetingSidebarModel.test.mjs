@@ -25,7 +25,7 @@ function item({
     needsAttention,
     attentionReason,
     moderatorPubkey: null,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     updatedAt,
     endedAt,
     latestSpeechAt: null,

@@ -5,9 +5,9 @@
 
 use buzz_core::{
     kind::{
-        KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
-        KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-        KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
+        KIND_AGENT_OBSERVER_FRAME, KIND_AGENT_PROFILE, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT,
+        KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE,
+        KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MEETING_ACTION_COMMAND, KIND_MEETING_BOARD_COMMAND, KIND_MEETING_CREATE,
@@ -39,10 +39,17 @@ pub const MEETING_V1_POLICY: &str = "moderated-baton-v1";
 pub const MEETING_V2_SCHEMA_VERSION: &str = "3";
 /// Floor policy emitted by Meeting V2 builders.
 pub const MEETING_V2_POLICY: &str = "moderated-board-v1";
-/// Action-capable Meeting V2 floor policy.
-pub const MEETING_V2_ACTIONS_POLICY: &str = "moderated-board-actions-v2";
-/// Runtime capability required for action-capable Meeting V2 sessions.
-pub const MEETING_V2_ACTIONS_CAPABILITY: &str = "meeting-v2-action-finalization-v2";
+/// Persisted policy used by ended, read-only action Meetings created before
+/// renewable action leases were introduced.
+pub const MEETING_V2_ACTIONS_V2_POLICY: &str = "moderated-board-actions-v2";
+/// Action-capable Meeting V2 floor policy with renewable action leases.
+pub const MEETING_V2_ACTIONS_POLICY: &str = "moderated-board-actions-v3";
+/// Retired runtime capability retained only for historical diagnostics.
+pub const MEETING_V2_ACTIONS_V2_CAPABILITY: &str = "meeting-v2-action-finalization-v2";
+/// Runtime capability required for renewable action-capable Meeting V2 sessions.
+pub const MEETING_V2_ACTIONS_CAPABILITY: &str = "meeting-v2-action-finalization-v3";
+/// Maximum number of bounded runtime capabilities in one Agent control profile.
+pub const MAX_AGENT_PROFILE_CAPABILITIES: usize = 64;
 /// Initial/current Meeting V2 board format.
 pub const MEETING_V2_BOARD_FORMAT: &str = "markdown";
 /// Maximum UTF-8 byte size of a Meeting V2 board body.
@@ -168,6 +175,47 @@ pub struct MeetingV2ActionCommandParams<'a> {
     pub session_id: Uuid,
     /// Current action-run fences.
     pub fence: MeetingV2ActionRunFence<'a>,
+}
+
+/// Low-cardinality diagnostic stage reported by an Action lease renewal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingV2ActionProgressStage {
+    /// The host is reasoning about the frozen Board and canonical state.
+    Reasoning,
+    /// The host is invoking a tool or business command.
+    ToolCall,
+    /// The host is processing a tool or business-command result.
+    ToolResult,
+    /// The host is preparing the final actions-recorded attestation.
+    Finalizing,
+    /// A Human-hosted action is intentionally waiting for Human input.
+    WaitingHuman,
+}
+
+impl MeetingV2ActionProgressStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::Finalizing => "finalizing",
+            Self::WaitingHuman => "waiting_human",
+        }
+    }
+}
+
+/// Inputs for renewing the exact in-flight Meeting V2 Action window.
+pub struct MeetingV2ActionLeaseRenewParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Current action-run fences.
+    pub fence: MeetingV2ActionRunFence<'a>,
+    /// Exact next renewal sequence for this action window.
+    pub progress_seq: u64,
+    /// Current low-cardinality host stage for diagnostics.
+    pub stage: MeetingV2ActionProgressStage,
+    /// Monotonic provider/tool activity sequence observed by the host.
+    pub last_activity_seq: u64,
 }
 
 /// Action-run fence carried by the moderator's final recorded-actions attestation.
@@ -1275,6 +1323,53 @@ pub fn build_profile(
     }
     let content = serde_json::Value::Object(map).to_string();
     Ok(EventBuilder::new(Kind::Custom(0), content).tags([]))
+}
+
+/// Build a complete Agent control profile event (kind 10100).
+///
+/// This replaceable profile carries the channel-add policy and the complete
+/// runtime-capability snapshot together. Writers must preserve the dimension
+/// they are not changing before calling this builder; emitting only one field
+/// would make the signed event projection disagree with Relay state.
+pub fn build_agent_profile_controls(
+    channel_add_policy: &str,
+    capabilities: &[&str],
+    display_name: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    if !matches!(channel_add_policy, "anyone" | "owner_only" | "nobody") {
+        return Err(SdkError::InvalidInput(format!(
+            "invalid channel_add_policy: {channel_add_policy}"
+        )));
+    }
+    if capabilities.len() > MAX_AGENT_PROFILE_CAPABILITIES {
+        return Err(SdkError::InvalidInput(format!(
+            "too many Agent capabilities (max {MAX_AGENT_PROFILE_CAPABILITIES})"
+        )));
+    }
+
+    let mut canonical = std::collections::BTreeSet::new();
+    for capability in capabilities {
+        if capability.is_empty()
+            || capability.len() > 128
+            || capability.trim() != *capability
+            || capability.chars().any(char::is_control)
+            || !canonical.insert(*capability)
+        {
+            return Err(SdkError::InvalidInput(
+                "Agent capabilities must be unique clean strings of 1..=128 bytes".to_string(),
+            ));
+        }
+    }
+
+    let mut content = serde_json::json!({
+        "channel_add_policy": channel_add_policy,
+        "capabilities": canonical.into_iter().collect::<Vec<_>>(),
+    });
+    if let Some(display_name) = display_name.filter(|value| !value.trim().is_empty()) {
+        content["display_name"] = serde_json::Value::String(display_name.to_string());
+    }
+    let content = content.to_string();
+    Ok(EventBuilder::new(Kind::Custom(KIND_AGENT_PROFILE as u16), content).tags([]))
 }
 
 /// Build a NIP-29 add-member event (kind 9000).
@@ -2795,6 +2890,8 @@ pub fn build_meeting_v2_action_block(
             | "provider_failure"
             | "affinity_lost"
             | "action_deadline_exceeded"
+            | "action_lease_expired"
+            | "action_operator_deadline_exceeded"
     ) {
         return Err(SdkError::InvalidInput(format!(
             "unsupported Meeting V2 action block reason code: {reason_code}"
@@ -2824,6 +2921,33 @@ pub fn build_meeting_v2_action_retry(
     params: MeetingV2ActionCommandParams<'_>,
 ) -> Result<EventBuilder, SdkError> {
     build_meeting_v2_empty_action_command(params, "retry")
+}
+
+/// Build an internal host `renew` command for a runnable Action window.
+///
+/// This builder intentionally has no `buzz-cli` subcommand: a renewal is a
+/// cooperative host-liveness signal, not a model-authored business action.
+pub fn build_meeting_v2_action_lease_renew(
+    params: MeetingV2ActionLeaseRenewParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    if params.progress_seq == 0 {
+        return Err(SdkError::InvalidInput(
+            "Meeting V2 action progress sequence must be positive".into(),
+        ));
+    }
+    check_meeting_v1_i64(params.progress_seq, "Meeting V2 action progress sequence")?;
+    check_meeting_v1_i64(
+        params.last_activity_seq,
+        "Meeting V2 action activity sequence",
+    )?;
+    let mut tags = meeting_v2_action_run_tags(params.session_id, "renew", params.fence)?;
+    tags.push(tag(&["progress-seq", &params.progress_seq.to_string()])?);
+    tags.push(tag(&["stage", params.stage.as_str()])?);
+    tags.push(tag(&[
+        "last-activity-seq",
+        &params.last_activity_seq.to_string(),
+    ])?);
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_ACTION_COMMAND as u16), "").tags(tags))
 }
 
 /// Build a `return-to-board` command that preserves any external effects.
@@ -3280,6 +3404,8 @@ fn build_meeting_decision_attempt_finish(
                 | "cas_churn"
                 | "source_changed"
                 | "runtime_replaced"
+                | "invalid_output"
+                | "provider_failure"
         ),
     };
     if !supported {
@@ -4648,6 +4774,35 @@ mod tests {
     }
 
     #[test]
+    fn agent_profile_controls_are_complete_and_canonical() {
+        let ev = sign(
+            build_agent_profile_controls(
+                "owner_only",
+                &["z-capability", MEETING_V2_ACTIONS_CAPABILITY],
+                Some("Agent One"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(ev.kind.as_u16(), KIND_AGENT_PROFILE as u16);
+        let value: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(value["channel_add_policy"], "owner_only");
+        assert_eq!(value["display_name"], "Agent One");
+        assert_eq!(
+            value["capabilities"],
+            serde_json::json!([MEETING_V2_ACTIONS_CAPABILITY, "z-capability"])
+        );
+    }
+
+    #[test]
+    fn agent_profile_controls_reject_invalid_or_duplicate_values() {
+        assert!(build_agent_profile_controls("owner-only", &[], None).is_err());
+        assert!(build_agent_profile_controls("anyone", &["duplicate", "duplicate"], None).is_err());
+        assert!(build_agent_profile_controls("anyone", &[" leading-space"], None).is_err());
+        let too_many = vec!["capability"; MAX_AGENT_PROFILE_CAPABILITIES + 1];
+        assert!(build_agent_profile_controls("nobody", &too_many, None).is_err());
+    }
+
+    #[test]
     fn add_member_with_role() {
         let cid = uuid();
         let pubkey = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
@@ -5066,6 +5221,41 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag.as_slice()[0] == "action-plan"));
+
+        let renewal = sign(
+            build_meeting_v2_action_lease_renew(MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence: MeetingV2ActionRunFence {
+                    action_run_id,
+                    action_window: 1,
+                    board_event_id: &board_event_id,
+                },
+                progress_seq: 3,
+                stage: MeetingV2ActionProgressStage::ToolResult,
+                last_activity_seq: 8,
+            })
+            .unwrap(),
+        );
+        assert!(has_tag(&renewal, "policy", MEETING_V2_ACTIONS_POLICY));
+        assert!(has_tag(&renewal, "action", "renew"));
+        assert!(has_tag(&renewal, "progress-seq", "3"));
+        assert!(has_tag(&renewal, "stage", "tool_result"));
+        assert!(has_tag(&renewal, "last-activity-seq", "8"));
+        assert!(renewal.content.is_empty());
+        assert!(
+            build_meeting_v2_action_lease_renew(MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence: MeetingV2ActionRunFence {
+                    action_run_id,
+                    action_window: 1,
+                    board_event_id: &board_event_id,
+                },
+                progress_seq: 0,
+                stage: MeetingV2ActionProgressStage::Reasoning,
+                last_activity_seq: 0,
+            })
+            .is_err()
+        );
 
         let returned = sign(
             build_meeting_v2_action_return_to_board(MeetingV2ActionCommandParams {

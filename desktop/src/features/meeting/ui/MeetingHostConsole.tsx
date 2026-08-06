@@ -91,7 +91,7 @@ export function MeetingHostConsole({
   const noDecisionWork =
     host.pendingIntents.length === 0 && host.openHandoffs.length === 0;
   const canFinalizeActions =
-    snapshot.policy === "moderated-board-actions-v2" &&
+    snapshot.policy === "moderated-board-actions-v3" &&
     snapshot.phase === "moderator_idle" &&
     host.canClose &&
     noDecisionWork &&

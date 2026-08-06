@@ -101,6 +101,9 @@ pub enum AcpError {
     #[error("Hard turn timeout exceeded (silence {silence:?})")]
     HardTimeout { silence: std::time::Duration },
 
+    #[error("Renewable action lease expired (silence {silence:?})")]
+    LeaseExpired { silence: std::time::Duration },
+
     #[error("Agent did not stop within {0:?} after cancellation")]
     CancelDrainTimeout(std::time::Duration),
 
@@ -872,8 +875,29 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.session_prompt_blocks_with_deadline_updates(
+            session_id,
+            prompt_blocks,
+            idle_timeout,
+            max_duration,
+            None,
+        )
+        .await
+    }
+
+    /// Send a prompt whose absolute hard boundary can be replaced by
+    /// authoritative Action lease updates. Updating the boundary never counts
+    /// as provider activity and therefore never resets the idle watchdog.
+    pub async fn session_prompt_blocks_with_deadline_updates(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[&str],
+        idle_timeout: std::time::Duration,
+        initial_duration: std::time::Duration,
+        deadline_updates: Option<tokio::sync::watch::Receiver<tokio::time::Instant>>,
+    ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
-        let hard_deadline = tokio::time::Instant::now() + max_duration;
+        let hard_deadline = tokio::time::Instant::now() + initial_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
@@ -908,12 +932,13 @@ impl AcpClient {
         }
 
         let result = self
-            .read_until_response_with_idle_timeout(
+            .read_until_response_with_idle_timeout_updates(
                 session_id,
                 id,
                 idle_timeout,
                 hard_deadline,
-                max_duration,
+                initial_duration,
+                deadline_updates,
             )
             .await;
 
@@ -924,7 +949,11 @@ impl AcpClient {
                 self.last_prompt_id = None;
                 self.current_hard_deadline = None;
             }
-            Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout { .. }) => {
+            Err(
+                AcpError::IdleTimeout(_)
+                | AcpError::HardTimeout { .. }
+                | AcpError::LeaseExpired { .. },
+            ) => {
                 // Leave last_prompt_id and current_hard_deadline set —
                 // caller will invoke cancel_with_cleanup.
             }
@@ -1443,7 +1472,28 @@ impl AcpClient {
         hard_deadline: tokio::time::Instant,
         max_duration: std::time::Duration,
     ) -> Result<serde_json::Value, AcpError> {
+        self.read_until_response_with_idle_timeout_updates(
+            session_id,
+            expected_id,
+            idle_timeout,
+            hard_deadline,
+            max_duration,
+            None,
+        )
+        .await
+    }
+
+    async fn read_until_response_with_idle_timeout_updates(
+        &mut self,
+        session_id: &str,
+        expected_id: u64,
+        idle_timeout: std::time::Duration,
+        hard_deadline: tokio::time::Instant,
+        max_duration: std::time::Duration,
+        mut deadline_updates: Option<tokio::sync::watch::Receiver<tokio::time::Instant>>,
+    ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
+        let renewable_deadline = deadline_updates.is_some();
 
         // Take the per-turn steer receiver into a local so it can be
         // borrowed independently of `self.reader` inside `select!`.
@@ -1496,7 +1546,11 @@ impl AcpClient {
                 } else {
                     let silence = Instant::now().saturating_duration_since(last_activity_at);
                     tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
-                    return Err(AcpError::HardTimeout { silence });
+                    return Err(if renewable_deadline {
+                        AcpError::LeaseExpired { silence }
+                    } else {
+                        AcpError::HardTimeout { silence }
+                    });
                 }
             }
 
@@ -1585,6 +1639,34 @@ impl AcpClient {
                     // response or the steer response next.
                     None
                 }
+                changed = async {
+                    match deadline_updates.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if deadline_updates.is_some() => {
+                    match changed {
+                        Ok(()) => {
+                            if let Some(rx) = deadline_updates.as_ref() {
+                                hard_deadline = *rx.borrow();
+                                self.current_hard_deadline = Some(hard_deadline);
+                                tracing::debug!(
+                                    target: "acp::deadline",
+                                    remaining_ms = hard_deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .as_millis(),
+                                    "applied authoritative renewable prompt deadline"
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            // The coordinator disappeared. Keep the last
+                            // canonical boundary; sender loss cannot extend it.
+                            deadline_updates = None;
+                        }
+                    }
+                    None
+                }
                 _ = tokio::time::sleep_until(next_deadline) => {
                     // The pre-select check at the top of the next iteration
                     // would catch this anyway, but firing the deadline arm
@@ -1599,7 +1681,11 @@ impl AcpClient {
                     } else {
                         let silence = Instant::now().saturating_duration_since(last_activity_at);
                         tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
-                        return Err(AcpError::HardTimeout { silence });
+                        return Err(if renewable_deadline {
+                            AcpError::LeaseExpired { silence }
+                        } else {
+                            AcpError::HardTimeout { silence }
+                        });
                     }
                 }
             };
@@ -3039,6 +3125,81 @@ mod tests {
         assert!(
             matches!(result, Err(AcpError::HardTimeout { .. })),
             "expected HardTimeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewable_deadline_update_extends_the_same_prompt() {
+        let mut client = spawn_script(
+            r#"sleep 0.35; echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#,
+        )
+        .await;
+        let initial = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(initial);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = deadline_tx
+                .send(tokio::time::Instant::now() + std::time::Duration::from_millis(800));
+        });
+        let result = client
+            .read_until_response_with_idle_timeout_updates(
+                "test",
+                42,
+                std::time::Duration::from_secs(2),
+                initial,
+                std::time::Duration::from_secs(2),
+                Some(deadline_rx),
+            )
+            .await;
+        assert!(result.is_ok(), "renewed prompt should complete: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn renewable_ticks_do_not_reset_the_idle_watchdog() {
+        let mut client = spawn_script("sleep 10").await;
+        let initial = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(initial);
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let _ = deadline_tx
+                    .send(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+        });
+        let result = client
+            .read_until_response_with_idle_timeout_updates(
+                "test",
+                999,
+                std::time::Duration::from_millis(120),
+                initial,
+                std::time::Duration::from_secs(2),
+                Some(deadline_rx),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::IdleTimeout(_))),
+            "renewal must not count as provider activity: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewable_boundary_has_a_distinct_lease_expired_outcome() {
+        let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
+        let initial = tokio::time::Instant::now() + std::time::Duration::from_millis(80);
+        let (_deadline_tx, deadline_rx) = tokio::sync::watch::channel(initial);
+        let result = client
+            .read_until_response_with_idle_timeout_updates(
+                "test",
+                999,
+                std::time::Duration::from_secs(2),
+                initial,
+                std::time::Duration::from_secs(2),
+                Some(deadline_rx),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::LeaseExpired { .. })),
+            "renewable boundary should not be a generic hard timeout: {result:?}"
         );
     }
 

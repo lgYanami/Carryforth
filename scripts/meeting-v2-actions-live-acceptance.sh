@@ -33,7 +33,7 @@ relay_url="ws://${relay_host}"
 database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 relay_private_key="0000000000000000000000000000000000000000000000000000000000000001"
 relay_pubkey="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-action_capability="meeting-v2-action-finalization-v2"
+action_capability="meeting-v2-action-finalization-v3"
 redis_url=""
 relay_pid=""
 agent_pid=""
@@ -181,7 +181,7 @@ jq -e --arg capability "${action_capability}" '
   and any(
     .meeting.protocols[];
     .schemaVersion == "3"
-      and .policy == "moderated-board-actions-v2"
+      and .policy == "moderated-board-actions-v3"
       and .capability == $capability
       and .moderatorContinuity == "exact_agent_slot_and_acp_session"
       and (.turns | index("action_finalization") != null)
@@ -424,7 +424,7 @@ printf '%s\n' \
 
 log "creating one action-capable Meeting"
 buzz_as_moderator meetings create \
-  --policy moderated-board-actions-v2 \
+  --policy moderated-board-actions-v3 \
   --title 'Meeting V2 action finalization real-provider acceptance' \
   --description 'One bounded backend acceptance using the ordinary Project View CLI.' \
   --board "${board_file}" \
@@ -538,7 +538,7 @@ db_state="$(docker exec -e PGPASSWORD=buzz_dev "${postgres_container}" \
 jq -e '
   .meetingStatus == "ended"
   and .terminalOutcome == "closed"
-  and .policy == "moderated-board-actions-v2"
+  and .policy == "moderated-board-actions-v3"
   and .actionTerminalStatus == "completed_closed"
   and .actionCondition == "runnable"
   and (.actionRunId | type == "string" and length == 36)
@@ -638,8 +638,8 @@ jq -n \
     sourceTree: {statusSha256: $status_sha, diffSha256: $diff_sha, unchanged: true},
     protocol: {
       schemaVersion: "3",
-      policy: "moderated-board-actions-v2",
-      capability: "meeting-v2-action-finalization-v2"
+      policy: "moderated-board-actions-v3",
+      capability: "meeting-v2-action-finalization-v3"
     },
     provider: {
       real: true,

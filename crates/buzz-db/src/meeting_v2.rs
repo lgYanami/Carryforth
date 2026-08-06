@@ -1464,6 +1464,24 @@ pub async fn action_roster_supports_capability_tx(
     participant_pubkeys: &[Vec<u8>],
     required_capability: &str,
 ) -> Result<bool> {
+    Ok(action_roster_missing_capability_tx(
+        tx,
+        community_id,
+        participant_pubkeys,
+        required_capability,
+    )
+    .await?
+    .is_empty())
+}
+
+/// Return the managed Agent identities in a proposed roster that do not
+/// advertise the required runtime capability. Human participants are omitted.
+pub async fn action_roster_missing_capability_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    participant_pubkeys: &[Vec<u8>],
+    required_capability: &str,
+) -> Result<Vec<Vec<u8>>> {
     if participant_pubkeys.is_empty()
         || required_capability.is_empty()
         || required_capability.len() > 128
@@ -1475,21 +1493,22 @@ pub async fn action_roster_supports_capability_tx(
             "invalid Meeting V2 action roster capability check".to_string(),
         ));
     }
-    let missing_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::BIGINT \
+    let missing_pubkeys: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT pubkey \
          FROM users \
          WHERE community_id = $1 AND pubkey = ANY($2::bytea[]) \
            AND agent_owner_pubkey IS NOT NULL \
            AND (capabilities IS NULL \
              OR jsonb_typeof(capabilities) <> 'array' \
-             OR NOT capabilities @> jsonb_build_array($3::text))",
+             OR NOT capabilities @> jsonb_build_array($3::text)) \
+         ORDER BY pubkey",
     )
     .bind(community_id.as_uuid())
     .bind(participant_pubkeys)
     .bind(required_capability)
-    .fetch_one(tx.as_mut())
+    .fetch_all(tx.as_mut())
     .await?;
-    Ok(missing_count == 0)
+    Ok(missing_pubkeys)
 }
 
 /// Atomically create a private Meeting V2 room and its initial current board.
@@ -1626,6 +1645,7 @@ impl Db {
                 AND to_regclass('meeting_v2_board_command_receipts') IS NOT NULL \
                 AND to_regclass('meeting_v2_action_runs') IS NOT NULL \
                 AND to_regclass('meeting_v2_action_command_receipts') IS NOT NULL \
+                AND to_regclass('meeting_v2_action_lease_renewals') IS NOT NULL \
                 AND EXISTS ( \
                     SELECT 1 FROM pg_attribute \
                     WHERE attrelid = to_regclass('meeting_v2_action_runs') \
@@ -1638,8 +1658,23 @@ impl Db {
                 ) \
                 AND EXISTS ( \
                     SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_v2_action_runs') \
+                      AND attname = 'progress_seq' AND NOT attisdropped \
+                ) \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_v2_action_runs') \
+                      AND attname = 'operator_hard_deadline' AND NOT attisdropped \
+                ) \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
                     WHERE attrelid = to_regclass('meeting_v2_config') \
                       AND attname = 'action_finalization_ms' AND NOT attisdropped \
+                ) \
+                AND EXISTS ( \
+                    SELECT 1 FROM pg_attribute \
+                    WHERE attrelid = to_regclass('meeting_v2_config') \
+                      AND attname = 'action_operator_hard_cap_ms' AND NOT attisdropped \
                 ) \
                 AND EXISTS ( \
                     SELECT 1 FROM pg_attribute \
@@ -2081,6 +2116,17 @@ mod tests {
         let roster = vec![first_agent.clone(), second_agent.clone(), human];
 
         let mut tx = pool.begin().await.expect("begin missing-capability check");
+        assert_eq!(
+            action_roster_missing_capability_tx(
+                &mut tx,
+                community_id,
+                &roster,
+                buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
+            )
+            .await
+            .expect("list incomplete Agent rollout"),
+            vec![second_agent.clone()],
+        );
         assert!(!action_roster_supports_capability_tx(
             &mut tx,
             community_id,
@@ -3008,6 +3054,134 @@ mod tests {
         )
         .expect("parse first action run id");
 
+        assert!(began_one.response["lease_ttl_ms"]
+            .as_i64()
+            .is_some_and(|ttl| ttl > 0));
+        assert!(began_one.response["server_now_ms"].as_i64().is_some());
+        let revisions_before_renewal: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT state_revision, floor_revision, intent_revision, speech_revision \
+             FROM meeting_baton_state WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read revisions before Action renewal");
+        let board_event_hex = hex::encode(&created.board_event_id);
+        let renew_one = buzz_sdk::build_meeting_v2_action_lease_renew(
+            buzz_sdk::MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id: run_one,
+                    action_window: 1,
+                    board_event_id: &board_event_hex,
+                },
+                progress_seq: 1,
+                stage: buzz_sdk::MeetingV2ActionProgressStage::Reasoning,
+                last_activity_seq: 0,
+            },
+        )
+        .expect("build first Action renewal")
+        .sign_with_keys(&host_keys)
+        .expect("sign first Action renewal");
+        let renew_params = || crate::meeting_v2_actions::ActionCommandTxParams {
+            community_id,
+            session_id,
+            event: &renew_one,
+            command: crate::meeting_v2_actions::ActionCommand::Renew {
+                fence: crate::meeting_v2_actions::ActionRunFence {
+                    action_run_id: run_one,
+                    action_window_epoch: 1,
+                    board_event_id: created.board_event_id.clone(),
+                },
+                progress_seq: 1,
+                stage: crate::meeting_v2_actions::ActionProgressStage::Reasoning,
+                last_activity_seq: 0,
+            },
+            relay_keys: &relay_keys,
+        };
+        let renewed_one = crate::meeting_v2_actions::execute_action_command(&db, renew_params())
+            .await
+            .expect("renew first Action window");
+        assert!(renewed_one.accepted);
+        assert!(!renewed_one.duplicate);
+        assert_eq!(renewed_one.outcome_code, "action_lease_renewed");
+        assert_eq!(renewed_one.response["accepted_progress_seq"], 1);
+        assert!(renewed_one.response["lease_ttl_ms"]
+            .as_i64()
+            .is_some_and(|ttl| ttl > 0));
+        let replayed_renewal =
+            crate::meeting_v2_actions::execute_action_command(&db, renew_params())
+                .await
+                .expect("replay identical Action renewal");
+        assert!(replayed_renewal.accepted);
+        assert!(replayed_renewal.duplicate);
+        assert_eq!(replayed_renewal.response["accepted_progress_seq"], 1);
+        let revisions_after_renewal: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT state_revision, floor_revision, intent_revision, speech_revision \
+             FROM meeting_baton_state WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read revisions after Action renewal");
+        assert_eq!(revisions_after_renewal.0, revisions_before_renewal.0 + 1);
+        assert_eq!(revisions_after_renewal.1, revisions_before_renewal.1);
+        assert_eq!(revisions_after_renewal.2, revisions_before_renewal.2);
+        assert_eq!(revisions_after_renewal.3, revisions_before_renewal.3);
+        let renewal_audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM meeting_v2_action_lease_renewals \
+             WHERE community_id = $1 AND session_id = $2 AND action_run_id = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(run_one)
+        .fetch_one(&pool)
+        .await
+        .expect("count Action renewal audit rows");
+        assert_eq!(renewal_audit_count, 1);
+
+        let conflicting_renewal = buzz_sdk::build_meeting_v2_action_lease_renew(
+            buzz_sdk::MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id: run_one,
+                    action_window: 1,
+                    board_event_id: &board_event_hex,
+                },
+                progress_seq: 1,
+                stage: buzz_sdk::MeetingV2ActionProgressStage::ToolCall,
+                last_activity_seq: 1,
+            },
+        )
+        .expect("build conflicting Action renewal")
+        .sign_with_keys(&host_keys)
+        .expect("sign conflicting Action renewal");
+        let conflict = crate::meeting_v2_actions::execute_action_command(
+            &db,
+            crate::meeting_v2_actions::ActionCommandTxParams {
+                community_id,
+                session_id,
+                event: &conflicting_renewal,
+                command: crate::meeting_v2_actions::ActionCommand::Renew {
+                    fence: crate::meeting_v2_actions::ActionRunFence {
+                        action_run_id: run_one,
+                        action_window_epoch: 1,
+                        board_event_id: created.board_event_id.clone(),
+                    },
+                    progress_seq: 1,
+                    stage: crate::meeting_v2_actions::ActionProgressStage::ToolCall,
+                    last_activity_seq: 1,
+                },
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect("reject reused Action renewal sequence");
+        assert!(!conflict.accepted);
+        assert_eq!(conflict.outcome_code, "progress_sequence_conflict");
+
         sqlx::query(
             "UPDATE meeting_v2_action_runs \
              SET action_deadline_at = clock_timestamp() - interval '1 second' \
@@ -3019,23 +3193,45 @@ mod tests {
         .execute(&pool)
         .await
         .expect("force first action deadline");
-        let due = crate::meeting_baton::claim_due_baton_sessions(&db, 100)
-            .await
-            .expect("claim action deadline");
-        assert!(due
-            .iter()
-            .any(|candidate| candidate.session_id == session_id));
-        let recovered =
-            crate::meeting_baton::recover_meeting_v1(&db, community_id, session_id, &relay_keys)
-                .await
-                .expect("recover action deadline through the shared sweeper path");
-        assert_eq!(
-            recovered
-                .iter()
-                .map(|transition| transition.primary_type.as_str())
-                .collect::<Vec<_>>(),
-            vec!["action_deadline_exceeded"]
-        );
+        let late_renewal = buzz_sdk::build_meeting_v2_action_lease_renew(
+            buzz_sdk::MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id: run_one,
+                    action_window: 1,
+                    board_event_id: &board_event_hex,
+                },
+                progress_seq: 2,
+                stage: buzz_sdk::MeetingV2ActionProgressStage::ToolResult,
+                last_activity_seq: 1,
+            },
+        )
+        .expect("build late Action renewal")
+        .sign_with_keys(&host_keys)
+        .expect("sign late Action renewal");
+        let late = crate::meeting_v2_actions::execute_action_command(
+            &db,
+            crate::meeting_v2_actions::ActionCommandTxParams {
+                community_id,
+                session_id,
+                event: &late_renewal,
+                command: crate::meeting_v2_actions::ActionCommand::Renew {
+                    fence: crate::meeting_v2_actions::ActionRunFence {
+                        action_run_id: run_one,
+                        action_window_epoch: 1,
+                        board_event_id: created.board_event_id.clone(),
+                    },
+                    progress_seq: 2,
+                    stage: crate::meeting_v2_actions::ActionProgressStage::ToolResult,
+                    last_activity_seq: 1,
+                },
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect("late renewal must trigger lazy due recovery");
+        assert!(!late.accepted);
+        assert_eq!(late.outcome_code, "action_deadline_recovered");
         let recovered_action: (String, Option<DateTime<Utc>>, Option<String>) = sqlx::query_as(
             "SELECT action_condition, action_deadline_at, last_error_code \
                  FROM meeting_v2_action_runs \
@@ -3052,7 +3248,7 @@ mod tests {
             (
                 "blocked".to_string(),
                 None,
-                Some("action_deadline_exceeded".to_string())
+                Some("action_lease_expired".to_string())
             )
         );
 
@@ -3090,7 +3286,6 @@ mod tests {
             .await
             .expect("rollback rejected premature close");
 
-        let board_event_hex = hex::encode(&created.board_event_id);
         let retry_one =
             buzz_sdk::build_meeting_v2_action_retry(buzz_sdk::MeetingV2ActionCommandParams {
                 session_id,
@@ -3128,8 +3323,47 @@ mod tests {
         );
         assert_eq!(
             retried_one.response["details"]["retry_reason"],
-            "action_deadline_exceeded"
+            "action_lease_expired"
         );
+        let old_window_renewal = buzz_sdk::build_meeting_v2_action_lease_renew(
+            buzz_sdk::MeetingV2ActionLeaseRenewParams {
+                session_id,
+                fence: buzz_sdk::MeetingV2ActionRunFence {
+                    action_run_id: run_one,
+                    action_window: 1,
+                    board_event_id: &board_event_hex,
+                },
+                progress_seq: 2,
+                stage: buzz_sdk::MeetingV2ActionProgressStage::Finalizing,
+                last_activity_seq: 2,
+            },
+        )
+        .expect("build old-window renewal")
+        .sign_with_keys(&host_keys)
+        .expect("sign old-window renewal");
+        let old_window = crate::meeting_v2_actions::execute_action_command(
+            &db,
+            crate::meeting_v2_actions::ActionCommandTxParams {
+                community_id,
+                session_id,
+                event: &old_window_renewal,
+                command: crate::meeting_v2_actions::ActionCommand::Renew {
+                    fence: crate::meeting_v2_actions::ActionRunFence {
+                        action_run_id: run_one,
+                        action_window_epoch: 1,
+                        board_event_id: created.board_event_id.clone(),
+                    },
+                    progress_seq: 2,
+                    stage: crate::meeting_v2_actions::ActionProgressStage::Finalizing,
+                    last_activity_seq: 2,
+                },
+                relay_keys: &relay_keys,
+            },
+        )
+        .await
+        .expect("reject old-window renewal after Retry");
+        assert!(!old_window.accepted);
+        assert_eq!(old_window.outcome_code, "stale_action_window");
 
         // Aborting from action finalization is still a Meeting lifecycle
         // terminal, but it carries no successful recorded-actions attestation.

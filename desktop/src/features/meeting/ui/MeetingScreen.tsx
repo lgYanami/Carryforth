@@ -19,6 +19,7 @@ import type {
   MeetingSnapshot,
   MeetingSpeech,
 } from "@/shared/api/tauriMeetings";
+import { ensureMeetingActionRenewal } from "@/shared/api/tauriMeetings";
 import { setVisibleChannel } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
@@ -157,6 +158,26 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   const currentParticipant = snapshot?.participants.find(
     (participant) => participant.pubkey === normalizedPubkey,
   );
+  const humanAction =
+    snapshot?.policy === "moderated-board-actions-v3" &&
+    snapshot.lifecycle === "finalizing_actions" &&
+    snapshot.action?.condition === "runnable" &&
+    snapshot.action.terminalStatus === null &&
+    normalizedPubkey === snapshot.moderatorPubkey &&
+    currentParticipant?.participantType === "human"
+      ? snapshot.action
+      : null;
+  React.useEffect(() => {
+    if (!humanAction || meetingAuthority.status !== "current") return;
+    void ensureMeetingActionRenewal({
+      meetingId,
+      actionRunId: humanAction.actionRunId,
+      actionWindowEpoch: humanAction.actionWindowEpoch,
+      boardEventId: humanAction.boardEventId,
+    }).catch((error) => {
+      console.error("Failed to retain the Human Meeting Action lease", error);
+    });
+  }, [humanAction, meetingAuthority.status, meetingId]);
   const boardEditable = Boolean(
     snapshot &&
       snapshot.lifecycle === "active" &&

@@ -102,6 +102,11 @@ fn enter_action_phase(snapshot: &mut MeetingSnapshot, condition: &str) {
         terminal_status: None,
         completion_event_id: None,
         action_deadline_at_ms: (condition == "runnable").then_some(90_000),
+        progress_seq: 0,
+        last_progress_stage: None,
+        last_progress_at_ms: None,
+        operator_hard_deadline_ms: Some(3_600_000),
+        created_at_ms: Some(1_000),
         last_error_code: (condition == "blocked").then(|| "external_operation_failed".to_string()),
     });
 }

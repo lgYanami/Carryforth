@@ -35,7 +35,7 @@ function meetingSeed(
     description: "Recovery boundary fixture",
     sourceChannelId: null,
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey: CURRENT,
     moderatorPubkey: CURRENT,
     createEventId: "1".repeat(64),

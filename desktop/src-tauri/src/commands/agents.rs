@@ -14,7 +14,7 @@ use crate::{
         ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
         DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
-    relay::{relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::relay_ws_url_with_override,
     util::now_iso,
 };
 
@@ -671,7 +671,7 @@ pub async fn create_managed_agent(
     };
 
     // ── Phase 3: save record (sync lock) ───────────────────────────────────────
-    let (agent, resolved_avatar_url) = {
+    let (agent, profile_reconcile) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -920,9 +920,14 @@ pub async fn create_managed_agent(
         // is_builtin/persona-membership gate).
         retain_managed_agent_pending(&app, &state, record);
         let personas = load_personas(&app).unwrap_or_default();
+        let profile_reconcile = ProfileReconcileData::from_record(
+            record,
+            &personas,
+            relay_ws_url_with_override(&state),
+        );
         (
             build_managed_agent_summary(&app, record, &runtimes, &personas)?,
-            resolved_avatar_url,
+            profile_reconcile,
         )
     };
 
@@ -960,23 +965,12 @@ pub async fn create_managed_agent(
 
     try_regenerate_nest(&app);
 
-    // ── Phase 4: sync agent profile on relay (async, outside lock) ───────────
-    // Use the avatar persisted on the record so the published profile and any
-    // later reconciliation agree on the same value.
-    let profile_relay_url = crate::relay::effective_agent_relay_url(
-        &resolved_relay_url,
-        &relay_ws_url_with_override(&state),
-    );
-    let profile_sync_error = (sync_managed_agent_profile(
-        &state,
-        &profile_relay_url,
-        &agent_keys,
-        &name,
-        resolved_avatar_url.as_deref(),
-        auth_tag.as_deref(),
-    )
-    .await)
-        .err();
+    // ── Phase 4: sync metadata + verified runtime controls ──────────────────
+    // This covers new local Agents even when spawn-after-create is disabled.
+    // Provider Agents publish capabilities from the runtime they actually
+    // launch; Desktop still publishes their ordinary metadata.
+    let profile_sync_error =
+        (reconcile_agent_profile(&state, &app, &pubkey, &profile_reconcile).await).err();
 
     // ── Phase 5: provider deploy (async, outside lock) ───────────────────────
     let spawn_error = if input.spawn_after_create && input.backend != BackendKind::Local {
@@ -1082,19 +1076,11 @@ pub async fn start_managed_agent(
         // profile reconcile (the create-time snapshot may be empty or stale for
         // a persona-inherited harness).
         let reconcile_personas = load_personas(&app).unwrap_or_default();
-        let reconcile_effective_command =
-            crate::managed_agents::record_agent_command(record, &reconcile_personas);
-
-        let reconcile = ProfileReconcileData {
-            private_key_nsec: record.private_key_nsec.clone(),
-            name: record.name.clone(),
-            relay_url: record.relay_url.clone(),
-            avatar_url: record.avatar_url.clone(),
-            auth_tag: record.auth_tag.clone(),
-            pubkey: record.pubkey.clone(),
-            agent_command: reconcile_effective_command,
-            persona_id: record.persona_id.clone(),
-        };
+        let reconcile = ProfileReconcileData::from_record(
+            record,
+            &reconcile_personas,
+            relay_ws_url_with_override(&state),
+        );
 
         let target = if record.backend == BackendKind::Local {
             StartTarget::Local

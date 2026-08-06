@@ -50,6 +50,11 @@ function meetingSeed(input: {
             condition === "runnable"
               ? now + (input.expired ? -10_000 : 180_000)
               : null,
+          progressSeq: 2,
+          lastProgressStage: "waiting_human",
+          lastProgressAtMs: now - 5_000,
+          operatorHardDeadlineMs: now + 3_600_000,
+          createdAtMs: now - 30_000,
           lastErrorCode:
             condition === "blocked" ? "external_operation_failed" : null,
         }
@@ -87,7 +92,7 @@ function meetingSeed(input: {
     description: "Record the final Board actions without a Meeting Plan.",
     sourceChannelId: null,
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey: moderatorPubkey,
     moderatorPubkey,
     createEventId: "5".repeat(64),

@@ -3059,6 +3059,11 @@ async function handleMeetingActionFinalization(
         terminalStatus: null,
         completionEventId: null,
         actionDeadlineAtMs: now + 180_000,
+        progressSeq: 0,
+        lastProgressStage: null,
+        lastProgressAtMs: null,
+        operatorHardDeadlineMs: now + 3_600_000,
+        createdAtMs: now,
         lastErrorCode: null,
       };
       host.boardControl.phase = "finalizing_actions";
@@ -3092,6 +3097,9 @@ async function handleMeetingActionFinalization(
       snapshot.action.condition = "runnable";
       snapshot.action.actionWindowEpoch += 1;
       snapshot.action.actionDeadlineAtMs = now + 180_000;
+      snapshot.action.progressSeq = 0;
+      snapshot.action.lastProgressStage = null;
+      snapshot.action.lastProgressAtMs = null;
       snapshot.action.lastErrorCode = null;
       advanceMockMeetingState(snapshot);
       break;
@@ -3587,7 +3595,7 @@ async function handleCreateMeeting(
     description: input.description ?? null,
     sourceChannelId: input.sourceChannelId ?? null,
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey,
     moderatorPubkey: hostPubkey,
     createEventId: eventId,
@@ -11723,6 +11731,8 @@ export function maybeInstallE2eTauriMocks() {
           payload as { input: MeetingActionFinalizationInput },
           activeConfig,
         );
+      case "ensure_meeting_action_renewal":
+        return { status: "already_active" };
       case "list_meetings": {
         const { meetingIds } = payload as { meetingIds: string[] };
         if (meetingIds.length > 64) {

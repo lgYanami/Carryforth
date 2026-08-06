@@ -1032,13 +1032,73 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
-    use nostr::{EventBuilder, Kind};
-    let builder = EventBuilder::new(
-        Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
-        &content,
-    )
-    .tags([]);
+    // kind:10100 is one complete replaceable Agent-control snapshot. Preserve
+    // runtime capabilities when changing only channel policy; publishing a
+    // policy-only event would make discovery report an empty capability list
+    // even though the Relay DB deliberately preserves the prior value.
+    let filter = serde_json::json!({
+        "authors": [client.public_key().to_hex()],
+        "kinds": [buzz_sdk::kind::KIND_AGENT_PROFILE],
+        "limit": 1
+    });
+    let raw = client.query(&filter).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| {
+        CliError::Other(format!("failed to parse Agent profile query: {error}"))
+    })?;
+    let current = events.iter().max_by(|left, right| {
+        let left_key = (
+            left.get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            left.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        );
+        let right_key = (
+            right
+                .get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            right
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        );
+        left_key.cmp(&right_key)
+    });
+    let mut capabilities = current
+        .and_then(|event| event.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .and_then(|content| content.get("capabilities").cloned())
+        .map(serde_json::from_value::<Vec<String>>)
+        .transpose()
+        .map_err(|error| CliError::Other(format!("invalid Agent capability profile: {error}")))?
+        .unwrap_or_default();
+    capabilities.sort();
+    capabilities.dedup();
+    let capability_refs = capabilities.iter().map(String::as_str).collect::<Vec<_>>();
+    let prior_created_at = current
+        .and_then(|event| event.get("created_at"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let display_name = current
+        .and_then(|event| event.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .and_then(|content| {
+            content
+                .get("display_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let created_at = nostr::Timestamp::now()
+        .as_secs()
+        .max(prior_created_at.saturating_add(1));
+    let builder =
+        buzz_sdk::build_agent_profile_controls(policy, &capability_refs, display_name.as_deref())
+            .map_err(|error| CliError::Other(format!("build Agent profile controls: {error}")))?
+            .custom_created_at(nostr::Timestamp::from(created_at));
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;

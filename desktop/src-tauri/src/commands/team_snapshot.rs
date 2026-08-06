@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    commands::{export_util::save_bytes_with_dialog, personas::resolve_snapshot_import_behavior},
+    commands::{
+        export_util::save_bytes_with_dialog, personas::resolve_snapshot_import_behavior,
+        reconcile_agent_profile, ProfileReconcileData,
+    },
     managed_agents::team_snapshot::{
         build_team_snapshot, decode_team_snapshot_json, decode_team_snapshot_png,
         encode_team_snapshot_json, encode_team_snapshot_png, TeamSnapshot,
@@ -20,7 +23,7 @@ use crate::{
         load_managed_agents, load_personas, load_teams, load_teams_readonly, save_managed_agents,
         save_personas, save_teams, AgentDefinition, ManagedAgentRecord, TeamRecord,
     },
-    relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::relay_ws_url_with_override,
     util::now_iso,
 };
 
@@ -258,7 +261,6 @@ struct MintedMember {
     pubkey: String,
     auth_tag: Option<String>,
     display_name: String,
-    effective_avatar: Option<String>,
 }
 
 fn build_team_export_snapshot(
@@ -487,7 +489,8 @@ pub async fn preview_team_snapshot_import(
 ///      surfacing rollback failures alongside the original error. This makes
 ///      the store phase all-or-none for ordinary application errors; a process
 ///      crash between atomic file commits is NOT covered.
-///   4. Profile sync — for each member, call `sync_managed_agent_profile`.
+///   4. Profile sync — reconcile metadata and exact local-harness capability
+///      state for every member.
 ///      Best-effort; errors are collected per member.
 ///   5. Memory restore — for each member with non-empty snapshot memory,
 ///      publish each entry as a `kind:30174` engram event. Best-effort.
@@ -616,7 +619,6 @@ pub async fn confirm_team_snapshot_import(
             pubkey,
             auth_tag,
             display_name,
-            effective_avatar: effective_avatar_url,
         });
     }
 
@@ -755,19 +757,27 @@ pub async fn confirm_team_snapshot_import(
     let mut member_results: Vec<TeamSnapshotImportMemberResult> = Vec::with_capacity(minted.len());
 
     for (m, snap_member) in minted.iter().zip(snapshot.members.iter()) {
-        let relay_url = effective_agent_relay_url(&m.record.relay_url, &relay_ws);
-
-        // Phase 4: profile sync (best-effort).
-        let profile_sync_error = sync_managed_agent_profile(
-            &state,
-            &relay_url,
-            &m.agent_keys,
-            &m.display_name,
-            m.effective_avatar.as_deref(),
-            m.auth_tag.as_deref(),
-        )
-        .await
-        .err();
+        let relay_url = crate::relay::effective_agent_relay_url(&m.record.relay_url, &relay_ws);
+        // Phase 4: metadata + exact local-harness capability sync
+        // (best-effort). Every imported member gets the same lifecycle as a
+        // normally-created Agent, even before its first process start.
+        let profile_reconcile = ProfileReconcileData {
+            private_key_nsec: m.record.private_key_nsec.clone(),
+            name: m.record.name.clone(),
+            relay_url: m.record.relay_url.clone(),
+            workspace_relay_url: relay_ws.clone(),
+            acp_command: m.record.acp_command.clone(),
+            backend: m.record.backend.clone(),
+            avatar_url: m.record.avatar_url.clone(),
+            auth_tag: m.record.auth_tag.clone(),
+            pubkey: m.record.pubkey.clone(),
+            agent_command: m.record.agent_command.clone(),
+            persona_id: m.record.persona_id.clone(),
+        };
+        let profile_sync_error =
+            reconcile_agent_profile(&state, &app, &m.pubkey, &profile_reconcile)
+                .await
+                .err();
 
         // Phase 5: memory restore (best-effort).
         let memory_total = snap_member.memory.entries.len();

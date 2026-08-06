@@ -156,7 +156,7 @@ function meetingSeed(input: {
     description: "Exercise the complete Human host discussion lifecycle.",
     sourceChannelId: null,
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey: moderatorPubkey,
     moderatorPubkey,
     createEventId: "5".repeat(64),

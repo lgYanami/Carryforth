@@ -12,12 +12,13 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     app_state::AppState,
+    commands::{reconcile_agent_profile, ProfileReconcileData},
     managed_agents::{
         agent_snapshot::{decode_snapshot_json, decode_snapshot_png, MemoryLevel},
         load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
         ManagedAgentRecord, RespondTo,
     },
-    relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::relay_ws_url_with_override,
     util::now_iso,
 };
 
@@ -297,8 +298,8 @@ pub async fn preview_agent_snapshot_import(
 ///   2. Mint — generate a new keypair + NIP-OA auth tag; create a
 ///      `AgentDefinition` + `ManagedAgentRecord` through the same primitives
 ///      used by the normal create flow.
-///   3. Publish — kind:30175 definition via retention path; kind:0 profile
-///      via `sync_managed_agent_profile`.
+///   3. Publish — kind:30175 definition via retention path; reconcile kind:0
+///      metadata and exact local-harness capability state.
 ///   4. Memory — for each opted-in entry, build a fresh `kind:30174` event
 ///      with `engram::build_event` under the new agent↔owner conversation
 ///      key and POST it to the relay. Failures are collected and returned as
@@ -503,19 +504,26 @@ pub async fn confirm_agent_snapshot_import(
         (persona, record)
     };
 
-    // ── Phase 3b: publish kind:0 profile (async, outside lock) ───────────────
+    // ── Phase 3b: publish metadata + verified runtime controls ──────────────
+    let workspace_relay_url = relay_ws_url_with_override(&state);
     let relay_url =
-        effective_agent_relay_url(&record.relay_url, &relay_ws_url_with_override(&state));
-    let profile_sync_error = sync_managed_agent_profile(
-        &state,
-        &relay_url,
-        &agent_keys,
-        &display_name,
-        effective_avatar.as_deref(),
-        auth_tag.as_deref(),
-    )
-    .await
-    .err();
+        crate::relay::effective_agent_relay_url(&record.relay_url, &workspace_relay_url);
+    let profile_reconcile = ProfileReconcileData {
+        private_key_nsec: record.private_key_nsec.clone(),
+        name: record.name.clone(),
+        relay_url: record.relay_url.clone(),
+        workspace_relay_url,
+        acp_command: record.acp_command.clone(),
+        backend: record.backend.clone(),
+        avatar_url: record.avatar_url.clone(),
+        auth_tag: record.auth_tag.clone(),
+        pubkey: record.pubkey.clone(),
+        agent_command: record.agent_command.clone(),
+        persona_id: record.persona_id.clone(),
+    };
+    let profile_sync_error = reconcile_agent_profile(&state, &app, &pubkey, &profile_reconcile)
+        .await
+        .err();
 
     // ── Phase 4: restore memory (async, outside lock) ─────────────────────────
     let memory_total = snapshot.memory.entries.len();

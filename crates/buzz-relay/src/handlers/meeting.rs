@@ -37,6 +37,9 @@ pub async fn handle_speech(
         MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
             super::meeting_baton::handle_speech(tenant, state, event, protocol).await
         }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => Err(IngestError::Rejected(
+            "conflict: moderated-board-actions-v2 Meetings are read-only history".into(),
+        )),
     }
 }
 

@@ -195,6 +195,17 @@ export type MeetingActionState = {
   terminalStatus: string | null;
   completionEventId: string | null;
   actionDeadlineAtMs: number | null;
+  progressSeq: number;
+  lastProgressStage:
+    | "reasoning"
+    | "tool_call"
+    | "tool_result"
+    | "finalizing"
+    | "waiting_human"
+    | null;
+  lastProgressAtMs: number | null;
+  operatorHardDeadlineMs: number | null;
+  createdAtMs: number | null;
   lastErrorCode: string | null;
 };
 
@@ -215,7 +226,10 @@ export type MeetingSnapshot = {
   description: string | null;
   sourceChannelId: string | null;
   schemaVersion: 3;
-  policy: "moderated-board-v1" | "moderated-board-actions-v2";
+  policy:
+    | "moderated-board-v1"
+    | "moderated-board-actions-v2"
+    | "moderated-board-actions-v3";
   hostPubkey: string;
   moderatorPubkey: string;
   createEventId: string;
@@ -540,6 +554,17 @@ export type MeetingActionFinalizationResult =
       message: string;
     };
 
+export type EnsureMeetingActionRenewalInput = {
+  meetingId: string;
+  actionRunId: string;
+  actionWindowEpoch: number;
+  boardEventId: string;
+};
+
+export type EnsureMeetingActionRenewalResult = {
+  status: "started" | "already_active";
+};
+
 export async function getMeetingCapability(): Promise<MeetingCapability> {
   return invokeTauri<MeetingCapability>("get_meeting_capability");
 }
@@ -571,6 +596,15 @@ export async function submitMeetingActionFinalization(
 ): Promise<MeetingActionFinalizationResult> {
   return invokeTauri<MeetingActionFinalizationResult>(
     "submit_meeting_action_finalization",
+    { input },
+  );
+}
+
+export async function ensureMeetingActionRenewal(
+  input: EnsureMeetingActionRenewalInput,
+): Promise<EnsureMeetingActionRenewalResult> {
+  return invokeTauri<EnsureMeetingActionRenewalResult>(
+    "ensure_meeting_action_renewal",
     { input },
   );
 }

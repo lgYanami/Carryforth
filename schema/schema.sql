@@ -206,7 +206,8 @@ CREATE TABLE meeting_sessions (
             'moderated-baton-v1',
             'moderated-board-v1',
             'moderated-board-actions-v1',
-            'moderated-board-actions-v2'
+            'moderated-board-actions-v2',
+            'moderated-board-actions-v3'
         )),
     CONSTRAINT chk_meeting_protocol_shape
         CHECK (
@@ -222,7 +223,8 @@ CREATE TABLE meeting_sessions (
                 AND floor_policy_version IN (
                     'moderated-board-v1',
                     'moderated-board-actions-v1',
-                    'moderated-board-actions-v2'
+                    'moderated-board-actions-v2',
+                    'moderated-board-actions-v3'
                 )
                 AND moderator_pubkey = host_pubkey)
         ),
@@ -632,7 +634,8 @@ CREATE TABLE meeting_v2_config (
     session_id          UUID NOT NULL,
     timing_profile_version TEXT NOT NULL,
     board_maintenance_ms BIGINT NOT NULL,
-    action_finalization_ms BIGINT NOT NULL DEFAULT 300000,
+    action_finalization_ms BIGINT NOT NULL DEFAULT 90000,
+    action_operator_hard_cap_ms BIGINT DEFAULT 3600000,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (community_id, session_id),
     FOREIGN KEY (community_id, session_id)
@@ -642,7 +645,11 @@ CREATE TABLE meeting_v2_config (
     CONSTRAINT chk_meeting_v2_board_maintenance_ms
         CHECK (board_maintenance_ms BETWEEN 1 AND 86400000),
     CONSTRAINT chk_meeting_v2_action_finalization_ms
-        CHECK (action_finalization_ms BETWEEN 1 AND 86400000)
+        CHECK (action_finalization_ms BETWEEN 1 AND 86400000),
+    CONSTRAINT chk_meeting_v2_action_operator_hard_cap_ms CHECK (
+        action_operator_hard_cap_ms IS NULL
+        OR action_operator_hard_cap_ms BETWEEN 300000 AND 86400000
+    )
 );
 
 CREATE TABLE meeting_v2_board_command_receipts (
@@ -702,6 +709,10 @@ CREATE TABLE meeting_v2_action_runs (
     completion_event_id BYTEA,
     action_deadline_at  TIMESTAMPTZ,
     last_error_code     TEXT,
+    progress_seq        BIGINT NOT NULL DEFAULT 0,
+    last_progress_stage TEXT,
+    last_progress_at    TIMESTAMPTZ,
+    operator_hard_deadline TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     terminal_at         TIMESTAMPTZ,
@@ -738,6 +749,20 @@ CREATE TABLE meeting_v2_action_runs (
             last_error_code IS NULL
             OR OCTET_LENGTH(last_error_code) BETWEEN 1 AND 128
         ),
+    CONSTRAINT chk_meeting_v2_action_progress_seq CHECK (progress_seq >= 0),
+    CONSTRAINT chk_meeting_v2_action_progress_stage CHECK (
+        last_progress_stage IS NULL
+        OR last_progress_stage IN (
+            'reasoning', 'tool_call', 'tool_result', 'finalizing', 'waiting_human'
+        )
+    ),
+    CONSTRAINT chk_meeting_v2_action_progress_shape CHECK (
+        (progress_seq = 0 AND last_progress_stage IS NULL AND last_progress_at IS NULL)
+        OR (progress_seq > 0 AND last_progress_stage IS NOT NULL AND last_progress_at IS NOT NULL)
+    ),
+    CONSTRAINT chk_meeting_v2_action_operator_deadline CHECK (
+        operator_hard_deadline IS NULL OR operator_hard_deadline > created_at
+    ),
     CONSTRAINT chk_meeting_v2_action_live_shape CHECK (
         (
             terminal_status IS NULL
@@ -809,7 +834,7 @@ CREATE TABLE meeting_v2_action_command_receipts (
     CONSTRAINT chk_meeting_v2_action_receipt_author
         CHECK (LENGTH(author_pubkey) = 32),
     CONSTRAINT chk_meeting_v2_action_receipt_action CHECK (
-        action IN ('begin', 'block', 'retry', 'return-to-board')
+        action IN ('begin', 'renew', 'block', 'retry', 'return-to-board')
     ),
     CONSTRAINT chk_meeting_v2_action_receipt_window
         CHECK (action_window_epoch IS NULL OR action_window_epoch > 0),
@@ -825,6 +850,38 @@ CREATE INDEX idx_meeting_v2_action_receipts_session
         session_id,
         recorded_at,
         command_event_id
+    );
+
+CREATE TABLE meeting_v2_action_lease_renewals (
+    community_id        UUID NOT NULL REFERENCES communities(id),
+    session_id          UUID NOT NULL,
+    action_run_id       UUID NOT NULL,
+    action_window_epoch BIGINT NOT NULL,
+    progress_seq        BIGINT NOT NULL,
+    renewal_event_id    BYTEA NOT NULL,
+    stage               TEXT NOT NULL,
+    last_activity_seq   BIGINT NOT NULL,
+    accepted_at         TIMESTAMPTZ NOT NULL,
+    lease_expires_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (
+        community_id, session_id, action_run_id, action_window_epoch, progress_seq
+    ),
+    UNIQUE (community_id, renewal_event_id),
+    FOREIGN KEY (community_id, session_id, action_run_id)
+        REFERENCES meeting_v2_action_runs (community_id, session_id, action_run_id),
+    CONSTRAINT chk_meeting_v2_action_renewal_window CHECK (action_window_epoch > 0),
+    CONSTRAINT chk_meeting_v2_action_renewal_progress CHECK (progress_seq > 0),
+    CONSTRAINT chk_meeting_v2_action_renewal_event CHECK (LENGTH(renewal_event_id) = 32),
+    CONSTRAINT chk_meeting_v2_action_renewal_stage CHECK (
+        stage IN ('reasoning', 'tool_call', 'tool_result', 'finalizing', 'waiting_human')
+    ),
+    CONSTRAINT chk_meeting_v2_action_renewal_activity CHECK (last_activity_seq >= 0),
+    CONSTRAINT chk_meeting_v2_action_renewal_expiry CHECK (lease_expires_at > accepted_at)
+);
+
+CREATE INDEX idx_meeting_v2_action_renewals_session
+    ON meeting_v2_action_lease_renewals (
+        community_id, session_id, accepted_at, progress_seq
     );
 
 CREATE TABLE meeting_baton_config (

@@ -17,6 +17,7 @@ use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::{
     ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeSupervisionStatus,
 };
+use crate::meeting_runtime::MeetingActionRenewalRuntime;
 
 mod key_file;
 use crate::pending_writes::PendingWrites;
@@ -126,6 +127,8 @@ pub struct AppState {
     pub mesh_coordinator: AsyncMutex<Option<crate::mesh_llm::MeshCoordinator>>,
     /// Late Relay projections and exact-retry commands, target/signer bound.
     pub(crate) pending_writes: PendingWrites,
+    /// Human-hosted Action lease renewal tasks, scoped to Community + identity.
+    pub(crate) meeting_action_renewals: MeetingActionRenewalRuntime,
 }
 
 /// Parse the `BUZZ_PRIVATE_KEY` env var into identity keys. `Some` means the
@@ -224,6 +227,7 @@ pub fn build_app_state() -> AppState {
         #[cfg(feature = "mesh-llm")]
         mesh_coordinator: AsyncMutex::new(None),
         pending_writes: PendingWrites::default(),
+        meeting_action_renewals: MeetingActionRenewalRuntime::default(),
     }
 }
 

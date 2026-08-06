@@ -11,14 +11,18 @@ use buzz_sdk_pkg::{
     MeetingV2EndOutcome,
 };
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    meeting_runtime::{
+        MeetingActionRenewalBinding, MeetingActionRenewalRegistration, RegisterMeetingActionRenewal,
+    },
     pending_writes::PendingMeetingCommand,
     relay::{
         parse_command_response, relay_api_base_url_with_override, submit_signed_event_at_with_keys,
+        submit_signed_event_at_with_keys_typed, RelayHttpError, RelayHttpErrorCategory,
         SubmitEventResponse,
     },
 };
@@ -152,6 +156,88 @@ struct ValidatedInput {
 struct ValidatedReceipt {
     state_revision: Option<i64>,
     duplicate: bool,
+}
+
+const HUMAN_ACTION_RENEW_CADENCE: std::time::Duration = std::time::Duration::from_secs(25);
+const HUMAN_ACTION_RENEW_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const ACTION_LEASE_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Exact canonical Action window for which Desktop should retain a Human claim.
+pub struct EnsureMeetingActionRenewalInput {
+    meeting_id: String,
+    action_run_id: String,
+    action_window_epoch: u64,
+    board_event_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EnsureMeetingActionRenewalResult {
+    Started,
+    AlreadyActive,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenewalReceipt {
+    meeting_id: String,
+    accepted: bool,
+    outcome: String,
+    action_run_id: Option<Uuid>,
+    action_window_epoch: Option<i64>,
+    state_revision: Option<i64>,
+    lease_ttl_ms: Option<i64>,
+    operator_hard_remaining_ms: Option<i64>,
+    accepted_progress_seq: Option<i64>,
+}
+
+struct PreparedRenewal {
+    event: nostr::Event,
+    progress_seq: u64,
+}
+
+/// Ensure that the current frozen Human moderator retains the exact runnable
+/// Action lease even after React navigates away from the Meeting screen.
+#[tauri::command]
+pub async fn ensure_meeting_action_renewal(
+    input: EnsureMeetingActionRenewalInput,
+    app: AppHandle,
+) -> Result<EnsureMeetingActionRenewalResult, String> {
+    let meeting_id = canonical_uuid(&input.meeting_id, "Meeting ID")?;
+    let action_run_id = canonical_uuid(&input.action_run_id, "Meeting action run ID")?;
+    if input.action_window_epoch == 0 {
+        return Err("Meeting action window must be positive".to_string());
+    }
+    canonical_hex64(&input.board_event_id, "Meeting action Board event")?;
+
+    let state = app.state::<AppState>();
+    let api_base_url = relay_api_base_url_with_override(&state);
+    let keys = state.signing_keys()?;
+    let signer_pubkey = keys.public_key().to_hex();
+    let binding = MeetingActionRenewalBinding {
+        api_base_url,
+        signer_pubkey,
+        meeting_id,
+        action_run_id,
+        action_window_epoch: input.action_window_epoch,
+        board_event_id: input.board_event_id,
+    };
+    let Some(_) = load_exact_human_action_snapshot(&state, &binding).await? else {
+        return Err(
+            "only the frozen Human moderator can renew the current runnable Action window"
+                .to_string(),
+        );
+    };
+    match state.meeting_action_renewals.register(binding)? {
+        RegisterMeetingActionRenewal::Existing => {
+            Ok(EnsureMeetingActionRenewalResult::AlreadyActive)
+        }
+        RegisterMeetingActionRenewal::Started(registration) => {
+            tauri::async_runtime::spawn(run_human_action_renewal(app.clone(), registration));
+            Ok(EnsureMeetingActionRenewalResult::Started)
+        }
+    }
 }
 
 /// Submit one Human-hosted Meeting action-finalization decision.
@@ -551,6 +637,270 @@ fn indeterminate_result(
         action: pending.action.clone(),
         message,
     }
+}
+
+struct HumanActionHead {
+    keys: nostr::Keys,
+    progress_seq: u64,
+}
+
+async fn load_exact_human_action_snapshot(
+    state: &AppState,
+    binding: &MeetingActionRenewalBinding,
+) -> Result<Option<HumanActionHead>, String> {
+    if relay_api_base_url_with_override(state) != binding.api_base_url {
+        return Ok(None);
+    }
+    let keys = state.signing_keys()?;
+    if keys.public_key().to_hex() != binding.signer_pubkey {
+        return Ok(None);
+    }
+    let Some(identity) = read_meeting_identity_at(state, &binding.api_base_url).await? else {
+        return Ok(None);
+    };
+    let loaded = load_meeting_snapshot_at(
+        state,
+        &identity,
+        &binding.meeting_id,
+        &binding.api_base_url,
+        &keys,
+    )
+    .await
+    .map_err(super::read_error_message)?;
+    let MeetingLoadResult::Ready { snapshot } = loaded else {
+        return Ok(None);
+    };
+    if snapshot.policy != buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
+        || !matches!(snapshot.lifecycle, MeetingLifecycle::FinalizingActions)
+        || snapshot.moderator_pubkey != binding.signer_pubkey
+        || !snapshot.participants.iter().any(|participant| {
+            participant.pubkey == binding.signer_pubkey
+                && participant.participant_type == MeetingParticipantType::Human
+        })
+    {
+        return Ok(None);
+    }
+    let Some(action) = snapshot.action.as_ref() else {
+        return Ok(None);
+    };
+    if action.action_run_id != binding.action_run_id
+        || action.action_window_epoch != binding.action_window_epoch
+        || action.board_event_id != binding.board_event_id
+        || action.board_event_id != snapshot.board.event_id
+        || action.condition != "runnable"
+        || action.terminal_status.is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(HumanActionHead {
+        keys,
+        progress_seq: action.progress_seq,
+    }))
+}
+
+fn prepare_human_action_renewal(
+    binding: &MeetingActionRenewalBinding,
+    head: &HumanActionHead,
+) -> Result<PreparedRenewal, String> {
+    let session_id = Uuid::parse_str(&binding.meeting_id)
+        .map_err(|error| format!("invalid Meeting ID after validation: {error}"))?;
+    let action_run_id = Uuid::parse_str(&binding.action_run_id)
+        .map_err(|error| format!("invalid Meeting action run after validation: {error}"))?;
+    let progress_seq = head
+        .progress_seq
+        .checked_add(1)
+        .ok_or_else(|| "Meeting action progress sequence overflow".to_string())?;
+    let event = buzz_sdk_pkg::build_meeting_v2_action_lease_renew(
+        buzz_sdk_pkg::MeetingV2ActionLeaseRenewParams {
+            session_id,
+            fence: MeetingV2ActionRunFence {
+                action_run_id,
+                action_window: binding.action_window_epoch,
+                board_event_id: &binding.board_event_id,
+            },
+            progress_seq,
+            stage: buzz_sdk_pkg::MeetingV2ActionProgressStage::WaitingHuman,
+            last_activity_seq: 0,
+        },
+    )
+    .map_err(|error| format!("invalid Meeting Action renewal: {error}"))?
+    .sign_with_keys(&head.keys)
+    .map_err(|error| format!("failed to sign Meeting Action renewal: {error}"))?;
+    Ok(PreparedRenewal {
+        event,
+        progress_seq,
+    })
+}
+
+fn validated_renewal_delay(
+    response: &SubmitEventResponse,
+    binding: &MeetingActionRenewalBinding,
+    prepared: &PreparedRenewal,
+    request_started_at: std::time::Instant,
+) -> Result<std::time::Duration, String> {
+    if response.event_id != prepared.event.id.to_hex() {
+        return Err("renewal response event ID does not match the signed event".to_string());
+    }
+    let receipt: RenewalReceipt = parse_command_response(&response.message)?;
+    let expected_run = Uuid::parse_str(&binding.action_run_id)
+        .map_err(|error| format!("invalid Meeting action run after validation: {error}"))?;
+    if receipt.meeting_id != binding.meeting_id
+        || !receipt.accepted
+        || receipt.outcome != "action_lease_renewed"
+        || receipt.action_run_id != Some(expected_run)
+        || receipt.action_window_epoch != i64::try_from(binding.action_window_epoch).ok()
+        || receipt.accepted_progress_seq != i64::try_from(prepared.progress_seq).ok()
+        || receipt.state_revision.is_none_or(|revision| revision <= 0)
+    {
+        return Err("renewal receipt does not match the signed Action fence".to_string());
+    }
+    let lease_ttl_ms = receipt
+        .lease_ttl_ms
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| "renewal receipt has no positive lease TTL".to_string())?;
+    let mut local_deadline = request_started_at
+        .checked_add(std::time::Duration::from_millis(lease_ttl_ms))
+        .and_then(|deadline| deadline.checked_sub(ACTION_LEASE_SAFETY_MARGIN))
+        .ok_or_else(|| "renewal lease is inside the local safety margin".to_string())?;
+    if let Some(operator_ms) = receipt.operator_hard_remaining_ms {
+        let operator_ms = u64::try_from(operator_ms)
+            .map_err(|_| "renewal operator deadline has elapsed".to_string())?;
+        let operator_deadline = request_started_at
+            .checked_add(std::time::Duration::from_millis(operator_ms))
+            .and_then(|deadline| deadline.checked_sub(ACTION_LEASE_SAFETY_MARGIN))
+            .ok_or_else(|| "renewal operator deadline is inside the safety margin".to_string())?;
+        local_deadline = local_deadline.min(operator_deadline);
+    }
+    let remaining = local_deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err("renewal response arrived after the local safety deadline".to_string());
+    }
+    let half_remaining = remaining / 2;
+    Ok(HUMAN_ACTION_RENEW_CADENCE
+        .min(half_remaining)
+        .max(std::time::Duration::from_secs(1)))
+}
+
+async fn wait_for_renewal_tick(
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    delay: std::time::Duration,
+) -> bool {
+    if *cancel.borrow() {
+        return false;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        changed = cancel.changed() => changed.is_ok() && !*cancel.borrow(),
+    }
+}
+
+fn definitive_renewal_error(error: &RelayHttpError) -> bool {
+    !error.request_may_have_reached_relay
+        && matches!(
+            error.category,
+            RelayHttpErrorCategory::Forbidden
+                | RelayHttpErrorCategory::Conflict
+                | RelayHttpErrorCategory::Http
+                | RelayHttpErrorCategory::Malformed
+                | RelayHttpErrorCategory::Internal
+        )
+}
+
+async fn run_human_action_renewal(
+    app: AppHandle,
+    mut registration: MeetingActionRenewalRegistration,
+) {
+    let mut prepared: Option<PreparedRenewal> = None;
+    let mut delay = std::time::Duration::ZERO;
+    loop {
+        if !wait_for_renewal_tick(&mut registration.cancel, delay).await {
+            break;
+        }
+        let state = app.state::<AppState>();
+        let head = match load_exact_human_action_snapshot(&state, &registration.binding).await {
+            Ok(Some(head)) => head,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("buzz-desktop: Human Meeting Action renewal read failed: {error}");
+                delay = HUMAN_ACTION_RENEW_RETRY;
+                continue;
+            }
+        };
+        if prepared
+            .as_ref()
+            .is_some_and(|pending| head.progress_seq >= pending.progress_seq)
+        {
+            prepared = None;
+        }
+        if prepared.is_none() {
+            match prepare_human_action_renewal(&registration.binding, &head) {
+                Ok(event) => prepared = Some(event),
+                Err(error) => {
+                    eprintln!("buzz-desktop: Human Meeting Action renewal stopped: {error}");
+                    break;
+                }
+            }
+        }
+        let Some(pending) = prepared.as_ref() else {
+            break;
+        };
+        let request_started_at = std::time::Instant::now();
+        let submit = submit_signed_event_at_with_keys_typed(
+            &pending.event,
+            &state,
+            &registration.binding.api_base_url,
+            &head.keys,
+        );
+        let response = tokio::select! {
+            changed = registration.cancel.changed() => {
+                let _ = changed;
+                break;
+            }
+            response = submit => response,
+        };
+        match response {
+            Ok(response) => match validated_renewal_delay(
+                &response,
+                &registration.binding,
+                pending,
+                request_started_at,
+            ) {
+                Ok(next_delay) => {
+                    prepared = None;
+                    delay = next_delay;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "buzz-desktop: Human Meeting Action renewal receipt needs reconciliation: {error}"
+                    );
+                    delay = HUMAN_ACTION_RENEW_RETRY;
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "buzz-desktop: Human Meeting Action renewal submit failed: {}",
+                    error.message
+                );
+                if definitive_renewal_error(&error) {
+                    match load_exact_human_action_snapshot(&state, &registration.binding).await {
+                        Ok(Some(canonical))
+                            if canonical.progress_seq
+                                >= prepared.as_ref().map_or(0, |value| value.progress_seq) =>
+                        {
+                            prepared = None;
+                        }
+                        Ok(Some(_)) => break,
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
+                delay = HUMAN_ACTION_RENEW_RETRY;
+            }
+        }
+    }
+    app.state::<AppState>()
+        .meeting_action_renewals
+        .finish(&registration.key, registration.generation);
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ import {
   buildInitialMeetingBoard,
   checkMeetingSourceAccess,
   dedupeMeetingRosterCandidates,
+  describeMeetingCapabilityRejection,
   validateMeetingDraft,
 } from "./createMeetingModel.ts";
 
@@ -135,7 +136,7 @@ test("deduplicates roster sources and classifies Agent capability tri-state", ()
     [
       {
         pubkey: AGENT,
-        capabilities: ["meeting-v2-action-finalization-v2"],
+        capabilities: ["meeting-v2-action-finalization-v3"],
       },
       { pubkey: INCOMPATIBLE, capabilities: [] },
     ],
@@ -154,6 +155,23 @@ test("deduplicates roster sources and classifies Agent capability tri-state", ()
     "incompatible",
   );
   assert.equal(candidates.at(-1)?.actionCapability, "unknown");
+});
+
+test("maps a Relay roster-capability race back to Agent names", () => {
+  assert.equal(
+    describeMeetingCapabilityRejection(
+      `relay returned 400: restricted:meeting:roster_capability_missing capability=meeting-v2-action-finalization-v3 missing_agent_pubkeys=${AGENT},${INCOMPATIBLE}`,
+      [
+        { pubkey: AGENT, displayName: "Ready before submit" },
+        { pubkey: INCOMPATIBLE, displayName: "Downgraded Agent" },
+      ],
+    ),
+    "The Relay rejected this roster because Ready before submit, Downgraded Agent no longer advertise the required Meeting capability. Refresh and try again.",
+  );
+  assert.equal(
+    describeMeetingCapabilityRejection("unrelated failure", []),
+    null,
+  );
 });
 
 test("source access allows none/open and checks every private roster identity", () => {

@@ -33,6 +33,11 @@ pub struct MeetingActionState {
     pub(super) terminal_status: Option<String>,
     pub(super) completion_event_id: Option<String>,
     pub(super) action_deadline_at_ms: Option<i64>,
+    pub(super) progress_seq: u64,
+    pub(super) last_progress_stage: Option<String>,
+    pub(super) last_progress_at_ms: Option<i64>,
+    pub(super) operator_hard_deadline_ms: Option<i64>,
+    pub(super) created_at_ms: Option<i64>,
     pub(super) last_error_code: Option<String>,
 }
 
@@ -593,7 +598,35 @@ pub(super) struct ActionWire {
     #[serde(default)]
     pub(super) action_deadline_at_ms: Option<i64>,
     #[serde(default)]
+    pub(super) progress_seq: i64,
+    #[serde(default)]
+    pub(super) last_progress_stage: Option<String>,
+    #[serde(default)]
+    pub(super) last_progress_at_ms: Option<i64>,
+    #[serde(default)]
+    pub(super) operator_hard_deadline_ms: Option<i64>,
+    #[serde(default)]
+    pub(super) created_at_ms: Option<i64>,
+    #[serde(default)]
     pub(super) last_error_code: Option<String>,
+}
+
+pub(super) fn action_from_wire(action: &ActionWire) -> MeetingActionState {
+    MeetingActionState {
+        action_run_id: action.action_run_id.to_string(),
+        board_event_id: action.board_event_id.clone(),
+        action_window_epoch: action.action_window_epoch,
+        condition: action.condition.clone(),
+        terminal_status: action.terminal_status.clone(),
+        completion_event_id: action.completion_event_id.clone(),
+        action_deadline_at_ms: action.action_deadline_at_ms,
+        progress_seq: u64::try_from(action.progress_seq).unwrap_or_default(),
+        last_progress_stage: action.last_progress_stage.clone(),
+        last_progress_at_ms: action.last_progress_at_ms,
+        operator_hard_deadline_ms: action.operator_hard_deadline_ms,
+        created_at_ms: action.created_at_ms,
+        last_error_code: action.last_error_code.clone(),
+    }
 }
 
 #[derive(Debug, Deserialize)]

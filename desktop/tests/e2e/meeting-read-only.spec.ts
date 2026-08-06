@@ -180,7 +180,7 @@ function readyMeeting(input: {
     description: "Review the Meeting Desktop lifecycle and safe room split.",
     sourceChannelId: "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9",
     schemaVersion: 3,
-    policy: "moderated-board-actions-v2",
+    policy: "moderated-board-actions-v3",
     hostPubkey: HOST,
     moderatorPubkey: HOST,
     createEventId: "c".repeat(64),
@@ -220,6 +220,12 @@ function readyMeeting(input: {
             completionEventId: null,
             actionDeadlineAtMs:
               input.lifecycle === "aborted" ? null : (NOW + 600) * 1_000,
+            progressSeq: 1,
+            lastProgressStage: "reasoning",
+            lastProgressAtMs: (NOW + 10) * 1_000,
+            operatorHardDeadlineMs:
+              input.lifecycle === "aborted" ? null : (NOW + 3_600) * 1_000,
+            createdAtMs: NOW * 1_000,
             lastErrorCode: null,
           }
         : null,

@@ -52,6 +52,8 @@ pub(crate) enum MeetingProtocol {
     /// Meeting V2 moderator-maintained current board.
     ModeratedBoardV2,
     /// Meeting V2 with optional action finalization before normal close.
+    ModeratedBoardActionsV2Legacy,
+    /// Meeting V2 with renewable action finalization before normal close.
     ModeratedBoardActionsV2,
 }
 
@@ -61,6 +63,7 @@ impl MeetingProtocol {
             Self::UniformV0 => buzz_db::meeting_floor::FLOOR_POLICY_VERSION,
             Self::ModeratedBatonV1 => MEETING_V1_POLICY,
             Self::ModeratedBoardV2 => MEETING_V2_POLICY,
+            Self::ModeratedBoardActionsV2Legacy => buzz_sdk::MEETING_V2_ACTIONS_V2_POLICY,
             Self::ModeratedBoardActionsV2 => MEETING_V2_ACTIONS_POLICY,
         }
     }
@@ -69,7 +72,9 @@ impl MeetingProtocol {
         match self {
             Self::UniformV0 => 1,
             Self::ModeratedBatonV1 => 2,
-            Self::ModeratedBoardV2 | Self::ModeratedBoardActionsV2 => 3,
+            Self::ModeratedBoardV2
+            | Self::ModeratedBoardActionsV2Legacy
+            | Self::ModeratedBoardActionsV2 => 3,
         }
     }
 
@@ -82,6 +87,9 @@ impl MeetingProtocol {
             (1, buzz_db::meeting_floor::FLOOR_POLICY_VERSION) => Ok(Self::UniformV0),
             (2, MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
             (3, MEETING_V2_POLICY) => Ok(Self::ModeratedBoardV2),
+            (3, buzz_sdk::MEETING_V2_ACTIONS_V2_POLICY) => {
+                Ok(Self::ModeratedBoardActionsV2Legacy)
+            }
             (3, MEETING_V2_ACTIONS_POLICY) => Ok(Self::ModeratedBoardActionsV2),
             _ => Err(IngestError::Internal(format!(
                 "error: meeting has unsupported persisted protocol v={schema_version}, policy={floor_policy_version}"
@@ -90,11 +98,19 @@ impl MeetingProtocol {
     }
 
     pub(crate) const fn is_v2(self) -> bool {
-        matches!(self, Self::ModeratedBoardV2 | Self::ModeratedBoardActionsV2)
+        matches!(
+            self,
+            Self::ModeratedBoardV2
+                | Self::ModeratedBoardActionsV2Legacy
+                | Self::ModeratedBoardActionsV2
+        )
     }
 
     pub(crate) const fn has_action_finalization(self) -> bool {
-        matches!(self, Self::ModeratedBoardActionsV2)
+        matches!(
+            self,
+            Self::ModeratedBoardActionsV2Legacy | Self::ModeratedBoardActionsV2
+        )
     }
 }
 
@@ -415,6 +431,11 @@ async fn handle_meeting_create(
             }
             None
         }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => {
+            return Err(IngestError::Rejected(
+                "invalid: moderated-board-actions-v2 is read-only history".into(),
+            ));
+        }
     };
 
     let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
@@ -493,6 +514,11 @@ async fn handle_meeting_create(
             Some(host_pubkey.clone())
         }
         MeetingProtocol::UniformV0 => None,
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => {
+            return Err(IngestError::Rejected(
+                "invalid: moderated-board-actions-v2 is read-only history".into(),
+            ));
+        }
     };
 
     let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
@@ -516,20 +542,41 @@ async fn handle_meeting_create(
         state.config.meeting_v2_create_enabled,
         state.config.meeting_v2_direct_actions_create_enabled,
     )?;
-    if protocol == MeetingProtocol::ModeratedBoardActionsV2
-        && !buzz_db::meeting_v2::action_roster_supports_capability_tx(
+    if protocol == MeetingProtocol::ModeratedBoardActionsV2 {
+        let missing_agent_pubkeys = buzz_db::meeting_v2::action_roster_missing_capability_tx(
             &mut tx,
             tenant.community(),
             &participant_pubkeys,
             buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
         )
         .await
-        .map_err(map_meeting_db_error)?
-    {
-        return Err(IngestError::Rejected(format!(
-            "restricted: every Agent in the Meeting roster must advertise {}",
-            buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY
-        )));
+        .map_err(map_meeting_db_error)?;
+        if !missing_agent_pubkeys.is_empty() {
+            let missing_count = missing_agent_pubkeys.len();
+            let missing_agent_pubkeys = missing_agent_pubkeys
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join(",");
+            metrics::counter!(
+                "buzz_meeting_create_capability_rejected_total",
+                "community" => tenant.host().to_owned(),
+                "capability" => buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY
+            )
+            .increment(1);
+            warn!(
+                community = tenant.host(),
+                policy = MEETING_V2_ACTIONS_POLICY,
+                capability = buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY,
+                missing_count,
+                missing_agent_pubkeys,
+                "Meeting create rejected because roster Agents lack runtime capability"
+            );
+            return Err(IngestError::Rejected(format!(
+                "restricted:meeting:roster_capability_missing capability={} missing_agent_pubkeys={missing_agent_pubkeys}",
+                buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY
+            )));
+        }
     }
 
     let (created_participant_pubkeys, board_event_id) = match protocol {
@@ -641,6 +688,11 @@ async fn handle_meeting_create(
                     .collect::<Vec<_>>(),
                 Some(hex::encode(snapshot.board_event_id)),
             )
+        }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => {
+            return Err(IngestError::Rejected(
+                "invalid: moderated-board-actions-v2 is read-only history".into(),
+            ));
         }
     };
 
@@ -1036,6 +1088,11 @@ async fn handle_meeting_end(
                     ManualEndResult::ParticipantRevoked
                 }
             }
+        }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => {
+            return Err(IngestError::Rejected(
+                "conflict: moderated-board-actions-v2 Meetings are read-only history".into(),
+            ));
         }
     };
 
@@ -1685,6 +1742,9 @@ fn validate_meeting_end_protocol(
             }
             Ok(())
         }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => Err(IngestError::Rejected(
+            "conflict: moderated-board-actions-v2 Meetings are read-only history".into(),
+        )),
     }
 }
 

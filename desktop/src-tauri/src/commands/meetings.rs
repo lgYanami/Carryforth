@@ -9,7 +9,7 @@ pub use create::create_meeting;
 mod activity;
 pub use activity::get_meeting_activities;
 mod actions;
-pub use actions::submit_meeting_action_finalization;
+pub use actions::{ensure_meeting_action_renewal, submit_meeting_action_finalization};
 mod floor;
 pub use floor::submit_meeting_floor_action;
 mod host;
@@ -392,7 +392,11 @@ async fn load_meeting_snapshot_at(
     if schema_version != Some(buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION)
         || !matches!(
             policy,
-            Some(buzz_sdk_pkg::MEETING_V2_POLICY | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY)
+            Some(
+                buzz_sdk_pkg::MEETING_V2_POLICY
+                    | buzz_sdk_pkg::MEETING_V2_ACTIONS_V2_POLICY
+                    | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
+            )
         )
     {
         return Ok(MeetingLoadResult::UnsupportedProtocol {
@@ -585,8 +589,8 @@ async fn load_meeting_snapshot_at(
 mod projection;
 
 use projection::{
-    action_from_wire, parse_create, parse_current_board, parse_current_end, parse_speech,
-    parse_state, select_current_state, validate_participants,
+    parse_create, parse_current_board, parse_current_end, parse_speech, parse_state,
+    select_current_state, validate_participants,
 };
 
 fn handoff_from_wire(context: &HandoffContextWire) -> MeetingHandoffContext {

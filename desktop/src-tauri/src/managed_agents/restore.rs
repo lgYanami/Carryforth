@@ -103,8 +103,7 @@ pub async fn restore_managed_agents_on_launch(
     let state = app.state::<AppState>();
 
     // ── Phase A (under lock): housekeeping + collect agents to restore ──
-    let mut agents_to_start: Vec<super::ManagedAgentRecord>;
-    {
+    let (agents_to_start, profile_reconcile_items) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -192,7 +191,7 @@ pub async fn restore_managed_agents_on_launch(
                 to_start.push(record.clone());
             }
         }
-        agents_to_start = to_start;
+        let mut agents_to_start = to_start;
 
         // Re-snapshot persona config for agents about to be restored, matching
         // the interactive spawn path so auto-start agents also pick up the
@@ -222,6 +221,55 @@ pub async fn restore_managed_agents_on_launch(
         if changed {
             save_managed_agents(app, &records)?;
         }
+
+        // Reconcile every managed Agent in the active Community, not only
+        // auto-start records. Capability profiles are durable fleet state and
+        // must also self-heal for offline and pre-fix agents.
+        let reconcile_personas = super::load_personas(app).unwrap_or_default();
+        let profile_reconcile_items = records
+            .iter()
+            .filter(|record| !record.pubkey.is_empty())
+            .map(|record| {
+                let effective_command =
+                    crate::managed_agents::record_agent_command(record, &reconcile_personas);
+                (
+                    record.pubkey.clone(),
+                    crate::commands::ProfileReconcileData {
+                        private_key_nsec: record.private_key_nsec.clone(),
+                        name: record.name.clone(),
+                        relay_url: record.relay_url.clone(),
+                        workspace_relay_url: crate::relay::relay_ws_url_with_override(&state),
+                        acp_command: record.acp_command.clone(),
+                        backend: record.backend.clone(),
+                        avatar_url: record.avatar_url.clone(),
+                        auth_tag: record.auth_tag.clone(),
+                        pubkey: record.pubkey.clone(),
+                        agent_command: effective_command,
+                        persona_id: record.persona_id.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        (agents_to_start, profile_reconcile_items)
+    };
+
+    // One sequential background task avoids a boot-time request storm while
+    // ensuring every stored Agent (including offline records) converges.
+    if !profile_reconcile_items.is_empty() {
+        let reconcile_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            for (pubkey, data) in profile_reconcile_items {
+                let state = reconcile_app.state::<AppState>();
+                if let Err(error) =
+                    crate::commands::reconcile_agent_profile(&state, &reconcile_app, &pubkey, &data)
+                        .await
+                {
+                    eprintln!(
+                        "buzz-desktop: fleet profile reconciliation failed for agent {pubkey}: {error}"
+                    );
+                }
+            }
+        });
     }
 
     if agents_to_start.is_empty() {
@@ -359,8 +407,6 @@ pub async fn restore_managed_agents_on_launch(
         .lock()
         .map_err(|error| error.to_string())?;
 
-    let mut successfully_spawned: Vec<String> = Vec::new();
-
     for (pubkey, outcome) in spawn_results {
         match outcome {
             // Skipped means a concurrent reconcile already owns a live child for
@@ -391,7 +437,6 @@ pub async fn restore_managed_agents_on_launch(
                 record.last_exit_code = None;
                 record.last_error = None;
                 runtimes.insert(key, super::ManagedAgentPairRuntime::starting(process));
-                successfully_spawned.push(pubkey);
             }
             SpawnOutcome::Failed(error) => {
                 let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
@@ -403,57 +448,10 @@ pub async fn restore_managed_agents_on_launch(
         }
     }
 
-    // Collect profile reconciliation data for successfully spawned agents before
-    // releasing the lock. This mirrors the fire-and-forget pattern in
-    // start_managed_agent — ensuring boot-restored agents get the same profile
-    // self-healing as UI-started agents.
-    let reconcile_personas = super::load_personas(app).unwrap_or_default();
-    let reconcile_items: Vec<(String, crate::commands::ProfileReconcileData)> =
-        successfully_spawned
-            .iter()
-            .filter_map(|pubkey| {
-                let record = records.iter().find(|r| r.pubkey == *pubkey)?;
-                // Resolve the effective harness for the avatar-fallback
-                // derivation (the snapshot may be empty/stale for an inherited
-                // harness). Mirrors the UI start path.
-                let effective_command =
-                    crate::managed_agents::record_agent_command(record, &reconcile_personas);
-                Some((
-                    pubkey.clone(),
-                    crate::commands::ProfileReconcileData {
-                        private_key_nsec: record.private_key_nsec.clone(),
-                        name: record.name.clone(),
-                        relay_url: record.relay_url.clone(),
-                        avatar_url: record.avatar_url.clone(),
-                        auth_tag: record.auth_tag.clone(),
-                        pubkey: record.pubkey.clone(),
-                        agent_command: effective_command,
-                        persona_id: record.persona_id.clone(),
-                    },
-                ))
-            })
-            .collect();
-
     save_managed_agents(app, &records)?;
     drop(runtimes);
     drop(_store_guard);
     drop(restore_transition);
-
-    // ── Profile reconciliation (fire-and-forget) ────────────────────────────
-    // Spawn background tasks to ensure each restored agent's kind:0 profile is
-    // published on the relay. Same pattern as the UI start path.
-    for (pubkey, data) in reconcile_items {
-        let reconcile_app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let state = reconcile_app.state::<AppState>();
-            if let Err(e) =
-                crate::commands::reconcile_agent_profile(&state, &reconcile_app, &pubkey, &data)
-                    .await
-            {
-                eprintln!("buzz-desktop: profile reconciliation failed for agent {pubkey}: {e}");
-            }
-        });
-    }
 
     Ok(())
 }

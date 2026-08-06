@@ -55,6 +55,7 @@ enum MeetingProtocol {
     UniformV0,
     ModeratedBatonV1,
     ModeratedBoardV2,
+    ModeratedBoardActionsV2Legacy,
     ModeratedBoardActionsV2,
 }
 
@@ -66,6 +67,9 @@ impl MeetingProtocol {
             ("1", "" | "uniform-v0") => Ok(Self::UniformV0),
             ("2", buzz_sdk::MEETING_V1_POLICY) => Ok(Self::ModeratedBatonV1),
             ("3", buzz_sdk::MEETING_V2_POLICY) => Ok(Self::ModeratedBoardV2),
+            ("3", buzz_sdk::MEETING_V2_ACTIONS_V2_POLICY) => {
+                Ok(Self::ModeratedBoardActionsV2Legacy)
+            }
             ("3", buzz_sdk::MEETING_V2_ACTIONS_POLICY) => Ok(Self::ModeratedBoardActionsV2),
             ("2", "") => Err(CliError::Other(
                 "invalid Meeting V1 Create: missing policy tag".into(),
@@ -81,16 +85,25 @@ impl MeetingProtocol {
             Self::UniformV0 => "uniform-v0",
             Self::ModeratedBatonV1 => buzz_sdk::MEETING_V1_POLICY,
             Self::ModeratedBoardV2 => buzz_sdk::MEETING_V2_POLICY,
+            Self::ModeratedBoardActionsV2Legacy => buzz_sdk::MEETING_V2_ACTIONS_V2_POLICY,
             Self::ModeratedBoardActionsV2 => buzz_sdk::MEETING_V2_ACTIONS_POLICY,
         }
     }
 
     const fn is_v2(self) -> bool {
-        matches!(self, Self::ModeratedBoardV2 | Self::ModeratedBoardActionsV2)
+        matches!(
+            self,
+            Self::ModeratedBoardV2
+                | Self::ModeratedBoardActionsV2Legacy
+                | Self::ModeratedBoardActionsV2
+        )
     }
 
     const fn has_action_finalization(self) -> bool {
-        matches!(self, Self::ModeratedBoardActionsV2)
+        matches!(
+            self,
+            Self::ModeratedBoardActionsV2Legacy | Self::ModeratedBoardActionsV2
+        )
     }
 }
 
@@ -554,6 +567,7 @@ async fn require_uniform_v0(client: &BuzzClient, meeting_id: Uuid) -> Result<(),
             buzz_sdk::MEETING_V1_POLICY
         ))),
         protocol @ (MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2Legacy
         | MeetingProtocol::ModeratedBoardActionsV2) => Err(CliError::Usage(format!(
             "meeting {meeting_id} uses {}; use the moderated Meeting command surface",
             protocol.policy()
@@ -688,7 +702,7 @@ async fn cmd_create_meeting(
             })
         }
         v2_policy @ (crate::MeetingPolicy::ModeratedBoardV2
-        | crate::MeetingPolicy::ModeratedBoardActionsV2) => {
+        | crate::MeetingPolicy::ModeratedBoardActionsV3) => {
             if moderator.is_some() {
                 return Err(CliError::Usage(
                     "Meeting V2 fixes the creator as moderator; do not pass --moderator".into(),
@@ -707,7 +721,7 @@ async fn cmd_create_meeting(
                 participant_pubkeys: &participant_refs,
                 initial_board: &board,
             };
-            if v2_policy == crate::MeetingPolicy::ModeratedBoardActionsV2 {
+            if v2_policy == crate::MeetingPolicy::ModeratedBoardActionsV3 {
                 buzz_sdk::build_meeting_v2_actions_create(params)
             } else {
                 buzz_sdk::build_meeting_v2_create(params)
@@ -1078,12 +1092,14 @@ pub async fn cmd_meeting_history(
             MeetingProtocol::UniformV0 => event_round(left),
             MeetingProtocol::ModeratedBatonV1
             | MeetingProtocol::ModeratedBoardV2
+            | MeetingProtocol::ModeratedBoardActionsV2Legacy
             | MeetingProtocol::ModeratedBoardActionsV2 => event_speech_revision(left),
         };
         let right_revision = match protocol {
             MeetingProtocol::UniformV0 => event_round(right),
             MeetingProtocol::ModeratedBatonV1
             | MeetingProtocol::ModeratedBoardV2
+            | MeetingProtocol::ModeratedBoardActionsV2Legacy
             | MeetingProtocol::ModeratedBoardActionsV2 => event_speech_revision(right),
         };
         left_revision
@@ -1134,6 +1150,7 @@ pub async fn cmd_floor_status(client: &BuzzClient, meeting_id: &str) -> Result<(
         },
         MeetingProtocol::ModeratedBatonV1
         | MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2Legacy
         | MeetingProtocol::ModeratedBoardActionsV2 => {
             match fetch_current_baton(client, &meeting_id).await? {
                 Some(state) => println!(
@@ -1157,6 +1174,7 @@ pub async fn cmd_floor_history(
     match fetch_meeting_protocol(client, &meeting_id).await? {
         MeetingProtocol::ModeratedBatonV1
         | MeetingProtocol::ModeratedBoardV2
+        | MeetingProtocol::ModeratedBoardActionsV2Legacy
         | MeetingProtocol::ModeratedBoardActionsV2 => {
             let states = fetch_baton_states(client, &meeting_id, limit).await?;
             let output = match format {
@@ -2680,6 +2698,9 @@ pub async fn cmd_say_meeting(
             print_v1_write_response(&response, "speech_event_id", &speech_event_id);
             Ok(())
         }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => Err(CliError::Usage(
+            "ended moderated-board-actions-v2 Meetings are read-only history".into(),
+        )),
     }
 }
 
@@ -2868,6 +2889,11 @@ pub async fn cmd_end_meeting(client: &BuzzClient, meeting_id: &str) -> Result<()
         }
         MeetingProtocol::ModeratedBoardV2 | MeetingProtocol::ModeratedBoardActionsV2 => {
             return cmd_close_meeting_v2(client, &meeting_id_text).await;
+        }
+        MeetingProtocol::ModeratedBoardActionsV2Legacy => {
+            return Err(CliError::Usage(
+                "ended moderated-board-actions-v2 Meetings are read-only history".into(),
+            ));
         }
     }
     .map_err(sdk_err)?;

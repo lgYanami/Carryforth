@@ -606,6 +606,21 @@ impl MeetingCoordinator {
         self.v1.take_continuity_directives()
     }
 
+    pub(crate) fn attach_action_deadline_sender(
+        &mut self,
+        turn_id: &str,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+    ) {
+        self.v1.attach_action_deadline_sender(turn_id, sender);
+    }
+
+    pub(crate) fn action_deadline_for_request(
+        &self,
+        request: &MeetingTurnRequest,
+    ) -> Option<tokio::time::Instant> {
+        self.v1.action_deadline_for_request(request)
+    }
+
     pub(crate) async fn register(&mut self, session_id: Uuid) {
         if self.protocols.contains_key(&session_id)
             || self.detection_in_flight.contains_key(&session_id)
@@ -742,6 +757,15 @@ impl MeetingCoordinator {
             succeeded,
         });
         self.start_next_v0_completion();
+    }
+
+    pub(crate) fn handle_action_lease_expired(&mut self, turn_id: &str) {
+        let Some(running) = self.running_turns.remove(turn_id) else {
+            return;
+        };
+        if running.request.kind.is_moderated() {
+            self.v1.handle_action_lease_expired(turn_id);
+        }
     }
 
     pub(crate) async fn handle_turn_failure(&mut self, turn_id: &str) {

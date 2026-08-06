@@ -185,8 +185,8 @@ pub enum MeetingPolicy {
     ModeratedBoardV2,
     /// Meeting V2 with direct moderator action finalization before normal close.
     #[default]
-    #[value(name = "moderated-board-actions-v2")]
-    ModeratedBoardActionsV2,
+    #[value(name = "moderated-board-actions-v3")]
+    ModeratedBoardActionsV3,
 }
 
 /// Meeting V1 moderator intent-rejection reason.
@@ -1629,7 +1629,7 @@ pub enum MeetingsCmd {
         #[arg(
             long,
             value_enum,
-            default_value = "moderated-board-actions-v2",
+            default_value = "moderated-board-actions-v3",
             hide = true
         )]
         policy: MeetingPolicy,
@@ -3342,7 +3342,7 @@ mod tests {
         else {
             panic!("expected Meeting Create");
         };
-        assert_eq!(policy, MeetingPolicy::ModeratedBoardActionsV2);
+        assert_eq!(policy, MeetingPolicy::ModeratedBoardActionsV3);
         assert!(moderator.is_none());
     }
 
@@ -3365,7 +3365,7 @@ mod tests {
             "uniform-v0",
             "moderated-baton-v1",
             "moderated-board-v1",
-            "moderated-board-actions-v2",
+            "moderated-board-actions-v3",
         ] {
             assert!(
                 !help.contains(legacy_surface),
@@ -3497,7 +3497,7 @@ mod tests {
             "meetings",
             "create",
             "--policy",
-            "moderated-board-actions-v2",
+            "moderated-board-actions-v3",
             "--title",
             "Action review",
             "--board",
@@ -3509,7 +3509,7 @@ mod tests {
         let Cmd::Meetings(MeetingsCmd::Create { policy, .. }) = cli.command else {
             panic!("expected Meeting Create");
         };
-        assert_eq!(policy, MeetingPolicy::ModeratedBoardActionsV2);
+        assert_eq!(policy, MeetingPolicy::ModeratedBoardActionsV3);
 
         Cli::try_parse_from([
             "buzz",

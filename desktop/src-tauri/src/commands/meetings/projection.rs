@@ -17,7 +17,9 @@ pub(super) fn parse_create(
     if version != buzz_sdk_pkg::MEETING_V2_SCHEMA_VERSION
         || !matches!(
             policy,
-            buzz_sdk_pkg::MEETING_V2_POLICY | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
+            buzz_sdk_pkg::MEETING_V2_POLICY
+                | buzz_sdk_pkg::MEETING_V2_ACTIONS_V2_POLICY
+                | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
         )
     {
         return Ok(None);
@@ -510,7 +512,11 @@ fn validate_board_control(
             )));
         }
     }
-    if create.policy != buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY && control.action.is_some() {
+    if !matches!(
+        create.policy.as_str(),
+        buzz_sdk_pkg::MEETING_V2_ACTIONS_V2_POLICY | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
+    ) && control.action.is_some()
+    {
         return Err(MeetingReadError::Other(integrity_error(
             "Meeting State exposes actions for a non-action policy",
         )));
@@ -562,6 +568,33 @@ fn validate_board_control(
             "Meeting action deadline is negative",
         )));
     }
+    if action.progress_seq < 0
+        || action
+            .last_progress_at_ms
+            .is_some_and(|timestamp| timestamp < 0)
+        || action
+            .operator_hard_deadline_ms
+            .is_some_and(|timestamp| timestamp < 0)
+        || action.created_at_ms.is_some_and(|timestamp| timestamp < 0)
+        || action.last_progress_stage.as_deref().is_some_and(|stage| {
+            !matches!(
+                stage,
+                "reasoning" | "tool_call" | "tool_result" | "finalizing" | "waiting_human"
+            )
+        })
+        || (action.progress_seq == 0
+            && (action.last_progress_stage.is_some() || action.last_progress_at_ms.is_some()))
+        || (action.progress_seq > 0
+            && (action.last_progress_stage.is_none() || action.last_progress_at_ms.is_none()))
+        || action
+            .operator_hard_deadline_ms
+            .zip(action.action_deadline_at_ms)
+            .is_some_and(|(operator, lease)| lease > operator)
+    {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting action progress or renewable deadline metadata is invalid",
+        )));
+    }
     if action.last_error_code.as_deref().is_some_and(|code| {
         !matches!(
             code,
@@ -571,6 +604,8 @@ fn validate_board_control(
                 | "provider_failure"
                 | "affinity_lost"
                 | "action_deadline_exceeded"
+                | "action_lease_expired"
+                | "action_operator_deadline_exceeded"
         )
     }) {
         return Err(MeetingReadError::Other(integrity_error(
@@ -753,7 +788,12 @@ pub(super) fn parse_current_end(
         }
         let actions_attested = attestation == Some("actions-recorded");
         if actions_attested
-            && (outcome != "closed" || create.policy != buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY)
+            && (outcome != "closed"
+                || !matches!(
+                    create.policy.as_str(),
+                    buzz_sdk_pkg::MEETING_V2_ACTIONS_V2_POLICY
+                        | buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY
+                ))
         {
             return Err(MeetingReadError::Other(integrity_error(
                 "Meeting End action attestation does not match its outcome or policy",
@@ -821,19 +861,6 @@ pub(super) fn validate_participants(
         )));
     }
     Ok(participants.into_values().collect())
-}
-
-pub(super) fn action_from_wire(action: &ActionWire) -> MeetingActionState {
-    MeetingActionState {
-        action_run_id: action.action_run_id.to_string(),
-        board_event_id: action.board_event_id.clone(),
-        action_window_epoch: action.action_window_epoch,
-        condition: action.condition.clone(),
-        terminal_status: action.terminal_status.clone(),
-        completion_event_id: action.completion_event_id.clone(),
-        action_deadline_at_ms: action.action_deadline_at_ms,
-        last_error_code: action.last_error_code.clone(),
-    }
 }
 
 pub(super) fn parse_speech(

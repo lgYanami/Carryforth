@@ -722,6 +722,9 @@ pub enum PromptOutcome {
     Error(AcpError),
     AgentExited,
     Timeout(TimeoutKind),
+    /// The canonical renewable Meeting Action lease reached its local safety
+    /// boundary and the prompt was cancelled cleanly. The agent is reusable.
+    LeaseExpired,
     /// Intentional cancel via `!cancel` command or interrupt mode.
     /// Agent is healthy — no respawn, no retry penalty.
     Cancelled,
@@ -1970,6 +1973,9 @@ fn bounded_turn_duration(
 pub(crate) struct PromptExecution {
     pub(crate) control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     pub(crate) absolute_hard_deadline: Option<tokio::time::Instant>,
+    /// Authoritative same-turn lease replacements. Present only for an exact
+    /// Meeting Action turn; updates do not count as ACP activity.
+    pub(crate) deadline_updates: Option<tokio::sync::watch::Receiver<tokio::time::Instant>>,
     pub(crate) turn_id: String,
     /// Keep an otherwise-rotatable successful channel Session alive until the
     /// main loop has installed/released its Meeting continuity binding.
@@ -1987,6 +1993,7 @@ pub async fn run_prompt_task(
     let PromptExecution {
         mut control_rx,
         absolute_hard_deadline,
+        mut deadline_updates,
         turn_id,
         defer_session_rotation,
     } = execution;
@@ -2756,7 +2763,13 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
-    let prompt_max_duration = bounded_turn_duration(ctx.max_turn_duration, absolute_hard_deadline);
+    let prompt_max_duration = if deadline_updates.is_some() {
+        absolute_hard_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(ctx.max_turn_duration)
+    } else {
+        bounded_turn_duration(ctx.max_turn_duration, absolute_hard_deadline)
+    };
     agent.acp.observe(
         "prompt_request_started",
         serde_json::json!({
@@ -2766,11 +2779,12 @@ pub async fn run_prompt_task(
     );
     let prompt_result = match control_rx {
         None => {
-            await_lifecycle!(agent.acp.session_prompt_blocks_with_idle_timeout(
+            await_lifecycle!(agent.acp.session_prompt_blocks_with_deadline_updates(
                 &session_id,
                 &prompt_blocks,
                 ctx.idle_timeout,
                 prompt_max_duration,
+                deadline_updates.take(),
             ))
         }
         Some(rx) => {
@@ -2797,11 +2811,12 @@ pub async fn run_prompt_task(
                     );
                     return;
                 }
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_blocks_with_deadline_updates(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
                     prompt_max_duration,
+                    deadline_updates.take(),
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
@@ -3163,6 +3178,65 @@ pub async fn run_prompt_task(
                 PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
                 requeue_batch_if_queue(&ctx, batch),
             );
+        }
+        Err(AcpError::LeaseExpired { silence }) => {
+            tracing::warn!(
+                target: "pool::prompt",
+                "renewable Meeting Action lease reached its local boundary (silence {silence:?}) — cancelling without replacing the agent"
+            );
+            match agent
+                .acp
+                .cancel_with_cleanup(&session_id, ctx.idle_timeout)
+                .await
+            {
+                Ok(stop_reason) => {
+                    log_stop_reason(&source, &stop_reason);
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+                    )
+                    .await;
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::LeaseExpired,
+                        None,
+                    );
+                }
+                Err(AcpError::AgentExited) => {
+                    agent.state.invalidate_all();
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::AgentExited,
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "pool::prompt",
+                        "Meeting Action lease cancel did not drain cleanly: {error}"
+                    );
+                    agent.state.invalidate_all();
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                        None,
+                    );
+                }
+            }
         }
         Err(e) => {
             tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
@@ -4831,6 +4905,7 @@ mod tests {
                 PromptExecution {
                     control_rx: None,
                     absolute_hard_deadline: None,
+                    deadline_updates: None,
                     turn_id: "meeting-granted-turn-test".into(),
                     defer_session_rotation: false,
                 },
@@ -4897,6 +4972,7 @@ mod tests {
                 PromptExecution {
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: None,
+                    deadline_updates: None,
                     turn_id: "pre-prompt-cancel-test".into(),
                     defer_session_rotation: false,
                 },
@@ -6522,6 +6598,7 @@ mod tests {
             PromptOutcome::Timeout(TimeoutKind::Idle) => "Timeout(Idle)",
             PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "Timeout(Hard)",
             PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
+            PromptOutcome::LeaseExpired => "LeaseExpired",
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::Ok(_) => "Ok",

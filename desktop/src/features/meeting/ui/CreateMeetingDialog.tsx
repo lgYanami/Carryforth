@@ -19,6 +19,7 @@ import {
   buildInitialMeetingBoard,
   checkMeetingSourceAccess,
   dedupeMeetingRosterCandidates,
+  describeMeetingCapabilityRejection,
   validateMeetingDraft,
 } from "@/features/meeting/createMeetingModel";
 import {
@@ -228,10 +229,20 @@ export function CreateMeetingDialog({
         // attempt deliberately receives a fresh submission/event identity.
         setPendingInput(null);
         setIndeterminateMessage(null);
-        setSubmitError(errorMessage(error, "Failed to create Meeting."));
+        const message = errorMessage(error, "Failed to create Meeting.");
+        setSubmitError(
+          describeMeetingCapabilityRejection(message, selectedCandidates) ??
+            message,
+        );
       }
     },
-    [createMutation.mutateAsync, onCreated, onOpenChange, resetDraft],
+    [
+      createMutation.mutateAsync,
+      onCreated,
+      onOpenChange,
+      resetDraft,
+      selectedCandidates,
+    ],
   );
 
   const handleSubmit = React.useCallback(async () => {
@@ -287,7 +298,7 @@ export function CreateMeetingDialog({
     if (
       verifiedSelected.some(
         (candidate) =>
-          candidate.isAgent && candidate.actionCapability === "unknown",
+          candidate.isAgent && candidate.actionCapability !== "compatible",
       )
     ) {
       const refreshedAgents = await relayAgentsQuery.refetch();

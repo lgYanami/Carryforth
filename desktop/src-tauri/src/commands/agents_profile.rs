@@ -1,11 +1,11 @@
-//! Agent kind:0 profile reconciliation — split from `agents.rs` (file-size
-//! guard). Owns the reconcile data carrier, the legacy-avatar backfill, and
-//! the needs-sync predicate.
+//! Agent metadata and runtime-capability profile reconciliation — split from
+//! `agents.rs` (file-size guard). Owns the reconcile data carrier, the
+//! legacy-avatar backfill, and the needs-sync predicate.
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
-use crate::managed_agents::managed_agent_avatar_url;
+use crate::managed_agents::{managed_agent_avatar_url, AgentDefinition};
 
 use super::*;
 
@@ -13,6 +13,15 @@ pub(crate) struct ProfileReconcileData {
     pub(crate) private_key_nsec: String,
     pub(crate) name: String,
     pub(crate) relay_url: String,
+    /// Workspace Relay authority captured before this deferred reconcile was
+    /// scheduled. A later Community switch must never retarget the task.
+    pub(crate) workspace_relay_url: String,
+    /// Exact ACP command configured for this Agent. Local capability
+    /// reconciliation probes this command, never a guessed runtime binary.
+    pub(crate) acp_command: String,
+    /// Provider runtimes must self-advertise from the remote harness. Desktop
+    /// only probes and signs on behalf of locally managed runtimes.
+    pub(crate) backend: BackendKind,
     /// Expected avatar URL for the published profile. `None` for legacy records
     /// that predate the `avatar_url` field — these will be backfilled from the
     /// relay's existing kind:0 profile on first reconciliation.
@@ -28,6 +37,28 @@ pub(crate) struct ProfileReconcileData {
     /// backfill to recover the correct avatar from the persona record when the
     /// relay profile has been corrupted.
     pub(crate) persona_id: Option<String>,
+}
+
+impl ProfileReconcileData {
+    pub(crate) fn from_record(
+        record: &ManagedAgentRecord,
+        personas: &[AgentDefinition],
+        workspace_relay_url: String,
+    ) -> Self {
+        Self {
+            private_key_nsec: record.private_key_nsec.clone(),
+            name: record.name.clone(),
+            relay_url: record.relay_url.clone(),
+            workspace_relay_url,
+            acp_command: record.acp_command.clone(),
+            backend: record.backend.clone(),
+            avatar_url: record.avatar_url.clone(),
+            auth_tag: record.auth_tag.clone(),
+            pubkey: record.pubkey.clone(),
+            agent_command: crate::managed_agents::record_agent_command(record, personas),
+            persona_id: record.persona_id.clone(),
+        }
+    }
 }
 
 /// Resolve the avatar to backfill for a legacy agent record (pre-PR-921, no
@@ -49,11 +80,12 @@ pub(super) fn resolve_legacy_avatar(
         .unwrap_or_default()
 }
 
-/// Reconcile an agent's kind:0 profile on the relay.
+/// Reconcile an Agent's kind:0 metadata and kind:10100 runtime controls.
 ///
-/// Queries the relay for the agent's existing profile and re-publishes if missing
-/// or stale (display_name or picture mismatch). This is fire-and-forget — errors
-/// are returned to the caller for logging but never block agent startup.
+/// Queries the relay for the Agent's existing metadata and re-publishes if
+/// missing or stale. For a local Agent, it then probes the exact configured ACP
+/// command and adds or withdraws the Meeting capability only after a positive
+/// result. Provider runtimes self-advertise from their remote harness.
 ///
 /// For legacy records (pre-PR-921) where `avatar_url` is `None`, this function
 /// backfills via `resolve_legacy_avatar` — preferring the persona record's avatar
@@ -76,10 +108,8 @@ pub(crate) async fn reconcile_agent_profile(
 
     // An explicit per-agent relay wins; an empty one falls back to the active
     // workspace relay. Resolved once and used for both the read and write-back.
-    let relay_url = crate::relay::effective_agent_relay_url(
-        &data.relay_url,
-        &relay_ws_url_with_override(state),
-    );
+    let relay_url =
+        crate::relay::effective_agent_relay_url(&data.relay_url, &data.workspace_relay_url);
 
     if !state
         .managed_agent_profile_reconcile_enabled
@@ -136,10 +166,6 @@ pub(crate) async fn reconcile_agent_profile(
         Some(expected_avatar)
     };
 
-    if !profile_needs_sync(existing.as_ref(), &data.name, expected_avatar.as_deref()) {
-        return Ok(());
-    }
-
     let agent_keys = Keys::parse(&data.private_key_nsec)
         .map_err(|e| format!("failed to parse agent keys: {e}"))?;
 
@@ -150,15 +176,55 @@ pub(crate) async fn reconcile_agent_profile(
         return Ok(());
     }
 
-    sync_managed_agent_profile(
+    if profile_needs_sync(existing.as_ref(), &data.name, expected_avatar.as_deref()) {
+        sync_managed_agent_profile(
+            state,
+            &relay_url,
+            &agent_keys,
+            &data.name,
+            expected_avatar.as_deref(),
+            data.auth_tag.as_deref(),
+        )
+        .await?;
+    }
+
+    if data.backend != BackendKind::Local {
+        // The local Desktop cannot attest what a provider actually launched.
+        // Its remote trusted buzz-acp process performs self-advertisement.
+        return Ok(());
+    }
+
+    let acp_command = data.acp_command.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        crate::managed_agents::probe_meeting_capability(&acp_command)
+    })
+    .await
+    .map_err(|error| format!("ACP capability probe task failed: {error}"))?;
+    let supports_meeting_actions = match probe {
+        crate::managed_agents::MeetingCapabilityProbe::Supported => true,
+        crate::managed_agents::MeetingCapabilityProbe::Unsupported => false,
+        crate::managed_agents::MeetingCapabilityProbe::Unknown(error) => {
+            return Err(format!(
+                "Meeting capability remains unchanged because the exact ACP harness could not be verified: {error}"
+            ));
+        }
+    };
+
+    let result = crate::relay::sync_managed_agent_capabilities(
         state,
         &relay_url,
         &agent_keys,
-        &data.name,
-        expected_avatar.as_deref(),
+        Some(&data.name),
         data.auth_tag.as_deref(),
+        supports_meeting_actions,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        // Refresh the kind:10100-backed Agent directory immediately. The
+        // frontend coalesces fleet bursts into one query invalidation.
+        let _ = app.emit("agents-data-changed", ());
+    }
+    result
 }
 
 /// Decide whether a published profile is missing or stale relative to the

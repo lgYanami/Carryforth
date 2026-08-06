@@ -9,7 +9,7 @@ const CAPACITY_AGENTS = Array.from({ length: 9 }, (_, index) => ({
   pubkey: (index + 80).toString(16).padStart(64, "0"),
   displayName: `Capacity Agent ${index + 1}`,
 }));
-const ACTION_CAPABILITY = "meeting-v2-action-finalization-v2";
+const ACTION_CAPABILITY = "meeting-v2-action-finalization-v3";
 
 const creatableCapability = {
   status: "creatable" as const,
