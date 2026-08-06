@@ -10,9 +10,11 @@ use crate::relay::{
 };
 
 use super::{
-    integrity_error, ProjectViewIdentity, ProjectViewSchema, PROJECT_CONTEXT_EXTENSION,
+    integrity_error, ProjectViewIdentity, ProjectViewSchema, PROJECT_CONTEXT_REFERENCE_EXTENSION,
     PROJECT_VIEW_V1_EXTENSION, PROJECT_VIEW_V2_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
 };
+
+const PROJECT_CONTEXT_EDGE_EXTENSION: &str = buzz_project_context_pkg::PROJECT_CONTEXT_CAPABILITY;
 
 #[derive(Debug, Deserialize)]
 struct Nip11Document {
@@ -82,9 +84,13 @@ pub(crate) async fn read_identity_at(
             .supported_extensions
             .iter()
             .any(|extension| extension == "buzz-project-document-v1"),
-        project_context_supported: info
+        project_context_reference_supported: info
             .supported_extensions
             .iter()
-            .any(|extension| extension == PROJECT_CONTEXT_EXTENSION),
+            .any(|extension| extension == PROJECT_CONTEXT_REFERENCE_EXTENSION),
+        project_context_edge_supported: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_CONTEXT_EDGE_EXTENSION),
     }))
 }

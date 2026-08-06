@@ -29,18 +29,18 @@ use buzz_sdk_pkg::project_view_v2::{
 };
 use buzz_sdk_pkg::role_brief::{RoleBrief, VerifiedRoleBriefSnapshot};
 use chrono::{DateTime, Utc};
-use nostr::Event;
+use nostr::{Event, Keys};
 use serde::Serialize;
 use serde_json::json;
 use tauri::State;
 
 use crate::app_state::AppState;
-use crate::relay::query_relay;
+use crate::relay::{query_relay, query_relay_at_with_keys_typed, RelayHttpErrorCategory};
 
 pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
 pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
 pub(crate) const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
-pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
+pub(crate) const PROJECT_CONTEXT_REFERENCE_EXTENSION: &str = "buzz-project-context-v1";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 
@@ -56,7 +56,8 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
     pub(crate) schema: ProjectViewSchema,
     pub(crate) project_document_supported: bool,
-    pub(crate) project_context_supported: bool,
+    pub(crate) project_context_reference_supported: bool,
+    pub(crate) project_context_edge_supported: bool,
 }
 
 struct ProjectSnapshot {
@@ -110,14 +111,21 @@ struct ProjectViewMembershipMember {
     role: CommunityMemberRole,
 }
 
+/// Failures produced while assembling a verified Project View read snapshot.
 #[derive(Debug)]
-enum ProjectViewReadError {
+pub(crate) enum ProjectViewReadError {
+    /// The current identity is not permitted to read the Project View.
     Forbidden,
+    /// A bounded read observed incompatible source revisions.
     Conflict(String),
+    /// The verified source could not be reached temporarily.
+    Unavailable(String),
+    /// The response was malformed, unverifiable, or otherwise invalid.
     Other(String),
 }
 
-type ProjectViewReadResult<T> = Result<T, ProjectViewReadError>;
+/// Result type shared by Project View's verified native readers.
+pub(crate) type ProjectViewReadResult<T> = Result<T, ProjectViewReadError>;
 
 /// Desktop-facing state of the active Community's Project View.
 #[derive(Debug, Serialize)]
@@ -173,6 +181,7 @@ pub(crate) use identity::read_identity_at;
 mod role_history;
 pub use role_history::*;
 mod v3;
+pub(crate) use v3::fetch_consistent_verified_v3_snapshot_at;
 pub use v3::ProjectViewRoleContinuityV3;
 use v3::{fetch_consistent_v3_snapshot, read_v3_meta, V3ProjectSnapshot};
 
@@ -181,7 +190,9 @@ fn read_error_message(error: ProjectViewReadError) -> String {
         ProjectViewReadError::Forbidden => {
             "restricted: Project View requires current Community membership".to_owned()
         }
-        ProjectViewReadError::Conflict(message) | ProjectViewReadError::Other(message) => message,
+        ProjectViewReadError::Conflict(message)
+        | ProjectViewReadError::Unavailable(message)
+        | ProjectViewReadError::Other(message) => message,
     }
 }
 
@@ -246,7 +257,7 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
                              role_continuity,
                          }| ProjectViewLoadResult::Ready {
                             relay_pubkey: identity.relay_pubkey.to_hex(),
-                            project_context_supported: identity.project_context_supported,
+                            project_context_supported: identity.project_context_reference_supported,
                             schema_version: 3,
                             project_revision: meta.project_revision,
                             projection_generation: meta.projection_generation,
@@ -269,6 +280,7 @@ async fn load_project_view(state: &AppState) -> Result<ProjectViewLoadResult, St
         }),
         Err(ProjectViewReadError::Forbidden) => Ok(ProjectViewLoadResult::Forbidden),
         Err(ProjectViewReadError::Conflict(message))
+        | Err(ProjectViewReadError::Unavailable(message))
         | Err(ProjectViewReadError::Other(message)) => Err(message),
     }
 }
@@ -909,6 +921,39 @@ async fn query_project_view(
             ProjectViewReadError::Other(message)
         }
     })
+}
+
+/// Query Project View through a Relay URL and signer captured before any await.
+pub(crate) async fn query_project_view_at_with_keys(
+    state: &AppState,
+    api_base_url: &str,
+    keys: &Keys,
+    filters: &[serde_json::Value],
+) -> ProjectViewReadResult<Vec<Event>> {
+    query_relay_at_with_keys_typed(state, api_base_url, filters, keys, None)
+        .await
+        .map_err(|error| match error.category {
+            RelayHttpErrorCategory::Forbidden => ProjectViewReadError::Forbidden,
+            RelayHttpErrorCategory::Conflict => {
+                conflict_error("Project View changed during snapshot pagination")
+            }
+            RelayHttpErrorCategory::Connect
+            | RelayHttpErrorCategory::Timeout
+            | RelayHttpErrorCategory::RateLimited
+            | RelayHttpErrorCategory::Unavailable => {
+                ProjectViewReadError::Unavailable(error.message)
+            }
+            RelayHttpErrorCategory::Http
+                if error
+                    .status
+                    .is_some_and(|status| (500..=504).contains(&status)) =>
+            {
+                ProjectViewReadError::Unavailable(error.message)
+            }
+            RelayHttpErrorCategory::Http
+            | RelayHttpErrorCategory::Malformed
+            | RelayHttpErrorCategory::Internal => ProjectViewReadError::Other(error.message),
+        })
 }
 
 fn validate_object_against_meta(
