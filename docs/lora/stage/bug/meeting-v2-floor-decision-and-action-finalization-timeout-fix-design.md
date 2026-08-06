@@ -1,6 +1,7 @@
 # Meeting V2 Floor Decision 空等与 Action Finalization 硬超时修复设计
 
-> 状态：已实现；相关自动化回归通过，待新建 Meeting 做长时现场验收
+> 状态：已实现；Floor Decision 现场验收通过；后续 Board→Action continuity
+> 核心修复已落地，Action lease 与完整关闭路径待现场重验
 >
 > 修订日期：2026-08-06
 >
@@ -9,7 +10,8 @@
 >
 > 关联设计：
 > [主持人乐观决策设计](../meeting/v1/meeting-v1-moderator-optimistic-decision-design.md)、
-> [主持人直接完成行动收口的后端修正方案](../meeting/fix/meeting-v2-direct-action-finalization-backend-plan.md)
+> [主持人直接完成行动收口的后端修正方案](../meeting/fix/meeting-v2-direct-action-finalization-backend-plan.md)、
+> [现场验收后续：Board→Action 连续性、Return-to-Board 投影与 Desktop 终态收敛修复设计](meeting-v2-board-action-continuity-return-to-board-and-directory-convergence-fix-design.md)
 
 ## 1. 结论
 

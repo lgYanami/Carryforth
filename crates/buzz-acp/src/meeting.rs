@@ -405,6 +405,26 @@ pub(crate) struct MeetingTurnContinuityInfo {
     pub(crate) kind: MeetingTurnKind,
 }
 
+/// Whether cancelling one stale Meeting turn may retain its ACP Session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeetingPreemptionDisposition {
+    InvalidateSession,
+    PreserveSession,
+}
+
+/// Exact in-flight Meeting turn selected for cancellation.
+///
+/// Keeping the turn ID alongside the Meeting ID prevents a delayed directive
+/// produced for turn A from cancelling a newer turn B in the same room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeetingTurnPreemption {
+    pub(crate) session_id: Uuid,
+    pub(crate) origin_turn_id: Option<String>,
+    pub(crate) target_turn_id: String,
+    pub(crate) reason: &'static str,
+    pub(crate) disposition: MeetingPreemptionDisposition,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MeetingContinuityDirective {
     Release { session_id: Uuid },
@@ -768,6 +788,18 @@ impl MeetingCoordinator {
         }
     }
 
+    /// Drop the exact turn fenced by a newer canonical Meeting State without
+    /// treating the healthy moderator runtime as a provider failure.
+    pub(crate) async fn handle_turn_superseded(&mut self, turn_id: &str) {
+        let Some(running) = self.running_turns.remove(turn_id) else {
+            return;
+        };
+        self.refresh_v1_external_reclaimable_turns();
+        if running.request.kind.is_moderated() {
+            self.v1.handle_turn_superseded(turn_id).await;
+        }
+    }
+
     pub(crate) async fn handle_turn_failure(&mut self, turn_id: &str) {
         self.handle_turn_result(turn_id, String::new(), false).await;
     }
@@ -777,11 +809,30 @@ impl MeetingCoordinator {
     /// V1 supplies preemptions required by a deterministic Offer ACK. A queued
     /// V0 Grant additionally preempts running V1 planning work. Granted turns
     /// are never selected by this cross-protocol priority path.
-    pub(crate) fn take_preemptions(&mut self) -> Vec<Uuid> {
-        let mut ready = BTreeSet::new();
+    pub(crate) fn take_preemptions(&mut self) -> Vec<MeetingTurnPreemption> {
+        let mut ready = BTreeMap::new();
+        for preemption in self.v1.take_targeted_preemptions() {
+            if self.mark_exact_running_turn_for_cancellation(
+                &preemption.target_turn_id,
+                preemption.session_id,
+                false,
+            ) {
+                ready.insert(preemption.target_turn_id.clone(), preemption);
+            }
+        }
         for session_id in self.v1.take_preemptions() {
-            if self.mark_running_turn_for_cancellation(session_id, None, false) {
-                ready.insert(session_id);
+            if let Some(target_turn_id) =
+                self.mark_running_turn_for_cancellation(session_id, None, false)
+            {
+                ready
+                    .entry(target_turn_id.clone())
+                    .or_insert(MeetingTurnPreemption {
+                        session_id,
+                        origin_turn_id: None,
+                        target_turn_id,
+                        reason: "legacy_protocol_preemption",
+                        disposition: MeetingPreemptionDisposition::InvalidateSession,
+                    });
             }
         }
 
@@ -829,15 +880,24 @@ impl MeetingCoordinator {
         candidates.dedup_by_key(|(_, session_id)| *session_id);
         for (_, session_id) in candidates.into_iter().take(required) {
             self.v1.mark_cross_protocol_preempted(session_id);
-            if self.mark_running_turn_for_cancellation(
+            if let Some(target_turn_id) = self.mark_running_turn_for_cancellation(
                 session_id,
                 Some(&[MeetingTurnKind::V1Intent]),
                 true,
             ) {
-                ready.insert(session_id);
+                ready.insert(
+                    target_turn_id.clone(),
+                    MeetingTurnPreemption {
+                        session_id,
+                        origin_turn_id: None,
+                        target_turn_id,
+                        reason: "cross_protocol_grant_priority",
+                        disposition: MeetingPreemptionDisposition::InvalidateSession,
+                    },
+                );
             }
         }
-        ready.into_iter().collect()
+        ready.into_values().collect()
     }
 
     /// Update the physical Agent slots currently available for a deterministic
@@ -869,14 +929,29 @@ impl MeetingCoordinator {
         session_id: Uuid,
         allowed_kinds: Option<&[MeetingTurnKind]>,
         v0_grant_capacity_credit: bool,
-    ) -> bool {
-        let Some(running) = self.running_turns.values_mut().find(|running| {
+    ) -> Option<String> {
+        let (turn_id, running) = self.running_turns.iter_mut().find(|(_, running)| {
             running.request.session_id == session_id
                 && allowed_kinds.is_none_or(|allowed| allowed.contains(&running.request.kind))
-        }) else {
+        })?;
+        if running.cancellation_requested {
+            return None;
+        }
+        running.cancellation_requested = true;
+        running.v0_grant_capacity_credit = v0_grant_capacity_credit;
+        Some(turn_id.clone())
+    }
+
+    fn mark_exact_running_turn_for_cancellation(
+        &mut self,
+        target_turn_id: &str,
+        session_id: Uuid,
+        v0_grant_capacity_credit: bool,
+    ) -> bool {
+        let Some(running) = self.running_turns.get_mut(target_turn_id) else {
             return false;
         };
-        if running.cancellation_requested {
+        if running.request.session_id != session_id || running.cancellation_requested {
             return false;
         }
         running.cancellation_requested = true;
@@ -3916,7 +3991,11 @@ mod tests {
             MeetingTurnKind::V0Granted,
         ));
 
-        let preemptions: BTreeSet<_> = coordinator.take_preemptions().into_iter().collect();
+        let preemptions: BTreeSet<_> = coordinator
+            .take_preemptions()
+            .into_iter()
+            .map(|preemption| preemption.session_id)
+            .collect();
         assert_eq!(preemptions, BTreeSet::from([v1_intent_session]));
         assert!(coordinator
             .running_turns

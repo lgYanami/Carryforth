@@ -2148,8 +2148,29 @@ async fn tokio_main(
             0
         });
         if pool_ready {
-            for channel_id in meeting_controller.take_preemptions() {
-                let _ = signal_in_flight_task(&mut pool, channel_id, ControlSignal::Cancel);
+            for preemption in meeting_controller.take_preemptions() {
+                let signal = match preemption.disposition {
+                    meeting::MeetingPreemptionDisposition::PreserveSession => {
+                        ControlSignal::MeetingCanonicalAdvance
+                    }
+                    meeting::MeetingPreemptionDisposition::InvalidateSession => {
+                        ControlSignal::Cancel
+                    }
+                };
+                if !signal_exact_in_flight_task(
+                    &mut pool,
+                    preemption.session_id,
+                    &preemption.target_turn_id,
+                    signal,
+                ) {
+                    tracing::debug!(
+                        meeting = %preemption.session_id,
+                        origin_turn_id = ?preemption.origin_turn_id,
+                        turn_id = %preemption.target_turn_id,
+                        reason = preemption.reason,
+                        "Meeting preemption target already completed or was replaced"
+                    );
+                }
             }
             dispatch_meeting_pending(
                 &mut pool,
@@ -2942,6 +2963,8 @@ async fn tokio_main(
                 let mut meeting_succeeded = matches!(&result.outcome, PromptOutcome::Ok(_));
                 let meeting_action_lease_expired =
                     matches!(&result.outcome, PromptOutcome::LeaseExpired);
+                let meeting_turn_superseded =
+                    matches!(&result.outcome, PromptOutcome::MeetingSuperseded);
                 if let Some(info) = continuity_info {
                     let agent_index = result.agent.index;
                     let resolved_session_id = result.resolved_session_id.as_deref();
@@ -2950,6 +2973,38 @@ async fn tokio_main(
                     let output = meeting_output.as_deref().unwrap_or_default();
                     let binding_existed = pool.meeting_slot_binding(info.session_id).is_some();
                     match info.kind {
+                        kind if meeting_turn_superseded => {
+                            let current_phase = pool
+                                .meeting_slot_binding(info.session_id)
+                                .map(|binding| binding.phase);
+                            let preserved_phase =
+                                superseded_meeting_binding_phase(kind, current_phase);
+                            if let (Some(acp_session_id), Some(phase)) =
+                                (resolved_session_id, preserved_phase)
+                            {
+                                if pool
+                                    .bind_meeting_slot(
+                                        info.session_id,
+                                        agent_index,
+                                        acp_session_id.to_string(),
+                                        phase,
+                                        result.rotation_deferred,
+                                    )
+                                    .is_err()
+                                {
+                                    affinity_lost = true;
+                                } else {
+                                    meeting_controller.record_continuity_binding(
+                                        info.session_id,
+                                        agent_index,
+                                        acp_session_id,
+                                        continuity_phase_name(phase),
+                                    );
+                                }
+                            } else {
+                                affinity_lost = true;
+                            }
+                        }
                         meeting::MeetingTurnKind::V2ModeratorBoard
                             if meeting_succeeded && v2_actions_board_output_is_holdable(output) =>
                         {
@@ -3033,6 +3088,7 @@ async fn tokio_main(
                     }
                     if affinity_lost
                         && !(info.kind == meeting::MeetingTurnKind::V2ModeratorBoard
+                            && !meeting_turn_superseded
                             && !binding_existed
                             && !v2_actions_board_output_is_holdable(output))
                     {
@@ -3060,6 +3116,10 @@ async fn tokio_main(
                 );
                 if meeting_action_lease_expired {
                     meeting_controller.handle_action_lease_expired(&meeting_turn_id);
+                } else if meeting_turn_superseded {
+                    meeting_controller
+                        .handle_turn_superseded(&meeting_turn_id)
+                        .await;
                 } else if let Some(output) = meeting_output {
                     meeting_controller
                         .handle_turn_result(&meeting_turn_id, output, meeting_succeeded)
@@ -3752,6 +3812,35 @@ fn signal_in_flight_task(
     false
 }
 
+/// Send a control signal only when both the Meeting channel and the exact
+/// coordinator turn ID still match. A delayed directive for turn A therefore
+/// cannot cancel a newer turn B in the same Meeting.
+fn signal_exact_in_flight_task(
+    pool: &mut AgentPool,
+    channel_id: uuid::Uuid,
+    target_turn_id: &str,
+    mode: ControlSignal,
+) -> bool {
+    let entry = pool
+        .task_map_mut()
+        .values_mut()
+        .find(|meta| meta.channel_id == Some(channel_id) && meta.turn_id == target_turn_id);
+
+    if let Some(meta) = entry {
+        if let Some(tx) = meta.control_tx.take() {
+            tracing::info!(
+                channel = %channel_id,
+                turn_id = target_turn_id,
+                ?mode,
+                "control signal sent to exact in-flight Meeting turn"
+            );
+            let _ = tx.send(mode);
+            return true;
+        }
+    }
+    false
+}
+
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
 ///
 /// Caller invariants:
@@ -3873,7 +3962,10 @@ fn prompt_outcome_replaces_agent(outcome: &PromptOutcome) -> bool {
                 | acp::AcpError::Timeout(_)
                 | acp::AcpError::Protocol(_)
         ),
-        PromptOutcome::Ok(_) | PromptOutcome::Cancelled | PromptOutcome::LeaseExpired => false,
+        PromptOutcome::Ok(_)
+        | PromptOutcome::Cancelled
+        | PromptOutcome::MeetingSuperseded
+        | PromptOutcome::LeaseExpired => false,
     }
 }
 
@@ -3926,6 +4018,23 @@ fn continuity_phase_name(phase: pool::MeetingSlotBindingPhase) -> &'static str {
         pool::MeetingSlotBindingPhase::PendingAction => "pending_action",
         pool::MeetingSlotBindingPhase::Action => "action",
         pool::MeetingSlotBindingPhase::ModeratorMeeting => "moderator_meeting",
+    }
+}
+
+/// Preserve the canonical continuity phase when an obsolete Meeting turn
+/// drains. In particular, a late Action result must not regress a
+/// Return-to-Board promotion from `ModeratorMeeting` back to `Action`.
+fn superseded_meeting_binding_phase(
+    kind: meeting::MeetingTurnKind,
+    current_phase: Option<pool::MeetingSlotBindingPhase>,
+) -> Option<pool::MeetingSlotBindingPhase> {
+    match kind {
+        meeting::MeetingTurnKind::V2ModeratorBoard => {
+            Some(current_phase.unwrap_or(pool::MeetingSlotBindingPhase::FinalControlCycle))
+        }
+        meeting::MeetingTurnKind::V2ModeratorFloor
+        | meeting::MeetingTurnKind::V2ActionFinalization => current_phase,
+        _ => None,
     }
 }
 
@@ -4320,7 +4429,13 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if matches!(result.outcome, PromptOutcome::MeetingSuperseded) {
+                tracing::debug!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dropping batch for canonically superseded Meeting turn"
+                );
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -4451,6 +4566,7 @@ fn handle_prompt_result(
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::MeetingSuperseded => "meeting_canonical_superseded",
         PromptOutcome::LeaseExpired => "action_lease_expired",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
     };
@@ -4507,7 +4623,7 @@ fn handle_prompt_result(
 
     match result.outcome {
         // Successful prompt — return agent to pool.
-        PromptOutcome::Ok(_) | PromptOutcome::LeaseExpired => {
+        PromptOutcome::Ok(_) | PromptOutcome::LeaseExpired | PromptOutcome::MeetingSuperseded => {
             tracing::debug!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -6021,6 +6137,69 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+
+    #[tokio::test]
+    async fn delayed_meeting_preemption_cannot_cancel_a_newer_turn() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "turn-b".to_string(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+            },
+        );
+
+        assert!(!signal_exact_in_flight_task(
+            &mut pool,
+            channel_id,
+            "turn-a",
+            ControlSignal::MeetingCanonicalAdvance,
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(signal_exact_in_flight_task(
+            &mut pool,
+            channel_id,
+            "turn-b",
+            ControlSignal::MeetingCanonicalAdvance,
+        ));
+        assert_eq!(
+            control_rx.await.unwrap(),
+            ControlSignal::MeetingCanonicalAdvance
+        );
+    }
+
+    #[test]
+    fn superseded_meeting_turn_preserves_canonical_binding_phase() {
+        assert_eq!(
+            superseded_meeting_binding_phase(meeting::MeetingTurnKind::V2ModeratorBoard, None,),
+            Some(pool::MeetingSlotBindingPhase::FinalControlCycle),
+            "a first Board turn can establish continuity from its resolved ACP Session",
+        );
+        assert_eq!(
+            superseded_meeting_binding_phase(
+                meeting::MeetingTurnKind::V2ActionFinalization,
+                Some(pool::MeetingSlotBindingPhase::ModeratorMeeting),
+            ),
+            Some(pool::MeetingSlotBindingPhase::ModeratorMeeting),
+            "a late Action result cannot undo canonical Return-to-Board promotion",
+        );
+        assert_eq!(
+            superseded_meeting_binding_phase(meeting::MeetingTurnKind::V2ModeratorFloor, None,),
+            None,
+            "a Floor turn cannot invent a missing exact-affinity binding",
+        );
     }
 }
 

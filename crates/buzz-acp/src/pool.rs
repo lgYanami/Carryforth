@@ -595,6 +595,10 @@ pub enum ControlSignal {
     /// turn re-creates the session and re-applies `desired_model`. Runtime-only
     /// — never persisted, gone on restart/respawn.
     SwitchModel(String),
+    /// A Relay-signed Meeting transition made this exact turn obsolete while
+    /// the moderator's slot/session affinity remains authoritative. The ACP
+    /// prompt is drained, but its channel session is deliberately preserved.
+    MeetingCanonicalAdvance,
 }
 
 /// Goose-native non-cancelling steer request, sent from the main loop to an
@@ -728,6 +732,10 @@ pub enum PromptOutcome {
     /// Intentional cancel via `!cancel` command or interrupt mode.
     /// Agent is healthy — no respawn, no retry penalty.
     Cancelled,
+    /// The exact Meeting turn was fenced by a newer canonical State. The
+    /// agent and ACP Session remain healthy and reusable; the stale model
+    /// output must not be processed or requeued.
+    MeetingSuperseded,
     /// The agent did not stop within `grace` after `session/cancel` was sent
     /// for a control-signal cancellation (steer fallback, interrupt, or
     /// explicit stop). Distinct from [`TimeoutKind::Hard`]: this is a bounded
@@ -2695,11 +2703,15 @@ pub async fn run_prompt_task(
     // the harness starts work known to be obsolete and immediately races a
     // `session/cancel` against a newly initialized adapter session.
     if let Some(control_signal) = take_ready_pre_prompt_control_signal(&mut control_rx) {
+        let meeting_canonical_advance =
+            matches!(control_signal, ControlSignal::MeetingCanonicalAdvance);
         if let ControlSignal::SwitchModel(ref model_id) = control_signal {
             agent.desired_model = Some(model_id.clone());
             agent.model_overridden = true;
         }
-        agent.state.invalidate(&source);
+        if !meeting_canonical_advance {
+            agent.state.invalidate(&source);
+        }
         agent.acp.observe(
             "prompt_cancelled_before_request",
             serde_json::json!({
@@ -2709,6 +2721,7 @@ pub async fn run_prompt_task(
                     ControlSignal::Cancel => "explicit_cancel",
                     ControlSignal::Rotate => "rotate",
                     ControlSignal::SwitchModel(_) => "switch_model",
+                    ControlSignal::MeetingCanonicalAdvance => "meeting_canonical_advance",
                 },
             }),
         );
@@ -2731,7 +2744,11 @@ pub async fn run_prompt_task(
             &turn_id,
             agent,
             source,
-            PromptOutcome::Cancelled,
+            if meeting_canonical_advance {
+                PromptOutcome::MeetingSuperseded
+            } else {
+                PromptOutcome::Cancelled
+            },
             retry_batch,
         );
         return;
@@ -2820,6 +2837,8 @@ pub async fn run_prompt_task(
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
+                    let meeting_canonical_advance =
+                        matches!(control_signal, ControlSignal::MeetingCanonicalAdvance);
                     // Land the model switch before any cancel/requeue work: setting
                     // `desired_model` here means the fresh session created by the
                     // requeued turn (busy) or the next turn (already-completed)
@@ -2840,6 +2859,7 @@ pub async fn run_prompt_task(
                                     ControlSignal::Cancel => "explicit_cancel",
                                     ControlSignal::Rotate => "rotate",
                                     ControlSignal::SwitchModel(_) => "switch_model",
+                                    ControlSignal::MeetingCanonicalAdvance => "meeting_canonical_advance",
                                 },
                             }),
                         );
@@ -2851,7 +2871,9 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
+                                if !meeting_canonical_advance {
+                                    agent.state.invalidate(&source);
+                                }
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -2870,7 +2892,11 @@ pub async fn run_prompt_task(
                                     &turn_id,
                                     agent,
                                     source,
-                                    PromptOutcome::Cancelled,
+                                    if meeting_canonical_advance {
+                                        PromptOutcome::MeetingSuperseded
+                                    } else {
+                                        PromptOutcome::Cancelled
+                                    },
                                     retry_batch,
                                 );
                                 return;
@@ -2965,7 +2991,11 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
-                            PromptOutcome::Ok(StopReason::EndTurn),
+                            if meeting_canonical_advance {
+                                PromptOutcome::MeetingSuperseded
+                            } else {
+                                PromptOutcome::Ok(StopReason::EndTurn)
+                            },
                             None, // turn succeeded — batch was processed, no requeue
                         );
                         return;
@@ -4054,7 +4084,9 @@ fn requeue_cancelled_batch(
         ControlSignal::Steer => CancelReason::Steer,
         ControlSignal::Interrupt | ControlSignal::SwitchModel(_) => CancelReason::Interrupt,
         // Cancel/Rotate discard the batch — no merged re-prompt.
-        ControlSignal::Cancel | ControlSignal::Rotate => return None,
+        ControlSignal::Cancel | ControlSignal::Rotate | ControlSignal::MeetingCanonicalAdvance => {
+            return None
+        }
     };
     requeue_batch_if_queue(ctx, batch).map(|mut b| {
         b.cancel_reason = Some(reason);
@@ -4997,6 +5029,162 @@ mod tests {
                 "prompt_request_started" | "acp_cancel_requested" | "acp_session_cancel_sent"
             )
         }));
+        result.agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_meeting_advance_skips_prompt_and_preserves_new_session() {
+        let observer = observer::ObserverHandle::in_process();
+        let channel_id = Uuid::new_v4();
+        let mut agent = pre_prompt_cancel_fake_agent(observer.clone()).await;
+        agent.state.canvas_sections.insert(
+            channel_id,
+            "[Channel Canvas]\nPre-prompt Meeting supersession test.".into(),
+        );
+
+        let agent_keys = Keys::generate();
+        let mut ctx = make_prompt_context_impl(&agent_keys, None);
+        ctx.require_permission_mode = false;
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(ControlSignal::MeetingCanonicalAdvance)
+            .expect("queue canonical advance before the prompt request");
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_prompt_task(
+                agent,
+                Some(batch),
+                Some("This superseded prompt must never reach the adapter.".into()),
+                Arc::new(ctx),
+                result_tx,
+                PromptExecution {
+                    control_rx: Some(control_rx),
+                    absolute_hard_deadline: None,
+                    deadline_updates: None,
+                    turn_id: "pre-prompt-meeting-superseded-test".into(),
+                    defer_session_rotation: false,
+                },
+            ),
+        )
+        .await
+        .expect("pre-prompt Meeting supersession must complete without a drain timeout");
+
+        let mut result = result_rx
+            .recv()
+            .await
+            .expect("run_prompt_task must return its agent");
+        assert!(matches!(result.outcome, PromptOutcome::MeetingSuperseded));
+        assert!(result.batch.is_none());
+        assert_eq!(
+            result
+                .agent
+                .state
+                .sessions
+                .get(&channel_id)
+                .map(String::as_str),
+            Some("pre-prompt-cancel-session"),
+        );
+        let events = observer.snapshot();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "prompt_cancelled_before_request"));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.kind.as_str(),
+                "prompt_request_started" | "acp_cancel_requested" | "acp_session_cancel_sent"
+            )
+        }));
+        result.agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_meeting_advance_cleanly_drains_and_preserves_session() {
+        let observer = observer::ObserverHandle::in_process();
+        let channel_id = Uuid::new_v4();
+        let mut agent = pre_prompt_cancel_fake_agent(observer.clone()).await;
+        agent.state.canvas_sections.insert(
+            channel_id,
+            "[Channel Canvas]\nIn-flight Meeting supersession test.".into(),
+        );
+
+        let agent_keys = Keys::generate();
+        let mut ctx = make_prompt_context_impl(&agent_keys, None);
+        ctx.require_permission_mode = false;
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let prompt_task = tokio::spawn(run_prompt_task(
+            agent,
+            Some(batch),
+            Some("Wait until the canonical State supersedes this turn.".into()),
+            Arc::new(ctx),
+            result_tx,
+            PromptExecution {
+                control_rx: Some(control_rx),
+                absolute_hard_deadline: None,
+                deadline_updates: None,
+                turn_id: "in-flight-meeting-superseded-test".into(),
+                defer_session_rotation: false,
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if observer
+                    .snapshot()
+                    .iter()
+                    .any(|event| event.kind == "prompt_request_started")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake ACP prompt must start");
+        control_tx
+            .send(ControlSignal::MeetingCanonicalAdvance)
+            .expect("send canonical advance to the in-flight prompt");
+
+        tokio::time::timeout(Duration::from_secs(5), prompt_task)
+            .await
+            .expect("clean Meeting drain must finish")
+            .expect("prompt task must not panic");
+        let mut result = result_rx
+            .recv()
+            .await
+            .expect("run_prompt_task must return its agent");
+        assert!(matches!(result.outcome, PromptOutcome::MeetingSuperseded));
+        assert!(result.batch.is_none());
+        assert_eq!(
+            result
+                .agent
+                .state
+                .sessions
+                .get(&channel_id)
+                .map(String::as_str),
+            Some("pre-prompt-cancel-session"),
+        );
+        let events = observer.snapshot();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "acp_cancel_requested"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "acp_session_cancel_sent"));
         result.agent.acp.shutdown().await;
     }
 
@@ -6519,6 +6707,26 @@ mod tests {
         assert_eq!(*s.turn_counts.get(&ch_b).unwrap(), 3);
     }
 
+    #[test]
+    fn meeting_canonical_advance_preserves_channel_session_after_completion_race() {
+        let (mut state, meeting_id, other_channel) = make_state();
+
+        apply_completed_before_control_signal(
+            &mut state,
+            &PromptSource::Channel(meeting_id),
+            &ControlSignal::MeetingCanonicalAdvance,
+        );
+
+        assert_eq!(
+            state.sessions.get(&meeting_id).map(String::as_str),
+            Some("sess-a")
+        );
+        assert_eq!(
+            state.sessions.get(&other_channel).map(String::as_str),
+            Some("sess-b")
+        );
+    }
+
     // ── requeue_cancelled_batch ────────────────────────────────────────────
     // Table-driven pin of the `ControlSignal` → `CancelReason` ownership that
     // decides whether a cancel-drain-expiry batch is merged into the next
@@ -6555,6 +6763,7 @@ mod tests {
             ),
             (ControlSignal::Cancel, None),
             (ControlSignal::Rotate, None),
+            (ControlSignal::MeetingCanonicalAdvance, None),
         ];
         let mut ctx = make_prompt_context_no_owner();
         ctx.dedup_mode = DedupMode::Queue;
@@ -6601,6 +6810,7 @@ mod tests {
             PromptOutcome::LeaseExpired => "LeaseExpired",
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::Cancelled => "Cancelled",
+            PromptOutcome::MeetingSuperseded => "MeetingSuperseded",
             PromptOutcome::Ok(_) => "Ok",
         };
         assert_eq!(
@@ -6659,6 +6869,15 @@ mod tests {
                 name: "CancelDrainTimeout + Rotate drops the batch",
                 error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
                 signal: ControlSignal::Rotate,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: false,
+                expected_reason: None,
+                invalidate_all: false,
+            },
+            Case {
+                name: "CancelDrainTimeout + Meeting advance fails closed and drops the batch",
+                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                signal: ControlSignal::MeetingCanonicalAdvance,
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: false,
                 expected_reason: None,

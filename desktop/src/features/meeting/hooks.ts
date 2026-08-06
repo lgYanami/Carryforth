@@ -33,6 +33,10 @@ import {
   KIND_MEETING_STATE,
   KIND_STREAM_MESSAGE,
 } from "@/shared/constants/kinds";
+import {
+  isTerminalMeetingLifecycle,
+  meetingDirectoryFallbackInterval,
+} from "./meetingSyncPolicy";
 
 const MEETING_LIVE_LOOKBACK_SECONDS = 5;
 const MEETING_INVALIDATION_DELAY_MS = 150;
@@ -152,12 +156,16 @@ export function useMeetingDirectory(meetingIds: readonly string[]) {
     enabled: Boolean(activeCommunity) && stableIds.length > 0,
     staleTime: 10_000,
     refetchOnWindowFocus: true,
+    refetchInterval: (query) =>
+      meetingDirectoryFallbackInterval(query.state.data),
+    refetchIntervalInBackground: false,
   });
 }
 
 export function useMeetingSnapshot(meetingId: string) {
   const { activeCommunity } = useCommunities();
-  return useQuery({
+  const queryClient = useQueryClient();
+  const query = useQuery({
     queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
     queryFn: () => getMeetingSnapshot(meetingId),
     enabled: Boolean(activeCommunity && meetingId),
@@ -165,6 +173,30 @@ export function useMeetingSnapshot(meetingId: string) {
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
+  const terminalSnapshot =
+    query.data?.status === "ready" &&
+    isTerminalMeetingLifecycle(query.data.snapshot.lifecycle)
+      ? query.data.snapshot
+      : null;
+  const terminalRevisionKey = terminalSnapshot
+    ? `${activeCommunity?.id ?? "no-community"}:${meetingId}:${terminalSnapshot.lifecycle}:${terminalSnapshot.stateRevision}`
+    : null;
+  const lastReconciledTerminal = React.useRef<string | null>(null);
+
+  React.useEffect(() => {
+    if (!terminalRevisionKey) {
+      lastReconciledTerminal.current = null;
+      return;
+    }
+    if (lastReconciledTerminal.current === terminalRevisionKey) return;
+    lastReconciledTerminal.current = terminalRevisionKey;
+    void queryClient.invalidateQueries({
+      queryKey: [...meetingQueryRoot(activeCommunity?.id), "directory"],
+      refetchType: "active",
+    });
+  }, [activeCommunity?.id, queryClient, terminalRevisionKey]);
+
+  return query;
 }
 
 export function useMeetingFloorActionMutation(meetingId: string) {

@@ -38,8 +38,8 @@ use uuid::Uuid;
 
 use crate::meeting::{
     fetch_meeting_history, now_ms, remaining_before, sign_builder, tag_value,
-    validate_bounded_text, MeetingBatonProtocol, MeetingContinuityDirective, MeetingTurnKind,
-    MeetingTurnRequest,
+    validate_bounded_text, MeetingBatonProtocol, MeetingContinuityDirective,
+    MeetingPreemptionDisposition, MeetingTurnKind, MeetingTurnPreemption, MeetingTurnRequest,
 };
 #[cfg(feature = "meeting-acceptance")]
 use crate::meeting_acceptance::{
@@ -367,6 +367,15 @@ struct BatonView {
     offer: Option<OfferView>,
     grant: Option<GrantView>,
     board_control: Option<BoardControlView>,
+    transition: Option<CanonicalTransitionView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CanonicalTransitionView {
+    primary_type: String,
+    outcome: String,
+    #[serde(default)]
+    caused_by_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,6 +456,8 @@ struct RawBatonState {
     grant: Option<GrantView>,
     #[serde(default)]
     board_control: Option<BoardControlView>,
+    #[serde(default)]
+    transition: Option<CanonicalTransitionView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1043,6 +1054,15 @@ struct ActionDeadlineHint {
     local_deadline: tokio::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+struct ConfirmedModeratorTransition {
+    state_event_id: String,
+    state_revision: u64,
+    primary_type: String,
+    caused_by_event_id: String,
+    origin_turn_id: Option<String>,
+}
+
 /// Participant and moderator V1 controller.
 pub(super) struct MeetingV1Coordinator {
     rest: RestClient,
@@ -1062,6 +1082,8 @@ pub(super) struct MeetingV1Coordinator {
     in_flight_epochs: HashMap<String, u64>,
     external_reclaimable_turns: BTreeSet<Uuid>,
     preemptions: BTreeSet<Uuid>,
+    targeted_preemptions: BTreeMap<String, MeetingTurnPreemption>,
+    confirmed_moderator_transitions: HashMap<Uuid, ConfirmedModeratorTransition>,
     moderator_terminal_turns: BTreeSet<String>,
     moderator_terminal_turn_order: VecDeque<String>,
     next_session_epoch: u64,
@@ -1140,6 +1162,8 @@ impl MeetingV1Coordinator {
             in_flight_epochs: HashMap::new(),
             external_reclaimable_turns: BTreeSet::new(),
             preemptions: BTreeSet::new(),
+            targeted_preemptions: BTreeMap::new(),
+            confirmed_moderator_transitions: HashMap::new(),
             moderator_terminal_turns: BTreeSet::new(),
             moderator_terminal_turn_order: VecDeque::new(),
             next_session_epoch: 0,
@@ -1654,6 +1678,9 @@ impl MeetingV1Coordinator {
             self.preemptions.remove(&session_id);
         }
         self.deferred_turn_results.remove(&session_id);
+        self.targeted_preemptions
+            .retain(|_, preemption| preemption.session_id != session_id);
+        self.confirmed_moderator_transitions.remove(&session_id);
         self.board_load_in_flight.remove(&session_id);
         self.protocol_in_flight
             .retain(|key, _| key.session_id() != session_id);
@@ -1703,6 +1730,9 @@ impl MeetingV1Coordinator {
             self.preemptions.remove(&session_id);
         }
         let deferred_turn_result = self.deferred_turn_results.remove(&session_id);
+        self.targeted_preemptions
+            .retain(|_, preemption| preemption.session_id != session_id);
+        self.confirmed_moderator_transitions.remove(&session_id);
         self.board_load_in_flight.remove(&session_id);
         // A primary Moderator action may already be committed at the Relay
         // even when the terminal State wins the local delivery race. Keep its
@@ -2650,8 +2680,71 @@ impl MeetingV1Coordinator {
         );
     }
 
+    pub(super) async fn handle_turn_superseded(&mut self, turn_id: &str) {
+        self.action_deadline_senders.remove(turn_id);
+        let Some(request) = self.in_flight.remove(turn_id) else {
+            return;
+        };
+        self.in_flight_epochs.remove(turn_id);
+        self.targeted_preemptions.remove(turn_id);
+        if let Some(runtime) = self.meetings.get_mut(&request.session_id) {
+            if runtime.in_flight_turn.as_deref() == Some(turn_id) {
+                runtime.in_flight_turn = None;
+            }
+            runtime.queued = false;
+        }
+        if let Some(ledger) = self.ledger_for_mut(request.session_id) {
+            for record in [
+                ledger
+                    .v2_board_maintenance
+                    .as_mut()
+                    .map(|record| (&mut record.turn_id, &mut record.state)),
+                ledger
+                    .v2_floor_decision
+                    .as_mut()
+                    .map(|record| (&mut record.turn_id, &mut record.state)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if record.0.as_deref() == Some(turn_id) {
+                    *record.0 = None;
+                    if record.1 == "running" {
+                        *record.1 = "completed".to_string();
+                    }
+                }
+            }
+            if let Some(record) = ledger.v2_action_finalization.as_mut() {
+                if record.turn_id.as_deref() == Some(turn_id) {
+                    record.turn_id = None;
+                    if record.state == "running" {
+                        record.state = "pending".to_string();
+                    }
+                }
+            }
+        }
+        self.persist_ledger_best_effort();
+        self.emit(
+            "meeting_v2_turn_superseded",
+            request.session_id,
+            Some(turn_id.to_string()),
+            json!({
+                "turn_type": board_turn_type(request.kind),
+                "reason": "canonical_state_advanced",
+                "session_preserved": true,
+            }),
+        );
+        self.reconcile(request.session_id).await;
+    }
+
     pub(super) fn take_preemptions(&mut self) -> Vec<Uuid> {
         std::mem::take(&mut self.preemptions).into_iter().collect()
+    }
+
+    pub(super) fn take_targeted_preemptions(&mut self) -> Vec<MeetingTurnPreemption> {
+        std::mem::take(&mut self.targeted_preemptions)
+            .into_values()
+            .collect()
     }
 
     pub(super) fn mark_cross_protocol_preempted(&mut self, session_id: Uuid) {
@@ -4294,6 +4387,7 @@ impl MeetingV1Coordinator {
     }
 
     fn apply_view_to_ledger(&mut self, view: &MeetingView) {
+        self.capture_confirmed_moderator_transition(view);
         if view.ended {
             self.teardown_terminal_session(view.session_id);
             return;
@@ -4978,6 +5072,65 @@ impl MeetingV1Coordinator {
                 );
             }
         }
+    }
+
+    /// Correlate a Relay-signed canonical transition with the exact signed
+    /// moderator command that produced it before ledger reconciliation clears
+    /// the prepared command. This receipt is process-local and intentionally
+    /// minimal: durable replay still lives in `prepared_moderator_action`.
+    fn capture_confirmed_moderator_transition(&mut self, view: &MeetingView) {
+        if self
+            .confirmed_moderator_transitions
+            .get(&view.session_id)
+            .is_some_and(|confirmed| confirmed.state_event_id == view.baton.state_event_id)
+        {
+            return;
+        }
+        self.confirmed_moderator_transitions
+            .remove(&view.session_id);
+
+        let Some(transition) = view.baton.transition.as_ref() else {
+            return;
+        };
+        let Some(caused_by_event_id) = transition
+            .caused_by_event_id
+            .as_deref()
+            .filter(|event_id| is_hex_id(event_id))
+        else {
+            return;
+        };
+        if transition.outcome != "accepted" {
+            return;
+        }
+        let Some((matched_event_id, origin_turn_id)) = self
+            .ledger_for(view.session_id)
+            .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
+            .filter(|prepared| prepared.event_id.eq_ignore_ascii_case(caused_by_event_id))
+            .map(|prepared| (prepared.event_id.clone(), prepared.turn_id.clone()))
+        else {
+            return;
+        };
+
+        let confirmed = ConfirmedModeratorTransition {
+            state_event_id: view.baton.state_event_id.clone(),
+            state_revision: view.baton.state_revision,
+            primary_type: transition.primary_type.clone(),
+            caused_by_event_id: matched_event_id,
+            origin_turn_id,
+        };
+        self.emit(
+            "meeting_v2_canonical_transition_correlated",
+            view.session_id,
+            confirmed.origin_turn_id.clone(),
+            json!({
+                "state_event_id": confirmed.state_event_id,
+                "state_revision": confirmed.state_revision,
+                "transition_type": confirmed.primary_type,
+                "caused_by_event_id": confirmed.caused_by_event_id,
+            }),
+        );
+        self.confirmed_moderator_transitions
+            .insert(view.session_id, confirmed);
     }
 
     async fn reconcile(&mut self, session_id: Uuid) {
@@ -7490,16 +7643,61 @@ impl MeetingV1Coordinator {
             self.board_load_in_flight.remove(&session_id);
             removed = true;
         }
-        let stale_running = self.in_flight.values().any(|request| {
-            request.session_id == session_id
+        let stale_running = self.in_flight.iter().find_map(|(turn_id, request)| {
+            let stale = request.session_id == session_id
                 && request.kind.is_v2_moderator()
                 && (!v2_host_request_matches_view(request, view, &self.agent_pubkey)
                     || (request.kind == MeetingTurnKind::V2ModeratorFloor
                         && request.basis_id.starts_with("floor:")
-                        && no_candidate_floor_was_superseded))
+                        && no_candidate_floor_was_superseded));
+            stale.then(|| (turn_id.clone(), request.kind))
         });
-        if stale_running {
-            self.preemptions.insert(session_id);
+        if let Some((target_turn_id, turn_kind)) = stale_running {
+            let confirmed = self
+                .confirmed_moderator_transitions
+                .get(&session_id)
+                .filter(|confirmed| confirmed.state_event_id == view.baton.state_event_id)
+                .cloned();
+            let reason = if confirmed.is_some() {
+                "canonical_self_advance"
+            } else {
+                "external_authority_change"
+            };
+            let disposition = if !view.ended && view.baton.moderator_pubkey == self.agent_pubkey {
+                // The canonical State fences this exact turn's output, but the
+                // moderator's ACP affinity remains valid. A transport/drain
+                // failure still replaces the process in the pool layer.
+                MeetingPreemptionDisposition::PreserveSession
+            } else {
+                MeetingPreemptionDisposition::InvalidateSession
+            };
+            self.targeted_preemptions
+                .entry(target_turn_id.clone())
+                .or_insert_with(|| MeetingTurnPreemption {
+                    session_id,
+                    origin_turn_id: confirmed
+                        .as_ref()
+                        .and_then(|value| value.origin_turn_id.clone()),
+                    target_turn_id: target_turn_id.clone(),
+                    reason,
+                    disposition,
+                });
+            self.emit(
+                "meeting_v2_turn_preemption_requested",
+                session_id,
+                Some(target_turn_id.clone()),
+                json!({
+                    "reason": reason,
+                    "turn_type": board_turn_type(turn_kind),
+                    "target_turn_id": target_turn_id,
+                    "state_event_id": view.baton.state_event_id,
+                    "state_revision": view.baton.state_revision,
+                    "transition_type": confirmed.as_ref().map(|value| value.primary_type.as_str()),
+                    "caused_by_event_id": confirmed.as_ref().map(|value| value.caused_by_event_id.as_str()),
+                    "origin_turn_id": confirmed.as_ref().and_then(|value| value.origin_turn_id.as_deref()),
+                    "preserve_session": disposition == MeetingPreemptionDisposition::PreserveSession,
+                }),
+            );
         }
         if removed {
             self.continuity_directives
@@ -9968,6 +10166,7 @@ fn baton_from_raw_state(
         offer: raw_state.offer,
         grant: raw_state.grant,
         board_control: raw_state.board_control,
+        transition: raw_state.transition,
     }
 }
 
@@ -10390,8 +10589,6 @@ fn validate_action_run(action: &ActionRunView, board: &BoardControlView) -> Resu
         || action.control_epoch == 0
         || action.board_window == 0
         || action.action_window_epoch == 0
-        || action.control_epoch != board.control_epoch
-        || action.board_window != board.board_window
         || !matches!(action.condition.as_str(), "runnable" | "blocked")
         || action.updated_at_ms < action.created_at_ms
         || (action.progress_seq == 0)
@@ -10420,7 +10617,10 @@ fn validate_action_run(action: &ActionRunView, board: &BoardControlView) -> Resu
 
     match action.terminal_status.as_deref() {
         None => {
-            if action.completion_event_id.is_some()
+            if board.phase != "finalizing_actions"
+                || action.control_epoch != board.control_epoch
+                || action.board_window != board.board_window
+                || action.completion_event_id.is_some()
                 || action.terminal_at_ms.is_some()
                 || (action.condition == "runnable") != action.action_deadline_at_ms.is_some()
             {
@@ -10430,7 +10630,11 @@ fn validate_action_run(action: &ActionRunView, board: &BoardControlView) -> Resu
             }
         }
         Some("completed_closed") => {
-            if action.completion_event_id.is_none()
+            if board.phase != "ended"
+                || board.terminal_outcome.as_deref() != Some("closed")
+                || action.control_epoch != board.control_epoch
+                || action.board_window != board.board_window
+                || action.completion_event_id.is_none()
                 || action.terminal_at_ms.is_none()
                 || action.action_deadline_at_ms.is_some()
             {
@@ -10439,13 +10643,32 @@ fn validate_action_run(action: &ActionRunView, board: &BoardControlView) -> Resu
                 ));
             }
         }
-        Some("completed_aborted" | "returned_to_board") => {
-            if action.completion_event_id.is_some()
+        Some("completed_aborted") => {
+            if board.phase != "ended"
+                || board.terminal_outcome.as_deref() != Some("aborted")
+                || action.control_epoch != board.control_epoch
+                || action.board_window != board.board_window
+                || action.completion_event_id.is_some()
                 || action.terminal_at_ms.is_none()
                 || action.action_deadline_at_ms.is_some()
             {
                 return Err(anyhow!(
-                    "terminal Meeting V2 direct action projection has invalid completion fields"
+                    "aborted Meeting V2 direct action projection has invalid completion fields"
+                ));
+            }
+        }
+        Some("returned_to_board") => {
+            if !matches!(
+                board.phase.as_str(),
+                "board_pending" | "floor_ready" | "ended"
+            ) || board.control_epoch < action.control_epoch
+                || board.board_window <= action.board_window
+                || action.completion_event_id.is_some()
+                || action.terminal_at_ms.is_none()
+                || action.action_deadline_at_ms.is_some()
+            {
+                return Err(anyhow!(
+                    "returned Meeting V2 direct action projection has invalid provenance fields"
                 ));
             }
         }
@@ -10491,6 +10714,19 @@ fn validate_baton_state_event(
         || PublicKey::from_hex(&state.moderator_pubkey).is_err()
     {
         return Err(anyhow!("Meeting V1 State has invalid core fields"));
+    }
+    if let Some(transition) = state.transition.as_ref() {
+        if transition.primary_type.trim().is_empty()
+            || transition.primary_type.len() > 128
+            || transition.outcome.trim().is_empty()
+            || transition.outcome.len() > 128
+            || transition
+                .caused_by_event_id
+                .as_deref()
+                .is_some_and(|event_id| !is_hex_id(event_id))
+        {
+            return Err(anyhow!("Meeting State has an invalid canonical transition"));
+        }
     }
     if let Some(attempt) = state.active_decision_attempt.as_ref() {
         validate_active_decision_attempt(state, attempt)?;
@@ -12891,6 +13127,7 @@ mod tests {
             offer: None,
             grant: None,
             board_control: None,
+            transition: None,
         }
     }
 
@@ -12935,6 +13172,7 @@ mod tests {
             offer: None,
             grant: None,
             board_control: None,
+            transition: None,
         }
     }
 
@@ -13076,6 +13314,215 @@ mod tests {
             serde_json::to_value(&view.baton.board_control).expect("serialize Board control");
     }
 
+    #[test]
+    fn returned_action_projection_accepts_later_board_provenance() {
+        let relay = Keys::generate();
+        let moderator = Keys::generate().public_key().to_hex();
+        let participant = Keys::generate().public_key().to_hex();
+        let mut view = meeting_v2_actions_view(Uuid::new_v4(), &moderator, &participant, &relay);
+        set_v2_direct_action(
+            &mut view,
+            Uuid::new_v4(),
+            pubkey(120),
+            now_ms().saturating_add(120_000),
+        );
+        let mut board = view
+            .baton
+            .board_control
+            .take()
+            .expect("action-capable Board control");
+        let action = board.action.as_mut().expect("direct Action projection");
+        let origin_control_epoch = action.control_epoch;
+        let origin_board_window = action.board_window;
+        action.terminal_status = Some("returned_to_board".to_string());
+        action.action_deadline_at_ms = None;
+        action.terminal_at_ms = Some(now_ms());
+
+        board.phase = "board_pending".to_string();
+        board.board_window = origin_board_window + 1;
+        assert!(
+            validate_action_run(board.action.as_ref().expect("returned Action"), &board,).is_ok()
+        );
+
+        board.phase = "floor_ready".to_string();
+        board.control_epoch = origin_control_epoch + 2;
+        board.board_window = origin_board_window + 4;
+        assert!(validate_action_run(
+            board.action.as_ref().expect("historical returned Action"),
+            &board,
+        )
+        .is_ok());
+
+        board.phase = "ended".to_string();
+        board.terminal_outcome = Some("closed".to_string());
+        assert!(validate_action_run(
+            board.action.as_ref().expect("ended returned Action"),
+            &board,
+        )
+        .is_ok());
+
+        board.phase = "floor_ready".to_string();
+        board.terminal_outcome = None;
+        board.board_window = origin_board_window;
+        assert!(validate_action_run(
+            board.action.as_ref().expect("same-window returned Action"),
+            &board,
+        )
+        .is_err());
+
+        board.board_window = origin_board_window + 1;
+        board.control_epoch = origin_control_epoch.saturating_sub(1);
+        assert!(validate_action_run(
+            board
+                .action
+                .as_ref()
+                .expect("regressed-epoch returned Action"),
+            &board,
+        )
+        .is_err());
+
+        board.control_epoch = origin_control_epoch;
+        board.phase = "finalizing_actions".to_string();
+        assert!(validate_action_run(
+            board.action.as_ref().expect("wrong-phase returned Action"),
+            &board,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn completed_action_projection_requires_matching_terminal_shape() {
+        let relay = Keys::generate();
+        let moderator = Keys::generate().public_key().to_hex();
+        let participant = Keys::generate().public_key().to_hex();
+        let mut view = meeting_v2_actions_view(Uuid::new_v4(), &moderator, &participant, &relay);
+        set_v2_direct_action(
+            &mut view,
+            Uuid::new_v4(),
+            pubkey(121),
+            now_ms().saturating_add(120_000),
+        );
+        let mut board = view
+            .baton
+            .board_control
+            .take()
+            .expect("action-capable Board control");
+        board.phase = "ended".to_string();
+        board.terminal_outcome = Some("closed".to_string());
+        let action = board.action.as_mut().expect("direct Action projection");
+        action.terminal_status = Some("completed_closed".to_string());
+        action.completion_event_id = Some(pubkey(122));
+        action.action_deadline_at_ms = None;
+        action.terminal_at_ms = Some(now_ms());
+        assert!(
+            validate_action_run(board.action.as_ref().expect("closed Action"), &board,).is_ok()
+        );
+
+        board.terminal_outcome = Some("aborted".to_string());
+        assert!(validate_action_run(
+            board.action.as_ref().expect("mismatched closed Action"),
+            &board,
+        )
+        .is_err());
+        let action = board.action.as_mut().expect("direct Action projection");
+        action.terminal_status = Some("completed_aborted".to_string());
+        action.completion_event_id = None;
+        assert!(
+            validate_action_run(board.action.as_ref().expect("aborted Action"), &board,).is_ok()
+        );
+    }
+
+    #[test]
+    fn canonical_transition_preemption_targets_exact_turn_and_preserves_session() {
+        let directory = tempfile::tempdir().expect("temporary ledger directory");
+        let moderator = Keys::generate();
+        let moderator_pubkey = moderator.public_key().to_hex();
+        let participant_pubkey = Keys::generate().public_key().to_hex();
+        let relay = Keys::generate();
+        let session_id = Uuid::new_v4();
+        let mut coordinator = test_coordinator(
+            moderator,
+            directory.path().join("meeting-v2-targeted-preemption.json"),
+            None,
+        );
+        coordinator.ensure_meeting_ledger(session_id);
+        let mut view =
+            meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
+        make_v2_local_moderator(&mut view, &moderator_pubkey);
+        set_v2_board_pending(&mut view, 7, now_ms().saturating_add(180_000));
+        coordinator.apply_view_to_ledger(&view);
+
+        let target_turn_id = "newer-board-turn";
+        coordinator.mark_dispatched(
+            target_turn_id.to_string(),
+            MeetingTurnRequest {
+                session_id,
+                prompt: "maintain Board".to_string(),
+                hard_deadline_unix_ms: now_ms().saturating_add(120_000),
+                kind: MeetingTurnKind::V2ModeratorBoard,
+                format_retry: false,
+                basis_id: "7".to_string(),
+                round_number: view.baton.control_epoch,
+                speech_cursor: None,
+                expected_speech_revision: Some(0),
+                floor_revision: 7,
+                grant_event_id: None,
+                queued_at_unix_ms: now_ms(),
+                moderator_observer_snapshot: None,
+                baton_protocol: Some(MeetingBatonProtocol::V2Actions),
+                board_event_id: Some(pubkey(101)),
+            },
+        );
+        let caused_by_event_id = pubkey(102);
+        coordinator
+            .ledger_for_mut(session_id)
+            .expect("Meeting ledger")
+            .prepared_moderator_action = Some(PreparedModeratorAction {
+            action_kind: "board_update".to_string(),
+            object_id: "1:7".to_string(),
+            attempt_id: None,
+            observer_snapshot: None,
+            turn_id: Some("origin-board-turn".to_string()),
+            event: json!({ "id": caused_by_event_id }),
+            event_id: caused_by_event_id.clone(),
+            state: "sent".to_string(),
+            created_at_ms: now_ms(),
+            hard_deadline_unix_ms: now_ms().saturating_add(120_000),
+        });
+
+        view.baton.state_revision = view.baton.state_revision.saturating_add(1);
+        view.baton.state_event_id = pubkey(103);
+        view.baton.transition = Some(CanonicalTransitionView {
+            primary_type: "board_updated".to_string(),
+            outcome: "accepted".to_string(),
+            caused_by_event_id: Some(caused_by_event_id),
+        });
+        let board = view.baton.board_control.as_mut().expect("Board control");
+        board.phase = "floor_ready".to_string();
+        board.board_deadline_at_ms = None;
+        board.board_completed_at_ms = Some(now_ms());
+        board.board_outcome = Some("updated".to_string());
+
+        coordinator.apply_view_to_ledger(&view);
+        assert!(coordinator
+            .ledger_for(session_id)
+            .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
+            .is_none());
+        coordinator.discard_stale_v2_host_requests(session_id, &view);
+        let preemptions = coordinator.take_targeted_preemptions();
+        assert_eq!(preemptions.len(), 1);
+        assert_eq!(preemptions[0].target_turn_id, target_turn_id);
+        assert_eq!(
+            preemptions[0].origin_turn_id.as_deref(),
+            Some("origin-board-turn")
+        );
+        assert_eq!(preemptions[0].reason, "canonical_self_advance");
+        assert_eq!(
+            preemptions[0].disposition,
+            MeetingPreemptionDisposition::PreserveSession
+        );
+    }
+
     fn make_v2_local_moderator(view: &mut MeetingView, agent_pubkey: &str) {
         view.baton.moderator_pubkey = agent_pubkey.to_string();
         view.baton.raw_state["moderator_pubkey"] = json!(agent_pubkey);
@@ -13150,6 +13597,7 @@ mod tests {
             "offer": view.baton.offer,
             "grant": view.baton.grant,
             "board_control": view.baton.board_control,
+            "transition": view.baton.transition,
         }))
         .expect("serialize test Meeting V2 State");
         EventBuilder::new(Kind::Custom(KIND_MEETING_ROUND_STATE as u16), content)
@@ -13268,6 +13716,8 @@ mod tests {
             in_flight_epochs: HashMap::new(),
             external_reclaimable_turns: BTreeSet::new(),
             preemptions: BTreeSet::new(),
+            targeted_preemptions: BTreeMap::new(),
+            confirmed_moderator_transitions: HashMap::new(),
             moderator_terminal_turns: BTreeSet::new(),
             moderator_terminal_turn_order: VecDeque::new(),
             next_session_epoch: 0,
@@ -20924,7 +21374,16 @@ mod tests {
             SyncApplyResult::Applied
         );
         coordinator.reconcile(session_id).await;
-        assert!(coordinator.preemptions.contains(&session_id));
+        let preemptions = coordinator.take_targeted_preemptions();
+        assert_eq!(preemptions.len(), 1);
+        assert_eq!(preemptions[0].session_id, session_id);
+        assert_eq!(preemptions[0].target_turn_id, "preempted-board");
+        assert_eq!(preemptions[0].origin_turn_id, None);
+        assert_eq!(preemptions[0].reason, "external_authority_change");
+        assert_eq!(
+            preemptions[0].disposition,
+            MeetingPreemptionDisposition::PreserveSession
+        );
 
         coordinator
             .process_deferred_turn_result(DeferredTurnResult {
@@ -21016,9 +21475,15 @@ mod tests {
         );
         coordinator.reconcile(session_id).await;
 
-        assert!(
-            coordinator.preemptions.contains(&session_id),
-            "new Relay-frozen work must release the obsolete no-candidate Floor slot"
+        let preemptions = coordinator.take_targeted_preemptions();
+        assert_eq!(preemptions.len(), 1);
+        assert_eq!(preemptions[0].session_id, session_id);
+        assert_eq!(preemptions[0].target_turn_id, "superseded-floor");
+        assert_eq!(preemptions[0].origin_turn_id, None);
+        assert_eq!(preemptions[0].reason, "external_authority_change");
+        assert_eq!(
+            preemptions[0].disposition,
+            MeetingPreemptionDisposition::PreserveSession
         );
         assert!(
             coordinator
