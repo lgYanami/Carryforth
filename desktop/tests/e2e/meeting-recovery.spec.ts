@@ -13,6 +13,7 @@ const RELAY_A = "ws://localhost:3000";
 const RELAY_B = "ws://localhost:3001";
 const MEETING_A = "60000000-0000-4000-8000-000000000001";
 const MEETING_B = "60000000-0000-4000-8000-000000000002";
+const MEETING_C = "60000000-0000-4000-8000-000000000003";
 
 type RelayConnectionState =
   | "connected"
@@ -174,6 +175,64 @@ async function openMeeting(page: Page, meetingId: string) {
   await page.getByTestId(`meeting-row-${meetingId}`).click();
   await expect(page.getByTestId("meeting-screen")).toBeVisible();
 }
+
+test("multiple Meeting rooms use single-channel live subscriptions and refresh the mounted snapshot", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetings: [
+      meetingSeed(MEETING_A, "Live review A", "# Board A"),
+      meetingSeed(MEETING_B, "Live review B", "# Board B"),
+      meetingSeed(MEETING_C, "Live review C", "# Board C"),
+    ],
+  });
+  await page.goto("/");
+  await openMeeting(page, MEETING_A);
+  const mountedMeetingUrl = page.url();
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const filters = window.__BUZZ_E2E_MEETING_LIVE_FILTERS__ ?? [];
+        return {
+          hasMultiChannelFilter: filters.some(
+            (filter) => filter.channelIds.length !== 1,
+          ),
+          meetingIds: [
+            ...new Set(filters.flatMap((filter) => filter.channelIds)),
+          ].sort(),
+        };
+      }),
+    )
+    .toEqual({
+      hasMultiChannelFilter: false,
+      meetingIds: [MEETING_A, MEETING_B, MEETING_C],
+    });
+
+  await page.evaluate(
+    ({ meetingId, speakerPubkey }) => {
+      const meeting = window.__BUZZ_E2E__?.mock?.meetings?.find(
+        (candidate) => candidate.id === meetingId,
+      );
+      if (meeting?.result.status !== "ready") {
+        throw new Error("Missing ready Meeting fixture");
+      }
+      meeting.result.snapshot.stateRevision += 1;
+      meeting.result.snapshot.phase = "granted";
+      meeting.result.snapshot.currentSpeakerPubkey = speakerPubkey;
+      if (meeting.result.snapshot.host) {
+        meeting.result.snapshot.host.boardControl.phase = "floor_ready";
+      }
+      window.__BUZZ_E2E_EMIT_MEETING_EVENT__?.({ meetingId });
+    },
+    { meetingId: MEETING_A, speakerPubkey: PARTICIPANT },
+  );
+
+  await expect(page.getByTestId("meeting-status-strip")).toContainText(
+    "has the floor",
+  );
+  await expect(page).toHaveURL(mountedMeetingUrl);
+});
 
 test("Meeting stays visible but non-authoritative until reconnect snapshot succeeds", async ({
   page,

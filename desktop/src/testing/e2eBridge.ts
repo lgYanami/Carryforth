@@ -35,6 +35,8 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_MEETING_END,
+  KIND_MEETING_STATE,
   KIND_PROJECT_DOCUMENT_META,
   KIND_PROJECT_VIEW_META,
   KIND_REPO_ANNOUNCEMENT,
@@ -1069,6 +1071,16 @@ declare global {
       meetingId: string;
       requesterPubkey: string;
     }) => boolean;
+    /** Meeting live REQ filters observed by the mock socket. */
+    __BUZZ_E2E_MEETING_LIVE_FILTERS__?: Array<{
+      channelIds: string[];
+      kinds: number[];
+    }>;
+    /** Emit a channel-scoped Meeting invalidation hint. */
+    __BUZZ_E2E_EMIT_MEETING_EVENT__?: (input: {
+      meetingId: string;
+      kind?: number;
+    }) => RelayEvent;
     __BUZZ_E2E_WEBVIEW_ZOOM__?: number;
     __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
       channelName: string;
@@ -10110,6 +10122,20 @@ function sendToMockSocket(args: {
     }
 
     if (subId.startsWith("live-")) {
+      if (
+        filters.some((filter) =>
+          filter.kinds?.some(
+            (kind) => kind === KIND_MEETING_STATE || kind === KIND_MEETING_END,
+          ),
+        )
+      ) {
+        for (const filter of filters) {
+          window.__BUZZ_E2E_MEETING_LIVE_FILTERS__?.push({
+            channelIds: [...(filter["#h"] ?? [])],
+            kinds: [...(filter.kinds ?? [])],
+          });
+        }
+      }
       // Collect channel IDs from all filters in the REQ
       const channelIds = new Set<string>();
       const kinds = new Set<number>();
@@ -10614,6 +10640,15 @@ export function maybeInstallE2eTauriMocks() {
       input.requesterPubkey.toLowerCase(),
       config,
     );
+  window.__BUZZ_E2E_MEETING_LIVE_FILTERS__ = [];
+  window.__BUZZ_E2E_EMIT_MEETING_EVENT__ = ({
+    meetingId,
+    kind = KIND_MEETING_STATE,
+  }) => {
+    const event = createMockEvent(kind, "", [["h", meetingId]]);
+    emitMockLiveEvent(meetingId, event);
+    return event;
+  };
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({

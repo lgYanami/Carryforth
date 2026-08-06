@@ -23,7 +23,7 @@ export function useMeetingRoomPartition(channels: Channel[]) {
     [meetingRooms],
   );
   const meetingDirectory = useMeetingDirectory(meetingIds);
-  useMeetingLiveSync(meetingIds);
+  useMeetingLiveSync(meetingIds, meetingDirectory.data);
   const meetingItems = React.useMemo<MeetingListItem[]>(() => {
     const projected = new Map(
       (meetingDirectory.data ?? []).map((meeting) => [

@@ -25,6 +25,7 @@ import {
   type MeetingActionFinalizationInput,
   type MeetingFloorActionInput,
   type MeetingHostActionInput,
+  type MeetingListItem,
   type MeetingSpeechCursor,
 } from "@/shared/api/tauriMeetings";
 import type { Channel } from "@/shared/api/types";
@@ -36,14 +37,16 @@ import {
 import {
   isTerminalMeetingLifecycle,
   meetingDirectoryFallbackInterval,
+  meetingLiveSubscriptionIds,
+  meetingSnapshotFallbackInterval,
 } from "./meetingSyncPolicy";
+import {
+  MeetingLiveInvalidationScheduler,
+  type MeetingLiveSignal,
+  MeetingLiveSubscriptionManager,
+} from "./liveSync";
 
-const MEETING_LIVE_LOOKBACK_SECONDS = 5;
-const MEETING_INVALIDATION_DELAY_MS = 150;
-const MEETING_SUBSCRIPTION_RETRY_BASE_MS = 500;
-const MEETING_SUBSCRIPTION_RETRY_MAX_MS = 5_000;
 const MEETING_DIRECTORY_BATCH_SIZE = 64;
-const MEETING_LIVE_BATCH_SIZE = 64;
 
 function chunks<T>(items: readonly T[], size: number): T[][] {
   const result: T[][] = [];
@@ -172,6 +175,9 @@ export function useMeetingSnapshot(meetingId: string) {
     staleTime: 5_000,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
+    refetchInterval: (snapshotQuery) =>
+      meetingSnapshotFallbackInterval(snapshotQuery.state.data),
+    refetchIntervalInBackground: false,
   });
   const terminalSnapshot =
     query.data?.status === "ready" &&
@@ -339,98 +345,99 @@ export function useMeetingActivities(input: {
  * Treat Meeting live events only as invalidation signals. The native bridge
  * re-reads and verifies the authoritative projection before React changes.
  */
-export function useMeetingLiveSync(meetingIds: readonly string[]): void {
+export function useMeetingLiveSync(
+  meetingIds: readonly string[],
+  meetings: readonly MeetingListItem[] | undefined,
+): void {
   const { activeCommunity } = useCommunities();
   const queryClient = useQueryClient();
   const communityId = activeCommunity?.id;
-  const meetingIdsKey = [...new Set(meetingIds)].sort().join(",");
+  const meetingIdsKey = meetingLiveSubscriptionIds(meetingIds, meetings).join(
+    ",",
+  );
   const stableIds = React.useMemo(
     () => (meetingIdsKey ? meetingIdsKey.split(",") : []),
     [meetingIdsKey],
   );
-  const invalidate = React.useEffectEvent(async () => {
-    await queryClient.invalidateQueries({
-      queryKey: meetingQueryRoot(communityId),
-    });
-  });
+  const invalidate = React.useEffectEvent(
+    async (meetingId: string, signals: ReadonlySet<MeetingLiveSignal>) => {
+      const invalidations: Promise<unknown>[] = [
+        queryClient.invalidateQueries({
+          queryKey: meetingSnapshotQueryKey(communityId, meetingId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: [...meetingQueryRoot(communityId), "directory"],
+        }),
+      ];
+      if (signals.has(KIND_STREAM_MESSAGE)) {
+        invalidations.push(
+          queryClient.invalidateQueries({
+            queryKey: meetingSpeechesQueryKey(communityId, meetingId),
+          }),
+        );
+      }
+      if (signals.has(KIND_MEETING_STATE) || signals.has(KIND_MEETING_END)) {
+        invalidations.push(
+          queryClient.invalidateQueries({
+            queryKey: meetingActivitiesQueryKey(communityId, meetingId),
+          }),
+        );
+      }
+      if (signals.has(KIND_MEETING_END)) {
+        invalidations.push(
+          queryClient.invalidateQueries({ queryKey: channelsQueryKey }),
+        );
+      }
+      await Promise.all(invalidations);
+    },
+  );
+  const managerRef = React.useRef<MeetingLiveSubscriptionManager | null>(null);
 
   React.useEffect(() => {
-    if (!communityId || stableIds.length === 0) return;
+    if (!communityId) {
+      managerRef.current = null;
+      return;
+    }
 
-    let cancelled = false;
-    let timer: number | null = null;
-    let retryTimer: number | null = null;
-    let disposeSubscriptions: Array<() => Promise<void>> = [];
-    const signal = () => {
-      if (cancelled) return;
-      if (timer !== null) window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        timer = null;
-        void invalidate();
-      }, MEETING_INVALIDATION_DELAY_MS);
+    const schedulers = new Map<string, MeetingLiveInvalidationScheduler>();
+    const schedulerFor = (meetingId: string) => {
+      const existing = schedulers.get(meetingId);
+      if (existing) return existing;
+      const scheduler = new MeetingLiveInvalidationScheduler(
+        (signals) => invalidate(meetingId, signals),
+        undefined,
+        window.setTimeout.bind(window),
+        window.clearTimeout.bind(window),
+      );
+      schedulers.set(meetingId, scheduler);
+      return scheduler;
     };
-
-    let retryAttempt = 0;
-    const subscribe = async () => {
-      const nextSubscriptions: Array<() => Promise<void>> = [];
-      try {
-        for (const batch of chunks(stableIds, MEETING_LIVE_BATCH_SIZE)) {
-          nextSubscriptions.push(
-            await relayClient.subscribeLive(
-              {
-                kinds: [
-                  KIND_STREAM_MESSAGE,
-                  KIND_MEETING_STATE,
-                  KIND_MEETING_END,
-                ],
-                "#h": batch,
-                limit: 256,
-                since: Math.max(
-                  0,
-                  Math.floor(Date.now() / 1_000) -
-                    MEETING_LIVE_LOOKBACK_SECONDS,
-                ),
-              },
-              signal,
-            ),
-          );
-        }
-        if (cancelled) {
-          for (const dispose of nextSubscriptions) {
-            void dispose().catch(() => {});
-          }
-          return;
-        }
-        disposeSubscriptions = nextSubscriptions;
-        retryAttempt = 0;
-        // Close the snapshot → subscription race.
-        signal();
-      } catch (error) {
-        for (const dispose of nextSubscriptions) {
-          void dispose().catch(() => {});
-        }
-        if (cancelled) return;
-        console.error("Failed to subscribe to Meeting updates", error);
-        const delay = Math.min(
-          MEETING_SUBSCRIPTION_RETRY_MAX_MS,
-          MEETING_SUBSCRIPTION_RETRY_BASE_MS * 2 ** retryAttempt,
-        );
-        retryAttempt += 1;
-        retryTimer = window.setTimeout(() => {
-          retryTimer = null;
-          void subscribe();
-        }, delay);
-      }
-    };
-    void subscribe();
+    const manager = new MeetingLiveSubscriptionManager({
+      subscribe: (filter, onEvent) =>
+        relayClient.subscribeLive(filter, onEvent),
+      onSignal: (meetingId, signal) => schedulerFor(meetingId).signal(signal),
+      onError: (meetingId, error, retryInMs) => {
+        console.error("Failed to subscribe to Meeting updates; retrying", {
+          meetingId,
+          retryInMs,
+          error,
+        });
+      },
+      setTimeoutFn: window.setTimeout.bind(window),
+      clearTimeoutFn: window.clearTimeout.bind(window),
+    });
+    managerRef.current = manager;
 
     return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-      if (retryTimer !== null) window.clearTimeout(retryTimer);
-      for (const dispose of disposeSubscriptions) {
-        void dispose().catch(() => {});
-      }
+      if (managerRef.current === manager) managerRef.current = null;
+      manager.destroy();
+      for (const scheduler of schedulers.values()) scheduler.dispose();
+      schedulers.clear();
     };
+  }, [communityId]);
+
+  React.useEffect(() => {
+    if (!communityId) return;
+    managerRef.current?.sync(stableIds);
   }, [communityId, stableIds]);
 }
