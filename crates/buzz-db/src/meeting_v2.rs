@@ -1799,8 +1799,9 @@ pub async fn get_current_board(
     }))
 }
 
-/// Load the current board after enforcing the shared Community-global reader
-/// predicate. The immutable roster remains an action boundary only.
+/// Load the current board after enforcing the published Meeting read contract.
+/// The immutable roster remains an action boundary only after Community-wide
+/// reads have been published.
 pub async fn get_current_board_for_reader(
     db: &Db,
     community_id: CommunityId,
@@ -1813,7 +1814,7 @@ pub async fn get_current_board_for_reader(
     {
         Some(true) => get_current_board(db, community_id, session_id).await,
         Some(false) => Err(DbError::AccessDenied(
-            "meeting board requires current Community membership".to_string(),
+            "meeting board reader is not authorized by the current read contract".to_string(),
         )),
         None => Ok(None),
     }
@@ -2026,7 +2027,27 @@ mod tests {
             .execute(pool)
             .await
             .expect("insert Meeting V2 test community");
-        CommunityId::from_uuid(id)
+        let community_id = CommunityId::from_uuid(id);
+        let db = Db::from_pool(pool.clone());
+        db.set_meeting_community_read_create_paused(community_id, true)
+            .await
+            .expect("pause empty Meeting corpus");
+        let audit = db
+            .audit_legacy_meeting_visibility(community_id)
+            .await
+            .expect("audit empty Meeting corpus");
+        db.approve_legacy_meeting_visibility(
+            community_id,
+            audit.watermark,
+            &audit.digest,
+            "meeting-v2-test",
+        )
+        .await
+        .expect("approve empty Meeting corpus");
+        db.enable_meeting_community_read(community_id)
+            .await
+            .expect("publish test Meeting reads");
+        community_id
     }
 
     async fn seed_identity(pool: &PgPool, community_id: CommunityId, pubkey: &[u8], role: &str) {

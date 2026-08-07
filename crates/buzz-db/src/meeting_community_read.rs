@@ -171,6 +171,37 @@ impl Db {
         .await?)
     }
 
+    /// Deployment readiness for the environment-level master switch.
+    ///
+    /// Pre-migration and all-unpublished deployments remain rolling-start
+    /// compatible. Once any active Community publishes the contract, every
+    /// serving Relay must carry migration 0052 and enable its master switch.
+    pub async fn meeting_community_read_deployment_ready(
+        &self,
+        master_enabled: bool,
+    ) -> Result<bool> {
+        let column_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+             WHERE attrelid = 'communities'::regclass \
+               AND attname = 'meeting_community_read_enabled' AND NOT attisdropped)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !column_exists {
+            return Ok(true);
+        }
+        let any_enabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM communities \
+             WHERE meeting_community_read_enabled AND archived_at IS NULL)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !any_enabled {
+            return Ok(true);
+        }
+        Ok(master_enabled && self.meeting_community_read_schema_ready().await?)
+    }
+
     /// Pause or resume new Meeting creation without changing existing data.
     ///
     /// Resuming before publication clears any pre-publication audit and
@@ -887,6 +918,10 @@ mod tests {
         .fetch_one(&scratch.pool)
         .await
         .expect("snapshot legacy counts");
+        assert!(db
+            .meeting_community_read_deployment_ready(false)
+            .await
+            .expect("unpublished deployment readiness"));
 
         let paused = db
             .set_meeting_community_read_create_paused(community_id, true)
@@ -949,6 +984,14 @@ mod tests {
         assert!(enabled.enabled);
         assert!(!enabled.create_paused);
         assert_eq!(enabled.audit_digest, Some(audit.digest));
+        assert!(!db
+            .meeting_community_read_deployment_ready(false)
+            .await
+            .expect("published deployment without master"));
+        assert!(db
+            .meeting_community_read_deployment_ready(true)
+            .await
+            .expect("published deployment with master"));
         let mut create_tx = scratch
             .pool
             .begin()

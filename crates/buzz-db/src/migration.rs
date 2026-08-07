@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 52);
+        assert_eq!(migrations.len(), 53);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1275,6 +1275,25 @@ mod tests {
                 "migration 0052 must not contain destructive statement {destructive}"
             );
         }
+
+        assert_eq!(migrations[52].version, 53);
+        let project_context_meeting_read = migrations[52].sql.as_str();
+        for required in [
+            "project_context_requires_meeting_community_read",
+            "project_context_edge_enabled",
+            "meeting_community_read_enabled",
+        ] {
+            assert!(
+                project_context_meeting_read.contains(required),
+                "migration 0053 must contain {required}"
+            );
+        }
+        for destructive in ["DELETE FROM", "TRUNCATE", "DROP TABLE", "DROP COLUMN"] {
+            assert!(
+                !project_context_meeting_read.contains(destructive),
+                "migration 0053 must not contain destructive statement {destructive}"
+            );
+        }
     }
 
     #[test]
@@ -1308,6 +1327,7 @@ mod tests {
             "legacy_meeting_visibility_watermark BIGINT",
             "legacy_meeting_visibility_audit_digest BYTEA",
             "meeting_community_read_contract_immutable",
+            "project_context_requires_meeting_community_read",
         ] {
             assert!(
                 schema.contains(required),

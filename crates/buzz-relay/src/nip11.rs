@@ -29,6 +29,8 @@ pub(crate) const MEETING_V2_CREATE_EXTENSION: &str = "buzz-meeting-v2-create";
 pub(crate) const MEETING_V2_DIRECT_ACTIONS_EXTENSION: &str = "buzz-meeting-v2-direct-actions";
 pub(crate) const MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION: &str =
     "buzz-meeting-v2-direct-actions-create";
+/// Community-wide Meeting history/read authorization contract.
+pub(crate) const MEETING_COMMUNITY_READ_EXTENSION: &str = "buzz-meeting-community-read-v1";
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,10 +267,16 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         PROJECT_CONTEXT_EXTENSION,
         project_context_ready_for_host(state, raw_host).await,
     );
+    let meeting_community_read_ready = meeting_community_read_ready_for_host(state, raw_host).await;
+    append_extension(
+        &mut info,
+        MEETING_COMMUNITY_READ_EXTENSION,
+        meeting_community_read_ready,
+    );
     append_extension(
         &mut info,
         PROJECT_CONTEXT_CAPABILITY,
-        project_context_edge_ready_for_host(state, raw_host).await,
+        project_context_edge_ready_for_host(state, raw_host, meeting_community_read_ready).await,
     );
     append_project_document_extension(
         &mut info,
@@ -349,8 +357,9 @@ async fn project_context_ready_for_host(state: &crate::state::AppState, raw_host
 async fn project_context_edge_ready_for_host(
     state: &crate::state::AppState,
     raw_host: &str,
+    meeting_community_read_ready: bool,
 ) -> bool {
-    if state.config.relay_private_key.is_none() || !state.config.meeting_community_read_enabled {
+    if state.config.relay_private_key.is_none() || !meeting_community_read_ready {
         return false;
     }
     let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
@@ -366,6 +375,25 @@ async fn project_context_edge_ready_for_host(
             tracing::warn!(
                 community_id = %tenant.community(),
                 "Project Context Edge NIP-11 readiness failed closed: {error}"
+            );
+            false
+        }
+    }
+}
+
+async fn meeting_community_read_ready_for_host(
+    state: &crate::state::AppState,
+    raw_host: &str,
+) -> bool {
+    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
+        return false;
+    };
+    match crate::handlers::req::meeting_community_read_active(state, tenant.community()).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Meeting Community-read NIP-11 readiness failed closed: {error}"
             );
             false
         }
@@ -804,6 +832,29 @@ mod tests {
             extensions
                 .iter()
                 .filter(|value| value.as_str() == PROJECT_DOCUMENT_EXTENSION)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn meeting_community_read_extension_is_appended_only_after_publication() {
+        let mut info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        append_extension(&mut info, MEETING_COMMUNITY_READ_EXTENSION, false);
+        assert!(!info
+            .supported_extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions
+                .iter()
+                .any(|value| value == MEETING_COMMUNITY_READ_EXTENSION)));
+
+        append_extension(&mut info, MEETING_COMMUNITY_READ_EXTENSION, true);
+        append_extension(&mut info, MEETING_COMMUNITY_READ_EXTENSION, true);
+        let extensions = info.supported_extensions.expect("extensions");
+        assert_eq!(
+            extensions
+                .iter()
+                .filter(|value| value.as_str() == MEETING_COMMUNITY_READ_EXTENSION)
                 .count(),
             1
         );

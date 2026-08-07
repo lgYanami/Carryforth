@@ -119,7 +119,10 @@ async fn handle_command_inner(
             "unavailable:project_context:stable_signer".to_owned(),
         ));
     }
-    if !state.config.meeting_community_read_enabled {
+    if !super::req::meeting_community_read_active(state, tenant.community())
+        .await
+        .map_err(|_| IngestError::Unavailable("unavailable:project_context:not_ready".to_owned()))?
+    {
         return Err(IngestError::Unavailable(
             "unavailable:project_context:not_ready".to_owned(),
         ));

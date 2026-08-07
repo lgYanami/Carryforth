@@ -151,12 +151,12 @@ pub struct Config {
     /// when either Create gate is later disabled.
     pub meeting_v2_direct_actions_create_enabled: bool,
 
-    /// Dark-launch switch for Community-wide Meeting reads.
+    /// Deployment master switch for Community-wide Meeting reads.
     ///
-    /// Defaults to `false` and is currently intended only for isolated
-    /// validation. Persistent Communities must keep it disabled until the
-    /// host-scoped operator approval gate is delivered by the final migration
-    /// stage.
+    /// Defaults to `false`. A Community additionally needs durable operator
+    /// approval and publication in migration 0052; this process-wide switch
+    /// alone never widens access. Once any Community publishes the contract,
+    /// pods with this switch off fail readiness rather than serving split ACLs.
     pub meeting_community_read_enabled: bool,
 
     /// Inter-relay mesh configuration (`BUZZ_MESH`, `BUZZ_MESH_BIND_ADDR`).

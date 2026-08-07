@@ -220,12 +220,14 @@ pub struct ProjectContextFeatureStatus {
 pub struct ProjectContextPreflight {
     /// Community identity.
     pub community_id: CommunityId,
-    /// Whether all migration 0049 objects exist.
+    /// Whether all current Project Context prerequisites exist.
     pub schema_ready: bool,
     /// Whether Project View v3 is enabled, structurally valid, and unfrozen.
     pub project_view_ready: bool,
     /// Whether Project Document is enabled and structurally valid.
     pub project_document_ready: bool,
+    /// Whether the durable Community-wide Meeting read contract is published.
+    pub meeting_community_read_ready: bool,
     /// Whether the Context catalog has been initialized.
     pub initialized: bool,
     /// Whether the stored Context signer matches the expected Relay.
@@ -356,6 +358,12 @@ impl Db {
                 AND to_regclass('idx_project_context_edge_coordinates_lookup') IS NOT NULL \
                 AND to_regclass('idx_project_context_bindings_edge') IS NOT NULL \
                 AND to_regclass('idx_project_context_bindings_active_document') IS NOT NULL \
+                AND EXISTS (SELECT 1 FROM pg_attribute \
+                        WHERE attrelid = 'communities'::regclass \
+                          AND attname = 'meeting_community_read_enabled' \
+                          AND NOT attisdropped) \
+                AND to_regprocedure('project_context_requires_meeting_community_read()') \
+                    IS NOT NULL \
                 AND to_regprocedure('project_context_validate_community(uuid)') IS NOT NULL \
                 AND to_regprocedure('project_context_compute_edge_key(uuid,bytea)') IS NOT NULL",
         )
@@ -464,6 +472,7 @@ impl Db {
                 schema_ready: false,
                 project_view_ready: false,
                 project_document_ready: false,
+                meeting_community_read_ready: false,
                 initialized: false,
                 signer_matches: false,
                 projection_parity: false,
@@ -478,6 +487,7 @@ impl Db {
         let row = sqlx::query(
             "SELECT c.archived_at IS NULL AS active, c.project_view_enabled, \
                     c.project_document_enabled, c.project_context_edge_enabled, \
+                    c.meeting_community_read_enabled, \
                     c.project_view_schema_version, maintenance.state AS maintenance_state, \
                     document_state.schema_version AS document_schema_version, \
                     document_state.projection_pubkey AS document_projection_pubkey, \
@@ -499,6 +509,7 @@ impl Db {
                 schema_ready: true,
                 project_view_ready: false,
                 project_document_ready: false,
+                meeting_community_read_ready: false,
                 initialized: false,
                 signer_matches: false,
                 projection_parity: false,
@@ -511,6 +522,7 @@ impl Db {
         let active: bool = row.try_get("active")?;
         let view_enabled: bool = row.try_get("project_view_enabled")?;
         let document_enabled: bool = row.try_get("project_document_enabled")?;
+        let meeting_community_read_ready: bool = row.try_get("meeting_community_read_enabled")?;
         let enabled: bool = row.try_get("project_context_edge_enabled")?;
         let schema_version: i16 = row.try_get("project_view_schema_version")?;
         let maintenance_state: String = row.try_get("maintenance_state")?;
@@ -562,6 +574,7 @@ impl Db {
             });
         let structural_read_ready = project_view_ready
             && project_document_ready
+            && meeting_community_read_ready
             && initialized
             && signer_matches
             && projection_parity
@@ -571,6 +584,7 @@ impl Db {
             schema_ready,
             project_view_ready,
             project_document_ready,
+            meeting_community_read_ready,
             initialized,
             signer_matches,
             projection_parity,
@@ -666,7 +680,8 @@ impl Db {
         crate::community_lock::acquire(&mut tx, community_id, false).await?;
         let community = sqlx::query(
             "SELECT archived_at IS NULL AS active, project_view_schema_version, \
-                    project_view_enabled, project_document_enabled \
+                    project_view_enabled, project_document_enabled, \
+                    meeting_community_read_enabled \
              FROM communities WHERE id = $1 FOR UPDATE",
         )
         .bind(community_id.as_uuid())
@@ -686,9 +701,15 @@ impl Db {
             let schema_version: i16 = community.try_get("project_view_schema_version")?;
             let view_enabled: bool = community.try_get("project_view_enabled")?;
             let document_enabled: bool = community.try_get("project_document_enabled")?;
-            if !active || schema_version != 3 || !view_enabled || !document_enabled {
+            let meeting_read_enabled: bool = community.try_get("meeting_community_read_enabled")?;
+            if !active
+                || schema_version != 3
+                || !view_enabled
+                || !document_enabled
+                || !meeting_read_enabled
+            {
                 return Err(DbError::InvalidData(
-                    "Project Context Edge requires active Project View v3 and Project Document"
+                    "Project Context Edge requires active Project View v3, Project Document, and published Community Meeting reads"
                         .to_owned(),
                 )
                 .into());
@@ -3149,6 +3170,25 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed Project Context actor");
+        let db = Db::from_pool(pool.clone());
+        db.set_meeting_community_read_create_paused(community_id, true)
+            .await
+            .expect("pause empty Meeting corpus");
+        let audit = db
+            .audit_legacy_meeting_visibility(community_id)
+            .await
+            .expect("audit empty Meeting corpus");
+        db.approve_legacy_meeting_visibility(
+            community_id,
+            audit.watermark,
+            &audit.digest,
+            "project-context-test",
+        )
+        .await
+        .expect("approve empty Meeting corpus");
+        db.enable_meeting_community_read(community_id)
+            .await
+            .expect("publish test Meeting reads");
         community_id
     }
 

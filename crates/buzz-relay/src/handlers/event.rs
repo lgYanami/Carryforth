@@ -190,6 +190,17 @@ pub async fn filter_fanout_by_access(
         if state.config.relay_private_key.is_none() {
             return Vec::new();
         }
+        match super::req::meeting_community_read_active(state, community_id).await {
+            Ok(true) => {}
+            Ok(false) => return Vec::new(),
+            Err(error) => {
+                warn!(
+                    community_id = %community_id,
+                    "Project Context Meeting-read readiness failed closed: {error}"
+                );
+                return Vec::new();
+            }
+        }
         match state
             .db
             .project_context_structural_read_ready(community_id, &state.relay_keypair.public_key())
@@ -412,7 +423,15 @@ pub async fn filter_fanout_by_access(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let active_readers = if state.config.meeting_community_read_enabled {
+        let community_read_active =
+            match super::req::meeting_community_read_active(state, community_id).await {
+                Ok(active) => active,
+                Err(error) => {
+                    warn!(%channel_id, "Meeting fan-out read contract mismatch: {error}");
+                    return Vec::new();
+                }
+            };
+        let active_readers = if community_read_active {
             buzz_db::meeting::active_meeting_reader_pubkeys_for_channel(
                 &state.db,
                 community_id,

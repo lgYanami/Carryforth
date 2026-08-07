@@ -1312,11 +1312,12 @@ pub async fn is_meeting_channel(
     .await?)
 }
 
-/// Check one Channel against Meeting classification and the reader's current
-/// Community-global principal state.
+/// Check one Channel against Meeting classification and the currently
+/// published read contract.
 ///
 /// `None` denotes an ordinary Channel. A Meeting returns `Some(false)` on any
-/// current-principal denial. The frozen roster is intentionally not consulted.
+/// denial. Before durable publication this retains the frozen-roster legacy
+/// contract; after publication it uses current Community-global membership.
 pub async fn is_meeting_reader_authorized_for_channel(
     db: &Db,
     community_id: CommunityId,
@@ -1329,7 +1330,17 @@ pub async fn is_meeting_reader_authorized_for_channel(
     if !is_meeting_reader_security_active(db, community_id, pubkey).await? {
         return Ok(Some(false));
     }
-    Ok(Some(true))
+    if db.meeting_community_read_enabled(community_id).await? {
+        return Ok(Some(true));
+    }
+    let authorized = meeting_channel_ids_for_frozen_reader(
+        db,
+        community_id,
+        pubkey,
+        std::slice::from_ref(&channel_id),
+    )
+    .await?;
+    Ok(Some(authorized.contains(&channel_id)))
 }
 
 async fn frozen_meeting_reader_pubkeys_for_channel(
@@ -1492,7 +1503,27 @@ mod tests {
             .execute(pool)
             .await
             .expect("insert test community");
-        CommunityId::from_uuid(id)
+        let community_id = CommunityId::from_uuid(id);
+        let db = Db::from_pool(pool.clone());
+        db.set_meeting_community_read_create_paused(community_id, true)
+            .await
+            .expect("pause empty Meeting corpus");
+        let audit = db
+            .audit_legacy_meeting_visibility(community_id)
+            .await
+            .expect("audit empty Meeting corpus");
+        db.approve_legacy_meeting_visibility(
+            community_id,
+            audit.watermark,
+            &audit.digest,
+            "meeting-test",
+        )
+        .await
+        .expect("approve empty Meeting corpus");
+        db.enable_meeting_community_read(community_id)
+            .await
+            .expect("publish test Meeting reads");
+        community_id
     }
 
     async fn seed_identity(

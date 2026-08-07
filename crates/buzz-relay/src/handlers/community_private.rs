@@ -178,6 +178,9 @@ pub(crate) async fn project_context_read_decision(
     if state.config.relay_private_key.is_none() {
         return Ok(ProjectContextReadDecision::Unavailable("stable_signer"));
     }
+    if !super::req::meeting_community_read_active(state, community_id).await? {
+        return Ok(ProjectContextReadDecision::Unavailable("meeting_read"));
+    }
     let Some(status) = state.db.project_context_status(community_id).await? else {
         return Ok(ProjectContextReadDecision::Unavailable("not_ready"));
     };

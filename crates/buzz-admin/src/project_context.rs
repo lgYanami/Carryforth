@@ -131,7 +131,7 @@ async fn show_status(db: &Db, community: Option<&str>) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema_ready": false,
                 "enabled": false,
-                "reason": "migration_0049_not_applied"
+                "reason": "project_context_or_meeting_read_schema_not_ready"
             }))?
         );
         return Ok(());
@@ -449,6 +449,8 @@ fn status_json(
         "change_count": status.change_count,
         "projection_parity": report.is_some_and(|value| value.projection_parity),
         "integrity_ready": report.is_some_and(|value| value.integrity_ready),
+        "meeting_community_read_ready": report
+            .is_some_and(|value| value.meeting_community_read_ready),
         "structural_read_ready": report.is_some_and(|value| value.structural_read_ready),
         "advertised_ready": report.is_some_and(|value| value.advertised_ready),
         "reproject_required": report.is_some_and(|value| value.initialized && (
@@ -476,6 +478,7 @@ fn preflight_json(
         "schema_ready": report.schema_ready,
         "project_view_ready": report.project_view_ready,
         "project_document_ready": report.project_document_ready,
+        "meeting_community_read_ready": report.meeting_community_read_ready,
         "initialized": report.initialized,
         "signer_matches": report.signer_matches,
         "projection_parity": report.projection_parity,
