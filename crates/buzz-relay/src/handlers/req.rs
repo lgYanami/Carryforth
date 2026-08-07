@@ -49,19 +49,52 @@ pub(crate) struct MeetingReadScope {
     pub revoked_channels: HashSet<uuid::Uuid>,
 }
 
-/// Remove Meeting Channels from one read request when its current principal
-/// security state has been revoked.
+/// Apply the request-local Meeting read contract.
 ///
-/// Ordinary Channel access remains untouched. The principal check is
-/// deliberately uncached; `accessible_channels` may come from a stale cache or
-/// from the immutable Meeting roster, neither of which is an authorization
-/// source after relay membership removal, deactivation, or a ban.
+/// During dark launch, roster-private reads remain byte-for-byte compatible.
+/// Once Community read is enabled, every non-deleted Meeting Channel is added
+/// for a current Community-global principal with a global read credential; the
+/// frozen roster is not consulted. Ordinary Channel access remains untouched.
 pub(crate) async fn apply_meeting_read_scope(
     state: &AppState,
     community_id: buzz_core::CommunityId,
     pubkey: &[u8],
+    credential_can_read_community_global: bool,
     accessible_channels: &mut Vec<uuid::Uuid>,
 ) -> Result<MeetingReadScope, buzz_db::DbError> {
+    if state.config.meeting_community_read_enabled {
+        let meeting_channels: HashSet<_> =
+            buzz_db::meeting::community_meeting_channel_ids(&state.db, community_id)
+                .await?
+                .into_iter()
+                .collect();
+        if meeting_channels.is_empty() {
+            return Ok(MeetingReadScope {
+                meeting_channels,
+                revoked_channels: HashSet::new(),
+            });
+        }
+        let reader_active = credential_can_read_community_global
+            && buzz_db::meeting::is_meeting_reader_security_active(&state.db, community_id, pubkey)
+                .await?;
+        if reader_active {
+            for channel_id in &meeting_channels {
+                if !accessible_channels.contains(channel_id) {
+                    accessible_channels.push(*channel_id);
+                }
+            }
+            return Ok(MeetingReadScope {
+                meeting_channels,
+                revoked_channels: HashSet::new(),
+            });
+        }
+        accessible_channels.retain(|channel_id| !meeting_channels.contains(channel_id));
+        return Ok(MeetingReadScope {
+            revoked_channels: meeting_channels.clone(),
+            meeting_channels,
+        });
+    }
+
     let meeting_channels: HashSet<_> =
         buzz_db::meeting::meeting_channel_ids(&state.db, community_id, accessible_channels)
             .await?
@@ -355,6 +388,8 @@ pub async fn handle_req(
     }
 
     let channel_id = extract_channel_id_from_filters(&filters);
+    let meeting_community_credential =
+        super::project_view::credential_can_read(&auth_scopes, token_channel_ids.as_deref());
 
     // Build the conformance `AbstractState` once at request entry. The
     // `Option` only goes `None` on malformed pubkey bytes (already a
@@ -364,7 +399,32 @@ pub async fn handle_req(
         .ok()
         .map(|pk| crate::conformance::state_for_request(&conn.tenant, &pk));
 
-    // Confirm channel access up front so the repaired `accessible_channels`
+    // Community-readable Meetings must be classified before the ordinary
+    // private-Channel membership check. Otherwise a valid Community observer
+    // would be rejected before the Meeting policy could run. The legacy path
+    // remains after cache repair until the dark-launch gate is enabled.
+    let mut meeting_scope = if state.config.meeting_community_read_enabled {
+        match apply_meeting_read_scope(
+            &state,
+            conn.tenant.community(),
+            &pubkey_bytes,
+            meeting_community_credential,
+            &mut accessible_channels,
+        )
+        .await
+        {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                warn!(conn_id = %conn_id, "Meeting reader security check failed: {error}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Confirm ordinary channel access up front so the repaired `accessible_channels`
     // vector reaches every downstream consumer: the NIP-50 search branch
     // below, subscription registration, historical delivery, and COUNT. A
     // cache-negative may be a stale miss on a non-writer pod (member just added
@@ -375,41 +435,58 @@ pub async fn handle_req(
     // is what fixes the search false-miss: a `#h=<just-added>` search would
     // otherwise be scoped against the stale vector and return empty.
     if let Some(ch_id) = channel_id {
+        if meeting_scope
+            .as_ref()
+            .is_some_and(|scope| scope.revoked_channels.contains(&ch_id))
+        {
+            board_read_observation.denied();
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "restricted: meeting access revoked",
+            ));
+            return;
+        }
+        let community_meeting_allowed = meeting_scope
+            .as_ref()
+            .is_some_and(|scope| scope.meeting_channels.contains(&ch_id));
         let token_allows = token_channel_ids
             .as_deref()
             .is_none_or(|allowed| allowed.contains(&ch_id));
-        let db_is_member = if !token_allows || accessible_channels.contains(&ch_id) {
-            None
-        } else {
-            match state
-                .db
-                .is_member(conn.tenant.community(), ch_id, &pubkey_bytes)
-                .await
-            {
-                Ok(member) => {
-                    if let Some(state_snap) = trace_state.as_ref() {
-                        crate::conformance::record_req_authcheck(
-                            &state.tracer,
-                            state_snap,
-                            ch_id,
-                            member,
-                        );
+        let db_is_member =
+            if community_meeting_allowed || !token_allows || accessible_channels.contains(&ch_id) {
+                None
+            } else {
+                match state
+                    .db
+                    .is_member(conn.tenant.community(), ch_id, &pubkey_bytes)
+                    .await
+                {
+                    Ok(member) => {
+                        if let Some(state_snap) = trace_state.as_ref() {
+                            crate::conformance::record_req_authcheck(
+                                &state.tracer,
+                                state_snap,
+                                ch_id,
+                                member,
+                            );
+                        }
+                        Some(member)
                     }
-                    Some(member)
+                    Err(e) => {
+                        warn!(conn_id = %conn_id, "Channel membership confirmation failed: {e}");
+                        conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                        return;
+                    }
                 }
-                Err(e) => {
-                    warn!(conn_id = %conn_id, "Channel membership confirmation failed: {e}");
-                    conn.send(RelayMessage::closed(&sub_id, "error: database error"));
-                    return;
-                }
-            }
-        };
-        if !resolve_request_local_access(
-            &mut accessible_channels,
-            ch_id,
-            token_allows,
-            db_is_member,
-        ) {
+            };
+        if !community_meeting_allowed
+            && !resolve_request_local_access(
+                &mut accessible_channels,
+                ch_id,
+                token_allows,
+                db_is_member,
+            )
+        {
             board_read_observation.denied();
             conn.send(RelayMessage::closed(
                 &sub_id,
@@ -422,20 +499,24 @@ pub async fn handle_req(
     // Meeting rosters are immutable collaboration history, not a durable read
     // authorization source. Re-check the principal after any targeted-channel
     // cache repair and before search, subscription registration, or history.
-    let meeting_scope = match apply_meeting_read_scope(
-        &state,
-        conn.tenant.community(),
-        &pubkey_bytes,
-        &mut accessible_channels,
-    )
-    .await
-    {
-        Ok(scope) => scope,
-        Err(error) => {
-            warn!(conn_id = %conn_id, "Meeting reader security check failed: {error}");
-            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
-            return;
-        }
+    let meeting_scope = match meeting_scope.take() {
+        Some(scope) => scope,
+        None => match apply_meeting_read_scope(
+            &state,
+            conn.tenant.community(),
+            &pubkey_bytes,
+            meeting_community_credential,
+            &mut accessible_channels,
+        )
+        .await
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                warn!(conn_id = %conn_id, "Meeting reader security check failed: {error}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        },
     };
     if channel_id.is_some_and(|channel_id| meeting_scope.revoked_channels.contains(&channel_id)) {
         board_read_observation.denied();

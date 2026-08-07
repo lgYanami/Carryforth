@@ -370,14 +370,15 @@ impl std::fmt::Debug for LegacyV1ProjectViewReprojectTx {
 }
 
 impl Db {
-    /// Return the subset of principals currently authorized to read or mutate
-    /// Community-global Project View state.
+    /// Return the subset of principals currently authorized to access
+    /// Community-global project assets.
     ///
     /// Authorization is deliberately stricter than Buzz's open-relay fallback:
     /// a principal must be a direct relay member, or a persisted managed agent
     /// whose owner is a relay member. Active bans on the principal, and on the
-    /// owner of a managed agent, fail closed.
-    pub async fn project_view_authorized_pubkeys(
+    /// owner of a managed agent, fail closed. This method deliberately keeps
+    /// the established Project View predicate as the single source of truth.
+    pub async fn community_global_authorized_pubkeys(
         &self,
         community_id: CommunityId,
         pubkeys: &[Vec<u8>],
@@ -441,17 +442,38 @@ impl Db {
         Ok(rows.into_iter().collect())
     }
 
-    /// Return whether one principal passes the strict Project View member gate.
-    pub async fn project_view_authorized_pubkey(
+    /// Return whether one principal passes the shared Community-global asset gate.
+    pub async fn community_global_authorized_pubkey(
         &self,
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> crate::Result<bool> {
         let requested = vec![pubkey.to_vec()];
         Ok(self
-            .project_view_authorized_pubkeys(community_id, &requested)
+            .community_global_authorized_pubkeys(community_id, &requested)
             .await?
             .contains(pubkey))
+    }
+
+    /// Return the subset of principals currently authorized to read or mutate
+    /// Community-global Project View state.
+    pub async fn project_view_authorized_pubkeys(
+        &self,
+        community_id: CommunityId,
+        pubkeys: &[Vec<u8>],
+    ) -> crate::Result<HashSet<Vec<u8>>> {
+        self.community_global_authorized_pubkeys(community_id, pubkeys)
+            .await
+    }
+
+    /// Return whether one principal passes the strict Project View member gate.
+    pub async fn project_view_authorized_pubkey(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) -> crate::Result<bool> {
+        self.community_global_authorized_pubkey(community_id, pubkey)
+            .await
     }
 
     /// Probe the live PostgreSQL catalog for the Project View schema.

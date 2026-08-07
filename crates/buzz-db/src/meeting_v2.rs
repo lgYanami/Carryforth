@@ -1799,8 +1799,8 @@ pub async fn get_current_board(
     }))
 }
 
-/// Load the current board after enforcing the immutable Meeting roster and
-/// current security/revocation reader fence.
+/// Load the current board after enforcing the shared Community-global reader
+/// predicate. The immutable roster remains an action boundary only.
 pub async fn get_current_board_for_reader(
     db: &Db,
     community_id: CommunityId,
@@ -1813,7 +1813,7 @@ pub async fn get_current_board_for_reader(
     {
         Some(true) => get_current_board(db, community_id, session_id).await,
         Some(false) => Err(DbError::AccessDenied(
-            "meeting board is restricted to the frozen participant roster".to_string(),
+            "meeting board requires current Community membership".to_string(),
         )),
         None => Ok(None),
     }
@@ -2330,10 +2330,11 @@ mod tests {
         assert_eq!(host_board.body, board_body);
         assert_eq!(host_board.moderator_pubkey, host);
         assert_eq!(host_board.event_id, snapshot.board_event_id);
-        assert!(matches!(
-            get_current_board_for_reader(&db, community_id, session_id, &outsider).await,
-            Err(DbError::AccessDenied(_))
-        ));
+        let observer_board = get_current_board_for_reader(&db, community_id, session_id, &outsider)
+            .await
+            .expect("non-roster Community observer reads current board")
+            .expect("observer board exists");
+        assert_eq!(host_board, observer_board);
 
         let session: (i32, String, Vec<u8>, Vec<u8>) = sqlx::query_as(
             "SELECT schema_version, floor_policy_version, host_pubkey, moderator_pubkey \

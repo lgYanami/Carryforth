@@ -275,6 +275,7 @@ pub async fn handle_count(
         &state,
         conn.tenant.community(),
         &pubkey_bytes,
+        super::project_view::credential_can_read(&auth_scopes, token_channel_ids.as_deref()),
         &mut accessible_channels,
     )
     .await

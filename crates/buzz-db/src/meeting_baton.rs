@@ -536,13 +536,7 @@ pub(crate) async fn create_moderated_meeting_base_tx(
         params.host_pubkey,
     )
     .await?;
-    validate_source_access_tx(
-        tx,
-        params.community_id,
-        params.source_channel_id,
-        params.participant_pubkeys,
-    )
-    .await?;
+    validate_source_access_tx(tx, params.community_id, params.source_channel_id).await?;
 
     let mut participants = resolve_participants_tx(
         tx,
@@ -2139,45 +2133,8 @@ async fn validate_source_access_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     source_channel_id: Option<Uuid>,
-    participant_pubkeys: &[Vec<u8>],
 ) -> Result<()> {
-    let Some(source_id) = source_channel_id else {
-        return Ok(());
-    };
-    let visibility: Option<String> = sqlx::query_scalar(
-        "SELECT visibility::text FROM channels \
-         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
-         FOR SHARE",
-    )
-    .bind(community_id.as_uuid())
-    .bind(source_id)
-    .fetch_optional(tx.as_mut())
-    .await?;
-    let visibility = visibility
-        .ok_or_else(|| DbError::InvalidData(format!("source channel not found: {source_id}")))?;
-    if visibility != "private" {
-        return Ok(());
-    }
-    for pubkey in participant_pubkeys {
-        let membership: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM channel_members \
-             WHERE community_id = $1 AND channel_id = $2 \
-               AND pubkey = $3 AND removed_at IS NULL \
-             FOR SHARE",
-        )
-        .bind(community_id.as_uuid())
-        .bind(source_id)
-        .bind(pubkey)
-        .fetch_optional(tx.as_mut())
-        .await?;
-        if membership.is_none() {
-            return Err(DbError::AccessDenied(format!(
-                "participant {} cannot read source channel {source_id}",
-                hex::encode(pubkey)
-            )));
-        }
-    }
-    Ok(())
+    crate::meeting::validate_community_readable_source_tx(tx, community_id, source_channel_id).await
 }
 
 async fn authorize_end_tx(

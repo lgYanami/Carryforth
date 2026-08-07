@@ -2362,6 +2362,7 @@ async fn query_events_authed(
         state,
         tenant.community(),
         &pubkey_bytes,
+        true,
         &mut accessible_channels,
     )
     .await
@@ -2982,6 +2983,7 @@ async fn count_events_authed(
         state,
         tenant.community(),
         &pubkey_bytes,
+        true,
         &mut accessible_channels,
     )
     .await

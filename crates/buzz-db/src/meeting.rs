@@ -134,42 +134,8 @@ pub async fn create_meeting_tx(
     let mut participants = Vec::with_capacity(params.participant_pubkeys.len());
     let mut agent_count = 0usize;
 
-    if let Some(source_id) = params.source_channel_id {
-        let source_visibility: Option<String> = sqlx::query_scalar(
-            "SELECT visibility::text FROM channels \
-             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
-             FOR SHARE",
-        )
-        .bind(params.community_id.as_uuid())
-        .bind(source_id)
-        .fetch_optional(&mut **tx)
+    validate_community_readable_source_tx(tx, params.community_id, params.source_channel_id)
         .await?;
-        let source_visibility = source_visibility.ok_or_else(|| {
-            DbError::InvalidData(format!("source channel not found: {source_id}"))
-        })?;
-
-        if source_visibility == "private" {
-            for pubkey in params.participant_pubkeys {
-                let source_membership: Option<i32> = sqlx::query_scalar(
-                    "SELECT 1 FROM channel_members \
-                     WHERE community_id = $1 AND channel_id = $2 \
-                       AND pubkey = $3 AND removed_at IS NULL \
-                     FOR SHARE",
-                )
-                .bind(params.community_id.as_uuid())
-                .bind(source_id)
-                .bind(pubkey)
-                .fetch_optional(&mut **tx)
-                .await?;
-                if source_membership.is_none() {
-                    return Err(DbError::AccessDenied(format!(
-                        "participant {} cannot read source channel {source_id}",
-                        hex::encode(pubkey)
-                    )));
-                }
-            }
-        }
-    }
 
     for pubkey in params.participant_pubkeys {
         let pubkey_hex = hex::encode(pubkey);
@@ -378,6 +344,44 @@ pub async fn create_meeting_tx(
     ))
 }
 
+/// Validate and lock the optional source used by a Community-readable Meeting.
+///
+/// A source is a navigation reference, not an authority bridge. It must be a
+/// non-deleted, ordinary, non-DM Channel whose current policy is readable by
+/// every current and future Community member. The row lock closes the check /
+/// Meeting-insert race inside the caller's transaction.
+pub(crate) async fn validate_community_readable_source_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    source_channel_id: Option<Uuid>,
+) -> Result<()> {
+    let Some(source_id) = source_channel_id else {
+        return Ok(());
+    };
+    let source = sqlx::query(
+        "SELECT visibility::text AS visibility, \
+                channel_type::text AS channel_type, room_kind \
+         FROM channels \
+         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
+         FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(source_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let source = source
+        .ok_or_else(|| DbError::InvalidData(format!("source channel not found: {source_id}")))?;
+    let visibility: String = source.try_get("visibility")?;
+    let channel_type: String = source.try_get("channel_type")?;
+    let room_kind: String = source.try_get("room_kind")?;
+    if visibility != "open" || room_kind != "standard" || channel_type == "dm" {
+        return Err(DbError::AccessDenied(
+            "meeting source is not Community-readable".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn has_active_ban_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -419,8 +423,8 @@ pub async fn is_meeting_actor_security_active(
 /// revocation fence used for Meeting command replay.
 ///
 /// A principal restored after a real revocation may write in newer Meetings,
-/// but cannot read or create command receipts in a Meeting that predates that
-/// revocation.
+/// but cannot submit or create command receipts in a Meeting that predates
+/// that revocation. Community-wide historical reads are evaluated separately.
 pub async fn is_meeting_actor_session_security_active(
     db: &Db,
     community_id: CommunityId,
@@ -912,57 +916,21 @@ async fn active_meeting_reader_pubkeys(
         return Ok(Vec::new());
     }
 
-    let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT u.pubkey \
-         FROM users u \
-         WHERE u.community_id = $1 \
-           AND u.pubkey = ANY($2::bytea[]) \
-           AND u.deactivated_at IS NULL \
-           AND EXISTS( \
-             SELECT 1 FROM relay_members rm \
-             WHERE rm.community_id = u.community_id \
-               AND rm.pubkey = encode(u.pubkey, 'hex') \
-           ) \
-           AND NOT EXISTS( \
-             SELECT 1 FROM community_bans direct_ban \
-             WHERE direct_ban.community_id = u.community_id \
-               AND direct_ban.pubkey = u.pubkey \
-               AND direct_ban.banned \
-               AND (direct_ban.ban_expires_at IS NULL \
-                    OR direct_ban.ban_expires_at > clock_timestamp()) \
-           ) \
-           AND ( \
-             u.agent_owner_pubkey IS NULL \
-             OR EXISTS( \
-               SELECT 1 FROM users owner_u \
-               WHERE owner_u.community_id = u.community_id \
-                 AND owner_u.pubkey = u.agent_owner_pubkey \
-                 AND owner_u.deactivated_at IS NULL \
-                 AND NOT EXISTS( \
-                   SELECT 1 FROM community_bans owner_ban \
-                   WHERE owner_ban.community_id = owner_u.community_id \
-                     AND owner_ban.pubkey = owner_u.pubkey \
-                     AND owner_ban.banned \
-                     AND (owner_ban.ban_expires_at IS NULL \
-                          OR owner_ban.ban_expires_at > clock_timestamp()) \
-                 ) \
-             ) \
-           )",
-    )
-    .bind(community_id.as_uuid())
-    .bind(pubkeys)
-    .fetch_all(&db.pool)
-    .await?;
-    Ok(rows)
+    let authorized = db
+        .community_global_authorized_pubkeys(community_id, pubkeys)
+        .await?;
+    Ok(pubkeys
+        .iter()
+        .filter(|pubkey| authorized.contains(pubkey.as_slice()))
+        .cloned()
+        .collect())
 }
 
-/// Check current read authorization for one Meeting principal without using
-/// Relay access caches or the immutable Meeting roster.
+/// Check current Community-global read authorization for one Meeting principal
+/// without using Relay access caches or the immutable Meeting roster.
 ///
-/// A reader needs direct Relay membership, an active user, and no active direct
-/// ban. An owned Agent additionally needs an active, unbanned authoritative
-/// owner; owner Relay membership does not cascade. Write timeouts deliberately
-/// do not revoke read access.
+/// This is the same principal predicate used by Project View, Project Document,
+/// and Project Context. Write timeouts deliberately do not revoke read access.
 pub async fn is_meeting_reader_security_active(
     db: &Db,
     community_id: CommunityId,
@@ -992,12 +960,32 @@ pub async fn meeting_channel_ids(
     .await?)
 }
 
-/// Return candidate Meeting Channels whose immutable roster contains `pubkey`.
+/// Return all non-deleted Meeting Channels in one Community.
+pub async fn community_meeting_channel_ids(
+    db: &Db,
+    community_id: CommunityId,
+) -> Result<Vec<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "SELECT ms.session_id \
+         FROM meeting_sessions ms \
+         JOIN channels channel \
+           ON channel.community_id = ms.community_id \
+          AND channel.id = ms.session_id \
+          AND channel.room_kind = 'meeting' \
+          AND channel.deleted_at IS NULL \
+         WHERE ms.community_id = $1 \
+         ORDER BY ms.session_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&db.pool)
+    .await?)
+}
+
+/// Migration-only legacy reader scope for the roster-private contract.
 ///
-/// V1/V2 use `meeting_participants`; V0's frozen roster is the complete set of
-/// `channel_members` rows, including soft-removed rows. A durable revocation
-/// job permanently excludes the principal from Meetings that predate it, even
-/// if the principal is later re-added or unbanned.
+/// Ordinary runtime stops calling this once Community-read is durably enabled,
+/// but the dark-launch path retains it so deploying new code cannot widen old
+/// Meeting visibility before operator approval.
 pub async fn meeting_channel_ids_for_frozen_reader(
     db: &Db,
     community_id: CommunityId,
@@ -1067,12 +1055,11 @@ pub async fn is_meeting_channel(
     .await?)
 }
 
-/// Check one Channel against both Meeting classification, the immutable frozen
-/// roster, durable per-Meeting revocation history, and the reader's current
-/// security state.
+/// Check one Channel against Meeting classification and the reader's current
+/// Community-global principal state.
 ///
 /// `None` denotes an ordinary Channel. A Meeting returns `Some(false)` on any
-/// roster or current-principal denial.
+/// current-principal denial. The frozen roster is intentionally not consulted.
 pub async fn is_meeting_reader_authorized_for_channel(
     db: &Db,
     community_id: CommunityId,
@@ -1085,9 +1072,7 @@ pub async fn is_meeting_reader_authorized_for_channel(
     if !is_meeting_reader_security_active(db, community_id, pubkey).await? {
         return Ok(Some(false));
     }
-    let authorized =
-        meeting_channel_ids_for_frozen_reader(db, community_id, pubkey, &[channel_id]).await?;
-    Ok(Some(authorized.contains(&channel_id)))
+    Ok(Some(true))
 }
 
 async fn frozen_meeting_reader_pubkeys_for_channel(
@@ -1145,14 +1130,8 @@ async fn frozen_meeting_reader_pubkeys_for_channel(
     .await?)
 }
 
-/// Batch-filter live recipients for a private Meeting fan-out.
-///
-/// Returns `None` for an ordinary Channel, preserving its existing membership
-/// policy. A Meeting first checks uncached current-principal security, then
-/// applies the frozen roster and durable per-Session revocation fence as the
-/// final read. That order prevents a rapid unban/re-add between the two reads
-/// from restoring an old Meeting.
-pub async fn active_meeting_reader_pubkeys_for_channel(
+/// Apply the retained roster-private contract during dark launch.
+pub async fn legacy_active_meeting_reader_pubkeys_for_channel(
     db: &Db,
     community_id: CommunityId,
     channel_id: Uuid,
@@ -1163,6 +1142,25 @@ pub async fn active_meeting_reader_pubkeys_for_channel(
     }
     let active_readers = active_meeting_reader_pubkeys(db, community_id, pubkeys).await?;
     frozen_meeting_reader_pubkeys_for_channel(db, community_id, channel_id, &active_readers)
+        .await
+        .map(Some)
+}
+
+/// Batch-filter live recipients for a Community-readable Meeting fan-out.
+///
+/// Returns `None` for an ordinary Channel, preserving its existing membership
+/// policy. A Meeting applies the uncached shared Community-global principal
+/// predicate; the immutable roster remains an action boundary only.
+pub async fn active_meeting_reader_pubkeys_for_channel(
+    db: &Db,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkeys: &[Vec<u8>],
+) -> Result<Option<Vec<Vec<u8>>>> {
+    if !is_meeting_channel(db, community_id, channel_id).await? {
+        return Ok(None);
+    }
+    active_meeting_reader_pubkeys(db, community_id, pubkeys)
         .await
         .map(Some)
 }
@@ -1271,6 +1269,57 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert test relay membership");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn meeting_source_requires_open_standard_non_dm_channel() {
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let creator = vec![0x45_u8; 32];
+        let open_standard = Uuid::new_v4();
+        let private_standard = Uuid::new_v4();
+        let open_dm = Uuid::new_v4();
+        let meeting_room = Uuid::new_v4();
+        for (id, channel_type, visibility, room_kind) in [
+            (open_standard, "stream", "open", "standard"),
+            (private_standard, "stream", "private", "standard"),
+            (open_dm, "dm", "open", "standard"),
+            (meeting_room, "stream", "private", "meeting"),
+        ] {
+            sqlx::query(
+                "INSERT INTO channels \
+                     (community_id, id, name, channel_type, visibility, created_by, room_kind) \
+                 VALUES ($1, $2, 'source', $3::channel_type, \
+                         $4::channel_visibility, $5, $6)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(id)
+            .bind(channel_type)
+            .bind(visibility)
+            .bind(&creator)
+            .bind(room_kind)
+            .execute(&pool)
+            .await
+            .expect("insert source candidate");
+        }
+
+        let mut tx = pool.begin().await.expect("begin source validation");
+        validate_community_readable_source_tx(&mut tx, community_id, Some(open_standard))
+            .await
+            .expect("open ordinary source");
+        for blocked in [private_standard, open_dm, meeting_room] {
+            assert!(matches!(
+                validate_community_readable_source_tx(&mut tx, community_id, Some(blocked)).await,
+                Err(DbError::AccessDenied(_))
+            ));
+        }
+        assert!(matches!(
+            validate_community_readable_source_tx(&mut tx, community_id, Some(Uuid::new_v4()),)
+                .await,
+            Err(DbError::InvalidData(_))
+        ));
+        tx.rollback().await.expect("rollback source validation");
     }
 
     async fn insert_command_event_tx(
@@ -2011,12 +2060,13 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn completed_revocation_permanently_blocks_old_meeting_reads_after_reactivation() {
+    async fn community_read_restores_history_after_reactivation_without_erasing_legacy_fence() {
         let pool = setup_pool().await;
         let db = Db::from_pool(pool.clone());
         let community_id = make_community(&pool).await;
         let host = vec![0x71_u8; 32];
         let restored_participant = vec![0x72_u8; 32];
+        let observer = vec![0x74_u8; 32];
 
         seed_identity(&pool, community_id, &host, "owner", None, "anyone").await;
         seed_identity(
@@ -2028,9 +2078,28 @@ mod tests {
             "anyone",
         )
         .await;
+        seed_identity(&pool, community_id, &observer, "member", None, "anyone").await;
 
         let (old_session, _) =
             create_active_v0_meeting(&pool, community_id, &host, &restored_participant).await;
+        assert_eq!(
+            is_meeting_reader_authorized_for_channel(&db, community_id, old_session, &observer)
+                .await
+                .expect("authorize non-roster Community observer"),
+            Some(true),
+            "the frozen roster is not a Community Meeting read ACL"
+        );
+        assert_eq!(
+            active_meeting_reader_pubkeys_for_channel(
+                &db,
+                community_id,
+                old_session,
+                std::slice::from_ref(&observer),
+            )
+            .await
+            .expect("filter observer fan-out"),
+            Some(vec![observer.clone()])
+        );
         assert_eq!(
             is_meeting_reader_authorized_for_channel(
                 &db,
@@ -2117,8 +2186,8 @@ mod tests {
             )
             .await
             .expect("authorize restored participant for old Meeting"),
-            Some(false),
-            "reactivation must not restore old Meeting history"
+            Some(true),
+            "current Community membership restores Community-readable history"
         );
         assert_eq!(
             active_meeting_reader_pubkeys_for_channel(
@@ -2129,8 +2198,8 @@ mod tests {
             )
             .await
             .expect("filter old Meeting fan-out"),
-            Some(Vec::new()),
-            "live fan-out must honor the same durable revocation fence"
+            Some(vec![restored_participant.clone()]),
+            "Community-wide live fan-out must not reuse the legacy roster fence"
         );
 
         let (new_session, _) =
@@ -2156,19 +2225,31 @@ mod tests {
             )
             .await
             .expect("filter old and new Meeting reads"),
-            vec![new_session]
+            vec![new_session],
+            "the frozen helper remains available only for dark-launch compatibility"
+        );
+        let mut expected_meetings = vec![old_session, new_session];
+        expected_meetings.sort();
+        assert_eq!(
+            community_meeting_channel_ids(&db, community_id)
+                .await
+                .expect("list Community-readable Meetings"),
+            expected_meetings,
+            "the Community reader catalog includes history across membership epochs"
         );
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn meeting_reader_current_security_distinguishes_timeouts_and_owner_relay_membership() {
+    async fn meeting_reader_uses_project_asset_membership_and_ignores_write_timeouts() {
         let pool = setup_pool().await;
         let db = Db::from_pool(pool.clone());
         let community_id = make_community(&pool).await;
         let owner = vec![0xa1_u8; 32];
         let agent = vec![0xa2_u8; 32];
         let direct_human = vec![0xa3_u8; 32];
+        let unmembered_owner = vec![0xa4_u8; 32];
+        let unmembered_agent = vec![0xa5_u8; 32];
 
         seed_identity(&pool, community_id, &owner, "owner", None, "anyone").await;
         seed_identity(
@@ -2181,6 +2262,18 @@ mod tests {
         )
         .await;
         seed_identity(&pool, community_id, &direct_human, "member", None, "anyone").await;
+        sqlx::query(
+            "INSERT INTO users \
+                 (community_id, pubkey, agent_owner_pubkey, channel_add_policy) \
+             VALUES ($1, $2, NULL, 'anyone'::channel_add_policy), \
+                    ($1, $3, $2, 'owner_only'::channel_add_policy)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&unmembered_owner)
+        .bind(&unmembered_agent)
+        .execute(&pool)
+        .await
+        .expect("seed Agent whose owner is not a Relay member");
 
         sqlx::query(
             "INSERT INTO community_bans \
@@ -2207,79 +2300,11 @@ mod tests {
             "an owner write-only timeout must not cascade to Agent reads"
         );
 
-        sqlx::query(
-            "DELETE FROM relay_members \
-             WHERE community_id = $1 AND pubkey = $2",
-        )
-        .bind(community_id.as_uuid())
-        .bind(hex::encode(&owner))
-        .execute(&pool)
-        .await
-        .expect("remove Agent owner Relay membership");
         assert!(
-            is_meeting_reader_security_active(&db, community_id, &agent)
+            !is_meeting_reader_security_active(&db, community_id, &unmembered_agent)
                 .await
-                .expect("check Agent after owner Relay removal"),
-            "owner Relay membership is not an authoritative Agent read gate"
-        );
-
-        sqlx::query(
-            "UPDATE community_bans \
-             SET banned = true, ban_expires_at = NULL \
-             WHERE community_id = $1 AND pubkey = $2",
-        )
-        .bind(community_id.as_uuid())
-        .bind(&owner)
-        .execute(&pool)
-        .await
-        .expect("ban Agent owner");
-        assert!(
-            !is_meeting_reader_security_active(&db, community_id, &agent)
-                .await
-                .expect("check Agent with banned owner"),
-            "an authoritative owner ban must revoke Agent reads"
-        );
-
-        sqlx::query(
-            "UPDATE community_bans SET banned = false \
-             WHERE community_id = $1 AND pubkey = $2",
-        )
-        .bind(community_id.as_uuid())
-        .bind(&owner)
-        .execute(&pool)
-        .await
-        .expect("unban Agent owner");
-        sqlx::query(
-            "UPDATE users SET deactivated_at = clock_timestamp() \
-             WHERE community_id = $1 AND pubkey = $2",
-        )
-        .bind(community_id.as_uuid())
-        .bind(&owner)
-        .execute(&pool)
-        .await
-        .expect("deactivate Agent owner");
-        assert!(
-            !is_meeting_reader_security_active(&db, community_id, &agent)
-                .await
-                .expect("check Agent with deactivated owner"),
-            "owner deactivation must revoke Agent reads"
-        );
-
-        sqlx::query(
-            "UPDATE community_bans \
-             SET banned = true, ban_expires_at = NULL \
-             WHERE community_id = $1 AND pubkey = $2",
-        )
-        .bind(community_id.as_uuid())
-        .bind(&direct_human)
-        .execute(&pool)
-        .await
-        .expect("ban direct Human");
-        assert!(
-            !is_meeting_reader_security_active(&db, community_id, &direct_human)
-                .await
-                .expect("check directly banned Human"),
-            "a direct active ban must revoke Meeting reads"
+                .expect("check Agent without an owner Relay membership"),
+            "managed Agent Community reads require its authoritative owner to remain a member"
         );
     }
 }

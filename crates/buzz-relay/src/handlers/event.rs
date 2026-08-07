@@ -412,14 +412,24 @@ pub async fn filter_fanout_by_access(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        match buzz_db::meeting::active_meeting_reader_pubkeys_for_channel(
-            &state.db,
-            community_id,
-            channel_id,
-            &recipient_pubkeys,
-        )
-        .await
-        {
+        let active_readers = if state.config.meeting_community_read_enabled {
+            buzz_db::meeting::active_meeting_reader_pubkeys_for_channel(
+                &state.db,
+                community_id,
+                channel_id,
+                &recipient_pubkeys,
+            )
+            .await
+        } else {
+            buzz_db::meeting::legacy_active_meeting_reader_pubkeys_for_channel(
+                &state.db,
+                community_id,
+                channel_id,
+                &recipient_pubkeys,
+            )
+            .await
+        };
+        match active_readers {
             Ok(Some(active_pubkeys)) => {
                 let active_pubkeys: HashSet<_> = active_pubkeys.into_iter().collect();
                 matches

@@ -151,6 +151,14 @@ pub struct Config {
     /// when either Create gate is later disabled.
     pub meeting_v2_direct_actions_create_enabled: bool,
 
+    /// Dark-launch switch for Community-wide Meeting reads.
+    ///
+    /// Defaults to `false` and is currently intended only for isolated
+    /// validation. Persistent Communities must keep it disabled until the
+    /// host-scoped operator approval gate is delivered by the final migration
+    /// stage.
+    pub meeting_community_read_enabled: bool,
+
     /// Inter-relay mesh configuration (`BUZZ_MESH`, `BUZZ_MESH_BIND_ADDR`).
     /// Opt-in: mesh forms only when `BUZZ_MESH=on` is explicit. The default
     /// (absent/off) is exact single-instance behavior — no bind, no Redis
@@ -527,6 +535,8 @@ impl Config {
         let meeting_v2_create_enabled = parse_optional_bool("BUZZ_MEETING_V2_CREATE_ENABLED")?;
         let meeting_v2_direct_actions_create_enabled =
             parse_optional_bool("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED")?;
+        let meeting_community_read_enabled =
+            parse_optional_bool("BUZZ_MEETING_COMMUNITY_READ_ENABLED")?;
 
         // Mesh opt-in: default OFF. Strict rollout no-regression — an image
         // upgrade with untouched env must not bind a new UDP port or write a
@@ -971,6 +981,7 @@ impl Config {
             meeting_v1_create_enabled,
             meeting_v2_create_enabled,
             meeting_v2_direct_actions_create_enabled,
+            meeting_community_read_enabled,
             mesh,
             mesh_demo_echo,
             relay_owner_pubkey,
@@ -1076,6 +1087,10 @@ mod tests {
         assert!(
             !config.meeting_v2_direct_actions_create_enabled,
             "action-capable Meeting V2 creation must remain separately opt-in"
+        );
+        assert!(
+            !config.meeting_community_read_enabled,
+            "Community-wide Meeting reads must remain dark until migration approval"
         );
         assert!(
             !config.runtime_unrecoverable_enabled,
@@ -1195,6 +1210,41 @@ mod tests {
             invalid,
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED")
+        ));
+    }
+
+    #[test]
+    fn meeting_community_read_gate_is_strict_and_defaults_off() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_MEETING_COMMUNITY_READ_ENABLED");
+
+        std::env::remove_var("BUZZ_MEETING_COMMUNITY_READ_ENABLED");
+        assert!(
+            !Config::from_env()
+                .expect("unset Meeting read gate is valid")
+                .meeting_community_read_enabled
+        );
+
+        std::env::set_var("BUZZ_MEETING_COMMUNITY_READ_ENABLED", "true");
+        assert!(
+            Config::from_env()
+                .expect("enabled Meeting read gate is valid")
+                .meeting_community_read_enabled
+        );
+
+        std::env::set_var("BUZZ_MEETING_COMMUNITY_READ_ENABLED", "sometimes");
+        let invalid = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_MEETING_COMMUNITY_READ_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_MEETING_COMMUNITY_READ_ENABLED");
+        }
+
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_MEETING_COMMUNITY_READ_ENABLED")
         ));
     }
 

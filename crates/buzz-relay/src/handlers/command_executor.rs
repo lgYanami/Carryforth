@@ -1469,6 +1469,9 @@ async fn handle_meeting_floor_signal(
 
 pub(crate) fn map_meeting_db_error(error: DbError) -> IngestError {
     match error {
+        DbError::AccessDenied(message) if message == "meeting source is not Community-readable" => {
+            IngestError::Rejected("restricted:meeting:source_not_community_readable".to_string())
+        }
         DbError::AccessDenied(_)
         | DbError::InvalidData(_)
         | DbError::NotFound(_)
