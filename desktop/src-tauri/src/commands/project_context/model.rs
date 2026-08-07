@@ -146,6 +146,8 @@ pub enum ProjectContextCoordinateDto {
     },
     /// Stable Project Document identity.
     Document { document_id: Uuid },
+    /// Stable terminal Meeting identity.
+    Meeting { meeting_id: Uuid },
 }
 
 /// One of the three Project Context set queries.
@@ -197,10 +199,72 @@ pub enum ProjectContextSourceState {
 pub enum ProjectContextDetailState {
     /// The source object is active.
     Active,
+    /// The Meeting has a verified immutable terminal outcome.
+    Terminal,
     /// The source identity is retained as a tombstone.
     Tombstoned,
     /// The source identity could not currently be hydrated.
     Unavailable,
+}
+
+/// Independent verification state for one Meeting coordinate hydration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectContextMeetingObservationState {
+    Observed,
+    Unavailable,
+    VerificationFailed,
+}
+
+/// Frozen participant preview carried by a metadata-first Meeting read.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextMeetingParticipant {
+    pub(super) pubkey: String,
+    pub(super) participant_type: String,
+}
+
+/// Bounded Action Finalization summary; Board and Speech remain on Meeting.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextMeetingActionSummary {
+    pub(super) condition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_status: Option<String>,
+    pub(super) actions_attested: bool,
+}
+
+/// Body-free Meeting metadata shown before opening the full Meeting route.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextMeetingDetail {
+    pub(super) discussion_goal: Option<String>,
+    pub(super) terminal_outcome: String,
+    pub(super) host_pubkey: String,
+    pub(super) participant_count: usize,
+    pub(super) participant_preview: Vec<ProjectContextMeetingParticipant>,
+    pub(super) created_at: DateTime<Utc>,
+    pub(super) ended_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) action_finalization: Option<ProjectContextMeetingActionSummary>,
+}
+
+/// Verification evidence for one unique Meeting coordinate in the result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextMeetingObservation {
+    pub(super) meeting_id: Uuid,
+    pub(super) state: ProjectContextMeetingObservationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) state_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) create_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) state_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) end_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) updated_at: Option<DateTime<Utc>>,
 }
 
 /// Signed Context catalog observation bounding every returned Edge.
@@ -271,6 +335,8 @@ pub struct ProjectContextCoordinateDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) document_revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) meeting: Option<ProjectContextMeetingDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) updated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) updated_by: Option<String>,
@@ -309,6 +375,7 @@ pub struct ProjectContextQueryResult {
     pub(super) query: ProjectContextQueryDto,
     pub(super) project_view_observation: ProjectContextProjectViewObservation,
     pub(super) document_observation: ProjectContextDocumentObservation,
+    pub(super) meeting_observations: Vec<ProjectContextMeetingObservation>,
     pub(super) edges: Vec<ProjectContextEdgeDto>,
     pub(super) coordinate_details: Vec<ProjectContextCoordinateDetail>,
     pub(super) document_details: Vec<ProjectContextDocumentDetail>,

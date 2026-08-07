@@ -15,6 +15,7 @@ import {
   projectContextProjectViewRelations,
 } from "@/features/project-context/inspectorModel";
 import { ProjectContextDocumentContent } from "@/features/project-context/ui/ProjectContextDocumentContent";
+import { ProjectContextMeetingContent } from "@/features/project-context/ui/ProjectContextMeetingContent";
 import {
   formatProjectViewTerm,
   projectViewObjectDescription,
@@ -234,15 +235,16 @@ function ProjectViewContent({
 }
 
 function stableCoordinateId(coordinate: ProjectContextCoordinate) {
-  return coordinate.type === "document"
-    ? coordinate.documentId
-    : coordinate.objectId;
+  if (coordinate.type === "document") return coordinate.documentId;
+  if (coordinate.type === "meeting") return coordinate.meetingId;
+  return coordinate.objectId;
 }
 
 /** Read-only detail for a selected real Coordinate. */
 export function ProjectContextCoordinateInspector({
   detail,
   onOpenDocument,
+  onOpenMeeting,
   onOpenProjectView,
   onSelectEdge,
   onShowIncident,
@@ -251,6 +253,7 @@ export function ProjectContextCoordinateInspector({
 }: {
   detail: ProjectContextCoordinateDetail;
   onOpenDocument: (documentId: string) => void;
+  onOpenMeeting: (meetingId: string) => void;
   onOpenProjectView: (objectId: string) => void;
   onSelectEdge: (edgeKey: string) => void;
   onShowIncident: (coordinate: ProjectContextCoordinate) => void;
@@ -272,7 +275,9 @@ export function ProjectContextCoordinateInspector({
   const typeLabel =
     coordinate.type === "document"
       ? "Document"
-      : projectViewObjectTypeLabel(coordinate.objectType);
+      : coordinate.type === "meeting"
+        ? "Meeting"
+        : projectViewObjectTypeLabel(coordinate.objectType);
   const documentDetail =
     coordinate.type === "document"
       ? {
@@ -296,6 +301,8 @@ export function ProjectContextCoordinateInspector({
           <Badge variant="outline">{typeLabel} Coordinate</Badge>
           {detail.state === "active" ? (
             <Badge variant="success">Active</Badge>
+          ) : detail.state === "terminal" ? (
+            <Badge variant="success">Terminal</Badge>
           ) : detail.state === "tombstoned" ? (
             <Badge variant="secondary">
               <Archive className="mr-1 h-3 w-3" />
@@ -355,6 +362,13 @@ export function ProjectContextCoordinateInspector({
           identity={projectContextDocumentIdentity(result)}
           onOpenDocument={onOpenDocument}
         />
+      ) : detail.state === "terminal" && coordinate.type === "meeting" ? (
+        <ProjectContextMeetingContent
+          fallback={detail.meeting}
+          meetingId={coordinate.meetingId}
+          onOpenMeeting={onOpenMeeting}
+          title={detail.title}
+        />
       ) : detail.state === "active" ? (
         <section
           className="rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-muted-foreground"
@@ -366,7 +380,7 @@ export function ProjectContextCoordinateInspector({
         </section>
       ) : null}
 
-      {detail.state !== "active" ? (
+      {detail.state === "tombstoned" || detail.state === "unavailable" ? (
         <section className="grid grid-cols-2 gap-3 rounded-xl border border-border/70 bg-muted/20 p-3">
           <Detail label="Known revision">
             {detail.objectRevision ?? detail.documentRevision ?? "Unknown"}

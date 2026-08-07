@@ -86,7 +86,7 @@ function ProjectContextRouteComponent() {
   usePreviewFeatureWarning("projectView");
   const search = Route.useSearch();
   const navigate = Route.useNavigate();
-  const { goDocuments, goView } = useAppNavigation();
+  const { goChannel, goDocuments, goView } = useAppNavigation();
   if (search.invalid) {
     return (
       <React.Suspense fallback={<ViewLoadingFallback kind="view" />}>
@@ -108,6 +108,7 @@ function ProjectContextRouteComponent() {
           })
         }
         onOpenDocument={(documentId) => void goDocuments({ documentId })}
+        onOpenMeeting={(meetingId) => void goChannel(meetingId)}
         onOpenProjectView={(objectId) => void goView({ objectId })}
         onSelectionChange={(selection, options) =>
           void navigate({

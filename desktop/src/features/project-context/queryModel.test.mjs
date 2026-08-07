@@ -16,6 +16,7 @@ const REQUIREMENT_ID = "20000000-0000-4000-8000-000000000001";
 const RESOURCE_ID = "30000000-0000-4000-8000-000000000001";
 const DOCUMENT_ID = "40000000-0000-4000-8000-000000000001";
 const TOMBSTONE_ID = "50000000-0000-4000-8000-000000000001";
+const MEETING_ID = "60000000-0000-4000-8000-000000000001";
 const requirement = {
   type: "project_view_object",
   objectType: "requirement",
@@ -181,4 +182,82 @@ test("picker groups active catalogs and retains visible lifecycle Coordinates", 
   );
   assert.equal(options[0].status, "Accepted");
   assert.equal(options[2].description, "Shared rationale");
+});
+
+test("picker exposes only terminal Meetings with searchable participant presentation", () => {
+  const options = buildProjectContextCoordinateOptions({
+    meetings: [
+      {
+        meetingId: MEETING_ID,
+        title: "Memory boundary review",
+        description: "Agree the first durable memory slice",
+        lifecycle: "closed",
+        phase: "ended",
+        currentSpeakerPubkey: null,
+        currentOfferPubkey: null,
+        needsAttention: false,
+        attentionReason: null,
+        moderatorPubkey: "a".repeat(64),
+        hostPubkey: "a".repeat(64),
+        participantCount: 4,
+        participantPreview: [
+          {
+            pubkey: "a".repeat(64),
+            participantType: "human",
+            channelRole: "admin",
+          },
+          {
+            pubkey: "b".repeat(64),
+            participantType: "agent",
+            channelRole: "member",
+          },
+        ],
+        viewerRole: "observer",
+        policy: "moderated-board-actions-v3",
+        createdAt: 1_786_054_800,
+        updatedAt: 1_786_055_400,
+        endedAt: 1_786_055_400,
+        latestSpeechAt: 1_786_055_300,
+        compatibility: "ready",
+      },
+      {
+        meetingId: "70000000-0000-4000-8000-000000000001",
+        title: "Still running",
+        description: null,
+        lifecycle: "active",
+        phase: "floor_ready",
+        currentSpeakerPubkey: null,
+        currentOfferPubkey: null,
+        needsAttention: false,
+        attentionReason: null,
+        moderatorPubkey: "a".repeat(64),
+        hostPubkey: "a".repeat(64),
+        participantCount: 2,
+        participantPreview: [],
+        viewerRole: "participant",
+        policy: "moderated-board-actions-v3",
+        createdAt: 1_786_055_500,
+        updatedAt: 1_786_055_500,
+        endedAt: null,
+        latestSpeechAt: null,
+        compatibility: "ready",
+      },
+    ],
+    profiles: {
+      ["a".repeat(64)]: { pubkey: "a".repeat(64), displayName: "Ada" },
+      ["b".repeat(64)]: { pubkey: "b".repeat(64), displayName: "Bumble" },
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.deepEqual(options[0].coordinate, {
+    type: "meeting",
+    meetingId: MEETING_ID,
+  });
+  assert.equal(options[0].coordinateKey, `meeting:${MEETING_ID}`);
+  assert.equal(options[0].group, "meetings");
+  assert.equal(options[0].state, "terminal");
+  assert.match(options[0].status, /^Closed/);
+  assert.match(options[0].searchTerms, /Ada/);
+  assert.match(options[0].searchTerms, /Bumble/);
 });

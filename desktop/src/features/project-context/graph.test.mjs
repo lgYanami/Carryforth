@@ -52,6 +52,7 @@ function result(edges, coordinateDetails) {
     query: { type: "contains_all", coordinates: [] },
     projectViewObservation: { state: "observed" },
     documentObservation: { state: "observed" },
+    meetingObservations: [],
     edges,
     coordinateDetails,
     documentDetails: [],
@@ -62,11 +63,45 @@ const A = "requirement:a";
 const B = "resource:b";
 const C = "goal:c";
 const D = "document:d";
+const M = "meeting:m";
+
+function meetingDetail(key, state = "terminal") {
+  const meetingId = key.slice(key.indexOf(":") + 1);
+  return {
+    coordinateKey: key,
+    coordinate: { type: "meeting", meetingId },
+    state,
+    title: `Meeting ${meetingId}`,
+  };
+}
 
 test("canonical ids preserve one Coordinate, Hub, and Spoke identity", () => {
   assert.equal(projectContextCoordinateNodeId(A), `coordinate:${A}`);
   assert.equal(projectContextHubNodeId("edge-ab"), "edge-hub:edge-ab");
   assert.equal(projectContextSpokeId("edge-ab", A), `spoke:edge-ab:${A}`);
+});
+
+test("Meeting remains a distinct terminal graph Coordinate", () => {
+  const graph = buildProjectContextGraph(
+    result(
+      [
+        {
+          edgeKey: "edge-am",
+          coordinateKeys: [M, A],
+          contextDocumentIds: ["context-meeting"],
+        },
+      ],
+      [projectViewDetail(A, "requirement"), meetingDetail(M)],
+    ),
+  );
+
+  const meeting = graph.coordinates.find(
+    (coordinate) => coordinate.coordinateKey === M,
+  );
+  assert.ok(meeting);
+  assert.equal(meeting.typeLabel, "Meeting");
+  assert.equal(meeting.stableId, "m");
+  assert.equal(meeting.state, "terminal");
 });
 
 test("binary Edge becomes one Hub and two undirected presentation Spokes", () => {

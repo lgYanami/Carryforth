@@ -16,6 +16,7 @@ import {
   createMeeting,
   getMeetingActivities,
   getMeetingCapability,
+  getMeetingContextDetail,
   getMeetingSnapshot,
   getMeetingSpeeches,
   listMeetings,
@@ -71,6 +72,11 @@ export const meetingSnapshotQueryKey = (
   communityId: string | undefined,
   meetingId: string,
 ) => [...meetingQueryRoot(communityId), "snapshot", meetingId] as const;
+
+export const meetingContextDetailQueryKey = (
+  communityId: string | undefined,
+  meetingId: string,
+) => [...meetingQueryRoot(communityId), "context-detail", meetingId] as const;
 
 export const meetingSpeechesQueryKey = (
   communityId: string | undefined,
@@ -203,6 +209,18 @@ export function useMeetingSnapshot(meetingId: string) {
   }, [activeCommunity?.id, queryClient, terminalRevisionKey]);
 
   return query;
+}
+
+/** Read body-free terminal metadata for Project Context inspection. */
+export function useMeetingContextDetail(meetingId: string) {
+  const { activeCommunity } = useCommunities();
+  return useQuery({
+    queryKey: meetingContextDetailQueryKey(activeCommunity?.id, meetingId),
+    queryFn: () => getMeetingContextDetail(meetingId),
+    enabled: Boolean(activeCommunity && meetingId),
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
+  });
 }
 
 export function useMeetingFloorActionMutation(meetingId: string) {

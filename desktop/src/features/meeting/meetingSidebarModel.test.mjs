@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  meetingCanNotifyViewer,
   meetingNeedsVisibleAttention,
   meetingSidebarItems,
   terminalMeetingAttentionKey,
@@ -14,10 +15,12 @@ function item({
   attentionReason = null,
   updatedAt = 0,
   endedAt = null,
+  viewerRole = "participant",
 }) {
   return {
     meetingId: id,
     title: id,
+    description: null,
     lifecycle,
     phase: "moderator_control",
     currentSpeakerPubkey: null,
@@ -25,13 +28,39 @@ function item({
     needsAttention,
     attentionReason,
     moderatorPubkey: null,
+    hostPubkey: null,
+    participantCount: 0,
+    participantPreview: [],
+    viewerRole,
     policy: "moderated-board-actions-v3",
+    createdAt: 0,
     updatedAt,
     endedAt,
     latestSpeechAt: null,
     compatibility: "ready",
   };
 }
+
+test("Community observers never inherit roster notification semantics", () => {
+  assert.equal(
+    meetingCanNotifyViewer(item({ id: "host", viewerRole: "host" })),
+    true,
+  );
+  assert.equal(
+    meetingCanNotifyViewer(
+      item({ id: "participant", viewerRole: "participant" }),
+    ),
+    true,
+  );
+  assert.equal(
+    meetingCanNotifyViewer(item({ id: "observer", viewerRole: "observer" })),
+    false,
+  );
+  assert.equal(
+    meetingCanNotifyViewer(item({ id: "unknown", viewerRole: null })),
+    false,
+  );
+});
 
 test("Meeting sidebar sorts attention, active state, recent activity, then stable ID", () => {
   const meetings = [

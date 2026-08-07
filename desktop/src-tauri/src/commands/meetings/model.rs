@@ -199,6 +199,7 @@ pub enum MeetingLoadResult {
 pub struct MeetingListItem {
     pub(super) meeting_id: String,
     pub(super) title: String,
+    pub(super) description: Option<String>,
     pub(super) lifecycle: Option<MeetingLifecycle>,
     pub(super) phase: Option<String>,
     pub(super) current_speaker_pubkey: Option<String>,
@@ -206,11 +207,66 @@ pub struct MeetingListItem {
     pub(super) needs_attention: bool,
     pub(super) attention_reason: Option<MeetingAttentionReason>,
     pub(super) moderator_pubkey: Option<String>,
+    pub(super) host_pubkey: Option<String>,
+    pub(super) participant_count: Option<usize>,
+    pub(super) participant_preview: Vec<MeetingParticipant>,
+    pub(super) viewer_role: Option<MeetingViewerRole>,
     pub(super) policy: Option<String>,
+    pub(super) created_at: Option<u64>,
     pub(super) updated_at: Option<u64>,
     pub(super) ended_at: Option<u64>,
     pub(super) latest_speech_at: Option<u64>,
     pub(super) compatibility: MeetingListCompatibility,
+}
+
+/// Body-free terminal Meeting metadata used by Project Context inspection.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingContextInspectorDetail {
+    pub(super) meeting_id: String,
+    pub(super) title: String,
+    pub(super) description: Option<String>,
+    pub(super) host_pubkey: String,
+    pub(super) participants: Vec<MeetingParticipant>,
+    pub(super) terminal_outcome: String,
+    pub(super) created_at: u64,
+    pub(super) ended_at: u64,
+    pub(super) action_finalization: Option<MeetingContextInspectorActionSummary>,
+}
+
+/// Bounded Action Finalization facts for a Meeting Context inspector.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingContextInspectorActionSummary {
+    pub(super) condition: String,
+    pub(super) terminal_status: Option<String>,
+    pub(super) actions_attested: bool,
+}
+
+/// Closed result for the Project Context Meeting metadata read boundary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MeetingContextInspectorLoadResult {
+    UnsupportedRelay,
+    Forbidden,
+    NotFound,
+    NotTerminal,
+    UnsupportedProtocol,
+    Ready {
+        detail: Box<MeetingContextInspectorDetail>,
+    },
+}
+
+/// Presentation-only relationship between the current identity and a Meeting.
+///
+/// This never grants protocol actions: the frozen roster and current Meeting
+/// state remain authoritative for every write command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingViewerRole {
+    Host,
+    Participant,
+    Observer,
 }
 
 /// Product-level reason the current Desktop identity must revisit a Meeting.

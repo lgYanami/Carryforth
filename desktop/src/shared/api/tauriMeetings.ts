@@ -266,6 +266,7 @@ export type MeetingLoadResult =
 export type MeetingListItem = {
   meetingId: string;
   title: string;
+  description: string | null;
   lifecycle: MeetingLifecycle | null;
   phase: string | null;
   currentSpeakerPubkey: string | null;
@@ -273,7 +274,12 @@ export type MeetingListItem = {
   needsAttention: boolean;
   attentionReason: MeetingAttentionReason | null;
   moderatorPubkey: string | null;
+  hostPubkey: string | null;
+  participantCount: number | null;
+  participantPreview: MeetingParticipant[];
+  viewerRole: "host" | "participant" | "observer" | null;
   policy: string | null;
+  createdAt: number | null;
   updatedAt: number | null;
   endedAt: number | null;
   latestSpeechAt: number | null;
@@ -284,6 +290,30 @@ export type MeetingListItem = {
     | "forbidden"
     | "not_found";
 };
+
+export type MeetingContextInspectorDetail = {
+  meetingId: string;
+  title: string;
+  description: string | null;
+  hostPubkey: string;
+  participants: MeetingParticipant[];
+  terminalOutcome: string;
+  createdAt: number;
+  endedAt: number;
+  actionFinalization: {
+    condition: string;
+    terminalStatus: string | null;
+    actionsAttested: boolean;
+  } | null;
+};
+
+export type MeetingContextInspectorLoadResult =
+  | { status: "unsupported_relay" }
+  | { status: "forbidden" }
+  | { status: "not_found" }
+  | { status: "not_terminal" }
+  | { status: "unsupported_protocol" }
+  | { status: "ready"; detail: MeetingContextInspectorDetail };
 
 export type MeetingAttentionReason =
   | "floor_offer"
@@ -637,6 +667,15 @@ export async function getMeetingSnapshot(
   meetingId: string,
 ): Promise<MeetingLoadResult> {
   return invokeTauri<MeetingLoadResult>("get_meeting_snapshot", { meetingId });
+}
+
+export async function getMeetingContextDetail(
+  meetingId: string,
+): Promise<MeetingContextInspectorLoadResult> {
+  return invokeTauri<MeetingContextInspectorLoadResult>(
+    "get_meeting_context_detail",
+    { meetingId },
+  );
 }
 
 export async function getMeetingBoard(

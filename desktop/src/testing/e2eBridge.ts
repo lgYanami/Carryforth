@@ -85,6 +85,7 @@ import type {
   MeetingHostActionInput,
   MeetingHostActionResult,
   MeetingCapability,
+  MeetingContextInspectorLoadResult,
   MeetingListItem,
   MeetingLoadResult,
   MeetingSnapshot,
@@ -3571,9 +3572,18 @@ function mockMeetingListItem(
   if (seed.result.status === "ready") {
     const snapshot = seed.result.snapshot;
     const attentionReason = mockMeetingAttentionReason(snapshot, viewerPubkey);
+    const viewerRole =
+      snapshot.hostPubkey === viewerPubkey
+        ? "host"
+        : snapshot.participants.some(
+              (participant) => participant.pubkey === viewerPubkey,
+            )
+          ? "participant"
+          : "observer";
     return {
       meetingId: seed.id,
       title: seed.title,
+      description: snapshot.description,
       lifecycle: snapshot.lifecycle,
       phase: snapshot.phase,
       currentSpeakerPubkey: snapshot.currentSpeakerPubkey,
@@ -3581,7 +3591,12 @@ function mockMeetingListItem(
       needsAttention: attentionReason !== null,
       attentionReason,
       moderatorPubkey: snapshot.moderatorPubkey,
+      hostPubkey: snapshot.hostPubkey,
+      participantCount: snapshot.participants.length,
+      participantPreview: snapshot.participants.slice(0, 3),
+      viewerRole,
       policy: snapshot.policy,
+      createdAt: snapshot.createdAt,
       updatedAt: Math.max(
         snapshot.createdAt,
         snapshot.end?.endedAt ?? 0,
@@ -3604,6 +3619,7 @@ function mockMeetingListItem(
   return {
     meetingId: seed.id,
     title: seed.title,
+    description: null,
     lifecycle: null,
     phase: null,
     currentSpeakerPubkey: null,
@@ -3611,7 +3627,12 @@ function mockMeetingListItem(
     needsAttention: false,
     attentionReason: null,
     moderatorPubkey: null,
+    hostPubkey: null,
+    participantCount: null,
+    participantPreview: [],
+    viewerRole: null,
     policy: null,
+    createdAt: null,
     updatedAt: null,
     endedAt: null,
     latestSpeechAt: null,
@@ -11945,6 +11966,44 @@ export function maybeInstallE2eTauriMocks() {
             status: "not_found",
           }
         );
+      }
+      case "get_meeting_context_detail": {
+        const { meetingId } = payload as { meetingId: string };
+        const result = getMockMeetingSeed(meetingId, activeConfig)?.result;
+        if (!result) return { status: "not_found" };
+        if (result.status !== "ready") {
+          return result.status === "unsupported_protocol"
+            ? { status: "unsupported_protocol" }
+            : { status: result.status };
+        }
+        const { snapshot } = result;
+        if (
+          snapshot.lifecycle !== "closed" &&
+          snapshot.lifecycle !== "aborted"
+        ) {
+          return { status: "not_terminal" };
+        }
+        if (!snapshot.end) return { status: "unsupported_protocol" };
+        return {
+          status: "ready",
+          detail: {
+            meetingId: snapshot.meetingId,
+            title: snapshot.title,
+            description: snapshot.description,
+            hostPubkey: snapshot.hostPubkey,
+            participants: structuredClone(snapshot.participants),
+            terminalOutcome: snapshot.end.outcome,
+            createdAt: snapshot.createdAt,
+            endedAt: snapshot.end.endedAt,
+            actionFinalization: snapshot.action
+              ? {
+                  condition: snapshot.action.condition,
+                  terminalStatus: snapshot.action.terminalStatus,
+                  actionsAttested: snapshot.end.actionsAttested,
+                }
+              : null,
+          },
+        } satisfies MeetingContextInspectorLoadResult;
       }
       case "get_meeting_board": {
         const { meetingId } = payload as { meetingId: string };

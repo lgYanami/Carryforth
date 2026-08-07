@@ -73,10 +73,22 @@ function meetingStatus(item: MeetingListItem): string {
   if (item.compatibility !== "ready") {
     return lifecycleLabel(null);
   }
-  if (item.lifecycle === "active" && item.currentSpeakerPubkey) {
-    return `Speaking · ${truncatePubkey(item.currentSpeakerPubkey)}`;
-  }
-  return lifecycleLabel(item.lifecycle);
+  const lifecycle =
+    item.lifecycle === "active" && item.currentSpeakerPubkey
+      ? `Speaking · ${truncatePubkey(item.currentSpeakerPubkey)}`
+      : lifecycleLabel(item.lifecycle);
+  const viewer = meetingViewerLabel(item);
+  return viewer ? `${lifecycle} · ${viewer}` : lifecycle;
+}
+
+function meetingViewerLabel(item: MeetingListItem): string | null {
+  return item.viewerRole === "host"
+    ? "Host"
+    : item.viewerRole === "participant"
+      ? "Participant"
+      : item.viewerRole === "observer"
+        ? "Observer"
+        : null;
 }
 
 function attentionLabel(reason: MeetingAttentionReason | null): string {
@@ -316,6 +328,7 @@ export function MeetingsSidebarSection({
               visibleHistoryItems.map((item) => (
                 <Button
                   className="h-auto w-full justify-start gap-3 px-3 py-2 text-left"
+                  data-testid={`meeting-history-row-${item.meetingId}`}
                   key={item.meetingId}
                   onClick={() => {
                     acknowledgeTerminalAttention(item);
@@ -331,6 +344,9 @@ export function MeetingsSidebarSection({
                     </span>
                     <span className="block text-xs text-muted-foreground">
                       {lifecycleLabel(item.lifecycle)}
+                      {meetingViewerLabel(item)
+                        ? ` · ${meetingViewerLabel(item)}`
+                        : ""}
                       {item.endedAt
                         ? ` · ${new Date(item.endedAt * 1_000).toLocaleString()}`
                         : ""}

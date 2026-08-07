@@ -106,6 +106,7 @@ function documentContextResult(): ProjectContextQueryResult {
     query: { type: "contains_all", coordinates: [] },
     projectViewObservation: { state: "not_requested" },
     documentObservation: { state: "observed" },
+    meetingObservations: [],
     edges: [],
     coordinateDetails: [
       {

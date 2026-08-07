@@ -399,14 +399,19 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   );
   const workingMeetingActivityAgents = React.useMemo(
     () =>
-      snapshot
+      snapshot && currentParticipant
         ? selectWorkingMeetingAgents({
             agents: meetingActivityAgents,
             lifecycle: snapshot.lifecycle,
             workingPubkeys: meetingWorkingPubkeys,
           })
         : [],
-    [meetingActivityAgents, meetingWorkingPubkeys, snapshot],
+    [
+      currentParticipant,
+      meetingActivityAgents,
+      meetingWorkingPubkeys,
+      snapshot,
+    ],
   );
   const {
     closeAgentActivity: handleCloseAgentActivity,

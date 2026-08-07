@@ -4,6 +4,11 @@ export function isTerminalMeeting(item: MeetingListItem): boolean {
   return item.lifecycle === "closed" || item.lifecycle === "aborted";
 }
 
+/** Community observers can discover Meetings but never inherit participant notifications. */
+export function meetingCanNotifyViewer(item: MeetingListItem): boolean {
+  return item.viewerRole === "host" || item.viewerRole === "participant";
+}
+
 export function terminalMeetingAttentionKey(
   item: MeetingListItem,
 ): string | null {

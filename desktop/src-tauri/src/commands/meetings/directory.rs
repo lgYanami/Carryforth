@@ -8,9 +8,21 @@ pub(super) fn list_item_from_load(
     match loaded {
         Ok(MeetingLoadResult::Ready { snapshot }) => {
             let attention_reason = meeting_attention_reason(&snapshot, viewer_pubkey);
+            let viewer_role = if snapshot.host_pubkey == viewer_pubkey {
+                MeetingViewerRole::Host
+            } else if snapshot
+                .participants
+                .iter()
+                .any(|participant| participant.pubkey == viewer_pubkey)
+            {
+                MeetingViewerRole::Participant
+            } else {
+                MeetingViewerRole::Observer
+            };
             MeetingListItem {
                 meeting_id,
                 title: snapshot.title.clone(),
+                description: snapshot.description.clone(),
                 lifecycle: Some(snapshot.lifecycle),
                 phase: Some(snapshot.phase.clone()),
                 current_speaker_pubkey: snapshot.current_speaker_pubkey.clone(),
@@ -18,7 +30,12 @@ pub(super) fn list_item_from_load(
                 needs_attention: attention_reason.is_some(),
                 attention_reason,
                 moderator_pubkey: Some(snapshot.moderator_pubkey.clone()),
+                host_pubkey: Some(snapshot.host_pubkey.clone()),
+                participant_count: Some(snapshot.participants.len()),
+                participant_preview: snapshot.participants.iter().take(3).cloned().collect(),
+                viewer_role: Some(viewer_role),
                 policy: Some(snapshot.policy.clone()),
+                created_at: Some(snapshot.created_at),
                 updated_at: Some(snapshot.authoritative_updated_at),
                 ended_at: snapshot.end.as_ref().map(|end| end.ended_at),
                 latest_speech_at: snapshot.latest_speech_at,
@@ -88,6 +105,7 @@ fn empty_list_item(meeting_id: String, compatibility: MeetingListCompatibility) 
     MeetingListItem {
         title: meeting_id.clone(),
         meeting_id,
+        description: None,
         lifecycle: None,
         phase: None,
         current_speaker_pubkey: None,
@@ -95,7 +113,12 @@ fn empty_list_item(meeting_id: String, compatibility: MeetingListCompatibility) 
         needs_attention: false,
         attention_reason: None,
         moderator_pubkey: None,
+        host_pubkey: None,
+        participant_count: None,
+        participant_preview: Vec::new(),
+        viewer_role: None,
         policy: None,
+        created_at: None,
         updated_at: None,
         ended_at: None,
         latest_speech_at: None,

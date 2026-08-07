@@ -10,6 +10,10 @@ export type ProjectContextCoordinate =
   | {
       type: "document";
       documentId: string;
+    }
+  | {
+      type: "meeting";
+      meetingId: string;
     };
 
 export type ProjectContextQuery =
@@ -22,7 +26,43 @@ export type ProjectContextSourceState =
   | "observed"
   | "unavailable";
 
-export type ProjectContextDetailState = "active" | "tombstoned" | "unavailable";
+export type ProjectContextDetailState =
+  | "active"
+  | "terminal"
+  | "tombstoned"
+  | "unavailable";
+
+export type ProjectContextMeetingParticipant = {
+  pubkey: string;
+  participantType: "human" | "agent" | "unknown";
+};
+
+export type ProjectContextMeetingActionSummary = {
+  condition: string;
+  terminalStatus?: string;
+  actionsAttested: boolean;
+};
+
+export type ProjectContextMeetingDetail = {
+  discussionGoal: string | null;
+  terminalOutcome: "closed" | "aborted" | string;
+  hostPubkey: string;
+  participantCount: number;
+  participantPreview: ProjectContextMeetingParticipant[];
+  createdAt: string;
+  endedAt: string;
+  actionFinalization?: ProjectContextMeetingActionSummary;
+};
+
+export type ProjectContextMeetingObservation = {
+  meetingId: string;
+  state: "observed" | "unavailable" | "verification_failed";
+  stateRevision?: number;
+  createEventId?: string;
+  stateEventId?: string;
+  endEventId?: string;
+  updatedAt?: string;
+};
 
 export type ProjectContextObservation = {
   contextRevision: number;
@@ -64,6 +104,7 @@ export type ProjectContextCoordinateDetail = {
   status?: unknown;
   objectRevision?: number;
   documentRevision?: number;
+  meeting?: ProjectContextMeetingDetail;
   updatedAt?: string;
   updatedBy?: string;
   unavailableReason?: string;
@@ -88,6 +129,7 @@ export type ProjectContextQueryResult = {
   query: ProjectContextQuery;
   projectViewObservation: ProjectContextProjectViewObservation;
   documentObservation: ProjectContextDocumentObservation;
+  meetingObservations: ProjectContextMeetingObservation[];
   edges: ProjectContextEdge[];
   coordinateDetails: ProjectContextCoordinateDetail[];
   documentDetails: ProjectContextDocumentDetail[];
@@ -172,6 +214,12 @@ function canonicalCoordinate(
       documentId: canonicalUuid(coordinate.documentId, "documentId"),
     };
   }
+  if (coordinate.type === "meeting") {
+    return {
+      type: "meeting",
+      meetingId: canonicalUuid(coordinate.meetingId, "meetingId"),
+    };
+  }
   if (!(coordinate.objectType in OBJECT_TYPE_RANK)) {
     throw new ProjectContextError({
       code: "invalid_input",
@@ -191,15 +239,19 @@ export function projectContextCoordinateKey(
   coordinate: ProjectContextCoordinate,
 ): string {
   const canonical = canonicalCoordinate(coordinate);
-  return canonical.type === "document"
-    ? `document:${canonical.documentId}`
-    : `${canonical.objectType}:${canonical.objectId}`;
+  if (canonical.type === "document") {
+    return `document:${canonical.documentId}`;
+  }
+  if (canonical.type === "meeting") {
+    return `meeting:${canonical.meetingId}`;
+  }
+  return `${canonical.objectType}:${canonical.objectId}`;
 }
 
 function coordinateRank(coordinate: ProjectContextCoordinate): number {
-  return coordinate.type === "document"
-    ? 9
-    : OBJECT_TYPE_RANK[coordinate.objectType];
+  if (coordinate.type === "document") return 9;
+  if (coordinate.type === "meeting") return 10;
+  return OBJECT_TYPE_RANK[coordinate.objectType];
 }
 
 /** Parse one canonical Coordinate token without accepting unknown object types. */
@@ -218,6 +270,9 @@ export function projectContextCoordinateFromKey(
   const id = coordinateKey.slice(separator + 1);
   if (type === "document") {
     return canonicalCoordinate({ type: "document", documentId: id });
+  }
+  if (type === "meeting") {
+    return canonicalCoordinate({ type: "meeting", meetingId: id });
   }
   if (!(type in OBJECT_TYPE_RANK)) {
     throw new ProjectContextError({

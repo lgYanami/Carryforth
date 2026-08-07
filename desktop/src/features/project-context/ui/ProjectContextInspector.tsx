@@ -78,6 +78,7 @@ export function ProjectContextInspector({
   onClose,
   onFocusSelection,
   onOpenDocument,
+  onOpenMeeting,
   onOpenProjectView,
   onSelect,
   onShowIncident,
@@ -88,6 +89,7 @@ export function ProjectContextInspector({
   onClose: () => void;
   onFocusSelection: () => void;
   onOpenDocument: (documentId: string) => void;
+  onOpenMeeting: (meetingId: string) => void;
   onOpenProjectView: (objectId: string) => void;
   onSelect: (selection: ProjectContextRouteSelection) => void;
   onShowIncident: (coordinate: ProjectContextCoordinate) => void;
@@ -140,6 +142,7 @@ export function ProjectContextInspector({
           <ProjectContextCoordinateInspector
             detail={projectContextInspectedCoordinate(result, selection.key)}
             onOpenDocument={onOpenDocument}
+            onOpenMeeting={onOpenMeeting}
             onOpenProjectView={onOpenProjectView}
             onSelectEdge={(edgeKey) => onSelect({ kind: "edge", key: edgeKey })}
             onShowIncident={onShowIncident}

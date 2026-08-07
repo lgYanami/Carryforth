@@ -16,9 +16,9 @@ import { Badge } from "@/shared/ui/badge";
 import { cn } from "@/shared/lib/cn";
 
 function coordinateType(detail: ProjectContextCoordinateDetail) {
-  return detail.coordinate.type === "document"
-    ? "Document"
-    : projectViewObjectTypeLabel(detail.coordinate.objectType);
+  if (detail.coordinate.type === "document") return "Document";
+  if (detail.coordinate.type === "meeting") return "Meeting";
+  return projectViewObjectTypeLabel(detail.coordinate.objectType);
 }
 
 function CoordinateRow({

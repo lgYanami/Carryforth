@@ -11,6 +11,9 @@ import {
   useProjectDocumentMeta,
   useProjectDocuments,
 } from "@/features/project-documents/hooks";
+import { useChannelsQuery } from "@/features/channels/hooks";
+import { useMeetingDirectory } from "@/features/meeting/hooks";
+import { useUsersBatchQuery } from "@/features/profile/hooks";
 import {
   buildProjectContextCoordinateOptions,
   type ProjectContextCoordinateOption,
@@ -56,6 +59,7 @@ type ValidProjectContextScreenProps = {
   appliedQuery: ProjectContextQuery;
   onApplyQuery: (query: ProjectContextQuery) => void;
   onOpenDocument: (documentId: string) => void;
+  onOpenMeeting: (meetingId: string) => void;
   onOpenProjectView: (objectId: string) => void;
   onSelectionChange: (
     selection: ProjectContextRouteSelection | null,
@@ -227,6 +231,7 @@ function ValidProjectContextScreen({
   appliedQuery,
   onApplyQuery,
   onOpenDocument,
+  onOpenMeeting,
   onOpenProjectView,
   onSelectionChange,
   selection,
@@ -238,6 +243,31 @@ function ValidProjectContextScreen({
   const projectViewQuery = useProjectViewQuery();
   const documentMetaQuery = useProjectDocumentMeta();
   const documentsQuery = useProjectDocuments(documentMetaQuery.data);
+  const channelsQuery = useChannelsQuery();
+  const meetingIds = React.useMemo(
+    () =>
+      (channelsQuery.data ?? [])
+        .filter((channel) => channel.roomKind === "meeting")
+        .map((channel) => channel.id)
+        .sort(),
+    [channelsQuery.data],
+  );
+  const meetingDirectoryQuery = useMeetingDirectory(meetingIds);
+  const meetingProfilePubkeys = React.useMemo(
+    () =>
+      [
+        ...new Set(
+          (meetingDirectoryQuery.data ?? []).flatMap((meeting) => [
+            ...(meeting.hostPubkey ? [meeting.hostPubkey] : []),
+            ...meeting.participantPreview.map(
+              (participant) => participant.pubkey,
+            ),
+          ]),
+        ),
+      ].sort(),
+    [meetingDirectoryQuery.data],
+  );
+  const meetingProfilesQuery = useUsersBatchQuery(meetingProfilePubkeys);
   const failureKind = contextQuery.isError
     ? projectContextFailureKind(contextQuery.error)
     : undefined;
@@ -294,10 +324,14 @@ function ValidProjectContextScreen({
       buildProjectContextCoordinateOptions({
         projectViewObjects,
         documents: documentsQuery.data?.documents,
+        meetings: meetingDirectoryQuery.data,
+        profiles: meetingProfilesQuery.data?.profiles,
         visibleDetails: result?.coordinateDetails,
       }),
     [
       documentsQuery.data?.documents,
+      meetingDirectoryQuery.data,
+      meetingProfilesQuery.data?.profiles,
       projectViewObjects,
       result?.coordinateDetails,
     ],
@@ -313,6 +347,15 @@ function ValidProjectContextScreen({
       documentMetaQuery.isPending ||
       Boolean(documentMetaQuery.data && documentsQuery.isPending),
     ready: Boolean(documentMetaQuery.data && documentsQuery.data),
+  });
+  const meetingsState = pickerSourceState({
+    error: channelsQuery.error ?? meetingDirectoryQuery.error,
+    loading:
+      channelsQuery.isPending ||
+      (meetingIds.length > 0 && meetingDirectoryQuery.isPending),
+    ready:
+      Boolean(channelsQuery.data) &&
+      (meetingIds.length === 0 || Boolean(meetingDirectoryQuery.data)),
   });
   const allContext = isAllProjectContextQuery(appliedQuery);
 
@@ -379,6 +422,7 @@ function ValidProjectContextScreen({
         appliedQuery={appliedQuery}
         coordinateOptions={coordinateOptions}
         documentsState={documentsState}
+        meetingsState={meetingsState}
         onRun={onApplyQuery}
         projectViewState={projectViewState}
       />
@@ -411,6 +455,7 @@ function ValidProjectContextScreen({
                 setFocusSelectionRequest((current) => current + 1);
               }}
               onOpenDocument={onOpenDocument}
+              onOpenMeeting={onOpenMeeting}
               onOpenProjectView={onOpenProjectView}
               onSelect={(nextSelection) => onSelectionChange(nextSelection)}
               onShowIncident={(coordinate) =>

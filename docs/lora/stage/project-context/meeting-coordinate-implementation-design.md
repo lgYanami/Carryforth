@@ -1,6 +1,6 @@
 # Meeting 作为 Project Context 坐标与 Community 可见性实现设计
 
-> 状态：产品与技术边界已确认，分阶段实现中；阶段 1～3 已完成并通过实现审查
+> 状态：产品与技术边界已确认，分阶段实现中；阶段 1～4 已完成并通过实现审查
 >
 > 日期：2026-08-07
 >
@@ -1000,6 +1000,15 @@ schema migration、数据删除或隐式 source 修改。
 完成标准：Agent 不依赖 Desktop 即可建立、发现和解释 Meeting Context Edge。
 
 ### 阶段 4：Desktop
+
+> 交付状态：已完成。Desktop Meeting directory 以 Community 可读集合为输入，并把 viewer 明确标记为
+> Host、Participant 或 Observer；observer 不进入 unread、attention 与 Agent Activity 提示，也不会获得
+> frozen-roster 写控件。Project Context Query Bar 只列 verified terminal Meeting，graph 使用独立 Meeting
+> node，Inspector 通过独立的 body-free Tauri read 按需补全最多 12 人的冻结 roster 与 Action 摘要，不把
+> Board 或 Speech 放入 Context result/cache。`Open Meeting` 复用现有 Channel route，浏览器返回可恢复原
+> query 与 selection。实现审查确认 Community query key 隔离仍覆盖 Meeting directory/detail，未引入新的
+> module-level Community cache；Mock Bridge E2E 覆盖 observer 历史发现、metadata-first Inspector、只读
+> 跳转和返回定位。
 
 - Community Meetings 导航与 observer 模式；
 - Meeting Coordinate picker、graph、Inspector；

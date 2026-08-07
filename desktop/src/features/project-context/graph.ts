@@ -91,6 +91,9 @@ function stableIdForDetail(
   if (detail?.coordinate.type === "document") {
     return detail.coordinate.documentId;
   }
+  if (detail?.coordinate.type === "meeting") {
+    return detail.coordinate.meetingId;
+  }
   if (detail?.coordinate.type === "project_view_object") {
     return detail.coordinate.objectId;
   }
@@ -107,6 +110,7 @@ function shortStableId(stableId: string) {
 
 function typeLabelForDetail(detail?: ProjectContextCoordinateDetail): string {
   if (detail?.coordinate.type === "document") return "Document";
+  if (detail?.coordinate.type === "meeting") return "Meeting";
   if (detail?.coordinate.type === "project_view_object") {
     return (
       OBJECT_TYPE_LABELS[detail.coordinate.objectType] ??

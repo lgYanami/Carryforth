@@ -28,6 +28,7 @@ const PROJECT_ID: &str = "3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77";
 const REQUIREMENT_ID: &str = "0fd3a16e-4da4-48c1-aa6a-63b3661091d0";
 const RESOURCE_ID: &str = "e0a286dd-4391-4a45-b843-62b2c57b014a";
 const DOCUMENT_ID: &str = "9c23f672-a397-42d1-b933-104ba2674f26";
+const MEETING_ID: &str = "0ed366aa-6f94-4eff-83db-b8bf081fbf35";
 const STAGE7_PROJECT_ID: &str = "00000000-0000-4000-8000-00000000c003";
 const STAGE7_GOAL_ID: &str = "10000000-0000-4000-8000-00000000c004";
 const STAGE7_ROLE_ID: &str = "20000000-0000-4000-8000-00000000c003";
@@ -60,16 +61,22 @@ fn document_coordinate() -> ProjectContextCoordinate {
     }
 }
 
+fn meeting_coordinate() -> ProjectContextCoordinate {
+    ProjectContextCoordinate::Meeting {
+        meeting_id: uuid(MEETING_ID),
+    }
+}
+
 fn projection_fixture(path: &str) -> Event {
     let content = match path {
         "context_meta" => include_str!(
-            "../../../../docs/nips/fixtures/project-context-edge-v1/events/meta-incremental.json"
+            "../../../../docs/nips/fixtures/project-context-edge-v2/events/meta-incremental.json"
         ),
         "context_meta_reproject" => include_str!(
-            "../../../../docs/nips/fixtures/project-context-edge-v1/events/meta-reset-reproject.json"
+            "../../../../docs/nips/fixtures/project-context-edge-v2/events/meta-reset-reproject.json"
         ),
         "binding" => include_str!(
-            "../../../../docs/nips/fixtures/project-context-edge-v1/events/binding-active.json"
+            "../../../../docs/nips/fixtures/project-context-edge-v2/events/binding-active.json"
         ),
         "document_meta" => include_str!(
             "../../../../docs/nips/fixtures/project-document-v1/events/meta-incremental.json"
@@ -550,7 +557,7 @@ async fn context_capabilities_are_independent_in_both_directions() {
         &[
             "buzz-project-view-v3",
             "buzz-project-document-v1",
-            "buzz-project-context-edge-v1",
+            "buzz-project-context-edge-v2",
         ],
         vec![projection_fixture("context_meta")],
         BindingPagesMode::Normal,
@@ -564,7 +571,7 @@ async fn context_capabilities_are_independent_in_both_directions() {
             "buzz-project-view-v3",
             "buzz-project-document-v1",
             "buzz-project-context-v1",
-            "buzz-project-context-edge-v1",
+            "buzz-project-context-edge-v2",
         ],
         vec![projection_fixture("context_meta")],
         BindingPagesMode::Normal,
@@ -607,7 +614,7 @@ async fn exact_query_can_return_a_verified_zero_match_without_inventing_an_edge(
         &[
             "buzz-project-view-v3",
             "buzz-project-document-v1",
-            "buzz-project-context-edge-v1",
+            "buzz-project-context-edge-v2",
         ],
         vec![projection_fixture("context_meta")],
         BindingPagesMode::Empty,
@@ -632,13 +639,13 @@ async fn exact_incident_and_contains_all_return_the_same_verified_edge_membershi
         &[
             "buzz-project-view-v3",
             "buzz-project-document-v1",
-            "buzz-project-context-edge-v1",
+            "buzz-project-context-edge-v2",
         ],
         vec![projection_fixture("context_meta")],
         BindingPagesMode::Normal,
     );
     let (state, context) = captured_context(server).await;
-    let coordinates = vec![requirement_coordinate(), resource_coordinate()];
+    let coordinates = vec![requirement_coordinate(), meeting_coordinate()];
     let queries = [
         CanonicalContextQuery::Exact(coordinates.clone()),
         CanonicalContextQuery::Incident(requirement_coordinate()),
@@ -666,7 +673,7 @@ async fn unstable_context_metadata_retries_the_complete_snapshot_then_conflicts(
         &[
             "buzz-project-view-v3",
             "buzz-project-document-v1",
-            "buzz-project-context-edge-v1",
+            "buzz-project-context-edge-v2",
         ],
         vec![
             projection_fixture("context_meta"),
@@ -693,7 +700,7 @@ async fn stable_pagination_that_makes_no_progress_fails_verification() {
         &[
             "buzz-project-view-v3",
             "buzz-project-document-v1",
-            "buzz-project-context-edge-v1",
+            "buzz-project-context-edge-v2",
         ],
         vec![projection_fixture("context_meta")],
         BindingPagesMode::RepeatFirstPage,
@@ -723,7 +730,7 @@ async fn delayed_identity(AxumState(state): AxumState<DelayedIdentityState>) -> 
         "supported_extensions": [
             "buzz-project-view-v3",
             "buzz-project-document-v1",
-            "buzz-project-context-edge-v1"
+            "buzz-project-context-edge-v2"
         ],
         "self": state.relay_pubkey,
     }))

@@ -3,6 +3,7 @@ import * as React from "react";
 import type { Channel } from "@/shared/api/types";
 import type { MeetingListItem } from "@/shared/api/tauriMeetings";
 import { useMeetingDirectory, useMeetingLiveSync } from "./hooks";
+import { meetingCanNotifyViewer } from "./meetingSidebarModel";
 
 /** Partition protocol-specific Meeting rooms away from ordinary chat surfaces. */
 export function useMeetingRoomPartition(channels: Channel[]) {
@@ -10,13 +11,9 @@ export function useMeetingRoomPartition(channels: Channel[]) {
     () => channels.filter((channel) => channel.roomKind !== "meeting"),
     [channels],
   );
-  const memberChannels = React.useMemo(
-    () => channels.filter((channel) => channel.isMember),
-    [channels],
-  );
   const meetingRooms = React.useMemo(
-    () => memberChannels.filter((channel) => channel.roomKind === "meeting"),
-    [memberChannels],
+    () => channels.filter((channel) => channel.roomKind === "meeting"),
+    [channels],
   );
   const meetingIds = React.useMemo(
     () => meetingRooms.map((channel) => channel.id).sort(),
@@ -41,6 +38,7 @@ export function useMeetingRoomPartition(channels: Channel[]) {
       return {
         meetingId: room.id,
         title: room.name,
+        description: null,
         lifecycle: "initializing",
         phase: "initializing",
         currentSpeakerPubkey: null,
@@ -48,7 +46,12 @@ export function useMeetingRoomPartition(channels: Channel[]) {
         needsAttention: false,
         attentionReason: null,
         moderatorPubkey: null,
+        hostPubkey: null,
+        participantCount: null,
+        participantPreview: [],
+        viewerRole: null,
         policy: null,
+        createdAt: null,
         updatedAt: room.lastMessageAt
           ? Math.floor(Date.parse(room.lastMessageAt) / 1_000)
           : null,
@@ -60,11 +63,13 @@ export function useMeetingRoomPartition(channels: Channel[]) {
   }, [meetingDirectory.data, meetingRooms]);
   const sidebarChannels = React.useMemo(
     () =>
-      memberChannels.filter(
+      channels.filter(
         (channel) =>
-          channel.roomKind !== "meeting" && channel.archivedAt === null,
+          channel.isMember &&
+          channel.roomKind !== "meeting" &&
+          channel.archivedAt === null,
       ),
-    [memberChannels],
+    [channels],
   );
 
   return {
@@ -85,6 +90,7 @@ export function useUnreadMeetingIds(
   return React.useMemo(() => {
     const unread = new Set<string>();
     for (const meeting of meetingItems) {
+      if (!meetingCanNotifyViewer(meeting)) continue;
       if (!meeting.latestSpeechAt) continue;
       const readAt = getChannelReadAt(meeting.meetingId);
       if (readAt === null || meeting.latestSpeechAt > readAt) {

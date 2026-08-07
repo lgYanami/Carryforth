@@ -43,6 +43,7 @@ function optionSearchText(option: ProjectContextCoordinateOption) {
     option.typeLabel,
     option.status,
     option.description,
+    option.searchTerms,
     option.coordinateKey,
   ]
     .filter(Boolean)
@@ -54,6 +55,7 @@ function CoordinatePicker({
   closeOnSelect,
   disabled,
   documentsState,
+  meetingsState,
   onSelect,
   options,
   projectViewState,
@@ -62,6 +64,7 @@ function CoordinatePicker({
   closeOnSelect: boolean;
   disabled: boolean;
   documentsState: ProjectContextPickerSourceState;
+  meetingsState: ProjectContextPickerSourceState;
   onSelect: (option: ProjectContextCoordinateOption) => void;
   options: ProjectContextCoordinateOption[];
   projectViewState: ProjectContextPickerSourceState;
@@ -175,14 +178,22 @@ function CoordinatePicker({
           className="max-h-80 overflow-y-auto overscroll-contain p-1"
           role="listbox"
         >
-          {(["project_view", "documents"] as const).map((group) => {
+          {(["project_view", "documents", "meetings"] as const).map((group) => {
             const groupOptions = filtered.filter(
               (option) => option.group === group,
             );
             const sourceState =
-              group === "project_view" ? projectViewState : documentsState;
+              group === "project_view"
+                ? projectViewState
+                : group === "documents"
+                  ? documentsState
+                  : meetingsState;
             const label =
-              group === "project_view" ? "Project View" : "Documents";
+              group === "project_view"
+                ? "Project View"
+                : group === "documents"
+                  ? "Documents"
+                  : "Meetings";
             if (groupOptions.length === 0 && sourceState === "ready") {
               return null;
             }
@@ -240,7 +251,8 @@ function CoordinatePicker({
           })}
           {filtered.length === 0 &&
           projectViewState !== "loading" &&
-          documentsState !== "loading" ? (
+          documentsState !== "loading" &&
+          meetingsState !== "loading" ? (
             <p className="px-3 py-6 text-center text-sm text-muted-foreground">
               No current-project Coordinates match.
             </p>
@@ -256,12 +268,14 @@ export function ProjectContextQueryBar({
   appliedQuery,
   coordinateOptions,
   documentsState,
+  meetingsState,
   onRun,
   projectViewState,
 }: {
   appliedQuery: ProjectContextQuery;
   coordinateOptions: ProjectContextCoordinateOption[];
   documentsState: ProjectContextPickerSourceState;
+  meetingsState: ProjectContextPickerSourceState;
   onRun: (query: ProjectContextQuery) => void;
   projectViewState: ProjectContextPickerSourceState;
 }) {
@@ -345,6 +359,7 @@ export function ProjectContextQueryBar({
               (draft.mode === "incident" && draft.coordinates.length === 1)
             }
             documentsState={documentsState}
+            meetingsState={meetingsState}
             onSelect={(option) =>
               setDraft((current) =>
                 addProjectContextDraftCoordinate(current, option.coordinate),

@@ -5,6 +5,8 @@ import {
   projectViewObjectTypeLabel,
 } from "@/features/project-view/model";
 import type { ProjectDocumentListItem } from "@/shared/api/tauriProjectDocument";
+import type { UserProfileSummary } from "@/shared/api/types";
+import type { MeetingListItem } from "@/shared/api/tauriMeetings";
 import {
   canonicalizeProjectContextCoordinates,
   canonicalizeProjectContextQuery,
@@ -15,6 +17,7 @@ import {
   type ProjectContextQuery,
 } from "@/shared/api/tauriProjectContext";
 import type { ProjectViewObject } from "@/shared/api/tauriProjectView";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 import {
   projectContextModeForQuery,
   type ProjectContextQueryMode,
@@ -41,12 +44,13 @@ export type ProjectContextDraftCoordinateTransition =
 export type ProjectContextCoordinateOption = {
   coordinate: ProjectContextCoordinate;
   coordinateKey: string;
-  group: "project_view" | "documents";
+  group: "project_view" | "documents" | "meetings";
   state: ProjectContextDetailState;
   title: string;
   typeLabel: string;
   description?: string;
   status?: string;
+  searchTerms?: string;
 };
 
 function coordinatesForQuery(
@@ -195,23 +199,40 @@ function optionFromVisibleDetail(
   detail: ProjectContextCoordinateDetail,
 ): ProjectContextCoordinateOption {
   const coordinate = detail.coordinate;
-  const document = coordinate.type === "document";
   const stableId =
     coordinate.type === "document"
       ? coordinate.documentId
-      : coordinate.objectId;
+      : coordinate.type === "meeting"
+        ? coordinate.meetingId
+        : coordinate.objectId;
   const typeLabel =
     coordinate.type === "document"
       ? "Document"
-      : projectViewObjectTypeLabel(coordinate.objectType);
+      : coordinate.type === "meeting"
+        ? "Meeting"
+        : projectViewObjectTypeLabel(coordinate.objectType);
   return {
     coordinate,
     coordinateKey: projectContextCoordinateKey(coordinate),
-    group: document ? "documents" : "project_view",
+    group:
+      coordinate.type === "document"
+        ? "documents"
+        : coordinate.type === "meeting"
+          ? "meetings"
+          : "project_view",
     state: detail.state,
     title: detail.title?.trim() || `${typeLabel} ${shortId(stableId)}`,
     typeLabel,
-    description: detail.unavailableReason,
+    description: detail.meeting?.discussionGoal ?? detail.unavailableReason,
+    status: detail.meeting?.terminalOutcome,
+    searchTerms: detail.meeting
+      ? [
+          detail.meeting.hostPubkey,
+          ...detail.meeting.participantPreview.map(
+            (participant) => participant.pubkey,
+          ),
+        ].join(" ")
+      : undefined,
   };
 }
 
@@ -219,8 +240,8 @@ function compareOptions(
   left: ProjectContextCoordinateOption,
   right: ProjectContextCoordinateOption,
 ) {
-  const group =
-    Number(left.group === "documents") - Number(right.group === "documents");
+  const groupRank = { project_view: 0, documents: 1, meetings: 2 } as const;
+  const group = groupRank[left.group] - groupRank[right.group];
   return (
     group ||
     left.typeLabel.localeCompare(right.typeLabel, "en") ||
@@ -236,6 +257,8 @@ function compareOptions(
 export function buildProjectContextCoordinateOptions(input: {
   projectViewObjects?: Iterable<ProjectViewObject>;
   documents?: ProjectDocumentListItem[];
+  meetings?: MeetingListItem[];
+  profiles?: Record<string, UserProfileSummary>;
   visibleDetails?: ProjectContextCoordinateDetail[];
 }): ProjectContextCoordinateOption[] {
   const options = new Map<string, ProjectContextCoordinateOption>();
@@ -274,6 +297,65 @@ export function buildProjectContextCoordinateOptions(input: {
       title: document.title,
       typeLabel: "Document",
       description: document.summary,
+    };
+    options.set(option.coordinateKey, option);
+  }
+  for (const meeting of input.meetings ?? []) {
+    if (
+      meeting.compatibility !== "ready" ||
+      (meeting.lifecycle !== "closed" && meeting.lifecycle !== "aborted")
+    ) {
+      continue;
+    }
+    const coordinate = {
+      type: "meeting" as const,
+      meetingId: meeting.meetingId,
+    };
+    const profileName = (pubkey: string) =>
+      input.profiles?.[pubkey.toLowerCase()]?.displayName?.trim() ||
+      truncatePubkey(pubkey);
+    const participantNames = meeting.participantPreview.map((participant) =>
+      profileName(participant.pubkey),
+    );
+    const remaining = Math.max(
+      0,
+      (meeting.participantCount ?? participantNames.length) -
+        participantNames.length,
+    );
+    const participantSummary = [
+      ...participantNames,
+      remaining > 0 ? `+${remaining}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const option: ProjectContextCoordinateOption = {
+      coordinate,
+      coordinateKey: projectContextCoordinateKey(coordinate),
+      group: "meetings",
+      state: "terminal",
+      title: meeting.title,
+      typeLabel: "Meeting",
+      description:
+        meeting.description ||
+        (participantSummary
+          ? `Participants: ${participantSummary}`
+          : undefined),
+      status: `${meeting.lifecycle === "closed" ? "Closed" : "Aborted"}${
+        meeting.endedAt
+          ? ` · ${new Date(meeting.endedAt * 1_000).toLocaleString()}`
+          : ""
+      }`,
+      searchTerms: [
+        meeting.hostPubkey,
+        meeting.hostPubkey ? profileName(meeting.hostPubkey) : undefined,
+        participantSummary,
+        ...meeting.participantPreview.flatMap((participant) => [
+          participant.pubkey,
+          profileName(participant.pubkey),
+        ]),
+      ]
+        .filter(Boolean)
+        .join(" "),
     };
     options.set(option.coordinateKey, option);
   }

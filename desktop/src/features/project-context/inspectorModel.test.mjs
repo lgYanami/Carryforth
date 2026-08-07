@@ -42,6 +42,7 @@ function result() {
       catalogRevision: 5,
       projectionGeneration: 4,
     },
+    meetingObservations: [],
     edges: [
       {
         edgeKey: "2".repeat(64),

@@ -36,6 +36,8 @@ mod model;
 pub use model::*;
 mod project_view_hydration;
 use project_view_hydration::hydrate_project_view;
+mod meeting_hydration;
+use meeting_hydration::hydrate_meetings;
 
 const QUERY_PAGE_SIZE: u16 = 500;
 const QUERY_SNAPSHOT_ATTEMPTS: usize = 3;
@@ -182,6 +184,9 @@ fn domain_coordinate(coordinate: ProjectContextCoordinateDto) -> ProjectContextC
         ProjectContextCoordinateDto::Document { document_id } => {
             ProjectContextCoordinate::Document { document_id }
         }
+        ProjectContextCoordinateDto::Meeting { meeting_id } => {
+            ProjectContextCoordinate::Meeting { meeting_id }
+        }
     }
 }
 
@@ -199,6 +204,9 @@ fn coordinate_dto(coordinate: &ProjectContextCoordinate) -> ProjectContextCoordi
                 document_id: *document_id,
             }
         }
+        ProjectContextCoordinate::Meeting { meeting_id } => ProjectContextCoordinateDto::Meeting {
+            meeting_id: *meeting_id,
+        },
     }
 }
 
@@ -210,6 +218,9 @@ fn coordinate_key(coordinate: &ProjectContextCoordinate) -> String {
         } => format!("{}:{object_id}", object_type.as_str()),
         ProjectContextCoordinate::Document { document_id } => {
             format!("document:{document_id}")
+        }
+        ProjectContextCoordinate::Meeting { meeting_id } => {
+            format!("meeting:{meeting_id}")
         }
     }
 }
@@ -554,6 +565,16 @@ async fn build_result(
         })
         .cloned()
         .collect::<BTreeSet<_>>();
+    let meeting_coordinates = requested_coordinates
+        .iter()
+        .filter(|coordinate| matches!(coordinate, ProjectContextCoordinate::Meeting { .. }))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let required_meeting_coordinates = edge_coordinates
+        .iter()
+        .filter(|coordinate| matches!(coordinate, ProjectContextCoordinate::Meeting { .. }))
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     let project_view = hydrate_project_view(
         state,
@@ -564,6 +585,13 @@ async fn build_result(
     )
     .await?;
     let documents = hydrate_documents(state, context, project_id, &document_ids).await?;
+    let meetings = hydrate_meetings(
+        state,
+        context,
+        &meeting_coordinates,
+        &required_meeting_coordinates,
+    )
+    .await;
     validate_context_documents_active(&context_document_ids, &documents.documents)?;
 
     let mut coordinate_details = Vec::with_capacity(requested_coordinates.len());
@@ -577,6 +605,11 @@ async fn build_result(
             ProjectContextCoordinate::Document { document_id } => {
                 document_coordinate_detail(&coordinate, documents.documents.get(document_id))
             }
+            ProjectContextCoordinate::Meeting { .. } => meetings
+                .coordinates
+                .get(&coordinate)
+                .cloned()
+                .unwrap_or_else(|| unavailable_coordinate(&coordinate)),
         };
         coordinate_details.push(detail);
     }
@@ -610,6 +643,7 @@ async fn build_result(
         query: query.to_dto(),
         project_view_observation: project_view.observation,
         document_observation: documents.observation,
+        meeting_observations: meetings.observations,
         edges,
         coordinate_details,
         document_details,
@@ -858,6 +892,7 @@ fn document_coordinate_detail(
             status: None,
             object_revision: None,
             document_revision: Some(*document_revision),
+            meeting: None,
             updated_at: Some(*updated_at),
             updated_by: Some(updated_by.to_hex()),
             unavailable_reason: None,
@@ -874,6 +909,7 @@ fn document_coordinate_detail(
             status: None,
             object_revision: None,
             document_revision: Some(*document_revision),
+            meeting: None,
             updated_at: Some(*deleted_at),
             updated_by: Some(deleted_by.to_hex()),
             unavailable_reason: None,
@@ -891,6 +927,7 @@ fn unavailable_coordinate(coordinate: &ProjectContextCoordinate) -> ProjectConte
         status: None,
         object_revision: None,
         document_revision: None,
+        meeting: None,
         updated_at: None,
         updated_by: None,
         unavailable_reason: Some("metadata_unavailable"),

@@ -11,6 +11,7 @@ import {
   Layers3,
   PackageOpen,
   Route,
+  Speech,
   UsersRound,
 } from "lucide-react";
 import type { CSSProperties } from "react";
@@ -34,6 +35,7 @@ const OBJECT_ICONS: Record<string, LucideIcon> = {
 
 function coordinateIcon(data: ProjectContextCoordinateFlowNode["data"]) {
   if (data.coordinate.coordinate?.type === "document") return FileText;
+  if (data.coordinate.coordinate?.type === "meeting") return Speech;
   return data.coordinate.objectType
     ? (OBJECT_ICONS[data.coordinate.objectType] ?? CircleDot)
     : CircleDot;

@@ -5,6 +5,7 @@ import type {
   ProjectContextQuery,
   ProjectContextQueryResult,
 } from "../../src/shared/api/tauriProjectContext";
+import type { MeetingSnapshot } from "../../src/shared/api/tauriMeetings";
 import type {
   ProjectDocument,
   ProjectDocumentMeta,
@@ -20,7 +21,7 @@ import {
 } from "../../src/shared/constants/kinds";
 import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { waitForAnimations } from "../helpers/animations";
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 const PROJECT_ID = "10000000-0000-4000-8000-000000000001";
 const REQUIREMENT_ID = "20000000-0000-4000-8000-000000000001";
@@ -33,6 +34,7 @@ const CONTEXT_DOCUMENT_A_ID = "40000000-0000-4000-8000-000000000002";
 const CONTEXT_DOCUMENT_B_ID = "40000000-0000-4000-8000-000000000003";
 const CONTEXT_DOCUMENT_C_ID = "40000000-0000-4000-8000-000000000004";
 const CONTEXT_DOCUMENT_D_ID = "40000000-0000-4000-8000-000000000005";
+const MEETING_ID = "50000000-0000-4000-8000-000000000001";
 const RELAY = "b".repeat(64);
 const ACTOR = "a".repeat(64);
 const COMMUNITY_A = {
@@ -100,6 +102,7 @@ function contextResult(input?: {
       updatedAt: "2026-08-06T08:00:00Z",
       metaEventId: "e".repeat(64),
     },
+    meetingObservations: [],
     edges,
     coordinateDetails: edgeCount
       ? [
@@ -173,6 +176,147 @@ function contextResult(input?: {
             : []),
         ]
       : [],
+  };
+}
+
+function terminalMeetingSnapshot(): MeetingSnapshot {
+  return {
+    meetingId: MEETING_ID,
+    title: "Memory boundary review",
+    description: "Agree the first durable Agent memory slice.",
+    sourceChannelId: null,
+    schemaVersion: 3,
+    policy: "moderated-board-actions-v3",
+    hostPubkey: TEST_IDENTITIES.alice.pubkey,
+    moderatorPubkey: TEST_IDENTITIES.alice.pubkey,
+    createEventId: "5".repeat(64),
+    createdAt: 1_786_054_800,
+    lifecycle: "closed",
+    phase: "ended",
+    stateRevision: 64,
+    floorRevision: 12,
+    intentRevision: 4,
+    speechRevision: 6,
+    currentSpeakerPubkey: null,
+    currentOfferPubkey: null,
+    floor: null,
+    host: null,
+    participants: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        participantType: "human",
+        channelRole: "admin",
+      },
+      {
+        pubkey: TEST_IDENTITIES.charlie.pubkey,
+        participantType: "agent",
+        channelRole: "member",
+      },
+    ],
+    board: {
+      eventId: "6".repeat(64),
+      format: "markdown",
+      body: "# Private to the Meeting route\nThis must not render in Context.",
+      moderatorPubkey: TEST_IDENTITIES.alice.pubkey,
+      updatedAt: 1_786_055_350,
+      source: "projection",
+    },
+    action: {
+      actionRunId: "51000000-0000-4000-8000-000000000001",
+      boardEventId: "6".repeat(64),
+      actionWindowEpoch: 2,
+      condition: "recorded",
+      terminalStatus: "completed_closed",
+      completionEventId: "7".repeat(64),
+      actionDeadlineAtMs: null,
+      progressSeq: 3,
+      lastProgressStage: "recorded",
+      lastProgressAtMs: 1_786_055_380_000,
+      operatorHardDeadlineMs: null,
+      createdAtMs: 1_786_055_300_000,
+      lastErrorCode: null,
+    },
+    end: {
+      eventId: "8".repeat(64),
+      outcome: "closed",
+      reasonCode: null,
+      reason: null,
+      endedBy: TEST_IDENTITIES.alice.pubkey,
+      endedAt: 1_786_055_400,
+      actionsAttested: true,
+      terminationSource: "host",
+    },
+    latestSpeechAt: 1_786_055_300,
+  };
+}
+
+function meetingContextResult(): ProjectContextQueryResult {
+  const base = contextResult();
+  return {
+    ...base,
+    meetingObservations: [
+      {
+        meetingId: MEETING_ID,
+        state: "observed",
+        stateRevision: 64,
+        createEventId: "5".repeat(64),
+        stateEventId: "9".repeat(64),
+        endEventId: "8".repeat(64),
+        updatedAt: "2026-08-07T22:30:00Z",
+      },
+    ],
+    edges: [
+      {
+        edgeKey: "3".repeat(64),
+        coordinateKeys: [
+          `requirement:${REQUIREMENT_ID}`,
+          `meeting:${MEETING_ID}`,
+        ],
+        contextDocumentIds: [CONTEXT_DOCUMENT_A_ID],
+      },
+    ],
+    coordinateDetails: [
+      {
+        coordinateKey: `requirement:${REQUIREMENT_ID}`,
+        coordinate: {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId: REQUIREMENT_ID,
+        },
+        state: "active",
+        title: "Durable memory boundary",
+      },
+      {
+        coordinateKey: `meeting:${MEETING_ID}`,
+        coordinate: { type: "meeting", meetingId: MEETING_ID },
+        state: "terminal",
+        title: "Memory boundary review",
+        status: "closed",
+        meeting: {
+          discussionGoal: "Agree the first durable Agent memory slice.",
+          terminalOutcome: "closed",
+          hostPubkey: TEST_IDENTITIES.alice.pubkey,
+          participantCount: 2,
+          participantPreview: [
+            {
+              pubkey: TEST_IDENTITIES.alice.pubkey,
+              participantType: "human",
+            },
+            {
+              pubkey: TEST_IDENTITIES.charlie.pubkey,
+              participantType: "agent",
+            },
+          ],
+          createdAt: "2026-08-07T22:20:00Z",
+          endedAt: "2026-08-07T22:30:00Z",
+          actionFinalization: {
+            condition: "recorded",
+            terminalStatus: "completed_closed",
+            actionsAttested: true,
+          },
+        },
+      },
+    ],
   };
 }
 
@@ -830,6 +974,52 @@ test("Project View Coordinate Inspector is read-only, responsive, and restores g
   await expect(page).not.toHaveURL(/selected=/);
   await expect(requirementNode.locator("button")).toBeFocused();
   expect(await documentBodyCalls(page)).toHaveLength(0);
+});
+
+test("Meeting Coordinate stays metadata-first and opens the Community-readable Meeting route", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetings: [
+      {
+        id: MEETING_ID,
+        title: "Memory boundary review",
+        result: { status: "ready", snapshot: terminalMeetingSnapshot() },
+        speeches: [],
+        activities: [],
+      },
+    ],
+    projectContext: meetingContextResult(),
+  });
+  await openProjectContext(page);
+
+  await page
+    .getByTestId(`project-context-coordinate-meeting:${MEETING_ID}`)
+    .click();
+  const inspector = page.getByTestId("project-context-inspector");
+  const meeting = inspector.getByTestId("project-context-meeting-detail");
+  await expect(meeting).toBeVisible();
+  await expect(meeting).toContainText("Memory boundary review");
+  await expect(meeting).toContainText(
+    "Agree the first durable Agent memory slice.",
+  );
+  await expect(meeting).toContainText("completed_closed");
+  await expect(meeting).not.toContainText("Private to the Meeting route");
+  await expect(page).toHaveURL(/selected=coordinate/);
+
+  await meeting.getByTestId("project-context-open-meeting").click();
+  await expect(page).toHaveURL(new RegExp(`/channels/${MEETING_ID}$`));
+  await page.getByTestId("meeting-history-trigger").click();
+  await expect(
+    page.getByTestId(`meeting-history-row-${MEETING_ID}`),
+  ).toContainText("Closed · Observer");
+  await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
+  await expect(page.getByTestId("meeting-host-console")).toHaveCount(0);
+  await expect(page.getByTestId("meeting-agent-activity-row")).toHaveCount(0);
+
+  await page.goBack();
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await expect(page).toHaveURL(/selected=coordinate/);
 });
 
 test("Document Coordinate lazily reads current Markdown and returns from Documents", async ({
