@@ -112,7 +112,7 @@ async fn audit(db: &Db, community: &str) -> Result<()> {
     let audit = db
         .audit_legacy_meeting_visibility(community_id)
         .await
-        .context("audit legacy Meeting visibility")?;
+        .map_err(|error| anyhow::anyhow!("audit legacy Meeting visibility: {error}"))?;
     println!(
         "{}",
         serde_json::to_string_pretty(&audit_json(&host, &audit))?
@@ -132,7 +132,7 @@ async fn approve(
     let audit = db
         .approve_legacy_meeting_visibility(community_id, watermark, &digest, approved_by)
         .await
-        .context("approve legacy Meeting visibility")?;
+        .map_err(|error| anyhow::anyhow!("approve legacy Meeting visibility: {error}"))?;
     let status = db
         .meeting_community_read_status(community_id)
         .await?
@@ -152,7 +152,7 @@ async fn enable(db: &Db, community: &str) -> Result<()> {
     let status = db
         .enable_meeting_community_read(community_id)
         .await
-        .context("publish Meeting Community-read contract")?;
+        .map_err(|error| anyhow::anyhow!("publish Meeting Community-read contract: {error}"))?;
     println!("{}", serde_json::to_string_pretty(&status_json(&status))?);
     Ok(())
 }

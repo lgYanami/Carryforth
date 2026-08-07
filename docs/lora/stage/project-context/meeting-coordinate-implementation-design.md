@@ -1,6 +1,6 @@
 # Meeting 作为 Project Context 坐标与 Community 可见性实现设计
 
-> 状态：产品与技术边界已确认，分阶段实现中；阶段 1～4 已完成并通过实现审查
+> 状态：已完成；阶段 1～5 均已实现、复核并分阶段提交，真实数据库完成非破坏切换
 >
 > 日期：2026-08-07
 >
@@ -1019,6 +1019,11 @@ schema migration、数据删除或隐式 source 修改。
 
 ### 阶段 5：非破坏迁移与真实验收
 
+> 交付状态：已完成。Meeting Community-read 使用持久化 host-scoped 审计/批准状态和部署总开关共同
+> 决定有效读合同；所有 Relay 读面、live fan-out、NIP-11、readiness 与 Project Context v2 使用同一
+> fail-closed gate。operator CLI 提供 `status / pause-create / resume-create / audit / approve / enable`，
+> 已发布合同没有 disable 或隐式回滚入口。迁移 `0051～0053` 均为追加式，不重建或删除业务数据。
+
 - 全量 legacy visibility audit、watermark 与 source 风险报告；
 - schema 2 reprojection；
 - capability 原子启用；
@@ -1026,6 +1031,31 @@ schema migration、数据删除或隐式 source 修改。
 - 数据前后对账与长期运行日志。
 
 完成标准：真实 Community 数据完整，v2 与 Meeting read capabilities ready，端到端验收通过。
+
+### 17.1 真实环境切换记录（2026-08-08）
+
+目标 Community：`localhost:3000`（`28c75f0f-670a-4dd8-a66d-17d093616c16`）。切换过程先暂停
+Meeting Create，并确认没有 active Meeting；完整 legacy corpus 包含 10 场终态 Meeting，watermark 为
+10，审计 digest 为
+`ef3e086ed5e57e174359f432725bf9ff76fb9166d4003ec4cf8e7633ddec0953`。source 风险报告为
+`community_wide=0 / private=0 / missing=10`；这里的 `missing` 表示旧会议缺少可用普通 source Channel
+深链，不表示 Meeting、Board 或 Speech 缺失，也不阻止已确认的 Community-read 发布。
+
+批准后 Relay 在同一事务重新计算完整 digest，发布 Community-read 合同并恢复 Meeting Create。随后
+Project Context 从 schema 1 / projection generation 1 重投影到 schema 2 / generation 2，保持
+`context_revision=14`、11 个 Edge、12 个 binding 和全部旧 Edge key；完整性验证结果为 projection parity
+通过、orphan projection 0、pointer mismatch 0。
+
+数据前后对账：Community 14、Channel 12、Meeting 10、Project View object 27、Document 15、Context
+Edge 11、Context binding 12，全部保持不变。Event 从 1226 增加到 1239，新增的 13 条恰好是 12 个
+binding current head 与 1 个 metadata head 的 schema 2 重投影事件，不是业务状态重写。
+
+新 Relay 启动后同时公告 `buzz-meeting-community-read-v1` 与 `buzz-project-context-edge-v2`，readiness
+为 ready。真实 managed Agent 能读取全部 10 场终态 Meeting 和 11 个 Context Edge；临时 Community 外
+身份对 Meeting list 只观察到空集合。`meeting:<uuid>` typed query 在无既有关联时返回零 Edge 且不产生
+写入，证明协议与 CLI 已切到 v2。Desktop 使用同一 capability 和 Community query boundary；Project
+Context 的 29 条 E2E 均通过，其中 Meeting metadata-first inspector、详情跳转、查询历史与无额外读取约束
+均已覆盖，现可由 Human 进行产品验收。
 
 ## 18. 最终验收标准
 

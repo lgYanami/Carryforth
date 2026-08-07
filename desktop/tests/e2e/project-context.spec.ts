@@ -1373,10 +1373,8 @@ test("Query Bar keeps a draft until Run and URL history restores query and selec
     .click();
   await expect(page).toHaveURL(/selected=coordinate/);
   expect(
-    await page.evaluate(
-      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length,
-    ),
-  ).toBe(0);
+    await page.evaluate(() => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ ?? []),
+  ).toEqual([]);
 
   await page.goBack();
   await expect(page).not.toHaveURL(/selected=/);

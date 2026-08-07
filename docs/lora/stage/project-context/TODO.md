@@ -1,10 +1,10 @@
 # Project Context 后续 TODO
 
-> 状态：方案已确认，待按 [Meeting Coordinate 实现设计](./meeting-coordinate-implementation-design.md) 交付
+> 状态：已按 [Meeting Coordinate 实现设计](./meeting-coordinate-implementation-design.md) 完成交付；本文保留为决策来源与验收索引
 >
 > 日期：2026-08-07
 
-## 1. 将终态 Meeting 作为 Project Context 坐标
+## 1. 将终态 Meeting 作为 Project Context 坐标（已完成）
 
 ### 背景
 
@@ -66,7 +66,7 @@ live fan-out、Meeting directory、Board/Speech point read 与 Desktop 都必须
 迁移完成前，不得把按旧合同产生的 legacy Speech 全文直接复制到 Community-wide Document；写入者必须
 先整理出适合目标可见范围的内容。
 
-### 后续交付条件
+### 已完成的交付条件
 
 1. 定义 Meeting Coordinate 的 wire、canonical ordering、Edge key variant byte 与 CLI token；
 2. 将 Meeting read authorization 迁移为 Community member，并保持 roster action authorization；
@@ -77,8 +77,9 @@ live fan-out、Meeting directory、Board/Speech point read 与 Desktop 都必须
    非 member 无侧信道；
 7. 验证现有 Project View / Document 坐标、Edge key、Context Revision 和三类集合查询语义不变。
 
-### 当前决定
+### 最终决定
 
-Project Context Edge v1 不原地扩展 closed union；下一版完整升级到 schema/capability v2，并加入终态
-Meeting Coordinate。Meeting 使用追加 family rank `0x02`，既有 Project View / Document-only Edge key
-保持不变。实现完成前继续使用 Project Document 承接经过整理的会议结论和来源说明。
+Project Context Edge v1 没有原地扩展 closed union；当前版本已完整升级到 schema/capability v2，并加入
+终态 Meeting Coordinate。Meeting 使用追加 family rank `0x02`，既有 Project View / Document-only
+Edge key 保持不变。Project Document 继续承接经过整理的会议结论和来源说明，Meeting 则作为可跳转、
+按需读取的来源证据坐标。

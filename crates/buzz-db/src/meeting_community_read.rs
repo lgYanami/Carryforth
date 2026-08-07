@@ -532,11 +532,11 @@ async fn compute_legacy_audit_tx(
                           AND round.session_id = session.session_id \
                           AND round.speech_event_id IS NOT NULL \
                         UNION \
-                        SELECT grant.speech_event_id \
-                        FROM meeting_baton_grants grant \
-                        WHERE grant.community_id = session.community_id \
-                          AND grant.session_id = session.session_id \
-                          AND grant.speech_event_id IS NOT NULL \
+                        SELECT baton_grant.speech_event_id \
+                        FROM meeting_baton_grants baton_grant \
+                        WHERE baton_grant.community_id = session.community_id \
+                          AND baton_grant.session_id = session.session_id \
+                          AND baton_grant.speech_event_id IS NOT NULL \
                     ) accepted ORDER BY accepted.speech_event_id \
                 ) AS speech_event_ids, \
                 action.action_run_id AS terminal_action_run_id, \

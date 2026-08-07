@@ -251,11 +251,23 @@ export function useProjectContextLiveSync(
           return;
         }
         disposeSubscription = dispose;
+
+        // Close every observation-to-subscription race before advertising the
+        // screen as Live. Future projection hints still use the coalescing
+        // scheduler, but this first catch-up must be awaitable so it cannot
+        // arrive after an unrelated route-only selection change.
+        try {
+          await invalidate(
+            new Set(["context", "project_view", "document_catalog"]),
+          );
+        } catch (error) {
+          disposeSubscription = undefined;
+          await dispose().catch(() => {});
+          throw error;
+        }
+        if (cancelled) return;
         retryAttempt = 0;
         setStatus("live");
-
-        // Revalidate after subscription to close every observation→live race.
-        scheduler.signal(["context", "project_view", "document_catalog"]);
       } catch (error) {
         if (cancelled) return;
         console.error(
