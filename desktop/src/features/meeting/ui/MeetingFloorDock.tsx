@@ -2,6 +2,11 @@ import * as React from "react";
 import { AlertTriangle, ClipboardCopy, Hand, Loader2 } from "lucide-react";
 
 import { useMeetingFloorActionMutation } from "@/features/meeting/hooks";
+import {
+  clearMeetingPendingCommand,
+  readMeetingPendingCommand,
+  writeMeetingPendingCommand,
+} from "@/features/meeting/meetingPendingCommandStore";
 import type { MeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
 import { useMeetingActionFinalizationController } from "@/features/meeting/useMeetingActionFinalizationController";
 import { useMeetingHostActionController } from "@/features/meeting/useMeetingHostActionController";
@@ -43,7 +48,9 @@ type MeetingFloorDockProps = {
   abortDialogOpen: boolean;
   authorityAvailable: boolean;
   boardDraft: MeetingBoardDraft;
+  commandScopeKey: string;
   currentPubkey?: string;
+  actionRenewalError: string | null;
   grantRenewalError: string | null;
   onAbortDialogOpenChange: (open: boolean) => void;
   onRefresh: () => void;
@@ -77,7 +84,9 @@ export function MeetingFloorDock({
   abortDialogOpen,
   authorityAvailable,
   boardDraft,
+  commandScopeKey,
   currentPubkey,
+  actionRenewalError,
   grantRenewalError,
   onAbortDialogOpenChange,
   onRefresh,
@@ -105,8 +114,25 @@ export function MeetingFloorDock({
     activeOffer?.targetPubkey === normalizedPubkey ? activeOffer : null;
   const ownGrant =
     activeGrant?.holderPubkey === normalizedPubkey ? activeGrant : null;
-  const [unresolved, setUnresolved] =
-    React.useState<MeetingFloorActionInput | null>(null);
+  const [unresolved, setUnresolvedState] =
+    React.useState<MeetingFloorActionInput | null>(() =>
+      readMeetingPendingCommand<MeetingFloorActionInput>(
+        commandScopeKey,
+        "floor",
+        snapshot.meetingId,
+      ),
+    );
+  const setUnresolved = React.useCallback(
+    (value: MeetingFloorActionInput | null) => {
+      setUnresolvedState(value);
+      if (value) {
+        writeMeetingPendingCommand(commandScopeKey, "floor", value);
+      } else {
+        clearMeetingPendingCommand(commandScopeKey, "floor");
+      }
+    },
+    [commandScopeKey],
+  );
   const [draft, setDraft] = React.useState<MeetingSpeechDraft>(EMPTY_DRAFT);
   const [draftGrantId, setDraftGrantId] = React.useState<string | null>(
     ownGrant?.grantId ?? null,
@@ -114,9 +140,13 @@ export function MeetingFloorDock({
   const [staleDraft, setStaleDraft] = React.useState<StaleDraft | null>(null);
   const hostController = useMeetingHostActionController({
     onBoardAccepted: boardDraft.markAccepted,
+    scopeKey: commandScopeKey,
     snapshot,
   });
-  const actionController = useMeetingActionFinalizationController(snapshot);
+  const actionController = useMeetingActionFinalizationController({
+    scopeKey: commandScopeKey,
+    snapshot,
+  });
 
   React.useEffect(() => {
     const currentGrantId = ownGrant?.grantId ?? null;
@@ -146,7 +176,7 @@ export function MeetingFloorDock({
       }
       return result;
     },
-    [draftGrantId],
+    [draftGrantId, setUnresolved],
   );
 
   const submit = React.useCallback(
@@ -194,7 +224,7 @@ export function MeetingFloorDock({
         setUnresolved(null);
       }
     }
-  }, [handleResult, mutateAsync, resetMutation, unresolved]);
+  }, [handleResult, mutateAsync, resetMutation, setUnresolved, unresolved]);
 
   const disabled =
     !authorityAvailable ||
@@ -443,6 +473,7 @@ export function MeetingFloorDock({
             hostController={renderedHostController}
             onRefresh={onRefresh}
             profiles={profiles}
+            renewalError={actionRenewalError}
             snapshot={snapshot}
           />
         ) : (

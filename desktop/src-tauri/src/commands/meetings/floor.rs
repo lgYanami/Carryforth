@@ -45,7 +45,12 @@ pub struct MeetingFloorActionInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 enum MeetingFloorAction {
     Request,
     Withdraw,
@@ -132,7 +137,11 @@ impl From<HandoffTypeInput> for MeetingV1HandoffType {
 
 /// Result of one Human Meeting Floor command.
 #[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum MeetingFloorActionResult {
     Accepted {
         meeting_id: String,
@@ -685,6 +694,89 @@ mod tests {
             action,
             fingerprint: "fingerprint".to_string(),
         }
+    }
+
+    fn desktop_floor_input(action: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "submissionId": "00000000-0000-4000-8000-000000000002",
+            "meetingId": MEETING_ID,
+            "expectedStateEventId": "55".repeat(32),
+            "action": action,
+        })
+    }
+
+    #[test]
+    fn desktop_floor_action_contract_accepts_every_camel_case_variant() {
+        let cases = [
+            (serde_json::json!({"type": "request"}), "request"),
+            (serde_json::json!({"type": "withdraw"}), "withdraw"),
+            (serde_json::json!({"type": "offer_ack"}), "offer_ack"),
+            (
+                serde_json::json!({"type": "offer_decline", "reason": "Not ready"}),
+                "offer_decline",
+            ),
+            (
+                serde_json::json!({
+                    "type": "grant_yield",
+                    "reasonCode": "insufficient_context",
+                    "reason": "Need more evidence",
+                }),
+                "grant_yield",
+            ),
+            (
+                serde_json::json!({
+                    "type": "speech",
+                    "content": "A canonical Speech",
+                    "mentions": ["33".repeat(32)],
+                    "handoff": {
+                        "targetPubkey": "33".repeat(32),
+                        "handoffType": "information_request",
+                        "reason": "Provide the evidence",
+                    },
+                }),
+                "speech",
+            ),
+        ];
+
+        for (action, expected_name) in cases {
+            let input: MeetingFloorActionInput =
+                serde_json::from_value(desktop_floor_input(action))
+                    .unwrap_or_else(|error| panic!("deserialize {expected_name}: {error}"));
+            assert_eq!(input.action.name(), expected_name);
+        }
+
+        assert!(
+            serde_json::from_value::<MeetingFloorActionInput>(desktop_floor_input(
+                serde_json::json!({"type": "grant_yield", "reason_code": "cancelled"})
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_floor_result_contract_serializes_camel_case_fields() {
+        let accepted = serde_json::to_value(MeetingFloorActionResult::Accepted {
+            meeting_id: MEETING_ID.to_string(),
+            event_id: "77".repeat(32),
+            action: "speech".to_string(),
+            canonical_object_id: Some("88".repeat(32)),
+            state_revision: Some(9),
+            duplicate: false,
+        })
+        .unwrap_or_else(|error| panic!("serialize accepted Floor result: {error}"));
+        assert_eq!(accepted["meetingId"], MEETING_ID);
+        assert_eq!(accepted["canonicalObjectId"], "88".repeat(32));
+        assert!(accepted.get("canonical_object_id").is_none());
+
+        let indeterminate = serde_json::to_value(MeetingFloorActionResult::Indeterminate {
+            meeting_id: MEETING_ID.to_string(),
+            event_id: "99".repeat(32),
+            action: "speech".to_string(),
+            message: "retry exact Floor command".to_string(),
+        })
+        .unwrap_or_else(|error| panic!("serialize indeterminate Floor result: {error}"));
+        assert_eq!(indeterminate["eventId"], "99".repeat(32));
+        assert!(indeterminate.get("event_id").is_none());
     }
 
     #[test]

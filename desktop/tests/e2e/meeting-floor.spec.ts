@@ -401,6 +401,16 @@ test("Yield consumes the Grant and preserves a non-replayable stale draft", asyn
     "preserved",
   );
   await expect(page.getByTestId("meeting-floor-request")).toBeVisible();
+  const yieldAction = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+        .filter((entry) => entry.command === "submit_meeting_floor_action")
+        .at(-1)?.payload.input.action,
+  );
+  expect(yieldAction).toEqual({
+    type: "grant_yield",
+    reasonCode: "cancelled",
+  });
 });
 
 test("indeterminate Speech retries the exact submission and materializes once", async ({

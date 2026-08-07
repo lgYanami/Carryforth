@@ -21,6 +21,8 @@ const IDS = {
   agentHost: "40000000-0000-4000-8000-000000000006",
   preemptedDraft: "40000000-0000-4000-8000-000000000007",
   handoff: "40000000-0000-4000-8000-000000000008",
+  scopedRetryA: "40000000-0000-4000-8000-000000000009",
+  scopedRetryB: "40000000-0000-4000-8000-000000000010",
 } as const;
 
 function pendingIntent(input: {
@@ -344,6 +346,25 @@ test("Human host completes Board, self Intent, Offer, Grant, Speech and direct C
     "board_unchanged",
     "close",
   ]);
+
+  const compoundActions = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .filter((entry) => entry.command === "submit_meeting_host_action")
+      .map((entry) => entry.payload.input.action),
+  );
+  expect(
+    compoundActions.find((action) => action.type === "intent_refresh"),
+  ).toMatchObject({
+    intentId: expect.any(String),
+    addressedTo: undefined,
+  });
+  expect(
+    compoundActions.find((action) => action.type === "select_intent"),
+  ).toMatchObject({
+    intentId: expect.any(String),
+    deferralReason:
+      "Resolve the blocking conclusion before the queued verification.",
+  });
 });
 
 test("indeterminate host action retries the exact event and Abort remains explicit", async ({
@@ -384,6 +405,51 @@ test("indeterminate host action retries the exact event and Abort remains explic
     "data-meeting-lifecycle",
     "aborted",
   );
+});
+
+test("unresolved Host commands and Board drafts remain scoped to their Meeting", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetingHostIndeterminateResponses: 1,
+    meetings: [
+      meetingSeed({ id: IDS.scopedRetryA, title: "Scoped retry Alpha" }),
+      meetingSeed({ id: IDS.scopedRetryB, title: "Scoped retry Bravo" }),
+    ],
+  });
+  await openMeeting(page, IDS.scopedRetryA);
+
+  await page.getByTestId("meeting-board-editor").fill("# Alpha private draft");
+  await page.getByTestId("meeting-board-save").click();
+  await expect(page.getByTestId("meeting-host-indeterminate")).toBeVisible();
+
+  await page.getByTestId(`meeting-row-${IDS.scopedRetryB}`).click();
+  await expect(
+    page.getByRole("heading", { name: "Scoped retry Bravo" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("meeting-host-indeterminate")).toHaveCount(0);
+  await expect(page.getByTestId("meeting-board-editor")).not.toHaveValue(
+    "# Alpha private draft",
+  );
+  await expect(page.getByTestId("meeting-board-save")).toBeDisabled();
+  await page
+    .getByTestId("meeting-board-editor")
+    .fill("# Bravo independent draft");
+  await expect(page.getByTestId("meeting-board-save")).toBeEnabled();
+
+  await page.getByTestId(`meeting-row-${IDS.scopedRetryA}`).click();
+  await expect(page.getByTestId("meeting-host-indeterminate")).toBeVisible();
+  await page.getByTestId("meeting-host-retry").click();
+  await expect(page.getByTestId("meeting-host-indeterminate")).toHaveCount(0);
+
+  const inputs = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .filter((entry) => entry.command === "submit_meeting_host_action")
+      .map((entry) => entry.payload.input),
+  );
+  expect(inputs).toHaveLength(2);
+  expect(inputs[0].meetingId).toBe(IDS.scopedRetryA);
+  expect(inputs[1]).toEqual(inputs[0]);
 });
 
 test("host can reject Intent, dismiss Handoff, then select an Intent into an Offer", async ({

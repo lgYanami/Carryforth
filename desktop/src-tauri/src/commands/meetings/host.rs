@@ -19,10 +19,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     pending_writes::PendingMeetingCommand,
-    relay::{
-        parse_command_response, relay_api_base_url_with_override, submit_signed_event_at_with_keys,
-        SubmitEventResponse,
-    },
+    relay::{relay_api_base_url_with_override, submit_signed_event_at_with_keys},
 };
 
 use super::pending::{
@@ -37,6 +34,9 @@ use super::{
 #[path = "host/builders.rs"]
 mod builders;
 use builders::{build_board_action, build_end};
+#[path = "host/receipt.rs"]
+mod receipt;
+use receipt::{validate_receipt, ReceiptValidationError};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -51,7 +51,12 @@ pub struct MeetingHostActionInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 enum MeetingHostAction {
     BoardUpdate {
         body: String,
@@ -113,14 +118,6 @@ impl MeetingHostAction {
             Self::Recall { .. } => "recall",
             Self::Close => "close",
             Self::Abort { .. } => "abort",
-        }
-    }
-
-    fn receipt_kind(&self) -> ReceiptKind {
-        match self {
-            Self::BoardUpdate { .. } | Self::BoardUnchanged => ReceiptKind::Board,
-            Self::Close | Self::Abort { .. } => ReceiptKind::End,
-            _ => ReceiptKind::Control,
         }
     }
 }
@@ -190,7 +187,11 @@ impl AbortReasonInput {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 /// Verified submission outcome for one Human-host Meeting action.
 pub enum MeetingHostActionResult {
     Accepted {
@@ -209,53 +210,12 @@ pub enum MeetingHostActionResult {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ReceiptKind {
-    Control,
-    Board,
-    End,
-}
-
-#[derive(Debug, Deserialize)]
-struct ControlReceipt {
-    meeting_id: String,
-    canonical_object_id: Option<String>,
-    state_revision: Option<i64>,
-    recovery_transitions: usize,
-    duplicate: bool,
-    outcome: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BoardReceipt {
-    meeting_id: String,
-    outcome: String,
-    duplicate: bool,
-    state_revision: Option<i64>,
-    board_event_id: Option<String>,
-    recovery_transitions: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct EndReceipt {
-    meeting_id: String,
-    status: String,
-    already_ended: bool,
-    terminal_outcome: Option<String>,
-}
-
 struct ValidatedInput {
     submission_id: String,
     meeting_id: String,
     expected_control_token: String,
     action: MeetingHostAction,
     fingerprint: String,
-}
-
-struct ValidatedReceipt {
-    canonical_object_id: Option<String>,
-    state_revision: Option<i64>,
-    duplicate: bool,
 }
 
 /// Submit one Human-hosted Meeting action against a verified control window.
@@ -314,13 +274,18 @@ async fn execute_host_action(
             }
         };
 
-    let receipt = match validate_receipt(&response, &pending, validated.action.receipt_kind()) {
+    let receipt = match validate_receipt(&response, &pending, &validated.action) {
         Ok(receipt) => receipt,
-        Err(message) => {
+        Err(ReceiptValidationError::CanonicalConflict(message)) => {
+            remove_pending(state, &validated.submission_id, &pending.event);
+            return Err(message);
+        }
+        Err(error) => {
             return Ok(indeterminate_result(
                 &pending,
                 format!(
-                    "Relay accepted the Meeting host command, but its receipt could not be verified: {message}. Retry to confirm the same signed event."
+                    "Relay accepted the Meeting host command, but its receipt could not be verified: {}. Retry to confirm the same signed event.",
+                    error.message()
                 ),
             ));
         }
@@ -911,71 +876,6 @@ fn build_event(
         ),
     };
     result.map_err(|error| format!("invalid Meeting host command: {error}"))
-}
-
-fn validate_receipt(
-    response: &SubmitEventResponse,
-    pending: &PendingMeetingCommand,
-    kind: ReceiptKind,
-) -> Result<ValidatedReceipt, String> {
-    if response.event_id != pending.event.id.to_hex() {
-        return Err("event ID does not match the signed host command".to_string());
-    }
-    match kind {
-        ReceiptKind::Control => {
-            let receipt: ControlReceipt = parse_command_response(&response.message)?;
-            if receipt.meeting_id != pending.meeting_id
-                || receipt.outcome.trim().is_empty()
-                || receipt.recovery_transitions > 64
-                || receipt.state_revision.is_some_and(|revision| revision <= 0)
-            {
-                return Err("control receipt fields do not match the signed command".to_string());
-            }
-            if let Some(object_id) = &receipt.canonical_object_id {
-                canonical_hex64(object_id, "canonical Meeting host object")?;
-            }
-            Ok(ValidatedReceipt {
-                canonical_object_id: receipt.canonical_object_id,
-                state_revision: receipt.state_revision,
-                duplicate: receipt.duplicate,
-            })
-        }
-        ReceiptKind::Board => {
-            let receipt: BoardReceipt = parse_command_response(&response.message)?;
-            if receipt.meeting_id != pending.meeting_id
-                || receipt.outcome.trim().is_empty()
-                || receipt.recovery_transitions > 1
-                || receipt.state_revision.is_some_and(|revision| revision <= 0)
-            {
-                return Err("Board receipt fields do not match the signed command".to_string());
-            }
-            if let Some(board_event_id) = &receipt.board_event_id {
-                canonical_hex64(board_event_id, "Meeting Board projection")?;
-            }
-            Ok(ValidatedReceipt {
-                canonical_object_id: receipt.board_event_id,
-                state_revision: receipt.state_revision,
-                duplicate: receipt.duplicate,
-            })
-        }
-        ReceiptKind::End => {
-            let receipt: EndReceipt = parse_command_response(&response.message)?;
-            if receipt.meeting_id != pending.meeting_id
-                || receipt.status != "ended"
-                || !matches!(
-                    receipt.terminal_outcome.as_deref(),
-                    Some("closed" | "aborted")
-                )
-            {
-                return Err("End receipt fields do not match the signed command".to_string());
-            }
-            Ok(ValidatedReceipt {
-                canonical_object_id: None,
-                state_revision: None,
-                duplicate: receipt.already_ended,
-            })
-        }
-    }
 }
 
 fn indeterminate_result(

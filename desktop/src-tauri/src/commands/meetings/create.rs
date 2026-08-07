@@ -42,7 +42,11 @@ pub struct CreateMeetingInput {
 
 /// Result of publishing a Human-authored Meeting Create.
 #[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum CreateMeetingResult {
     /// Relay accepted the exact signed Create command.
     Accepted {
@@ -465,6 +469,50 @@ mod tests {
             participant_pubkeys: vec![participant.public_key().to_hex()],
             initial_board: "# Goal\n\nAgree on delivery.\n\n## Agenda\n\n- Review".to_string(),
         }
+    }
+
+    #[test]
+    fn desktop_create_contract_uses_camel_case_fields() {
+        let participant = Keys::generate().public_key().to_hex();
+        let input: CreateMeetingInput = serde_json::from_value(serde_json::json!({
+            "submissionId": "30000000-0000-4000-8000-000000000001",
+            "title": "Desktop lifecycle review",
+            "description": "Agree on delivery",
+            "sourceChannelId": "30000000-0000-4000-8000-000000000002",
+            "participantPubkeys": [participant],
+            "initialBoard": "# Goal\n\nAgree on delivery."
+        }))
+        .unwrap_or_else(|error| panic!("deserialize Desktop Create payload: {error}"));
+        assert_eq!(
+            input.source_channel_id.as_deref(),
+            Some("30000000-0000-4000-8000-000000000002")
+        );
+        assert_eq!(input.participant_pubkeys.len(), 1);
+
+        let accepted = serde_json::to_value(CreateMeetingResult::Accepted {
+            meeting_id: "30000000-0000-4000-8000-000000000003".to_string(),
+            event_id: "ab".repeat(32),
+            host_pubkey: "cd".repeat(32),
+            participant_pubkeys: vec!["ef".repeat(32)],
+            title: "Desktop lifecycle review".to_string(),
+        })
+        .unwrap_or_else(|error| panic!("serialize accepted Create result: {error}"));
+        assert_eq!(
+            accepted["meetingId"],
+            "30000000-0000-4000-8000-000000000003"
+        );
+        assert_eq!(accepted["hostPubkey"], "cd".repeat(32));
+        assert!(accepted.get("participantPubkeys").is_some());
+        assert!(accepted.get("meeting_id").is_none());
+
+        let indeterminate = serde_json::to_value(CreateMeetingResult::Indeterminate {
+            meeting_id: "30000000-0000-4000-8000-000000000003".to_string(),
+            event_id: "ab".repeat(32),
+            message: "retry exact Create".to_string(),
+        })
+        .unwrap_or_else(|error| panic!("serialize indeterminate Create result: {error}"));
+        assert_eq!(indeterminate["eventId"], "ab".repeat(32));
+        assert!(indeterminate.get("event_id").is_none());
     }
 
     #[test]

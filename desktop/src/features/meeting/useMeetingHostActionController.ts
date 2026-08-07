@@ -1,6 +1,11 @@
 import * as React from "react";
 
 import { useMeetingHostActionMutation } from "@/features/meeting/hooks";
+import {
+  clearMeetingPendingCommand,
+  readMeetingPendingCommand,
+  writeMeetingPendingCommand,
+} from "@/features/meeting/meetingPendingCommandStore";
 import type {
   MeetingHostAction,
   MeetingHostActionInput,
@@ -22,13 +27,31 @@ export type MeetingHostActionController = {
 
 export function useMeetingHostActionController(input: {
   onBoardAccepted: () => void;
+  scopeKey: string;
   snapshot: MeetingSnapshot;
 }): MeetingHostActionController {
-  const { onBoardAccepted, snapshot } = input;
+  const { onBoardAccepted, scopeKey, snapshot } = input;
   const mutation = useMeetingHostActionMutation(snapshot.meetingId);
   const { error, isPending, mutateAsync, reset } = mutation;
-  const [unresolved, setUnresolved] =
-    React.useState<MeetingHostActionInput | null>(null);
+  const [unresolved, setUnresolvedState] =
+    React.useState<MeetingHostActionInput | null>(() =>
+      readMeetingPendingCommand<MeetingHostActionInput>(
+        scopeKey,
+        "host",
+        snapshot.meetingId,
+      ),
+    );
+  const setUnresolved = React.useCallback(
+    (value: MeetingHostActionInput | null) => {
+      setUnresolvedState(value);
+      if (value) {
+        writeMeetingPendingCommand(scopeKey, "host", value);
+      } else {
+        clearMeetingPendingCommand(scopeKey, "host");
+      }
+    },
+    [scopeKey],
+  );
 
   const handleResult = React.useCallback(
     (
@@ -48,7 +71,7 @@ export function useMeetingHostActionController(input: {
       }
       return result;
     },
-    [onBoardAccepted],
+    [onBoardAccepted, setUnresolved],
   );
 
   const submit = React.useCallback(
@@ -95,7 +118,7 @@ export function useMeetingHostActionController(input: {
         setUnresolved(null);
       }
     }
-  }, [handleResult, mutateAsync, reset, unresolved]);
+  }, [handleResult, mutateAsync, reset, setUnresolved, unresolved]);
 
   return {
     disabled: isPending || unresolved !== null,

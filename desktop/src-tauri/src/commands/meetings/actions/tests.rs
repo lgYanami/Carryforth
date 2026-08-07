@@ -213,6 +213,135 @@ fn has_tag(event: &nostr::Event, key: &str, value: &str) -> bool {
     })
 }
 
+fn desktop_action_input(action: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "submissionId": "00000000-0000-4000-8000-000000000010",
+        "meetingId": MEETING_ID,
+        "expectedControlToken": object_id(2),
+        "action": action,
+    })
+}
+
+#[test]
+fn desktop_action_contract_accepts_every_camel_case_variant() {
+    let cases = [
+        (serde_json::json!({"type": "begin"}), "begin"),
+        (
+            serde_json::json!({
+                "type": "block",
+                "reasonCode": "external_state_conflict",
+                "reason": "Project state changed",
+            }),
+            "block",
+        ),
+        (serde_json::json!({"type": "retry"}), "retry"),
+        (
+            serde_json::json!({"type": "return_to_board"}),
+            "return_to_board",
+        ),
+        (serde_json::json!({"type": "confirm"}), "confirm"),
+    ];
+
+    for (action, expected_name) in cases {
+        let input: MeetingActionFinalizationInput =
+            serde_json::from_value(desktop_action_input(action))
+                .unwrap_or_else(|error| panic!("deserialize {expected_name}: {error}"));
+        assert_eq!(input.action.name(), expected_name);
+    }
+
+    assert!(
+        serde_json::from_value::<MeetingActionFinalizationInput>(desktop_action_input(
+            serde_json::json!({"type": "block", "reason_code": "provider_failure"})
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn desktop_action_result_contract_serializes_camel_case_fields() {
+    let accepted = serde_json::to_value(MeetingActionFinalizationResult::Accepted {
+        meeting_id: MEETING_ID.to_string(),
+        event_id: object_id(40),
+        action: "confirm".to_string(),
+        state_revision: Some(22),
+        duplicate: false,
+    })
+    .unwrap_or_else(|error| panic!("serialize accepted Action result: {error}"));
+    assert_eq!(accepted["meetingId"], MEETING_ID);
+    assert_eq!(accepted["stateRevision"], 22);
+    assert!(accepted.get("state_revision").is_none());
+
+    let indeterminate = serde_json::to_value(MeetingActionFinalizationResult::Indeterminate {
+        meeting_id: MEETING_ID.to_string(),
+        event_id: object_id(41),
+        action: "confirm".to_string(),
+        message: "retry exact Action command".to_string(),
+    })
+    .unwrap_or_else(|error| panic!("serialize indeterminate Action result: {error}"));
+    assert_eq!(indeterminate["eventId"], object_id(41));
+    assert!(indeterminate.get("event_id").is_none());
+}
+
+fn pending_action_command() -> PendingMeetingCommand {
+    let keys = Keys::generate();
+    let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "pending action command")
+        .sign_with_keys(&keys)
+        .unwrap_or_else(|error| panic!("sign pending action command: {error}"));
+    PendingMeetingCommand {
+        event,
+        api_base_url: "http://localhost:3000".to_string(),
+        signer_pubkey: keys.public_key().to_hex(),
+        meeting_id: MEETING_ID.to_string(),
+        fingerprint: "fingerprint".to_string(),
+        action: "confirm".to_string(),
+    }
+}
+
+fn completion_response(
+    pending: &PendingMeetingCommand,
+    terminal_outcome: serde_json::Value,
+) -> SubmitEventResponse {
+    SubmitEventResponse {
+        event_id: pending.event.id.to_hex(),
+        accepted: true,
+        message: serde_json::json!({
+            "meeting_id": MEETING_ID,
+            "status": "ended",
+            "already_ended": true,
+            "terminal_outcome": terminal_outcome,
+        })
+        .to_string(),
+    }
+}
+
+#[test]
+fn action_completion_distinguishes_conflict_from_unverifiable_receipt() {
+    let pending = pending_action_command();
+    let confirm = MeetingActionFinalizationAction::Confirm;
+    assert!(validate_receipt(
+        &completion_response(&pending, serde_json::json!("closed")),
+        &pending,
+        &confirm,
+    )
+    .is_ok());
+    assert!(matches!(
+        validate_receipt(
+            &completion_response(&pending, serde_json::json!("aborted")),
+            &pending,
+            &confirm,
+        ),
+        Err(ReceiptValidationError::CanonicalConflict(_))
+    ));
+    assert!(matches!(
+        validate_receipt(
+            &completion_response(&pending, serde_json::Value::Null),
+            &pending,
+            &confirm,
+        ),
+        Err(ReceiptValidationError::Unverifiable(_))
+    ));
+}
+
 #[test]
 fn block_text_is_bounded_and_normalized() {
     let normalized = normalize_action(MeetingActionFinalizationAction::Block {

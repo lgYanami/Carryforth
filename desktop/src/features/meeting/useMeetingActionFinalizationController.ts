@@ -1,6 +1,11 @@
 import * as React from "react";
 
 import { useMeetingActionFinalizationMutation } from "@/features/meeting/hooks";
+import {
+  clearMeetingPendingCommand,
+  readMeetingPendingCommand,
+  writeMeetingPendingCommand,
+} from "@/features/meeting/meetingPendingCommandStore";
 import type {
   MeetingActionFinalizationAction,
   MeetingActionFinalizationInput,
@@ -20,13 +25,32 @@ export type MeetingActionFinalizationController = {
   ) => Promise<MeetingActionFinalizationResult | undefined>;
 };
 
-export function useMeetingActionFinalizationController(
-  snapshot: MeetingSnapshot,
-): MeetingActionFinalizationController {
+export function useMeetingActionFinalizationController(input: {
+  scopeKey: string;
+  snapshot: MeetingSnapshot;
+}): MeetingActionFinalizationController {
+  const { scopeKey, snapshot } = input;
   const mutation = useMeetingActionFinalizationMutation(snapshot.meetingId);
   const { error, isPending, mutateAsync, reset } = mutation;
-  const [unresolved, setUnresolved] =
-    React.useState<MeetingActionFinalizationInput | null>(null);
+  const [unresolved, setUnresolvedState] =
+    React.useState<MeetingActionFinalizationInput | null>(() =>
+      readMeetingPendingCommand<MeetingActionFinalizationInput>(
+        scopeKey,
+        "action",
+        snapshot.meetingId,
+      ),
+    );
+  const setUnresolved = React.useCallback(
+    (value: MeetingActionFinalizationInput | null) => {
+      setUnresolvedState(value);
+      if (value) {
+        writeMeetingPendingCommand(scopeKey, "action", value);
+      } else {
+        clearMeetingPendingCommand(scopeKey, "action");
+      }
+    },
+    [scopeKey],
+  );
 
   const handleResult = React.useCallback(
     (
@@ -36,7 +60,7 @@ export function useMeetingActionFinalizationController(
       setUnresolved(result.status === "indeterminate" ? submitted : null);
       return result;
     },
-    [],
+    [setUnresolved],
   );
 
   const submit = React.useCallback(
@@ -83,7 +107,7 @@ export function useMeetingActionFinalizationController(
         setUnresolved(null);
       }
     }
-  }, [handleResult, mutateAsync, reset, unresolved]);
+  }, [handleResult, mutateAsync, reset, setUnresolved, unresolved]);
 
   return {
     disabled: isPending || unresolved !== null,

@@ -3,6 +3,7 @@ use super::super::{
     MeetingParticipant, MeetingParticipantType, MeetingPendingIntent,
 };
 use super::*;
+use crate::relay::SubmitEventResponse;
 use nostr::Keys;
 
 const MEETING_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -130,6 +131,220 @@ fn has_tag(event: &nostr::Event, key: &str, value: &str) -> bool {
         values.first().map(String::as_str) == Some(key)
             && values.get(1).map(String::as_str) == Some(value)
     })
+}
+
+fn desktop_host_input(action: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "submissionId": "00000000-0000-4000-8000-000000000010",
+        "meetingId": MEETING_ID,
+        "expectedControlToken": object_id(2),
+        "action": action,
+    })
+}
+
+#[test]
+fn desktop_host_action_contract_accepts_every_camel_case_variant() {
+    let intent_id = object_id(10);
+    let handoff_id = object_id(20);
+    let addressee = object_id(30);
+    let cases = [
+        (
+            serde_json::json!({"type": "board_update", "body": "# Board"}),
+            "board_update",
+        ),
+        (
+            serde_json::json!({"type": "board_unchanged"}),
+            "board_unchanged",
+        ),
+        (
+            serde_json::json!({
+                "type": "intent_submit",
+                "summary": "I should speak",
+                "addressedTo": addressee,
+            }),
+            "intent_submit",
+        ),
+        (
+            serde_json::json!({
+                "type": "intent_refresh",
+                "intentId": intent_id,
+                "summary": "Updated intent",
+                "addressedTo": addressee,
+            }),
+            "intent_refresh",
+        ),
+        (
+            serde_json::json!({"type": "intent_withdraw", "intentId": intent_id}),
+            "intent_withdraw",
+        ),
+        (
+            serde_json::json!({
+                "type": "select_intent",
+                "intentId": intent_id,
+                "selectionReason": "Best next speaker",
+                "deferralReason": "Resolve this first",
+            }),
+            "select_intent",
+        ),
+        (
+            serde_json::json!({
+                "type": "select_handoff",
+                "handoffId": handoff_id,
+                "selectionReason": "Answer the open question",
+            }),
+            "select_handoff",
+        ),
+        (
+            serde_json::json!({
+                "type": "reject_intent",
+                "intentId": intent_id,
+                "reasonCode": "off_topic",
+                "reason": "Outside the agenda",
+            }),
+            "reject_intent",
+        ),
+        (
+            serde_json::json!({
+                "type": "dismiss_handoff",
+                "handoffId": handoff_id,
+                "reasonCode": "no_longer_needed",
+                "reason": "Resolved already",
+            }),
+            "dismiss_handoff",
+        ),
+        (
+            serde_json::json!({"type": "recall", "reason": "Return to the agenda"}),
+            "recall",
+        ),
+        (serde_json::json!({"type": "close"}), "close"),
+        (
+            serde_json::json!({
+                "type": "abort",
+                "reasonCode": "discussion_blocked",
+                "reason": "Required evidence is unavailable",
+            }),
+            "abort",
+        ),
+    ];
+
+    for (action, expected_name) in cases {
+        let input: MeetingHostActionInput = serde_json::from_value(desktop_host_input(action))
+            .unwrap_or_else(|error| panic!("deserialize {expected_name}: {error}"));
+        assert_eq!(input.action.name(), expected_name);
+    }
+
+    assert!(
+        serde_json::from_value::<MeetingHostActionInput>(desktop_host_input(
+            serde_json::json!({"type": "select_intent", "intent_id": intent_id})
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn desktop_host_result_contract_serializes_camel_case_fields() {
+    let accepted = serde_json::to_value(MeetingHostActionResult::Accepted {
+        meeting_id: MEETING_ID.to_string(),
+        event_id: object_id(40),
+        action: "select_intent".to_string(),
+        canonical_object_id: Some(object_id(41)),
+        state_revision: Some(12),
+        duplicate: false,
+    })
+    .unwrap_or_else(|error| panic!("serialize accepted Host result: {error}"));
+    assert_eq!(accepted["meetingId"], MEETING_ID);
+    assert_eq!(accepted["stateRevision"], 12);
+    assert!(accepted.get("canonicalObjectId").is_some());
+    assert!(accepted.get("state_revision").is_none());
+
+    let indeterminate = serde_json::to_value(MeetingHostActionResult::Indeterminate {
+        meeting_id: MEETING_ID.to_string(),
+        event_id: object_id(42),
+        action: "select_intent".to_string(),
+        message: "retry exact Host command".to_string(),
+    })
+    .unwrap_or_else(|error| panic!("serialize indeterminate Host result: {error}"));
+    assert_eq!(indeterminate["eventId"], object_id(42));
+    assert!(indeterminate.get("event_id").is_none());
+}
+
+fn pending_host_command(action: &str) -> PendingMeetingCommand {
+    let keys = Keys::generate();
+    let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "pending host command")
+        .sign_with_keys(&keys)
+        .unwrap_or_else(|error| panic!("sign pending host command: {error}"));
+    PendingMeetingCommand {
+        event,
+        api_base_url: "http://localhost:3000".to_string(),
+        signer_pubkey: keys.public_key().to_hex(),
+        meeting_id: MEETING_ID.to_string(),
+        fingerprint: "fingerprint".to_string(),
+        action: action.to_string(),
+    }
+}
+
+fn end_response(
+    pending: &PendingMeetingCommand,
+    terminal_outcome: serde_json::Value,
+) -> SubmitEventResponse {
+    SubmitEventResponse {
+        event_id: pending.event.id.to_hex(),
+        accepted: true,
+        message: serde_json::json!({
+            "meeting_id": MEETING_ID,
+            "status": "ended",
+            "already_ended": true,
+            "terminal_outcome": terminal_outcome,
+        })
+        .to_string(),
+    }
+}
+
+#[test]
+fn host_terminal_receipt_must_match_the_requested_outcome() {
+    let pending = pending_host_command("close");
+    let close = MeetingHostAction::Close;
+    assert!(validate_receipt(
+        &end_response(&pending, serde_json::json!("closed")),
+        &pending,
+        &close,
+    )
+    .is_ok());
+    assert!(matches!(
+        validate_receipt(
+            &end_response(&pending, serde_json::json!("aborted")),
+            &pending,
+            &close,
+        ),
+        Err(ReceiptValidationError::CanonicalConflict(_))
+    ));
+
+    let abort = MeetingHostAction::Abort {
+        reason_code: AbortReasonInput::DiscussionBlocked,
+        reason: Some("Blocked".to_string()),
+    };
+    assert!(validate_receipt(
+        &end_response(&pending, serde_json::json!("aborted")),
+        &pending,
+        &abort,
+    )
+    .is_ok());
+    assert!(matches!(
+        validate_receipt(
+            &end_response(&pending, serde_json::json!("closed")),
+            &pending,
+            &abort,
+        ),
+        Err(ReceiptValidationError::CanonicalConflict(_))
+    ));
+    assert!(matches!(
+        validate_receipt(
+            &end_response(&pending, serde_json::Value::Null),
+            &pending,
+            &close,
+        ),
+        Err(ReceiptValidationError::Unverifiable(_))
+    ));
 }
 
 #[test]

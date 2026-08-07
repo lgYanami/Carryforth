@@ -74,12 +74,14 @@ export function MeetingActionFinalizationCard({
   hostController,
   onRefresh,
   profiles,
+  renewalError,
   snapshot,
 }: {
   actionController: MeetingActionFinalizationController;
   hostController: MeetingHostActionController;
   onRefresh: () => void;
   profiles: Record<string, UserProfileSummary>;
+  renewalError: string | null;
   snapshot: MeetingSnapshot;
 }) {
   const { goChannel, goView } = useAppNavigation();
@@ -162,6 +164,20 @@ export function MeetingActionFinalizationCard({
               {new Date(action.lastProgressAtMs).toLocaleTimeString()}
             </span>
           ) : null}
+        </div>
+      ) : null}
+
+      {runnable && renewalError ? (
+        <div
+          className="mt-4 flex items-start gap-2 rounded-lg border border-amber-500/35 bg-amber-500/5 p-3 text-xs"
+          data-testid="meeting-action-renewal-error"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <span>
+            Buzz could not retain this action-recording window. The canonical
+            Meeting state is being rechecked and renewal will retry while this
+            exact window remains current.
+          </span>
         </div>
       ) : null}
 

@@ -359,6 +359,8 @@ type E2eConfig = {
     meetingFloorActionDelayMs?: number;
     /** Fail the native Human Grant renewal ensure boundary. */
     meetingGrantRenewalError?: string;
+    /** Fail successive native Human Action renewal ensure attempts. */
+    meetingActionRenewalErrors?: Array<string | null>;
     /** Definitive failures for successive Human host submissions. */
     meetingHostErrors?: Array<string | null>;
     /** Process then lose this many Human host command receipts. */
@@ -11807,6 +11809,11 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig,
         );
       case "ensure_meeting_action_renewal":
+        {
+          const actionRenewalError =
+            activeConfig?.mock?.meetingActionRenewalErrors?.shift();
+          if (actionRenewalError) throw new Error(actionRenewalError);
+        }
         return { status: "already_active" };
       case "ensure_meeting_human_grant_renewal":
         if (activeConfig?.mock?.meetingGrantRenewalError) {

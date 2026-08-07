@@ -49,7 +49,12 @@ pub struct MeetingActionFinalizationInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 enum MeetingActionFinalizationAction {
     Begin,
     Block {
@@ -108,7 +113,11 @@ impl ActionBlockReasonInput {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 /// Verified submission outcome for one Human action-finalization command.
 pub enum MeetingActionFinalizationResult {
     Accepted {
@@ -156,6 +165,20 @@ struct ValidatedInput {
 struct ValidatedReceipt {
     state_revision: Option<i64>,
     duplicate: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiptValidationError {
+    Unverifiable(String),
+    CanonicalConflict(String),
+}
+
+impl ReceiptValidationError {
+    fn message(self) -> String {
+        match self {
+            Self::Unverifiable(message) | Self::CanonicalConflict(message) => message,
+        }
+    }
 }
 
 const HUMAN_ACTION_RENEW_CADENCE: std::time::Duration = std::time::Duration::from_secs(25);
@@ -303,11 +326,16 @@ async fn execute_action(
 
     let receipt = match validate_receipt(&response, &pending, &validated.action) {
         Ok(receipt) => receipt,
-        Err(message) => {
+        Err(ReceiptValidationError::CanonicalConflict(message)) => {
+            remove_pending(state, &validated.submission_id, &pending.event);
+            return Err(message);
+        }
+        Err(error) => {
             return Ok(indeterminate_result(
                 &pending,
                 format!(
-                    "Relay accepted the Meeting action-finalization command, but its receipt could not be verified: {message}. Retry to confirm the same signed event."
+                    "Relay accepted the Meeting action-finalization command, but its receipt could not be verified: {}. Retry to confirm the same signed event.",
+                    error.message()
                 ),
             ));
         }
@@ -593,12 +621,15 @@ fn validate_receipt(
     response: &SubmitEventResponse,
     pending: &PendingMeetingCommand,
     action: &MeetingActionFinalizationAction,
-) -> Result<ValidatedReceipt, String> {
+) -> Result<ValidatedReceipt, ReceiptValidationError> {
     if response.event_id != pending.event.id.to_hex() {
-        return Err("event ID does not match the signed action-finalization command".to_string());
+        return Err(ReceiptValidationError::Unverifiable(
+            "event ID does not match the signed action-finalization command".to_string(),
+        ));
     }
     if let Some(expected_outcome) = action.expected_outcome() {
-        let receipt: ActionReceipt = parse_command_response(&response.message)?;
+        let receipt: ActionReceipt = parse_command_response(&response.message)
+            .map_err(ReceiptValidationError::Unverifiable)?;
         if receipt.meeting_id != pending.meeting_id
             || !receipt.accepted
             || receipt.outcome != expected_outcome
@@ -606,7 +637,9 @@ fn validate_receipt(
             || receipt.action_window_epoch.is_none_or(|window| window <= 0)
             || receipt.state_revision.is_none_or(|revision| revision <= 0)
         {
-            return Err("action receipt fields do not match the signed command".to_string());
+            return Err(ReceiptValidationError::Unverifiable(
+                "action receipt fields do not match the signed command".to_string(),
+            ));
         }
         return Ok(ValidatedReceipt {
             state_revision: receipt.state_revision,
@@ -614,12 +647,25 @@ fn validate_receipt(
         });
     }
 
-    let receipt: EndReceipt = parse_command_response(&response.message)?;
-    if receipt.meeting_id != pending.meeting_id
-        || receipt.status != "ended"
-        || receipt.terminal_outcome.as_deref() != Some("closed")
-    {
-        return Err("action completion receipt does not close the Meeting".to_string());
+    let receipt: EndReceipt =
+        parse_command_response(&response.message).map_err(ReceiptValidationError::Unverifiable)?;
+    if receipt.meeting_id != pending.meeting_id || receipt.status != "ended" {
+        return Err(ReceiptValidationError::Unverifiable(
+            "action completion receipt does not identify an ended Meeting".to_string(),
+        ));
+    }
+    match receipt.terminal_outcome.as_deref() {
+        Some("closed") => {}
+        Some("aborted") => {
+            return Err(ReceiptValidationError::CanonicalConflict(
+                "Meeting already ended as `aborted`; action output cannot be confirmed".to_string(),
+            ));
+        }
+        _ => {
+            return Err(ReceiptValidationError::Unverifiable(
+                "action completion receipt has an unknown terminal outcome".to_string(),
+            ));
+        }
     }
     Ok(ValidatedReceipt {
         state_revision: None,

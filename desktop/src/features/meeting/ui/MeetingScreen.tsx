@@ -158,6 +158,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   });
   const boardWidth = useResizableMeetingBoardWidth(activeCommunity?.id);
   const normalizedPubkey = identityQuery.data?.pubkey.toLowerCase();
+  const meetingCommandScopeKey = `${activeCommunity?.id ?? "no-community"}:${normalizedPubkey ?? "no-identity"}:${meetingId}`;
   const currentParticipant = snapshot?.participants.find(
     (participant) => participant.pubkey === normalizedPubkey,
   );
@@ -179,22 +180,69 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       ? activeGrant
       : null;
   const humanGrantId = humanGrant?.grantId ?? null;
+  const humanActionRunId = humanAction?.actionRunId ?? null;
+  const humanActionWindowEpoch = humanAction?.actionWindowEpoch ?? null;
+  const humanActionBoardEventId = humanAction?.boardEventId ?? null;
+  const humanActionKey =
+    humanActionRunId &&
+    humanActionWindowEpoch !== null &&
+    humanActionBoardEventId
+      ? `${humanActionRunId}:${humanActionWindowEpoch}:${humanActionBoardEventId}`
+      : null;
   const [grantRenewalFailure, setGrantRenewalFailure] = React.useState<{
     grantId: string;
     message: string;
   } | null>(null);
-  React.useEffect(() => {
-    if (!humanAction || meetingAuthority.status !== "current") return;
-    void ensureMeetingActionRenewal({
-      meetingId,
-      actionRunId: humanAction.actionRunId,
-      actionWindowEpoch: humanAction.actionWindowEpoch,
-      boardEventId: humanAction.boardEventId,
-    }).catch((error) => {
-      console.error("Failed to retain the Human Meeting Action lease", error);
-    });
-  }, [humanAction, meetingAuthority.status, meetingId]);
+  const [actionRenewalFailure, setActionRenewalFailure] = React.useState<{
+    actionKey: string;
+    message: string;
+  } | null>(null);
   const refetchSnapshot = snapshotQuery.refetch;
+  React.useEffect(() => {
+    if (
+      !humanActionKey ||
+      !humanActionRunId ||
+      humanActionWindowEpoch === null ||
+      !humanActionBoardEventId ||
+      meetingAuthority.status !== "current"
+    ) {
+      setActionRenewalFailure(null);
+      return;
+    }
+    let disposed = false;
+    let retryTimer: number | null = null;
+    const ensureRenewal = async () => {
+      try {
+        await ensureMeetingActionRenewal({
+          meetingId,
+          actionRunId: humanActionRunId,
+          actionWindowEpoch: humanActionWindowEpoch,
+          boardEventId: humanActionBoardEventId,
+        });
+        if (!disposed) setActionRenewalFailure(null);
+      } catch (error) {
+        if (disposed) return;
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("Failed to retain the Human Meeting Action lease", error);
+        setActionRenewalFailure({ actionKey: humanActionKey, message });
+        void refetchSnapshot();
+        retryTimer = window.setTimeout(() => void ensureRenewal(), 2_000);
+      }
+    };
+    void ensureRenewal();
+    return () => {
+      disposed = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [
+    humanActionBoardEventId,
+    humanActionKey,
+    humanActionRunId,
+    humanActionWindowEpoch,
+    meetingAuthority.status,
+    meetingId,
+    refetchSnapshot,
+  ]);
   React.useEffect(() => {
     if (!humanGrantId || meetingAuthority.status !== "current") {
       setGrantRenewalFailure(null);
@@ -233,6 +281,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   );
   const boardDraft = useMeetingBoardDraft({
     editable: boardEditable,
+    scopeKey: meetingCommandScopeKey,
     snapshot,
   });
   const boardPanelIsOverlay = useMediaBreakpoint(1280);
@@ -642,9 +691,16 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
             ) : null}
           </main>
           <MeetingFloorDock
+            key={meetingCommandScopeKey}
+            actionRenewalError={
+              actionRenewalFailure?.actionKey === humanActionKey
+                ? actionRenewalFailure.message
+                : null
+            }
             abortDialogOpen={abortDialogOpen}
             authorityAvailable={meetingAuthority.authorityAvailable}
             boardDraft={boardDraft}
+            commandScopeKey={meetingCommandScopeKey}
             currentPubkey={identityQuery.data?.pubkey}
             grantRenewalError={
               grantRenewalFailure?.grantId === humanGrantId

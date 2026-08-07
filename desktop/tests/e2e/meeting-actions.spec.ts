@@ -277,6 +277,55 @@ test("blocked action recording retries into a fresh runnable window before close
       .map((entry) => entry.payload.input.action.type),
   );
   expect(actions).toEqual(["block", "retry", "confirm"]);
+  const blockAction = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+        .filter(
+          (entry) => entry.command === "submit_meeting_action_finalization",
+        )
+        .find((entry) => entry.payload.input.action.type === "block")?.payload
+        .input.action,
+  );
+  expect(blockAction).toMatchObject({
+    type: "block",
+    reasonCode: "external_state_conflict",
+  });
+});
+
+test("Human Action renewal initial failure is visible and retries the exact window", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetingActionRenewalErrors: ["mock action renewal unavailable"],
+    meetings: [
+      meetingSeed({
+        id: IDS.recovery,
+        title: "Action renewal recovery",
+        lifecycle: "finalizing_actions",
+      }),
+    ],
+  });
+  await openMeeting(page, IDS.recovery);
+
+  await expect(page.getByTestId("meeting-action-renewal-error")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter(
+            (entry) => entry.command === "ensure_meeting_action_renewal",
+          ).length,
+      ),
+    )
+    .toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("meeting-action-renewal-error")).toHaveCount(0);
+
+  const renewalInputs = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .filter((entry) => entry.command === "ensure_meeting_action_renewal")
+      .map((entry) => entry.payload.input),
+  );
+  expect(renewalInputs[1]).toEqual(renewalInputs[0]);
 });
 
 test("runnable and blocked action runs can return to a new Board window", async ({
