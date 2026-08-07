@@ -20,6 +20,7 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod meeting_community_read;
 mod project_context;
 mod project_document;
 mod project_runtime;
@@ -106,6 +107,11 @@ enum Command {
         #[command(subcommand)]
         command: project_runtime::ProjectRuntimeCommand,
     },
+    /// Audit and publish Community-wide Meeting history reads.
+    MeetingCommunityRead {
+        #[command(subcommand)]
+        command: meeting_community_read::MeetingCommunityReadCommand,
+    },
     /// Emit kind:39000/39002 events for channels missing them.
     ///
     /// Channels created via direct SQL (seed scripts, pre-migration data) won't
@@ -177,6 +183,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::ProjectContext { command } => project_context::run(command).await,
         Command::ProjectDocument { command } => project_document::run(command).await,
         Command::ProjectRuntime { command } => project_runtime::run(command).await,
+        Command::MeetingCommunityRead { command } => meeting_community_read::run(command).await,
         Command::ReconcileChannels { relay_key } => {
             reconcile_channels(relay_key).await?;
             Ok(0)
