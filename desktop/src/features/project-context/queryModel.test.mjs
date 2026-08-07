@@ -9,6 +9,7 @@ import {
   projectContextDraftValidationMessage,
   projectContextQueryFromDraft,
   removeProjectContextDraftCoordinate,
+  tryAddProjectContextDraftCoordinate,
 } from "./queryModel.ts";
 
 const REQUIREMENT_ID = "20000000-0000-4000-8000-000000000001";
@@ -44,7 +45,7 @@ test("draft mode constraints stay distinct from the applied query", () => {
   assert.deepEqual(applied, { type: "contains_all", coordinates: [] });
 });
 
-test("Incident accepts one Coordinate and duplicate input is rejected", () => {
+test("Incident accepts one Coordinate and rejects repeated input without throwing", () => {
   let draft = changeProjectContextDraftMode(
     projectContextDraftFromQuery({ type: "contains_all", coordinates: [] }),
     "incident",
@@ -54,14 +55,47 @@ test("Incident accepts one Coordinate and duplicate input is rejected", () => {
     type: "incident",
     coordinate: document,
   });
-  assert.throws(
-    () => addProjectContextDraftCoordinate(draft, document),
-    /already/,
+  const duplicate = tryAddProjectContextDraftCoordinate(draft, document);
+  assert.deepEqual(duplicate, {
+    status: "unchanged",
+    draft,
+    reason: "duplicate",
+  });
+  const incidentFull = tryAddProjectContextDraftCoordinate(draft, requirement);
+  assert.deepEqual(incidentFull, {
+    status: "unchanged",
+    draft,
+    reason: "incident_full",
+  });
+  assert.strictEqual(
+    addProjectContextDraftCoordinate(draft, requirement),
+    draft,
   );
-  assert.throws(
-    () => addProjectContextDraftCoordinate(draft, requirement),
-    /exactly one/,
+});
+
+test("All rejects stale Coordinate selection as an idempotent transition", () => {
+  const draft = projectContextDraftFromQuery({
+    type: "contains_all",
+    coordinates: [],
+  });
+  assert.deepEqual(tryAddProjectContextDraftCoordinate(draft, requirement), {
+    status: "unchanged",
+    draft,
+    reason: "mode_all",
+  });
+});
+
+test("switching a multi-Coordinate draft to Incident keeps one canonical Coordinate", () => {
+  let draft = changeProjectContextDraftMode(
+    projectContextDraftFromQuery({ type: "contains_all", coordinates: [] }),
+    "exact",
   );
+  draft = addProjectContextDraftCoordinate(draft, resource);
+  draft = addProjectContextDraftCoordinate(draft, requirement);
+  assert.deepEqual(changeProjectContextDraftMode(draft, "incident"), {
+    mode: "incident",
+    coordinates: [requirement],
+  });
 });
 
 test("Contains all supports one Coordinate while empty is represented by All", () => {

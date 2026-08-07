@@ -51,6 +51,7 @@ function optionSearchText(option: ProjectContextCoordinateOption) {
 }
 
 function CoordinatePicker({
+  closeOnSelect,
   disabled,
   documentsState,
   onSelect,
@@ -58,6 +59,7 @@ function CoordinatePicker({
   projectViewState,
   selectedKeys,
 }: {
+  closeOnSelect: boolean;
   disabled: boolean;
   documentsState: ProjectContextPickerSourceState;
   onSelect: (option: ProjectContextCoordinateOption) => void;
@@ -77,6 +79,13 @@ function CoordinatePicker({
     );
   }, [options, search, selectedKeys]);
 
+  React.useEffect(() => {
+    if (!disabled) return;
+    setOpen(false);
+    setSearch("");
+    setHighlightedIndex(0);
+  }, [disabled]);
+
   function handleOpenChange(next: boolean) {
     setOpen(next);
     if (!next) {
@@ -86,10 +95,13 @@ function CoordinatePicker({
   }
 
   function selectOption(option: ProjectContextCoordinateOption) {
-    if (selectedKeys.has(option.coordinateKey)) return;
+    if (disabled || selectedKeys.has(option.coordinateKey)) return;
+    if (closeOnSelect) handleOpenChange(false);
     onSelect(option);
-    setSearch("");
-    setHighlightedIndex(0);
+    if (!closeOnSelect) {
+      setSearch("");
+      setHighlightedIndex(0);
+    }
   }
 
   function moveHighlight(direction: 1 | -1) {
@@ -282,10 +294,19 @@ export function ProjectContextQueryBar({
     [coordinateOptions],
   );
   const validation = projectContextDraftValidationMessage(draft);
+  let conversionError: string | undefined;
+  let draftQuery: ProjectContextQuery | undefined;
   let draftKey: string | undefined;
   if (!validation) {
-    draftKey = projectContextQueryKey(projectContextQueryFromDraft(draft));
+    try {
+      draftQuery = projectContextQueryFromDraft(draft);
+      draftKey = projectContextQueryKey(draftQuery);
+    } catch (error) {
+      conversionError =
+        error instanceof Error ? error.message : "The query draft is invalid.";
+    }
   }
+  const draftError = validation ?? conversionError;
   const dirty = draftKey !== appliedKey;
 
   return (
@@ -318,6 +339,7 @@ export function ProjectContextQueryBar({
             ))}
           </fieldset>
           <CoordinatePicker
+            closeOnSelect={draft.mode === "incident"}
             disabled={
               draft.mode === "all" ||
               (draft.mode === "incident" && draft.coordinates.length === 1)
@@ -353,8 +375,10 @@ export function ProjectContextQueryBar({
           </Badge>
           <Button
             data-testid="project-context-run-query"
-            disabled={Boolean(validation) || !dirty}
-            onClick={() => onRun(projectContextQueryFromDraft(draft))}
+            disabled={Boolean(draftError) || !dirty || !draftQuery}
+            onClick={() => {
+              if (draftQuery) onRun(draftQuery);
+            }}
             size="sm"
             type="button"
           >
@@ -404,14 +428,14 @@ export function ProjectContextQueryBar({
         <p
           className={cn(
             "text-xs",
-            validation
+            draftError
               ? "text-amber-700 dark:text-amber-300"
               : "text-muted-foreground",
           )}
           data-testid="project-context-query-guidance"
-          role={validation ? "status" : undefined}
+          role={draftError ? "status" : undefined}
         >
-          {validation ??
+          {draftError ??
             (draft.mode === "all"
               ? "All Context is the complete contains-all empty-set query."
               : "Editing this draft does not change the graph until you Run it.")}

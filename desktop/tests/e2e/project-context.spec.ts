@@ -1202,6 +1202,94 @@ test("Query Bar keeps a draft until Run and URL history restores query and selec
   await expect(page).toHaveURL(/selected=coordinate/);
 });
 
+test("Incident Coordinate selection closes safely and ignores stale repeated input", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectContext: contextResult() });
+  await openProjectContext(page);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length ?? 0,
+      ),
+    )
+    .toBeGreaterThanOrEqual(2);
+  const callsBeforeDraft = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length ?? 0,
+  );
+
+  await page.getByTestId("project-context-mode-incident").click();
+  await page.getByTestId("project-context-coordinate-picker").click();
+  await page.evaluate(
+    ({ firstKey, secondKey }) => {
+      const first = document.querySelector<HTMLElement>(
+        `[role="option"][data-coordinate-key="${firstKey}"]`,
+      );
+      const second = document.querySelector<HTMLElement>(
+        `[role="option"][data-coordinate-key="${secondKey}"]`,
+      );
+      if (!first || !second) throw new Error("Coordinate fixtures missing");
+      first.click();
+      second.click();
+    },
+    {
+      firstKey: `requirement:${REQUIREMENT_ID}`,
+      secondKey: `resource:${RESOURCE_ID}`,
+    },
+  );
+
+  await expect(
+    page.getByTestId("project-context-coordinate-search"),
+  ).toBeHidden();
+  await expect(
+    page.getByTestId("project-context-coordinate-picker"),
+  ).toBeDisabled();
+  await expect(
+    page.getByTestId("project-context-query-chips").locator("li"),
+  ).toHaveCount(1);
+  await expect(page.getByTestId("project-context-query-chips")).toContainText(
+    "Verified requirement",
+  );
+  await expect(page.getByText("Something went wrong!")).toHaveCount(0);
+  expect(
+    await page.evaluate(
+      () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length ?? 0,
+    ),
+  ).toBe(callsBeforeDraft);
+
+  await page.getByTestId("project-context-clear-coordinates").click();
+  await expect(
+    page.getByTestId("project-context-coordinate-picker"),
+  ).toBeEnabled();
+  await page.getByTestId("project-context-coordinate-picker").click();
+  const search = page.getByTestId("project-context-coordinate-search");
+  await search.fill("Verified resource");
+  await search.evaluate((element) => {
+    const init = { bubbles: true, cancelable: true, key: "Enter" };
+    element.dispatchEvent(new KeyboardEvent("keydown", init));
+    element.dispatchEvent(new KeyboardEvent("keydown", init));
+  });
+  await expect(search).toBeHidden();
+  await expect(
+    page.getByTestId("project-context-query-chips").locator("li"),
+  ).toHaveCount(1);
+  await expect(page.getByText("Something went wrong!")).toHaveCount(0);
+
+  await page.getByTestId("project-context-clear-coordinates").click();
+  await page.getByTestId("project-context-mode-exact").click();
+  await page.getByTestId("project-context-coordinate-picker").click();
+  await expect(
+    page.getByTestId("project-context-coordinate-search"),
+  ).toBeVisible();
+  await page.getByTestId("project-context-mode-all").click();
+  await expect(
+    page.getByTestId("project-context-coordinate-search"),
+  ).toBeHidden();
+  await expect(
+    page.getByTestId("project-context-coordinate-picker"),
+  ).toBeDisabled();
+});
+
 test("Exact and Contains all enforce arity and submit canonical typed queries", async ({
   page,
 }) => {

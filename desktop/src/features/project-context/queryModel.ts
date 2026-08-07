@@ -25,6 +25,19 @@ export type ProjectContextQueryDraft = {
   coordinates: ProjectContextCoordinate[];
 };
 
+export type ProjectContextDraftCoordinateRejection =
+  | "mode_all"
+  | "duplicate"
+  | "incident_full";
+
+export type ProjectContextDraftCoordinateTransition =
+  | { status: "changed"; draft: ProjectContextQueryDraft }
+  | {
+      status: "unchanged";
+      draft: ProjectContextQueryDraft;
+      reason: ProjectContextDraftCoordinateRejection;
+    };
+
 export type ProjectContextCoordinateOption = {
   coordinate: ProjectContextCoordinate;
   coordinateKey: string;
@@ -71,13 +84,19 @@ export function changeProjectContextDraftMode(
   };
 }
 
-/** Add one distinct Coordinate in canonical order, enforcing Incident arity. */
-export function addProjectContextDraftCoordinate(
+/**
+ * Try to add one Coordinate without throwing for recoverable UI input.
+ *
+ * Strict query validation remains at the closed query/native boundary. Query
+ * Bar interactions instead stay total so stale or repeated input cannot tear
+ * down the React route.
+ */
+export function tryAddProjectContextDraftCoordinate(
   draft: ProjectContextQueryDraft,
   coordinate: ProjectContextCoordinate,
-): ProjectContextQueryDraft {
+): ProjectContextDraftCoordinateTransition {
   if (draft.mode === "all") {
-    throw new Error("Choose a focused query mode before adding Coordinates.");
+    return { status: "unchanged", draft, reason: "mode_all" };
   }
   const key = projectContextCoordinateKey(coordinate);
   if (
@@ -85,18 +104,29 @@ export function addProjectContextDraftCoordinate(
       (candidate) => projectContextCoordinateKey(candidate) === key,
     )
   ) {
-    throw new Error("That Coordinate is already in the query.");
+    return { status: "unchanged", draft, reason: "duplicate" };
   }
   if (draft.mode === "incident" && draft.coordinates.length === 1) {
-    throw new Error("Incident accepts exactly one Coordinate.");
+    return { status: "unchanged", draft, reason: "incident_full" };
   }
   return {
-    ...draft,
-    coordinates: canonicalizeProjectContextCoordinates([
-      ...draft.coordinates,
-      coordinate,
-    ]),
+    status: "changed",
+    draft: {
+      ...draft,
+      coordinates: canonicalizeProjectContextCoordinates([
+        ...draft.coordinates,
+        coordinate,
+      ]),
+    },
   };
+}
+
+/** Add one Coordinate as an idempotent Query Bar state transition. */
+export function addProjectContextDraftCoordinate(
+  draft: ProjectContextQueryDraft,
+  coordinate: ProjectContextCoordinate,
+): ProjectContextQueryDraft {
+  return tryAddProjectContextDraftCoordinate(draft, coordinate).draft;
 }
 
 /** Remove one Coordinate without changing the currently applied query. */
