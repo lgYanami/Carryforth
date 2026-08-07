@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 51);
+        assert_eq!(migrations.len(), 52);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1245,6 +1245,36 @@ mod tests {
             );
         }
         assert!(!project_context_meeting_v2.contains("DELETE FROM project_context"));
+
+        assert_eq!(migrations[51].version, 52);
+        let meeting_community_read = migrations[51].sql.as_str();
+        for required in [
+            "ADD COLUMN meeting_community_read_enabled",
+            "ADD COLUMN meeting_community_read_create_paused",
+            "legacy_meeting_visibility_watermark",
+            "legacy_meeting_visibility_audit_digest",
+            "legacy_meeting_visibility_approved_at",
+            "legacy_meeting_visibility_approved_by",
+            "meeting_community_read_contract_immutable",
+        ] {
+            assert!(
+                meeting_community_read.contains(required),
+                "migration 0052 must contain {required}"
+            );
+        }
+        for destructive in [
+            "DELETE FROM",
+            "TRUNCATE",
+            "DROP TABLE",
+            "DROP COLUMN",
+            "UPDATE meeting_sessions",
+            "UPDATE events",
+        ] {
+            assert!(
+                !meeting_community_read.contains(destructive),
+                "migration 0052 must not contain destructive statement {destructive}"
+            );
+        }
     }
 
     #[test]
@@ -1273,6 +1303,11 @@ mod tests {
             "event.kind = 40909",
             "command.kind = 44302",
             "buzz.project_context_reproject",
+            "meeting_community_read_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "meeting_community_read_create_paused BOOLEAN NOT NULL DEFAULT FALSE",
+            "legacy_meeting_visibility_watermark BIGINT",
+            "legacy_meeting_visibility_audit_digest BYTEA",
+            "meeting_community_read_contract_immutable",
         ] {
             assert!(
                 schema.contains(required),

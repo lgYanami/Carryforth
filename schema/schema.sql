@@ -58,10 +58,143 @@ CREATE TABLE communities (
     archived_at     TIMESTAMPTZ,
     project_view_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     project_document_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    meeting_community_read_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    meeting_community_read_create_paused BOOLEAN NOT NULL DEFAULT FALSE,
+    legacy_meeting_visibility_watermark BIGINT,
+    legacy_meeting_visibility_audit_digest BYTEA,
+    legacy_meeting_visibility_meeting_count BIGINT,
+    legacy_meeting_visibility_community_source_count BIGINT,
+    legacy_meeting_visibility_private_source_count BIGINT,
+    legacy_meeting_visibility_missing_source_count BIGINT,
+    legacy_meeting_visibility_audited_at TIMESTAMPTZ,
+    legacy_meeting_visibility_approved_at TIMESTAMPTZ,
+    legacy_meeting_visibility_approved_by TEXT,
+    meeting_community_read_enabled_at TIMESTAMPTZ,
+    CONSTRAINT chk_legacy_meeting_visibility_watermark
+        CHECK (
+            legacy_meeting_visibility_watermark IS NULL
+            OR legacy_meeting_visibility_watermark >= 0
+        ),
+    CONSTRAINT chk_legacy_meeting_visibility_audit_digest
+        CHECK (
+            legacy_meeting_visibility_audit_digest IS NULL
+            OR LENGTH(legacy_meeting_visibility_audit_digest) = 32
+        ),
+    CONSTRAINT chk_legacy_meeting_visibility_counts
+        CHECK (
+            (legacy_meeting_visibility_meeting_count IS NULL
+             AND legacy_meeting_visibility_community_source_count IS NULL
+             AND legacy_meeting_visibility_private_source_count IS NULL
+             AND legacy_meeting_visibility_missing_source_count IS NULL)
+            OR
+            (legacy_meeting_visibility_meeting_count >= 0
+             AND legacy_meeting_visibility_community_source_count >= 0
+             AND legacy_meeting_visibility_private_source_count >= 0
+             AND legacy_meeting_visibility_missing_source_count >= 0
+             AND legacy_meeting_visibility_meeting_count =
+                 legacy_meeting_visibility_community_source_count
+                 + legacy_meeting_visibility_private_source_count
+                 + legacy_meeting_visibility_missing_source_count)
+        ),
+    CONSTRAINT chk_legacy_meeting_visibility_audit_shape
+        CHECK (
+            (legacy_meeting_visibility_watermark IS NULL
+             AND legacy_meeting_visibility_audit_digest IS NULL
+             AND legacy_meeting_visibility_meeting_count IS NULL
+             AND legacy_meeting_visibility_community_source_count IS NULL
+             AND legacy_meeting_visibility_private_source_count IS NULL
+             AND legacy_meeting_visibility_missing_source_count IS NULL
+             AND legacy_meeting_visibility_audited_at IS NULL
+             AND legacy_meeting_visibility_approved_at IS NULL
+             AND legacy_meeting_visibility_approved_by IS NULL)
+            OR
+            (legacy_meeting_visibility_watermark IS NOT NULL
+             AND legacy_meeting_visibility_audit_digest IS NOT NULL
+             AND legacy_meeting_visibility_meeting_count IS NOT NULL
+             AND legacy_meeting_visibility_community_source_count IS NOT NULL
+             AND legacy_meeting_visibility_private_source_count IS NOT NULL
+             AND legacy_meeting_visibility_missing_source_count IS NOT NULL
+             AND legacy_meeting_visibility_audited_at IS NOT NULL
+             AND (
+                 (legacy_meeting_visibility_approved_at IS NULL
+                  AND legacy_meeting_visibility_approved_by IS NULL)
+                 OR
+                 (legacy_meeting_visibility_approved_at IS NOT NULL
+                  AND legacy_meeting_visibility_approved_by IS NOT NULL
+                  AND OCTET_LENGTH(BTRIM(legacy_meeting_visibility_approved_by))
+                      BETWEEN 1 AND 255)
+             ))
+        ),
+    CONSTRAINT chk_meeting_community_read_enable_shape
+        CHECK (
+            (NOT meeting_community_read_enabled
+             AND meeting_community_read_enabled_at IS NULL)
+            OR
+            (meeting_community_read_enabled
+             AND meeting_community_read_enabled_at IS NOT NULL
+             AND legacy_meeting_visibility_approved_at IS NOT NULL
+             AND legacy_meeting_visibility_approved_by IS NOT NULL)
+        ),
     CONSTRAINT chk_communities_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid)
 );
 
 CREATE UNIQUE INDEX idx_communities_host ON communities (lower(host));
+
+CREATE FUNCTION meeting_community_read_contract_immutable() RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.meeting_community_read_enabled
+       AND NOT NEW.meeting_community_read_enabled
+    THEN
+        RAISE EXCEPTION
+            'Meeting Community-read contract cannot be disabled after publication'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF OLD.meeting_community_read_enabled
+       AND (
+           NEW.legacy_meeting_visibility_watermark
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_watermark
+           OR NEW.legacy_meeting_visibility_audit_digest
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_audit_digest
+           OR NEW.legacy_meeting_visibility_meeting_count
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_meeting_count
+           OR NEW.legacy_meeting_visibility_community_source_count
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_community_source_count
+           OR NEW.legacy_meeting_visibility_private_source_count
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_private_source_count
+           OR NEW.legacy_meeting_visibility_missing_source_count
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_missing_source_count
+           OR NEW.legacy_meeting_visibility_audited_at
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_audited_at
+           OR NEW.legacy_meeting_visibility_approved_at
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_approved_at
+           OR NEW.legacy_meeting_visibility_approved_by
+               IS DISTINCT FROM OLD.legacy_meeting_visibility_approved_by
+       )
+    THEN
+        RAISE EXCEPTION
+            'approved legacy Meeting visibility evidence is immutable after publication'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_meeting_community_read_contract_immutable
+    BEFORE UPDATE OF
+        meeting_community_read_enabled,
+        legacy_meeting_visibility_watermark,
+        legacy_meeting_visibility_audit_digest,
+        legacy_meeting_visibility_meeting_count,
+        legacy_meeting_visibility_community_source_count,
+        legacy_meeting_visibility_private_source_count,
+        legacy_meeting_visibility_missing_source_count,
+        legacy_meeting_visibility_audited_at,
+        legacy_meeting_visibility_approved_at,
+        legacy_meeting_visibility_approved_by
+    ON communities
+    FOR EACH ROW
+    EXECUTE FUNCTION meeting_community_read_contract_immutable();
 
 -- ── Channels ──────────────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". `community_id` immutable.

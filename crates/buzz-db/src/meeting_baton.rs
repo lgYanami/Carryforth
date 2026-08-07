@@ -536,6 +536,8 @@ pub(crate) async fn create_moderated_meeting_base_tx(
         params.host_pubkey,
     )
     .await?;
+    crate::meeting_community_read::ensure_meeting_create_allowed_tx(tx, params.community_id)
+        .await?;
     validate_source_access_tx(tx, params.community_id, params.source_channel_id).await?;
 
     let mut participants = resolve_participants_tx(

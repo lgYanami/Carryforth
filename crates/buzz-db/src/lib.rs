@@ -32,6 +32,8 @@ pub mod git_repo;
 pub mod meeting;
 /// Meeting V1 moderated-baton persistence.
 pub mod meeting_baton;
+/// Durable operator approval and readiness for Community-wide Meeting reads.
+pub mod meeting_community_read;
 /// Meeting V0 speech-floor state machine and delivery outbox.
 pub mod meeting_floor;
 /// Durable cleanup for meetings affected by a real security revocation.

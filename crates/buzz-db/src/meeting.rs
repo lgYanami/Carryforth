@@ -389,6 +389,8 @@ pub async fn create_meeting_tx(
     let mut participants = Vec::with_capacity(params.participant_pubkeys.len());
     let mut agent_count = 0usize;
 
+    crate::meeting_community_read::ensure_meeting_create_allowed_tx(tx, params.community_id)
+        .await?;
     validate_community_readable_source_tx(tx, params.community_id, params.source_channel_id)
         .await?;
 
