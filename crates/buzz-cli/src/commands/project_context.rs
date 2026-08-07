@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use uuid::{Uuid, Version};
 
 use crate::client::{BuzzClient, ProjectCommandDelivery};
+use crate::commands::meetings::{fetch_meeting_context_summaries, MeetingSummary};
 use crate::commands::project_view_snapshot::{
     read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
 };
@@ -85,6 +86,7 @@ struct ProjectContextQueryOutput {
     query: QueryDescriptor,
     project_view_observation: ProjectViewObservation,
     document_observation: DocumentObservation,
+    meeting_observation: MeetingObservation,
     edges: Vec<EdgeOutput>,
 }
 
@@ -94,6 +96,8 @@ struct CoordinateOutput {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,7 +109,16 @@ struct CoordinateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     updated_by: Option<PublicKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    meeting_fetch: Option<MeetingFetchCommands>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     unavailable_reason: Option<&'static str>,
+}
+
+#[derive(Clone, Serialize)]
+struct MeetingFetchCommands {
+    metadata: String,
+    board: String,
+    speech: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -152,6 +165,13 @@ struct DocumentObservation {
     projection_generation: Option<u64>,
 }
 
+#[derive(Clone, Serialize)]
+struct MeetingObservation {
+    state: &'static str,
+    requested_count: usize,
+    observed_count: usize,
+}
+
 struct EdgeSnapshot {
     meta: VerifiedProjectContextMeta,
     edges: Vec<ProjectContextEdge>,
@@ -170,6 +190,11 @@ struct ProjectViewHydration {
 struct DocumentHydration {
     observation: DocumentObservation,
     heads: BTreeMap<Uuid, DocumentMetadata>,
+}
+
+struct MeetingHydration {
+    observation: MeetingObservation,
+    summaries: BTreeMap<Uuid, MeetingSummary>,
 }
 
 #[derive(Clone)]
@@ -251,6 +276,7 @@ async fn run_query(
 
     let mut project_view_coordinates = BTreeSet::new();
     let mut document_ids = BTreeSet::new();
+    let mut meeting_ids = BTreeSet::new();
     let mut context_document_ids = BTreeSet::new();
     for edge in &snapshot.edges {
         for coordinate in edge.coordinates() {
@@ -261,6 +287,9 @@ async fn run_query(
                 ProjectContextCoordinate::Document { document_id } => {
                     document_ids.insert(*document_id);
                 }
+                ProjectContextCoordinate::Meeting { meeting_id } => {
+                    meeting_ids.insert(*meeting_id);
+                }
             }
         }
         context_document_ids.extend(edge.context_document_ids().iter().copied());
@@ -270,6 +299,7 @@ async fn run_query(
     let project_view =
         hydrate_project_view(client, identity, project_id, &project_view_coordinates).await?;
     let documents = hydrate_documents(client, identity, project_id, &document_ids).await?;
+    let meetings = hydrate_meetings(client, &meeting_ids).await?;
 
     let mut edges = Vec::with_capacity(snapshot.edges.len());
     for edge in snapshot.edges {
@@ -284,6 +314,10 @@ async fn run_query(
                 ProjectContextCoordinate::Document { document_id } => {
                     document_coordinate_output(coordinate.clone(), documents.heads.get(document_id))
                 }
+                ProjectContextCoordinate::Meeting { meeting_id } => meeting_coordinate_output(
+                    coordinate.clone(),
+                    meetings.summaries.get(meeting_id),
+                ),
             };
             coordinates.push(hydrated);
         }
@@ -310,6 +344,7 @@ async fn run_query(
         },
         project_view_observation: project_view.observation,
         document_observation: documents.observation,
+        meeting_observation: meetings.observation,
         edges,
     })
 }
@@ -326,6 +361,18 @@ async fn require_identity(client: &BuzzClient) -> Result<ProjectViewIdentity, Cl
     if !identity.document_enabled {
         return Err(CliError::Other(
             "unavailable:project_context:project_document_not_ready".to_owned(),
+        ));
+    }
+    if !identity.context_edge_enabled {
+        return Err(CliError::Other(
+            if identity.context_edge_migration_required {
+                format!(
+                    "migration_required:{}",
+                    buzz_project_context::PROJECT_CONTEXT_CAPABILITY
+                )
+            } else {
+                "unavailable:project_context:capability_disabled".to_owned()
+            },
         ));
     }
     Ok(identity)
@@ -575,7 +622,7 @@ async fn hydrate_project_view(
                 } = coordinate
                 else {
                     return Err(integrity_error(
-                        "Project View hydration received a Document coordinate",
+                        "Project View hydration received a non-Project-View coordinate",
                     ));
                 };
                 let entry = snapshot.entry(*object_id).ok_or_else(|| {
@@ -630,11 +677,13 @@ fn project_view_coordinate_output(
                 coordinate: coordinate.clone(),
                 state: "active",
                 title: Some(title),
+                description: None,
                 status,
                 object_revision: Some(object.object_revision),
                 document_revision: None,
                 updated_at: Some(object.updated_at),
                 updated_by: Some(object.updated_by),
+                meeting_fetch: None,
                 unavailable_reason: None,
             }
         }
@@ -642,11 +691,13 @@ fn project_view_coordinate_output(
             coordinate: coordinate.clone(),
             state: "tombstoned",
             title: None,
+            description: None,
             status: None,
             object_revision: Some(tombstone.object_revision),
             document_revision: None,
             updated_at: Some(tombstone.deleted_at),
             updated_by: Some(tombstone.deleted_by),
+            meeting_fetch: None,
             unavailable_reason: None,
         },
     }
@@ -866,11 +917,13 @@ fn document_coordinate_output(
             coordinate,
             state: "active",
             title: Some(title.clone()),
+            description: None,
             status: None,
             object_revision: None,
             document_revision: Some(*document_revision),
             updated_at: Some(*updated_at),
             updated_by: Some(*updated_by),
+            meeting_fetch: None,
             unavailable_reason: None,
         },
         Some(DocumentMetadata::Tombstoned {
@@ -881,14 +934,90 @@ fn document_coordinate_output(
             coordinate,
             state: "tombstoned",
             title: None,
+            description: None,
             status: None,
             object_revision: None,
             document_revision: Some(*document_revision),
             updated_at: Some(*deleted_at),
             updated_by: Some(*deleted_by),
+            meeting_fetch: None,
             unavailable_reason: None,
         },
         None => unavailable_coordinate(coordinate),
+    }
+}
+
+async fn hydrate_meetings(
+    client: &BuzzClient,
+    requested: &BTreeSet<Uuid>,
+) -> Result<MeetingHydration, CliError> {
+    if requested.is_empty() {
+        return Ok(MeetingHydration {
+            observation: MeetingObservation {
+                state: "not_requested",
+                requested_count: 0,
+                observed_count: 0,
+            },
+            summaries: BTreeMap::new(),
+        });
+    }
+
+    match fetch_meeting_context_summaries(client, requested).await {
+        Ok(summaries) => {
+            let observed_count = summaries.len();
+            Ok(MeetingHydration {
+                observation: MeetingObservation {
+                    state: if observed_count == requested.len() {
+                        "observed"
+                    } else {
+                        "partial"
+                    },
+                    requested_count: requested.len(),
+                    observed_count,
+                },
+                summaries,
+            })
+        }
+        Err(error) if hydration_is_unavailable(&error) => Ok(MeetingHydration {
+            observation: MeetingObservation {
+                state: "unavailable",
+                requested_count: requested.len(),
+                observed_count: 0,
+            },
+            summaries: BTreeMap::new(),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn meeting_coordinate_output(
+    coordinate: ProjectContextCoordinate,
+    summary: Option<&MeetingSummary>,
+) -> CoordinateOutput {
+    let ProjectContextCoordinate::Meeting { meeting_id } = coordinate else {
+        return unavailable_coordinate(coordinate);
+    };
+    let Some(summary) = summary else {
+        return unavailable_coordinate(ProjectContextCoordinate::Meeting { meeting_id });
+    };
+    CoordinateOutput {
+        coordinate: ProjectContextCoordinate::Meeting { meeting_id },
+        state: "terminal",
+        title: Some(summary.title.clone()),
+        description: summary.description.clone(),
+        status: Some(json!(summary.status)),
+        object_revision: None,
+        document_revision: None,
+        updated_at: i64::try_from(summary.updated_at)
+            .ok()
+            .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0)),
+        updated_by: None,
+        meeting_fetch: Some(MeetingFetchCommands {
+            metadata: format!("buzz meetings show {meeting_id}"),
+            board: format!("buzz meetings board get {meeting_id}"),
+            speech: format!("buzz --format compact meetings history {meeting_id} --limit 200"),
+        }),
+        unavailable_reason: None,
     }
 }
 
@@ -937,11 +1066,13 @@ fn unavailable_coordinate(coordinate: ProjectContextCoordinate) -> CoordinateOut
         coordinate,
         state: "unavailable",
         title: None,
+        description: None,
         status: None,
         object_revision: None,
         document_revision: None,
         updated_at: None,
         updated_by: None,
+        meeting_fetch: None,
         unavailable_reason: Some("metadata_unavailable"),
     }
 }
@@ -1201,6 +1332,7 @@ fn parse_coordinate_token(token: &str) -> Result<ProjectContextCoordinate, CliEr
             object_id: id,
         },
         "document" => ProjectContextCoordinate::Document { document_id: id },
+        "meeting" => ProjectContextCoordinate::Meeting { meeting_id: id },
         _ => return Err(coordinate_usage(token)),
     };
     coordinate
@@ -1215,7 +1347,7 @@ fn token_id(token: &str) -> &str {
 
 fn coordinate_usage(token: &str) -> CliError {
     CliError::Usage(format!(
-        "invalid Project Context coordinate {token:?}; expected TYPE:<uuid-v4>, where TYPE is project_profile, goal, role, plan, stage, requirement, issue, work, resource, or document"
+        "invalid Project Context coordinate {token:?}; expected TYPE:<uuid-v4>, where TYPE is project_profile, goal, role, plan, stage, requirement, issue, work, resource, document, or meeting"
     ))
 }
 
@@ -1443,6 +1575,7 @@ mod tests {
             schema: ProjectViewSchema::V3,
             context_enabled: false,
             context_edge_enabled: true,
+            context_edge_migration_required: false,
             document_enabled: true,
         }
     }
@@ -1468,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_tokens_cover_the_closed_v1_union() {
+    fn coordinate_tokens_cover_the_closed_v2_union() {
         let id = Uuid::new_v4();
         let requirement =
             parse_coordinate_token(&format!("requirement:{id}")).expect("Requirement token parses");
@@ -1482,6 +1615,10 @@ mod tests {
         assert!(matches!(
             parse_coordinate_token(&format!("document:{id}")),
             Ok(ProjectContextCoordinate::Document { document_id }) if document_id == id
+        ));
+        assert!(matches!(
+            parse_coordinate_token(&format!("meeting:{id}")),
+            Ok(ProjectContextCoordinate::Meeting { meeting_id }) if meeting_id == id
         ));
         assert!(parse_coordinate_token(&format!("unknown:{id}")).is_err());
         assert!(parse_coordinate_token("requirement:not-a-uuid").is_err());
@@ -1522,6 +1659,39 @@ mod tests {
         let json = serde_json::to_value(output).expect("serialize metadata-only output");
         assert!(json.get("content_markdown").is_none());
         assert!(json.get("fetch_command").is_some());
+    }
+
+    #[test]
+    fn meeting_coordinate_output_is_typed_metadata_first_and_on_demand() {
+        let meeting_id = Uuid::new_v4();
+        let output = meeting_coordinate_output(
+            ProjectContextCoordinate::Meeting { meeting_id },
+            Some(&MeetingSummary {
+                meeting_id: meeting_id.to_string(),
+                title: "Architecture review".to_owned(),
+                description: Some("Set the first delivery boundary".to_owned()),
+                room_kind: "meeting".to_owned(),
+                status: "ended",
+                updated_at: 1_800_000_000,
+            }),
+        );
+        let value = serde_json::to_value(output).expect("serialize Meeting coordinate output");
+        assert_eq!(value["coordinate"]["coordinate_type"], "meeting");
+        assert_eq!(value["coordinate"]["meeting_id"], meeting_id.to_string());
+        assert_eq!(value["state"], "terminal");
+        assert_eq!(value["title"], "Architecture review");
+        assert_eq!(value["status"], "ended");
+        assert_eq!(
+            value["meeting_fetch"]["metadata"],
+            format!("buzz meetings show {meeting_id}")
+        );
+        assert_eq!(
+            value["meeting_fetch"]["board"],
+            format!("buzz meetings board get {meeting_id}")
+        );
+        assert!(value.get("content").is_none());
+        assert!(value.get("board").is_none());
+        assert!(value.get("speech").is_none());
     }
 
     #[test]

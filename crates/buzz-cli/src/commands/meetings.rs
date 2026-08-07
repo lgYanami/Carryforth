@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,15 +19,16 @@ const KIND_MEETING_FLOOR_CLAIM: u32 = 42102;
 const KIND_MEETING_ROUND_STATE: u32 = 42103;
 const KIND_MEETING_FLOOR_SIGNAL: u32 = 42104;
 const KIND_MEETING_BOARD: u32 = buzz_sdk::kind::KIND_MEETING_BOARD;
+const MEETING_METADATA_CHUNK_SIZE: usize = 200;
 
 #[derive(Debug, Serialize)]
-struct MeetingSummary {
-    meeting_id: String,
-    title: String,
-    description: Option<String>,
-    room_kind: String,
-    status: &'static str,
-    updated_at: u64,
+pub(crate) struct MeetingSummary {
+    pub(crate) meeting_id: String,
+    pub(crate) title: String,
+    pub(crate) description: Option<String>,
+    pub(crate) room_kind: String,
+    pub(crate) status: &'static str,
+    pub(crate) updated_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -615,6 +616,52 @@ async fn fetch_meeting_metadata(
     let response = client.query(&filter).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap_or_default();
     Ok(events.into_iter().find(is_meeting_metadata))
+}
+
+/// Read bounded, metadata-only Meeting summaries for Project Context output.
+///
+/// Missing or malformed individual metadata heads remain absent so callers can
+/// retain the verified Edge and mark only that coordinate detail unavailable.
+pub(crate) async fn fetch_meeting_context_summaries(
+    client: &BuzzClient,
+    requested: &BTreeSet<Uuid>,
+) -> Result<BTreeMap<Uuid, MeetingSummary>, CliError> {
+    let mut summaries = BTreeMap::new();
+    let requested_ids = requested.iter().copied().collect::<Vec<_>>();
+    for chunk in requested_ids.chunks(MEETING_METADATA_CHUNK_SIZE) {
+        let ids = chunk.iter().map(Uuid::to_string).collect::<Vec<_>>();
+        let filter = serde_json::json!({
+            "kinds": [KIND_GROUP_METADATA],
+            "#d": ids,
+            "limit": chunk.len(),
+        });
+        let response = client.query(&filter).await?;
+        let events: Vec<serde_json::Value> = serde_json::from_str(&response).map_err(|error| {
+            CliError::Other(format!(
+                "Meeting metadata response is not a JSON event array: {error}"
+            ))
+        })?;
+        for event in events {
+            let Some(summary) = meeting_summary(&event) else {
+                continue;
+            };
+            let Ok(meeting_id) = Uuid::parse_str(&summary.meeting_id) else {
+                continue;
+            };
+            if !requested.contains(&meeting_id) {
+                return Err(CliError::Other(
+                    "Meeting metadata response contained an unrequested identity".to_owned(),
+                ));
+            }
+            let replace = summaries
+                .get(&meeting_id)
+                .is_none_or(|current: &MeetingSummary| current.updated_at < summary.updated_at);
+            if replace {
+                summaries.insert(meeting_id, summary);
+            }
+        }
+    }
+    Ok(summaries)
 }
 
 async fn cmd_create_meeting(

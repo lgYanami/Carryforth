@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 ///
 /// The content hash is also part of [`contract_id`], so changing the wording
 /// invalidates old sessions even if this version is accidentally left alone.
-pub(crate) const PROJECT_SPACE_CONTRACT_VERSION: &str = "4";
+pub(crate) const PROJECT_SPACE_CONTRACT_VERSION: &str = "5";
 
 /// Stable Project Space operating contract.
 ///
@@ -25,11 +25,13 @@ Project View is the shared canonical view of the Project's current direct state.
 
 Buzz supports versioned Project Documents for durable long-form project knowledge. Documents are first-class project assets and may be referenced directly from Project View. Resources are Project View asset coordinates with a Guide Document explaining how the resource is used. When a Resource is relevant, read its Guide; when a Document is relevant, read only the needed body on demand. Project View objects may associate relevant Resources and Documents through Context References.
 
-Buzz supports undirected Project Context Edges that connect an exact, unordered set of two or more Project View or Document coordinates. Within the Project, each exact coordinate set has one Edge, and one or more Project Documents carry the explanatory context for that set. Discover relevant Edges with `buzz project-context exact`, `buzz project-context incident`, or `buzz project-context contains-all`, then read only the needed Document bodies on demand. Buzz records the structure and state; it does not infer that context is missing, stale, conflicting, or incorrect, and it does not automatically produce a Gap. When your actual work materially discovers, creates, or corrects explanatory context across coordinates, explicitly write that context back through Buzz.
+Meetings are Community-visible project meeting records. The frozen Meeting roster controls participation and actions, not who in the Community may read the record. A terminal Meeting may be used as a Project Context coordinate, but the ordinary Project Document attached to the Edge still explains why its coordinates are related. Discover relevant Edges with `buzz project-context exact`, `buzz project-context incident`, or `buzz project-context contains-all`. Read Meeting metadata with `buzz meetings show`, the Board with `buzz meetings board get`, and formal Speech with `buzz meetings history` only when needed; do not load every Meeting or its full history into each turn.
+
+Buzz supports undirected Project Context Edges that connect an exact, unordered set of two or more Project View, Document, or terminal Meeting coordinates. Within the Project, each exact coordinate set has one Edge, and one or more Project Documents carry the explanatory context for that set. Buzz records the structure and state; it does not infer that context is missing, stale, conflicting, or incorrect, does not automatically produce a Gap, and does not infer an Edge from a Meeting or its materialized output. When your actual work materially discovers, creates, or corrects explanatory context across coordinates, explicitly write that context back through Buzz.
 
 At the start of each complete turn you receive a full [Role Brief], a compact [Role Binding], or an unavailable state. These are verified, revision-bound projections, not separate facts or cached authorization. A Role Brief summarizes the current project and role situation; a Role Binding confirms that the same verified assignment and revision still apply. Use the Role Directory to find active responsibility boundaries and vacancies. Use `buzz project-view` and `buzz roles` to inspect details, full Role definitions, current assignments, checkpoints, and handoffs when the injected slice is insufficient. To immediately rebuild and read your own complete Role Brief, run `buzz roles brief --markdown`.
 
-Chat, local files, tool output, and Agent memory do not update the Project automatically. When your work materially changes Project View state, Resource information or Guide linkage, Document content, or Context References, explicitly write the change back through Buzz. Write direct current-state changes to their owning Project View objects. After a material change in progress, blockers, risks, open questions, or next steps, append a Role Checkpoint that references the underlying facts instead of duplicating them. Use Handoff for transition context; a Handoff does not end an Assignment, and an Agent cannot use it to resign itself.
+Chat, local files, tool output, and Agent memory do not update the Project automatically. When your work materially changes Meeting state, Project View state, Resource information or Guide linkage, Document content, Context References, or Project Context Edges, explicitly write the change back through Buzz using the owning surface. Write direct current-state changes to their owning Project View objects. After a material change in progress, blockers, risks, open questions, or next steps, append a Role Checkpoint that references the underlying facts instead of duplicating them. Use Handoff for transition context; a Handoff does not end an Assignment, and an Agent cannot use it to resign itself.
 
 When a user explicitly asks you to start or convene a Meeting, use `buzz meetings create` with the requested frozen roster and an initial Board. This is the only normal Meeting creation path and it creates the current complete Meeting; do not select or explain a legacy Meeting protocol. If the Relay rejects Meeting creation, report the exact failure reason and ask the requester to adjust the request. Never create an ordinary Channel, Thread, Canvas, or Huddle as a substitute for a failed Meeting. Use `buzz channels create` only when the user explicitly asks for an ordinary collaboration channel rather than a Meeting.
 
@@ -61,7 +63,7 @@ mod tests {
 
     #[test]
     fn contract_is_a_stable_platform_section() {
-        assert_eq!(PROJECT_SPACE_CONTRACT_VERSION, "4");
+        assert_eq!(PROJECT_SPACE_CONTRACT_VERSION, "5");
         assert!(PROJECT_SPACE_SECTION.starts_with("[Project Space]\n"));
         for required in [
             "One Buzz Community is one Project",
@@ -85,7 +87,14 @@ mod tests {
             "read only the needed body on demand",
             "Context References",
             "undirected Project Context Edges",
-            "an exact, unordered set of two or more Project View or Document coordinates",
+            "Meetings are Community-visible project meeting records",
+            "frozen Meeting roster controls participation and actions",
+            "terminal Meeting may be used as a Project Context coordinate",
+            "`buzz meetings show`",
+            "`buzz meetings board get`",
+            "`buzz meetings history`",
+            "do not load every Meeting or its full history into each turn",
+            "an exact, unordered set of two or more Project View, Document, or terminal Meeting coordinates",
             "Within the Project, each exact coordinate set has one Edge",
             "one or more Project Documents carry the explanatory context",
             "`buzz project-context exact`",
@@ -94,6 +103,7 @@ mod tests {
             "records the structure and state",
             "does not infer that context is missing, stale, conflicting, or incorrect",
             "does not automatically produce a Gap",
+            "does not infer an Edge from a Meeting or its materialized output",
             "actual work materially discovers, creates, or corrects explanatory context across coordinates",
             "explicitly write that context back through Buzz",
             "materially changes",
@@ -135,7 +145,7 @@ mod tests {
     #[test]
     fn contract_id_changes_with_version_or_content() {
         let current = contract_id();
-        assert_ne!(current, content_id("3", PROJECT_SPACE_SECTION.as_bytes()));
+        assert_ne!(current, content_id("4", PROJECT_SPACE_SECTION.as_bytes()));
         assert_ne!(
             current,
             content_id(PROJECT_SPACE_CONTRACT_VERSION, b"[Project Space]\nchanged")

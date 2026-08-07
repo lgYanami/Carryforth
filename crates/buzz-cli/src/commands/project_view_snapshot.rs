@@ -38,7 +38,9 @@ use crate::client::BuzzClient;
 use crate::error::CliError;
 
 pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
-pub(crate) const PROJECT_CONTEXT_EDGE_EXTENSION: &str = "buzz-project-context-edge-v1";
+pub(crate) const PROJECT_CONTEXT_EDGE_EXTENSION: &str =
+    buzz_project_context::PROJECT_CONTEXT_CAPABILITY;
+const LEGACY_PROJECT_CONTEXT_EDGE_EXTENSION: &str = "buzz-project-context-edge-v1";
 pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_OBJECT_PAGE_SIZE: usize = 500;
@@ -60,6 +62,7 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) schema: ProjectViewSchema,
     pub(crate) context_enabled: bool,
     pub(crate) context_edge_enabled: bool,
+    pub(crate) context_edge_migration_required: bool,
     pub(crate) document_enabled: bool,
 }
 
@@ -144,6 +147,10 @@ fn identity_from_nip11(
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_CONTEXT_EDGE_EXTENSION),
+        context_edge_migration_required: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == LEGACY_PROJECT_CONTEXT_EDGE_EXTENSION),
         document_enabled: info
             .supported_extensions
             .iter()
@@ -676,7 +683,7 @@ mod tests {
     use super::{
         identity_from_nip11, is_managed_runtime_value, runtime_fence_from_file,
         runtime_fence_from_legacy_env, v3_identity_from_nip11, Nip11Document, ProjectViewSchema,
-        PROJECT_VIEW_V3_EXTENSION,
+        PROJECT_CONTEXT_EDGE_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
     };
     use buzz_project_view::v2::RuntimeFence;
     use nostr::Keys;
@@ -713,6 +720,28 @@ mod tests {
         .expect("v3 bootstrap readback needs the Relay signer, not runtime readiness");
         assert_eq!(bootstrap.schema, ProjectViewSchema::V3);
         assert_eq!(bootstrap.relay_pubkey.to_hex(), relay_pubkey);
+
+        let context_v2 = identity_from_nip11(
+            Nip11Document {
+                supported_extensions: vec![PROJECT_CONTEXT_EDGE_EXTENSION.to_owned()],
+                relay_self: Some(relay_pubkey.clone()),
+            },
+            ProjectViewSchema::V3,
+        )
+        .expect("read Project Context v2 identity");
+        assert!(context_v2.context_edge_enabled);
+        assert!(!context_v2.context_edge_migration_required);
+
+        let context_v1 = identity_from_nip11(
+            Nip11Document {
+                supported_extensions: vec!["buzz-project-context-edge-v1".to_owned()],
+                relay_self: Some(relay_pubkey),
+            },
+            ProjectViewSchema::V3,
+        )
+        .expect("read frozen Project Context v1 identity");
+        assert!(!context_v1.context_edge_enabled);
+        assert!(context_v1.context_edge_migration_required);
     }
 
     #[test]

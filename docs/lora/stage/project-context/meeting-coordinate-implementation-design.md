@@ -1,6 +1,6 @@
 # Meeting 作为 Project Context 坐标与 Community 可见性实现设计
 
-> 状态：产品与技术边界已确认，分阶段实现中；阶段 1、2 已完成并通过实现审查
+> 状态：产品与技术边界已确认，分阶段实现中；阶段 1～3 已完成并通过实现审查
 >
 > 日期：2026-08-07
 >
@@ -984,6 +984,13 @@ schema migration、数据删除或隐式 source 修改。
 完成标准：旧 Edge key 不变，Meeting mixed Edge 可在 isolated Relay 完整 attach/query/detach。
 
 ### 阶段 3：CLI 与 ACP
+
+> 交付状态：已完成。CLI 仅认 `buzz-project-context-edge-v2`，对仍公告 v1 的 Relay 给出明确
+> `migration_required`，支持 `meeting:<uuid>` 的 query/attach/detach，并以 typed coordinate、轻量
+> Meeting metadata 和 `show` / `board get` / `history` 按需命令输出；metadata 缺失只降级对应 detail，
+> 不丢弃已验证 Edge。ACP Project Space contract 已独立升版，明确 Community read 与 frozen roster
+> action 边界、普通 Context Document 的解释职责、按需读取和禁止自动推断 Edge。实现审查同时保留了
+> 既有稳定“explicitly write the change back through Buzz”合同短语，避免旧 harness 行为回退。
 
 - CLI token、typed output、错误语义；
 - Project Space stable contract；
