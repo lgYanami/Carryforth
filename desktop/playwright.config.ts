@@ -105,6 +105,7 @@ export default defineConfig({
         "**/meeting-create.spec.ts",
         "**/meeting-floor.spec.ts",
         "**/meeting-host.spec.ts",
+        "**/meeting-agent-activity.spec.ts",
         "**/meeting-actions.spec.ts",
         "**/meeting-recovery.spec.ts",
         "**/meeting-sidebar-attention.spec.ts",

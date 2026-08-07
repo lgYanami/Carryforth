@@ -62,9 +62,11 @@ import { useChannelsQuery } from "@/features/channels/hooks";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
+  allowInterruptTurn?: boolean;
   channel: Channel | null;
   channelId?: string | null;
   canInterruptTurn: boolean;
+  emptyDescription?: string;
   layout?: "standalone" | "split";
   isSinglePanelView?: boolean;
   profiles?: UserProfileLookup;
@@ -77,20 +79,24 @@ type AgentSessionThreadPanelProps = {
    */
   onBack?: () => void;
   onClose: () => void;
+  scopeLabelOverride?: string;
   widthPx: number;
   transparentChrome?: boolean;
 };
 
 export function AgentSessionThreadPanel({
   agent,
+  allowInterruptTurn = true,
   canInterruptTurn,
   channel,
   channelId = null,
+  emptyDescription,
   layout = "standalone",
   isSinglePanelView = false,
   profiles,
   onBack,
   onClose,
+  scopeLabelOverride,
   widthPx,
   transparentChrome = false,
 }: AgentSessionThreadPanelProps) {
@@ -103,7 +109,8 @@ export function AgentSessionThreadPanel({
     agent.pubkey,
     sessionChannelId,
   );
-  const canStopCurrentTurn = isWorking && canInterruptTurn;
+  const canStopCurrentTurn =
+    allowInterruptTurn && isWorking && canInterruptTurn;
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -232,11 +239,13 @@ export function AgentSessionThreadPanel({
         ?.name ?? null
     );
   }, [channel, channelsQuery.data, sessionChannelId]);
-  const scopeLabel = sessionChannelId
-    ? scopeChannelName
-      ? `#${scopeChannelName}`
-      : "1 channel"
-    : "All channels";
+  const scopeLabel =
+    scopeLabelOverride ??
+    (sessionChannelId
+      ? scopeChannelName
+        ? `#${scopeChannelName}`
+        : "1 channel"
+      : "All channels");
   const animateActivity = useTranscriptAnimationEnabled();
   const showTimestamps = useTranscriptTimestampsEnabled();
   async function handleInterruptTurn() {
@@ -373,36 +382,40 @@ export function AgentSessionThreadPanel({
                 tabIndex={-1}
               />
             </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              className="items-start gap-3"
-              data-testid="agent-session-stop-turn"
-              disabled={!canStopCurrentTurn}
-              onSelect={() => {
-                void handleInterruptTurn();
-              }}
-              title={
-                canStopCurrentTurn
-                  ? "Interrupt the current ACP turn without stopping the agent process."
-                  : isWorking
-                    ? "Only locally managed agents can be interrupted from this community."
-                    : "Available while the agent is working."
-              }
-            >
-              <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm font-medium">
-                  Stop current turn
-                </span>
-                {!canStopCurrentTurn ? (
-                  <span className="mt-0.5 block text-xs text-muted-foreground">
-                    {isWorking
-                      ? "Only available for locally managed agents."
-                      : "Available while the agent is working."}
+            {allowInterruptTurn ? (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="items-start gap-3"
+                  data-testid="agent-session-stop-turn"
+                  disabled={!canStopCurrentTurn}
+                  onSelect={() => {
+                    void handleInterruptTurn();
+                  }}
+                  title={
+                    canStopCurrentTurn
+                      ? "Interrupt the current ACP turn without stopping the agent process."
+                      : isWorking
+                        ? "Only locally managed agents can be interrupted from this community."
+                        : "Available while the agent is working."
+                  }
+                >
+                  <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">
+                      Stop current turn
+                    </span>
+                    {!canStopCurrentTurn ? (
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {isWorking
+                          ? "Only available for locally managed agents."
+                          : "Available while the agent is working."}
+                      </span>
+                    ) : null}
                   </span>
-                ) : null}
-              </span>
-            </DropdownMenuItem>
+                </DropdownMenuItem>
+              </>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
       ) : null}
@@ -466,9 +479,10 @@ export function AgentSessionThreadPanel({
             channelId={sessionChannelId}
             className="border-0 bg-transparent px-0 py-2 shadow-none"
             emptyDescription={
-              sessionChannelId
+              emptyDescription ??
+              (sessionChannelId
                 ? `Mention ${agent.name} in the channel to see its work here.`
-                : `Mention ${agent.name} in any channel to see its work here.`
+                : `Mention ${agent.name} in any channel to see its work here.`)
             }
             profiles={profiles}
             rawLayout="exclusive"

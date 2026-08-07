@@ -3,12 +3,22 @@ import { AlertTriangle, ClipboardList, RefreshCw } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useChannelWorkingAgentPubkeys } from "@/features/agents/agentWorkingSignal";
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
 import {
   useMeetingActivities,
   useMeetingSnapshot,
   useMeetingSpeeches,
 } from "@/features/meeting/hooks";
+import {
+  buildMeetingAgentActivityAgents,
+  selectWorkingMeetingAgents,
+} from "@/features/meeting/meetingAgentActivityModel";
 import { useMeetingBoardDraft } from "@/features/meeting/useMeetingBoardDraft";
+import { useMeetingAgentActivity } from "@/features/meeting/useMeetingAgentActivity";
 import { useMeetingAuthority } from "@/features/meeting/useMeetingAuthority";
 import { useResizableMeetingBoardWidth } from "@/features/meeting/useResizableMeetingBoardWidth";
 import { useCommunities } from "@/features/communities/useCommunities";
@@ -37,10 +47,11 @@ import {
   SheetDescription,
   SheetHeader,
   SheetTitle,
-  SheetTrigger,
 } from "@/shared/ui/sheet";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import { MeetingBoardPanel } from "./MeetingBoardPanel";
+import { MeetingAgentActivityDock } from "./MeetingAgentActivityDock";
+import { MeetingAgentActivityRail } from "./MeetingAgentActivityRail";
 import { MeetingActivityPanel } from "./MeetingActivityPanel";
 import { MeetingFloorDock } from "./MeetingFloorDock";
 import { MeetingHeader } from "./MeetingHeader";
@@ -150,6 +161,13 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   const snapshotQuery = useMeetingSnapshot(meetingId);
   const snapshot =
     snapshotQuery.data?.status === "ready" ? snapshotQuery.data.snapshot : null;
+  const managedAgentsQuery = useManagedAgentsQuery({
+    enabled: snapshot !== null,
+  });
+  const relayAgentsQuery = useRelayAgentsQuery({
+    enabled: snapshot !== null,
+  });
+  const meetingWorkingPubkeys = useChannelWorkingAgentPubkeys(meetingId);
   const meetingAuthority = useMeetingAuthority({
     hasVerifiedSnapshot: snapshot !== null,
     readError: Boolean(snapshotQuery.error),
@@ -336,25 +354,6 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     [meetingId],
   );
   const autoOpenedBoardKeyRef = React.useRef<string | null>(null);
-
-  React.useEffect(() => {
-    if (!boardEditable || !boardDraft.controlToken) return;
-    const autoOpenKey = `${meetingId}:${boardDraft.controlToken}:${boardPanelIsOverlay ? "overlay" : "wide"}`;
-    if (autoOpenedBoardKeyRef.current === autoOpenKey) return;
-    autoOpenedBoardKeyRef.current = autoOpenKey;
-    if (boardPanelIsOverlay) {
-      setBoardSheetOpen(true);
-    } else {
-      setWideBoardOpen(true);
-    }
-  }, [
-    boardDraft.controlToken,
-    boardEditable,
-    boardPanelIsOverlay,
-    meetingId,
-    setBoardSheetOpen,
-    setWideBoardOpen,
-  ]);
   const speechesQuery = useMeetingSpeeches({
     meetingId,
     enabled: snapshot !== null,
@@ -379,6 +378,65 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     enabled: participantPubkeys.length > 0,
   });
   const profiles = profilesQuery.data?.profiles ?? EMPTY_PROFILES;
+  const meetingActivityAgents = React.useMemo(
+    () =>
+      snapshot
+        ? buildMeetingAgentActivityAgents({
+            currentPubkey: identityQuery.data?.pubkey,
+            managedAgents: managedAgentsQuery.data ?? [],
+            participants: snapshot.participants,
+            profiles,
+            relayAgents: relayAgentsQuery.data ?? [],
+          })
+        : [],
+    [
+      identityQuery.data?.pubkey,
+      managedAgentsQuery.data,
+      profiles,
+      relayAgentsQuery.data,
+      snapshot,
+    ],
+  );
+  const workingMeetingActivityAgents = React.useMemo(
+    () =>
+      snapshot
+        ? selectWorkingMeetingAgents({
+            agents: meetingActivityAgents,
+            lifecycle: snapshot.lifecycle,
+            workingPubkeys: meetingWorkingPubkeys,
+          })
+        : [],
+    [meetingActivityAgents, meetingWorkingPubkeys, snapshot],
+  );
+  const {
+    closeAgentActivity: handleCloseAgentActivity,
+    openAgentActivity: handleOpenAgentActivity,
+    selectedAgent: selectedAgentActivityAgent,
+    selectedPubkey: selectedAgentActivityPubkey,
+    showMeetingBoard: handleBackToMeetingBoard,
+  } = useMeetingAgentActivity({
+    agents: meetingActivityAgents,
+    boardPanelIsOverlay,
+    boardSheetOpen,
+    scopeKey: meetingCommandScopeKey,
+    setBoardSheetOpen,
+    setWideBoardOpen,
+    wideBoardOpen,
+  });
+
+  React.useEffect(() => {
+    if (!boardEditable || !boardDraft.controlToken) return;
+    const autoOpenKey = `${meetingId}:${boardDraft.controlToken}:${boardPanelIsOverlay ? "overlay" : "wide"}`;
+    if (autoOpenedBoardKeyRef.current === autoOpenKey) return;
+    autoOpenedBoardKeyRef.current = autoOpenKey;
+    handleBackToMeetingBoard();
+  }, [
+    boardDraft.controlToken,
+    boardEditable,
+    boardPanelIsOverlay,
+    handleBackToMeetingBoard,
+    meetingId,
+  ]);
   const speeches = React.useMemo(() => {
     const byId = new Map<string, MeetingSpeech>();
     for (const page of speechesQuery.data?.pages ?? []) {
@@ -471,7 +529,21 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     readySnapshot.lifecycle === "aborted";
   const statusText = meetingStatusText(readySnapshot, profiles);
   const sourceChannelId = readySnapshot.sourceChannelId;
-  const boardOpen = boardPanelIsOverlay ? boardSheetOpen : wideBoardOpen;
+  const agentActivityOpen = selectedAgentActivityAgent !== null;
+  const boardOpen =
+    !agentActivityOpen &&
+    (boardPanelIsOverlay ? boardSheetOpen : wideBoardOpen);
+  const handleBoardTrigger = () => {
+    if (agentActivityOpen) {
+      handleBackToMeetingBoard();
+      return;
+    }
+    if (boardPanelIsOverlay) {
+      setBoardSheetOpen(!boardSheetOpen);
+    } else {
+      setWideBoardOpen(!wideBoardOpen);
+    }
+  };
   const boardTrigger = (
     <Button
       aria-controls={
@@ -481,9 +553,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       }
       aria-expanded={boardOpen}
       data-testid="meeting-board-trigger"
-      onClick={
-        boardPanelIsOverlay ? undefined : () => setWideBoardOpen(!wideBoardOpen)
-      }
+      onClick={handleBoardTrigger}
       size="sm"
       title={boardOpen ? "Hide Meeting board" : "Show Meeting board"}
       variant="outline"
@@ -493,35 +563,46 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     </Button>
   );
   const boardControl = boardPanelIsOverlay ? (
-    <Sheet onOpenChange={setBoardSheetOpen} open={boardSheetOpen}>
-      <SheetTrigger asChild>{boardTrigger}</SheetTrigger>
-      <SheetContent
-        className="p-0 sm:max-w-xl"
-        id="meeting-board-overlay-panel"
-      >
-        <SheetHeader className="sr-only">
-          <SheetTitle>Meeting board</SheetTitle>
-          <SheetDescription>
-            The current Board maintained by the host.
-          </SheetDescription>
-        </SheetHeader>
-        <MeetingBoardPanel
-          board={readySnapshot.board}
-          className="h-full"
-          editor={
-            boardEditable
-              ? {
-                  disabled: !meetingAuthority.authorityAvailable,
-                  onChange: boardDraft.setValue,
-                  value: boardDraft.value,
-                }
-              : undefined
+    <>
+      {boardTrigger}
+      <Sheet
+        onOpenChange={(open) => {
+          if (open && agentActivityOpen) {
+            handleBackToMeetingBoard();
+            return;
           }
-          onDismissStaleDraft={boardDraft.dismissStale}
-          staleDraft={boardDraft.stale}
-        />
-      </SheetContent>
-    </Sheet>
+          setBoardSheetOpen(open);
+        }}
+        open={boardSheetOpen && !agentActivityOpen}
+      >
+        <SheetContent
+          className="p-0 sm:max-w-xl"
+          id="meeting-board-overlay-panel"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>Meeting board</SheetTitle>
+            <SheetDescription>
+              The current Board maintained by the host.
+            </SheetDescription>
+          </SheetHeader>
+          <MeetingBoardPanel
+            board={readySnapshot.board}
+            className="h-full"
+            editor={
+              boardEditable
+                ? {
+                    disabled: !meetingAuthority.authorityAvailable,
+                    onChange: boardDraft.setValue,
+                    value: boardDraft.value,
+                  }
+                : undefined
+            }
+            onDismissStaleDraft={boardDraft.dismissStale}
+            staleDraft={boardDraft.stale}
+          />
+        </SheetContent>
+      </Sheet>
+    </>
   ) : (
     boardTrigger
   );
@@ -604,6 +685,39 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
               profiles={profiles}
             />
           </div>
+        </SheetContent>
+      </Sheet>
+
+      <Sheet
+        onOpenChange={(open) => {
+          if (!open && selectedAgentActivityAgent) {
+            handleCloseAgentActivity();
+          }
+        }}
+        open={boardPanelIsOverlay && selectedAgentActivityAgent !== null}
+      >
+        <SheetContent
+          className="flex p-0 sm:max-w-lg"
+          data-testid="meeting-agent-activity-sheet"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>Agent activity</SheetTitle>
+            <SheetDescription>
+              ACP activity for the selected Agent in this Meeting.
+            </SheetDescription>
+          </SheetHeader>
+          {selectedAgentActivityAgent ? (
+            <MeetingAgentActivityRail
+              key={`${meetingCommandScopeKey}:${selectedAgentActivityAgent.pubkey}`}
+              agent={selectedAgentActivityAgent}
+              meetingId={meetingId}
+              meetingTitle={readySnapshot.title}
+              onBack={handleBackToMeetingBoard}
+              onClose={handleCloseAgentActivity}
+              profiles={profiles}
+              widthPx={boardWidth.widthPx}
+            />
+          ) : null}
         </SheetContent>
       </Sheet>
 
@@ -690,6 +804,14 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
               </div>
             ) : null}
           </main>
+          <MeetingAgentActivityDock
+            key={meetingCommandScopeKey}
+            agents={workingMeetingActivityAgents}
+            meetingId={meetingId}
+            onOpenAgentActivity={handleOpenAgentActivity}
+            openAgentPubkey={selectedAgentActivityPubkey}
+            profiles={profiles}
+          />
           <MeetingFloorDock
             key={meetingCommandScopeKey}
             actionRenewalError={
@@ -713,16 +835,29 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
             snapshot={readySnapshot}
           />
         </div>
-        {!boardPanelIsOverlay && wideBoardOpen ? (
+        {!boardPanelIsOverlay &&
+        (wideBoardOpen || selectedAgentActivityAgent) ? (
           <aside
-            aria-label="Meeting board panel"
+            aria-label={
+              selectedAgentActivityAgent
+                ? `${selectedAgentActivityAgent.name} Agent activity panel`
+                : "Meeting board panel"
+            }
             className="relative flex min-h-0 shrink-0"
-            data-testid="meeting-board-wide"
-            id="meeting-board-wide-panel"
+            data-testid={
+              selectedAgentActivityAgent
+                ? "meeting-agent-activity-wide"
+                : "meeting-board-wide"
+            }
+            id={
+              selectedAgentActivityAgent
+                ? "meeting-agent-activity-wide-panel"
+                : "meeting-board-wide-panel"
+            }
             style={{ width: boardWidth.widthPx }}
           >
             <button
-              aria-label="Resize Meeting board"
+              aria-label="Resize Meeting side panel"
               className="group absolute inset-y-0 left-0 z-40 w-3 -translate-x-1/2 cursor-col-resize"
               data-testid="meeting-board-resize-handle"
               onDoubleClick={boardWidth.reset}
@@ -733,21 +868,34 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
             >
               <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/80 group-focus-visible:bg-ring" />
             </button>
-            <MeetingBoardPanel
-              board={readySnapshot.board}
-              className="h-full w-full border-l"
-              editor={
-                boardEditable
-                  ? {
-                      disabled: !meetingAuthority.authorityAvailable,
-                      onChange: boardDraft.setValue,
-                      value: boardDraft.value,
-                    }
-                  : undefined
-              }
-              onDismissStaleDraft={boardDraft.dismissStale}
-              staleDraft={boardDraft.stale}
-            />
+            {selectedAgentActivityAgent ? (
+              <MeetingAgentActivityRail
+                key={`${meetingCommandScopeKey}:${selectedAgentActivityAgent.pubkey}`}
+                agent={selectedAgentActivityAgent}
+                meetingId={meetingId}
+                meetingTitle={readySnapshot.title}
+                onBack={handleBackToMeetingBoard}
+                onClose={handleCloseAgentActivity}
+                profiles={profiles}
+                widthPx={boardWidth.widthPx}
+              />
+            ) : (
+              <MeetingBoardPanel
+                board={readySnapshot.board}
+                className="h-full w-full border-l"
+                editor={
+                  boardEditable
+                    ? {
+                        disabled: !meetingAuthority.authorityAvailable,
+                        onChange: boardDraft.setValue,
+                        value: boardDraft.value,
+                      }
+                    : undefined
+                }
+                onDismissStaleDraft={boardDraft.dismissStale}
+                staleDraft={boardDraft.stale}
+              />
+            )}
           </aside>
         ) : null}
       </div>
