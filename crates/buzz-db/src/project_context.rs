@@ -13,15 +13,17 @@ use buzz_core::kind::{
 };
 use buzz_core::{CommunityId, EventId, PublicKey, StoredEvent};
 use buzz_project_context::{
-    reduce_project_context, EdgeKey, ProjectContextBindingProjection, ProjectContextBindingState,
-    ProjectContextCatalog, ProjectContextCommand, ProjectContextCoordinate, ProjectContextEdge,
-    ProjectContextError, ProjectContextOperation, ProjectContextReceipt, ProjectContextTransition,
-    MAX_SAFE_REVISION, PROJECT_CONTEXT_SCHEMA_VERSION,
+    reduce_project_context, ChangedContextBinding, EdgeKey, ProjectContextBindingProjection,
+    ProjectContextBindingState, ProjectContextCatalog, ProjectContextCommand,
+    ProjectContextCoordinate, ProjectContextEdge, ProjectContextError, ProjectContextOperation,
+    ProjectContextReceipt, ProjectContextTransition, MAX_SAFE_REVISION,
+    PROJECT_CONTEXT_SCHEMA_VERSION,
 };
 use buzz_project_view::ProjectViewObjectType;
 use buzz_sdk::project_context::{
-    parse_project_context_binding, parse_project_context_command, parse_project_context_meta,
-    verify_project_context_binding_observation, verify_project_context_projection_bundle,
+    legacy_v1_migration, parse_project_context_binding, parse_project_context_command,
+    parse_project_context_meta, verify_project_context_binding_observation,
+    verify_project_context_projection_bundle,
 };
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -64,6 +66,18 @@ pub enum ProjectContextWriteError {
     /// A prepared command/projection bundle does not match the locked basis.
     #[error("invalid prepared Project Context commit: {0}")]
     InvalidCommit(String),
+    /// The supplied Meeting coordinate does not exist in this Community.
+    #[error("Project Context Meeting coordinate was not found")]
+    MeetingNotFound,
+    /// The supplied UUID names an ordinary Channel rather than a Meeting.
+    #[error("Project Context coordinate is not a Meeting")]
+    NotAMeeting,
+    /// The supplied Meeting is still active.
+    #[error("Project Context Meeting coordinate is not terminal")]
+    MeetingNotTerminal,
+    /// The supplied Meeting has an incomplete or inconsistent terminal chain.
+    #[error("Project Context Meeting terminal evidence is invalid")]
+    MeetingTerminalInvalid,
 }
 
 /// Convenient Project Context write result.
@@ -72,6 +86,8 @@ pub type ProjectContextWriteResult<T> = Result<T, ProjectContextWriteError>;
 /// Durable Project-scoped catalog metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectContextStateMetadata {
+    /// Current Project Context wire schema version.
+    pub schema_version: u16,
     /// Current global Context revision.
     pub context_revision: u64,
     /// Number of active coordinate-set edges.
@@ -181,6 +197,8 @@ pub struct ProjectContextFeatureStatus {
     pub maintenance_state: String,
     /// Current Context revision when initialized.
     pub context_revision: Option<u64>,
+    /// Current Project Context wire schema when initialized.
+    pub context_schema_version: Option<u16>,
     /// Canonical active Edge count when initialized.
     pub active_edge_count: Option<u64>,
     /// Canonical active binding count when initialized.
@@ -242,6 +260,8 @@ pub struct ProjectContextReprojectContext {
     pub source_generation: u64,
     /// Projection signer visible before this maintenance operation.
     pub source_pubkey: PublicKey,
+    /// Wire schema visible before this maintenance operation.
+    pub source_schema_version: u16,
     /// Exact current active and deleted binding heads rebuilt for the target generation.
     pub bindings: Vec<ProjectContextBindingProjection>,
 }
@@ -461,7 +481,7 @@ impl Db {
                     c.project_view_schema_version, maintenance.state AS maintenance_state, \
                     document_state.schema_version AS document_schema_version, \
                     document_state.projection_pubkey AS document_projection_pubkey, \
-                    state.projection_pubkey \
+                    state.schema_version AS context_schema_version, state.projection_pubkey \
              FROM communities c \
              JOIN project_view_maintenance maintenance ON maintenance.community_id = c.id \
              LEFT JOIN project_document_state document_state \
@@ -495,7 +515,8 @@ impl Db {
         let schema_version: i16 = row.try_get("project_view_schema_version")?;
         let maintenance_state: String = row.try_get("maintenance_state")?;
         let stored_pubkey: Option<Vec<u8>> = row.try_get("projection_pubkey")?;
-        let initialized = stored_pubkey.is_some();
+        let context_schema_version: Option<i16> = row.try_get("context_schema_version")?;
+        let initialized = stored_pubkey.is_some() && context_schema_version == Some(2);
         let signer_matches = stored_pubkey
             .as_deref()
             .is_some_and(|bytes| bytes == expected_pubkey.as_bytes());
@@ -672,14 +693,28 @@ impl Db {
                 )
                 .into());
             }
-            let signer: Option<Vec<u8>> = sqlx::query_scalar(
-                "SELECT projection_pubkey FROM project_context_edge_state \
+            let state: Option<(i16, Vec<u8>)> = sqlx::query_as(
+                "SELECT schema_version, projection_pubkey \
+                 FROM project_context_edge_state \
                  WHERE community_id = $1 FOR UPDATE",
             )
             .bind(community_id.as_uuid())
             .fetch_optional(&mut *tx)
             .await?;
-            if signer.as_deref() != Some(expected_pubkey.as_bytes()) {
+            if state.as_ref().map(|(schema, _)| *schema)
+                != Some(i16::try_from(PROJECT_CONTEXT_SCHEMA_VERSION).map_err(|_| {
+                    DbError::InvalidData("Project Context schema version overflow".to_owned())
+                })?)
+            {
+                return Err(DbError::InvalidData(
+                    "Project Context Edge schema v2 reprojection must complete before enable"
+                        .to_owned(),
+                )
+                .into());
+            }
+            if state.as_ref().map(|(_, signer)| signer.as_slice())
+                != Some(expected_pubkey.as_bytes())
+            {
                 return Err(DbError::InvalidData(
                     "Project Context Edge stable signer does not match initialized state"
                         .to_owned(),
@@ -813,7 +848,7 @@ impl Db {
                     AND maintenance.state = 'normal' \
                     AND view_state.schema_version = 3 \
                     AND document_state.schema_version = 1 \
-                    AND context_state.schema_version = 1 \
+                    AND context_state.schema_version = 2 \
                     AND view_state.projection_pubkey = $2 \
                     AND document_state.projection_pubkey = $2 \
                     AND context_state.projection_pubkey = $2 \
@@ -878,7 +913,7 @@ async fn store_empty_project_context_catalog_in_tx(
     let community_id = prepared.catalog.project_id();
     let expected_pubkey = prepared.meta_projection.pubkey;
     if let Some(row) = sqlx::query(
-        "SELECT context_revision, active_edge_count, bound_document_count, \
+        "SELECT schema_version, context_revision, active_edge_count, bound_document_count, \
                 last_change_id, last_actor_pubkey, projection_pubkey, \
                 projection_generation, meta_projection_event_id, initialized_at, updated_at \
          FROM project_context_edge_state WHERE community_id = $1 FOR UPDATE",
@@ -896,7 +931,8 @@ async fn store_empty_project_context_catalog_in_tx(
         .bind(community_id.as_uuid())
         .fetch_one(&mut **tx)
         .await?;
-        let exact = metadata.context_revision == 0
+        let exact = metadata.schema_version == PROJECT_CONTEXT_SCHEMA_VERSION
+            && metadata.context_revision == 0
             && metadata.active_edge_count == 0
             && metadata.bound_document_count == 0
             && metadata.last_change_id.is_none()
@@ -954,7 +990,7 @@ async fn store_empty_project_context_catalog_in_tx(
             (community_id, schema_version, context_revision, active_edge_count, \
              bound_document_count, projection_pubkey, projection_generation, \
              meta_projection_event_id, initialized_at, updated_at) \
-         VALUES ($1, 1, 0, 0, 0, $2, 1, $3, $4, $4)",
+         VALUES ($1, 2, 0, 0, 0, $2, 1, $3, $4, $4)",
     )
     .bind(community_id.as_uuid())
     .bind(expected_pubkey.as_bytes())
@@ -970,6 +1006,7 @@ const PROJECT_CONTEXT_STATUS_SQL: &str =
             c.project_context_edge_enabled, c.project_view_schema_version, \
             c.project_view_enabled, c.project_document_enabled, \
             maintenance.state AS maintenance_state, \
+            state.schema_version AS context_schema_version, \
             state.context_revision, state.active_edge_count, state.bound_document_count, \
             state.projection_generation, state.projection_pubkey, \
             (SELECT count(*)::bigint FROM project_context_edges edge \
@@ -1009,7 +1046,7 @@ impl ProjectContextReprojectTx {
             ));
         }
         let state_row = sqlx::query(
-            "SELECT context_revision, active_edge_count, bound_document_count, \
+            "SELECT schema_version, context_revision, active_edge_count, bound_document_count, \
                     last_change_id, last_actor_pubkey, projection_pubkey, \
                     projection_generation, meta_projection_event_id, initialized_at, updated_at \
              FROM project_context_edge_state WHERE community_id = $1 FOR UPDATE",
@@ -1023,6 +1060,19 @@ impl ProjectContextReprojectTx {
             )
         })?;
         let metadata = state_metadata_from_row(&state_row)?;
+        if !matches!(metadata.schema_version, 1 | PROJECT_CONTEXT_SCHEMA_VERSION) {
+            return Err(ProjectContextWriteError::InvalidCommit(format!(
+                "unsupported Project Context reprojection source schema {}",
+                metadata.schema_version
+            )));
+        }
+        if !context_projection_parity(&mut self.tx, self.community_id, &metadata.projection_pubkey)
+            .await?
+        {
+            return Err(ProjectContextWriteError::InvalidCommit(
+                "source Project Context generation failed cryptographic parity".to_owned(),
+            ));
+        }
         let projection_generation = metadata
             .projection_generation
             .checked_add(1)
@@ -1186,6 +1236,7 @@ impl ProjectContextReprojectTx {
             catalog,
             source_generation: metadata.projection_generation,
             source_pubkey: metadata.projection_pubkey,
+            source_schema_version: metadata.schema_version,
             bindings,
         };
         self.loaded = Some(context.clone());
@@ -1321,10 +1372,11 @@ impl ProjectContextReprojectTx {
         }
         let state_update = sqlx::query(
             "UPDATE project_context_edge_state \
-             SET projection_pubkey = $2, projection_generation = $3, \
+             SET schema_version = 2, projection_pubkey = $2, projection_generation = $3, \
                  meta_projection_event_id = $4 \
              WHERE community_id = $1 AND projection_pubkey = $5 \
-               AND projection_generation = $6 AND context_revision = $7",
+               AND projection_generation = $6 AND context_revision = $7 \
+               AND schema_version = $8",
         )
         .bind(self.community_id.as_uuid())
         .bind(self.target_pubkey.as_bytes())
@@ -1342,6 +1394,11 @@ impl ProjectContextReprojectTx {
             loaded.catalog.context_revision(),
             "context_revision",
         )?)
+        .bind(i16::try_from(loaded.source_schema_version).map_err(|_| {
+            ProjectContextWriteError::InvalidCommit(
+                "source Project Context schema does not fit SMALLINT".to_owned(),
+            )
+        })?)
         .execute(&mut *self.tx)
         .await?;
         if state_update.rows_affected() != 1 {
@@ -1441,7 +1498,7 @@ impl ProjectContextWriteTx {
         }
         command.validate_for_project(*self.community_id.as_uuid())?;
         let state_row = sqlx::query(
-            "SELECT context_revision, active_edge_count, bound_document_count, \
+            "SELECT schema_version, context_revision, active_edge_count, bound_document_count, \
                     last_change_id, last_actor_pubkey, projection_pubkey, \
                     projection_generation, meta_projection_event_id, initialized_at, updated_at \
              FROM project_context_edge_state WHERE community_id = $1 FOR UPDATE",
@@ -1455,7 +1512,9 @@ impl ProjectContextWriteTx {
             });
         };
         let metadata = state_metadata_from_row(&state_row)?;
-        if metadata.projection_pubkey != self.expected_projection_pubkey {
+        if metadata.schema_version != PROJECT_CONTEXT_SCHEMA_VERSION
+            || metadata.projection_pubkey != self.expected_projection_pubkey
+        {
             return Err(ProjectContextWriteError::Unavailable {
                 community_id: self.community_id,
             });
@@ -1570,8 +1629,36 @@ impl ProjectContextWriteTx {
 
         let mut all_coordinates_active = true;
         for coordinate in command.coordinates() {
-            let active =
-                coordinate_active_in_tx(&mut self.tx, self.community_id, coordinate).await?;
+            let active = match (self.operation, coordinate) {
+                (ProjectContextOperation::Detach, ProjectContextCoordinate::Meeting { .. }) => {
+                    false
+                }
+                (
+                    ProjectContextOperation::Attach,
+                    ProjectContextCoordinate::Meeting { meeting_id },
+                ) => match crate::meeting::resolve_meeting_coordinate_tx(
+                    &mut self.tx,
+                    self.community_id,
+                    *meeting_id,
+                )
+                .await?
+                {
+                    crate::meeting::MeetingCoordinateResolution::Terminal { .. } => true,
+                    crate::meeting::MeetingCoordinateResolution::Active => {
+                        return Err(ProjectContextWriteError::MeetingNotTerminal);
+                    }
+                    crate::meeting::MeetingCoordinateResolution::OrdinaryChannel => {
+                        return Err(ProjectContextWriteError::NotAMeeting);
+                    }
+                    crate::meeting::MeetingCoordinateResolution::MissingOrForeign => {
+                        return Err(ProjectContextWriteError::MeetingNotFound);
+                    }
+                    crate::meeting::MeetingCoordinateResolution::InvalidTerminal => {
+                        return Err(ProjectContextWriteError::MeetingTerminalInvalid);
+                    }
+                },
+                _ => coordinate_active_in_tx(&mut self.tx, self.community_id, coordinate).await?,
+            };
             all_coordinates_active &= active;
         }
         let context_document_active: bool = sqlx::query_scalar(
@@ -1861,6 +1948,9 @@ async fn load_normalized_coordinates(
             ("document", None) => ProjectContextCoordinate::Document {
                 document_id: coordinate_id,
             },
+            ("meeting", None) => ProjectContextCoordinate::Meeting {
+                meeting_id: coordinate_id,
+            },
             _ => {
                 return Err(ProjectContextWriteError::InvalidCommit(
                     "normalized Project Context coordinate has an invalid closed shape".to_owned(),
@@ -1907,6 +1997,10 @@ async fn coordinate_active_in_tx(
         .fetch_optional(&mut **tx)
         .await?
         .unwrap_or(false)),
+        ProjectContextCoordinate::Meeting { meeting_id } => Ok(matches!(
+            crate::meeting::resolve_meeting_coordinate_tx(tx, community_id, *meeting_id).await?,
+            crate::meeting::MeetingCoordinateResolution::Terminal { .. }
+        )),
     }
 }
 
@@ -2039,6 +2133,11 @@ fn state_metadata_from_row(
     let projection_pubkey: Vec<u8> = row.try_get("projection_pubkey")?;
     let meta_event_id: Vec<u8> = row.try_get("meta_projection_event_id")?;
     Ok(ProjectContextStateMetadata {
+        schema_version: u16::try_from(row.try_get::<i16, _>("schema_version")?).map_err(|_| {
+            ProjectContextWriteError::InvalidCommit(
+                "Project Context schema version is negative".to_owned(),
+            )
+        })?,
         context_revision: db_nonnegative_revision(
             row.try_get::<i64, _>("context_revision")?,
             "context_revision",
@@ -2096,6 +2195,14 @@ fn status_from_row(row: sqlx::postgres::PgRow) -> crate::Result<ProjectContextFe
         project_document_enabled: row.try_get("project_document_enabled")?,
         maintenance_state: row.try_get("maintenance_state")?,
         context_revision: optional_nonnegative("context_revision")?,
+        context_schema_version: row
+            .try_get::<Option<i16>, _>("context_schema_version")?
+            .map(|value| {
+                u16::try_from(value).map_err(|_| {
+                    DbError::InvalidData("negative Project Context schema version".to_owned())
+                })
+            })
+            .transpose()?,
         active_edge_count: optional_nonnegative("active_edge_count")?,
         bound_document_count: optional_nonnegative("bound_document_count")?,
         projection_generation,
@@ -2511,6 +2618,7 @@ async fn insert_coordinates(
                 *object_id,
             ),
             ProjectContextCoordinate::Document { document_id } => ("document", None, *document_id),
+            ProjectContextCoordinate::Meeting { meeting_id } => ("meeting", None, *meeting_id),
         };
         sqlx::query(
             "INSERT INTO project_context_edge_coordinates \
@@ -2631,7 +2739,7 @@ pub(crate) async fn context_projection_parity(
     expected_pubkey: &PublicKey,
 ) -> crate::Result<bool> {
     let state = sqlx::query(
-        "SELECT context_revision, active_edge_count, bound_document_count, \
+        "SELECT schema_version, context_revision, active_edge_count, bound_document_count, \
                 last_change_id, projection_generation, meta_projection_event_id, updated_at \
          FROM project_context_edge_state WHERE community_id = $1",
     )
@@ -2641,6 +2749,10 @@ pub(crate) async fn context_projection_parity(
     let Some(state) = state else {
         return Ok(false);
     };
+    let schema_version: i16 = state.try_get("schema_version")?;
+    if !matches!(schema_version, 1 | 2) {
+        return Ok(false);
+    }
     let context_revision: i64 = state.try_get("context_revision")?;
     let active_edge_count: i64 = state.try_get("active_edge_count")?;
     let bound_document_count: i64 = state.try_get("bound_document_count")?;
@@ -2660,19 +2772,29 @@ pub(crate) async fn context_projection_parity(
     else {
         return Ok(false);
     };
-    let Ok(meta) = parse_project_context_meta(&meta_event.event, expected_pubkey, community_id)
-    else {
-        return Ok(false);
+    let meta_projection = if schema_version == 1 {
+        let Ok(projection) =
+            legacy_v1_migration::verify_meta(&meta_event.event, expected_pubkey, community_id)
+        else {
+            return Ok(false);
+        };
+        projection
+    } else {
+        let Ok(verified) =
+            parse_project_context_meta(&meta_event.event, expected_pubkey, community_id)
+        else {
+            return Ok(false);
+        };
+        verified.projection
     };
-    if i64::try_from(meta.projection.context_revision).ok() != Some(context_revision)
-        || i64::try_from(meta.projection.active_edge_count).ok() != Some(active_edge_count)
-        || i64::try_from(meta.projection.bound_document_count).ok() != Some(bound_document_count)
-        || i64::try_from(meta.projection.projection_generation).ok() != Some(projection_generation)
-        || meta.projection.updated_at != updated_at
-        || (context_revision == 0 && !meta.projection.reset)
-        || (!meta.projection.reset
-            && meta
-                .projection
+    if i64::try_from(meta_projection.context_revision).ok() != Some(context_revision)
+        || i64::try_from(meta_projection.active_edge_count).ok() != Some(active_edge_count)
+        || i64::try_from(meta_projection.bound_document_count).ok() != Some(bound_document_count)
+        || i64::try_from(meta_projection.projection_generation).ok() != Some(projection_generation)
+        || meta_projection.updated_at != updated_at
+        || (context_revision == 0 && !meta_projection.reset)
+        || (!meta_projection.reset
+            && meta_projection
                 .source_event_id
                 .as_ref()
                 .map(|event_id| event_id.as_bytes().as_slice())
@@ -2738,6 +2860,9 @@ pub(crate) async fn context_projection_parity(
                 ("document", None) => ProjectContextCoordinate::Document {
                     document_id: coordinate_id,
                 },
+                ("meeting", None) => ProjectContextCoordinate::Meeting {
+                    meeting_id: coordinate_id,
+                },
                 _ => return Ok(false),
             };
             let canonical_key: String = coordinate_row.try_get("canonical_key")?;
@@ -2762,7 +2887,7 @@ pub(crate) async fn context_projection_parity(
     .await?;
     let mut active_bindings = 0_i64;
     let mut active_members_by_edge: BTreeMap<EdgeKey, u64> = BTreeMap::new();
-    let mut current_incremental_binding_verified = meta.projection.reset;
+    let mut current_incremental_binding_verified = meta_projection.reset;
     for row in binding_rows {
         let context_document_id: Uuid = row.try_get("context_document_id")?;
         let key_bytes: Vec<u8> = row.try_get("edge_key")?;
@@ -2792,28 +2917,54 @@ pub(crate) async fn context_projection_parity(
         else {
             return Ok(false);
         };
-        let Ok(binding) =
-            parse_project_context_binding(&binding_event.event, expected_pubkey, community_id)
-        else {
-            return Ok(false);
+        let binding_projection = if schema_version == 1 {
+            let Ok(projection) = legacy_v1_migration::verify_binding(
+                &binding_event.event,
+                expected_pubkey,
+                community_id,
+            ) else {
+                return Ok(false);
+            };
+            projection
+        } else {
+            let Ok(verified) =
+                parse_project_context_binding(&binding_event.event, expected_pubkey, community_id)
+            else {
+                return Ok(false);
+            };
+            verified.projection
         };
-        if binding.projection.context_document_id != context_document_id
-            || binding.projection.edge_key != edge_key
-            || &binding.projection.coordinates != coordinates
-            || binding.projection.state != binding_state
-            || i64::try_from(binding.projection.context_revision).ok()
+        if binding_projection.context_document_id != context_document_id
+            || binding_projection.edge_key != edge_key
+            || &binding_projection.coordinates != coordinates
+            || binding_projection.state != binding_state
+            || i64::try_from(binding_projection.context_revision).ok()
                 != Some(binding_context_revision)
-            || binding.projection.source_event_id.as_bytes() != source_event_id.as_slice()
-            || binding.projection.updated_at != binding_updated_at
-            || i64::try_from(binding.projection.projection_generation).ok()
+            || binding_projection.source_event_id.as_bytes() != source_event_id.as_slice()
+            || binding_projection.updated_at != binding_updated_at
+            || i64::try_from(binding_projection.projection_generation).ok()
                 != Some(projection_generation)
-            || verify_project_context_binding_observation(&meta, &binding).is_err()
+            || binding_projection.project_id != *community_id.as_uuid()
+            || binding_projection.context_revision > meta_projection.context_revision
         {
             return Ok(false);
         }
-        if !meta.projection.reset
-            && binding.projection.context_revision == meta.projection.context_revision
+        if !meta_projection.reset
+            && binding_projection.context_revision == meta_projection.context_revision
         {
+            let expected_change = ChangedContextBinding {
+                context_document_id,
+                edge_key,
+                binding_coordinate: buzz_project_context::context_binding_coordinate(
+                    *community_id.as_uuid(),
+                    context_document_id,
+                ),
+                binding_event_id: binding_event.event.id,
+                state: binding_state,
+            };
+            if meta_projection.changed_bindings.as_slice() != [expected_change] {
+                return Ok(false);
+            }
             current_incremental_binding_verified = true;
         }
     }
@@ -2902,7 +3053,7 @@ mod tests {
         build_document_command, build_document_head_projection, build_document_meta_projection,
         build_document_revision_projection, changed_head_for,
     };
-    use nostr::{EventBuilder, Keys, Kind};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
     use sqlx::{Executor, PgPool};
 
     use crate::project_document::{
@@ -2938,7 +3089,12 @@ mod tests {
             let admin = PgPool::connect(&admin_url)
                 .await
                 .expect("connect test database server");
-            let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+            let nonce = Uuid::new_v4().simple().to_string();
+            let name = format!("{prefix}_{}", &nonce[..20]);
+            assert!(
+                name.len() <= 63,
+                "Project Context scratch database name exceeds PostgreSQL's identifier limit"
+            );
             sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
                 .execute(&admin)
                 .await
@@ -2986,7 +3142,7 @@ mod tests {
             .await
             .expect("seed Project Context Community");
         sqlx::query(
-            "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'member')",
+            "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'owner')",
         )
         .bind(community_id.as_uuid())
         .bind(actor.public_key().to_hex())
@@ -2994,6 +3150,147 @@ mod tests {
         .await
         .expect("seed Project Context actor");
         community_id
+    }
+
+    #[derive(Clone, Copy)]
+    enum MeetingFixtureLifecycle {
+        Active,
+        Closed,
+        Aborted,
+        InvalidTerminal,
+    }
+
+    async fn seed_meeting_coordinate_fixture(
+        pool: &PgPool,
+        community_id: CommunityId,
+        host: &Keys,
+        relay: &Keys,
+        lifecycle: MeetingFixtureLifecycle,
+    ) -> Uuid {
+        let meeting_id = Uuid::new_v4();
+        let meeting_tag = Tag::parse(["h", &meeting_id.to_string()]).expect("Meeting h tag");
+        let create = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_CREATE as u16),
+            "{}",
+        )
+        .tags([meeting_tag.clone()])
+        .sign_with_keys(host)
+        .expect("sign Meeting Create fixture");
+        let state = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_STATE as u16),
+            "{}",
+        )
+        .tags([meeting_tag.clone()])
+        .sign_with_keys(relay)
+        .expect("sign Meeting State fixture");
+        let end = EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_MEETING_END as u16), "{}")
+            .tags([meeting_tag])
+            .sign_with_keys(host)
+            .expect("sign Meeting End fixture");
+
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin Meeting coordinate fixture");
+        sqlx::query(
+            "INSERT INTO channels \
+                 (id, community_id, name, channel_type, visibility, created_by, room_kind) \
+             VALUES ($1, $2, $3, 'stream', 'private', $4, 'meeting')",
+        )
+        .bind(meeting_id)
+        .bind(community_id.as_uuid())
+        .bind(format!("Meeting coordinate {meeting_id}"))
+        .bind(host.public_key().as_bytes())
+        .execute(&mut *tx)
+        .await
+        .expect("insert Meeting Channel fixture");
+        for event in [&create, &state] {
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut tx, community_id, event, Some(meeting_id))
+                    .await
+                    .expect("insert Meeting coordinate evidence");
+            assert!(inserted);
+        }
+        if matches!(
+            lifecycle,
+            MeetingFixtureLifecycle::Closed | MeetingFixtureLifecycle::Aborted
+        ) {
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut tx, community_id, &end, Some(meeting_id))
+                    .await
+                    .expect("insert Meeting End evidence");
+            assert!(inserted);
+        }
+
+        let terminal = !matches!(lifecycle, MeetingFixtureLifecycle::Active);
+        let end_event_id = if matches!(lifecycle, MeetingFixtureLifecycle::InvalidTerminal) {
+            vec![0x55; 32]
+        } else {
+            end.id.as_bytes().to_vec()
+        };
+        let terminal_outcome = match lifecycle {
+            MeetingFixtureLifecycle::Closed | MeetingFixtureLifecycle::InvalidTerminal => {
+                Some("closed")
+            }
+            MeetingFixtureLifecycle::Aborted => Some("aborted"),
+            MeetingFixtureLifecycle::Active => None,
+        };
+        let terminal_reason =
+            matches!(lifecycle, MeetingFixtureLifecycle::Aborted).then_some("fixture_abort");
+        sqlx::query(
+            "INSERT INTO meeting_sessions \
+                 (community_id, session_id, create_event_id, host_pubkey, schema_version, \
+                  status, ended_at, ended_by, end_event_id, floor_policy_version, \
+                  moderator_pubkey, terminal_outcome, terminal_reason_code) \
+             VALUES ($1, $2, $3, $4, 3, $5, \
+                     CASE WHEN $6 THEN clock_timestamp() ELSE NULL END, \
+                     CASE WHEN $6 THEN $4 ELSE NULL END, \
+                     CASE WHEN $6 THEN $7 ELSE NULL END, \
+                     'moderated-board-actions-v3', $4, $8, $9)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(meeting_id)
+        .bind(create.id.as_bytes().as_slice())
+        .bind(host.public_key().as_bytes())
+        .bind(if terminal { "ended" } else { "active" })
+        .bind(terminal)
+        .bind(end_event_id)
+        .bind(terminal_outcome)
+        .bind(terminal_reason)
+        .execute(&mut *tx)
+        .await
+        .expect("insert Meeting Session fixture");
+        sqlx::query(
+            "INSERT INTO meeting_baton_state_history \
+                 (community_id, session_id, state_revision, state_event_id, \
+                  floor_revision, intent_revision, speech_revision, control_epoch, \
+                  decision_epoch, transition_primary_type) \
+             VALUES ($1, $2, 1, $3, 1, 0, 0, 1, 0, 'project_context_fixture')",
+        )
+        .bind(community_id.as_uuid())
+        .bind(meeting_id)
+        .bind(state.id.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("insert Meeting State history fixture");
+        sqlx::query(
+            "INSERT INTO meeting_baton_state \
+                 (community_id, session_id, phase, floor_revision, intent_revision, \
+                  speech_revision, state_revision, control_epoch, decision_epoch, \
+                  state_event_id) \
+             VALUES ($1, $2, $3, 1, 0, 0, 1, 1, 0, $4)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(meeting_id)
+        .bind(if terminal { "ended" } else { "moderator_idle" })
+        .bind(state.id.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("insert current Meeting State fixture");
+        tx.commit()
+            .await
+            .expect("commit Meeting coordinate fixture");
+        meeting_id
     }
 
     async fn bootstrap_documents(db: &Db, community_id: CommunityId, relay: &Keys) {
@@ -3983,6 +4280,137 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn legacy_v1_projection_is_migration_only_and_reprojects_atomically_to_v2() {
+        let scratch = ScratchDatabase::create("buzz_project_context_v1_to_v2").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let actor = Keys::generate();
+        let source_relay = Keys::generate();
+        let target_relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        bootstrap_documents(&db, community_id, &source_relay).await;
+        let bootstrap = context_bootstrap(community_id, &source_relay, whole_second_now());
+        assert_eq!(
+            store_context_bootstrap(&db, &bootstrap).await,
+            ProjectContextBootstrapOutcome { replayed: false }
+        );
+
+        let legacy_content = bootstrap.meta_projection.content.replacen(
+            "\"schema_version\":2",
+            "\"schema_version\":1",
+            1,
+        );
+        assert_ne!(legacy_content, bootstrap.meta_projection.content);
+        let legacy_meta = EventBuilder::new(
+            Kind::Custom(KIND_PROJECT_CONTEXT_META as u16),
+            legacy_content,
+        )
+        .tags(bootstrap.meta_projection.tags.clone())
+        .custom_created_at(bootstrap.meta_projection.created_at)
+        .sign_with_keys(&source_relay)
+        .expect("sign frozen v1 metadata fixture");
+        let (_, inserted) =
+            crate::event::insert_event(&scratch.pool, community_id, &legacy_meta, None)
+                .await
+                .expect("insert frozen v1 metadata fixture");
+        assert!(inserted);
+
+        let mut downgrade = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin v1 fixture downgrade");
+        downgrade
+            .execute("SET LOCAL session_replication_role = replica")
+            .await
+            .expect("disable v2 guards for legacy fixture construction");
+        sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(bootstrap.meta_projection.id.as_bytes().as_slice())
+        .execute(&mut *downgrade)
+        .await
+        .expect("retire synthetic v2 bootstrap head");
+        sqlx::query(
+            "UPDATE project_context_edge_state \
+             SET schema_version = 1, meta_projection_event_id = $2 \
+             WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(legacy_meta.id.as_bytes().as_slice())
+        .execute(&mut *downgrade)
+        .await
+        .expect("construct frozen v1 catalog fixture");
+        downgrade
+            .execute("SET LOCAL session_replication_role = origin")
+            .await
+            .expect("restore v2 guards after legacy fixture construction");
+        downgrade
+            .commit()
+            .await
+            .expect("commit frozen v1 catalog fixture");
+
+        assert!(context_projection_parity(
+            &mut scratch.pool.begin().await.expect("begin v1 parity"),
+            community_id,
+            &source_relay.public_key(),
+        )
+        .await
+        .expect("verify frozen v1 migration source"));
+        let preflight = db
+            .project_context_preflight(community_id, &source_relay.public_key())
+            .await
+            .expect("read v1 preflight");
+        assert!(!preflight.initialized);
+        assert!(!preflight.structural_read_ready);
+        assert!(db
+            .set_project_context_edge_enabled_checked(
+                community_id,
+                true,
+                Some(&source_relay.public_key()),
+            )
+            .await
+            .is_err());
+
+        let mut write = begin_reproject_test_write(&db, community_id, target_relay.public_key())
+            .await
+            .expect("begin v1-to-v2 reprojection");
+        let context = write
+            .load_current()
+            .await
+            .expect("load verified v1 reprojection source");
+        assert_eq!(context.source_schema_version, 1);
+        assert_eq!(context.source_generation, 1);
+        assert_eq!(context.catalog.projection_generation(), 2);
+        let prepared = prepare_context_reprojection(&context, &target_relay);
+        let outcome = write
+            .commit_reprojection(prepared)
+            .await
+            .expect("commit atomic v1-to-v2 reprojection");
+        assert_eq!(outcome.projection_generation, 2);
+        assert_eq!(outcome.context_revision, 0);
+        let state: (i16, i64, i64, Vec<u8>) = sqlx::query_as(
+            "SELECT schema_version, context_revision, projection_generation, projection_pubkey \
+             FROM project_context_edge_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read migrated v2 Context state");
+        assert_eq!(state.0, 2);
+        assert_eq!(state.1, 0);
+        assert_eq!(state.2, 2);
+        assert_eq!(state.3, target_relay.public_key().to_bytes());
+        db.verify_project_context_storage(community_id, &target_relay.public_key())
+            .await
+            .expect("verify migrated v2 projection");
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn document_and_coordinate_lifecycles_are_independent_and_non_cascading() {
         let scratch = ScratchDatabase::create("buzz_project_context_lifecycle").await;
         let db = Db::from_pool(scratch.pool.clone());
@@ -4353,6 +4781,306 @@ mod tests {
         db.verify_project_context_storage(community_id, &relay.public_key())
             .await
             .expect("verify final lifecycle parity");
+
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn meeting_coordinate_requires_verified_terminal_evidence_and_detaches_after_archive() {
+        let scratch = ScratchDatabase::create("buzz_project_context_meeting").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let actor = Keys::generate();
+        let relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        bootstrap_documents(&db, community_id, &relay).await;
+        let bootstrap = context_bootstrap(community_id, &relay, whole_second_now());
+        assert_eq!(
+            store_context_bootstrap(&db, &bootstrap).await,
+            ProjectContextBootstrapOutcome { replayed: false }
+        );
+
+        let coordinate_document_id = Uuid::new_v4();
+        let context_document_id = Uuid::new_v4();
+        for document_id in [coordinate_document_id, context_document_id] {
+            create_document(&db, community_id, document_id, &actor, &relay).await;
+        }
+        let closed_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::Closed,
+        )
+        .await;
+        let aborted_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::Aborted,
+        )
+        .await;
+        assert!(matches!(
+            crate::meeting::resolve_meeting_coordinate_tx(
+                &mut scratch.pool.begin().await.expect("begin closed resolver"),
+                community_id,
+                closed_meeting,
+            )
+            .await
+            .expect("resolve closed Meeting"),
+            crate::meeting::MeetingCoordinateResolution::Terminal {
+                normalized_outcome: crate::meeting::MeetingCoordinateTerminalOutcome::Closed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            crate::meeting::resolve_meeting_coordinate_tx(
+                &mut scratch.pool.begin().await.expect("begin aborted resolver"),
+                community_id,
+                aborted_meeting,
+            )
+            .await
+            .expect("resolve aborted Meeting"),
+            crate::meeting::MeetingCoordinateResolution::Terminal {
+                normalized_outcome: crate::meeting::MeetingCoordinateTerminalOutcome::Aborted,
+                ..
+            }
+        ));
+
+        let coordinates = vec![
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_document_id,
+            },
+            ProjectContextCoordinate::Meeting {
+                meeting_id: closed_meeting,
+            },
+        ];
+        let attach = ProjectContextCommand::new(
+            0,
+            ProjectContextOperation::Attach,
+            coordinates.clone(),
+            context_document_id,
+        )
+        .expect("build Meeting attach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, attach, &actor, &relay).await;
+        let attached = write
+            .commit(prepared)
+            .await
+            .expect("commit terminal Meeting attach");
+        let rust_edge_key = attached.receipt.edge_key;
+        let sql_edge_key: Vec<u8> =
+            sqlx::query_scalar("SELECT project_context_compute_edge_key($1, $2)")
+                .bind(community_id.as_uuid())
+                .bind(rust_edge_key.as_bytes().as_slice())
+                .fetch_one(&scratch.pool)
+                .await
+                .expect("derive Meeting Edge key in SQL");
+        assert_eq!(sql_edge_key.as_slice(), rust_edge_key.as_bytes());
+
+        sqlx::query(
+            "UPDATE channels SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(closed_meeting)
+        .execute(&scratch.pool)
+        .await
+        .expect("archive attached Meeting");
+        let detach = ProjectContextCommand::new(
+            1,
+            ProjectContextOperation::Detach,
+            coordinates,
+            context_document_id,
+        )
+        .expect("build archived Meeting detach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach, &actor, &relay).await;
+        let detached = write
+            .commit(prepared)
+            .await
+            .expect("detach must not re-resolve archived Meeting");
+        assert_eq!(detached.receipt.context_revision, 2);
+        assert_eq!(
+            detached.receipt.edge_state,
+            ProjectContextBindingState::Deleted
+        );
+
+        let active_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::Active,
+        )
+        .await;
+        let invalid_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::InvalidTerminal,
+        )
+        .await;
+        let ordinary_channel = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channels \
+                 (id, community_id, name, channel_type, visibility, created_by, room_kind) \
+             VALUES ($1, $2, 'ordinary-context-fixture', 'stream', 'open', $3, 'standard')",
+        )
+        .bind(ordinary_channel)
+        .bind(community_id.as_uuid())
+        .bind(actor.public_key().as_bytes())
+        .execute(&scratch.pool)
+        .await
+        .expect("insert ordinary Channel fixture");
+        let foreign_actor = Keys::generate();
+        let foreign_community = seed_community(&scratch.pool, &foreign_actor).await;
+        let foreign_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            foreign_community,
+            &foreign_actor,
+            &relay,
+            MeetingFixtureLifecycle::Closed,
+        )
+        .await;
+
+        for (meeting_id, expected) in [
+            (active_meeting, "active"),
+            (invalid_meeting, "invalid"),
+            (ordinary_channel, "ordinary"),
+            (Uuid::new_v4(), "missing"),
+            (foreign_meeting, "missing"),
+        ] {
+            let candidate_document = Uuid::new_v4();
+            create_document(&db, community_id, candidate_document, &actor, &relay).await;
+            let command = ProjectContextCommand::new(
+                2,
+                ProjectContextOperation::Attach,
+                vec![
+                    ProjectContextCoordinate::Document {
+                        document_id: coordinate_document_id,
+                    },
+                    ProjectContextCoordinate::Meeting { meeting_id },
+                ],
+                candidate_document,
+            )
+            .expect("build rejected Meeting attach");
+            let mut write = begin_storage_test_write(
+                &db,
+                community_id,
+                relay.public_key(),
+                ProjectContextOperation::Attach,
+            )
+            .await
+            .expect("begin rejected Meeting attach");
+            let error = write
+                .load_current(&command)
+                .await
+                .expect_err("non-terminal or invalid Meeting must be rejected");
+            match expected {
+                "active" => assert!(matches!(
+                    error,
+                    ProjectContextWriteError::MeetingNotTerminal
+                )),
+                "invalid" => assert!(matches!(
+                    error,
+                    ProjectContextWriteError::MeetingTerminalInvalid
+                )),
+                "ordinary" => {
+                    assert!(matches!(error, ProjectContextWriteError::NotAMeeting))
+                }
+                "missing" => {
+                    assert!(matches!(error, ProjectContextWriteError::MeetingNotFound))
+                }
+                _ => unreachable!("closed fixture expectation"),
+            }
+            write
+                .rollback()
+                .await
+                .expect("rollback rejected Meeting attach");
+        }
+
+        db.verify_project_context_storage(community_id, &relay.public_key())
+            .await
+            .expect("verify Meeting Context storage");
+        scratch.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn meeting_coordinate_resolver_follows_meeting_session_lock_order() {
+        let scratch = ScratchDatabase::create("buzz_context_meeting_lock_order").await;
+        let actor = Keys::generate();
+        let relay = Keys::generate();
+        let community_id = seed_community(&scratch.pool, &actor).await;
+        let meeting_id = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::Active,
+        )
+        .await;
+
+        let mut meeting_end = scratch.pool.begin().await.expect("begin Meeting End lock");
+        sqlx::query(
+            "SELECT session_id FROM meeting_sessions \
+             WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(meeting_id)
+        .fetch_one(&mut *meeting_end)
+        .await
+        .expect("hold Meeting Session lock");
+
+        let resolver_pool = scratch.pool.clone();
+        let mut resolver = tokio::spawn(async move {
+            let mut tx = resolver_pool
+                .begin()
+                .await
+                .expect("begin coordinate resolver");
+            let result =
+                crate::meeting::resolve_meeting_coordinate_tx(&mut tx, community_id, meeting_id)
+                    .await;
+            tx.rollback().await.expect("rollback coordinate resolver");
+            result
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut resolver)
+                .await
+                .is_err(),
+            "resolver must wait for the Session lock"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sqlx::query(
+                "SELECT id FROM channels \
+                 WHERE community_id = $1 AND id = $2 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .fetch_one(&mut *meeting_end),
+        )
+        .await
+        .expect("resolver must not hold Channel while waiting for Session")
+        .expect("lock Meeting Channel after Session");
+        meeting_end
+            .rollback()
+            .await
+            .expect("release Meeting End locks");
+
+        let resolution = tokio::time::timeout(std::time::Duration::from_secs(1), resolver)
+            .await
+            .expect("resolver completes after Session unlock")
+            .expect("coordinate resolver task")
+            .expect("resolve active Meeting");
+        assert!(matches!(
+            resolution,
+            crate::meeting::MeetingCoordinateResolution::Active
+        ));
 
         scratch.cleanup().await;
     }

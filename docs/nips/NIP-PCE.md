@@ -13,14 +13,14 @@ For a given Project and exact coordinate set there is exactly one edge. An edge
 may contain multiple Context Documents, while one Context Document may belong
 to at most one active edge. `{A,B}` and `{A,B,C}` are different edges.
 
-This NIP defines the v1 coordinate union, deterministic edge identity,
+This NIP defines the v2 coordinate union, deterministic edge identity,
 member-signed attach/detach commands, relay-signed binding and metadata
 projections, and their strict verification rules.
 
 ## Status and scope
 
 The protocol kinds and wire contract are registered. Until a relay advertises
-`buzz-project-context-edge-v1` and has a ready canonical Context catalog, it
+`buzz-project-context-edge-v2` and has a ready canonical Context catalog, it
 MUST reject exclusive reads and writes as unavailable and MUST exclude these
 kinds from wildcard, mixed-kind, IDs-only, count, search-candidate, point-read,
 and live-subscription results.
@@ -45,7 +45,7 @@ Community-private and Community-global; none uses an `h` tag.
 
 ## Coordinate model
 
-The v1 union is closed:
+The v2 union is closed:
 
 ```json
 {
@@ -59,6 +59,13 @@ The v1 union is closed:
 {
   "coordinate_type": "document",
   "document_id": "9c23f672-a397-42d1-b933-104ba2674f26"
+}
+```
+
+```json
+{
+  "coordinate_type": "meeting",
+  "meeting_id": "0ed366aa-6f94-4eff-83db-b8bf081fbf35"
 }
 ```
 
@@ -81,10 +88,12 @@ MUST equal the host-derived Project ID.
 
 Every edge carries at least two distinct coordinates. The canonical order is:
 
-1. Project View coordinates before Document coordinates;
+1. Project View coordinates before Document coordinates, and Document
+   coordinates before Meeting coordinates;
 2. Project View coordinates by the explicit object-type order above, then UUID
    bytes;
-3. Document coordinates by UUID bytes.
+3. Document coordinates by UUID bytes;
+4. Meeting coordinates by UUID bytes.
 
 Senders MUST canonicalize before signing. Receivers MUST reject duplicate,
 undersized, or non-canonically ordered sets. They MUST NOT silently sort a
@@ -100,6 +109,7 @@ Each binding carries one `c` tag per coordinate, in canonical order:
 ```text
 pv:<project-uuid>:<object-type>:<object-uuid>
 document:<project-uuid>:<document-uuid>
+meeting:<project-uuid>:<meeting-uuid>
 ```
 
 These tags support incident queries. Their values are derived from verified
@@ -130,6 +140,16 @@ Each Document coordinate is encoded as:
 0x01 || document_uuid_bytes
 ```
 
+Each Meeting coordinate is encoded as:
+
+```text
+0x02 || meeting_uuid_bytes
+```
+
+The edge-key algorithm intentionally retains the v1 domain separator. Schema
+v2 appends the previously unused `0x02` family rank, so every Project View /
+Document-only edge keeps its existing key byte-for-byte.
+
 Object ranks are zero-based in the order listed above. The wire spelling of an
 edge key is exactly 64 lowercase hexadecimal characters.
 
@@ -152,7 +172,7 @@ The closed content shape is:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "expected_context_revision": 12,
   "acting_assignment_id": "151f2347-7d24-41a0-ab0d-f272e84fcf88",
   "runtime_fence": {
@@ -179,10 +199,14 @@ membership, and restriction gates pass.
 
 ### Attach
 
-Attach requires every coordinate and the Context Document to be active at the
-transaction-locked check. The Document MUST have no other active Context Edge
-binding. The first Document creates the edge; subsequent Documents join the
-same deterministic edge.
+Attach requires every Project View / Document coordinate and the Context
+Document to be active at the transaction-locked check. A Meeting coordinate
+MUST resolve in the same host-derived Project to a verified terminal
+Create-State-End chain whose normalized outcome is `closed` or `aborted`.
+Active Meetings, ordinary Channel UUIDs, foreign/missing Meetings, and invalid
+terminal chains are rejected. The Document MUST have no other active Context
+Edge binding. The first Document creates the edge; subsequent Documents join
+the same deterministic edge.
 
 ### Detach
 
@@ -192,13 +216,17 @@ allows cleanup after coordinate tombstones. The last Document removes the
 active edge. Deleted binding transport state retains the edge key and canonical
 coordinates.
 
+Meeting lifecycle state is checked only for a new attach. Detach MUST use the
+persisted canonical exact set and remain possible after Meeting archival or a
+later hydration failure.
+
 ## Binding projection
 
 Kind `40908` content is closed:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "projection_type": "context_edge_binding",
   "project_id": "3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77",
   "projection_generation": 1,
@@ -240,7 +268,7 @@ Kind `40909` content is:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "projection_type": "context_meta",
   "project_id": "3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77",
   "projection_generation": 1,
@@ -315,7 +343,7 @@ part of the business receipt.
 
 ## Limits and strict parsing
 
-V1 freezes these bounds:
+V2 freezes these bounds:
 
 ```text
 minimum edge coordinates       2
@@ -361,14 +389,21 @@ coordinate sets differ or whose Context Document IDs repeat. Binding content
 does not include Markdown; callers hydrate only the necessary Project Document
 bodies on demand.
 
+A Meeting coordinate is hydrated metadata-first. Its stable identity contains
+only `meeting_id`; title, final Board, participant roster, Speech, action state,
+and lifecycle evidence are observations from the Meeting domain rather than
+edge identity. A client MAY show bounded terminal metadata in Context results,
+but MUST fetch the full Meeting record on demand.
+
 ## Privacy
 
-Commands and projections reveal coordinate and Document identities and are
-therefore Community-private. Authentication alone is insufficient: readers
-must satisfy the relay's current Community principal policy and use a global
-read credential. Relay implementations MUST protect historical REQ, live
-fan-out, COUNT, HTTP query/count, IDs-only and kindless filters, point reads,
-search/fallback candidates, and wildcard filters.
+Commands and projections reveal coordinate, Document, and Meeting identities
+and are therefore Community-private. Authentication alone is insufficient:
+readers must satisfy the relay's current Community principal policy and use a
+global read credential. Meeting roster membership is an action boundary, not
+an additional Context read boundary. Relay implementations MUST protect
+historical REQ, live fan-out, COUNT, HTTP query/count, IDs-only and kindless
+filters, point reads, search/fallback candidates, and wildcard filters.
 
 A relay that knows the kinds but lacks a ready canonical Context capability
 MUST fail closed. Registration is not authorization and is not readiness.
@@ -379,8 +414,13 @@ because it is attached to an edge.
 
 ## Shared fixtures
 
-Normative interoperability fixtures live in
-`docs/nips/fixtures/project-context-edge-v1/`. They freeze canonical attach and
-detach command content, active/deleted binding events, incremental/reset meta
-events, receipt bytes, event IDs, and the deterministic edge key. Production
-SDK parsers consume these same fixtures in tests.
+Normative v2 interoperability fixtures live in
+`docs/nips/fixtures/project-context-edge-v2/`. They freeze canonical Meeting
+mixed-set attach and detach command content, active/deleted binding events,
+incremental/reset meta events, receipt bytes, event IDs, and deterministic edge
+keys. Production SDK parsers consume these same fixtures in tests.
+
+The frozen v1 fixtures remain under
+`docs/nips/fixtures/project-context-edge-v1/` solely for operator-controlled
+v1-to-v2 reprojection verification. Ordinary v2 command and projection parsers
+MUST reject them; relays MUST NOT advertise or dual-write the v1 capability.

@@ -4,6 +4,7 @@ use buzz_project_context::{
     ProjectContextCommand, ProjectContextCoordinate, ProjectContextError, ProjectContextOperation,
     ProjectContextProjectionType, MAX_COMMAND_CONTENT_BYTES, MAX_COMMAND_JSON_DEPTH,
     MAX_PROJECTION_CONTENT_BYTES, MAX_SAFE_REVISION, MIN_EDGE_COORDINATES,
+    PROJECT_CONTEXT_SCHEMA_VERSION,
 };
 use buzz_project_view::ProjectViewObjectType;
 use serde_json::Value;
@@ -173,7 +174,7 @@ fn a_legal_command_can_still_fail_the_derived_projection_content_limit() {
         }
         ProjectContextCommand::from_json(&raw_command).expect("legal command content");
         let projection = ProjectContextBindingProjection {
-            schema_version: 1,
+            schema_version: PROJECT_CONTEXT_SCHEMA_VERSION,
             projection_type: ProjectContextProjectionType::ContextEdgeBinding,
             project_id: project,
             projection_generation: 1,

@@ -1,0 +1,1 @@
+{"schema_version":2,"expected_context_revision":1,"request":{"type":"detach","coordinates":[{"coordinate_type":"project_view_object","object_type":"requirement","object_id":"0fd3a16e-4da4-48c1-aa6a-63b3661091d0"},{"coordinate_type":"meeting","meeting_id":"0ed366aa-6f94-4eff-83db-b8bf081fbf35"}],"context_document_id":"9c23f672-a397-42d1-b933-104ba2674f26"}}

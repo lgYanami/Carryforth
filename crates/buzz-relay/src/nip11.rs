@@ -350,7 +350,7 @@ async fn project_context_edge_ready_for_host(
     state: &crate::state::AppState,
     raw_host: &str,
 ) -> bool {
-    if state.config.relay_private_key.is_none() {
+    if state.config.relay_private_key.is_none() || !state.config.meeting_community_read_enabled {
         return false;
     }
     let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {

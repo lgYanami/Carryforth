@@ -1,6 +1,6 @@
 # Meeting 作为 Project Context 坐标与 Community 可见性实现设计
 
-> 状态：产品与技术边界已确认，分阶段实现中；阶段 1 的暗发布读取链与 source gate 已完成
+> 状态：产品与技术边界已确认，分阶段实现中；阶段 1、2 已完成并通过实现审查
 >
 > 日期：2026-08-07
 >
@@ -958,6 +958,9 @@ schema migration、数据删除或隐式 source 修改。
 
 ### 阶段 1：领域规范与权限读取链
 
+> 交付状态：已完成。Community reader 采用暗发布门禁，Meeting 行动仍保持 roster-scoped，
+> 新 Meeting source 在事务内限制为同 Community 的 open standard Channel。
+
 - 更新 Meeting / Project Context 领域规范；
 - 实现 Community reader predicate；
 - 迁移 list/query/count/live fan-out；
@@ -967,6 +970,11 @@ schema migration、数据删除或隐式 source 修改。
 完成标准：任意有效 member 可以读，observer 无法写，非 member 无侧信道。
 
 ### 阶段 2：Project Context v2 协议与数据库
+
+> 交付状态：已完成。实现审查确认 v1 Edge key domain 与既有 key 不变；v1 只保留在显式迁移
+> verifier 中，普通 runtime 仅接受 v2；Meeting attach 需要可验证终态，detach 不依赖当前 Meeting
+> 水合状态。Meeting resolver 与 End 使用一致的 `Session → Channel → State` 锁顺序，并有独立数据库
+> 并发回归测试。迁移只扩展约束和投影，不删除业务行或重置 Context Revision。
 
 - Meeting coordinate、canonical bytes、tag、fixtures；
 - schema 2 NIP-PCE / SDK；

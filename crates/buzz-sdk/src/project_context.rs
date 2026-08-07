@@ -1,4 +1,4 @@
-//! Project Context Edge v1 command and Relay projection builders/verifiers.
+//! Project Context Edge v2 command and Relay projection builders/verifiers.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -744,4 +744,254 @@ fn canonical_decimal(value: u64) -> String {
 
 fn invalid_projection(message: impl Into<String>) -> SdkError {
     SdkError::InvalidProjection(message.into())
+}
+
+/// Frozen Project Context v1 projection verification used only by an explicit
+/// operator-controlled v1-to-v2 reprojection.
+///
+/// Ordinary command, read, and write paths must use this module's v2 parsers.
+/// Keeping the legacy wire types private prevents v1 from becoming an
+/// accidentally supported runtime protocol again.
+pub mod legacy_v1_migration {
+    use super::*;
+    use serde::Deserialize;
+
+    const LEGACY_SCHEMA_VERSION: u16 = 1;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(
+        tag = "coordinate_type",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    enum LegacyCoordinate {
+        ProjectViewObject {
+            object_type: buzz_project_view::ProjectViewObjectType,
+            object_id: Uuid,
+        },
+        Document {
+            document_id: Uuid,
+        },
+    }
+
+    impl LegacyCoordinate {
+        fn into_current(self) -> ProjectContextCoordinate {
+            match self {
+                Self::ProjectViewObject {
+                    object_type,
+                    object_id,
+                } => ProjectContextCoordinate::ProjectViewObject {
+                    object_type,
+                    object_id,
+                },
+                Self::Document { document_id } => {
+                    ProjectContextCoordinate::Document { document_id }
+                }
+            }
+        }
+
+        fn tag_value(&self, project_id: Uuid) -> String {
+            match self {
+                Self::ProjectViewObject {
+                    object_type,
+                    object_id,
+                } => format!("pv:{project_id}:{}:{object_id}", object_type.as_str()),
+                Self::Document { document_id } => {
+                    format!("document:{project_id}:{document_id}")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyBindingProjection {
+        schema_version: u16,
+        projection_type: ProjectContextProjectionType,
+        project_id: Uuid,
+        projection_generation: u64,
+        context_revision: u64,
+        edge_key: EdgeKey,
+        coordinates: Vec<LegacyCoordinate>,
+        context_document_id: Uuid,
+        state: ProjectContextBindingState,
+        source_event_id: EventId,
+        updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyMetaProjection {
+        schema_version: u16,
+        projection_type: ProjectContextProjectionType,
+        project_id: Uuid,
+        projection_generation: u64,
+        context_revision: u64,
+        active_edge_count: u64,
+        bound_document_count: u64,
+        reset: bool,
+        changed_bindings: Vec<ChangedContextBinding>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_event_id: Option<EventId>,
+        updated_at: DateTime<Utc>,
+    }
+
+    /// Verify one frozen v1 binding head and convert its closed content to the
+    /// equivalent v2 domain projection without changing its edge identity.
+    pub fn verify_binding(
+        event: &Event,
+        expected_relay: &PublicKey,
+        expected_project: CommunityId,
+    ) -> Result<ProjectContextBindingProjection, SdkError> {
+        verify_projection_envelope(event, expected_relay, KIND_PROJECT_CONTEXT_EDGE_BINDING)?;
+        let (raw, legacy) =
+            parse_projection_content::<LegacyBindingProjection>(event, "legacy v1 binding")?;
+        if legacy.schema_version != LEGACY_SCHEMA_VERSION
+            || legacy.projection_type != ProjectContextProjectionType::ContextEdgeBinding
+        {
+            return Err(invalid_projection(
+                "legacy binding is not a Project Context v1 binding",
+            ));
+        }
+        require_project(legacy.project_id, expected_project)?;
+        require_event_time(event, legacy.updated_at, "legacy v1 binding")?;
+        let expected_tags = legacy_binding_tags(&legacy);
+        require_exact_tags(event, &expected_tags, "legacy v1 binding")?;
+        require_canonical_value(&raw, &legacy, "legacy v1 binding")?;
+
+        let coordinates = legacy
+            .coordinates
+            .iter()
+            .cloned()
+            .map(LegacyCoordinate::into_current)
+            .collect();
+        let current = ProjectContextBindingProjection {
+            schema_version: PROJECT_CONTEXT_SCHEMA_VERSION,
+            projection_type: legacy.projection_type,
+            project_id: legacy.project_id,
+            projection_generation: legacy.projection_generation,
+            context_revision: legacy.context_revision,
+            edge_key: legacy.edge_key,
+            coordinates,
+            context_document_id: legacy.context_document_id,
+            state: legacy.state,
+            source_event_id: legacy.source_event_id,
+            updated_at: legacy.updated_at,
+        };
+        current
+            .validate()
+            .map_err(|error| invalid_projection(error.to_string()))?;
+        Ok(current)
+    }
+
+    /// Verify one frozen v1 metadata head and convert its closed content to the
+    /// equivalent v2 domain projection.
+    pub fn verify_meta(
+        event: &Event,
+        expected_relay: &PublicKey,
+        expected_project: CommunityId,
+    ) -> Result<ProjectContextMetaProjection, SdkError> {
+        verify_projection_envelope(event, expected_relay, KIND_PROJECT_CONTEXT_META)?;
+        let (raw, legacy) =
+            parse_projection_content::<LegacyMetaProjection>(event, "legacy v1 metadata")?;
+        if legacy.schema_version != LEGACY_SCHEMA_VERSION
+            || legacy.projection_type != ProjectContextProjectionType::ContextMeta
+        {
+            return Err(invalid_projection(
+                "legacy metadata is not Project Context v1 metadata",
+            ));
+        }
+        require_project(legacy.project_id, expected_project)?;
+        require_event_time(event, legacy.updated_at, "legacy v1 metadata")?;
+        let expected_tags = legacy_meta_tags(&legacy);
+        require_exact_tags(event, &expected_tags, "legacy v1 metadata")?;
+        require_canonical_value(&raw, &legacy, "legacy v1 metadata")?;
+
+        let current = ProjectContextMetaProjection {
+            schema_version: PROJECT_CONTEXT_SCHEMA_VERSION,
+            projection_type: legacy.projection_type,
+            project_id: legacy.project_id,
+            projection_generation: legacy.projection_generation,
+            context_revision: legacy.context_revision,
+            active_edge_count: legacy.active_edge_count,
+            bound_document_count: legacy.bound_document_count,
+            reset: legacy.reset,
+            changed_bindings: legacy.changed_bindings,
+            source_event_id: legacy.source_event_id,
+            updated_at: legacy.updated_at,
+        };
+        current
+            .validate()
+            .map_err(|error| invalid_projection(error.to_string()))?;
+        Ok(current)
+    }
+
+    fn legacy_binding_tags(projection: &LegacyBindingProjection) -> Vec<Vec<String>> {
+        let mut tags = vec![
+            vec!["-".to_owned()],
+            vec![
+                "d".to_owned(),
+                domain_binding_coordinate(projection.project_id, projection.context_document_id),
+            ],
+            vec!["t".to_owned(), PROJECT_CONTEXT_PROJECTION_TAG.to_owned()],
+            vec!["t".to_owned(), BINDING_TAG.to_owned()],
+            vec!["s".to_owned(), projection.state.as_str().to_owned()],
+            vec![
+                "g".to_owned(),
+                domain_edge_coordinate(projection.project_id, projection.edge_key),
+            ],
+        ];
+        for coordinate in &projection.coordinates {
+            tags.push(vec![
+                "c".to_owned(),
+                coordinate.tag_value(projection.project_id),
+            ]);
+        }
+        tags.extend([
+            vec![
+                "projection_generation".to_owned(),
+                canonical_decimal(projection.projection_generation),
+            ],
+            vec![
+                "context_revision".to_owned(),
+                canonical_decimal(projection.context_revision),
+            ],
+            vec![
+                "e".to_owned(),
+                projection.source_event_id.to_hex(),
+                String::new(),
+                "source".to_owned(),
+            ],
+        ]);
+        tags
+    }
+
+    fn legacy_meta_tags(projection: &LegacyMetaProjection) -> Vec<Vec<String>> {
+        let mut tags = vec![
+            vec!["-".to_owned()],
+            vec![
+                "d".to_owned(),
+                domain_meta_coordinate(projection.project_id),
+            ],
+            vec!["t".to_owned(), PROJECT_CONTEXT_PROJECTION_TAG.to_owned()],
+            vec!["t".to_owned(), META_TAG.to_owned()],
+            vec![
+                "projection_generation".to_owned(),
+                canonical_decimal(projection.projection_generation),
+            ],
+            vec![
+                "context_revision".to_owned(),
+                canonical_decimal(projection.context_revision),
+            ],
+        ];
+        if let Some(source) = projection.source_event_id {
+            tags.push(vec![
+                "e".to_owned(),
+                source.to_hex(),
+                String::new(),
+                "source".to_owned(),
+            ]);
+        }
+        tags
+    }
 }

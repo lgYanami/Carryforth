@@ -1,4 +1,4 @@
-//! Closed member-signed Project Context Edge v1 commands.
+//! Closed member-signed Project Context Edge v2 commands.
 
 use buzz_core::RuntimeFence;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectContextCommand {
-    /// Must equal one.
+    /// Must equal the current Project Context schema version.
     pub schema_version: u16,
     /// Global Context revision observed by the caller.
     pub expected_context_revision: u64,
@@ -42,7 +42,7 @@ pub struct ProjectContextCommand {
 }
 
 impl ProjectContextCommand {
-    /// Construct a canonical v1 command without a managed runtime fence.
+    /// Construct a canonical v2 command without a managed runtime fence.
     pub fn new(
         expected_context_revision: u64,
         operation: ProjectContextOperation,
@@ -169,7 +169,7 @@ impl ProjectContextCommand {
     }
 }
 
-/// One of the two operations supported by Project Context Edge v1.
+/// One of the two operations supported by Project Context Edge v2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectContextCommandRequest {

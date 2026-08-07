@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 50);
+        assert_eq!(migrations.len(), 51);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1228,6 +1228,23 @@ mod tests {
         assert!(project_context_builtin_sha256
             .contains("CREATE OR REPLACE FUNCTION project_context_compute_edge_key"));
         assert!(project_context_builtin_sha256.contains("RETURN sha256(payload)"));
+
+        assert_eq!(migrations[50].version, 51);
+        let project_context_meeting_v2 = migrations[50].sql.as_str();
+        for required in [
+            "schema_version IN (1, 2)",
+            "coordinate_type = 'meeting'",
+            "project_context_meeting_is_terminal",
+            "WHEN 'meeting' THEN",
+            "context_state.schema_version = 2",
+            "OLD.schema_version = 1 AND NEW.schema_version = 2",
+        ] {
+            assert!(
+                project_context_meeting_v2.contains(required),
+                "migration 0051 must contain {required}"
+            );
+        }
+        assert!(!project_context_meeting_v2.contains("DELETE FROM project_context"));
     }
 
     #[test]
@@ -1245,6 +1262,10 @@ mod tests {
             "project_context_compute_edge_key",
             "project_context_validate_community",
             "project_context_validate_new_change",
+            "project_context_meeting_is_terminal",
+            "coordinate_type = 'meeting'",
+            "schema_version IN (1, 2)",
+            "context_state.schema_version = 2",
             "active Context Document must be detached before deletion",
             "idx_project_context_edge_coordinates_lookup",
             "idx_project_context_bindings_active_document",
@@ -1998,7 +2019,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(50));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -2103,8 +2124,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0050");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(50));
+            .expect("upgrade scratch database through 0051");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
         let flags: Vec<(uuid::Uuid, bool, i16)> = sqlx::query_as(
             "SELECT id, project_view_enabled, project_view_schema_version \
              FROM communities ORDER BY id",
@@ -2313,8 +2334,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0050");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(50));
+            .expect("upgrade scratch database through 0051");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -2391,7 +2412,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(50));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(51));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -2479,7 +2500,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(50));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
     }
 
     #[tokio::test]

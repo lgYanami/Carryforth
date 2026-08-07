@@ -32,7 +32,7 @@ impl EdgeKey {
         validate_canonical_coordinates(coordinates)?;
         let count = u32::try_from(coordinates.len()).map_err(|_| {
             ProjectContextError::InvalidCoordinate {
-                reason: "coordinate count exceeds the v1 u32 identity encoding".to_owned(),
+                reason: "coordinate count exceeds the edge-key-v1 u32 identity encoding".to_owned(),
             }
         })?;
         let mut hasher = Sha256::new();

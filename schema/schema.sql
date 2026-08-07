@@ -9264,7 +9264,7 @@ ALTER TABLE communities
 
 CREATE TABLE project_context_edge_state (
     community_id             UUID        NOT NULL,
-    schema_version           SMALLINT    NOT NULL DEFAULT 1,
+    schema_version           SMALLINT    NOT NULL DEFAULT 2,
     context_revision         BIGINT      NOT NULL,
     active_edge_count        BIGINT      NOT NULL,
     bound_document_count     BIGINT      NOT NULL,
@@ -9279,7 +9279,7 @@ CREATE TABLE project_context_edge_state (
     PRIMARY KEY (community_id),
     CONSTRAINT project_context_edge_state_community_fk
         FOREIGN KEY (community_id) REFERENCES communities (id) ON DELETE NO ACTION,
-    CONSTRAINT project_context_edge_state_schema_check CHECK (schema_version = 1),
+    CONSTRAINT project_context_edge_state_schema_check CHECK (schema_version IN (1, 2)),
     CONSTRAINT project_context_edge_state_revision_check
         CHECK (context_revision BETWEEN 0 AND 9007199254740991),
     CONSTRAINT project_context_edge_state_count_check
@@ -9388,6 +9388,12 @@ CREATE TABLE project_context_edge_coordinates (
                 AND coordinate_subtype IS NULL
                 AND canonical_key =
                     'document:' || community_id::text || ':' || coordinate_id::text
+            )
+            OR (
+                coordinate_type = 'meeting'
+                AND coordinate_subtype IS NULL
+                AND canonical_key =
+                    'meeting:' || community_id::text || ':' || coordinate_id::text
             )
         )
 );
@@ -9551,6 +9557,7 @@ DECLARE
     coordinate_count INTEGER;
     coordinate_row RECORD;
     payload BYTEA;
+    subtype_byte TEXT;
 BEGIN
     SELECT count(*)::integer INTO coordinate_count
     FROM project_context_edge_coordinates
@@ -9567,9 +9574,9 @@ BEGIN
         WHERE community_id = target_community AND edge_key = target_edge
         ORDER BY ordinal
     LOOP
-        IF coordinate_row.coordinate_type = 'project_view_object' THEN
-            payload := payload || decode('00', 'hex') || decode(
-                CASE coordinate_row.coordinate_subtype
+        CASE coordinate_row.coordinate_type
+            WHEN 'project_view_object' THEN
+                subtype_byte := CASE coordinate_row.coordinate_subtype
                     WHEN 'project_profile' THEN '00'
                     WHEN 'goal' THEN '01'
                     WHEN 'role' THEN '02'
@@ -9579,12 +9586,27 @@ BEGIN
                     WHEN 'issue' THEN '06'
                     WHEN 'work' THEN '07'
                     WHEN 'resource' THEN '08'
-                END,
-                'hex'
-            ) || uuid_send(coordinate_row.coordinate_id);
-        ELSE
-            payload := payload || decode('01', 'hex') || uuid_send(coordinate_row.coordinate_id);
-        END IF;
+                    ELSE NULL
+                END;
+                IF subtype_byte IS NULL THEN
+                    RAISE EXCEPTION 'unsupported Project Context object subtype %',
+                        coordinate_row.coordinate_subtype
+                        USING ERRCODE = 'check_violation';
+                END IF;
+                payload := payload || decode('00', 'hex')
+                    || decode(subtype_byte, 'hex')
+                    || uuid_send(coordinate_row.coordinate_id);
+            WHEN 'document' THEN
+                payload := payload || decode('01', 'hex')
+                    || uuid_send(coordinate_row.coordinate_id);
+            WHEN 'meeting' THEN
+                payload := payload || decode('02', 'hex')
+                    || uuid_send(coordinate_row.coordinate_id);
+            ELSE
+                RAISE EXCEPTION 'unsupported Project Context coordinate type %',
+                    coordinate_row.coordinate_type
+                    USING ERRCODE = 'check_violation';
+        END CASE;
     END LOOP;
     RETURN sha256(payload);
 END
@@ -9640,15 +9662,19 @@ CREATE FUNCTION project_context_edge_state_guard_update() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
     IF current_setting('buzz.project_context_reproject', true) = 'on' THEN
-        IF ROW(OLD.community_id, OLD.schema_version, OLD.context_revision,
+        IF ROW(OLD.community_id, OLD.context_revision,
                OLD.active_edge_count, OLD.bound_document_count, OLD.last_change_id,
                OLD.last_actor_pubkey, OLD.initialized_at, OLD.updated_at)
            IS DISTINCT FROM
-           ROW(NEW.community_id, NEW.schema_version, NEW.context_revision,
+           ROW(NEW.community_id, NEW.context_revision,
                NEW.active_edge_count, NEW.bound_document_count, NEW.last_change_id,
                NEW.last_actor_pubkey, NEW.initialized_at, NEW.updated_at)
-           OR NEW.projection_generation <> OLD.projection_generation + 1 THEN
-            RAISE EXCEPTION 'Project Context reproject may only replace signer generation and metadata pointer'
+           OR NEW.projection_generation <> OLD.projection_generation + 1
+           OR NOT (
+               NEW.schema_version = OLD.schema_version
+               OR (OLD.schema_version = 1 AND NEW.schema_version = 2)
+           ) THEN
+            RAISE EXCEPTION 'Project Context reproject may only upgrade schema and replace signer generation/pointers'
                 USING ERRCODE = 'check_violation';
         END IF;
         RETURN NEW;
@@ -9762,6 +9788,100 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION project_context_meeting_is_terminal(
+    target_community UUID,
+    target_meeting UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    session_row RECORD;
+    state_row RECORD;
+    normalized_outcome TEXT;
+BEGIN
+    SELECT session.*, channel.room_kind, channel.deleted_at AS channel_deleted_at
+    INTO session_row
+    FROM meeting_sessions session
+    JOIN channels channel
+      ON channel.community_id = session.community_id
+     AND channel.id = session.session_id
+    WHERE session.community_id = target_community
+      AND session.session_id = target_meeting;
+    IF NOT FOUND
+       OR session_row.room_kind <> 'meeting'
+       OR session_row.channel_deleted_at IS NOT NULL
+       OR session_row.status <> 'ended'
+       OR session_row.end_event_id IS NULL
+       OR session_row.ended_by IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    IF session_row.schema_version = 1 THEN
+        SELECT floor_revision AS state_revision, state_event_id, phase, outcome
+        INTO state_row
+        FROM meeting_rounds
+        WHERE community_id = target_community
+          AND session_id = target_meeting
+          AND round_number = session_row.current_round;
+        IF NOT FOUND
+           OR state_row.phase IS DISTINCT FROM 'closed'
+           OR state_row.outcome IS DISTINCT FROM 'ended' THEN
+            RETURN FALSE;
+        END IF;
+        normalized_outcome := CASE
+            WHEN session_row.ended_by = session_row.host_pubkey THEN 'closed'
+            ELSE 'aborted'
+        END;
+    ELSIF session_row.schema_version IN (2, 3) THEN
+        SELECT state_revision, state_event_id, phase
+        INTO state_row
+        FROM meeting_baton_state
+        WHERE community_id = target_community AND session_id = target_meeting;
+        IF NOT FOUND OR state_row.phase IS DISTINCT FROM 'ended' THEN
+            RETURN FALSE;
+        END IF;
+        normalized_outcome := CASE
+            WHEN session_row.schema_version = 3 THEN session_row.terminal_outcome
+            WHEN session_row.ended_by = session_row.host_pubkey THEN 'closed'
+            ELSE 'aborted'
+        END;
+    ELSE
+        RETURN FALSE;
+    END IF;
+
+    IF state_row.state_revision <= 0
+       OR octet_length(state_row.state_event_id) <> 32
+       OR normalized_outcome IS NULL
+       OR normalized_outcome NOT IN ('closed', 'aborted') THEN
+        RETURN FALSE;
+    END IF;
+    RETURN EXISTS (
+        SELECT 1 FROM events event
+        WHERE event.community_id = target_community
+          AND event.channel_id = target_meeting
+          AND event.id = session_row.create_event_id
+          AND event.kind = 42100
+          AND event.pubkey = session_row.host_pubkey
+          AND event.deleted_at IS NULL
+    ) AND EXISTS (
+        SELECT 1 FROM events event
+        WHERE event.community_id = target_community
+          AND event.channel_id = target_meeting
+          AND event.id = state_row.state_event_id
+          AND event.kind = 42103
+          AND event.deleted_at IS NULL
+    ) AND EXISTS (
+        SELECT 1 FROM events event
+        WHERE event.community_id = target_community
+          AND event.channel_id = target_meeting
+          AND event.id = session_row.end_event_id
+          AND event.kind = 42101
+          AND event.pubkey = session_row.ended_by
+          AND event.deleted_at IS NULL
+    );
+END
+$$;
+
 CREATE FUNCTION project_context_validate_community(target_community UUID) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -9777,6 +9897,17 @@ BEGIN
     FROM project_context_edge_state
     WHERE community_id = target_community;
     IF NOT FOUND THEN RETURN; END IF;
+    IF state_row.schema_version NOT IN (1, 2) THEN
+        RAISE EXCEPTION 'unsupported Project Context schema %', state_row.schema_version
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF state_row.schema_version = 1 AND EXISTS (
+        SELECT 1 FROM project_context_edge_coordinates
+        WHERE community_id = target_community AND coordinate_type = 'meeting'
+    ) THEN
+        RAISE EXCEPTION 'Project Context v1 cannot contain Meeting coordinates'
+            USING ERRCODE = 'check_violation';
+    END IF;
 
     SELECT count(*) INTO actual_active_edges
     FROM project_context_edges
@@ -9804,7 +9935,12 @@ BEGIN
                 SELECT ordinal,
                        row_number() OVER (
                            ORDER BY
-                               CASE coordinate_type WHEN 'project_view_object' THEN 0 ELSE 1 END,
+                               CASE coordinate_type
+                                   WHEN 'project_view_object' THEN 0
+                                   WHEN 'document' THEN 1
+                                   WHEN 'meeting' THEN 2
+                                   ELSE 3
+                               END,
                                CASE coordinate_subtype
                                    WHEN 'project_profile' THEN 0 WHEN 'goal' THEN 1
                                    WHEN 'role' THEN 2 WHEN 'plan' THEN 3
@@ -9829,10 +9965,15 @@ BEGIN
                     'object_type', coordinate_subtype,
                     'object_id', coordinate_id
                 )
-                ELSE jsonb_build_object(
+                WHEN 'document' THEN jsonb_build_object(
                     'coordinate_type', 'document',
                     'document_id', coordinate_id
                 )
+                WHEN 'meeting' THEN jsonb_build_object(
+                    'coordinate_type', 'meeting',
+                    'meeting_id', coordinate_id
+                )
+                ELSE NULL
             END ORDER BY ordinal
         ) INTO normalized_coordinates
         FROM project_context_edge_coordinates
@@ -9863,6 +10004,19 @@ BEGIN
                           SELECT 1 FROM project_documents document
                           WHERE document.community_id = coordinate.community_id
                             AND document.document_id = coordinate.coordinate_id
+                      )
+                  )
+                  OR (
+                      coordinate.coordinate_type = 'meeting'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM meeting_sessions session
+                          JOIN channels channel
+                            ON channel.community_id = session.community_id
+                           AND channel.id = session.session_id
+                          WHERE session.community_id = coordinate.community_id
+                            AND session.session_id = coordinate.coordinate_id
+                            AND channel.room_kind = 'meeting'
                       )
                   )
               )
@@ -9931,7 +10085,7 @@ BEGIN
             OR (change.operation = 'attach') <> (binding.state = 'active')
             OR projection.id IS NULL
             OR (projection.content::jsonb - 'updated_at') IS DISTINCT FROM jsonb_build_object(
-                'schema_version', 1,
+                'schema_version', state_row.schema_version,
                 'projection_type', 'context_edge_binding',
                 'project_id', binding.community_id,
                 'projection_generation', state_row.projection_generation,
@@ -9962,7 +10116,7 @@ BEGIN
     END IF;
     IF (meta_content->>'reset')::boolean THEN
         expected_meta := jsonb_build_object(
-            'schema_version', 1,
+            'schema_version', state_row.schema_version,
             'projection_type', 'context_meta',
             'project_id', target_community,
             'projection_generation', state_row.projection_generation,
@@ -9978,7 +10132,7 @@ BEGIN
                 USING ERRCODE = 'check_violation';
         END IF;
         SELECT jsonb_build_object(
-            'schema_version', 1,
+            'schema_version', state_row.schema_version,
             'projection_type', 'context_meta',
             'project_id', target_community,
             'projection_generation', state_row.projection_generation,
@@ -10086,9 +10240,19 @@ BEGIN
                             AND document.state = 'active'
                       )
                   )
+                  OR (
+                      coordinate.coordinate_type = 'meeting'
+                      AND NOT project_context_meeting_is_terminal(
+                          coordinate.community_id,
+                          coordinate.coordinate_id
+                      )
+                  )
+                  OR coordinate.coordinate_type NOT IN (
+                      'project_view_object', 'document', 'meeting'
+                  )
               )
         ) THEN
-            RAISE EXCEPTION 'Project Context attach requires active coordinates and Context Document'
+            RAISE EXCEPTION 'Project Context attach requires active coordinates, a terminal Meeting, and an active Context Document'
                 USING ERRCODE = 'check_violation';
         END IF;
     END IF;
@@ -10159,7 +10323,7 @@ BEGIN
         JOIN project_document_state document_state
           ON document_state.community_id = community.id AND document_state.schema_version = 1
         JOIN project_context_edge_state context_state
-          ON context_state.community_id = community.id AND context_state.schema_version = 1
+          ON context_state.community_id = community.id AND context_state.schema_version = 2
         WHERE community.id = target_community
           AND community.archived_at IS NULL
           AND community.project_view_schema_version = 3
@@ -10168,7 +10332,7 @@ BEGIN
           AND view_state.projection_pubkey = document_state.projection_pubkey
           AND document_state.projection_pubkey = context_state.projection_pubkey
     ) THEN
-        RAISE EXCEPTION 'Project Context capability prerequisites are not ready'
+        RAISE EXCEPTION 'Project Context v2 capability prerequisites are not ready'
             USING ERRCODE = 'check_violation';
     END IF;
     PERFORM project_view_v3_validate_community(target_community);

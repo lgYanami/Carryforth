@@ -1,4 +1,4 @@
-//! Project Context Edge v1 Relay protocol adapter.
+//! Project Context Edge v2 Relay protocol adapter.
 //!
 //! The pure reducer owns Edge semantics, the SDK owns exact wire bytes, and
 //! `buzz-db` owns the Community-locked atomic commit. This module supplies
@@ -119,6 +119,11 @@ async fn handle_command_inner(
             "unavailable:project_context:stable_signer".to_owned(),
         ));
     }
+    if !state.config.meeting_community_read_enabled {
+        return Err(IngestError::Unavailable(
+            "unavailable:project_context:not_ready".to_owned(),
+        ));
+    }
     validate_signed_event_frame_size(&event, state.config.max_frame_bytes)
         .map_err(|_| IngestError::Rejected("invalid:project_context:event_frame".to_owned()))?;
 
@@ -140,7 +145,10 @@ async fn handle_command_inner(
         .ok_or_else(|| {
             IngestError::Unavailable("unavailable:project_context:not_ready".to_owned())
         })?;
-    if status.context_revision.is_none() {
+    if status.context_revision.is_none()
+        || status.context_schema_version
+            != Some(buzz_project_context::PROJECT_CONTEXT_SCHEMA_VERSION)
+    {
         return Err(IngestError::Unavailable(
             "unavailable:project_context:not_ready".to_owned(),
         ));
@@ -291,6 +299,18 @@ fn map_write_error(error: ProjectContextWriteError) -> IngestError {
         ProjectContextWriteError::RuntimeFence => {
             IngestError::AuthFailed("restricted:project_context:runtime_fence".to_owned())
         }
+        ProjectContextWriteError::MeetingNotFound => {
+            IngestError::Rejected("invalid:project_context:meeting_not_found".to_owned())
+        }
+        ProjectContextWriteError::NotAMeeting => {
+            IngestError::Rejected("invalid:project_context:not_a_meeting".to_owned())
+        }
+        ProjectContextWriteError::MeetingNotTerminal => {
+            IngestError::Rejected("invalid:project_context:meeting_not_terminal".to_owned())
+        }
+        ProjectContextWriteError::MeetingTerminalInvalid => {
+            IngestError::Rejected("invalid:project_context:meeting_terminal_invalid".to_owned())
+        }
         ProjectContextWriteError::Domain(error) => map_domain_error(error),
         ProjectContextWriteError::Database(_)
         | ProjectContextWriteError::Sqlx(_)
@@ -425,6 +445,26 @@ mod tests {
             map_write_error(ProjectContextWriteError::RuntimeFence),
             IngestError::AuthFailed(message)
                 if message == "restricted:project_context:runtime_fence"
+        ));
+        assert!(matches!(
+            map_write_error(ProjectContextWriteError::MeetingNotFound),
+            IngestError::Rejected(message)
+                if message == "invalid:project_context:meeting_not_found"
+        ));
+        assert!(matches!(
+            map_write_error(ProjectContextWriteError::NotAMeeting),
+            IngestError::Rejected(message)
+                if message == "invalid:project_context:not_a_meeting"
+        ));
+        assert!(matches!(
+            map_write_error(ProjectContextWriteError::MeetingNotTerminal),
+            IngestError::Rejected(message)
+                if message == "invalid:project_context:meeting_not_terminal"
+        ));
+        assert!(matches!(
+            map_write_error(ProjectContextWriteError::MeetingTerminalInvalid),
+            IngestError::Rejected(message)
+                if message == "invalid:project_context:meeting_terminal_invalid"
         ));
     }
 

@@ -7,7 +7,7 @@ use crate::EdgeKey;
 /// Convenient result type for Project Context protocol operations.
 pub type ProjectContextResult<T> = Result<T, ProjectContextError>;
 
-/// Closed failures produced while parsing, validating, or reducing v1 values.
+/// Closed failures produced while parsing, validating, or reducing v2 values.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProjectContextError {
     /// Content is not JSON or does not match the closed schema.
@@ -40,7 +40,7 @@ pub enum ProjectContextError {
         /// Version implemented by this contract.
         supported: u16,
     },
-    /// A coordinate identity was malformed or outside the closed v1 union.
+    /// A coordinate identity was malformed or outside the closed v2 union.
     #[error("invalid Project Context coordinate: {reason}")]
     InvalidCoordinate {
         /// Safe coordinate diagnostic.

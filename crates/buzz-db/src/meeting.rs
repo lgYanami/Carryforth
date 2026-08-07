@@ -102,6 +102,261 @@ pub enum EndMeetingOutcome {
     ParticipantRevoked,
 }
 
+/// Normalized terminal outcome exposed to Project Context coordinate checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingCoordinateTerminalOutcome {
+    /// The verified Meeting ended normally.
+    Closed,
+    /// The verified Meeting ended abnormally or by administrative action.
+    Aborted,
+}
+
+/// Security-neutral lifecycle resolution for a prospective Meeting coordinate.
+///
+/// Callers must authorize the Community actor before mapping these variants to
+/// user-visible diagnostics. `MissingOrForeign` intentionally combines absent
+/// and cross-Community identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeetingCoordinateResolution {
+    /// The Meeting has a verified terminal Create -> State -> End chain.
+    Terminal {
+        /// Stable Meeting identity.
+        meeting_id: Uuid,
+        /// Normalized legacy/current terminal outcome.
+        normalized_outcome: MeetingCoordinateTerminalOutcome,
+        /// Terminal state projection revision.
+        state_revision: u64,
+        /// Signed Meeting Create event ID.
+        create_event_id: Vec<u8>,
+        /// Relay-signed terminal Meeting State event ID.
+        state_event_id: Vec<u8>,
+        /// Signed Meeting End event ID.
+        end_event_id: Vec<u8>,
+    },
+    /// The Meeting exists but is still active.
+    Active,
+    /// The UUID belongs to an ordinary Channel in this Community.
+    OrdinaryChannel,
+    /// No Meeting or Channel with this identity exists in this Community.
+    MissingOrForeign,
+    /// A Meeting-shaped row exists but its terminal evidence is incomplete or inconsistent.
+    InvalidTerminal,
+}
+
+/// Resolve and lock one Meeting coordinate inside a caller-owned transaction.
+///
+/// This function does not authorize the caller. It is intended for the
+/// Project Context attach path after Community write authorization has passed.
+pub async fn resolve_meeting_coordinate_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    meeting_id: Uuid,
+) -> Result<MeetingCoordinateResolution> {
+    // Meeting mutations lock Session before Channel. Keep the same order here
+    // so a concurrent End and Project Context attach cannot deadlock.
+    let session = sqlx::query(
+        "SELECT create_event_id, host_pubkey, schema_version, status, ended_by, \
+                end_event_id, current_round, terminal_outcome \
+         FROM meeting_sessions \
+         WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(session) = session else {
+        let channel = sqlx::query(
+            "SELECT room_kind FROM channels \
+             WHERE community_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(meeting_id)
+        .fetch_optional(tx.as_mut())
+        .await?;
+        return Ok(match channel {
+            Some(channel) if channel.try_get::<String, _>("room_kind")? != "meeting" => {
+                MeetingCoordinateResolution::OrdinaryChannel
+            }
+            Some(_) => MeetingCoordinateResolution::InvalidTerminal,
+            None => MeetingCoordinateResolution::MissingOrForeign,
+        });
+    };
+
+    let channel = sqlx::query(
+        "SELECT room_kind, deleted_at FROM channels \
+         WHERE community_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(channel) = channel else {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    };
+    let room_kind: String = channel.try_get("room_kind")?;
+    if room_kind != "meeting" {
+        return Ok(MeetingCoordinateResolution::OrdinaryChannel);
+    }
+    if channel
+        .try_get::<Option<DateTime<Utc>>, _>("deleted_at")?
+        .is_some()
+    {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    }
+
+    let status: String = session.try_get("status")?;
+    if status == "active" {
+        return Ok(MeetingCoordinateResolution::Active);
+    }
+    if status != "ended" {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    }
+
+    let create_event_id: Vec<u8> = session.try_get("create_event_id")?;
+    let host_pubkey: Vec<u8> = session.try_get("host_pubkey")?;
+    let ended_by: Option<Vec<u8>> = session.try_get("ended_by")?;
+    let end_event_id: Option<Vec<u8>> = session.try_get("end_event_id")?;
+    let schema_version: i32 = session.try_get("schema_version")?;
+    let Some(ended_by) = ended_by else {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    };
+    let Some(end_event_id) = end_event_id else {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    };
+    if create_event_id.len() != 32 || ended_by.len() != 32 || end_event_id.len() != 32 {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    }
+
+    let (state_revision, state_event_id, state_is_terminal) = match schema_version {
+        1 => {
+            let current_round: i64 = session.try_get("current_round")?;
+            let state = sqlx::query(
+                "SELECT floor_revision, state_event_id, phase, outcome \
+                 FROM meeting_rounds \
+                 WHERE community_id = $1 AND session_id = $2 AND round_number = $3 \
+                 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .bind(current_round)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            let Some(state) = state else {
+                return Ok(MeetingCoordinateResolution::InvalidTerminal);
+            };
+            let revision: i64 = state.try_get("floor_revision")?;
+            let event_id: Vec<u8> = state.try_get("state_event_id")?;
+            let phase: String = state.try_get("phase")?;
+            let outcome: Option<String> = state.try_get("outcome")?;
+            (
+                revision,
+                event_id,
+                phase == "closed" && outcome.as_deref() == Some("ended"),
+            )
+        }
+        2 | 3 => {
+            let state = sqlx::query(
+                "SELECT state_revision, state_event_id, phase FROM meeting_baton_state \
+                 WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            let Some(state) = state else {
+                return Ok(MeetingCoordinateResolution::InvalidTerminal);
+            };
+            let revision: i64 = state.try_get("state_revision")?;
+            let event_id: Vec<u8> = state.try_get("state_event_id")?;
+            let phase: String = state.try_get("phase")?;
+            (revision, event_id, phase == "ended")
+        }
+        _ => return Ok(MeetingCoordinateResolution::InvalidTerminal),
+    };
+    let Ok(state_revision) = u64::try_from(state_revision) else {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    };
+    if state_revision == 0 || state_event_id.len() != 32 || !state_is_terminal {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    }
+
+    let create_valid = meeting_coordinate_event_exists_tx(
+        tx,
+        community_id,
+        meeting_id,
+        &create_event_id,
+        buzz_core::kind::KIND_MEETING_CREATE,
+        Some(&host_pubkey),
+    )
+    .await?;
+    let state_valid = meeting_coordinate_event_exists_tx(
+        tx,
+        community_id,
+        meeting_id,
+        &state_event_id,
+        buzz_core::kind::KIND_MEETING_STATE,
+        None,
+    )
+    .await?;
+    let end_valid = meeting_coordinate_event_exists_tx(
+        tx,
+        community_id,
+        meeting_id,
+        &end_event_id,
+        buzz_core::kind::KIND_MEETING_END,
+        Some(&ended_by),
+    )
+    .await?;
+    if !create_valid || !state_valid || !end_valid {
+        return Ok(MeetingCoordinateResolution::InvalidTerminal);
+    }
+
+    let normalized_outcome = match schema_version {
+        3 => match session
+            .try_get::<Option<String>, _>("terminal_outcome")?
+            .as_deref()
+        {
+            Some("closed") => MeetingCoordinateTerminalOutcome::Closed,
+            Some("aborted") => MeetingCoordinateTerminalOutcome::Aborted,
+            _ => return Ok(MeetingCoordinateResolution::InvalidTerminal),
+        },
+        1 | 2 if ended_by == host_pubkey => MeetingCoordinateTerminalOutcome::Closed,
+        1 | 2 => MeetingCoordinateTerminalOutcome::Aborted,
+        _ => return Ok(MeetingCoordinateResolution::InvalidTerminal),
+    };
+
+    Ok(MeetingCoordinateResolution::Terminal {
+        meeting_id,
+        normalized_outcome,
+        state_revision,
+        create_event_id,
+        state_event_id,
+        end_event_id,
+    })
+}
+
+async fn meeting_coordinate_event_exists_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    meeting_id: Uuid,
+    event_id: &[u8],
+    kind: u32,
+    expected_pubkey: Option<&[u8]>,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM events \
+         WHERE community_id = $1 AND channel_id = $2 AND id = $3 AND kind = $4 \
+           AND deleted_at IS NULL AND ($5::bytea IS NULL OR pubkey = $5))",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .bind(event_id)
+    .bind(i32::try_from(kind).map_err(|_| DbError::InvalidData("Meeting kind overflow".into()))?)
+    .bind(expected_pubkey)
+    .fetch_one(tx.as_mut())
+    .await?)
+}
+
 /// Parameters for atomically ending a Meeting V0 session.
 pub struct EndMeetingParams<'a> {
     /// Community that owns the meeting.

@@ -9,11 +9,11 @@ use uuid::Uuid;
 use crate::validation::{validate_uuid_v4, MIN_EDGE_COORDINATES};
 use crate::{ProjectContextError, ProjectContextResult};
 
-/// One v1 endpoint of a Project Context hyperedge.
+/// One v2 endpoint of a Project Context hyperedge.
 ///
-/// The closed union initially admits Project View objects and Project
-/// Documents. New coordinate families can be appended in a later schema while
-/// retaining the explicit canonical rank used by v1.
+/// The closed union admits Project View objects, Project Documents, and
+/// terminal Meetings. New coordinate families must be appended after the
+/// explicit ranks allocated here so existing edge identities remain stable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(
     tag = "coordinate_type",
@@ -33,6 +33,11 @@ pub enum ProjectContextCoordinate {
         /// Stable Document UUID.
         document_id: Uuid,
     },
+    /// A terminal Meeting coordinate.
+    Meeting {
+        /// Stable Meeting UUID.
+        meeting_id: Uuid,
+    },
 }
 
 impl ProjectContextCoordinate {
@@ -41,6 +46,7 @@ impl ProjectContextCoordinate {
         match self {
             Self::ProjectViewObject { object_id, .. } => validate_uuid_v4(*object_id, "object_id"),
             Self::Document { document_id } => validate_uuid_v4(*document_id, "document_id"),
+            Self::Meeting { meeting_id } => validate_uuid_v4(*meeting_id, "meeting_id"),
         }
     }
 
@@ -73,6 +79,7 @@ impl ProjectContextCoordinate {
             Self::Document { document_id } => {
                 format!("document:{project_id}:{document_id}")
             }
+            Self::Meeting { meeting_id } => format!("meeting:{project_id}:{meeting_id}"),
         }
     }
 
@@ -80,6 +87,7 @@ impl ProjectContextCoordinate {
         match self {
             Self::ProjectViewObject { .. } => 0,
             Self::Document { .. } => 1,
+            Self::Meeting { .. } => 2,
         }
     }
 
@@ -108,6 +116,7 @@ impl ProjectContextCoordinate {
                 output.extend_from_slice(object_id.as_bytes());
             }
             Self::Document { document_id } => output.extend_from_slice(document_id.as_bytes()),
+            Self::Meeting { meeting_id } => output.extend_from_slice(meeting_id.as_bytes()),
         }
     }
 }
@@ -130,6 +139,9 @@ impl Ord for ProjectContextCoordinate {
                     .cmp(&Self::object_type_rank(*right_type))
                     .then_with(|| left_id.as_bytes().cmp(right_id.as_bytes())),
                 (Self::Document { document_id: left }, Self::Document { document_id: right }) => {
+                    left.as_bytes().cmp(right.as_bytes())
+                }
+                (Self::Meeting { meeting_id: left }, Self::Meeting { meeting_id: right }) => {
                     left.as_bytes().cmp(right.as_bytes())
                 }
                 _ => Ordering::Equal,

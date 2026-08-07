@@ -1,4 +1,4 @@
-//! Project Context Edge v1 limits and canonical-value validation.
+//! Project Context Edge v2 limits and canonical-value validation.
 
 use serde::Deserialize;
 use serde_json::Value;

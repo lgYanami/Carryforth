@@ -54,6 +54,10 @@ fn document(id: Uuid) -> ProjectContextCoordinate {
     ProjectContextCoordinate::Document { document_id: id }
 }
 
+fn meeting(id: Uuid) -> ProjectContextCoordinate {
+    ProjectContextCoordinate::Meeting { meeting_id: id }
+}
+
 fn coordinates() -> Vec<ProjectContextCoordinate> {
     canonicalize_coordinates(vec![
         document(uuid(3)),
@@ -64,8 +68,9 @@ fn coordinates() -> Vec<ProjectContextCoordinate> {
 }
 
 #[test]
-fn explicit_order_is_project_view_type_then_uuid_then_document() {
+fn explicit_order_appends_meeting_after_existing_coordinate_families() {
     let values = canonicalize_coordinates(vec![
+        meeting(uuid(1)),
         document(uuid(1)),
         resource(uuid(1)),
         ProjectContextCoordinate::ProjectViewObject {
@@ -112,6 +117,36 @@ fn explicit_order_is_project_view_type_then_uuid_then_document() {
         values[4],
         ProjectContextCoordinate::Document { .. }
     ));
+    assert!(matches!(
+        values[5],
+        ProjectContextCoordinate::Meeting { meeting_id } if meeting_id == uuid(1)
+    ));
+}
+
+#[test]
+fn meeting_coordinate_has_stable_tag_and_mixed_edge_identity() {
+    let meeting_id = uuid(41);
+    let coordinate = meeting(meeting_id);
+    assert_eq!(
+        coordinate.tag_value(project()),
+        format!("meeting:{}:{meeting_id}", project())
+    );
+
+    let existing_only = canonicalize_coordinates(vec![requirement(uuid(1)), resource(uuid(2))])
+        .expect("existing-only coordinates");
+    assert_eq!(
+        EdgeKey::derive(project(), &existing_only)
+            .expect("legacy-stable key")
+            .to_string(),
+        "95998c5b78b6fa4efda616f85841aa001fce244775aa2ea4c5ae5ab9ec566c34"
+    );
+
+    let mixed = canonicalize_coordinates(vec![meeting(meeting_id), document(uuid(3))])
+        .expect("mixed coordinates");
+    assert_ne!(
+        EdgeKey::derive(project(), &existing_only).expect("existing key"),
+        EdgeKey::derive(project(), &mixed).expect("mixed key")
+    );
 }
 
 #[test]
@@ -146,7 +181,7 @@ fn duplicate_too_small_and_noncanonical_coordinate_sets_fail() {
     ));
 
     let value = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "expected_context_revision": 0,
         "request": {
             "type": "attach",

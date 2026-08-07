@@ -9,10 +9,9 @@ use buzz_project_view::ProjectViewObjectType;
 use buzz_sdk::project_context::{
     aggregate_project_context_edges, build_project_context_binding_projection,
     build_project_context_command, build_project_context_meta_projection,
-    changed_project_context_binding_for, parse_project_context_binding,
+    changed_project_context_binding_for, legacy_v1_migration, parse_project_context_binding,
     parse_project_context_command, parse_project_context_meta, validate_signed_event_frame_size,
-    verify_project_context_binding_observation, verify_project_context_meta_change,
-    verify_project_context_projection_bundle,
+    verify_project_context_meta_change, verify_project_context_projection_bundle,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Keys, Tag, Timestamp};
@@ -22,13 +21,13 @@ const PROJECT: &str = "3f2b2e8f-3f1d-4e91-91ac-5e5f1f0a2d77";
 const REQUIREMENT: &str = "0fd3a16e-4da4-48c1-aa6a-63b3661091d0";
 const RESOURCE: &str = "e0a286dd-4391-4a45-b843-62b2c57b014a";
 const CONTEXT_DOCUMENT: &str = "9c23f672-a397-42d1-b933-104ba2674f26";
-const COMMAND_ATTACH_ID: &str = "6b9b34d6048d5782acd918e36565cbb9425bcbbf90ded11d287384af45bf2be6";
-const BINDING_ACTIVE_ID: &str = "580c6cffc65d3f42aa3a1e8819e1ca25a6ae88435104b04f5844a9b817c414ea";
+const COMMAND_ATTACH_ID: &str = "9045864ebbce4d6e1fd37ba4a35ee832823a535c107d78ad88064879dfc0eefe";
+const BINDING_ACTIVE_ID: &str = "f3dc55d71e0479c6cc0ec4b805ef76b2fa4a959fb37032c47094b129d5e2a383";
 const META_INCREMENTAL_ID: &str =
-    "d0e79749ecf470809eb4b70f68334065c98b6fad05fb175813a33c9c413f788d";
-const COMMAND_DETACH_ID: &str = "b8c68930ad3fadb7d339b91b2a2e6b35782065535a9d13da22ef22f67eda6b3d";
-const BINDING_DELETED_ID: &str = "9a72a6158e4fb78e0bde59797d8db6eaae40705b414d01c7aef40916019a32e4";
-const META_DETACH_ID: &str = "655b70bb01c3277561c7f1753a675cf2fec9fbcb8fd91e9543d8f30b7c175099";
+    "24f769eff8547238beeb1a41006c51e75be63ed84705f7de3a9be3c9ffbea306";
+const COMMAND_DETACH_ID: &str = "b900a43007575986118593995b346c3c7e7257f7b39e9b9495abbb0ad48837d4";
+const BINDING_DELETED_ID: &str = "96ea3a97c28289bcaef8d68213666a5c0d26701bc4b9b3e622c70c5afcb352a1";
+const META_DETACH_ID: &str = "d7ce27aa7d9828bea06a63ac1af12c398879f1ca92144f86a532350551ff1b72";
 
 fn keys(secret: u8) -> Keys {
     Keys::parse(&format!("{secret:064x}")).expect("fixed test key")
@@ -208,7 +207,111 @@ fn deleted_binding_bundle_is_strict() {
 }
 
 #[test]
-fn production_parsers_accept_shared_golden_fixtures() {
+fn v2_meeting_fixtures_are_normative_and_production_parseable() {
+    let relay = keys(1).public_key();
+    let command_attach: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/command-attach.json"
+    ))
+    .expect("v2 attach event fixture");
+    let binding_active: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/binding-active.json"
+    ))
+    .expect("v2 active binding fixture");
+    let meta_incremental: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-incremental.json"
+    ))
+    .expect("v2 incremental metadata fixture");
+    let command_detach: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/command-detach.json"
+    ))
+    .expect("v2 detach event fixture");
+    let binding_deleted: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/binding-deleted.json"
+    ))
+    .expect("v2 deleted binding fixture");
+    let meta_detach: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-detach.json"
+    ))
+    .expect("v2 detach metadata fixture");
+    let meta_reset: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-reset.json"
+    ))
+    .expect("v2 reset metadata fixture");
+    let meta_reset_reproject: Event = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-reset-reproject.json"
+    ))
+    .expect("v2 reproject metadata fixture");
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/nips/fixtures/project-context-edge-v2/golden.json"
+    ))
+    .expect("v2 golden manifest");
+
+    let attach = parse_project_context_command(&command_attach, project_id())
+        .expect("parse v2 Meeting attach");
+    assert!(matches!(
+        attach.coordinates()[1],
+        ProjectContextCoordinate::Meeting { meeting_id }
+            if meeting_id
+                == Uuid::parse_str("0ed366aa-6f94-4eff-83db-b8bf081fbf35")
+                    .expect("Meeting UUID")
+    ));
+    parse_project_context_command(&command_detach, project_id()).expect("parse v2 Meeting detach");
+    let active = parse_project_context_binding(&binding_active, &relay, project_id())
+        .expect("parse v2 active binding");
+    let incremental = parse_project_context_meta(&meta_incremental, &relay, project_id())
+        .expect("parse v2 incremental metadata");
+    verify_project_context_meta_change(&incremental, &active)
+        .expect("verify v2 active observation");
+    let deleted = parse_project_context_binding(&binding_deleted, &relay, project_id())
+        .expect("parse v2 deleted binding");
+    let detached = parse_project_context_meta(&meta_detach, &relay, project_id())
+        .expect("parse v2 detach metadata");
+    verify_project_context_meta_change(&detached, &deleted).expect("verify v2 deleted observation");
+    assert!(
+        parse_project_context_meta(&meta_reset, &relay, project_id())
+            .expect("parse v2 reset metadata")
+            .projection
+            .reset
+    );
+    assert!(
+        parse_project_context_meta(&meta_reset_reproject, &relay, project_id())
+            .expect("parse v2 reproject metadata")
+            .projection
+            .reset
+    );
+
+    let raw_attach =
+        include_str!("../../../docs/nips/fixtures/project-context-edge-v2/commands/attach.json")
+            .trim();
+    assert_eq!(
+        serde_json::to_string(&ProjectContextCommand::from_json(raw_attach).expect("v2 attach"))
+            .expect("serialize v2 attach"),
+        raw_attach
+    );
+    let receipt_raw =
+        include_str!("../../../docs/nips/fixtures/project-context-edge-v2/receipt-detach.json")
+            .trim();
+    let receipt: ProjectContextReceipt =
+        serde_json::from_str(receipt_raw).expect("v2 receipt fixture");
+    receipt.validate().expect("validate v2 receipt");
+    assert_eq!(receipt.edge_key.to_string(), golden["edge_key"]);
+
+    for (field, event) in [
+        ("command_attach_event_id", &command_attach),
+        ("binding_active_event_id", &binding_active),
+        ("meta_incremental_event_id", &meta_incremental),
+        ("command_detach_event_id", &command_detach),
+        ("binding_deleted_event_id", &binding_deleted),
+        ("meta_detach_event_id", &meta_detach),
+        ("meta_reset_event_id", &meta_reset),
+        ("meta_reset_reproject_event_id", &meta_reset_reproject),
+    ] {
+        assert_eq!(golden[field], event.id.to_hex());
+    }
+}
+
+#[test]
+fn legacy_v1_fixtures_are_migration_only_and_rejected_by_v2_runtime_parsers() {
     let relay = keys(1).public_key();
     let command_attach: Event = serde_json::from_str(include_str!(
         "../../../docs/nips/fixtures/project-context-edge-v1/events/command-attach.json"
@@ -247,27 +350,43 @@ fn production_parsers_accept_shared_golden_fixtures() {
     ))
     .expect("golden manifest");
 
-    parse_project_context_command(&command_attach, project_id()).expect("attach command");
-    parse_project_context_command(&command_detach, project_id()).expect("detach command");
-    let active = parse_project_context_binding(&binding_active, &relay, project_id())
-        .expect("active binding");
-    let incremental = parse_project_context_meta(&meta_incremental, &relay, project_id())
-        .expect("incremental meta");
-    verify_project_context_meta_change(&incremental, &active).expect("active observation");
-    let deleted = parse_project_context_binding(&binding_deleted, &relay, project_id())
-        .expect("deleted binding");
-    let detach =
-        parse_project_context_meta(&meta_detach, &relay, project_id()).expect("detach meta");
-    verify_project_context_meta_change(&detach, &deleted).expect("deleted observation");
-    let reset = parse_project_context_meta(&meta_reset, &relay, project_id()).expect("reset meta");
-    assert!(reset.projection.reset);
-    let reproject_reset = parse_project_context_meta(&meta_reset_reproject, &relay, project_id())
-        .expect("reproject reset meta");
-    verify_project_context_binding_observation(&reproject_reset, &active)
-        .expect("reset boundary accepts an equal-revision binding without a changed pointer");
-    let mut future_binding = active.clone();
-    future_binding.projection.context_revision = 2;
-    assert!(verify_project_context_binding_observation(&reproject_reset, &future_binding).is_err());
+    assert!(parse_project_context_command(&command_attach, project_id()).is_err());
+    assert!(parse_project_context_command(&command_detach, project_id()).is_err());
+    assert!(parse_project_context_binding(&binding_active, &relay, project_id()).is_err());
+    assert!(parse_project_context_meta(&meta_incremental, &relay, project_id()).is_err());
+
+    let active = legacy_v1_migration::verify_binding(&binding_active, &relay, project_id())
+        .expect("migration verifies active binding");
+    let incremental = legacy_v1_migration::verify_meta(&meta_incremental, &relay, project_id())
+        .expect("migration verifies incremental metadata");
+    assert_eq!(
+        incremental.changed_bindings[0].binding_event_id,
+        binding_active.id
+    );
+    assert_eq!(incremental.changed_bindings[0].edge_key, active.edge_key);
+    let deleted = legacy_v1_migration::verify_binding(&binding_deleted, &relay, project_id())
+        .expect("migration verifies deleted binding");
+    let detach = legacy_v1_migration::verify_meta(&meta_detach, &relay, project_id())
+        .expect("migration verifies detach metadata");
+    assert_eq!(
+        detach.changed_bindings[0].binding_event_id,
+        binding_deleted.id
+    );
+    assert_eq!(detach.changed_bindings[0].edge_key, deleted.edge_key);
+    let reset = legacy_v1_migration::verify_meta(&meta_reset, &relay, project_id())
+        .expect("migration verifies reset metadata");
+    assert!(reset.reset);
+    let reproject_reset =
+        legacy_v1_migration::verify_meta(&meta_reset_reproject, &relay, project_id())
+            .expect("migration verifies reproject reset metadata");
+    assert!(reproject_reset.reset);
+    assert_eq!(reproject_reset.context_revision, active.context_revision);
+    assert!(legacy_v1_migration::verify_binding(
+        &binding_active,
+        &keys(3).public_key(),
+        project_id()
+    )
+    .is_err());
 
     for (field, event) in [
         ("command_attach_event_id", &command_attach),
@@ -285,33 +404,26 @@ fn production_parsers_accept_shared_golden_fixtures() {
     let attach_raw =
         include_str!("../../../docs/nips/fixtures/project-context-edge-v1/commands/attach.json")
             .trim();
-    let attach = ProjectContextCommand::from_json(attach_raw).expect("raw attach fixture");
-    assert_eq!(
-        serde_json::to_string(&attach).expect("command JSON"),
-        attach_raw
-    );
+    let attach: serde_json::Value = serde_json::from_str(attach_raw).expect("raw attach fixture");
+    assert_eq!(attach["schema_version"], 1);
+    assert!(ProjectContextCommand::from_json(attach_raw).is_err());
     let detach_raw =
         include_str!("../../../docs/nips/fixtures/project-context-edge-v1/commands/detach.json")
             .trim();
-    let detach = ProjectContextCommand::from_json(detach_raw).expect("raw detach fixture");
-    assert_eq!(
-        serde_json::to_string(&detach).expect("command JSON"),
-        detach_raw
-    );
+    let detach: serde_json::Value = serde_json::from_str(detach_raw).expect("raw detach fixture");
+    assert_eq!(detach["schema_version"], 1);
+    assert!(ProjectContextCommand::from_json(detach_raw).is_err());
 
     let receipt_raw =
         include_str!("../../../docs/nips/fixtures/project-context-edge-v1/receipt-detach.json")
             .trim();
     let receipt: ProjectContextReceipt =
         serde_json::from_str(receipt_raw).expect("receipt fixture");
-    receipt.validate().expect("receipt");
+    assert!(receipt.validate().is_err());
     assert_eq!(
         serde_json::to_string(&receipt).expect("receipt JSON"),
         receipt_raw
     );
-    let mut invalid_receipt = receipt;
-    invalid_receipt.context_revision += 1;
-    assert!(invalid_receipt.validate().is_err());
 }
 
 #[test]

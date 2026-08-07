@@ -1,4 +1,4 @@
-//! Relay-signed Project Context Edge v1 projection and receipt wire types.
+//! Relay-signed Project Context Edge v2 projection and receipt wire types.
 
 use buzz_core::{EventId, PublicKey};
 use chrono::{DateTime, Utc};
@@ -30,7 +30,7 @@ pub enum ProjectContextProjectionType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectContextBindingProjection {
-    /// Must equal one.
+    /// Must equal the current Project Context schema version.
     pub schema_version: u16,
     /// Must equal `context_edge_binding`.
     pub projection_type: ProjectContextProjectionType,
@@ -123,7 +123,7 @@ impl ChangedContextBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectContextMetaProjection {
-    /// Must equal one.
+    /// Must equal the current Project Context schema version.
     pub schema_version: u16,
     /// Must equal `context_meta`.
     pub projection_type: ProjectContextProjectionType,
@@ -200,7 +200,7 @@ impl ProjectContextMetaProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectContextReceipt {
-    /// Must equal one.
+    /// Must equal the current Project Context schema version.
     pub schema_version: u16,
     /// Accepted command event and stable replay identity.
     pub change_id: EventId,
