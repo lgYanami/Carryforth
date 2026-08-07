@@ -220,6 +220,16 @@ pub async fn handle_req(
     }
 
     let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
+    if filters.iter().any(|filter| {
+        super::project_view::filter_is_exclusively_project_view(filter)
+            && super::project_view::filter_has_unscoped_project_view_projection(filter)
+    }) {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_view:v3_projection_filter_required",
+        ));
+        return;
+    }
     let project_view_exclusive = !filters.is_empty()
         && filters
             .iter()
@@ -242,6 +252,7 @@ pub async fn handle_req(
     } else {
         false
     };
+    let project_view_projection_signer = super::project_view::configured_projection_signer(&state);
     if project_view_exclusive && !project_view_read_allowed {
         conn.send(RelayMessage::closed(
             &sub_id,
@@ -507,6 +518,17 @@ pub async fn handle_req(
                     buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
                 ]);
             }
+            if super::project_view::filter_has_unscoped_project_view_projection(filter) {
+                let excluded = params.excluded_kinds.get_or_insert_with(Vec::new);
+                for kind in [
+                    buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+                    buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+                ] {
+                    if !excluded.contains(&kind) {
+                        excluded.push(kind);
+                    }
+                }
+            }
             super::community_private::exclude_project_document_kinds(
                 &mut params,
                 filter,
@@ -607,6 +629,13 @@ pub async fn handle_req(
             if !project_view_read_allowed
                 && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
             {
+                continue;
+            }
+            if !super::project_view::projection_event_visible_for_filter(
+                filter,
+                &stored.event,
+                project_view_projection_signer.as_ref(),
+            ) {
                 continue;
             }
             if !super::community_private::event_is_visible(
@@ -742,6 +771,7 @@ async fn handle_search_req(
     trace_state: Option<&crate::conformance::AbstractState>,
     project_view_read_allowed: bool,
 ) {
+    let project_view_projection_signer = super::project_view::configured_projection_signer(state);
     // The community-wide channel scope (no #h tag on the filter). `None` means
     // "no accessible channels and no global access" → EOSE, exactly as the
     // legacy string-filter helper short-circuited.
@@ -939,6 +969,13 @@ async fn handle_search_req(
                             stored.event.kind.as_u16() as u32,
                         )
                     {
+                        continue;
+                    }
+                    if !super::project_view::projection_event_visible_for_filter(
+                        filter,
+                        &stored.event,
+                        project_view_projection_signer.as_ref(),
+                    ) {
                         continue;
                     }
                     // Project Document does not support NIP-50. This result

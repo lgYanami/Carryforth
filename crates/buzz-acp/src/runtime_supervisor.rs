@@ -1843,10 +1843,19 @@ async fn read_maintenance_status(client: &RestClient) -> Result<MaintenanceStatu
 }
 
 fn validate_maintenance_status(status: &MaintenanceStatus) -> Result<(), String> {
+    // Ordinary managed Runtime operation is schema-v3-only. A schema-v2
+    // status is accepted solely as the disabled, active maintenance envelope
+    // needed to quiesce an old Runtime before an explicit operator cutover.
+    // It must never make a normal/enabled v2 Community look runnable again.
+    let legacy_cutover_maintenance = status.project_view_schema_version == 2
+        && !status.project_view_enabled
+        && !status.archived
+        && status.current_epoch.is_some()
+        && matches!(status.state.as_str(), "draining" | "frozen");
     if status.community_id.is_nil()
         || status.host.is_empty()
         || status.host.contains('\0')
-        || !matches!(status.project_view_schema_version, 2 | 3)
+        || (status.project_view_schema_version != 3 && !legacy_cutover_maintenance)
         || !(MAINTENANCE_POLL_MIN..=MAINTENANCE_POLL_MAX).contains(&status.poll_after_seconds)
     {
         return Err("maintenance status header is malformed".to_owned());
@@ -2441,7 +2450,7 @@ mod tests {
                 "state": "normal",
                 "current_epoch": null,
                 "latest_epoch": null,
-                "project_view_schema_version": 2,
+                "project_view_schema_version": 3,
                 "project_view_enabled": true,
                 "archived": false,
                 "poll_after_seconds": 5,
@@ -2967,6 +2976,16 @@ mod tests {
             }),
         };
         validate_maintenance_status(&status).expect("valid maintenance status");
+
+        let mut ordinary_v2 = status.clone();
+        ordinary_v2.state = "normal".to_owned();
+        ordinary_v2.current_epoch = None;
+        ordinary_v2.project_view_enabled = true;
+        ordinary_v2.epoch = None;
+        assert_eq!(
+            validate_maintenance_status(&ordinary_v2),
+            Err("maintenance status header is malformed".to_owned())
+        );
         assert_eq!(
             maintenance_assignment_ack_id(7, &assignment),
             maintenance_assignment_ack_id(7, &assignment)

@@ -5,17 +5,17 @@ use std::collections::HashSet;
 use buzz_core_pkg::kind::KIND_PROJECT_VIEW_OBJECT;
 use buzz_core_pkg::{CommunityId, EventId};
 use buzz_project_view_pkg::v2::{RoleContinuityChange, RoleContinuityEntity};
-use buzz_sdk_pkg::project_view_v2::parse_entity_projection as parse_v2_entity_projection;
 use buzz_sdk_pkg::project_view_v3::{
     parse_entity_projection as parse_v3_entity_projection, V3EntityChange,
+    PROJECT_VIEW_V3_ENTITY_TAG, PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::State;
 
 use super::{
-    integrity_error, query_project_view, read_error_message, read_identity, read_v2_meta,
-    read_v3_meta, AppState, ProjectViewIdentity, ProjectViewSchema,
+    integrity_error, query_project_view, read_error_message, read_identity, read_v3_meta, AppState,
+    ProjectViewIdentity, ProjectViewSchema,
 };
 
 struct HistoryMeta {
@@ -72,9 +72,10 @@ pub async fn get_project_view_role_history(
     let Some(identity) = read_identity(&state).await? else {
         return Err("Project View Role history is unsupported".to_owned());
     };
-    if identity.schema == ProjectViewSchema::V1 {
-        return Err("Project View Role history requires schema v2 or v3".to_owned());
+    if identity.schema != ProjectViewSchema::V3 {
+        return Err("Project View Role history requires schema v3".to_owned());
     }
+    identity.require_runtime_ready("Project View Role history")?;
     let meta = read_history_meta(&state, identity)
         .await?
         .ok_or_else(|| "Project View is uninitialized".to_owned())?;
@@ -85,7 +86,7 @@ pub async fn get_project_view_role_history(
     }
 
     let mut extension = json!({
-        "scope": "role_history",
+        "scope": PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
         "revision": input.project_revision,
         "projection_generation": input.projection_generation,
         "entity_types": [
@@ -108,11 +109,7 @@ pub async fn get_project_view_role_history(
         &[json!({
             "kinds": [KIND_PROJECT_VIEW_OBJECT],
             "authors": [identity.relay_pubkey.to_hex()],
-            "#t": [match identity.schema {
-                ProjectViewSchema::V2 => "buzz-project-view-v2-entity",
-                ProjectViewSchema::V3 => "buzz-project-view-v3-entity",
-                ProjectViewSchema::V1 => unreachable!("schema v1 rejected above"),
-            }],
+            "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
             "limit": input.limit,
             "buzz_project_view": extension,
         })],
@@ -134,29 +131,12 @@ pub async fn get_project_view_role_history(
                 "Role history page contains a duplicate signed event",
             ));
         }
-        let (projection_generation, project_revision, entity) = match identity.schema {
-            ProjectViewSchema::V2 => {
-                let projection =
-                    parse_v2_entity_projection(&event, &identity.relay_pubkey, meta.project_id)
-                        .map_err(|error| integrity_error(error.to_string()))?;
-                (
-                    projection.projection_generation,
-                    projection.project_revision,
-                    projection.entity,
-                )
-            }
-            ProjectViewSchema::V3 => {
-                let projection =
-                    parse_v3_entity_projection(&event, &identity.relay_pubkey, meta.project_id)
-                        .map_err(|error| integrity_error(error.to_string()))?;
-                (
-                    projection.projection_generation,
-                    projection.project_revision,
-                    v3_history_change(projection.entity)?,
-                )
-            }
-            ProjectViewSchema::V1 => unreachable!("schema v1 rejected above"),
-        };
+        let projection =
+            parse_v3_entity_projection(&event, &identity.relay_pubkey, meta.project_id)
+                .map_err(|error| integrity_error(error.to_string()))?;
+        let projection_generation = projection.projection_generation;
+        let project_revision = projection.project_revision;
+        let entity = v3_history_change(projection.entity)?;
         if projection_generation != meta.projection_generation
             || project_revision > meta.project_revision
         {
@@ -202,28 +182,20 @@ async fn read_history_meta(
     state: &AppState,
     identity: ProjectViewIdentity,
 ) -> Result<Option<HistoryMeta>, String> {
-    let meta = match identity.schema {
-        ProjectViewSchema::V1 => return Ok(None),
-        ProjectViewSchema::V2 => read_v2_meta(state, identity)
-            .await
-            .map_err(read_error_message)?
-            .map(|meta| HistoryMeta {
+    if identity.schema != ProjectViewSchema::V3 {
+        return Err("Project View Role history requires schema v3".to_owned());
+    }
+    read_v3_meta(state, identity)
+        .await
+        .map_err(read_error_message)
+        .map(|meta| {
+            meta.map(|meta| HistoryMeta {
                 event_id: meta.event_id,
                 project_id: meta.project_id,
                 project_revision: meta.project_revision,
                 projection_generation: meta.projection_generation,
-            }),
-        ProjectViewSchema::V3 => read_v3_meta(state, identity)
-            .await
-            .map_err(read_error_message)?
-            .map(|meta| HistoryMeta {
-                event_id: meta.event_id,
-                project_id: meta.project_id,
-                project_revision: meta.project_revision,
-                projection_generation: meta.projection_generation,
-            }),
-    };
-    Ok(meta)
+            })
+        })
 }
 
 fn v3_history_change(entity: V3EntityChange) -> Result<RoleContinuityChange, String> {

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::client::BuzzClient;
 use crate::commands::documents::{read_verified_document, DocumentReadOutput};
-use crate::commands::project_view_v2_snapshot::{
+use crate::commands::project_view_snapshot::{
     read_identity, read_v3_meta, read_verified_v3_snapshot, ProjectViewSchema,
     PROJECT_VIEW_V3_EXTENSION,
 };

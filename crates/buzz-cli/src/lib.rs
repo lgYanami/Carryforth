@@ -355,7 +355,7 @@ enum Cmd {
     /// Resolve Project View Resources and their mandatory Guides
     #[command(subcommand)]
     Resources(ResourcesCmd),
-    /// Read and govern Project View v2 Roles and Assignments
+    /// Read and govern Project View v3 Roles and Assignments
     #[command(subcommand)]
     Roles(RolesCmd),
     /// Submit trusted managed-runtime evidence and read availability
@@ -440,22 +440,13 @@ pub enum ProjectViewCmd {
         /// Stable object UUID.
         id: Uuid,
     },
-    /// Atomically create the profile and initial goals
-    Init {
-        /// JSON file containing the Project Profile, or `-` for stdin.
-        #[arg(long)]
-        profile: String,
-        /// JSON file containing one initial Goal; repeat for multiple goals.
-        #[arg(long, required = true)]
-        goal: Vec<String>,
-    },
     /// Initialize one prepared empty schema-v3 Community from a closed command
     InitV3 {
         /// JSON file containing the complete ProjectViewInitializeV3 command.
         #[arg(long)]
         command: String,
     },
-    /// Local schema-v3 review operations (does not submit a mutation)
+    /// Explicit Human-only v2-to-v3 migration review (does not mutate Relay state)
     V3 {
         #[command(subcommand)]
         command: ProjectViewV3ClientCmd,
@@ -564,10 +555,10 @@ pub enum ProjectViewContextCmd {
     },
 }
 
-/// Member-side schema-v3 workflows.
+/// Explicit local migration-review workflows.
 #[derive(Subcommand)]
 pub enum ProjectViewV3ClientCmd {
-    /// Review legacy Resource mappings.
+    /// Review legacy Resource mappings for an operator v2-to-v3 cutover.
     Resources {
         #[command(subcommand)]
         command: ProjectViewV3ResourcesClientCmd,
@@ -577,7 +568,7 @@ pub enum ProjectViewV3ClientCmd {
 /// Human Resource review commands.
 #[derive(Subcommand)]
 pub enum ProjectViewV3ResourcesClientCmd {
-    /// Verify current v2 Resource/Guide pins and create detached approvals
+    /// Verify frozen v2 migration inputs and create detached Human approvals
     Approve {
         /// Operator-exported draft JSON completed by the Human reviewer.
         #[arg(long)]
@@ -762,7 +753,7 @@ pub enum RuntimeEvidenceArg {
     SupervisorHeartbeat,
 }
 
-/// Project View v2 Role continuity commands.
+/// Project View v3 Role continuity commands.
 #[derive(Subcommand)]
 pub enum RolesCmd {
     /// List canonical Roles with their current assignee or vacancy
@@ -3802,7 +3793,6 @@ mod tests {
                 "delete",
                 "get",
                 "get-object",
-                "init",
                 "init-v3",
                 "update",
                 "v3"
@@ -4014,7 +4004,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
-            ("project-view", 9),
+            ("project-view", 8),
             ("reactions", 3),
             ("repos", 4),
             ("resources", 1),

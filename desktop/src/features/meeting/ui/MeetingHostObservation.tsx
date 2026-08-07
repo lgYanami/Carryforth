@@ -130,7 +130,7 @@ export function MeetingHostObservation({
   return (
     <section
       aria-label="Agent host observation"
-      className="mx-auto mb-3 max-h-[40vh] w-full max-w-4xl overflow-y-auto rounded-xl border bg-background p-4 shadow-xs"
+      className="mb-3 max-h-[40vh] min-w-0 w-full overflow-y-auto rounded-xl border bg-background p-4 shadow-xs"
       data-host-phase={phase.kind}
       data-testid="meeting-host-observation"
     >

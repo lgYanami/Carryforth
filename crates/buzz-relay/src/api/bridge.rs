@@ -18,6 +18,10 @@ use buzz_core::TenantContext;
 use buzz_db::project_document::{
     ProjectDocumentActiveHeadsPageRequest, ProjectDocumentHistoryPageRequest,
 };
+use buzz_sdk::project_view_v3::{
+    PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE, PROJECT_VIEW_V3_ENTITY_TAG,
+    PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
+};
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
 use crate::state::AppState;
@@ -255,31 +259,48 @@ const BRIDGE_FEED_MAX_LIMIT: i64 = 100;
 const BRIDGE_THREAD_MAX_LIMIT: u32 = 500;
 
 enum ProjectViewPageRequest {
-    ActiveObjects {
+    // Migration-only source read used by the explicit v2 -> v3 operator
+    // cutover/Resource-review flow. Ordinary runtime capability discovery no
+    // longer advertises v2, and v3 clients use the closed v3 scopes below.
+    V2MigrationObjects {
         revision: u64,
         projection_generation: u64,
         after: Option<buzz_db::project_view::ProjectViewSnapshotCursor>,
         limit: u16,
     },
-    V2CurrentEntities {
+    V2MigrationCurrentEntities {
         revision: u64,
         projection_generation: u64,
-        after: Option<buzz_db::project_view::ProjectViewV2EntityCursor>,
+        after: Option<buzz_db::project_view::ProjectViewEntityCursor>,
         limit: u16,
     },
+    /// Exact retained v2 metadata pointer for an explicit operator migration
+    /// or recovery read. Ordinary Project View queries never enter this path.
+    V2MigrationMeta,
     V3CurrentEntities {
         revision: u64,
         projection_generation: u64,
-        after: Option<buzz_db::project_view::ProjectViewV2EntityCursor>,
+        after: Option<buzz_db::project_view::ProjectViewEntityCursor>,
         limit: u16,
     },
-    RoleHistory {
+    V3RoleHistory {
         revision: u64,
         projection_generation: u64,
-        filter: buzz_db::project_view::ProjectViewRoleHistoryFilter,
-        after: Option<buzz_db::project_view::ProjectViewRoleHistoryCursor>,
+        filter: buzz_db::project_view::ProjectViewV3RoleHistoryFilter,
+        after: Option<buzz_db::project_view::ProjectViewV3RoleHistoryCursor>,
         limit: u16,
     },
+}
+
+impl ProjectViewPageRequest {
+    const fn is_v2_migration(&self) -> bool {
+        matches!(
+            self,
+            Self::V2MigrationObjects { .. }
+                | Self::V2MigrationCurrentEntities { .. }
+                | Self::V2MigrationMeta
+        )
+    }
 }
 
 enum ProjectDocumentPageRequest {
@@ -573,43 +594,76 @@ fn parse_project_view_page_request(
                 "buzz_project_view must be an object",
             )
         })?;
-    let revision = project_view_safe_revision(extension, "revision")?;
-    let projection_generation = project_view_safe_revision(extension, "projection_generation")?;
     let scope = extension
         .get("scope")
-        .map(|value| {
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view scope is required",
+            )
+        })
+        .and_then(|value| {
             value.as_str().ok_or_else(|| {
                 api_error(
                     StatusCode::BAD_REQUEST,
                     "buzz_project_view scope must be a string",
                 )
             })
-        })
-        .transpose()?
-        .unwrap_or("active_objects");
+        })?;
 
     let request = match scope {
-        "active_objects" => {
-            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-active")?;
+        "v2_migration_meta" => {
+            require_project_view_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_VIEW_META,
+                buzz_sdk::project_view_v3::PROJECT_VIEW_V3_META_TAG,
+            )?;
+            const ALLOWED: &[&str] = &["scope"];
+            reject_project_view_extension_fields(extension, ALLOWED)?;
+            ProjectViewPageRequest::V2MigrationMeta
+        }
+        "v2_migration_objects" => {
+            // Closed, read-only source page for the explicit operator
+            // migration. Ordinary v2 projection filters remain rejected.
+            require_project_view_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_VIEW_OBJECT,
+                "buzz-project-view-v2-object",
+            )?;
             const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
             reject_project_view_extension_fields(extension, ALLOWED)?;
-            ProjectViewPageRequest::ActiveObjects {
-                revision,
-                projection_generation,
+            ProjectViewPageRequest::V2MigrationObjects {
+                revision: project_view_safe_revision(extension, "revision")?,
+                projection_generation: project_view_safe_revision(
+                    extension,
+                    "projection_generation",
+                )?,
                 after: extension
                     .get("after")
-                    .map(parse_project_view_cursor)
+                    .map(parse_project_view_object_cursor)
                     .transpose()?,
                 limit,
             }
         }
-        "v2_current_entities" => {
-            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v2-entity")?;
+        "v2_migration_current_entities" => {
+            // Keep this exact legacy scope solely as a read-only cutover input.
+            // It cannot mutate canonical state and the DB reader pins schema 2.
+            require_project_view_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_VIEW_OBJECT,
+                "buzz-project-view-v2-entity",
+            )?;
             const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
             reject_project_view_extension_fields(extension, ALLOWED)?;
-            ProjectViewPageRequest::V2CurrentEntities {
-                revision,
-                projection_generation,
+            ProjectViewPageRequest::V2MigrationCurrentEntities {
+                revision: project_view_safe_revision(extension, "revision")?,
+                projection_generation: project_view_safe_revision(
+                    extension,
+                    "projection_generation",
+                )?,
                 after: extension
                     .get("after")
                     .map(parse_project_view_entity_cursor)
@@ -617,13 +671,21 @@ fn parse_project_view_page_request(
                 limit,
             }
         }
-        "v3_current_entities" => {
-            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v3-entity")?;
+        PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE => {
+            require_project_view_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_VIEW_OBJECT,
+                PROJECT_VIEW_V3_ENTITY_TAG,
+            )?;
             const ALLOWED: &[&str] = &["scope", "revision", "projection_generation", "after"];
             reject_project_view_extension_fields(extension, ALLOWED)?;
             ProjectViewPageRequest::V3CurrentEntities {
-                revision,
-                projection_generation,
+                revision: project_view_safe_revision(extension, "revision")?,
+                projection_generation: project_view_safe_revision(
+                    extension,
+                    "projection_generation",
+                )?,
                 after: extension
                     .get("after")
                     .map(parse_project_view_entity_cursor)
@@ -631,8 +693,13 @@ fn parse_project_view_page_request(
                 limit,
             }
         }
-        "role_history" => {
-            require_project_view_outer_filter(raw, relay_pubkey, "buzz-project-view-v2-entity")?;
+        PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE => {
+            require_project_view_outer_filter(
+                raw,
+                relay_pubkey,
+                buzz_core::kind::KIND_PROJECT_VIEW_OBJECT,
+                PROJECT_VIEW_V3_ENTITY_TAG,
+            )?;
             const ALLOWED: &[&str] = &[
                 "scope",
                 "revision",
@@ -657,10 +724,13 @@ fn parse_project_view_page_request(
                 .get("member_pubkey")
                 .map(parse_project_view_member_pubkey)
                 .transpose()?;
-            ProjectViewPageRequest::RoleHistory {
-                revision,
-                projection_generation,
-                filter: buzz_db::project_view::ProjectViewRoleHistoryFilter {
+            ProjectViewPageRequest::V3RoleHistory {
+                revision: project_view_safe_revision(extension, "revision")?,
+                projection_generation: project_view_safe_revision(
+                    extension,
+                    "projection_generation",
+                )?,
+                filter: buzz_db::project_view::ProjectViewV3RoleHistoryFilter {
                     entity_types,
                     role_id,
                     assignment_id,
@@ -683,15 +753,32 @@ fn parse_project_view_page_request(
     Ok(Some(request))
 }
 
+fn bridge_filter_has_forbidden_unscoped_project_view_projection(
+    raw: &Value,
+    filter: &nostr::Filter,
+) -> bool {
+    let explicit_v2_migration = raw
+        .get("buzz_project_view")
+        .and_then(|extension| extension.get("scope"))
+        .and_then(Value::as_str)
+        .is_some_and(|scope| {
+            matches!(
+                scope,
+                "v2_migration_meta" | "v2_migration_objects" | "v2_migration_current_entities"
+            )
+        });
+    !explicit_v2_migration
+        && crate::handlers::project_view::filter_is_exclusively_project_view(filter)
+        && crate::handlers::project_view::filter_has_unscoped_project_view_projection(filter)
+}
+
 fn require_project_view_outer_filter(
     raw: &serde_json::Map<String, Value>,
     relay_pubkey: &nostr::PublicKey,
+    expected_kind: u32,
     expected_tag: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    if raw.get("kinds")
-        != Some(&serde_json::json!([
-            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT
-        ]))
+    if raw.get("kinds") != Some(&serde_json::json!([expected_kind]))
         || raw.get("#t") != Some(&serde_json::json!([expected_tag]))
         || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
     {
@@ -732,65 +819,9 @@ fn project_view_safe_revision(
         })
 }
 
-fn parse_project_view_cursor(
-    value: &Value,
-) -> Result<buzz_db::project_view::ProjectViewSnapshotCursor, (StatusCode, Json<Value>)> {
-    let object = value.as_object().ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "buzz_project_view after must be an object",
-        )
-    })?;
-    if object.len() != 2 || !object.contains_key("object_type") || !object.contains_key("object_id")
-    {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "buzz_project_view after requires exactly object_type and object_id",
-        ));
-    }
-    let object_type = match object.get("object_type").and_then(Value::as_str) {
-        Some("project_profile") => buzz_project_view::ProjectViewObjectType::ProjectProfile,
-        Some("goal") => buzz_project_view::ProjectViewObjectType::Goal,
-        Some("role") => buzz_project_view::ProjectViewObjectType::Role,
-        Some("plan") => buzz_project_view::ProjectViewObjectType::Plan,
-        Some("stage") => buzz_project_view::ProjectViewObjectType::Stage,
-        Some("requirement") => buzz_project_view::ProjectViewObjectType::Requirement,
-        Some("issue") => buzz_project_view::ProjectViewObjectType::Issue,
-        Some("work") => buzz_project_view::ProjectViewObjectType::Work,
-        Some("resource") => buzz_project_view::ProjectViewObjectType::Resource,
-        _ => {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "buzz_project_view after.object_type is invalid",
-            ));
-        }
-    };
-    let object_id = object
-        .get("object_id")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<uuid::Uuid>().ok())
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "buzz_project_view after.object_id must be a canonical UUID",
-            )
-        })?;
-    let canonical_object_id = object_id.to_string();
-    if object.get("object_id").and_then(Value::as_str) != Some(canonical_object_id.as_str()) {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "buzz_project_view after.object_id must be a canonical lowercase UUID",
-        ));
-    }
-    Ok(buzz_db::project_view::ProjectViewSnapshotCursor {
-        object_type,
-        object_id,
-    })
-}
-
 fn parse_project_view_entity_cursor(
     value: &Value,
-) -> Result<buzz_db::project_view::ProjectViewV2EntityCursor, (StatusCode, Json<Value>)> {
+) -> Result<buzz_db::project_view::ProjectViewEntityCursor, (StatusCode, Json<Value>)> {
     let object = value.as_object().ok_or_else(|| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -825,15 +856,63 @@ fn parse_project_view_entity_cursor(
             )
         })
         .and_then(|value| parse_project_view_uuid(value, "after.entity_id"))?;
-    Ok(buzz_db::project_view::ProjectViewV2EntityCursor {
+    Ok(buzz_db::project_view::ProjectViewEntityCursor {
         entity_type,
         entity_id,
     })
 }
 
+fn parse_project_view_object_cursor(
+    value: &Value,
+) -> Result<buzz_db::project_view::ProjectViewSnapshotCursor, (StatusCode, Json<Value>)> {
+    let object = value.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "buzz_project_view after must be an object",
+        )
+    })?;
+    if object.len() != 2 || !object.contains_key("object_type") || !object.contains_key("object_id")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "migration-object after requires exactly object_type and object_id",
+        ));
+    }
+    let object_type = match object.get("object_type").and_then(Value::as_str) {
+        Some("project_profile") => buzz_project_view::ProjectViewObjectType::ProjectProfile,
+        Some("goal") => buzz_project_view::ProjectViewObjectType::Goal,
+        Some("role") => buzz_project_view::ProjectViewObjectType::Role,
+        Some("plan") => buzz_project_view::ProjectViewObjectType::Plan,
+        Some("stage") => buzz_project_view::ProjectViewObjectType::Stage,
+        Some("requirement") => buzz_project_view::ProjectViewObjectType::Requirement,
+        Some("issue") => buzz_project_view::ProjectViewObjectType::Issue,
+        Some("work") => buzz_project_view::ProjectViewObjectType::Work,
+        Some("resource") => buzz_project_view::ProjectViewObjectType::Resource,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "buzz_project_view after.object_type is invalid",
+            ));
+        }
+    };
+    let object_id = object
+        .get("object_id")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "migration-object after is missing object_id",
+            )
+        })
+        .and_then(|value| parse_project_view_uuid(value, "after.object_id"))?;
+    Ok(buzz_db::project_view::ProjectViewSnapshotCursor {
+        object_type,
+        object_id,
+    })
+}
+
 fn parse_project_view_history_cursor(
     value: &Value,
-) -> Result<buzz_db::project_view::ProjectViewRoleHistoryCursor, (StatusCode, Json<Value>)> {
+) -> Result<buzz_db::project_view::ProjectViewV3RoleHistoryCursor, (StatusCode, Json<Value>)> {
     let object = value.as_object().ok_or_else(|| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -865,7 +944,7 @@ fn parse_project_view_history_cursor(
             )
         })
         .and_then(|value| parse_project_view_uuid(value, "after.entity_id"))?;
-    Ok(buzz_db::project_view::ProjectViewRoleHistoryCursor {
+    Ok(buzz_db::project_view::ProjectViewV3RoleHistoryCursor {
         project_revision,
         entity_type,
         entity_id,
@@ -1337,6 +1416,17 @@ fn exclude_private_protocols_if_unauthorized(
             buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
             buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
         ]);
+    }
+    if crate::handlers::project_view::filter_has_unscoped_project_view_projection(filter) {
+        let excluded = query.excluded_kinds.get_or_insert_with(Vec::new);
+        for kind in [
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+        ] {
+            if !excluded.contains(&kind) {
+                excluded.push(kind);
+            }
+        }
     }
     crate::handlers::community_private::exclude_project_document_kinds(
         query,
@@ -1845,6 +1935,15 @@ async fn query_events_authed(
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
+    if raw_filters.iter().zip(&filters).any(|(raw, filter)| {
+        bridge_filter_has_forbidden_unscoped_project_view_projection(raw, filter)
+    }) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_view:v3_projection_filter_required",
+        ));
+    }
+
     let project_document_can_match = filters
         .iter()
         .any(crate::handlers::community_private::filter_can_match_project_document);
@@ -1912,6 +2011,8 @@ async fn query_events_authed(
     } else {
         false
     };
+    let project_view_projection_signer =
+        crate::handlers::project_view::configured_projection_signer(state);
     if project_view_exclusive && !project_view_read_allowed {
         return Err(api_error(
             StatusCode::FORBIDDEN,
@@ -2032,6 +2133,22 @@ async fn query_events_authed(
     if let Some(page) =
         parse_project_view_page_request(&raw_filters, &state.relay_keypair.public_key())?
     {
+        if page.is_v2_migration()
+            && !state
+                .db
+                .project_view_v3_migration_reader_authorized_pubkey(tenant.community(), &pubkey)
+                .await
+                .map_err(|error| {
+                    internal_error(&format!(
+                        "Project View migration reader authorization lookup: {error}"
+                    ))
+                })?
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "restricted:project_view:v2_migration_direct_human_required",
+            ));
+        }
         if state.config.relay_private_key.is_none() {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2040,7 +2157,17 @@ async fn query_events_authed(
         }
         let snapshot_started = std::time::Instant::now();
         let page_result = match page {
-            ProjectViewPageRequest::ActiveObjects {
+            ProjectViewPageRequest::V2MigrationMeta => state
+                .db
+                .project_view_v2_migration_meta(
+                    tenant.community(),
+                    &state.relay_keypair.public_key(),
+                )
+                .await
+                .map(|event| buzz_db::project_view::ProjectViewSnapshotPage {
+                    events: vec![event],
+                }),
+            ProjectViewPageRequest::V2MigrationObjects {
                 revision,
                 projection_generation,
                 after,
@@ -2048,7 +2175,7 @@ async fn query_events_authed(
             } => {
                 state
                     .db
-                    .project_view_snapshot_page(
+                    .project_view_v2_migration_objects_page(
                         tenant.community(),
                         &state.relay_keypair.public_key(),
                         revision,
@@ -2058,7 +2185,7 @@ async fn query_events_authed(
                     )
                     .await
             }
-            ProjectViewPageRequest::V2CurrentEntities {
+            ProjectViewPageRequest::V2MigrationCurrentEntities {
                 revision,
                 projection_generation,
                 after,
@@ -2066,7 +2193,7 @@ async fn query_events_authed(
             } => {
                 state
                     .db
-                    .project_view_v2_current_entities_page(
+                    .project_view_v2_migration_current_entities_page(
                         tenant.community(),
                         &state.relay_keypair.public_key(),
                         revision,
@@ -2082,12 +2209,9 @@ async fn query_events_authed(
                 after,
                 limit,
             } => {
-                // The canonical current-set selection is schema-independent;
-                // the active Community schema determines which strict signed
-                // projection major each stored pointer resolves to.
                 state
                     .db
-                    .project_view_v2_current_entities_page(
+                    .project_view_v3_current_entities_page(
                         tenant.community(),
                         &state.relay_keypair.public_key(),
                         revision,
@@ -2097,7 +2221,7 @@ async fn query_events_authed(
                     )
                     .await
             }
-            ProjectViewPageRequest::RoleHistory {
+            ProjectViewPageRequest::V3RoleHistory {
                 revision,
                 projection_generation,
                 filter,
@@ -2106,10 +2230,10 @@ async fn query_events_authed(
             } => {
                 state
                     .db
-                    .project_view_role_history_page(
+                    .project_view_v3_role_history_page(
                         tenant.community(),
                         &state.relay_keypair.public_key(),
-                        &buzz_db::project_view::ProjectViewRoleHistoryPageRequest {
+                        &buzz_db::project_view::ProjectViewV3RoleHistoryPageRequest {
                             project_revision: revision,
                             projection_generation,
                             filter,
@@ -2501,6 +2625,13 @@ async fn query_events_authed(
                     {
                         continue;
                     }
+                    if !crate::handlers::project_view::projection_event_visible_for_filter(
+                        filter,
+                        &se.event,
+                        project_view_projection_signer.as_ref(),
+                    ) {
+                        continue;
+                    }
                     if !crate::handlers::community_private::event_is_visible(
                         se.event.kind.as_u16() as u32,
                         project_document_read_allowed,
@@ -2623,6 +2754,16 @@ async fn count_events_authed(
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
+    if filters.iter().any(|filter| {
+        crate::handlers::project_view::filter_is_exclusively_project_view(filter)
+            && crate::handlers::project_view::filter_has_unscoped_project_view_projection(filter)
+    }) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_view:v3_projection_filter_required",
+        ));
+    }
+
     let project_document_can_match = filters
         .iter()
         .any(crate::handlers::community_private::filter_can_match_project_document);
@@ -2690,6 +2831,8 @@ async fn count_events_authed(
     } else {
         false
     };
+    let project_view_projection_signer =
+        crate::handlers::project_view::configured_projection_signer(state);
     if project_view_exclusive && !project_view_read_allowed {
         return Err(api_error(
             StatusCode::FORBIDDEN,
@@ -2770,6 +2913,11 @@ async fn count_events_authed(
         // over-count foreign unshared persona events (existence leak).
         let needs_persona_filtering =
             crate::handlers::req::filter_can_match_persona_shared_kinds(filter);
+        // A v3 metadata filter also matches retained v2 metadata at the NIP-01
+        // kind/tag layer. Require the shared strict per-event parser even if a
+        // future database implementation makes `#t` COUNT filters pushable.
+        let needs_v3_projection_filtering =
+            crate::handlers::project_view::filter_requires_v3_projection_post_filter(filter);
 
         // If filter targets a specific channel, verify access.
         if let Some(ch_id) = extract_channel_from_filter(filter) {
@@ -2805,6 +2953,7 @@ async fn count_events_authed(
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_persona_filtering
+                && !needs_v3_projection_filtering
             {
                 match state.db.count_events(&query).await {
                     Ok(n) => total += n as u64,
@@ -2841,6 +2990,13 @@ async fn count_events_authed(
                                     se.event.kind.as_u16() as u32,
                                 )
                             {
+                                continue;
+                            }
+                            if !crate::handlers::project_view::projection_event_visible_for_filter(
+                                filter,
+                                &se.event,
+                                project_view_projection_signer.as_ref(),
+                            ) {
                                 continue;
                             }
                             if !crate::handlers::community_private::event_is_visible(
@@ -2890,6 +3046,7 @@ async fn count_events_authed(
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_persona_filtering
+                && !needs_v3_projection_filtering
             {
                 query.limit = None;
                 match state.db.count_events(&query).await {
@@ -2926,6 +3083,13 @@ async fn count_events_authed(
                                     se.event.kind.as_u16() as u32,
                                 )
                             {
+                                continue;
+                            }
+                            if !crate::handlers::project_view::projection_event_visible_for_filter(
+                                filter,
+                                &se.event,
+                                project_view_projection_signer.as_ref(),
+                            ) {
                                 continue;
                             }
                             if !crate::handlers::community_private::event_is_visible(
@@ -3000,6 +3164,8 @@ async fn handle_bridge_search(
     tenant: &buzz_core::tenant::TenantContext,
     reader: &BridgeSearchReader<'_>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project_view_projection_signer =
+        crate::handlers::project_view::configured_projection_signer(state);
     // Bridge always includes global (channel-less) events — same as WS with
     // full scopes. `None` means no accessible channels and no global access →
     // empty result set (the caller short-circuits exactly as the WS door EOSEs).
@@ -3128,6 +3294,13 @@ async fn handle_bridge_search(
             if !reader.project_view_read_allowed
                 && buzz_core::kind::is_project_view_protocol_kind(stored.event.kind.as_u16() as u32)
             {
+                continue;
+            }
+            if !crate::handlers::project_view::projection_event_visible_for_filter(
+                filter,
+                &stored.event,
+                project_view_projection_signer.as_ref(),
+            ) {
                 continue;
             }
             if !crate::handlers::community_private::event_is_visible(
@@ -3611,28 +3784,118 @@ mod tests {
     }
 
     #[test]
-    fn project_view_extension_parses_versioned_current_and_role_history_scopes() {
+    fn project_view_extension_separates_migration_v2_from_v3_runtime_scopes() {
         let relay = Keys::generate().public_key();
         let role_id = uuid::Uuid::new_v4();
+        let legacy_active = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-active"],
+            "limit": 100,
+            "buzz_project_view": {
+                "scope": "active_objects",
+                "revision": 7,
+                "projection_generation": 2,
+            },
+        });
+        assert!(parse_project_view_page_request(&[legacy_active], &relay).is_err());
+
+        let missing_scope = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
+            "limit": 100,
+            "buzz_project_view": {
+                "revision": 7,
+                "projection_generation": 3,
+            },
+        });
+        assert!(parse_project_view_page_request(&[missing_scope], &relay).is_err());
+
+        let migration_object_id = uuid::Uuid::new_v4();
+        let migration_objects = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-object"],
+            "limit": 500,
+            "buzz_project_view": {
+                "scope": "v2_migration_objects",
+                "revision": 7,
+                "projection_generation": 2,
+                "after": {
+                    "object_type": "role",
+                    "object_id": migration_object_id,
+                },
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(std::slice::from_ref(&migration_objects), &relay),
+            Ok(Some(ProjectViewPageRequest::V2MigrationObjects {
+                revision: 7,
+                projection_generation: 2,
+                after: Some(buzz_db::project_view::ProjectViewSnapshotCursor {
+                    object_type: buzz_project_view::ProjectViewObjectType::Role,
+                    object_id,
+                }),
+                limit: 500,
+            })) if object_id == migration_object_id
+        ));
+
+        let mut malformed_object_cursor = migration_objects.clone();
+        malformed_object_cursor["buzz_project_view"]["after"]["extra"] = serde_json::json!(true);
+        assert!(parse_project_view_page_request(&[malformed_object_cursor], &relay).is_err());
+
+        let mut unknown_object_type = migration_objects.clone();
+        unknown_object_type["buzz_project_view"]["after"]["object_type"] =
+            serde_json::json!("role_assignment");
+        assert!(parse_project_view_page_request(&[unknown_object_type], &relay).is_err());
+
+        let mut noncanonical_object_id = migration_objects.clone();
+        noncanonical_object_id["buzz_project_view"]["after"]["object_id"] =
+            serde_json::json!("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA");
+        assert!(parse_project_view_page_request(&[noncanonical_object_id], &relay).is_err());
+
+        let mut wrong_object_tag = migration_objects.clone();
+        wrong_object_tag["#t"] = serde_json::json!(["buzz-project-view-v3-object"]);
+        assert!(parse_project_view_page_request(&[wrong_object_tag], &relay).is_err());
+
+        let mut unpinned_object_page = migration_objects.clone();
+        unpinned_object_page["buzz_project_view"]["revision"] = serde_json::json!(0);
+        assert!(parse_project_view_page_request(&[unpinned_object_page], &relay).is_err());
+
         let current = serde_json::json!({
             "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
             "authors": [relay.to_hex()],
             "#t": ["buzz-project-view-v2-entity"],
             "limit": 100,
             "buzz_project_view": {
-                "scope": "v2_current_entities",
+                "scope": "v2_migration_current_entities",
                 "revision": 7,
                 "projection_generation": 2,
             },
         });
         assert!(matches!(
             parse_project_view_page_request(&[current], &relay),
-            Ok(Some(ProjectViewPageRequest::V2CurrentEntities {
+            Ok(Some(ProjectViewPageRequest::V2MigrationCurrentEntities {
                 revision: 7,
                 projection_generation: 2,
                 limit: 100,
                 ..
             }))
+        ));
+
+        let migration_meta = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_META],
+            "authors": [relay.to_hex()],
+            "#t": [buzz_sdk::project_view_v3::PROJECT_VIEW_V3_META_TAG],
+            "limit": 2,
+            "buzz_project_view": {
+                "scope": "v2_migration_meta",
+            },
+        });
+        assert!(matches!(
+            parse_project_view_page_request(&[migration_meta], &relay),
+            Ok(Some(ProjectViewPageRequest::V2MigrationMeta))
         ));
 
         let v3_current = serde_json::json!({
@@ -3667,10 +3930,10 @@ mod tests {
         let history = serde_json::json!({
             "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
             "authors": [relay.to_hex()],
-            "#t": ["buzz-project-view-v2-entity"],
+            "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
             "limit": 20,
             "buzz_project_view": {
-                "scope": "role_history",
+                "scope": PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
                 "revision": 7,
                 "projection_generation": 2,
                 "entity_types": ["role_checkpoint", "role_handoff"],
@@ -3683,12 +3946,113 @@ mod tests {
             },
         });
         assert!(matches!(
-            parse_project_view_page_request(&[history], &relay),
-            Ok(Some(ProjectViewPageRequest::RoleHistory {
+            parse_project_view_page_request(std::slice::from_ref(&history), &relay),
+            Ok(Some(ProjectViewPageRequest::V3RoleHistory {
                 revision: 7,
                 projection_generation: 2,
                 limit: 20,
                 ..
+            }))
+        ));
+
+        let mut legacy_scope = history.clone();
+        legacy_scope["buzz_project_view"]["scope"] = serde_json::json!("role_history");
+        assert!(parse_project_view_page_request(&[legacy_scope], &relay).is_err());
+
+        let mut legacy_tag = history;
+        legacy_tag["#t"] = serde_json::json!(["buzz-project-view-v2-entity"]);
+        assert!(parse_project_view_page_request(&[legacy_tag], &relay).is_err());
+    }
+
+    #[test]
+    fn project_view_page_request_marks_only_explicit_v2_migration_scopes() {
+        let v2_requests = [
+            ProjectViewPageRequest::V2MigrationMeta,
+            ProjectViewPageRequest::V2MigrationObjects {
+                revision: 1,
+                projection_generation: 1,
+                after: None,
+                limit: 1,
+            },
+            ProjectViewPageRequest::V2MigrationCurrentEntities {
+                revision: 1,
+                projection_generation: 1,
+                after: None,
+                limit: 1,
+            },
+        ];
+        assert!(v2_requests
+            .iter()
+            .all(ProjectViewPageRequest::is_v2_migration));
+
+        let v3_requests = [
+            ProjectViewPageRequest::V3CurrentEntities {
+                revision: 1,
+                projection_generation: 1,
+                after: None,
+                limit: 1,
+            },
+            ProjectViewPageRequest::V3RoleHistory {
+                revision: 1,
+                projection_generation: 1,
+                filter: buzz_db::project_view::ProjectViewV3RoleHistoryFilter {
+                    entity_types: Vec::new(),
+                    role_id: None,
+                    assignment_id: None,
+                    member_pubkey: None,
+                },
+                after: None,
+                limit: 1,
+            },
+        ];
+        assert!(v3_requests.iter().all(|request| !request.is_v2_migration()));
+    }
+
+    #[test]
+    fn legacy_project_view_projection_filters_require_an_explicit_migration_scope() {
+        let relay = Keys::generate().public_key();
+        let unscoped = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-object"],
+            "limit": 500,
+        });
+        assert!(matches!(
+            parse_project_view_page_request(std::slice::from_ref(&unscoped), &relay),
+            Ok(None)
+        ));
+        let unscoped_filter: nostr::Filter =
+            serde_json::from_value(unscoped.clone()).expect("parse unscoped legacy filter");
+        assert!(
+            bridge_filter_has_forbidden_unscoped_project_view_projection(
+                &unscoped,
+                &unscoped_filter,
+            )
+        );
+
+        let scoped = serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
+            "authors": [relay.to_hex()],
+            "#t": ["buzz-project-view-v2-object"],
+            "limit": 500,
+            "buzz_project_view": {
+                "scope": "v2_migration_objects",
+                "revision": 9,
+                "projection_generation": 3,
+            },
+        });
+        let scoped_filter: nostr::Filter =
+            serde_json::from_value(scoped.clone()).expect("parse scoped migration filter");
+        assert!(
+            !bridge_filter_has_forbidden_unscoped_project_view_projection(&scoped, &scoped_filter,)
+        );
+        assert!(matches!(
+            parse_project_view_page_request(&[scoped], &relay),
+            Ok(Some(ProjectViewPageRequest::V2MigrationObjects {
+                revision: 9,
+                projection_generation: 3,
+                after: None,
+                limit: 500,
             }))
         ));
     }
@@ -3784,10 +4148,10 @@ mod tests {
         let filter = serde_json::json!({
             "kinds": [buzz_core::kind::KIND_PROJECT_VIEW_OBJECT],
             "authors": [relay.to_hex()],
-            "#t": ["buzz-project-view-v2-entity"],
+            "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
             "limit": 20,
             "buzz_project_view": {
-                "scope": "role_history",
+                "scope": PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
                 "revision": 7,
                 "projection_generation": 2,
                 "entity_types": ["role_checkpoint"],

@@ -1,8 +1,6 @@
 import type {
-  ProjectViewLocatorType,
-  ProjectViewPriority,
-  ProjectViewResourceType,
   ProjectRoleLevel,
+  ProjectViewPriority,
 } from "@/shared/api/tauriProjectView";
 
 export const CREATE_GUIDE_VALUE = "__create_guide__";
@@ -28,9 +26,6 @@ export type ProjectViewObjectFormState = {
   plannedInStageId: string;
   aboutId: string;
   handlesId: string;
-  resourceType: ProjectViewResourceType;
-  locatorType: ProjectViewLocatorType;
-  locatorValue: string;
   resourceKind: string;
   summary: string;
   guideDocumentId: string;

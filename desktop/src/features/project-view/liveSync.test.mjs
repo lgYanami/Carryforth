@@ -9,6 +9,7 @@ import {
   KIND_PROJECT_VIEW_META,
   KIND_PROJECT_VIEW_OBJECT,
 } from "../../shared/constants/kinds.ts";
+import { PROJECT_VIEW_V3_PROJECTION_TAGS } from "../../shared/constants/projectView.ts";
 
 test("Project View live filter is signer-scoped and overlaps the verified snapshot", () => {
   assert.deepEqual(
@@ -20,6 +21,7 @@ test("Project View live filter is signer-scoped and overlaps the verified snapsh
     {
       authors: ["abcd"],
       kinds: [KIND_PROJECT_VIEW_OBJECT, KIND_PROJECT_VIEW_META],
+      "#t": [...PROJECT_VIEW_V3_PROJECTION_TAGS],
       limit: 256,
       since: Math.floor(Date.parse("2026-07-28T08:00:10Z") / 1_000) - 5,
     },

@@ -9,31 +9,27 @@ use std::{sync::Arc, time::Instant};
 
 use buzz_auth::Scope;
 use buzz_core::kind::{
-    is_project_view_protocol_kind, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
-    KIND_PROJECT_VIEW_OBJECT,
+    is_project_view_projection_kind, is_project_view_protocol_kind, KIND_PROJECT_VIEW_META,
+    KIND_PROJECT_VIEW_MUTATION, KIND_PROJECT_VIEW_OBJECT,
 };
-use buzz_core::{StoredEvent, TenantContext};
-use buzz_db::project_view::{
-    PreparedObjectProjection, PreparedProjectViewCommit, ProjectViewWriteError,
-};
+use buzz_core::{PublicKey, StoredEvent, TenantContext};
+use buzz_db::project_view::PreparedObjectProjection;
 use buzz_db::project_view_v2::{
-    PreparedV2EntityProjection, PreparedV2ProjectObjectCommit, PreparedV2ProjectObjectHead,
-    PreparedV2RoleCommit, ProjectViewV2PrepareOutcome, ProjectViewV2ProjectObjectPrepareOutcome,
-    ProjectViewV2WriteError, V2MembershipEntry,
+    PreparedV2EntityProjection, ProjectViewV2WriteError, V2MembershipEntry,
 };
 use buzz_db::project_view_v3::{
     PreparedV3ProjectObjectCommit, PreparedV3ProjectObjectHead, PreparedV3RoleCommit,
     ProjectViewV3PrepareOutcome, ProjectViewV3ProjectObjectPrepareOutcome, ProjectViewV3WriteError,
 };
-use buzz_project_view::v2::{
-    ProjectObjectCommand, RoleCommand, RoleContinuityChange, RoleContinuityError,
-};
+use buzz_project_view::v2::{RoleContinuityChange, RoleContinuityError};
 use buzz_project_view::v3::{
     ProjectObjectCommandV3, ProjectViewInitializeV3, RoleCommandV3, V3ContractError,
     V3ProjectObjectError, V3ReferenceError,
 };
-use buzz_project_view::{
-    DomainError, Mutation, ProjectViewEntry, ProjectionPlan, MAX_MUTATION_CONTENT_BYTES,
+use buzz_project_view::{DomainError, MAX_MUTATION_CONTENT_BYTES};
+use buzz_sdk::project_view_v3::{
+    parse_entity_projection, parse_meta_projection, parse_project_object_projection,
+    PROJECT_VIEW_V3_ENTITY_TAG, PROJECT_VIEW_V3_META_TAG, PROJECT_VIEW_V3_OBJECT_TAG,
 };
 use nostr::{Event, EventBuilder, Filter, Kind, Tag, Timestamp};
 use tracing::{info, warn};
@@ -84,6 +80,142 @@ pub(crate) fn filter_is_project_view_search(filter: &Filter) -> bool {
                 .iter()
                 .any(|kind| is_project_view_protocol_kind(kind.as_u16() as u32))
         })
+}
+
+/// Return whether an ordinary Nostr filter explicitly selects only schema-v3
+/// Project View projection coordinates.
+///
+/// Kindless filters and filters that merely name kind 44301/44302 are not a
+/// Project View reader contract: they would also match retained v1/v2
+/// migration evidence. A mixed ordinary filter may continue to read its
+/// non-Project-View kinds, but Project View projections are silently omitted.
+#[must_use]
+pub(crate) fn filter_allows_v3_projections(filter: &Filter) -> bool {
+    let Some(kinds) = filter.kinds.as_ref() else {
+        return false;
+    };
+    let requests_object = kinds
+        .iter()
+        .any(|kind| kind.as_u16() as u32 == KIND_PROJECT_VIEW_OBJECT);
+    let requests_meta = kinds
+        .iter()
+        .any(|kind| kind.as_u16() as u32 == KIND_PROJECT_VIEW_META);
+    if !requests_object && !requests_meta {
+        return false;
+    }
+
+    let t = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
+    let Some(values) = filter.generic_tags.get(&t) else {
+        return false;
+    };
+    if values.is_empty()
+        || values.iter().any(|value| {
+            !matches!(
+                value.as_str(),
+                PROJECT_VIEW_V3_OBJECT_TAG | PROJECT_VIEW_V3_ENTITY_TAG | PROJECT_VIEW_V3_META_TAG
+            )
+        })
+    {
+        return false;
+    }
+
+    (!requests_object
+        || values.contains(PROJECT_VIEW_V3_OBJECT_TAG)
+        || values.contains(PROJECT_VIEW_V3_ENTITY_TAG))
+        && (!requests_meta || values.contains(PROJECT_VIEW_V3_META_TAG))
+}
+
+/// Return whether a filter can match a Project View projection but lacks the
+/// closed schema-v3 projection tag contract.
+#[must_use]
+pub(crate) fn filter_has_unscoped_project_view_projection(filter: &Filter) -> bool {
+    filter.kinds.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| is_project_view_projection_kind(kind.as_u16() as u32))
+    }) && !filter_allows_v3_projections(filter)
+}
+
+/// Return whether a stored Relay projection is a fully verified schema-v3
+/// wire event.
+///
+/// Metadata retained from v1/v2 shares the historical `buzz-project-view-meta`
+/// tag, so tag admission alone is insufficient. Every result chokepoint calls
+/// this parser before delivery/counting; the strict SDK parser verifies the
+/// signature, exact canonical tags, typed content, and schema version.
+#[must_use]
+pub(crate) fn event_is_v3_projection(event: &Event, expected_relay_pubkey: &PublicKey) -> bool {
+    let kind = event.kind.as_u16() as u32;
+    if !is_project_view_projection_kind(kind) {
+        return true;
+    }
+    if kind == KIND_PROJECT_VIEW_META {
+        return parse_meta_projection(event, expected_relay_pubkey).is_ok();
+    }
+
+    let Ok(content) = serde_json::from_str::<serde_json::Value>(&event.content) else {
+        return false;
+    };
+    let Some(project_id) = content
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(buzz_core::CommunityId::from_uuid)
+    else {
+        return false;
+    };
+    match content
+        .get("projection_type")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("object") => {
+            parse_project_object_projection(event, expected_relay_pubkey, project_id).is_ok()
+        }
+        Some("entity") => parse_entity_projection(event, expected_relay_pubkey, project_id).is_ok(),
+        _ => false,
+    }
+}
+
+/// Return the configured stable Relay projection signer.
+///
+/// `AppState` always owns a keypair, but when no private key was configured it
+/// is process-ephemeral and is not a Project View authority. Callers therefore
+/// receive `None` and must fail closed for projection delivery.
+#[must_use]
+pub(crate) fn configured_projection_signer(state: &AppState) -> Option<PublicKey> {
+    state
+        .config
+        .relay_private_key
+        .as_ref()
+        .map(|_| state.relay_keypair.public_key())
+}
+
+/// Return whether an event is admissible for one ordinary Project View
+/// projection filter.
+///
+/// Legacy metadata uses the same kind and `t` coordinate as v3 metadata, so
+/// the NIP-01 match alone is not a schema boundary. Every ordinary result and
+/// COUNT fallback uses this predicate to fail closed on the strict v3 parser.
+#[must_use]
+pub(crate) fn projection_event_visible_for_filter(
+    filter: &Filter,
+    event: &Event,
+    expected_relay_pubkey: Option<&PublicKey>,
+) -> bool {
+    !is_project_view_projection_kind(event.kind.as_u16() as u32)
+        || expected_relay_pubkey.is_some_and(|relay_pubkey| {
+            filter_allows_v3_projections(filter) && event_is_v3_projection(event, relay_pubkey)
+        })
+}
+
+/// Return whether COUNT must retain the per-event v3 projection gate.
+///
+/// `#t` is not SQL-pushable today, but spelling this independently prevents a
+/// future tag-index optimization from silently counting retained legacy rows
+/// that share the v3 metadata coordinate.
+#[must_use]
+pub(crate) fn filter_requires_v3_projection_post_filter(filter: &Filter) -> bool {
+    filter_allows_v3_projections(filter)
 }
 
 /// Apply one signed member mutation and publish its committed projections.
@@ -184,14 +316,6 @@ async fn handle_mutation_inner(
             "unavailable:project_view:stable_signer".to_owned(),
         ));
     }
-    let status = state
-        .db
-        .project_view_status_by_host(tenant.host())
-        .await
-        .map_err(|error| {
-            IngestError::Internal(format!("error: Project View status check failed: {error}"))
-        })?
-        .ok_or_else(|| IngestError::Unavailable("unavailable:project_view:community".to_owned()))?;
     let relay_pubkey = state.relay_keypair.public_key();
     let schema_version = state
         .db
@@ -200,75 +324,32 @@ async fn handle_mutation_inner(
         .map_err(|error| {
             IngestError::Internal(format!("error: Project View schema lookup failed: {error}"))
         })?;
-    if schema_version == 3 {
-        if is_initialize_command(&event.content) {
-            let command = ProjectViewInitializeV3::from_json(&event.content)
-                .map_err(map_v3_contract_error)?;
-            return handle_v3_initialize(tenant, state, event, &command).await;
-        }
-        if !status.enabled {
-            return Err(IngestError::Unavailable(
-                "unavailable:project_view:disabled".to_owned(),
-            ));
-        }
-        if !state
-            .db
-            .project_view_v3_advertised_write_ready(tenant.community(), &relay_pubkey)
-            .await
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: Project View v3 readiness check failed: {error}"
-                ))
-            })?
-        {
-            return Err(IngestError::Unavailable(
-                "unavailable:project_view:not_ready".to_owned(),
-            ));
-        }
-        return if is_project_object_command(&event.content) {
-            handle_v3_project_object_mutation(tenant, state, event).await
-        } else {
-            handle_v3_role_mutation(tenant, state, event).await
-        };
+    require_project_view_v3_runtime(schema_version)?;
+    let status = state
+        .db
+        .project_view_status_by_host(tenant.host())
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!("error: Project View status check failed: {error}"))
+        })?
+        .ok_or_else(|| IngestError::Unavailable("unavailable:project_view:community".to_owned()))?;
+    if is_initialize_command(&event.content) {
+        let command =
+            ProjectViewInitializeV3::from_json(&event.content).map_err(map_v3_contract_error)?;
+        return handle_v3_initialize(tenant, state, event, &command).await;
     }
     if !status.enabled {
         return Err(IngestError::Unavailable(
             "unavailable:project_view:disabled".to_owned(),
         ));
     }
-    if schema_version == 2 {
-        if !state
-            .db
-            .project_view_v2_capability_ready(tenant.community(), &relay_pubkey)
-            .await
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: Project View v2 readiness check failed: {error}"
-                ))
-            })?
-        {
-            return Err(IngestError::Unavailable(
-                "unavailable:project_view:not_ready".to_owned(),
-            ));
-        }
-        return if is_project_object_command(&event.content) {
-            handle_v2_project_object_mutation(tenant, state, event).await
-        } else {
-            handle_v2_role_mutation(tenant, state, event).await
-        };
-    }
-    if schema_version != 1 {
-        return Err(IngestError::Unsupported(
-            "unsupported:project_view:schema".to_owned(),
-        ));
-    }
     if !state
         .db
-        .project_view_capability_ready(tenant.community(), &relay_pubkey)
+        .project_view_v3_advertised_write_ready(tenant.community(), &relay_pubkey)
         .await
         .map_err(|error| {
             IngestError::Internal(format!(
-                "error: Project View readiness check failed: {error}"
+                "error: Project View v3 readiness check failed: {error}"
             ))
         })?
     {
@@ -276,114 +357,23 @@ async fn handle_mutation_inner(
             "unavailable:project_view:not_ready".to_owned(),
         ));
     }
-
-    let mutation = Mutation::from_json(&event.content).map_err(map_domain_error)?;
-    let mut write = state
-        .db
-        .begin_project_view_write(tenant.community())
-        .await
-        .map_err(map_write_error)?;
-
-    // Current security/readiness gates intentionally precede receipt lookup.
-    // A once-authorized event cannot use idempotency to bypass a later member
-    // removal, ban, timeout, feature disable, or signer-readiness failure.
-    if let Some(receipt) = write
-        .find_receipt(event.id.as_bytes())
-        .await
-        .map_err(map_write_error)?
-    {
-        write.rollback().await.map_err(map_write_error)?;
-        return Ok(IngestResult {
-            event_id: event.id.to_hex(),
-            accepted: true,
-            message: response_message(&receipt.result)?,
-        });
+    if is_project_object_command(&event.content) {
+        handle_v3_project_object_mutation(tenant, state, event).await
+    } else {
+        handle_v3_role_mutation(tenant, state, event).await
     }
+}
 
-    let context = write.load_current().await.map_err(map_write_error)?;
-    let projection_generation = match context.metadata.as_ref() {
-        Some(metadata) if metadata.projection_pubkey == relay_pubkey => {
-            metadata.projection_generation
-        }
-        Some(_) => {
-            write.rollback().await.map_err(map_write_error)?;
-            return Err(IngestError::Unavailable(
-                "unavailable:project_view:signer_rotation".to_owned(),
-            ));
-        }
-        None => 1,
-    };
-    let (next_state, outcome) = context
-        .state
-        .reduce(&mutation, event.pubkey, context.canonical_time)
-        .map_err(map_domain_error)?;
-    let plan = ProjectionPlan::for_mutation(
-        &next_state,
-        &outcome,
-        event.id.to_bytes(),
-        projection_generation,
-    )
-    .map_err(map_domain_error)?;
-
-    let mut object_projections = Vec::with_capacity(plan.entries().len());
-    let mut object_events = Vec::with_capacity(plan.entries().len());
-    let mut changed_heads = Vec::with_capacity(plan.entries().len());
-    for entry in plan.entries() {
-        let projection = buzz_sdk::project_view::build_object_projection(&plan, entry)
-            .map_err(|error| {
-                IngestError::Internal(format!("error: build Project View projection: {error}"))
-            })?
-            .sign_with_keys(&state.relay_keypair)
-            .map_err(|error| {
-                IngestError::Internal(format!("error: sign Project View projection: {error}"))
-            })?;
-        changed_heads.push(
-            buzz_sdk::project_view::changed_head_for(&plan, entry, &projection).map_err(
-                |error| {
-                    IngestError::Internal(format!("error: bind Project View changed head: {error}"))
-                },
-            )?,
-        );
-        object_projections.push(PreparedObjectProjection::new(
-            entry.id(),
-            projection.clone(),
-        ));
-        object_events.push(projection);
+fn require_project_view_v3_runtime(schema_version: i16) -> Result<(), IngestError> {
+    match schema_version {
+        3 => Ok(()),
+        1 | 2 => Err(IngestError::Unsupported(
+            "unsupported:project_view:migration_required".to_owned(),
+        )),
+        _ => Err(IngestError::Unsupported(
+            "unsupported:project_view:schema".to_owned(),
+        )),
     }
-    let meta_projection = buzz_sdk::project_view::build_meta_projection(&plan, &changed_heads)
-        .map_err(|error| {
-            IngestError::Internal(format!("error: build Project View metadata: {error}"))
-        })?
-        .sign_with_keys(&state.relay_keypair)
-        .map_err(|error| {
-            IngestError::Internal(format!("error: sign Project View metadata: {error}"))
-        })?;
-    let receipt_result = mutation_receipt(&outcome.changed_entries, outcome.project_revision);
-
-    let commit = PreparedProjectViewCommit {
-        command_event: event.clone(),
-        mutation,
-        next_state,
-        outcome,
-        object_projections,
-        meta_projection: meta_projection.clone(),
-        projection_generation,
-        receipt_result,
-    };
-    let committed = write
-        .commit_mutation(commit)
-        .await
-        .map_err(map_write_error)?;
-    let message = response_message(&committed.receipt.result)?;
-    if !committed.replayed {
-        dispatch_committed_events(tenant, state, &event, &object_events, &meta_projection).await;
-    }
-
-    Ok(IngestResult {
-        event_id: event.id.to_hex(),
-        accepted: true,
-        message,
-    })
 }
 
 fn is_project_object_command(content: &str) -> bool {
@@ -430,352 +420,7 @@ async fn handle_v3_initialize(
         .await
         .map_err(map_v3_write_error)?;
     let message = response_message(&outcome.result)?;
-    dispatch_v2_committed_events(tenant, state, &outcome.events).await;
-    Ok(IngestResult {
-        event_id: event.id.to_hex(),
-        accepted: true,
-        message,
-    })
-}
-
-async fn handle_v2_project_object_mutation(
-    tenant: &TenantContext,
-    state: &Arc<AppState>,
-    event: Event,
-) -> Result<IngestResult, IngestError> {
-    let command = ProjectObjectCommand::from_json(&event.content).map_err(map_domain_error)?;
-    let mut write = state
-        .db
-        .begin_project_view_v2_write(tenant.community())
-        .await
-        .map_err(map_v2_write_error)?;
-    let preparation = write
-        .prepare_project_object_command(&event, &command)
-        .await
-        .map_err(map_v2_write_error)?;
-    let prepared = match preparation {
-        ProjectViewV2ProjectObjectPrepareOutcome::Replayed(receipt) => {
-            write.rollback().await.map_err(map_v2_write_error)?;
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: response_message(&receipt.result)?,
-            });
-        }
-        ProjectViewV2ProjectObjectPrepareOutcome::Prepared(prepared) => prepared,
-    };
-    if prepared.projection_pubkey != state.relay_keypair.public_key() {
-        write.rollback().await.map_err(map_v2_write_error)?;
-        return Err(IngestError::Unavailable(
-            "unavailable:project_view:signer_rotation".to_owned(),
-        ));
-    }
-    let context = buzz_sdk::project_view_v2::V2ProjectionContext {
-        project_id: prepared.community_id,
-        projection_generation: prepared.projection_generation,
-        project_revision: prepared.project_revision,
-        source: buzz_sdk::project_view_v2::V2ProjectionSource::NostrEvent {
-            change_id: event.id,
-            event_id: event.id,
-        },
-        updated_at: prepared.canonical_time,
-    };
-    let mut projections = Vec::with_capacity(prepared.heads.len());
-    let mut entity_projections = Vec::with_capacity(prepared.entity_changes.len());
-    let mut changed_heads =
-        Vec::with_capacity(prepared.heads.len() + prepared.entity_changes.len());
-    for head in &prepared.heads {
-        let (object_id, projection, changed_head) = match head {
-            PreparedV2ProjectObjectHead::Role(role) => {
-                let entity = RoleContinuityChange::Role(role.clone());
-                let projection =
-                    buzz_sdk::project_view_v2::build_entity_projection(&context, &entity)
-                        .map_err(|error| {
-                            IngestError::Internal(format!(
-                                "error: build v2 Role projection: {error}"
-                            ))
-                        })?
-                        .sign_with_keys(&state.relay_keypair)
-                        .map_err(|error| {
-                            IngestError::Internal(format!(
-                                "error: sign v2 Role projection: {error}"
-                            ))
-                        })?;
-                let changed_head =
-                    buzz_sdk::project_view_v2::changed_head_for(&context, &entity, &projection)
-                        .map_err(|error| {
-                            IngestError::Internal(format!(
-                                "error: bind v2 Role changed head: {error}"
-                            ))
-                        })?;
-                (role.role_id, projection, changed_head)
-            }
-            PreparedV2ProjectObjectHead::Object {
-                entry,
-                responsible_role_id,
-            } => {
-                let projection =
-                    buzz_sdk::project_view_v2::build_project_object_projection_with_responsibility(
-                        &context,
-                        entry,
-                        *responsible_role_id,
-                    )
-                    .map_err(|error| {
-                        IngestError::Internal(format!(
-                            "error: build v2 Project object projection: {error}"
-                        ))
-                    })?
-                    .sign_with_keys(&state.relay_keypair)
-                    .map_err(|error| {
-                        IngestError::Internal(format!(
-                            "error: sign v2 Project object projection: {error}"
-                        ))
-                    })?;
-                let changed_head = buzz_sdk::project_view_v2::changed_head_for_project_object(
-                    &context,
-                    entry,
-                    &projection,
-                )
-                .map_err(|error| {
-                    IngestError::Internal(format!(
-                        "error: bind v2 Project object changed head: {error}"
-                    ))
-                })?;
-                (entry.id(), projection, changed_head)
-            }
-        };
-        projections.push(PreparedObjectProjection::new(object_id, projection));
-        changed_heads.push(changed_head);
-    }
-    for entity in &prepared.entity_changes {
-        let projection = buzz_sdk::project_view_v2::build_entity_projection(&context, entity)
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: build terminal Work side-effect projection: {error}"
-                ))
-            })?
-            .sign_with_keys(&state.relay_keypair)
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: sign terminal Work side-effect projection: {error}"
-                ))
-            })?;
-        changed_heads.push(
-            buzz_sdk::project_view_v2::changed_head_for(&context, entity, &projection).map_err(
-                |error| {
-                    IngestError::Internal(format!(
-                        "error: bind terminal Work side-effect head: {error}"
-                    ))
-                },
-            )?,
-        );
-        entity_projections.push(PreparedV2EntityProjection {
-            entity_type: entity.entity_type(),
-            entity_id: entity.entity_id(),
-            event: projection,
-        });
-    }
-    let counts = buzz_sdk::project_view_v2::V2EntityCounts {
-        active_objects: prepared.counts.active_objects,
-        open_proposals: prepared.counts.open_proposals,
-        active_assignments: prepared.counts.active_assignments,
-        active_commitments: prepared.counts.active_commitments,
-        checkpoints: prepared.counts.checkpoints,
-        handoffs: prepared.counts.handoffs,
-    };
-    let meta_projection = buzz_sdk::project_view_v2::build_meta_projection(
-        &context,
-        counts,
-        prepared.membership_snapshot_event_id,
-        false,
-        &changed_heads,
-    )
-    .map_err(|error| {
-        IngestError::Internal(format!("error: build v2 metadata projection: {error}"))
-    })?
-    .sign_with_keys(&state.relay_keypair)
-    .map_err(|error| {
-        IngestError::Internal(format!("error: sign v2 metadata projection: {error}"))
-    })?;
-    let committed = write
-        .commit_project_object_command(PreparedV2ProjectObjectCommit {
-            command_event: event.clone(),
-            object_projections: projections,
-            entity_projections,
-            meta_projection,
-        })
-        .await
-        .map_err(map_v2_write_error)?;
-    let message = response_message(&committed.receipt.result)?;
-    dispatch_v2_committed_events(tenant, state, &committed.events).await;
-    Ok(IngestResult {
-        event_id: event.id.to_hex(),
-        accepted: true,
-        message,
-    })
-}
-
-async fn handle_v2_role_mutation(
-    tenant: &TenantContext,
-    state: &Arc<AppState>,
-    event: Event,
-) -> Result<IngestResult, IngestError> {
-    let command = RoleCommand::from_json(&event.content).map_err(map_v2_domain_error)?;
-    let mut write = state
-        .db
-        .begin_project_view_v2_write(tenant.community())
-        .await
-        .map_err(map_v2_write_error)?;
-    let preparation = write
-        .prepare_role_command(&event, &command)
-        .await
-        .map_err(map_v2_write_error)?;
-    let prepared = match preparation {
-        ProjectViewV2PrepareOutcome::Replayed(receipt) => {
-            write.rollback().await.map_err(map_v2_write_error)?;
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: response_message(&receipt.result)?,
-            });
-        }
-        ProjectViewV2PrepareOutcome::Prepared(prepared) => prepared,
-    };
-    if prepared.projection_pubkey != state.relay_keypair.public_key() {
-        write.rollback().await.map_err(map_v2_write_error)?;
-        return Err(IngestError::Unavailable(
-            "unavailable:project_view:signer_rotation".to_owned(),
-        ));
-    }
-
-    let membership_projection = if prepared.membership_changed() {
-        Some(
-            build_membership_projection(&prepared.membership_after, prepared.canonical_time)?
-                .sign_with_keys(&state.relay_keypair)
-                .map_err(|error| {
-                    IngestError::Internal(format!(
-                        "error: sign atomic membership projection: {error}"
-                    ))
-                })?,
-        )
-    } else {
-        None
-    };
-    let membership_event_id = membership_projection
-        .as_ref()
-        .map(|event| event.id)
-        .or(prepared.membership_snapshot_event_id)
-        .ok_or_else(|| {
-            IngestError::Internal("error: prepared v2 change has no membership snapshot".to_owned())
-        })?;
-    let context = buzz_sdk::project_view_v2::V2ProjectionContext {
-        project_id: prepared.community_id,
-        projection_generation: prepared.projection_generation,
-        project_revision: prepared.project_revision,
-        source: buzz_sdk::project_view_v2::V2ProjectionSource::NostrEvent {
-            change_id: event.id,
-            event_id: event.id,
-        },
-        updated_at: prepared.canonical_time,
-    };
-    let mut entity_projections = Vec::with_capacity(prepared.changes.len());
-    let mut object_projections = Vec::with_capacity(prepared.work_heads.len());
-    let mut changed_heads = Vec::with_capacity(prepared.changes.len() + prepared.work_heads.len());
-    for entity in &prepared.changes {
-        let projection = buzz_sdk::project_view_v2::build_entity_projection(&context, entity)
-            .map_err(|error| {
-                IngestError::Internal(format!("error: build v2 entity projection: {error}"))
-            })?
-            .sign_with_keys(&state.relay_keypair)
-            .map_err(|error| {
-                IngestError::Internal(format!("error: sign v2 entity projection: {error}"))
-            })?;
-        changed_heads.push(
-            buzz_sdk::project_view_v2::changed_head_for(&context, entity, &projection).map_err(
-                |error| IngestError::Internal(format!("error: bind v2 changed head: {error}")),
-            )?,
-        );
-        entity_projections.push(PreparedV2EntityProjection {
-            entity_type: entity.entity_type(),
-            entity_id: entity.entity_id(),
-            event: projection,
-        });
-    }
-    for head in &prepared.work_heads {
-        let PreparedV2ProjectObjectHead::Object {
-            entry,
-            responsible_role_id,
-        } = head
-        else {
-            return Err(IngestError::Internal(
-                "error: Role command prepared a non-Work object head".to_owned(),
-            ));
-        };
-        let projection =
-            buzz_sdk::project_view_v2::build_project_object_projection_with_responsibility(
-                &context,
-                entry,
-                *responsible_role_id,
-            )
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: build Work responsibility projection: {error}"
-                ))
-            })?
-            .sign_with_keys(&state.relay_keypair)
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: sign Work responsibility projection: {error}"
-                ))
-            })?;
-        changed_heads.push(
-            buzz_sdk::project_view_v2::changed_head_for_project_object(
-                &context,
-                entry,
-                &projection,
-            )
-            .map_err(|error| {
-                IngestError::Internal(format!(
-                    "error: bind Work responsibility changed head: {error}"
-                ))
-            })?,
-        );
-        object_projections.push(PreparedObjectProjection::new(entry.id(), projection));
-    }
-    let counts = buzz_sdk::project_view_v2::V2EntityCounts {
-        active_objects: prepared.counts.active_objects,
-        open_proposals: prepared.counts.open_proposals,
-        active_assignments: prepared.counts.active_assignments,
-        active_commitments: prepared.counts.active_commitments,
-        checkpoints: prepared.counts.checkpoints,
-        handoffs: prepared.counts.handoffs,
-    };
-    let meta_projection = buzz_sdk::project_view_v2::build_meta_projection(
-        &context,
-        counts,
-        membership_event_id,
-        false,
-        &changed_heads,
-    )
-    .map_err(|error| {
-        IngestError::Internal(format!("error: build v2 metadata projection: {error}"))
-    })?
-    .sign_with_keys(&state.relay_keypair)
-    .map_err(|error| {
-        IngestError::Internal(format!("error: sign v2 metadata projection: {error}"))
-    })?;
-    let committed = write
-        .commit_role_command(PreparedV2RoleCommit {
-            command_event: event.clone(),
-            entity_projections,
-            object_projections,
-            meta_projection,
-            membership_projection,
-        })
-        .await
-        .map_err(map_v2_write_error)?;
-    let message = response_message(&committed.receipt.result)?;
-    dispatch_v2_committed_events(tenant, state, &committed.events).await;
+    dispatch_project_view_committed_events(tenant, state, &outcome.events).await;
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -898,7 +543,7 @@ async fn handle_v3_project_object_mutation(
         .await
         .map_err(map_v3_write_error)?;
     let message = response_message(&committed.receipt.result)?;
-    dispatch_v2_committed_events(tenant, state, &committed.events).await;
+    dispatch_project_view_committed_events(tenant, state, &committed.events).await;
     Ok(IngestResult {
         event_id: nostr::EventId::from_byte_array(committed.receipt.change_id).to_hex(),
         accepted: true,
@@ -911,7 +556,7 @@ async fn handle_v3_role_mutation(
     state: &Arc<AppState>,
     event: Event,
 ) -> Result<IngestResult, IngestError> {
-    let command = RoleCommandV3::from_json(&event.content).map_err(map_v2_domain_error)?;
+    let command = RoleCommandV3::from_json(&event.content).map_err(map_role_continuity_error)?;
     let mut write = state
         .db
         .begin_project_view_v3_write(tenant.community())
@@ -1037,7 +682,7 @@ async fn handle_v3_role_mutation(
         .await
         .map_err(map_v3_write_error)?;
     let message = response_message(&committed.receipt.result)?;
-    dispatch_v2_committed_events(tenant, state, &committed.events).await;
+    dispatch_project_view_committed_events(tenant, state, &committed.events).await;
     Ok(IngestResult {
         event_id: nostr::EventId::from_byte_array(committed.receipt.change_id).to_hex(),
         accepted: true,
@@ -1279,29 +924,6 @@ fn validate_mutation_tags(event: &Event) -> Result<(), IngestError> {
     }
 }
 
-fn mutation_receipt(entries: &[ProjectViewEntry], project_revision: u64) -> serde_json::Value {
-    let mut result = serde_json::Map::new();
-    result.insert(
-        "project_revision".to_owned(),
-        serde_json::Value::from(project_revision),
-    );
-    if let [entry] = entries {
-        result.insert(
-            "object_id".to_owned(),
-            serde_json::Value::String(entry.id().to_string()),
-        );
-        result.insert(
-            "object_revision".to_owned(),
-            serde_json::Value::from(entry.object_revision()),
-        );
-        result.insert(
-            "deleted".to_owned(),
-            serde_json::Value::Bool(matches!(entry, ProjectViewEntry::Tombstone(_))),
-        );
-    }
-    serde_json::Value::Object(result)
-}
-
 fn response_message(result: &serde_json::Value) -> Result<String, IngestError> {
     serde_json::to_string(result)
         .map(|json| format!("response:{json}"))
@@ -1310,57 +932,7 @@ fn response_message(result: &serde_json::Value) -> Result<String, IngestError> {
         })
 }
 
-async fn dispatch_committed_events(
-    tenant: &TenantContext,
-    state: &Arc<AppState>,
-    command: &Event,
-    object_events: &[Event],
-    meta_event: &Event,
-) {
-    let actor = command.pubkey.to_hex();
-    let command_stored = StoredEvent::new(command.clone(), None);
-    dispatch_persistent_event(
-        tenant,
-        state,
-        &command_stored,
-        KIND_PROJECT_VIEW_MUTATION,
-        &actor,
-        None,
-    )
-    .await;
-
-    let projection_options = PersistentDispatchOptions {
-        audit: false,
-        workflow: false,
-    };
-    let relay_actor = state.relay_keypair.public_key().to_hex();
-    for event in object_events {
-        let stored = StoredEvent::new(event.clone(), None);
-        dispatch_persistent_event_with_options(
-            tenant,
-            state,
-            &stored,
-            KIND_PROJECT_VIEW_OBJECT,
-            &relay_actor,
-            None,
-            projection_options,
-        )
-        .await;
-    }
-    let stored = StoredEvent::new(meta_event.clone(), None);
-    dispatch_persistent_event_with_options(
-        tenant,
-        state,
-        &stored,
-        KIND_PROJECT_VIEW_META,
-        &relay_actor,
-        None,
-        projection_options,
-    )
-    .await;
-}
-
-pub(crate) async fn dispatch_v2_committed_events(
+pub(crate) async fn dispatch_project_view_committed_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     events: &[Event],
@@ -1405,7 +977,7 @@ fn map_domain_error(error: DomainError) -> IngestError {
     }
 }
 
-fn map_v2_domain_error(error: RoleContinuityError) -> IngestError {
+fn map_role_continuity_error(error: RoleContinuityError) -> IngestError {
     let code = error.code();
     match error {
         RoleContinuityError::UnsupportedSchema => {
@@ -1436,25 +1008,25 @@ fn map_v2_domain_error(error: RoleContinuityError) -> IngestError {
     }
 }
 
-fn map_v2_write_error(error: ProjectViewV2WriteError) -> IngestError {
+fn map_continuity_storage_error(error: ProjectViewV2WriteError) -> IngestError {
     match error {
         ProjectViewV2WriteError::Unavailable { .. } => {
             IngestError::Unavailable("unavailable:project_view:not_ready".to_owned())
         }
-        ProjectViewV2WriteError::Domain(error) => map_v2_domain_error(error),
+        ProjectViewV2WriteError::Domain(error) => map_role_continuity_error(error),
         ProjectViewV2WriteError::ObjectDomain(error) => map_domain_error(error),
         ProjectViewV2WriteError::Database(buzz_db::DbError::AccessDenied(_)) => {
             IngestError::AuthFailed("restricted:project_view:access_denied".to_owned())
         }
-        ProjectViewV2WriteError::Database(error) => {
-            IngestError::Internal(format!("error: Project View v2 database failure: {error}"))
-        }
-        ProjectViewV2WriteError::Sqlx(error) => {
-            IngestError::Internal(format!("error: Project View v2 SQL failure: {error}"))
-        }
-        ProjectViewV2WriteError::Audit(error) => {
-            IngestError::Internal(format!("error: Project View v2 audit failure: {error}"))
-        }
+        ProjectViewV2WriteError::Database(error) => IngestError::Internal(format!(
+            "error: Project View continuity database failure: {error}"
+        )),
+        ProjectViewV2WriteError::Sqlx(error) => IngestError::Internal(format!(
+            "error: Project View continuity SQL failure: {error}"
+        )),
+        ProjectViewV2WriteError::Audit(error) => IngestError::Internal(format!(
+            "error: Project View continuity audit failure: {error}"
+        )),
         ProjectViewV2WriteError::RuntimeSupervision(error) => {
             use buzz_db::project_runtime::RuntimeSupervisionError;
 
@@ -1482,9 +1054,9 @@ fn map_v2_write_error(error: ProjectViewV2WriteError) -> IngestError {
                 )),
             }
         }
-        ProjectViewV2WriteError::InvalidCommit(reason) => {
-            IngestError::Internal(format!("error: invalid Project View v2 commit: {reason}"))
-        }
+        ProjectViewV2WriteError::InvalidCommit(reason) => IngestError::Internal(format!(
+            "error: invalid Project View continuity commit: {reason}"
+        )),
     }
 }
 
@@ -1531,8 +1103,8 @@ fn map_v3_write_error(error: ProjectViewV3WriteError) -> IngestError {
         }
         ProjectViewV3WriteError::ObjectDomain(error) => map_v3_object_error(error),
         ProjectViewV3WriteError::Contract(error) => map_v3_contract_error(error),
-        ProjectViewV3WriteError::RoleDomain(error) => map_v2_domain_error(error),
-        ProjectViewV3WriteError::ContinuityStorage(error) => map_v2_write_error(error),
+        ProjectViewV3WriteError::RoleDomain(error) => map_role_continuity_error(error),
+        ProjectViewV3WriteError::ContinuityStorage(error) => map_continuity_storage_error(error),
         ProjectViewV3WriteError::RuntimeSupervision(error) => match error {
             buzz_db::project_runtime::RuntimeSupervisionError::CommandFence
             | buzz_db::project_runtime::RuntimeSupervisionError::StaleEpoch
@@ -1576,31 +1148,21 @@ fn map_v3_write_error(error: ProjectViewV3WriteError) -> IngestError {
     }
 }
 
-fn map_write_error(error: ProjectViewWriteError) -> IngestError {
-    match error {
-        ProjectViewWriteError::Unavailable { .. } => {
-            IngestError::Unavailable("unavailable:project_view:disabled".to_owned())
-        }
-        ProjectViewWriteError::RevisionConflict { .. } => {
-            IngestError::Conflict("conflict:project_view:revision".to_owned())
-        }
-        ProjectViewWriteError::Domain(error) => map_domain_error(error),
-        ProjectViewWriteError::Database(error) => {
-            IngestError::Internal(format!("error: Project View database failure: {error}"))
-        }
-        ProjectViewWriteError::Sqlx(error) => {
-            IngestError::Internal(format!("error: Project View SQL failure: {error}"))
-        }
-        ProjectViewWriteError::InvalidCommit(reason) => {
-            IngestError::Internal(format!("error: invalid Project View commit: {reason}"))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use buzz_core::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
+    use buzz_sdk::{
+        project_view_v2::{
+            build_meta_projection as build_v2_meta_projection, V2EntityCounts, V2ProjectionContext,
+            V2ProjectionSource,
+        },
+        project_view_v3::{
+            build_meta_projection as build_v3_meta_projection, V3EntityCounts, V3ProjectionContext,
+            V3ProjectionSource,
+        },
+    };
+    use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
 
     fn mutation_event(tags: Vec<Tag>) -> Event {
         EventBuilder::new(Kind::Custom(KIND_PROJECT_VIEW_MUTATION as u16), "{}")
@@ -1633,6 +1195,25 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_runtime_requires_schema_v3() {
+        assert!(require_project_view_v3_runtime(3).is_ok());
+
+        for legacy_schema in [1, 2] {
+            assert!(matches!(
+                require_project_view_v3_runtime(legacy_schema),
+                Err(IngestError::Unsupported(reason))
+                    if reason == "unsupported:project_view:migration_required"
+            ));
+        }
+
+        assert!(matches!(
+            require_project_view_v3_runtime(4),
+            Err(IngestError::Unsupported(reason))
+                if reason == "unsupported:project_view:schema"
+        ));
+    }
+
+    #[test]
     fn filter_classification_distinguishes_exclusive_mixed_and_wildcard() {
         let exclusive = Filter::new().kinds([
             nostr::Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16),
@@ -1650,6 +1231,147 @@ mod tests {
 
         assert!(filter_can_match(&Filter::new()));
         assert!(!filter_is_exclusively_project_view(&Filter::new()));
+    }
+
+    #[test]
+    fn ordinary_projection_filters_require_closed_v3_tags() {
+        let t = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
+        let object = Filter::new()
+            .kind(nostr::Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
+            .custom_tags(t, [PROJECT_VIEW_V3_OBJECT_TAG]);
+        assert!(filter_allows_v3_projections(&object));
+        assert!(!filter_has_unscoped_project_view_projection(&object));
+
+        let t = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
+        let entity = Filter::new()
+            .kind(nostr::Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
+            .custom_tags(t, [PROJECT_VIEW_V3_ENTITY_TAG]);
+        assert!(filter_allows_v3_projections(&entity));
+
+        let t = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
+        let meta = Filter::new()
+            .kind(nostr::Kind::Custom(KIND_PROJECT_VIEW_META as u16))
+            .custom_tags(t, [PROJECT_VIEW_V3_META_TAG]);
+        assert!(filter_allows_v3_projections(&meta));
+
+        let unscoped = Filter::new().kind(nostr::Kind::Custom(KIND_PROJECT_VIEW_META as u16));
+        assert!(!filter_allows_v3_projections(&unscoped));
+        assert!(filter_has_unscoped_project_view_projection(&unscoped));
+
+        let t = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
+        let legacy = Filter::new()
+            .kind(nostr::Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
+            .custom_tags(t, ["buzz-project-view-v2-object"]);
+        assert!(!filter_allows_v3_projections(&legacy));
+        assert!(filter_has_unscoped_project_view_projection(&legacy));
+
+        let ordinary = Filter::new().kind(nostr::Kind::TextNote);
+        assert!(!filter_has_unscoped_project_view_projection(&ordinary));
+    }
+
+    #[test]
+    fn shared_meta_coordinate_excludes_real_v2_projection_from_v3_results_and_counts() {
+        let relay = Keys::generate();
+        let project_id = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let updated_at =
+            chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("valid projection timestamp");
+        let change_id = EventId::all_zeros();
+
+        let v2 = build_v2_meta_projection(
+            &V2ProjectionContext {
+                project_id,
+                projection_generation: 1,
+                project_revision: 1,
+                source: V2ProjectionSource::System {
+                    change_id,
+                    audit_seq: 1,
+                },
+                updated_at,
+            },
+            V2EntityCounts {
+                active_objects: 0,
+                open_proposals: 0,
+                active_assignments: 0,
+                active_commitments: 0,
+                checkpoints: 0,
+                handoffs: 0,
+            },
+            EventId::all_zeros(),
+            true,
+            &[],
+        )
+        .expect("build v2 metadata")
+        .sign_with_keys(&relay)
+        .expect("sign v2 metadata");
+        let v3_context = V3ProjectionContext {
+            project_id,
+            projection_generation: 2,
+            project_revision: 2,
+            source: V3ProjectionSource::System {
+                change_id,
+                audit_seq: 2,
+            },
+            updated_at,
+        };
+        let v3_counts = V3EntityCounts {
+            active_objects: 0,
+            open_proposals: 0,
+            active_assignments: 0,
+            active_commitments: 0,
+            checkpoints: 0,
+            handoffs: 0,
+        };
+        let v3 = build_v3_meta_projection(&v3_context, v3_counts, EventId::all_zeros(), true, &[])
+            .expect("build v3 metadata")
+            .sign_with_keys(&relay)
+            .expect("sign v3 metadata");
+        let foreign_signer = Keys::generate();
+        let foreign_v3 =
+            build_v3_meta_projection(&v3_context, v3_counts, EventId::all_zeros(), true, &[])
+                .expect("build foreign v3 metadata")
+                .sign_with_keys(&foreign_signer)
+                .expect("sign foreign v3 metadata");
+
+        let t = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_PROJECT_VIEW_META as u16))
+            .custom_tags(t, [PROJECT_VIEW_V3_META_TAG]);
+        assert!(filter_requires_v3_projection_post_filter(&filter));
+        assert!(buzz_core::filter::filters_match(
+            std::slice::from_ref(&filter),
+            &buzz_core::StoredEvent::new(v2.clone(), None),
+        ));
+        assert!(buzz_core::filter::filters_match(
+            std::slice::from_ref(&filter),
+            &buzz_core::StoredEvent::new(v3.clone(), None),
+        ));
+
+        let visible = [v2, v3]
+            .into_iter()
+            .filter(|event| {
+                projection_event_visible_for_filter(&filter, event, Some(&relay.public_key()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible.len(), 1);
+        let visible_content: serde_json::Value =
+            serde_json::from_str(&visible[0].content).expect("valid metadata JSON");
+        assert_eq!(visible_content["schema_version"], 3);
+        assert!(event_is_v3_projection(&visible[0], &relay.public_key()));
+        assert!(event_is_v3_projection(
+            &foreign_v3,
+            &foreign_signer.public_key()
+        ));
+        assert!(!event_is_v3_projection(&foreign_v3, &relay.public_key()));
+        assert!(!projection_event_visible_for_filter(
+            &filter,
+            &foreign_v3,
+            Some(&relay.public_key()),
+        ));
+        assert!(!projection_event_visible_for_filter(
+            &filter,
+            &visible[0],
+            None,
+        ));
     }
 
     #[test]

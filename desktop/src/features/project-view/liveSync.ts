@@ -3,6 +3,7 @@ import {
   KIND_PROJECT_VIEW_META,
   KIND_PROJECT_VIEW_OBJECT,
 } from "@/shared/constants/kinds";
+import { PROJECT_VIEW_V3_PROJECTION_TAGS } from "@/shared/constants/projectView";
 
 export const PROJECT_VIEW_LIVE_LOOKBACK_SECONDS = 5;
 export const PROJECT_VIEW_LIVE_INVALIDATION_DELAY_MS = 150;
@@ -23,6 +24,7 @@ export function projectViewLiveFilter(input: {
   return {
     authors: [input.relayPubkey.trim().toLowerCase()],
     kinds: [KIND_PROJECT_VIEW_OBJECT, KIND_PROJECT_VIEW_META],
+    "#t": [...PROJECT_VIEW_V3_PROJECTION_TAGS],
     limit: 256,
     since: Math.max(0, snapshotSeconds - PROJECT_VIEW_LIVE_LOOKBACK_SECONDS),
   };

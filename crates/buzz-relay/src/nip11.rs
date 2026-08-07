@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use buzz_sdk::project_view_v3::{PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION, PROJECT_VIEW_V3_EXTENSION};
+
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_FRAME_BYTES;
 
@@ -19,9 +21,6 @@ pub(crate) const SUPPORTED_NIPS: &[u32] = &[1, 2, 10, 11, 16, 17, 23, 25, 29, 33
 /// stable signing key — both are required for kind 13534/8000/8001 events
 /// to be verifiable by clients.
 pub(crate) const NIP_RELAY_MEMBERSHIP: u32 = 43;
-const PROJECT_VIEW_EXTENSION: &str = "buzz-project-view-v1";
-const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
-const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
 const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 pub(crate) const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
@@ -163,7 +162,7 @@ impl RelayInfo {
 
         let mut supported_extensions = vec!["nip-er".to_string()];
         if advertise_project_view {
-            supported_extensions.push(PROJECT_VIEW_EXTENSION.to_owned());
+            supported_extensions.push(PROJECT_VIEW_V3_EXTENSION.to_owned());
         }
 
         Self {
@@ -251,32 +250,15 @@ fn push_descriptor(
 pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &str) -> RelayInfo {
     let (relay_self, advertise_nip43) = nip11_facts(state);
     let icon = workspace_icon_for_host(state, raw_host).await;
-    let project_view_capability = project_view_ready_for_host(state, raw_host).await;
+    let project_view_ready = project_view_ready_for_host(state, raw_host).await;
     let mut info = RelayInfo::build(
         relay_self.as_deref(),
         icon.as_deref(),
         advertise_nip43,
-        project_view_capability.is_some(),
+        project_view_ready,
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
     );
-    if matches!(
-        project_view_capability,
-        Some(ProjectViewCapability::V2 | ProjectViewCapability::V3)
-    ) {
-        let replacement = match project_view_capability {
-            Some(ProjectViewCapability::V2) => PROJECT_VIEW_V2_EXTENSION,
-            Some(ProjectViewCapability::V3) => PROJECT_VIEW_V3_EXTENSION,
-            Some(ProjectViewCapability::V1) | None => unreachable!("matched v2/v3 above"),
-        };
-        if let Some(extensions) = info.supported_extensions.as_mut() {
-            for extension in extensions {
-                if extension == PROJECT_VIEW_EXTENSION {
-                    *extension = replacement.to_owned();
-                }
-            }
-        }
-    }
     append_extension(
         &mut info,
         PROJECT_CONTEXT_EXTENSION,
@@ -285,6 +267,12 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     append_project_document_extension(
         &mut info,
         project_document_ready_for_host(state, raw_host).await,
+    );
+    append_extension(
+        &mut info,
+        PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION,
+        !project_view_ready
+            && project_view_v3_bootstrap_discoverable_for_host(state, raw_host).await,
     );
     let meeting_v2_ready = meeting_v2_runtime_ready(state).await;
     apply_meeting_v2_extensions(
@@ -408,20 +396,12 @@ async fn meeting_v2_runtime_ready(state: &crate::state::AppState) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectViewCapability {
-    V1,
-    V2,
-    V3,
-}
-
-async fn project_view_ready_for_host(
-    state: &crate::state::AppState,
-    raw_host: &str,
-) -> Option<ProjectViewCapability> {
-    state.config.relay_private_key.as_ref()?;
+async fn project_view_ready_for_host(state: &crate::state::AppState, raw_host: &str) -> bool {
+    if state.config.relay_private_key.is_none() {
+        return false;
+    }
     let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return None;
+        return false;
     };
     let schema_version = match state
         .db
@@ -434,43 +414,65 @@ async fn project_view_ready_for_host(
                 community_id = %tenant.community(),
                 "Project View NIP-11 schema lookup failed closed: {error}"
             );
-            return None;
+            return false;
         }
     };
-    let ready = if schema_version == 3 {
-        state
-            .db
-            .project_view_v3_advertised_write_ready(
-                tenant.community(),
-                &state.relay_keypair.public_key(),
-            )
-            .await
-    } else if schema_version == 2 {
-        state
-            .db
-            .project_view_v2_capability_ready(tenant.community(), &state.relay_keypair.public_key())
-            .await
-    } else if schema_version == 1 {
-        state
-            .db
-            .project_view_capability_ready(tenant.community(), &state.relay_keypair.public_key())
-            .await
-    } else {
-        return None;
-    };
-    match ready {
-        Ok(true) if schema_version == 3 => Some(ProjectViewCapability::V3),
-        Ok(true) if schema_version == 2 => Some(ProjectViewCapability::V2),
-        Ok(true) => Some(ProjectViewCapability::V1),
-        Ok(false) => None,
+    if !project_view_schema_is_advertisable(schema_version) {
+        return false;
+    }
+    match state
+        .db
+        .project_view_v3_advertised_write_ready(
+            tenant.community(),
+            &state.relay_keypair.public_key(),
+        )
+        .await
+    {
+        Ok(ready) => ready,
         Err(error) => {
             tracing::warn!(
                 community_id = %tenant.community(),
                 "Project View NIP-11 readiness failed closed: {error}"
             );
-            None
+            false
         }
     }
+}
+
+/// Return whether Desktop may show the closed v3 owner-bootstrap guide.
+///
+/// This marker is intentionally distinct from `buzz-project-view-v3`: it is
+/// present only for a schema-v3 Community with no canonical state and cannot
+/// authorize ordinary reads or writes. An initialized-but-disabled Community
+/// is a maintenance state and therefore does not masquerade as greenfield.
+async fn project_view_v3_bootstrap_discoverable_for_host(
+    state: &crate::state::AppState,
+    raw_host: &str,
+) -> bool {
+    if state.config.relay_private_key.is_none() {
+        return false;
+    }
+    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
+        return false;
+    };
+    match state
+        .db
+        .project_view_v3_bootstrap_discoverable(tenant.community())
+        .await
+    {
+        Ok(discoverable) => discoverable,
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Project View bootstrap discovery lookup failed closed: {error}"
+            );
+            false
+        }
+    }
+}
+
+const fn project_view_schema_is_advertisable(schema_version: i16) -> bool {
+    schema_version == 3
 }
 
 /// Fetches the workspace icon for the community bound to `raw_host`, as the
@@ -702,14 +704,14 @@ mod tests {
     }
 
     #[test]
-    fn project_view_extension_is_controlled_by_host_scoped_ready_scalar() {
+    fn only_v3_project_view_extension_is_controlled_by_host_scoped_ready_scalar() {
         let disabled = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
         assert!(!disabled
             .supported_extensions
             .as_ref()
             .is_some_and(|extensions| extensions
                 .iter()
-                .any(|value| value == PROJECT_VIEW_EXTENSION)));
+                .any(|value| value == PROJECT_VIEW_V3_EXTENSION)));
 
         let enabled = RelayInfo::build(None, None, false, true, DEFAULT_MAX_FRAME_BYTES, None);
         assert!(enabled
@@ -717,7 +719,39 @@ mod tests {
             .as_ref()
             .is_some_and(|extensions| extensions
                 .iter()
-                .any(|value| value == PROJECT_VIEW_EXTENSION)));
+                .any(|value| value == PROJECT_VIEW_V3_EXTENSION)));
+        assert!(!enabled
+            .supported_extensions
+            .as_ref()
+            .is_some_and(|extensions| {
+                extensions.iter().any(|value| {
+                    matches!(
+                        value.as_str(),
+                        "buzz-project-view-v1" | "buzz-project-view-v2"
+                    )
+                })
+            }));
+    }
+
+    #[test]
+    fn bootstrap_discovery_is_distinct_from_runtime_readiness() {
+        let mut info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
+        append_extension(&mut info, PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION, true);
+        let extensions = info.supported_extensions.expect("extensions");
+        assert!(extensions
+            .iter()
+            .any(|value| value == PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION));
+        assert!(!extensions
+            .iter()
+            .any(|value| value == PROJECT_VIEW_V3_EXTENSION));
+    }
+
+    #[test]
+    fn project_view_advertisement_rejects_legacy_schema_majors() {
+        assert!(!project_view_schema_is_advertisable(1));
+        assert!(!project_view_schema_is_advertisable(2));
+        assert!(project_view_schema_is_advertisable(3));
+        assert!(!project_view_schema_is_advertisable(4));
     }
 
     #[test]

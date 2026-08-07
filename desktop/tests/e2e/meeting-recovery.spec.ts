@@ -1,4 +1,4 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 
 import type {
   MeetingSnapshot,
@@ -176,6 +176,13 @@ async function openMeeting(page: Page, meetingId: string) {
   await expect(page.getByTestId("meeting-screen")).toBeVisible();
 }
 
+async function elementBox(locator: Locator) {
+  return locator.evaluate((element) => {
+    const { height, width, x, y } = element.getBoundingClientRect();
+    return { height, width, x, y };
+  });
+}
+
 test("multiple Meeting rooms use single-channel live subscriptions and refresh the mounted snapshot", async ({
   page,
 }) => {
@@ -311,6 +318,24 @@ test("wide Meeting Board collapse preserves its draft, width, and timeline posit
     "width",
     "416px",
   );
+  const workAreaBox = await elementBox(page.getByTestId("meeting-work-area"));
+  const expandedBoardBox = await elementBox(
+    page.getByTestId("meeting-board-wide"),
+  );
+  const expandedDockBox = await elementBox(
+    page.getByTestId("meeting-floor-dock"),
+  );
+  expect(Math.abs(expandedBoardBox.y - workAreaBox.y)).toBeLessThanOrEqual(2);
+  expect(
+    Math.abs(
+      expandedBoardBox.y +
+        expandedBoardBox.height -
+        (workAreaBox.y + workAreaBox.height),
+    ),
+  ).toBeLessThanOrEqual(2);
+  expect(expandedDockBox.x + expandedDockBox.width).toBeLessThanOrEqual(
+    expandedBoardBox.x + 2,
+  );
   await page
     .getByTestId("meeting-board-editor")
     .fill("# Wide unsent Board draft");
@@ -327,6 +352,18 @@ test("wide Meeting Board collapse preserves its draft, width, and timeline posit
   await expect(page.getByTestId("meeting-speech-timeline")).toContainText(
     "Formal Speech 36",
   );
+  const collapsedWorkspaceBox = await elementBox(
+    page.getByTestId("meeting-left-workspace"),
+  );
+  const collapsedDockBox = await elementBox(
+    page.getByTestId("meeting-floor-dock"),
+  );
+  expect(
+    Math.abs(collapsedWorkspaceBox.width - workAreaBox.width),
+  ).toBeLessThanOrEqual(2);
+  expect(
+    Math.abs(collapsedDockBox.width - collapsedWorkspaceBox.width),
+  ).toBeLessThanOrEqual(2);
   await expect
     .poll(() => timelineScroll.evaluate((element) => element.scrollTop))
     .toBe(300);
@@ -477,6 +514,21 @@ test("narrow Meeting sheets preserve the Board draft and produce distinct scoped
     .screenshot({ path: testInfo.outputPath("meeting-narrow-board.png") });
 
   await page.keyboard.press("Escape");
+  const narrowWorkAreaBox = await elementBox(
+    page.getByTestId("meeting-work-area"),
+  );
+  const narrowWorkspaceBox = await elementBox(
+    page.getByTestId("meeting-left-workspace"),
+  );
+  const narrowDockBox = await elementBox(
+    page.getByTestId("meeting-floor-dock"),
+  );
+  expect(
+    Math.abs(narrowWorkspaceBox.width - narrowWorkAreaBox.width),
+  ).toBeLessThanOrEqual(2);
+  expect(
+    Math.abs(narrowDockBox.width - narrowWorkspaceBox.width),
+  ).toBeLessThanOrEqual(2);
   await page.getByTestId("meeting-participants-trigger").click();
   const participants = page.getByTestId("meeting-participants");
   await expect(participants).toBeVisible();

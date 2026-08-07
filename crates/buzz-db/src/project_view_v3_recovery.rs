@@ -34,7 +34,7 @@ use crate::project_view_maintenance::{
     ProjectViewMaintenanceReceipt, ProjectViewMaintenanceResult,
 };
 use crate::project_view_v3_migration::{
-    load_current_entities_in_tx, load_object_origin_in_tx, StoredOrigin,
+    load_all_continuity_entities_in_tx, load_object_origin_in_tx, StoredOrigin,
 };
 use crate::Db;
 
@@ -437,7 +437,7 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         let objects = load_recovery_objects_in_tx(&mut tx, community_id).await?;
-        let entities = load_current_entities_in_tx(&mut tx, community_id, 3)
+        let entities = load_all_continuity_entities_in_tx(&mut tx, community_id, 3)
             .await
             .map_err(|error| ProjectViewMaintenanceError::Invalid(error.to_string()))?;
         let next_generation =

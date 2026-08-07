@@ -7,11 +7,9 @@ import {
 } from "@/features/project-view/ui/ProjectViewFormFields";
 import {
   ISSUE_STATUSES,
-  LOCATOR_TYPES,
   PLAN_STATUSES,
   PRIORITIES,
   REQUIREMENT_STATUSES,
-  RESOURCE_TYPES,
   STAGE_STATUSES,
   WORK_STATUSES,
 } from "@/features/project-view/ui/projectViewObjectFormOptions";
@@ -21,11 +19,9 @@ import {
 } from "@/features/project-view/ui/projectViewObjectDialogState";
 import type {
   ProjectRoleLevel,
-  ProjectViewLocatorType,
   ProjectViewObject,
   ProjectViewObjectType,
   ProjectViewPriority,
-  ProjectViewResourceType,
 } from "@/shared/api/tauriProjectView";
 import { Input } from "@/shared/ui/input";
 import { Switch } from "@/shared/ui/switch";
@@ -43,7 +39,6 @@ export function ProjectViewObjectTextFields({
   roleHasActiveAssignment,
   roleHasOpenProposal,
   roleCreation,
-  schemaVersion,
   set,
   type,
 }: {
@@ -53,7 +48,6 @@ export function ProjectViewObjectTextFields({
   roleHasActiveAssignment?: boolean;
   roleHasOpenProposal?: boolean;
   roleCreation: boolean;
-  schemaVersion: 1 | 2 | 3;
   set: SetFormField;
   type: ProjectViewObjectType;
 }) {
@@ -170,72 +164,6 @@ export function ProjectViewObjectTextFields({
     );
   }
   if (type === "resource") {
-    if (schemaVersion === 3) {
-      return (
-        <>
-          <ProjectViewField label="Name" required>
-            <Input
-              autoFocus
-              onChange={(event) => set("name", event.target.value)}
-              value={form.name}
-            />
-          </ProjectViewField>
-          <ProjectViewField label="Resource kind" required>
-            <Input
-              onChange={(event) => set("resourceKind", event.target.value)}
-              placeholder="repository, service, design-system, …"
-              value={form.resourceKind}
-            />
-          </ProjectViewField>
-          <ProjectViewField label="Summary">
-            <Textarea
-              onChange={(event) => set("summary", event.target.value)}
-              value={form.summary}
-            />
-          </ProjectViewField>
-          <ProjectViewSelect
-            label="Guide"
-            onChange={(value) => set("guideDocumentId", value)}
-            options={guideOptions}
-            required
-            value={form.guideDocumentId}
-          />
-          {form.guideDocumentId === CREATE_GUIDE_VALUE ? (
-            <div className="space-y-4 rounded-lg border border-border/70 bg-muted/20 p-3">
-              <div>
-                <div className="text-sm font-medium">Create Guide first</div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  The Guide is committed as an independent Document before the
-                  Resource. If the Resource conflicts, the Guide is preserved
-                  for retry.
-                </p>
-              </div>
-              <ProjectViewField label="Guide title" required>
-                <Input
-                  onChange={(event) => set("guideTitle", event.target.value)}
-                  value={form.guideTitle}
-                />
-              </ProjectViewField>
-              <ProjectViewField label="Guide summary">
-                <Input
-                  onChange={(event) => set("guideSummary", event.target.value)}
-                  value={form.guideSummary}
-                />
-              </ProjectViewField>
-              <ProjectViewField label="Guide Markdown" required>
-                <Textarea
-                  className="min-h-40 font-mono"
-                  onChange={(event) =>
-                    set("guideContentMarkdown", event.target.value)
-                  }
-                  value={form.guideContentMarkdown}
-                />
-              </ProjectViewField>
-            </div>
-          ) : null}
-        </>
-      );
-    }
     return (
       <>
         <ProjectViewField label="Name" required>
@@ -245,34 +173,59 @@ export function ProjectViewObjectTextFields({
             value={form.name}
           />
         </ProjectViewField>
-        <ProjectViewEnumSelect
-          label="Resource type"
-          onChange={(value) =>
-            set("resourceType", value as ProjectViewResourceType)
-          }
-          value={form.resourceType}
-          values={RESOURCE_TYPES}
-        />
-        <ProjectViewEnumSelect
-          label="Locator type"
-          onChange={(value) =>
-            set("locatorType", value as ProjectViewLocatorType)
-          }
-          value={form.locatorType}
-          values={LOCATOR_TYPES}
-        />
-        <ProjectViewField label="Locator" required>
+        <ProjectViewField label="Resource kind" required>
           <Input
-            onChange={(event) => set("locatorValue", event.target.value)}
-            value={form.locatorValue}
+            onChange={(event) => set("resourceKind", event.target.value)}
+            placeholder="repository, service, design-system, …"
+            value={form.resourceKind}
           />
         </ProjectViewField>
-        <ProjectViewField label="Description" required>
+        <ProjectViewField label="Summary">
           <Textarea
-            onChange={(event) => set("description", event.target.value)}
-            value={form.description}
+            onChange={(event) => set("summary", event.target.value)}
+            value={form.summary}
           />
         </ProjectViewField>
+        <ProjectViewSelect
+          label="Guide"
+          onChange={(value) => set("guideDocumentId", value)}
+          options={guideOptions}
+          required
+          value={form.guideDocumentId}
+        />
+        {form.guideDocumentId === CREATE_GUIDE_VALUE ? (
+          <div className="space-y-4 rounded-lg border border-border/70 bg-muted/20 p-3">
+            <div>
+              <div className="text-sm font-medium">Create Guide first</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                The Guide is committed as an independent Document before the
+                Resource. If the Resource conflicts, the Guide is preserved for
+                retry.
+              </p>
+            </div>
+            <ProjectViewField label="Guide title" required>
+              <Input
+                onChange={(event) => set("guideTitle", event.target.value)}
+                value={form.guideTitle}
+              />
+            </ProjectViewField>
+            <ProjectViewField label="Guide summary">
+              <Input
+                onChange={(event) => set("guideSummary", event.target.value)}
+                value={form.guideSummary}
+              />
+            </ProjectViewField>
+            <ProjectViewField label="Guide Markdown" required>
+              <Textarea
+                className="min-h-40 font-mono"
+                onChange={(event) =>
+                  set("guideContentMarkdown", event.target.value)
+                }
+                value={form.guideContentMarkdown}
+              />
+            </ProjectViewField>
+          </div>
+        ) : null}
       </>
     );
   }

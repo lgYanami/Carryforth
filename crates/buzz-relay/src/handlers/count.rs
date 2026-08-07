@@ -113,6 +113,16 @@ pub async fn handle_count(
     }
 
     let project_view_can_match = filters.iter().any(super::project_view::filter_can_match);
+    if filters.iter().any(|filter| {
+        super::project_view::filter_is_exclusively_project_view(filter)
+            && super::project_view::filter_has_unscoped_project_view_projection(filter)
+    }) {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_view:v3_projection_filter_required",
+        ));
+        return;
+    }
     let project_view_exclusive = !filters.is_empty()
         && filters
             .iter()
@@ -135,6 +145,7 @@ pub async fn handle_count(
     } else {
         false
     };
+    let project_view_projection_signer = super::project_view::configured_projection_signer(&state);
     if project_view_exclusive && !project_view_read_allowed {
         conn.send(RelayMessage::closed(
             &sub_id,
@@ -248,6 +259,12 @@ pub async fn handle_count(
         // reader's own pubkey.
         let needs_result_gated_filtering = filter_can_match_result_gated_kinds(filter)
             && !result_gated_count_safe_for_pushdown(filter, &authed_pubkey_hex);
+        // A closed v3 projection filter still needs strict per-event parsing:
+        // retained v2 metadata shares its kind and `t` tag with v3 metadata.
+        // Keep this independent of today's generic-tag pushability rules so a
+        // future `#t` SQL optimization cannot reintroduce legacy over-counting.
+        let needs_v3_projection_filtering =
+            super::project_view::filter_requires_v3_projection_post_filter(filter);
 
         if let Some(ch_id) = extract_channel_from_filter(filter) {
             // Filter targets a specific channel — verify access. Mirrors the WS
@@ -335,6 +352,7 @@ pub async fn handle_count(
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_persona_filtering
+                && !needs_v3_projection_filtering
             {
                 match state.db.count_events(&query).await {
                     Ok(n) => total += n as u64,
@@ -370,6 +388,13 @@ pub async fn handle_count(
                                     se.event.kind.as_u16() as u32,
                                 )
                             {
+                                continue;
+                            }
+                            if !super::project_view::projection_event_visible_for_filter(
+                                filter,
+                                &se.event,
+                                project_view_projection_signer.as_ref(),
+                            ) {
                                 continue;
                             }
                             if !super::community_private::event_is_visible(
@@ -423,6 +448,7 @@ pub async fn handle_count(
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_persona_filtering
+                && !needs_v3_projection_filtering
             {
                 query.limit = None; // COUNT doesn't need a row limit
                 match state.db.count_events(&query).await {
@@ -460,6 +486,13 @@ pub async fn handle_count(
                             {
                                 continue;
                             }
+                            if !super::project_view::projection_event_visible_for_filter(
+                                filter,
+                                &se.event,
+                                project_view_projection_signer.as_ref(),
+                            ) {
+                                continue;
+                            }
                             if !super::community_private::event_is_visible(
                                 se.event.kind.as_u16() as u32,
                                 document_visible_for_filter,
@@ -492,6 +525,17 @@ fn exclude_private_protocols_if_unauthorized(
             buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
             buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
         ]);
+    }
+    if super::project_view::filter_has_unscoped_project_view_projection(filter) {
+        let excluded = query.excluded_kinds.get_or_insert_with(Vec::new);
+        for kind in [
+            buzz_core::kind::KIND_PROJECT_VIEW_OBJECT as i32,
+            buzz_core::kind::KIND_PROJECT_VIEW_META as i32,
+        ] {
+            if !excluded.contains(&kind) {
+                excluded.push(kind);
+            }
+        }
     }
     super::community_private::exclude_project_document_kinds(
         query,

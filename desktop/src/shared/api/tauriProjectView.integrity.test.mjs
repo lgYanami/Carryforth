@@ -21,6 +21,7 @@ function object(objectType, id, data, relations = {}) {
     updated_by: ACTOR,
     data: { object_type: objectType, data },
     relations,
+    context_references: [],
   };
 }
 
@@ -28,39 +29,35 @@ function readyResult() {
   return {
     status: "ready",
     relay_pubkey: "b".repeat(64),
-    schema_version: 1,
+    schema_version: 3,
     project_revision: 1,
     projection_generation: 1,
     active_object_count: 2,
     updated_at: NOW,
-    view: {
-      profile: object(
-        "project_profile",
-        "00000000-0000-4000-8000-000000000001",
-        {
-          name: "Project",
-          positioning: "Positioning",
-          purpose: "Purpose",
-          problem: "Problem",
-          scope: "Scope",
-        },
-      ),
-      goals: [
-        {
-          goal: object("goal", "00000000-0000-4000-8000-000000000002", {
-            title: "Goal",
-            desired_outcome: "Outcome",
-            directions: [],
-          }),
-          plans: [],
-        },
-      ],
-      unbound_plans: [],
-      unplanned_requirements: [],
-      unplanned_issues: [],
+    objects_v3: [
+      object("project_profile", "00000000-0000-4000-8000-000000000001", {
+        name: "Project",
+        positioning: "Positioning",
+        purpose: "Purpose",
+        problem: "Problem",
+        scope: "Scope",
+      }),
+      object("goal", "00000000-0000-4000-8000-000000000002", {
+        title: "Goal",
+        desired_outcome: "Outcome",
+        directions: [],
+      }),
+    ],
+    role_continuity: {
       roles: [],
-      resources: [],
-      issue_references_by_target: {},
+      proposals: [],
+      assignments: [],
+      commitments: [],
+      workResponsibilities: [],
+      checkpoints: [],
+      handoffs: [],
+      members: [{ pubkey: ACTOR, role: "owner" }],
+      briefs: [],
     },
   };
 }
@@ -85,7 +82,7 @@ test("rejects an active object count that cannot describe the assembled View", (
 
 test("rejects an object from a future project revision", () => {
   const raw = readyResult();
-  raw.view.goals[0].goal.project_revision = 2;
+  raw.objects_v3[1].project_revision = 2;
 
   assert.throws(
     () => normalizeProjectViewLoadResult(raw),
@@ -93,7 +90,7 @@ test("rejects an object from a future project revision", () => {
   );
 });
 
-test("rejects a relation tree that disagrees with the object relation", () => {
+test("rejects a v3 relation that references a missing parent", () => {
   const raw = readyResult();
   const plan = object(
     "plan",
@@ -105,12 +102,12 @@ test("rejects a relation tree that disagrees with the object relation", () => {
     },
     { under_goal_id: "00000000-0000-4000-8000-000000000099" },
   );
-  raw.view.goals[0].plans.push({ plan, stages: [] });
+  raw.objects_v3.push(plan);
   raw.active_object_count = 3;
 
   assert.throws(
     () => normalizeProjectViewLoadResult(raw),
-    /is under the wrong Goal/,
+    /references a missing Goal/,
   );
 });
 

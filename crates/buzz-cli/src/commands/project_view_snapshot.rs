@@ -1,4 +1,4 @@
-//! Shared verified Project View v2 snapshot reader for CLI commands.
+//! Verified Project View v3 runtime reads plus an isolated legacy cutover reader.
 
 use std::collections::HashSet;
 #[cfg(test)]
@@ -12,18 +12,21 @@ use buzz_core::kind::{
     KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::PublicKey;
-use buzz_project_view::v2::RoleContinuityEntity;
 #[cfg(test)]
 use buzz_project_view::v2::RuntimeFence;
 use buzz_sdk::project_view_v2::{
-    parse_entity_projection, parse_membership_projection, parse_meta_projection,
-    parse_project_object_projection, V2EntityProjection, V2MembershipProjection, V2MetaProjection,
+    parse_entity_projection, parse_membership_projection as parse_v2_membership_projection,
+    parse_meta_projection, parse_project_object_projection, V2EntityProjection,
+    V2MembershipProjection, V2MetaProjection,
 };
+pub(crate) use buzz_sdk::project_view_v3::PROJECT_VIEW_V3_EXTENSION;
 use buzz_sdk::project_view_v3::{
     parse_entity_projection as parse_v3_entity_projection,
+    parse_membership_projection as parse_v3_membership_projection,
     parse_meta_projection as parse_v3_meta_projection,
     parse_project_object_projection as parse_v3_project_object_projection, V3EntityProjection,
-    V3MetaProjection,
+    V3MembershipProjection, V3MetaProjection, PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
+    PROJECT_VIEW_V3_ENTITY_TAG, PROJECT_VIEW_V3_META_TAG, PROJECT_VIEW_V3_OBJECT_TAG,
 };
 use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
 use buzz_sdk::role_brief_v3::VerifiedRoleBriefSnapshotV3;
@@ -34,13 +37,11 @@ use serde_json::{json, Value};
 use crate::client::BuzzClient;
 use crate::error::CliError;
 
-pub(crate) const PROJECT_VIEW_V1_EXTENSION: &str = "buzz-project-view-v1";
-pub(crate) const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
-pub(crate) const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
 pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
-const V2_ENTITY_PAGE_SIZE: usize = 500;
+const V2_OBJECT_PAGE_SIZE: usize = 500;
+const ENTITY_PAGE_SIZE: usize = 500;
 #[cfg(test)]
 const RUNTIME_FENCE_FILE_MAX_BYTES: u64 = 4 * 1024;
 #[cfg(test)]
@@ -48,7 +49,6 @@ const RUNTIME_FENCE_PATH_ENV: &str = "BUZZ_RUNTIME_FENCE_PATH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectViewSchema {
-    V1,
     V2,
     V3,
 }
@@ -59,21 +59,6 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) schema: ProjectViewSchema,
     pub(crate) context_enabled: bool,
     pub(crate) document_enabled: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct RoleHistoryPage {
-    pub(crate) projections: Vec<V2EntityProjection>,
-    pub(crate) next_before: Option<String>,
-}
-
-pub(crate) struct RoleHistoryRequest<'a> {
-    pub(crate) entity_types: &'a [RoleContinuityEntity],
-    pub(crate) role_id: Option<uuid::Uuid>,
-    pub(crate) assignment_id: Option<uuid::Uuid>,
-    pub(crate) member_pubkey: Option<PublicKey>,
-    pub(crate) limit: u16,
-    pub(crate) before: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -87,41 +72,66 @@ struct Nip11Document {
 pub(crate) async fn read_identity(
     client: &BuzzClient,
 ) -> Result<Option<ProjectViewIdentity>, CliError> {
-    let raw = client.get_public("/info").await?;
-    let info: Nip11Document = serde_json::from_str(&raw)
-        .map_err(|error| integrity_error(format!("invalid NIP-11 document: {error}")))?;
-    let schema = if info
+    v3_identity_from_nip11(read_nip11(client).await?)
+}
+
+/// Resolve the Relay signer for the closed schema-v3 bootstrap confirmation.
+///
+/// A successful `init-v3` deliberately leaves ordinary Project View disabled
+/// until the operator runs the checked enable step, so NIP-11 must not yet
+/// advertise the runtime extension. The signed initialization receipt proves
+/// that the Relay accepted the v3 command; this helper obtains only its
+/// canonical signing identity for strict projection readback and never makes
+/// an older runtime major available.
+pub(crate) async fn read_v3_bootstrap_identity(
+    client: &BuzzClient,
+) -> Result<ProjectViewIdentity, CliError> {
+    identity_from_nip11(read_nip11(client).await?, ProjectViewSchema::V3)
+}
+
+fn v3_identity_from_nip11(info: Nip11Document) -> Result<Option<ProjectViewIdentity>, CliError> {
+    if !info
         .supported_extensions
         .iter()
         .any(|extension| extension == PROJECT_VIEW_V3_EXTENSION)
     {
-        ProjectViewSchema::V3
-    } else if info
-        .supported_extensions
-        .iter()
-        .any(|extension| extension == PROJECT_VIEW_V2_EXTENSION)
-    {
-        ProjectViewSchema::V2
-    } else if info
-        .supported_extensions
-        .iter()
-        .any(|extension| extension == PROJECT_VIEW_V1_EXTENSION)
-    {
-        ProjectViewSchema::V1
-    } else {
         return Ok(None);
-    };
+    }
+    identity_from_nip11(info, ProjectViewSchema::V3).map(Some)
+}
+
+/// Resolve the canonical Relay identity for an explicit operator-controlled
+/// v2-to-v3 cutover. This deliberately does not depend on v2 being advertised:
+/// a v3-only Relay may still expose the frozen legacy projections that the
+/// reviewed approval manifest was built from.
+pub(crate) async fn read_legacy_v2_identity(
+    client: &BuzzClient,
+) -> Result<ProjectViewIdentity, CliError> {
+    identity_from_nip11(read_nip11(client).await?, ProjectViewSchema::V2)
+}
+
+async fn read_nip11(client: &BuzzClient) -> Result<Nip11Document, CliError> {
+    let raw = client.get_public("/info").await?;
+    serde_json::from_str(&raw)
+        .map_err(|error| project_view_integrity_error(format!("invalid NIP-11 document: {error}")))
+}
+
+fn identity_from_nip11(
+    info: Nip11Document,
+    schema: ProjectViewSchema,
+) -> Result<ProjectViewIdentity, CliError> {
     let relay_self = info.relay_self.ok_or_else(|| {
-        integrity_error("NIP-11 advertises Project View without a relay `self` key")
+        project_view_integrity_error("NIP-11 document has no canonical Relay `self` key")
     })?;
-    let relay_pubkey = PublicKey::from_hex(&relay_self)
-        .map_err(|error| integrity_error(format!("invalid NIP-11 relay `self`: {error}")))?;
+    let relay_pubkey = PublicKey::from_hex(&relay_self).map_err(|error| {
+        project_view_integrity_error(format!("invalid NIP-11 relay `self`: {error}"))
+    })?;
     if relay_pubkey.to_hex() != relay_self {
-        return Err(integrity_error(
+        return Err(project_view_integrity_error(
             "NIP-11 relay `self` is not canonical lowercase hex",
         ));
     }
-    Ok(Some(ProjectViewIdentity {
+    Ok(ProjectViewIdentity {
         relay_pubkey,
         schema,
         context_enabled: info
@@ -132,7 +142,7 @@ pub(crate) async fn read_identity(
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_DOCUMENT_EXTENSION),
-    }))
+    })
 }
 
 /// Read and validate one bounded schema-v3 current snapshot.
@@ -151,7 +161,7 @@ pub(crate) async fn read_verified_v3_snapshot(
             .query_all(json!({
                 "kinds": [KIND_PROJECT_VIEW_OBJECT],
                 "authors": [identity.relay_pubkey.to_hex()],
-                "#t": ["buzz-project-view-v3-object"],
+                "#t": [PROJECT_VIEW_V3_OBJECT_TAG],
             }))
             .await?;
         let entity_projections =
@@ -219,7 +229,7 @@ async fn read_current_v3_entity_projections(
     let mut after: Option<Value> = None;
     loop {
         let mut extension = json!({
-            "scope": "v3_current_entities",
+            "scope": PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
             "revision": meta.project_revision,
             "projection_generation": meta.projection_generation,
         });
@@ -229,13 +239,13 @@ async fn read_current_v3_entity_projections(
         let filter = json!({
             "kinds": [KIND_PROJECT_VIEW_OBJECT],
             "authors": [identity.relay_pubkey.to_hex()],
-            "#t": ["buzz-project-view-v3-entity"],
-            "limit": V2_ENTITY_PAGE_SIZE,
+            "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
+            "limit": ENTITY_PAGE_SIZE,
             "buzz_project_view": extension,
         });
         let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
             .map_err(|error| v3_integrity_error(format!("invalid v3 entity page: {error}")))?;
-        if values.len() > V2_ENTITY_PAGE_SIZE {
+        if values.len() > ENTITY_PAGE_SIZE {
             return Err(v3_integrity_error(
                 "v3 current-entity page exceeded the requested limit",
             ));
@@ -258,7 +268,7 @@ async fn read_current_v3_entity_projections(
             }));
             projections.push(projection);
         }
-        if page_len < V2_ENTITY_PAGE_SIZE {
+        if page_len < ENTITY_PAGE_SIZE {
             break;
         }
     }
@@ -272,6 +282,7 @@ pub(crate) async fn read_v3_meta(
     let filter = json!({
         "kinds": [KIND_PROJECT_VIEW_META],
         "authors": [identity.relay_pubkey.to_hex()],
+        "#t": [PROJECT_VIEW_V3_META_TAG],
         "limit": 2,
     });
     let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
@@ -291,7 +302,7 @@ async fn read_v3_membership(
     client: &BuzzClient,
     identity: ProjectViewIdentity,
     meta: &V3MetaProjection,
-) -> Result<V2MembershipProjection, CliError> {
+) -> Result<V3MembershipProjection, CliError> {
     let filter = json!({
         "ids": [meta.membership_snapshot_event_id.to_hex()],
         "kinds": [KIND_NIP43_MEMBERSHIP_LIST],
@@ -312,22 +323,11 @@ async fn read_v3_membership(
             "membership query returned an event other than the v3 metadata pointer",
         ));
     }
-    parse_membership_projection(&event, &identity.relay_pubkey)
+    parse_v3_membership_projection(&event, &identity.relay_pubkey)
         .map_err(|error| v3_integrity_error(error.to_string()))
 }
 
-pub(crate) async fn require_v2_identity(
-    client: &BuzzClient,
-) -> Result<ProjectViewIdentity, CliError> {
-    match read_identity(client).await? {
-        Some(identity) if identity.schema == ProjectViewSchema::V2 => Ok(identity),
-        _ => Err(CliError::Other(format!(
-            "unsupported: relay does not advertise {PROJECT_VIEW_V2_EXTENSION}"
-        ))),
-    }
-}
-
-pub(crate) async fn read_verified_v2_snapshot(
+pub(crate) async fn read_legacy_v2_migration_snapshot(
     client: &BuzzClient,
     identity: ProjectViewIdentity,
 ) -> Result<VerifiedRoleBriefSnapshot, CliError> {
@@ -338,30 +338,19 @@ pub(crate) async fn read_verified_v2_snapshot(
     }
     for attempt in 0..SNAPSHOT_ATTEMPTS {
         let before = read_meta(client, identity).await?;
-        let ordinary_values = client
-            .query_all(json!({
-                "kinds": [KIND_PROJECT_VIEW_OBJECT],
-                "authors": [identity.relay_pubkey.to_hex()],
-                "#t": ["buzz-project-view-v2-object"],
-            }))
-            .await?;
-        let entity_projections = read_current_entity_projections(client, identity, &before).await?;
+        let object_projections =
+            read_legacy_v2_migration_objects(client, identity, &before).await?;
+        let entity_projections =
+            read_legacy_v2_migration_current_entities(client, identity, &before).await?;
 
         let mut event_ids =
-            HashSet::with_capacity(ordinary_values.len() + entity_projections.len());
-        let mut object_projections = Vec::with_capacity(ordinary_values.len());
-        for value in ordinary_values {
-            let event: Event = serde_json::from_value(value)
-                .map_err(|error| integrity_error(format!("invalid v2 object event: {error}")))?;
-            if !event_ids.insert(event.id) {
+            HashSet::with_capacity(object_projections.len() + entity_projections.len());
+        for projection in &object_projections {
+            if !event_ids.insert(projection.event_id) {
                 return Err(integrity_error(
                     "v2 object query returned a duplicate event",
                 ));
             }
-            object_projections.push(
-                parse_project_object_projection(&event, &identity.relay_pubkey, before.project_id)
-                    .map_err(|error| integrity_error(error.to_string()))?,
-            );
         }
         for projection in &entity_projections {
             if !event_ids.insert(projection.event_id) {
@@ -395,7 +384,82 @@ pub(crate) async fn read_verified_v2_snapshot(
     ))
 }
 
-async fn read_current_entity_projections(
+async fn read_legacy_v2_migration_objects(
+    client: &BuzzClient,
+    identity: ProjectViewIdentity,
+    meta: &V2MetaProjection,
+) -> Result<Vec<buzz_sdk::project_view_v2::V2ProjectObjectProjection>, CliError> {
+    let mut projections = Vec::new();
+    let mut event_ids = HashSet::new();
+    let mut after: Option<(String, uuid::Uuid)> = None;
+    loop {
+        let mut extension = json!({
+            "scope": "v2_migration_objects",
+            "revision": meta.project_revision,
+            "projection_generation": meta.projection_generation,
+        });
+        if let Some((object_type, object_id)) = &after {
+            extension["after"] = json!({
+                "object_type": object_type,
+                "object_id": object_id,
+            });
+        }
+        let filter = json!({
+            "kinds": [KIND_PROJECT_VIEW_OBJECT],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "#t": ["buzz-project-view-v2-object"],
+            "limit": V2_OBJECT_PAGE_SIZE,
+            "buzz_project_view": extension,
+        });
+        let values: Vec<Value> =
+            serde_json::from_str(&client.query(&filter).await?).map_err(|error| {
+                integrity_error(format!("invalid v2 migration object page: {error}"))
+            })?;
+        if values.len() > V2_OBJECT_PAGE_SIZE {
+            return Err(integrity_error(
+                "v2 migration object page exceeded the requested limit",
+            ));
+        }
+        let page_len = values.len();
+        for value in values {
+            let event: Event = serde_json::from_value(value).map_err(|error| {
+                integrity_error(format!("invalid v2 migration object event: {error}"))
+            })?;
+            if !event_ids.insert(event.id) {
+                return Err(integrity_error(
+                    "v2 migration object pages contain a duplicate event",
+                ));
+            }
+            let projection =
+                parse_project_object_projection(&event, &identity.relay_pubkey, meta.project_id)
+                    .map_err(|error| integrity_error(error.to_string()))?;
+            if projection.projection_generation != meta.projection_generation
+                || projection.project_revision > meta.project_revision
+            {
+                return Err(integrity_error(
+                    "v2 migration object projection is outside the pinned snapshot",
+                ));
+            }
+            let key = (
+                projection.object.object_type().as_str().to_owned(),
+                projection.object.id(),
+            );
+            if after.as_ref().is_some_and(|cursor| key <= *cursor) {
+                return Err(integrity_error(
+                    "v2 migration object pages are not in strict keyset order",
+                ));
+            }
+            after = Some(key);
+            projections.push(projection);
+        }
+        if page_len < V2_OBJECT_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(projections)
+}
+
+async fn read_legacy_v2_migration_current_entities(
     client: &BuzzClient,
     identity: ProjectViewIdentity,
     meta: &V2MetaProjection,
@@ -405,7 +469,7 @@ async fn read_current_entity_projections(
     let mut after: Option<Value> = None;
     loop {
         let mut extension = json!({
-            "scope": "v2_current_entities",
+            "scope": "v2_migration_current_entities",
             "revision": meta.project_revision,
             "projection_generation": meta.projection_generation,
         });
@@ -416,12 +480,12 @@ async fn read_current_entity_projections(
             "kinds": [KIND_PROJECT_VIEW_OBJECT],
             "authors": [identity.relay_pubkey.to_hex()],
             "#t": ["buzz-project-view-v2-entity"],
-            "limit": V2_ENTITY_PAGE_SIZE,
+            "limit": ENTITY_PAGE_SIZE,
             "buzz_project_view": extension,
         });
         let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
             .map_err(|error| integrity_error(format!("invalid v2 entity page: {error}")))?;
-        if values.len() > V2_ENTITY_PAGE_SIZE {
+        if values.len() > ENTITY_PAGE_SIZE {
             return Err(integrity_error(
                 "v2 current-entity page exceeded the requested limit",
             ));
@@ -444,238 +508,11 @@ async fn read_current_entity_projections(
             }));
             projections.push(projection);
         }
-        if page_len < V2_ENTITY_PAGE_SIZE {
+        if page_len < ENTITY_PAGE_SIZE {
             break;
         }
     }
     Ok(projections)
-}
-
-pub(crate) async fn read_role_history_page(
-    client: &BuzzClient,
-    identity: ProjectViewIdentity,
-    meta: &V2MetaProjection,
-    request: RoleHistoryRequest<'_>,
-) -> Result<RoleHistoryPage, CliError> {
-    let entity_types = request.entity_types;
-    let role_id = request.role_id;
-    let assignment_id = request.assignment_id;
-    let member_pubkey = request.member_pubkey;
-    let limit = request.limit;
-    let before = request.before;
-    if entity_types.is_empty() {
-        return Err(CliError::Usage(
-            "Role history requires at least one entity type".to_owned(),
-        ));
-    }
-    let after = before
-        .map(|cursor| parse_history_cursor(cursor, entity_types))
-        .transpose()?;
-    let mut extension = json!({
-        "scope": "role_history",
-        "revision": meta.project_revision,
-        "projection_generation": meta.projection_generation,
-        "entity_types": entity_types
-            .iter()
-            .map(|entity_type| entity_type.as_str())
-            .collect::<Vec<_>>(),
-    });
-    if let Some(role_id) = role_id {
-        extension["role_id"] = json!(role_id);
-    }
-    if let Some(assignment_id) = assignment_id {
-        extension["assignment_id"] = json!(assignment_id);
-    }
-    if let Some(member_pubkey) = member_pubkey {
-        extension["member_pubkey"] = json!(member_pubkey.to_hex());
-    }
-    if let Some(after) = after {
-        extension["after"] = json!({
-            "project_revision": after.project_revision,
-            "entity_type": after.entity_type.as_str(),
-            "entity_id": after.entity_id,
-        });
-    }
-    let filter = json!({
-        "kinds": [KIND_PROJECT_VIEW_OBJECT],
-        "authors": [identity.relay_pubkey.to_hex()],
-        "#t": ["buzz-project-view-v2-entity"],
-        "limit": limit,
-        "buzz_project_view": extension,
-    });
-    let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
-        .map_err(|error| integrity_error(format!("invalid Role history page: {error}")))?;
-    if values.len() > usize::from(limit) {
-        return Err(integrity_error(
-            "Role history page exceeded the requested limit",
-        ));
-    }
-    let mut projections = Vec::with_capacity(values.len());
-    let mut event_ids = HashSet::with_capacity(values.len());
-    let mut previous: Option<RoleHistoryCursor> = None;
-    for value in values {
-        let event: Event = serde_json::from_value(value)
-            .map_err(|error| integrity_error(format!("invalid Role history event: {error}")))?;
-        if !event_ids.insert(event.id) {
-            return Err(integrity_error(
-                "Role history page contains a duplicate event",
-            ));
-        }
-        let projection = parse_entity_projection(&event, &identity.relay_pubkey, meta.project_id)
-            .map_err(|error| integrity_error(error.to_string()))?;
-        let cursor = RoleHistoryCursor {
-            project_revision: projection.project_revision,
-            entity_type: projection.entity.entity_type(),
-            entity_id: projection.entity.entity_id(),
-        };
-        if !entity_types.contains(&cursor.entity_type)
-            || projection.projection_generation != meta.projection_generation
-            || cursor.project_revision > meta.project_revision
-            || previous.is_some_and(|previous| !history_cursor_precedes(previous, cursor))
-        {
-            return Err(integrity_error(
-                "Role history page violates its requested type, revision, or canonical order",
-            ));
-        }
-        validate_history_projection_filter(&projection, role_id, assignment_id, member_pubkey)?;
-        previous = Some(cursor);
-        projections.push(projection);
-    }
-    let next_before = (projections.len() == usize::from(limit))
-        .then(|| previous.map(format_history_cursor))
-        .flatten();
-    Ok(RoleHistoryPage {
-        projections,
-        next_before,
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RoleHistoryCursor {
-    project_revision: u64,
-    entity_type: RoleContinuityEntity,
-    entity_id: uuid::Uuid,
-}
-
-fn parse_history_cursor(
-    value: &str,
-    allowed: &[RoleContinuityEntity],
-) -> Result<RoleHistoryCursor, CliError> {
-    let mut parts = value.splitn(3, ':');
-    let project_revision = parts
-        .next()
-        .and_then(|part| part.parse::<u64>().ok())
-        .filter(|revision| *revision > 0)
-        .ok_or_else(|| CliError::Usage("invalid Role history cursor revision".to_owned()))?;
-    let entity_type = match parts.next() {
-        Some("role_assignment_proposal") => RoleContinuityEntity::RoleAssignmentProposal,
-        Some("role_assignment") => RoleContinuityEntity::RoleAssignment,
-        Some("role_checkpoint") => RoleContinuityEntity::RoleCheckpoint,
-        Some("role_handoff") => RoleContinuityEntity::RoleHandoff,
-        _ => {
-            return Err(CliError::Usage(
-                "invalid Role history cursor entity type".to_owned(),
-            ));
-        }
-    };
-    if !allowed.contains(&entity_type) {
-        return Err(CliError::Usage(
-            "Role history cursor type is outside this command".to_owned(),
-        ));
-    }
-    let entity_id = parts
-        .next()
-        .and_then(|part| part.parse::<uuid::Uuid>().ok())
-        .ok_or_else(|| CliError::Usage("invalid Role history cursor UUID".to_owned()))?;
-    let cursor = RoleHistoryCursor {
-        project_revision,
-        entity_type,
-        entity_id,
-    };
-    if format_history_cursor(cursor) != value {
-        return Err(CliError::Usage(
-            "Role history cursor is not canonical".to_owned(),
-        ));
-    }
-    Ok(cursor)
-}
-
-fn format_history_cursor(cursor: RoleHistoryCursor) -> String {
-    format!(
-        "{}:{}:{}",
-        cursor.project_revision,
-        cursor.entity_type.as_str(),
-        cursor.entity_id
-    )
-}
-
-fn history_cursor_precedes(previous: RoleHistoryCursor, current: RoleHistoryCursor) -> bool {
-    previous.project_revision > current.project_revision
-        || (previous.project_revision == current.project_revision
-            && (history_entity_order(previous.entity_type)
-                < history_entity_order(current.entity_type)
-                || (previous.entity_type == current.entity_type
-                    && previous.entity_id > current.entity_id)))
-}
-
-const fn history_entity_order(entity_type: RoleContinuityEntity) -> u8 {
-    match entity_type {
-        RoleContinuityEntity::RoleAssignmentProposal => 0,
-        RoleContinuityEntity::RoleAssignment => 1,
-        RoleContinuityEntity::RoleCheckpoint => 2,
-        RoleContinuityEntity::RoleHandoff => 3,
-        RoleContinuityEntity::Role | RoleContinuityEntity::WorkCommitment => u8::MAX,
-    }
-}
-
-fn validate_history_projection_filter(
-    projection: &V2EntityProjection,
-    role_id: Option<uuid::Uuid>,
-    assignment_id: Option<uuid::Uuid>,
-    member_pubkey: Option<PublicKey>,
-) -> Result<(), CliError> {
-    let (actual_role, actual_assignment, actual_member) = match &projection.entity {
-        buzz_project_view::v2::RoleContinuityChange::Proposal(proposal) => {
-            (proposal.role_id, None, Some(proposal.candidate_pubkey))
-        }
-        buzz_project_view::v2::RoleContinuityChange::Assignment(assignment) => (
-            assignment.role_id,
-            Some(assignment.assignment_id),
-            Some(assignment.member_pubkey),
-        ),
-        buzz_project_view::v2::RoleContinuityChange::Checkpoint(checkpoint) => (
-            checkpoint.role_id,
-            Some(checkpoint.assignment_id),
-            Some(checkpoint.created_by),
-        ),
-        buzz_project_view::v2::RoleContinuityChange::Handoff(handoff) => (
-            handoff.role_id,
-            Some(handoff.from_assignment_id),
-            handoff.created_by,
-        ),
-        buzz_project_view::v2::RoleContinuityChange::Role(_)
-        | buzz_project_view::v2::RoleContinuityChange::Commitment(_) => {
-            return Err(integrity_error(
-                "non-history entity appeared in a Role history page",
-            ));
-        }
-    };
-    if role_id.is_some_and(|expected| expected != actual_role)
-        || assignment_id.is_some_and(|expected| Some(expected) != actual_assignment)
-        || member_pubkey.is_some_and(|expected| Some(expected) != actual_member)
-    {
-        return Err(integrity_error(
-            "Role history event is outside the requested Role or Assignment",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) async fn read_current_v2_snapshot(
-    client: &BuzzClient,
-) -> Result<VerifiedRoleBriefSnapshot, CliError> {
-    let identity = require_v2_identity(client).await?;
-    read_verified_v2_snapshot(client, identity).await
 }
 
 pub(crate) fn is_managed_runtime() -> bool {
@@ -764,7 +601,9 @@ async fn read_meta(
     let filter = json!({
         "kinds": [KIND_PROJECT_VIEW_META],
         "authors": [identity.relay_pubkey.to_hex()],
+        "#t": [PROJECT_VIEW_V3_META_TAG],
         "limit": 2,
+        "buzz_project_view": {"scope": "v2_migration_meta"},
     });
     let values: Vec<Value> = serde_json::from_str(&client.query(&filter).await?)
         .map_err(|error| integrity_error(format!("invalid v2 metadata response: {error}")))?;
@@ -804,7 +643,7 @@ async fn read_membership(
             "membership query returned an event other than the metadata pointer",
         ));
     }
-    parse_membership_projection(&event, &identity.relay_pubkey)
+    parse_v2_membership_projection(&event, &identity.relay_pubkey)
         .map_err(|error| integrity_error(error.to_string()))
 }
 
@@ -813,6 +652,10 @@ pub(crate) fn integrity_error(message: impl Into<String>) -> CliError {
         "Project View v2 integrity error: {}",
         message.into()
     ))
+}
+
+fn project_view_integrity_error(message: impl Into<String>) -> CliError {
+    CliError::Other(format!("Project View integrity error: {}", message.into()))
 }
 
 pub(crate) fn v3_integrity_error(message: impl Into<String>) -> CliError {
@@ -825,47 +668,45 @@ pub(crate) fn v3_integrity_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_history_cursor, history_cursor_precedes, is_managed_runtime_value,
-        parse_history_cursor, runtime_fence_from_file, runtime_fence_from_legacy_env,
-        RoleHistoryCursor,
+        identity_from_nip11, is_managed_runtime_value, runtime_fence_from_file,
+        runtime_fence_from_legacy_env, v3_identity_from_nip11, Nip11Document, ProjectViewSchema,
+        PROJECT_VIEW_V3_EXTENSION,
     };
-    use buzz_project_view::v2::{RoleContinuityEntity, RuntimeFence};
+    use buzz_project_view::v2::RuntimeFence;
+    use nostr::Keys;
     use uuid::Uuid;
 
     #[test]
-    fn role_history_cursor_round_trips_and_is_type_scoped() {
-        let cursor = RoleHistoryCursor {
-            project_revision: 42,
-            entity_type: RoleContinuityEntity::RoleCheckpoint,
-            entity_id: Uuid::new_v4(),
-        };
-        let encoded = format_history_cursor(cursor);
-        let parsed = parse_history_cursor(&encoded, &[RoleContinuityEntity::RoleCheckpoint])
-            .expect("parse canonical cursor");
-        assert_eq!(parsed.project_revision, cursor.project_revision);
-        assert_eq!(parsed.entity_type, cursor.entity_type);
-        assert_eq!(parsed.entity_id, cursor.entity_id);
-        assert!(parse_history_cursor(&encoded, &[RoleContinuityEntity::RoleHandoff]).is_err());
-    }
+    fn ordinary_identity_rejects_v2_only_but_closed_transition_identities_need_no_advertisement() {
+        let relay_pubkey = Keys::generate().public_key().to_hex();
+        let ordinary = v3_identity_from_nip11(Nip11Document {
+            supported_extensions: vec!["buzz-project-view-v2".to_owned()],
+            relay_self: Some(relay_pubkey.clone()),
+        })
+        .expect("parse v2-only NIP-11 identity");
+        assert!(ordinary.is_none());
 
-    #[test]
-    fn role_history_order_is_revision_type_then_descending_uuid() {
-        let high = RoleHistoryCursor {
-            project_revision: 7,
-            entity_type: RoleContinuityEntity::RoleCheckpoint,
-            entity_id: Uuid::from_u128(2),
-        };
-        let low_id = RoleHistoryCursor {
-            entity_id: Uuid::from_u128(1),
-            ..high
-        };
-        let handoff = RoleHistoryCursor {
-            entity_type: RoleContinuityEntity::RoleHandoff,
-            ..high
-        };
-        assert!(history_cursor_precedes(high, low_id));
-        assert!(history_cursor_precedes(high, handoff));
-        assert!(!history_cursor_precedes(low_id, high));
+        let migration = identity_from_nip11(
+            Nip11Document {
+                supported_extensions: vec![PROJECT_VIEW_V3_EXTENSION.to_owned()],
+                relay_self: Some(relay_pubkey.clone()),
+            },
+            ProjectViewSchema::V2,
+        )
+        .expect("migration identity must not depend on a v2 advertisement");
+        assert_eq!(migration.schema, ProjectViewSchema::V2);
+        assert_eq!(migration.relay_pubkey.to_hex(), relay_pubkey);
+
+        let bootstrap = identity_from_nip11(
+            Nip11Document {
+                supported_extensions: Vec::new(),
+                relay_self: Some(relay_pubkey.clone()),
+            },
+            ProjectViewSchema::V3,
+        )
+        .expect("v3 bootstrap readback needs the Relay signer, not runtime readiness");
+        assert_eq!(bootstrap.schema, ProjectViewSchema::V3);
+        assert_eq!(bootstrap.relay_pubkey.to_hex(), relay_pubkey);
     }
 
     #[test]

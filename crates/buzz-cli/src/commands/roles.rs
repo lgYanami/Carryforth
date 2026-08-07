@@ -1,17 +1,16 @@
-//! `buzz roles` — verified Project View v2 Role continuity reads and writes.
+//! `buzz roles` — verified Project View v3 Role continuity reads and writes.
 
 use std::collections::{BTreeMap, HashSet};
 
 use buzz_core::PublicKey;
 use buzz_project_view::v2::{
     HandoffCause, ProposalStatus, RoleActorIntent, RoleAssignment, RoleAssignmentProposal,
-    RoleCheckpointContent, RoleCommand, RoleCommandRequest, RoleContinuityChange,
-    RoleContinuityEntity, RoleDefinition, RoleHandoffContent,
+    RoleCheckpointContent, RoleCommandRequest, RoleContinuityEntity, RoleHandoffContent,
 };
-use buzz_project_view::v3::RoleCommandV3;
-use buzz_sdk::project_view_v2::{build_role_command, V2MetaProjection};
-use buzz_sdk::project_view_v3::build_role_command as build_v3_role_command;
-use buzz_sdk::role_brief::render_role_brief_markdown;
+use buzz_project_view::v3::{RoleCommandV3, RoleDefinitionV3};
+use buzz_sdk::project_view_v3::{
+    build_role_command as build_v3_role_command, V3EntityChange, V3MetaProjection,
+};
 use buzz_sdk::role_brief_v3::render_role_brief_markdown_v3;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,12 +18,14 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::{normalize_write_response, BuzzClient};
-use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_current_v2_snapshot, read_identity, read_role_history_page,
-    read_verified_v2_snapshot, read_verified_v3_snapshot, require_v2_identity, ProjectViewIdentity,
-    ProjectViewSchema, RoleHistoryRequest,
+use crate::commands::project_view_snapshot::{
+    is_managed_runtime, read_identity, read_verified_v3_snapshot, ProjectViewIdentity,
+    ProjectViewSchema,
 };
 use crate::commands::project_view_v3_context::resolve_v3_role_brief;
+use crate::commands::project_view_v3_role_history::{
+    read_v3_role_history_page, V3RoleHistoryRequest,
+};
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
 use crate::{
@@ -34,8 +35,8 @@ use crate::{
 
 #[derive(Debug)]
 struct RoleSnapshot {
-    meta: V2MetaProjection,
-    roles: Vec<RoleDefinition>,
+    meta: V3MetaProjection,
+    roles: Vec<RoleDefinitionV3>,
     assignments: Vec<RoleAssignment>,
 }
 
@@ -48,7 +49,7 @@ struct ManagedRoleState {
 #[derive(Serialize)]
 struct RoleListItem<'a> {
     #[serde(flatten)]
-    role: &'a RoleDefinition,
+    role: &'a RoleDefinitionV3,
     vacant: bool,
     current_assignment: Option<&'a RoleAssignment>,
 }
@@ -80,7 +81,7 @@ pub async fn dispatch(
         } => {
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     acting_assignment,
                     RoleCommandRequest::RequestRole {
@@ -103,7 +104,7 @@ pub async fn dispatch(
         } => {
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     acting_assignment,
                     RoleCommandRequest::OfferRole {
@@ -136,41 +137,17 @@ async fn show_brief(
         .transpose()?
         .unwrap_or_else(|| client.public_key());
     let identity = require_role_identity(client).await?;
-    match identity.schema {
-        ProjectViewSchema::V2 => {
-            let snapshot = read_verified_v2_snapshot(client, identity).await?;
-            let brief = snapshot
-                .brief_for(member, Utc::now())
-                .map_err(|error| integrity_error(error.to_string()))?;
-            if markdown {
-                print!("{}", render_role_brief_markdown(&brief));
-                return Ok(());
-            }
-            print_json(
-                &serde_json::to_value(brief)
-                    .map_err(|error| CliError::Other(format!("serialize Role Brief: {error}")))?,
-                format,
-            )
-        }
-        ProjectViewSchema::V3 => {
-            let snapshot = read_verified_v3_snapshot(client, identity).await?;
-            let brief =
-                resolve_v3_role_brief(client, identity, &snapshot, member, Utc::now()).await?;
-            if markdown {
-                print!("{}", render_role_brief_markdown_v3(&brief));
-                return Ok(());
-            }
-            print_json(
-                &serde_json::to_value(brief).map_err(|error| {
-                    CliError::Other(format!("serialize Role Brief v3: {error}"))
-                })?,
-                format,
-            )
-        }
-        ProjectViewSchema::V1 => Err(CliError::Other(
-            "unsupported: Role Brief requires Project View schema v2 or v3".to_owned(),
-        )),
+    let snapshot = read_verified_v3_snapshot(client, identity).await?;
+    let brief = resolve_v3_role_brief(client, identity, &snapshot, member, Utc::now()).await?;
+    if markdown {
+        print!("{}", render_role_brief_markdown_v3(&brief));
+        return Ok(());
     }
+    print_json(
+        &serde_json::to_value(brief)
+            .map_err(|error| CliError::Other(format!("serialize Role Brief v3: {error}")))?,
+        format,
+    )
 }
 
 async fn list_roles(client: &BuzzClient, format: &OutputFormat) -> Result<(), CliError> {
@@ -210,8 +187,8 @@ async fn get_role(
     role_id: Uuid,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
-    let identity = require_v2_identity(client).await?;
-    let snapshot = read_verified_v2_snapshot(client, identity).await?;
+    let identity = require_role_identity(client).await?;
+    let snapshot = read_verified_v3_snapshot(client, identity).await?;
     let role = snapshot
         .roles()
         .find(|role| role.role_id == role_id)
@@ -226,13 +203,13 @@ async fn get_role(
     let mut handoffs = Vec::new();
     for change in history {
         match change {
-            RoleContinuityChange::Proposal(proposal) => {
+            V3EntityChange::Proposal(proposal) => {
                 proposals.push(proposal_output(&proposal));
             }
-            RoleContinuityChange::Assignment(assignment) => assignments.push(assignment),
-            RoleContinuityChange::Checkpoint(checkpoint) => checkpoints.push(checkpoint),
-            RoleContinuityChange::Handoff(handoff) => handoffs.push(handoff),
-            RoleContinuityChange::Role(_) | RoleContinuityChange::Commitment(_) => {
+            V3EntityChange::Assignment(assignment) => assignments.push(assignment),
+            V3EntityChange::Checkpoint(checkpoint) => checkpoints.push(checkpoint),
+            V3EntityChange::Handoff(handoff) => handoffs.push(handoff),
+            V3EntityChange::Role(_) | V3EntityChange::Commitment(_) => {
                 return Err(integrity_error(
                     "Role history returned an entity outside the requested history set",
                 ));
@@ -264,9 +241,9 @@ async fn get_role(
 async fn read_complete_role_history(
     client: &BuzzClient,
     identity: ProjectViewIdentity,
-    meta: &V2MetaProjection,
+    meta: &V3MetaProjection,
     role_id: Uuid,
-) -> Result<Vec<RoleContinuityChange>, CliError> {
+) -> Result<Vec<V3EntityChange>, CliError> {
     const PAGE_SIZE: u16 = 500;
 
     let entity_types = [
@@ -279,11 +256,11 @@ async fn read_complete_role_history(
     let mut event_ids = HashSet::new();
     let mut before = None;
     loop {
-        let page = read_role_history_page(
+        let page = read_v3_role_history_page(
             client,
             identity,
             meta,
-            RoleHistoryRequest {
+            V3RoleHistoryRequest {
                 entity_types: &entity_types,
                 role_id: Some(role_id),
                 assignment_id: None,
@@ -321,54 +298,26 @@ async fn current_assignment(
         .transpose()?
         .unwrap_or_else(|| client.public_key());
     let identity = require_role_identity(client).await?;
-    match identity.schema {
-        ProjectViewSchema::V2 => {
-            let snapshot = read_verified_v2_snapshot(client, identity).await?;
-            let assignment = snapshot
-                .assignments()
-                .find(|assignment| assignment.member_pubkey == member && assignment.is_active());
-            let role = assignment.and_then(|assignment| {
-                snapshot
-                    .roles()
-                    .find(|role| role.role_id == assignment.role_id)
-            });
-            print_json(
-                &json!({
-                    "project_revision": snapshot.meta().project_revision,
-                    "member_pubkey": member,
-                    "assigned": assignment.is_some(),
-                    "assignment": assignment,
-                    "role": role,
-                }),
-                format,
-            )
-        }
-        ProjectViewSchema::V3 => {
-            let snapshot = read_verified_v3_snapshot(client, identity).await?;
-            let assignment = snapshot
-                .assignments()
-                .find(|assignment| assignment.member_pubkey == member && assignment.is_active());
-            let role = assignment.and_then(|assignment| {
-                snapshot
-                    .roles()
-                    .find(|role| role.role_id == assignment.role_id)
-            });
-            print_json(
-                &json!({
-                    "project_view_schema_version": 3,
-                    "project_revision": snapshot.meta().project_revision,
-                    "member_pubkey": member,
-                    "assigned": assignment.is_some(),
-                    "assignment": assignment,
-                    "role": role,
-                }),
-                format,
-            )
-        }
-        ProjectViewSchema::V1 => Err(CliError::Other(
-            "unsupported: current Assignment requires Project View schema v2 or v3".to_owned(),
-        )),
-    }
+    let snapshot = read_verified_v3_snapshot(client, identity).await?;
+    let assignment = snapshot
+        .assignments()
+        .find(|assignment| assignment.member_pubkey == member && assignment.is_active());
+    let role = assignment.and_then(|assignment| {
+        snapshot
+            .roles()
+            .find(|role| role.role_id == assignment.role_id)
+    });
+    print_json(
+        &json!({
+            "project_view_schema_version": 3,
+            "project_revision": snapshot.meta().project_revision,
+            "member_pubkey": member,
+            "assigned": assignment.is_some(),
+            "assignment": assignment,
+            "role": role,
+        }),
+        format,
+    )
 }
 
 async fn list_proposals(
@@ -378,13 +327,13 @@ async fn list_proposals(
     before: Option<&str>,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
-    let identity = require_v2_identity(client).await?;
-    let snapshot = read_verified_v2_snapshot(client, identity).await?;
-    let page = read_role_history_page(
+    let identity = require_role_identity(client).await?;
+    let snapshot = read_verified_v3_snapshot(client, identity).await?;
+    let page = read_v3_role_history_page(
         client,
         identity,
         snapshot.meta(),
-        RoleHistoryRequest {
+        V3RoleHistoryRequest {
             entity_types: &[RoleContinuityEntity::RoleAssignmentProposal],
             role_id: None,
             assignment_id: None,
@@ -399,7 +348,7 @@ async fn list_proposals(
         .projections
         .into_iter()
         .filter_map(|projection| match projection.entity {
-            RoleContinuityChange::Proposal(proposal) => Some(proposal),
+            V3EntityChange::Proposal(proposal) => Some(proposal),
             _ => None,
         })
         .filter(|proposal| {
@@ -483,7 +432,7 @@ async fn submit_proposal(client: &BuzzClient, command: RoleProposalCmd) -> Resul
             },
         ),
     };
-    submit(client, RoleCommand::new(expected, acting, request)).await
+    submit(client, RoleCommandV3::new(expected, acting, request)).await
 }
 
 async fn dispatch_assignment(
@@ -500,8 +449,8 @@ async fn dispatch_assignment(
             before,
         } => {
             let member = member.as_deref().map(parse_pubkey).transpose()?;
-            let identity = require_v2_identity(client).await?;
-            let snapshot = read_verified_v2_snapshot(client, identity).await?;
+            let identity = require_role_identity(client).await?;
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
             if !include_ended {
                 if before.is_some() {
                     return Err(CliError::Usage(
@@ -530,11 +479,11 @@ async fn dispatch_assignment(
                     format,
                 );
             }
-            let page = read_role_history_page(
+            let page = read_v3_role_history_page(
                 client,
                 identity,
                 snapshot.meta(),
-                RoleHistoryRequest {
+                V3RoleHistoryRequest {
                     entity_types: &[RoleContinuityEntity::RoleAssignment],
                     role_id: role,
                     assignment_id: None,
@@ -548,7 +497,7 @@ async fn dispatch_assignment(
                 .projections
                 .into_iter()
                 .filter_map(|projection| match projection.entity {
-                    RoleContinuityChange::Assignment(assignment) => Some(assignment),
+                    V3EntityChange::Assignment(assignment) => Some(assignment),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -595,7 +544,7 @@ async fn dispatch_assignment(
         } => {
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     acting_assignment,
                     RoleCommandRequest::EndAssignment {
@@ -613,7 +562,7 @@ async fn dispatch_assignment(
         } => {
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     Some(assignment),
                     RoleCommandRequest::RequestReplacement {
@@ -631,7 +580,7 @@ async fn dispatch_assignment(
         } => {
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     Some(assignment),
                     RoleCommandRequest::ReportUnableToContinue {
@@ -712,7 +661,7 @@ async fn dispatch_work(client: &BuzzClient, command: RoleWorkCmd) -> Result<(), 
             },
         ),
     };
-    submit(client, RoleCommand::new(expected, acting, request)).await
+    submit(client, RoleCommandV3::new(expected, acting, request)).await
 }
 
 async fn dispatch_checkpoint(
@@ -736,7 +685,7 @@ async fn dispatch_checkpoint(
                 })?;
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     acting_assignment,
                     RoleCommandRequest::AppendCheckpoint {
@@ -756,13 +705,13 @@ async fn dispatch_checkpoint(
             limit,
             before,
         } => {
-            let identity = require_v2_identity(client).await?;
-            let snapshot = read_verified_v2_snapshot(client, identity).await?;
-            let page = read_role_history_page(
+            let identity = require_role_identity(client).await?;
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            let page = read_v3_role_history_page(
                 client,
                 identity,
                 snapshot.meta(),
-                RoleHistoryRequest {
+                V3RoleHistoryRequest {
                     entity_types: &[RoleContinuityEntity::RoleCheckpoint],
                     role_id: role,
                     assignment_id: assignment,
@@ -776,7 +725,7 @@ async fn dispatch_checkpoint(
                 .projections
                 .into_iter()
                 .filter_map(|projection| match projection.entity {
-                    RoleContinuityChange::Checkpoint(checkpoint) => Some(checkpoint),
+                    V3EntityChange::Checkpoint(checkpoint) => Some(checkpoint),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -816,7 +765,7 @@ async fn dispatch_handoff(
                 })?;
             submit(
                 client,
-                RoleCommand::new(
+                RoleCommandV3::new(
                     expected_project_revision,
                     acting_assignment,
                     RoleCommandRequest::AppendHandoff {
@@ -839,13 +788,13 @@ async fn dispatch_handoff(
             limit,
             before,
         } => {
-            let identity = require_v2_identity(client).await?;
-            let snapshot = read_verified_v2_snapshot(client, identity).await?;
-            let page = read_role_history_page(
+            let identity = require_role_identity(client).await?;
+            let snapshot = read_verified_v3_snapshot(client, identity).await?;
+            let page = read_v3_role_history_page(
                 client,
                 identity,
                 snapshot.meta(),
-                RoleHistoryRequest {
+                V3RoleHistoryRequest {
                     entity_types: &[RoleContinuityEntity::RoleHandoff],
                     role_id: role,
                     assignment_id: assignment,
@@ -859,7 +808,7 @@ async fn dispatch_handoff(
                 .projections
                 .into_iter()
                 .filter_map(|projection| match projection.entity {
-                    RoleContinuityChange::Handoff(handoff) => Some(handoff),
+                    V3EntityChange::Handoff(handoff) => Some(handoff),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -879,7 +828,7 @@ async fn dispatch_handoff(
     }
 }
 
-async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), CliError> {
+async fn submit(client: &BuzzClient, mut command: RoleCommandV3) -> Result<(), CliError> {
     let identity = require_role_identity(client).await?;
     if is_managed_runtime() {
         let actor_intent = command.request.actor_intent();
@@ -940,25 +889,7 @@ async fn submit(client: &BuzzClient, mut command: RoleCommand) -> Result<(), Cli
         } => Some((*work_id, *responsible_role_id)),
         _ => None,
     };
-    let event = match identity.schema {
-        ProjectViewSchema::V2 => {
-            client.sign_event_exact(build_role_command(command).map_err(sdk_err)?)?
-        }
-        ProjectViewSchema::V3 => {
-            let mut v3 = RoleCommandV3::new(
-                command.expected_project_revision,
-                command.acting_assignment_id,
-                command.request,
-            );
-            v3.runtime_fence = command.runtime_fence;
-            client.sign_event_exact(build_v3_role_command(v3).map_err(sdk_err)?)?
-        }
-        ProjectViewSchema::V1 => {
-            return Err(CliError::Other(
-                "unsupported: Role continuity requires Project View schema v2 or v3".to_owned(),
-            ));
-        }
-    };
+    let event = client.sign_event_exact(build_v3_role_command(command).map_err(sdk_err)?)?;
     let response = client.submit_event(event.clone()).await?;
     if let Some((work_id, responsible_role_id)) = responsibility {
         return print_responsibility_write(
@@ -981,31 +912,15 @@ async fn read_managed_role_state(
     proposal_id: Option<Uuid>,
 ) -> Result<ManagedRoleState, CliError> {
     let actor = client.public_key();
-    match identity.schema {
-        ProjectViewSchema::V2 => {
-            let snapshot = read_verified_v2_snapshot(client, identity)
-                .await
-                .map_err(assignment_read_error)?;
-            Ok(managed_role_state(
-                actor,
-                proposal_id,
-                snapshot.assignments(),
-                snapshot.proposals(),
-            ))
-        }
-        ProjectViewSchema::V3 => {
-            let snapshot = read_verified_v3_snapshot(client, identity)
-                .await
-                .map_err(assignment_read_error)?;
-            Ok(managed_role_state(
-                actor,
-                proposal_id,
-                snapshot.assignments(),
-                snapshot.proposals(),
-            ))
-        }
-        ProjectViewSchema::V1 => Ok(ManagedRoleState::default()),
-    }
+    let snapshot = read_verified_v3_snapshot(client, identity)
+        .await
+        .map_err(assignment_read_error)?;
+    Ok(managed_role_state(
+        actor,
+        proposal_id,
+        snapshot.assignments(),
+        snapshot.proposals(),
+    ))
 }
 
 fn managed_role_state<'a>(
@@ -1041,9 +956,15 @@ const fn managed_command_requires_assignment(
 }
 
 async fn require_role_identity(client: &BuzzClient) -> Result<ProjectViewIdentity, CliError> {
-    read_identity(client).await?.ok_or_else(|| {
-        CliError::Other("unsupported: relay does not advertise Project View v2 or v3".to_owned())
-    })
+    match read_identity(client).await? {
+        Some(identity) if identity.schema == ProjectViewSchema::V3 => Ok(identity),
+        Some(_) => Err(CliError::Other(
+            "migration_required: Role continuity requires Project View schema v3".to_owned(),
+        )),
+        None => Err(CliError::Other(
+            "unsupported: relay does not advertise Project View v3".to_owned(),
+        )),
+    }
 }
 
 fn assignment_read_error(error: CliError) -> CliError {
@@ -1112,61 +1033,29 @@ async fn print_responsibility_write(
         || receipt.changed_objects.len() != 1
         || changed.responsible_role_id != responsible_role_id
         || changed.object_revision == 0
-        || match identity.schema {
-            ProjectViewSchema::V2 => {
-                receipt.schema_version.is_some() || changed.object_type.as_deref() != Some("work")
-            }
-            ProjectViewSchema::V3 => {
-                receipt.schema_version != Some(3)
-                    || changed
-                        .object_type
-                        .as_deref()
-                        .is_some_and(|object_type| object_type != "work")
-            }
-            ProjectViewSchema::V1 => true,
-        }
+        || receipt.schema_version != Some(3)
+        || changed
+            .object_type
+            .as_deref()
+            .is_some_and(|object_type| object_type != "work")
     {
         return Err(integrity_error(
             "responsibility receipt differs from the submitted operation",
         ));
     }
-    let projection_source = match identity.schema {
-        ProjectViewSchema::V2 => {
-            let snapshot = read_verified_v2_snapshot(client, identity).await?;
-            let work = snapshot.active_object(work_id).ok_or_else(|| {
-                integrity_error("accepted responsibility has no verified active Work projection")
-            })?;
-            if snapshot.meta().project_revision < receipt.project_revision
-                || work.responsible_role_id != responsible_role_id
-                || work.source.change_id.to_hex() != event.id.to_hex()
-            {
-                return Err(integrity_error(
-                    "verified Work projection does not confirm the responsibility receipt",
-                ));
-            }
-            work.source
-        }
-        ProjectViewSchema::V3 => {
-            let snapshot = read_verified_v3_snapshot(client, identity).await?;
-            let work = snapshot.active_object(work_id).ok_or_else(|| {
-                integrity_error("accepted responsibility has no verified active v3 Work projection")
-            })?;
-            if snapshot.meta().project_revision < receipt.project_revision
-                || work.responsible_role_id != responsible_role_id
-                || work.source.change_id.to_hex() != event.id.to_hex()
-            {
-                return Err(integrity_error(
-                    "verified v3 Work projection does not confirm the responsibility receipt",
-                ));
-            }
-            work.source
-        }
-        ProjectViewSchema::V1 => {
-            return Err(integrity_error(
-                "responsibility writes require Project View schema v2 or v3",
-            ));
-        }
-    };
+    let snapshot = read_verified_v3_snapshot(client, identity).await?;
+    let work = snapshot.active_object(work_id).ok_or_else(|| {
+        integrity_error("accepted responsibility has no verified active v3 Work projection")
+    })?;
+    if snapshot.meta().project_revision < receipt.project_revision
+        || work.responsible_role_id != responsible_role_id
+        || work.source.change_id.to_hex() != event.id.to_hex()
+    {
+        return Err(integrity_error(
+            "verified v3 Work projection does not confirm the responsibility receipt",
+        ));
+    }
+    let projection_source = work.source;
     println!(
         "{}",
         json!({
@@ -1184,7 +1073,8 @@ async fn print_responsibility_write(
 }
 
 async fn read_snapshot(client: &BuzzClient) -> Result<RoleSnapshot, CliError> {
-    let snapshot = read_current_v2_snapshot(client).await?;
+    let identity = require_role_identity(client).await?;
+    let snapshot = read_verified_v3_snapshot(client, identity).await?;
     Ok(RoleSnapshot {
         meta: snapshot.meta().clone(),
         roles: snapshot.roles().cloned().collect(),
@@ -1230,7 +1120,7 @@ fn print_json(value: &Value, format: &OutputFormat) -> Result<(), CliError> {
 
 fn integrity_error(message: impl Into<String>) -> CliError {
     CliError::Other(format!(
-        "Project View v2 integrity error: {}",
+        "Project View v3 integrity error: {}",
         message.into()
     ))
 }

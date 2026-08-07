@@ -89,20 +89,6 @@ export type ProjectViewWorkStatus =
   | "submitted"
   | "completed"
   | "cancelled";
-export type ProjectViewResourceType =
-  | "repository"
-  | "document"
-  | "design"
-  | "service"
-  | "environment"
-  | "artifact"
-  | "url";
-export type ProjectViewLocatorType =
-  | "url"
-  | "nostr_address"
-  | "nostr_event"
-  | "buzz_deep_link";
-
 type RawProjectProfileData = {
   name: string;
   positioning: string;
@@ -160,16 +146,6 @@ type RawWorkData = {
 
 type RawResourceData = {
   name: string;
-  resource_type: ProjectViewResourceType;
-  locator: {
-    locator_type: ProjectViewLocatorType;
-    value: string;
-  };
-  description: string;
-};
-
-type RawResourceDataV3 = {
-  name: string;
   resource_kind: string;
   summary?: string;
   guide_document_id: string;
@@ -185,10 +161,6 @@ type RawDataByType = {
   issue: RawIssueData;
   work: RawWorkData;
   resource: RawResourceData;
-};
-
-type RawDataByTypeV3 = Omit<RawDataByType, "resource"> & {
-  resource: RawResourceDataV3;
 };
 
 export type RawProjectViewContextReference =
@@ -213,7 +185,7 @@ export type RawProjectViewRelations = {
   handles?: RawProjectViewObjectRef;
 };
 
-type RawProjectViewObjectOf<T extends ProjectViewObjectType> = {
+export type RawProjectViewObjectV3Of<T extends ProjectViewObjectType> = {
   id: string;
   object_type: T;
   object_revision: number;
@@ -227,67 +199,12 @@ type RawProjectViewObjectOf<T extends ProjectViewObjectType> = {
     data: RawDataByType[T];
   };
   relations: RawProjectViewRelations;
-};
-
-export type RawProjectViewObject = {
-  [T in ProjectViewObjectType]: RawProjectViewObjectOf<T>;
-}[ProjectViewObjectType];
-
-export type RawProjectViewObjectV3Of<T extends ProjectViewObjectType> = {
-  id: string;
-  object_type: T;
-  object_revision: number;
-  project_revision: number;
-  created_at: string;
-  updated_at: string;
-  created_by: string;
-  updated_by: string;
-  data: {
-    object_type: T;
-    data: RawDataByTypeV3[T];
-  };
-  relations: RawProjectViewRelations;
   context_references: RawProjectViewContextReference[];
 };
 
 export type RawProjectViewObjectV3 = {
   [T in ProjectViewObjectType]: RawProjectViewObjectV3Of<T>;
 }[ProjectViewObjectType];
-
-export type RawProjectView = {
-  profile: RawProjectViewObjectOf<"project_profile">;
-  goals: Array<{
-    goal: RawProjectViewObjectOf<"goal">;
-    plans: RawPlanView[];
-  }>;
-  unbound_plans: RawPlanView[];
-  unplanned_requirements: RawRequirementView[];
-  unplanned_issues: RawIssueView[];
-  roles: Array<RawProjectViewObjectOf<"role">>;
-  resources: Array<RawProjectViewObjectOf<"resource">>;
-  issue_references_by_target: Record<string, RawProjectViewObjectRef[]>;
-};
-
-type RawPlanView = {
-  plan: RawProjectViewObjectOf<"plan">;
-  stages: RawStageView[];
-};
-
-type RawStageView = {
-  stage: RawProjectViewObjectOf<"stage">;
-  requirements: RawRequirementView[];
-  issues: RawIssueView[];
-};
-
-type RawRequirementView = {
-  requirement: RawProjectViewObjectOf<"requirement">;
-  works: Array<RawProjectViewObjectOf<"work">>;
-};
-
-type RawIssueView = {
-  issue: RawProjectViewObjectOf<"issue">;
-  works: Array<RawProjectViewObjectOf<"work">>;
-};
 
 export type RawProjectViewLoadResult =
   | { status: "unsupported" }
@@ -297,25 +214,11 @@ export type RawProjectViewLoadResult =
       status: "ready";
       relay_pubkey: string;
       project_context_supported?: boolean;
-      schema_version: 1 | 2;
-      project_revision: number;
-      projection_generation: number;
-      active_object_count: number;
-      updated_at: string;
-      view: RawProjectView;
-      objects_v3?: never;
-      role_continuity?: RawProjectViewRoleContinuity;
-    }
-  | {
-      status: "ready";
-      relay_pubkey: string;
-      project_context_supported?: boolean;
       schema_version: 3;
       project_revision: number;
       projection_generation: number;
       active_object_count: number;
       updated_at: string;
-      view?: never;
       objects_v3: RawProjectViewObjectV3[];
       role_continuity: RawProjectViewRoleContinuity;
     };
@@ -332,32 +235,12 @@ export type ProjectStageData = RawStageData;
 export type ProjectRequirementData = RawRequirementData;
 export type ProjectIssueData = RawIssueData;
 export type ProjectWorkData = RawWorkData;
-export type ProjectResourceDataLegacy = {
-  name: string;
-  resourceType: ProjectViewResourceType;
-  locator: {
-    locatorType: ProjectViewLocatorType;
-    value: string;
-  };
-  description: string;
-};
-
-export type ProjectResourceDataV3 = {
+export type ProjectResourceData = {
   name: string;
   resourceKind: string;
   summary?: string;
   guideDocumentId: string;
 };
-
-export type ProjectResourceData =
-  | ProjectResourceDataLegacy
-  | ProjectResourceDataV3;
-
-export function isProjectResourceDataV3(
-  resource: ProjectResourceData,
-): resource is ProjectResourceDataV3 {
-  return "guideDocumentId" in resource;
-}
 
 export type ProjectViewContextReference =
   | { referenceType: "resource"; resourceId: string }
@@ -454,13 +337,13 @@ export type ProjectViewLoadResult =
       status: "ready";
       relayPubkey: string;
       contextCapability: boolean;
-      schemaVersion: 1 | 2 | 3;
+      schemaVersion: 3;
       projectRevision: number;
       projectionGeneration: number;
       activeObjectCount: number;
       updatedAt: string;
       view: ProjectView;
-      roleContinuity?: ProjectViewRoleContinuity;
+      roleContinuity: ProjectViewRoleContinuity;
     };
 
 export type ProjectViewWritableObject =
@@ -496,11 +379,6 @@ export type ProjectViewWritableObject =
   | { objectType: "resource"; data: ProjectResourceData };
 
 export type ProjectViewMutationIntent =
-  | {
-      operation: "initialize";
-      profile: ProjectProfileData;
-      goals: ProjectGoalData[];
-    }
   | {
       operation: "create";
       expectedProjectRevision: number;
@@ -565,158 +443,6 @@ export type ProjectViewMutationResult =
       currentProjectRevision?: number;
       message: string;
     };
-
-function normalizeRef(raw: RawProjectViewObjectRef): ProjectViewObjectRef {
-  return {
-    objectType: raw.object_type,
-    objectId: raw.object_id,
-  };
-}
-
-function normalizeRelations(
-  raw: RawProjectViewRelations,
-): ProjectViewRelations {
-  return {
-    underGoalId: raw.under_goal_id,
-    underPlanId: raw.under_plan_id,
-    plannedInStageId: raw.planned_in_stage_id,
-    about: raw.about ? normalizeRef(raw.about) : undefined,
-    handles: raw.handles ? normalizeRef(raw.handles) : undefined,
-  };
-}
-
-function commonObjectFields<T extends ProjectViewObjectType>(
-  raw: RawProjectViewObjectOf<T>,
-) {
-  if (raw.data.object_type !== raw.object_type) {
-    throw new ProjectViewIntegrityError("object type does not match its data");
-  }
-  return {
-    id: raw.id,
-    objectRevision: raw.object_revision,
-    projectRevision: raw.project_revision,
-    createdAt: raw.created_at,
-    updatedAt: raw.updated_at,
-    createdBy: raw.created_by,
-    updatedBy: raw.updated_by,
-    relations: normalizeRelations(raw.relations),
-  };
-}
-
-export function normalizeProjectViewObject(
-  raw: RawProjectViewObject,
-): ProjectViewObject {
-  switch (raw.object_type) {
-    case "project_profile":
-      return {
-        ...commonObjectFields(raw),
-        objectType: raw.object_type,
-        data: raw.data.data,
-      };
-    case "goal":
-      return {
-        ...commonObjectFields(raw),
-        objectType: raw.object_type,
-        data: {
-          title: raw.data.data.title,
-          desiredOutcome: raw.data.data.desired_outcome,
-          directions: raw.data.data.directions,
-        },
-      };
-    case "role":
-    case "plan":
-    case "stage":
-    case "requirement":
-    case "issue":
-    case "work":
-      return {
-        ...commonObjectFields(raw),
-        objectType: raw.object_type,
-        data: raw.data.data,
-      } as ProjectViewObject;
-    case "resource":
-      return {
-        ...commonObjectFields(raw),
-        objectType: raw.object_type,
-        data: {
-          name: raw.data.data.name,
-          resourceType: raw.data.data.resource_type,
-          locator: {
-            locatorType: raw.data.data.locator.locator_type,
-            value: raw.data.data.locator.value,
-          },
-          description: raw.data.data.description,
-        },
-      };
-  }
-}
-
-function normalizePlan(raw: RawPlanView): ProjectViewPlan {
-  return {
-    plan: normalizeProjectViewObject(raw.plan) as ProjectViewObjectOf<"plan">,
-    stages: raw.stages.map(normalizeStage),
-  };
-}
-
-function normalizeStage(raw: RawStageView): ProjectViewStage {
-  return {
-    stage: normalizeProjectViewObject(
-      raw.stage,
-    ) as ProjectViewObjectOf<"stage">,
-    requirements: raw.requirements.map(normalizeRequirement),
-    issues: raw.issues.map(normalizeIssue),
-  };
-}
-
-function normalizeRequirement(raw: RawRequirementView): ProjectViewRequirement {
-  return {
-    requirement: normalizeProjectViewObject(
-      raw.requirement,
-    ) as ProjectViewObjectOf<"requirement">,
-    works: raw.works.map(
-      (work) => normalizeProjectViewObject(work) as ProjectViewObjectOf<"work">,
-    ),
-  };
-}
-
-function normalizeIssue(raw: RawIssueView): ProjectViewIssue {
-  return {
-    issue: normalizeProjectViewObject(
-      raw.issue,
-    ) as ProjectViewObjectOf<"issue">,
-    works: raw.works.map(
-      (work) => normalizeProjectViewObject(work) as ProjectViewObjectOf<"work">,
-    ),
-  };
-}
-
-export function normalizeProjectView(raw: RawProjectView): ProjectView {
-  return {
-    profile: normalizeProjectViewObject(
-      raw.profile,
-    ) as ProjectViewObjectOf<"project_profile">,
-    goals: raw.goals.map(({ goal, plans }) => ({
-      goal: normalizeProjectViewObject(goal) as ProjectViewObjectOf<"goal">,
-      plans: plans.map(normalizePlan),
-    })),
-    unboundPlans: raw.unbound_plans.map(normalizePlan),
-    unplannedRequirements: raw.unplanned_requirements.map(normalizeRequirement),
-    unplannedIssues: raw.unplanned_issues.map(normalizeIssue),
-    roles: raw.roles.map(
-      (role) => normalizeProjectViewObject(role) as ProjectViewObjectOf<"role">,
-    ),
-    resources: raw.resources.map(
-      (resource) =>
-        normalizeProjectViewObject(resource) as ProjectViewObjectOf<"resource">,
-    ),
-    issueReferencesByTarget: Object.fromEntries(
-      Object.entries(raw.issue_references_by_target).map(([target, refs]) => [
-        target,
-        refs.map(normalizeRef),
-      ]),
-    ),
-  };
-}
 
 function assertProjectViewSnapshotIntegrity(
   view: ProjectView,
@@ -882,39 +608,18 @@ export function normalizeProjectViewLoadResult(
         relayPubkey: raw.relay_pubkey,
       };
     case "ready": {
-      const view =
-        raw.schema_version === 3
-          ? assembleProjectViewV3(raw.objects_v3)
-          : normalizeProjectView(raw.view);
+      const view = assembleProjectViewV3(raw.objects_v3);
       assertProjectViewSnapshotIntegrity(
         view,
         raw.project_revision,
         raw.active_object_count,
       );
-      let roleContinuity: ProjectViewRoleContinuity | undefined;
-      if (raw.role_continuity) {
-        if (raw.schema_version === 1) {
-          throw new ProjectViewIntegrityError(
-            "schema-v1 Project View returned Role continuity",
-          );
-        }
-        roleContinuity = normalizeRoleContinuity(
-          raw.role_continuity,
-          view,
-          raw.project_revision,
-          raw.projection_generation,
-          raw.schema_version,
-        );
-      }
-      if (
-        ((raw.schema_version === 2 || raw.schema_version === 3) &&
-          !roleContinuity) ||
-        (raw.schema_version === 1 && Boolean(roleContinuity))
-      ) {
-        throw new ProjectViewIntegrityError(
-          "Role continuity payload does not match the Project View schema",
-        );
-      }
+      const roleContinuity = normalizeRoleContinuity(
+        raw.role_continuity,
+        view,
+        raw.project_revision,
+        raw.projection_generation,
+      );
       return {
         status: raw.status,
         relayPubkey: raw.relay_pubkey,

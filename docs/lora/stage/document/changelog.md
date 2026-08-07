@@ -1,5 +1,48 @@
 # Project Document 分阶段交付记录
 
+## 2026-08-07 — 解除 Document 对 Project View 初始化状态的错误依赖
+
+- Document 仍是可被 Project View 直接引用的独立版本化资产；schema-v3 Community 尚未建立
+  `project_view_state` 时，只要自身 Document capability ready，Document CRUD 不应被拒绝。
+- migration 0048 让 Document deferred trigger 复用统一的 v3 bootstrap lifecycle 判定：合法
+  bootstrap 状态只做 Document 自身校验；Project View state 建立后恢复完整跨资产一致性校验。
+- Desktop Tauri 改为从 `buzz-project-document-v1` 与 NIP-11 `self` 独立解析 Document identity，
+  不再调用 Project View `require_runtime_ready`。测试 fixture 固定“仅广告 Document、不广告
+  Project View”仍可完成 verified Document read。
+- 变更不更新、删除或重建任何现有 Document、Project View、消息、Meeting 或 Agent 数据。
+- Document deployment readiness 同时统计并拒绝 active + enabled 的旧 Project View schema，
+  防止 Relay 健康检查为绿色但 NIP-11 静默隐藏 Document capability；新增
+  `buzz_project_document_migration_required_communities` 供部署告警。
+- Document bootstrap 底层仅接受 Project View schema 2/3：schema 2 是显式、
+  capability-disabled 的 operator cutover 输入，schema 3 是唯一普通运行时；schema 1
+  不再接受。`buzz-admin project-document bootstrap/reproject` 在 schema 2 上额外要求
+  `--for-v3-cutover`，避免把迁移 seam 当成普通兼容入口。
+
+## 2026-08-07 — Stage 6 Context canary改为独立schema-v3 greenfield fixture
+
+- `scripts/test-project-view-stage6-canary.sh`不再调用Stage 5或显式legacy v2→v3 migration canary，也不再读取
+  其`acceptance-summary.json`、旧Role/Assignment、Resource或Guide坐标。
+- Stage 6现在自行创建scratch schema-v3 Community与owner/managed Agent identity，固定执行
+  `prepare-v3 → owner init-v3 → checked enable`，随后bootstrap/enable Project Document，创建Guide、Resource、
+  Role，完成Offer/Accept与supervisor binding，再执行原有Context、Role Brief与Runtime fence验收。
+- Runtime部分按当前边界验收binding与ACP lease generation生命周期；Context普通写只服从Community/Role
+  governance，不再把旧Runtime fence误当作Context ACL。Assignment结束后的预签名写仍必须拒绝。
+- Just/release入口与v3静态门禁要求Stage 6脚本只使用当前v3普通运行面；历史链式canary证据明确退役。此次仅做
+  shell语法和静态门禁检查，未运行Docker、数据库或真实canary，也未删除任何数据。
+
+## 2026-08-07 — Stage 2普通canary全面切换到greenfield Project View v3
+
+- `scripts/test-project-document-e2e.sh`不再调用已删除的v1 `project-view init`或v2 cutover。
+  独立scratch database现在显式创建schema-v3空Community，并执行
+  `prepare-v3 → direct Human owner签名init-v3 → checked enable`。
+- canary将Human owner与Relay projection signer拆成两把测试身份；固定验证初始化前只广告
+  `buzz-project-view-v3-bootstrap`、初始化后disabled时不广告普通Project View、enable后只广告
+  `buzz-project-view-v3`，再进入原有Document bootstrap、CRUD、撤权、incident与recovery语义。
+- 新增`PROJECT_DOCUMENT_E2E_SCRATCH_DATABASE=1`证据标记；原有受限database命名、独立restore
+  命名和最终清理边界保持不变。不接触现有Community，不恢复旧runtime、dual-read或dual-write。
+- Stage 2 release contract和全局v3静态守卫同时固定这条链路，防止普通Document验收脚本再次
+  悄然依赖legacy Project View版本。
+
 ## 2026-08-03 — 修复 Desktop Document mutation 字段命名不一致
 
 - 修复 Desktop 前端以camelCase提交`contentMarkdown`、`documentId`与

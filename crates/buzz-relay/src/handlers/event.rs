@@ -145,6 +145,18 @@ pub async fn filter_fanout_by_access(
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
     let kind = event_kind_u32(&stored_event.event);
+    let configured_projection_signer = super::project_view::configured_projection_signer(state);
+    if !project_view_projection_passes_final_fanout_gate(
+        &stored_event.event,
+        configured_projection_signer.as_ref(),
+    ) {
+        warn!(
+            community_id = %community_id,
+            event_id = %stored_event.event.id,
+            "Project View projection failed the final Relay-signer fan-out gate"
+        );
+        return Vec::new();
+    }
     // First enforce the receiver-side tenant label. Subscription indexes are
     // community-scoped, but stale/injected matches and future fan-out helpers
     // must still fail closed at the send chokepoint: a connection bound to
@@ -405,6 +417,22 @@ pub async fn filter_fanout_by_access(
         }
     }
     allowed
+}
+
+/// Final local/Redis delivery fence for Relay-authored Project View heads.
+///
+/// The subscription registry has no key material and performs only coordinate
+/// matching. This shared send chokepoint therefore requires the configured
+/// stable Relay signer and a strict schema-v3 wire before any projection can
+/// reach a client. Ordinary non-projection events are unaffected.
+fn project_view_projection_passes_final_fanout_gate(
+    event: &Event,
+    expected_relay_pubkey: Option<&PublicKey>,
+) -> bool {
+    !buzz_core::kind::is_project_view_projection_kind(event_kind_u32(event))
+        || expected_relay_pubkey.is_some_and(|relay_pubkey| {
+            super::project_view::event_is_v3_projection(event, relay_pubkey)
+        })
 }
 
 /// Deliver one event to this relay's local subscribers through the access gate.
@@ -1470,7 +1498,10 @@ mod tests {
         encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
         OBSERVER_FRAME_TELEMETRY,
     };
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use buzz_sdk::project_view_v3::{
+        build_meta_projection, V3EntityCounts, V3ProjectionContext, V3ProjectionSource,
+    };
+    use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
     use tokio::sync::{mpsc, Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -1509,6 +1540,61 @@ mod tests {
             ),
             "fan-out frame sharing must not escape a single cycle"
         );
+    }
+
+    #[test]
+    fn live_projection_final_gate_requires_the_configured_relay_signer() {
+        let relay = Keys::generate();
+        let foreign = Keys::generate();
+        let project_id = buzz_core::CommunityId::from_uuid(Uuid::new_v4());
+        let updated_at =
+            chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("projection timestamp");
+        let foreign_projection = build_meta_projection(
+            &V3ProjectionContext {
+                project_id,
+                projection_generation: 1,
+                project_revision: 1,
+                source: V3ProjectionSource::System {
+                    change_id: EventId::all_zeros(),
+                    audit_seq: 1,
+                },
+                updated_at,
+            },
+            V3EntityCounts {
+                active_objects: 0,
+                open_proposals: 0,
+                active_assignments: 0,
+                active_commitments: 0,
+                checkpoints: 0,
+                handoffs: 0,
+            },
+            EventId::all_zeros(),
+            true,
+            &[],
+        )
+        .expect("build foreign projection")
+        .sign_with_keys(&foreign)
+        .expect("sign foreign projection");
+
+        assert!(!super::project_view_projection_passes_final_fanout_gate(
+            &foreign_projection,
+            None,
+        ));
+        assert!(!super::project_view_projection_passes_final_fanout_gate(
+            &foreign_projection,
+            Some(&relay.public_key()),
+        ));
+        assert!(super::project_view_projection_passes_final_fanout_gate(
+            &foreign_projection,
+            Some(&foreign.public_key()),
+        ));
+
+        let ordinary = EventBuilder::text_note("ordinary event")
+            .sign_with_keys(&foreign)
+            .expect("sign ordinary event");
+        assert!(super::project_view_projection_passes_final_fanout_gate(
+            &ordinary, None,
+        ));
     }
 
     #[test]

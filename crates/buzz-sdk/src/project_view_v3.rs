@@ -24,10 +24,41 @@ use uuid::Uuid;
 use crate::SdkError;
 
 const PROJECT_VIEW_TAG: &str = "buzz-project-view";
-const PROJECT_VIEW_V3_ENTITY_TAG: &str = "buzz-project-view-v3-entity";
-const PROJECT_VIEW_V3_OBJECT_TAG: &str = "buzz-project-view-v3-object";
-const PROJECT_VIEW_META_TAG: &str = "buzz-project-view-meta";
+/// NIP-11 extension advertised by a ready schema-v3 Project View Community.
+pub const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
+/// NIP-11 discovery marker for an empty schema-v3 Community awaiting the
+/// explicit owner bootstrap. This is not an ordinary runtime capability.
+pub const PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION: &str = "buzz-project-view-v3-bootstrap";
+/// Exact `t` tag carried by every schema-v3 ordinary-object projection.
+pub const PROJECT_VIEW_V3_OBJECT_TAG: &str = "buzz-project-view-v3-object";
+/// Exact `t` tag carried by every schema-v3 Role-continuity entity projection.
+pub const PROJECT_VIEW_V3_ENTITY_TAG: &str = "buzz-project-view-v3-entity";
+/// Exact `t` tag carried by schema-v3 metadata projections.
+///
+/// The wire value predates v3, so ordinary readers must additionally use the
+/// strict v3 parser before returning an event. Exporting the coordinate here
+/// keeps query admission and wire verification tied to one SDK contract.
+pub const PROJECT_VIEW_V3_META_TAG: &str = "buzz-project-view-meta";
+/// Closed bridge pagination scope for the current schema-v3 entity set.
+pub const PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE: &str = "v3_current_entities";
+/// Closed bridge pagination scope for schema-v3 Role-continuity history.
+pub const PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE: &str = "v3_role_history";
 const PROJECT_VIEW_MUTATION_TAG: &str = "buzz-project-view-mutation";
+
+/// Verified Relay-authored NIP-43 membership snapshot bound by v3 metadata.
+///
+/// Project View v3 deliberately keeps the established NIP-43 wire shape. The
+/// v3 name prevents ordinary callers from depending on the legacy runtime
+/// module merely to verify this shared Community snapshot.
+pub type V3MembershipProjection = crate::project_view_v2::V2MembershipProjection;
+
+/// Strictly parse the NIP-43 membership snapshot referenced by v3 metadata.
+pub fn parse_membership_projection(
+    event: &Event,
+    expected_relay: &PublicKey,
+) -> Result<V3MembershipProjection, SdkError> {
+    crate::project_view_v2::parse_membership_projection(event, expected_relay)
+}
 
 /// Build a protected kind `44300` schema-v3 ordinary-object command.
 pub fn build_project_object_command(
@@ -1117,7 +1148,7 @@ fn meta_tags(
         vec!["-".to_owned()],
         vec!["d".to_owned(), coordinate.to_owned()],
         vec!["t".to_owned(), PROJECT_VIEW_TAG.to_owned()],
-        vec!["t".to_owned(), PROJECT_VIEW_META_TAG.to_owned()],
+        vec!["t".to_owned(), PROJECT_VIEW_V3_META_TAG.to_owned()],
         vec!["projection_generation".to_owned(), generation.to_string()],
         vec!["project_revision".to_owned(), project_revision.to_string()],
         vec!["change".to_owned(), source.change_id().to_hex()],
@@ -1291,6 +1322,23 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    #[test]
+    fn public_v3_runtime_coordinates_are_stable() {
+        assert_eq!(PROJECT_VIEW_V3_EXTENSION, "buzz-project-view-v3");
+        assert_eq!(
+            PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION,
+            "buzz-project-view-v3-bootstrap"
+        );
+        assert_eq!(PROJECT_VIEW_V3_OBJECT_TAG, "buzz-project-view-v3-object");
+        assert_eq!(PROJECT_VIEW_V3_ENTITY_TAG, "buzz-project-view-v3-entity");
+        assert_eq!(PROJECT_VIEW_V3_META_TAG, "buzz-project-view-meta");
+        assert_eq!(
+            PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
+            "v3_current_entities"
+        );
+        assert_eq!(PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE, "v3_role_history");
+    }
 
     #[test]
     fn role_definition_has_one_strict_v3_entity_head() {

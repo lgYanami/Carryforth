@@ -117,7 +117,9 @@ pub(crate) async fn project_document_read_decision(
     if !status.enabled {
         return Ok(ProjectDocumentReadDecision::Unavailable("disabled"));
     }
-    if !matches!(status.project_view_schema_version, 2 | 3) {
+    // Migration reads use explicit operator tooling. Community-private Relay
+    // reads are an ordinary schema-v3 runtime surface only.
+    if status.project_view_schema_version != 3 {
         return Ok(ProjectDocumentReadDecision::Unavailable("schema"));
     }
     if !state

@@ -2,6 +2,11 @@
 
 > 状态：已实现，并于 2026-07-31 完成 Linux 本地运行验收。
 >
+> 2026-08-07 协议覆盖：本文中出现的 Project View v2 capability/写入描述只记录事故发生时
+> 的历史实现。当前普通 CLI、Desktop、ACP 与 Relay 运行时均为 Project View v3-only；v2
+> 只能存在于显式 operator migration/recovery 维护边界，不能作为 fallback。运行时模式的
+> 当前唯一标记仍为 `BUZZ_MANAGED_RUNTIME=1`。
+>
 > 本文修复 Desktop 进程所有权标记与 Role/Project View managed 模式标记复用所造成的
 > 活跃 Codex/ACP 子进程误杀。修复不改变 Project View、Role Continuity、Assignment、
 > Runtime fence 或 Relay 授权协议，也不通过降低 Agent 并行度规避问题。
@@ -146,7 +151,7 @@ BUZZ_MANAGED_AGENT_START_NONCE=<random-nonce>
 3. 给每个模型子进程强制写入 `BUZZ_MANAGED_AGENT=1`；
 4. 给 developer MCP server 同样写入值 `1`。
 
-`crates/buzz-cli/src/commands/project_view_v2_snapshot.rs::is_managed_runtime()` 又要求该值
+`crates/buzz-cli/src/commands/project_view_snapshot.rs::is_managed_runtime()` 又要求该值
 严格等于 `1`，以决定 Role 和 Project View 写入是否需要 managed snapshot 与 Assignment
 fence。
 
@@ -332,7 +337,7 @@ BUZZ_RUNTIME_FENCE_PATH  # 有动态 fence 时传入
 
 ### 6.5 CLI managed 模式
 
-`crates/buzz-cli/src/commands/project_view_v2_snapshot.rs::is_managed_runtime()` 改为只检查：
+`crates/buzz-cli/src/commands/project_view_snapshot.rs::is_managed_runtime()` 改为只检查：
 
 ```text
 BUZZ_MANAGED_RUNTIME == "1"

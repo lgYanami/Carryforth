@@ -1,5 +1,20 @@
 # 角色连续性变更记录
 
+## 2026-08-07 — Role Continuity 运行时全面迁移到 Project View v3
+
+- 修复 v3 Checkpoint 已成功写入、`buzz roles checkpoint list` 却仍要求 Relay 广告 v2
+  的混合 major 问题。
+- CLI、Desktop/Tauri 与 ACP managed Role Brief 的 Role 运行时统一为 v3-only；schema
+  v1/v2 不再静默 fallback。
+- Relay history 使用显式 `v3_role_history` scope 和 v3 entity tag；DB 对 current/history
+  返回事件执行 signer、coordinate、revision、generation 和 strict v3 parser 校验。
+- cutover/reproject 改为重投影全部 Proposal、Assignment、Commitment、Checkpoint、Handoff
+  canonical 历史；readiness 在广告 v3 前验证全部 pointer，不删除或压缩 canonical 数据。
+- SDK 提供共享 scope/tag 常量，仓库 `check` 增加 Role runtime v3-only 静态门禁。
+
+实现依据见
+[Project View v3 Role History 运行时全量迁移修复设计](../bug/project-view-v3-role-history-runtime-migration-fix-design.md)。
+
 ## 2026-08-03 — Role 定义与 Assignment 治理统一（已修复并验证）
 
 - 修复普通 Community member 能创建 Role、却无权向它发 Offer 的分裂授权。Role 定义的
@@ -575,7 +590,7 @@
 ### 有界可信读取与历史分页
 
 - 现有 `POST /query` 的 `buzz_project_view` extension 增加
-  `v2_current_entities` 与 `role_history` scope，不增加 Role 专用 HTTP endpoint。两者继续
+  `v2_migration_current_entities` 与 `role_history` scope，不增加 Role 专用 HTTP endpoint。两者继续
   返回普通、可独立验签的 `40903` projection event。
 - 默认 snapshot 精确读取当前 Role、open Proposal、active Assignment、active
   Commitment 及其必要依赖，并为每个未删除 Role 只附带最新 Checkpoint 和最近 3 条

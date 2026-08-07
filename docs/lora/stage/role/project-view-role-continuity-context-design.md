@@ -5,6 +5,11 @@
 > [项目视图定义与项目上下文关系](../project-view/project-view.md)中尚待后续设计的
 > Project Context 领域能力。
 
+> 2026-08-07 协议覆盖：本文出现的 verified Project View v2 snapshot 均由 verified v3
+> snapshot 取代。ACP Role Brief、CLI Role reads/writes 与 Desktop Role history/mutation
+> 均为 v3-only；详见
+> [Project View v3 Role History 运行时全量迁移修复设计](../bug/project-view-v3-role-history-runtime-migration-fix-design.md)。
+
 ## 1. 文档目的
 
 [项目定位与目标](../../project-positioning.md)已经确定：

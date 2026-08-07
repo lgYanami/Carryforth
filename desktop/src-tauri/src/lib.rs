@@ -735,6 +735,7 @@ pub fn run() {
             get_meeting_activities,
             create_meeting,
             ensure_meeting_action_renewal,
+            ensure_meeting_human_grant_renewal,
             submit_meeting_action_finalization,
             submit_meeting_floor_action,
             submit_meeting_host_action,

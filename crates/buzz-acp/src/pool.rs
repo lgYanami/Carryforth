@@ -831,7 +831,7 @@ pub struct PromptContext {
     pub cwd: String,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
-    /// Project View v2 resolver that verifies meta every turn and retains only
+    /// Project View v3 resolver that verifies meta every turn and retains only
     /// an exact-head compact prompt cache; the cache never authorizes writes.
     pub role_brief_resolver: crate::role_brief::RoleBriefResolver,
     /// Shared channel metadata for startup-known and dynamically joined channels.

@@ -418,6 +418,9 @@ pub struct MeetingGrant {
     pub(super) soft_lease_expires_at_ms: i64,
     pub(super) hard_deadline_ms: i64,
     pub(super) progress_seq: u64,
+    /// Relay-frozen cadence used only by the native Human renewal task.
+    #[serde(skip)]
+    pub(super) progress_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -662,6 +665,8 @@ pub(super) struct StateWire {
     pub(super) consecutive_moderator_speeches: i64,
     pub(super) forced_return_to_moderator: bool,
     pub(super) moderator_pubkey: String,
+    #[serde(default)]
+    pub(super) baton_config: Option<BatonConfigWire>,
     pub(super) participants: Vec<StateParticipant>,
     #[serde(default)]
     pub(super) pending_intents: Vec<PendingIntentWire>,
@@ -677,6 +682,13 @@ pub(super) struct StateWire {
     pub(super) board_control: Option<BoardControlWire>,
     #[serde(default)]
     pub(super) transition: Option<TransitionWire>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct BatonConfigWire {
+    pub(super) grant_soft_lease_ms: i64,
+    pub(super) progress_interval_ms: i64,
+    pub(super) grant_hard_deadline_ms: i64,
 }
 
 #[derive(Debug)]

@@ -1,13 +1,12 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import { canonicalizeProjectViewContextReferences } from "@/shared/api/tauriProjectViewContext";
-import {
-  isProjectResourceDataV3,
-  type ProjectViewMutationIntent,
-  type ProjectViewMutationResult,
-  type ProjectViewContextReference,
-  type ProjectViewObjectRef,
-  type ProjectViewWritableObject,
-  type RawProjectViewMutationResult,
+import type {
+  ProjectViewMutationIntent,
+  ProjectViewMutationResult,
+  ProjectViewContextReference,
+  ProjectViewObjectRef,
+  ProjectViewWritableObject,
+  RawProjectViewMutationResult,
 } from "@/shared/api/tauriProjectView";
 
 function rawReference(reference: ProjectViewObjectRef) {
@@ -71,22 +70,12 @@ function serializeWritableObject(
         handles: rawReference(object.handles),
       };
     case "resource":
-      return isProjectResourceDataV3(object.data)
-        ? {
-            name: object.data.name,
-            resource_kind: object.data.resourceKind,
-            summary: object.data.summary,
-            guide_document_id: object.data.guideDocumentId,
-          }
-        : {
-            name: object.data.name,
-            resource_type: object.data.resourceType,
-            locator: {
-              locator_type: object.data.locator.locatorType,
-              value: object.data.locator.value,
-            },
-            description: object.data.description,
-          };
+      return {
+        name: object.data.name,
+        resource_kind: object.data.resourceKind,
+        summary: object.data.summary,
+        guide_document_id: object.data.guideDocumentId,
+      };
   }
 }
 
@@ -94,16 +83,6 @@ export function serializeProjectViewMutationIntent(
   intent: ProjectViewMutationIntent,
 ): Record<string, unknown> {
   switch (intent.operation) {
-    case "initialize":
-      return {
-        operation: intent.operation,
-        profile: intent.profile,
-        goals: intent.goals.map((goal) => ({
-          title: goal.title,
-          desired_outcome: goal.desiredOutcome,
-          directions: goal.directions,
-        })),
-      };
     case "create":
       return {
         operation: intent.operation,

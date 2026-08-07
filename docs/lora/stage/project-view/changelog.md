@@ -1,5 +1,50 @@
 # Project View 变更记录
 
+## 2026-08-07 — 普通运行时全面收敛到 schema v3
+
+- 修复 schema-v3 写入后部分 CLI/Desktop/Relay 读取仍选择 v1/v2 parser、scope 或
+  capability 的混合 major 问题；整个 Project View 普通运行时统一为 v3-only。
+- Relay 只对 ready schema-v3 Community 广告 Project View，普通 command、current/history
+  bridge 与 Context 治理前置条件均不再回退到 v1/v2；Document 继续使用独立 capability。
+- 新建但未初始化的 schema-v3 Community 只广告 discovery-only
+  `buzz-project-view-v3-bootstrap`；Desktop 仅显示 operator/owner setup guide，不发 projection
+  query/subscription，也不允许 Project View mutation 或 Role history。Document 不借用该
+  marker，而是按自身 capability 与 Relay signer 工作。初始化后 marker 消失，
+  checked enable 且 strict-ready 后才广告普通 v3，两个能力不会同时出现。
+- CLI、Desktop/Tauri 与 ACP 的普通读取、写入、回执和 canonical readback 只接受 v3；
+  v1/v2-only Relay 明确 fail closed。
+- ACP Runtime supervisor 的正常/enabled 状态只接受 schema v3；schema v2 仅可作为 disabled
+  且 `draining/frozen` 的显式 cutover 维护信封完成 quiesce acknowledgement，不能恢复旧
+  Agent runtime。
+- v1/v2 实现只保留在显式 operator cutover/reproject/recovery、Resource migration review、
+  内部 domain 复用和 legacy migration 测试中，不得重新接入普通运行时。
+- v2→v3 cutover/reproject 覆盖全部 Project objects 和全部 terminal continuity history，
+  不删除或重建 canonical 数据；readiness 在任何 pointer 未升级时停止能力广告。
+- `just check` 增加普通运行时 v3-only 静态门禁，防止未来新增命令再次遗漏升级。
+- CI 退役固定 Slice 4 Relay 的 post-mutation compatible rollback smoke，不再让已删除的
+  v1/v2 普通 CLI 成为发布门禁；保留的 pre-feature smoke 只验证初始化前 additive schema
+  安全，历史数据只由 scratch-only 显式 v2→v3 operator migration canary 验收。
+- Meeting action-finalization 真实 Provider acceptance 改为 greenfield v3：prepare、owner
+  init、checked enable，并通过 v3 Role Offer/Accept 建立主持 Assignment，不再创建或运行
+  schema-v1/v2 Project View。
+- migration 0048 为新 Community 固定 schema 3 默认值，并以共享数据库 predicate 统一
+  deferred trigger、capability discovery、owner bootstrap、prepare/init 的无 state 生命周期；
+  Project Document 触发器与 Desktop identity reader 同时解除对“Project View 已初始化”的
+  错误依赖。迁移不更新或删除任何既有 Community 数据。
+- 缺少 migration 0026 schema coordinate 的数据库现在直接失败关闭，不再静默回退为 v1；
+  CI 静态门禁固定 v3 创建入口、无破坏性 migration 48、共享 bootstrap predicate 与独立
+  Document capability 路径。
+- deployment readiness 现在拒绝任何 active + enabled 的非 v3 Community，并输出
+  `buzz_project_view_migration_required_communities` 与
+  `buzz_project_document_migration_required_communities`。disabled 的存量数据仍可进入显式
+  operator cutover，但不会恢复旧 capability；生产构建中的普通 v2 transaction writer 被
+  `cfg(test)` 隔离。
+- Project Document bootstrap 底层不再接受 Project View schema 1；schema 2 只作为
+  capability-disabled 的 v3 cutover 输入，普通 bootstrap 与运行时固定 schema 3。
+
+完整边界与验收见
+[Project View 普通运行时全面收敛到 v3 的修复设计](../bug/project-view-v3-only-runtime-migration-fix-design.md)。
+
 ## 2026-08-03 — Role 定义治理授权与初始化后 admin Role 创建（已修复并验证）
 
 ### 问题与边界
@@ -591,18 +636,18 @@
   出现前的 Relay，在已由当前 `buzz-admin` 迁移到 25、全部开关为 false 的数据库上以
   `BUZZ_AUTO_MIGRATE=false` 启动，验证 readiness 与既有 NIP-11 路径。该测试不会用
   当前 Relay 模拟旧版本。
-- 新增 post-mutation compatible rollback smoke：先由当前 Relay 接受初始化，再用同一
-  migration 25 数据库启动固定 `8ef125c1`（Slice 4）Relay，验证 capability、稳定
-  signer、revision 1 完整快照和 Project View 专属非成员拒绝。由此分别覆盖首次
-  mutation 前的 pre-feature 回滚与已有数据后的兼容回滚边界。
+- 当时新增过 post-mutation compatible rollback smoke：先由当前 Relay 接受初始化，再用
+  同一 migration 25 数据库启动固定 `8ef125c1`（Slice 4）Relay。该历史门禁现已由
+  schema-v3-only 收口退役；当前不支持写入后的旧 Project View 运行时回滚，历史数据改由
+  显式 scratch-only operator v2→v3 migration canary 验收。
 
 ### CI 与制品
 
 - backend nextest archive 加入 `buzz-db`、`e2e_project_view`、`buzz` 和
   `buzz-admin`；独立 Project View integration job 顺序执行 DB transaction、
-  migration/schema drift 与真实 Relay/CLI E2E。rollback job 使用固定 pre-feature
-  与 compatible 源码 binary cache，避免用当前 binary 模拟旧版本，也避免把 ignored
-  migration tests 留在非必经路径。
+  migration/schema drift 与真实 Relay/CLI E2E。rollback job 曾同时使用 fixed pre-feature
+  与 compatible binary cache；v3-only 收口后只保留 pre-feature additive-schema safety，
+  不再构建或执行 compatible old-runtime binary。
 - Docker PR path filter 新增 `migrations/**` 与 `schema/**`。Relay release
   `LOG_PATHS` 新增 Project View crate、CLI/admin、schema、协议/运维文档、Chart、
   Compose 和专用测试脚本。

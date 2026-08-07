@@ -1302,14 +1302,9 @@ impl Db {
             });
         }
         let eligible: Option<bool> = sqlx::query_scalar(
-            "SELECT c.archived_at IS NULL AND NOT c.project_view_enabled \
-                    AND NOT c.project_context_enabled \
+            "SELECT c.archived_at IS NULL \
                     AND c.project_view_preparation_operation_id IS NULL \
-                    AND maintenance.state = 'normal' \
-                    AND NOT EXISTS (SELECT 1 FROM project_view_state WHERE community_id = c.id) \
-                    AND NOT EXISTS (SELECT 1 FROM project_view_objects WHERE community_id = c.id) \
-                    AND NOT EXISTS (SELECT 1 FROM project_view_mutations WHERE community_id = c.id) \
-                    AND NOT EXISTS (SELECT 1 FROM project_view_changes WHERE community_id = c.id) \
+                    AND project_view_v3_bootstrap_lifecycle_valid(c.id) \
              FROM communities c \
              JOIN project_view_maintenance maintenance ON maintenance.community_id = c.id \
              WHERE c.id = $1 FOR UPDATE OF c, maintenance",
@@ -2405,6 +2400,21 @@ async fn validate_v3_structural_in_tx(
         .bind(community_id.as_uuid())
         .execute(&mut **tx)
         .await?;
+    // Maintenance verify/resume may run while the Community is frozen or
+    // archived, so it cannot reuse advertised-write readiness (which requires
+    // enabled + normal). It must still enforce the exact signed v3 wire
+    // contract before resolving invalidations or resuming ordinary traffic.
+    if !crate::project_view_v3::strict_v3_projection_wires_ready_in_tx(
+        tx,
+        community_id,
+        relay_pubkey,
+    )
+    .await?
+    {
+        return Err(ProjectViewMaintenanceError::Unavailable(
+            "schema-3 signed projection verification failed".to_owned(),
+        ));
+    }
     let relay = relay_pubkey.to_bytes();
     let row = sqlx::query(
         "SELECT state.meta_projection_event_id, state.project_revision, \

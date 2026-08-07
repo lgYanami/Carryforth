@@ -1,32 +1,40 @@
-//! Atomic Project View v2 Role Proposal and Assignment coordinator.
+//! Legacy Project View v2 Role Proposal and Assignment coordinator.
 //!
-//! A caller holds [`ProjectViewV2WriteTx`] across pure reduction and Relay
-//! signing. All canonical rows are staged in the same SQL transaction; the
-//! final commit also stores the command, receipt, entity heads, metadata head,
-//! membership role changes, and the exact NIP-43 snapshot.
+//! Production Relay ingress no longer calls this coordinator. It remains for
+//! explicit operator migration/recovery, test fixtures, and domain machinery
+//! reused by the v3 coordinator; it is not a v2 runtime fallback.
+//!
+//! The old ordinary v2 writer is compiled only for regression tests. Explicit
+//! operator migration/recovery paths remain available, but production code
+//! cannot open a v2 runtime write transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use buzz_audit::{AuditAction, NewAuditEntry};
+#[cfg(test)]
+use buzz_core::kind::KIND_PROJECT_VIEW_MUTATION;
 use buzz_core::kind::{
-    KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
-    KIND_PROJECT_VIEW_OBJECT,
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_project_view::v2::ChangeSource;
 use buzz_project_view::v2::{
     authorize_role_creation, authorize_role_governance_transition, AssignmentEndReason,
-    CommitmentEndReason, CommunityMemberRole, GeneratedRoleContinuityIds, HandoffCause,
-    MemberGovernance, ProjectObjectCommand, ProposalStatus, ProposalType, RoleAssignment,
-    RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent, RoleCommand,
+    CommitmentEndReason, CommunityMemberRole, HandoffCause, MemberGovernance, ProposalStatus,
+    ProposalType, RoleAssignment, RoleAssignmentProposal, RoleCheckpoint, RoleCheckpointContent,
     RoleContinuityChange, RoleContinuityEntity, RoleContinuityError, RoleContinuityReference,
     RoleContinuityState, RoleDefinition, RoleGovernanceError, RoleGovernanceState,
     RoleGovernorAuthority, RoleHandoff, RoleHandoffContent, RoleLevel, RoleSlot, WorkCommitment,
     WorkResponsibility,
 };
+#[cfg(test)]
+use buzz_project_view::v2::{GeneratedRoleContinuityIds, ProjectObjectCommand, RoleCommand};
+use buzz_project_view::{DomainError, ProjectViewEntry, WorkStatus};
+#[cfg(test)]
 use buzz_project_view::{
-    DomainError, MutationOutcome, MutationRequest, ProjectViewEntry, ProjectViewObject,
-    ProjectViewObjectData, ProjectViewObjectType, ProjectViewState, WorkStatus,
+    MutationOutcome, MutationRequest, ProjectViewObject, ProjectViewObjectData,
+    ProjectViewObjectType, ProjectViewState,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -117,6 +125,7 @@ pub struct ProjectViewV2Receipt {
 }
 
 /// Prepared state returned to the Relay for signing.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PreparedV2RoleChange {
     /// Community/Project identity.
@@ -146,6 +155,7 @@ pub struct PreparedV2RoleChange {
 }
 
 /// One changed head produced by an ordinary-object command.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedV2ProjectObjectHead {
     /// An ordinary active object or tombstone.
@@ -159,6 +169,7 @@ pub enum PreparedV2ProjectObjectHead {
     Role(RoleDefinition),
 }
 
+#[cfg(test)]
 impl PreparedV2ProjectObjectHead {
     /// Stable canonical object ID whose projection pointer will be replaced.
     #[must_use]
@@ -183,6 +194,7 @@ impl PreparedV2ProjectObjectHead {
 }
 
 /// Prepared state returned to the Relay for signing an ordinary-object change.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PreparedV2ProjectObjectChange {
     /// Community/Project identity.
@@ -207,6 +219,7 @@ pub struct PreparedV2ProjectObjectChange {
     pub receipt_result: Value,
 }
 
+#[cfg(test)]
 impl PreparedV2RoleChange {
     /// Return whether the transaction must publish a replacement membership
     /// snapshot.
@@ -229,6 +242,7 @@ pub struct PreparedV2EntityProjection {
 }
 
 /// Relay-signed material completing a staged v2 transaction.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PreparedV2RoleCommit {
     /// Original accepted member command.
@@ -244,6 +258,7 @@ pub struct PreparedV2RoleCommit {
 }
 
 /// Relay-signed material completing a staged ordinary-object change.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PreparedV2ProjectObjectCommit {
     /// Original accepted member command.
@@ -257,6 +272,7 @@ pub struct PreparedV2ProjectObjectCommit {
 }
 
 /// Result of committing a new v2 role change.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct ProjectViewV2CommitOutcome {
     /// Durable receipt.
@@ -304,6 +320,7 @@ pub struct ProjectViewV2CutoverOutcome {
 }
 
 /// Result of one trusted internal Project View system change.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct ProjectViewV2SystemOutcome {
     /// New or replayed project revision.
@@ -318,6 +335,7 @@ pub struct ProjectViewV2SystemOutcome {
 
 /// Preparation may discover an already accepted event after current security
 /// fencing.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum ProjectViewV2PrepareOutcome {
     /// Existing receipt; no revision was allocated.
@@ -327,6 +345,7 @@ pub enum ProjectViewV2PrepareOutcome {
 }
 
 /// Ordinary-object preparation may discover an accepted event after fencing.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum ProjectViewV2ProjectObjectPrepareOutcome {
     /// Existing receipt; no revision was allocated.
@@ -336,6 +355,7 @@ pub enum ProjectViewV2ProjectObjectPrepareOutcome {
 }
 
 /// Caller-owned v2 write transaction holding the Community Project lock.
+#[cfg(test)]
 pub struct ProjectViewV2WriteTx {
     tx: Transaction<'static, Postgres>,
     community_id: CommunityId,
@@ -343,6 +363,7 @@ pub struct ProjectViewV2WriteTx {
     object_basis: Option<V2PreparedProjectObjectBasis>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct V2PreparedBasis {
     command: RoleCommand,
@@ -354,6 +375,7 @@ struct V2PreparedBasis {
     old_object_projection_ids: BTreeMap<Uuid, [u8; 32]>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct V2PreparedProjectObjectBasis {
     command: ProjectObjectCommand,
@@ -369,6 +391,7 @@ struct V2PreparedProjectObjectBasis {
     old_entity_projection_ids: BTreeMap<(RoleContinuityEntity, Uuid), [u8; 32]>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for ProjectViewV2WriteTx {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -389,6 +412,7 @@ impl Db {
 
     /// Return whether an enabled v2 Community has a complete, live projection
     /// root for the expected stable Relay signer.
+    #[cfg(test)]
     pub async fn project_view_v2_capability_ready(
         &self,
         community_id: CommunityId,
@@ -1317,7 +1341,8 @@ impl Db {
     /// Community membership, signed projections, and supervisor fencing commit
     /// in one transaction. Presence and lease expiry are never accepted as the
     /// terminal evidence.
-    pub async fn end_unrecoverable_assignment(
+    #[cfg(test)]
+    pub async fn end_unrecoverable_assignment_legacy_v2_for_test(
         &self,
         claim: &crate::project_runtime::RuntimeUnrecoverableClaim,
         relay_keys: &Keys,
@@ -1794,6 +1819,7 @@ impl Db {
 
     /// Begin a v2 write under the same Community advisory lock used by all
     /// membership writers.
+    #[cfg(test)]
     pub async fn begin_project_view_v2_write(
         &self,
         community_id: CommunityId,
@@ -1824,6 +1850,7 @@ impl Db {
     }
 }
 
+#[cfg(test)]
 impl ProjectViewV2WriteTx {
     /// Explicitly roll back and release the Community lock.
     pub async fn rollback(self) -> ProjectViewV2WriteResult<()> {
@@ -2839,6 +2866,7 @@ pub(crate) struct LoadedContinuityState {
     pub(crate) membership_snapshot_event_id: Option<EventId>,
 }
 
+#[cfg(test)]
 async fn load_v2_state(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -3004,6 +3032,7 @@ async fn load_work_responsibilities(
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct LoadedV2ProjectObjectState {
     state: ProjectViewState,
     canonical_time: DateTime<Utc>,
@@ -3015,6 +3044,7 @@ struct LoadedV2ProjectObjectState {
     work_responsibilities: BTreeMap<Uuid, Uuid>,
 }
 
+#[cfg(test)]
 async fn load_v2_project_object_state(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -3093,6 +3123,7 @@ async fn load_v2_project_object_state(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn validate_project_object_actor_fence(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -3210,6 +3241,7 @@ pub(crate) async fn authorize_role_definition_in_tx(
     })
 }
 
+#[cfg(test)]
 async fn reject_assigned_role_deactivation(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -3310,6 +3342,7 @@ pub(crate) async fn reject_role_ids_with_active_authority(
     Ok(())
 }
 
+#[cfg(test)]
 fn role_definition_from_object(
     object: &ProjectViewObject,
     level: RoleLevel,
@@ -3834,6 +3867,7 @@ pub(crate) async fn find_receipt(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn insert_change(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -3867,6 +3901,7 @@ async fn insert_change(
     Ok(())
 }
 
+#[cfg(test)]
 fn project_object_receipt(
     command: &ProjectObjectCommand,
     entries: &[ProjectViewEntry],
@@ -3914,6 +3949,7 @@ fn project_object_receipt(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn insert_project_object_change(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -4028,6 +4064,7 @@ pub(crate) async fn load_old_projection_ids(
     Ok(result)
 }
 
+#[cfg(test)]
 async fn prepare_work_responsibility_heads(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -4111,6 +4148,7 @@ async fn prepare_work_responsibility_heads(
     Ok((heads, old_projection_ids))
 }
 
+#[cfg(test)]
 async fn close_commitments_for_terminal_work(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -4789,6 +4827,7 @@ pub(crate) async fn load_counts(
     })
 }
 
+#[cfg(test)]
 fn validate_commit_bundle(
     basis: &V2PreparedBasis,
     commit: &PreparedV2RoleCommit,
@@ -4983,6 +5022,7 @@ fn validate_commit_bundle(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_project_object_commit_bundle(
     basis: &V2PreparedProjectObjectBasis,
     commit: &PreparedV2ProjectObjectCommit,
@@ -5382,6 +5422,7 @@ pub(crate) async fn update_projection_pointer(
     Ok(())
 }
 
+#[cfg(test)]
 fn role_receipt(
     command: &RoleCommand,
     changes: &[RoleContinuityChange],

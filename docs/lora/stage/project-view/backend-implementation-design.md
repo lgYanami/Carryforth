@@ -1,5 +1,10 @@
 # Project View 后端实现设计
 
+> 版本说明（2026-08-07）：本文保留首版协议与迁移历史，不再定义普通运行时的协议选择。
+> 当前 CLI、Desktop、ACP 与 Relay 普通运行时必须使用 schema v3；v1/v2 只允许用于显式
+> operator migration/recovery。见
+> [Project View 普通运行时全面收敛到 v3](../bug/project-view-v3-only-runtime-migration-fix-design.md)。
+
 > 本文定义 Project View 首版如何作为 Buzz 原生后端能力落地。
 > 实现范围包括领域模型、Nostr 事件、Relay、PostgreSQL、读取投影、SDK、Agent CLI、
 > 测试、CI、迁移、发布和回滚；暂不实现 Desktop、Web 或 Mobile 界面，也不实现项目连续性。

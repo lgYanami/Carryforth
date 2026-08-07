@@ -1,4 +1,4 @@
-//! Strict parsing and normalization for Relay Project View mutation receipts.
+//! Strict parsing and normalization for schema-v3 Project View mutation receipts.
 
 use nostr::Event;
 use serde::Deserialize;
@@ -15,12 +15,6 @@ pub(super) struct ProjectViewReceipt {
     pub(super) object_id: Option<Uuid>,
     pub(super) object_revision: Option<u64>,
     pub(super) deleted: Option<bool>,
-}
-
-#[derive(Debug)]
-pub(super) enum ParsedProjectViewReceipt {
-    Legacy(ProjectViewReceipt),
-    V3(ProjectViewObjectReceiptV3),
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +40,7 @@ struct ProjectViewObjectReceiptEntryV3 {
 pub(super) fn parse_receipt(
     response: &SubmitEventResponse,
     event: &Event,
-) -> Result<ParsedProjectViewReceipt, String> {
+) -> Result<ProjectViewObjectReceiptV3, String> {
     if response.event_id != event.id.to_hex() {
         return Err(
             "Project View integrity error: mutation response event_id differs from the submitted event"
@@ -58,79 +52,39 @@ pub(super) fn parse_receipt(
             .to_owned()
     })?;
     let value: Value = serde_json::from_str(payload).map_err(|error| {
-        format!("Project View integrity error: invalid mutation receipt: {error}")
+        format!("Project View integrity error: invalid v3 mutation receipt: {error}")
     })?;
-    if value.get("schema_version").is_some() {
-        return serde_json::from_value(value)
-            .map(ParsedProjectViewReceipt::V3)
-            .map_err(|error| {
-                format!("Project View integrity error: invalid v3 mutation receipt: {error}")
-            });
-    }
-    serde_json::from_value(value)
-        .map(ParsedProjectViewReceipt::Legacy)
-        .map_err(|error| format!("Project View integrity error: invalid mutation receipt: {error}"))
+    serde_json::from_value(value).map_err(|error| {
+        format!("Project View integrity error: invalid v3 mutation receipt: {error}")
+    })
 }
 
 pub(super) fn validate_receipt(
-    receipt: ParsedProjectViewReceipt,
-    target: Option<MutationTarget>,
+    receipt: ProjectViewObjectReceiptV3,
+    target: MutationTarget,
 ) -> Result<ProjectViewReceipt, String> {
-    match receipt {
-        ParsedProjectViewReceipt::Legacy(receipt) => match target {
-            None if receipt.object_id.is_none()
-                && receipt.object_revision.is_none()
-                && receipt.deleted.is_none() =>
-            {
-                Ok(receipt)
-            }
-            None => Err(
-                "Project View integrity error: initialization receipt contains object fields"
-                    .to_owned(),
-            ),
-            Some(target)
-                if receipt.object_id == Some(target.object_id)
-                    && receipt.object_revision.is_some()
-                    && receipt.deleted == Some(target.deleted) =>
-            {
-                Ok(receipt)
-            }
-            Some(_) => Err(
-                "Project View integrity error: mutation receipt does not match the requested object"
-                    .to_owned(),
-            ),
-        },
-        ParsedProjectViewReceipt::V3(receipt) => {
-            let Some(target) = target else {
-                return Err(
-                    "Project View integrity error: v3 object receipt has no requested object"
-                        .to_owned(),
-                );
-            };
-            let [object] = receipt.objects.as_slice() else {
-                return Err(
-                    "Project View integrity error: v3 mutation receipt must contain exactly one changed object"
-                        .to_owned(),
-                );
-            };
-            if receipt.schema_version != 3
-                || receipt.operation != target.operation
-                || object.object_type != target.object_type.as_str()
-                || object.object_id != target.object_id
-                || object.object_revision == 0
-                || object.deleted != target.deleted
-            {
-                return Err(
-                    "Project View integrity error: v3 mutation receipt does not match the requested object"
-                        .to_owned(),
-                );
-            }
-            Ok(ProjectViewReceipt {
-                project_revision: receipt.project_revision,
-                object_id: Some(object.object_id),
-                object_revision: Some(object.object_revision),
-                deleted: Some(object.deleted),
-            })
-        }
+    let [object] = receipt.objects.as_slice() else {
+        return Err(
+            "Project View integrity error: v3 mutation receipt must contain exactly one changed object"
+                .to_owned(),
+        );
+    };
+    if receipt.schema_version != 3
+        || receipt.operation != target.operation
+        || object.object_type != target.object_type.as_str()
+        || object.object_id != target.object_id
+        || object.object_revision == 0
+        || object.deleted != target.deleted
+    {
+        return Err(
+            "Project View integrity error: v3 mutation receipt does not match the requested object"
+                .to_owned(),
+        );
     }
+    Ok(ProjectViewReceipt {
+        project_revision: receipt.project_revision,
+        object_id: Some(object.object_id),
+        object_revision: Some(object.object_revision),
+        deleted: Some(object.deleted),
+    })
 }

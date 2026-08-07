@@ -140,6 +140,7 @@ pub async fn apply_workspace(
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
         state.meeting_action_renewals.cancel_all();
+        state.meeting_grant_renewals.cancel_all();
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
             *override_guard = Some(relay_url);

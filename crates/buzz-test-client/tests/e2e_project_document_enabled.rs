@@ -1,6 +1,6 @@
 //! Stage 2 Project Document enabled-path and private fan-out E2E.
 //!
-//! The isolated harness bootstraps and enables one Project View v2 Community.
+//! The isolated harness greenfield-initializes and enables one schema-v3 Project View Community.
 //! This test proves signed command/projection fan-out, closed HTTP pagination,
 //! current membership enforcement at query and final dispatch, and Relay-only
 //! projection writes.

@@ -31,19 +31,18 @@ import {
   CREATE_GUIDE_VALUE,
   type ProjectViewObjectFormState as FormState,
 } from "@/features/project-view/ui/projectViewObjectDialogState";
-import {
-  isProjectResourceDataV3,
-  type ProjectView,
-  type ProjectViewIssueStatus,
-  type ProjectViewMutationResult,
-  type ProjectViewObject,
-  type ProjectViewObjectRef,
-  type ProjectViewObjectType,
-  type ProjectViewPlanStatus,
-  type ProjectViewRequirementStatus,
-  type ProjectViewStageStatus,
-  type ProjectViewWorkStatus,
-  type ProjectViewWritableObject,
+import type {
+  ProjectView,
+  ProjectViewIssueStatus,
+  ProjectViewMutationResult,
+  ProjectViewObject,
+  ProjectViewObjectRef,
+  ProjectViewObjectType,
+  ProjectViewPlanStatus,
+  ProjectViewRequirementStatus,
+  ProjectViewStageStatus,
+  ProjectViewWorkStatus,
+  ProjectViewWritableObject,
 } from "@/shared/api/tauriProjectView";
 import { Button } from "@/shared/ui/button";
 import {
@@ -78,9 +77,6 @@ const BASE_FORM: FormState = {
   plannedInStageId: "",
   aboutId: "",
   handlesId: "",
-  resourceType: "repository",
-  locatorType: "url",
-  locatorValue: "",
   resourceKind: "repository",
   summary: "",
   guideDocumentId: "",
@@ -186,22 +182,13 @@ function formFromObject(object: ProjectViewObject): FormState {
         handlesId: object.relations.handles?.objectId ?? "",
       };
     case "resource":
-      return isProjectResourceDataV3(object.data)
-        ? {
-            ...form,
-            name: object.data.name,
-            resourceKind: object.data.resourceKind,
-            summary: object.data.summary ?? "",
-            guideDocumentId: object.data.guideDocumentId,
-          }
-        : {
-            ...form,
-            name: object.data.name,
-            description: object.data.description,
-            resourceType: object.data.resourceType,
-            locatorType: object.data.locator.locatorType,
-            locatorValue: object.data.locator.value,
-          };
+      return {
+        ...form,
+        name: object.data.name,
+        resourceKind: object.data.resourceKind,
+        summary: object.data.summary ?? "",
+        guideDocumentId: object.data.guideDocumentId,
+      };
   }
 }
 
@@ -232,7 +219,6 @@ function writableFromForm(
   type: ProjectViewObjectType,
   form: FormState,
   objects: ReadonlyMap<string, ProjectViewObject>,
-  schemaVersion: 1 | 2 | 3,
   createdGuideDocumentId?: string,
 ): ProjectViewWritableObject {
   switch (type) {
@@ -324,31 +310,18 @@ function writableFromForm(
         handles: referenceFor(form.handlesId, objects, "Handles"),
       };
     case "resource":
-      return schemaVersion === 3
-        ? {
-            objectType: type,
-            data: {
-              name: required(form.name, "Name"),
-              resourceKind: required(form.resourceKind, "Resource kind"),
-              summary: form.summary.trim() || undefined,
-              guideDocumentId: required(
-                createdGuideDocumentId ?? form.guideDocumentId,
-                "Guide",
-              ),
-            },
-          }
-        : {
-            objectType: type,
-            data: {
-              name: required(form.name, "Name"),
-              resourceType: form.resourceType,
-              locator: {
-                locatorType: form.locatorType,
-                value: required(form.locatorValue, "Locator"),
-              },
-              description: required(form.description, "Description"),
-            },
-          };
+      return {
+        objectType: type,
+        data: {
+          name: required(form.name, "Name"),
+          resourceKind: required(form.resourceKind, "Resource kind"),
+          summary: form.summary.trim() || undefined,
+          guideDocumentId: required(
+            createdGuideDocumentId ?? form.guideDocumentId,
+            "Guide",
+          ),
+        },
+      };
   }
 }
 
@@ -368,7 +341,6 @@ export function ProjectViewObjectDialog({
   roleHasActiveAssignment,
   roleHasOpenProposal,
   roleActingAssignmentId,
-  schemaVersion,
   view,
 }: {
   canCreateAdminRole: boolean;
@@ -386,7 +358,6 @@ export function ProjectViewObjectDialog({
   roleHasActiveAssignment?: boolean;
   roleHasOpenProposal?: boolean;
   roleActingAssignmentId?: string;
-  schemaVersion: 1 | 2 | 3;
   view: ProjectView;
 }) {
   const createTypes = React.useMemo(
@@ -402,8 +373,7 @@ export function ProjectViewObjectDialog({
   const [objectType, setObjectType] =
     React.useState<ProjectViewObjectType>(initialObjectType);
   const mutation = useProjectViewMutation();
-  const guideDocumentsEnabled =
-    open && schemaVersion === 3 && objectType === "resource";
+  const guideDocumentsEnabled = open && objectType === "resource";
   const documentMeta = useProjectDocumentMeta(guideDocumentsEnabled);
   const documents = useProjectDocuments(
     guideDocumentsEnabled ? documentMeta.data : undefined,
@@ -562,7 +532,6 @@ export function ProjectViewObjectDialog({
         return;
       }
       if (
-        schemaVersion === 3 &&
         objectType === "resource" &&
         form.guideDocumentId === CREATE_GUIDE_VALUE
       ) {
@@ -594,7 +563,6 @@ export function ProjectViewObjectDialog({
         objectType,
         form,
         objects,
-        schemaVersion,
         createdGuideForRetry,
       );
       if (
@@ -741,7 +709,6 @@ export function ProjectViewObjectDialog({
               roleHasActiveAssignment={roleHasActiveAssignment}
               roleHasOpenProposal={roleHasOpenProposal}
               roleCreation={mode === "create"}
-              schemaVersion={schemaVersion}
               set={set}
               type={objectType}
             />

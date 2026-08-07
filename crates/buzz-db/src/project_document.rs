@@ -432,11 +432,58 @@ impl Db {
         Ok(ready)
     }
 
+    /// Count active Communities that have Project Document enabled but still
+    /// need an explicit migration to the Project View schema-v3 runtime.
+    ///
+    /// Project Document has an independent feature gate, but its current
+    /// authorization coordinate is the Community's Project View schema. Before
+    /// that coordinate exists, every active enabled Document Community is
+    /// migration-required. Before the Document feature column exists, the count
+    /// is zero because Project Document cannot have been enabled yet.
+    pub async fn project_document_migration_required_count(&self) -> crate::Result<i64> {
+        let (feature_column_exists, schema_column_exists): (bool, bool) = sqlx::query_as(
+            "SELECT \
+                 EXISTS ( \
+                     SELECT 1 FROM pg_attribute \
+                     WHERE attrelid = 'communities'::regclass \
+                       AND attname = 'project_document_enabled' AND NOT attisdropped \
+                 ), \
+                 EXISTS ( \
+                     SELECT 1 FROM pg_attribute \
+                     WHERE attrelid = 'communities'::regclass \
+                       AND attname = 'project_view_schema_version' AND NOT attisdropped \
+                 )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !feature_column_exists {
+            return Ok(0);
+        }
+
+        let count = if schema_column_exists {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM communities \
+                 WHERE project_document_enabled AND archived_at IS NULL \
+                   AND project_view_schema_version IS DISTINCT FROM 3",
+            )
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM communities \
+                 WHERE project_document_enabled AND archived_at IS NULL",
+            )
+            .fetch_one(&self.pool)
+            .await?
+        };
+        Ok(count)
+    }
+
     /// Deployment-global rolling-start readiness.
     ///
-    /// Pre-migration and all-disabled deployments remain ready. Once any active
-    /// Community is enabled, the full schema and a configured stable signer are
-    /// mandatory.
+    /// Pre-migration and all-disabled deployments remain ready. Every active
+    /// enabled Community must already be on Project View schema v3; the full
+    /// Document schema and a configured stable signer are then mandatory.
     pub async fn project_document_deployment_ready(
         &self,
         stable_signer_configured: bool,
@@ -459,6 +506,9 @@ impl Db {
         .await?;
         if !any_enabled {
             return Ok(true);
+        }
+        if self.project_document_migration_required_count().await? != 0 {
+            return Ok(false);
         }
         Ok(stable_signer_configured && self.project_document_schema_ready().await?)
     }
@@ -488,7 +538,7 @@ impl Db {
                  JOIN project_document_state s ON s.community_id = c.id \
                  WHERE c.id = $1 AND c.archived_at IS NULL \
                    AND c.project_document_enabled \
-                   AND c.project_view_schema_version IN (2, 3) \
+                   AND c.project_view_schema_version = 3 \
                    AND s.projection_pubkey = $2 \
                    AND s.projection_generation BETWEEN 1 AND 9007199254740991)",
         )
@@ -608,7 +658,7 @@ impl Db {
         };
         let active: bool = row.try_get("active")?;
         let project_view_schema_version: i16 = row.try_get("project_view_schema_version")?;
-        let project_view_schema_ready = matches!(project_view_schema_version, 2 | 3);
+        let project_view_schema_ready = project_view_schema_version == 3;
         let stored_pubkey: Option<Vec<u8>> = row.try_get("projection_pubkey")?;
         let meta_event_id: Option<Vec<u8>> = row.try_get("meta_projection_event_id")?;
         let active_count: Option<i64> = row.try_get("active_document_count")?;
@@ -647,7 +697,7 @@ impl Db {
 
     /// Enable or disable one Community under the shared Community/Project
     /// writer lock. Disable is always fail-closed and preserves every canonical
-    /// row and event. Enable requires schema 2/3, a stable signer, bootstrap,
+    /// row and event. Enable requires schema 3, a stable signer, bootstrap,
     /// and full pointer/projection parity.
     pub async fn set_project_document_enabled_checked(
         &self,
@@ -678,9 +728,9 @@ impl Db {
                     "a stable Relay signer is required to enable Project Document".to_owned(),
                 )
             })?;
-            if !matches!(schema_version, 2 | 3) {
+            if schema_version != 3 {
                 return Err(DbError::InvalidData(
-                    "Project Document requires Project View schema 2 or 3".to_owned(),
+                    "Project Document enable requires Project View schema 3".to_owned(),
                 )
                 .into());
             }
@@ -993,7 +1043,10 @@ impl Db {
         };
         let enabled: bool = community.try_get("project_document_enabled")?;
         let schema_version: i16 = community.try_get("project_view_schema_version")?;
-        if enabled || !matches!(schema_version, 1..=3) {
+        // Schema 3 is the current runtime. Schema 2 is accepted here only as
+        // explicit operator migration input while the capability is disabled;
+        // schema 1 must never receive a new Document catalog.
+        if enabled || !matches!(schema_version, 2 | 3) {
             return Err(ProjectDocumentWriteError::Unavailable { community_id });
         }
         let occupied: bool = sqlx::query_scalar(
@@ -1145,6 +1198,10 @@ impl Db {
 
     /// Start or safely resume one inactive target generation while member
     /// access remains disabled.
+    ///
+    /// This is an explicit operator migration/reprojection seam, so schema 2
+    /// remains a valid source input even though ordinary runtime reads and
+    /// writes require schema 3.
     pub async fn begin_project_document_reproject(
         &self,
         community_id: CommunityId,
@@ -1596,7 +1653,7 @@ impl Db {
             "SELECT project_document_enabled \
              FROM communities \
              WHERE id = $1 AND archived_at IS NULL \
-               AND project_view_schema_version IN (2, 3) FOR UPDATE",
+               AND project_view_schema_version = 3 FOR UPDATE",
         )
         .bind(community_id.as_uuid())
         .fetch_optional(&mut *tx)
@@ -1634,6 +1691,8 @@ async fn require_reproject_basis(
     context: &ProjectDocumentReprojectContext,
     required_state: &str,
 ) -> ProjectDocumentWriteResult<()> {
+    // Explicit disabled-state reprojection may consume a schema-2 source. It
+    // never re-enables or exposes the legacy runtime surface.
     let exact: bool = sqlx::query_scalar(
         "SELECT EXISTS ( \
              SELECT 1 FROM project_document_reprojects r \
@@ -2503,7 +2562,7 @@ async fn require_document_read_state_in_tx(
     let generation: Option<i64> = row.try_get("projection_generation")?;
     let revision: Option<i64> = row.try_get("catalog_revision")?;
     if !enabled
-        || !matches!(schema, 2 | 3)
+        || schema != 3
         || signer.as_deref() != Some(expected_pubkey.as_bytes())
         || generation.and_then(|value| u64::try_from(value).ok()) != Some(projection_generation)
     {
@@ -3393,8 +3452,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn deployment_readiness_rejects_enabled_legacy_schema_but_allows_disabled_cutover() {
+        let scratch = ScratchDatabase::create("buzz_pd_v3_readiness").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+
+        let mut fixture = scratch.pool.begin().await.expect("begin legacy fixture");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *fixture)
+            .await
+            .expect("suspend cross-domain fixture triggers");
+        sqlx::query(
+            "INSERT INTO communities \
+                 (id, host, project_document_enabled, project_view_schema_version) \
+             VALUES ($1, $2, TRUE, 2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(format!("project-document-v3-readiness-{community_id}.test"))
+        .execute(&mut *fixture)
+        .await
+        .expect("seed enabled schema-v2 Document fixture");
+        fixture.commit().await.expect("commit legacy fixture");
+
+        assert_eq!(
+            db.project_document_migration_required_count()
+                .await
+                .expect("count enabled legacy Document Communities"),
+            1
+        );
+        assert!(!db
+            .project_document_deployment_ready(true)
+            .await
+            .expect("enabled legacy Document Community fails deployment readiness"));
+
+        let mut disable = scratch.pool.begin().await.expect("begin fixture disable");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *disable)
+            .await
+            .expect("suspend fixture triggers for disable");
+        sqlx::query("UPDATE communities SET project_document_enabled = FALSE WHERE id = $1")
+            .bind(community_id.as_uuid())
+            .execute(&mut *disable)
+            .await
+            .expect("disable legacy Document fixture");
+        disable.commit().await.expect("commit fixture disable");
+
+        assert_eq!(
+            db.project_document_migration_required_count()
+                .await
+                .expect("disabled legacy Document Community needs no active-runtime migration"),
+            0
+        );
+        assert!(db
+            .project_document_deployment_ready(false)
+            .await
+            .expect("all-disabled legacy Document deployment stays ready for operator migration"));
+
+        scratch.cleanup().await;
+    }
+
     async fn seed_community(pool: &PgPool, actor: &Keys) -> CommunityId {
         let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let owner = Keys::generate();
         sqlx::query(
             "INSERT INTO communities (id, host, project_document_enabled) \
              VALUES ($1, $2, FALSE)",
@@ -3405,13 +3526,15 @@ mod tests {
         .await
         .expect("seed Project Document Community");
         sqlx::query(
-            "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'member')",
+            "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+             VALUES ($1, $2, 'owner', NULL), ($1, $3, 'member', $2)",
         )
         .bind(community_id.as_uuid())
+        .bind(owner.public_key().to_hex())
         .bind(actor.public_key().to_hex())
         .execute(pool)
         .await
-        .expect("seed Project Document actor");
+        .expect("seed Project Document owner and actor");
         community_id
     }
 
@@ -3825,6 +3948,31 @@ mod tests {
             .await
             .expect("commit fixture schema switch");
 
+        assert!(!db
+            .project_document_capability_ready(community_id, &new_relay.public_key())
+            .await
+            .expect("schema-2 ordinary capability must fail closed"));
+        assert!(
+            !db.project_document_preflight(community_id, &new_relay.public_key())
+                .await
+                .expect("schema-2 ordinary preflight must fail closed")
+                .project_view_schema_ready
+        );
+        assert!(matches!(
+            db.begin_project_document_write(community_id, new_relay.public_key())
+                .await,
+            Err(ProjectDocumentWriteError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            db.set_project_document_enabled_checked(
+                community_id,
+                true,
+                Some(&new_relay.public_key())
+            )
+            .await,
+            Err(ProjectDocumentWriteError::Database(DbError::InvalidData(_)))
+        ));
+
         let context = db
             .begin_project_document_reproject(community_id, new_relay.public_key())
             .await
@@ -3997,8 +4145,8 @@ mod tests {
         assert!(preflight.bootstrapped);
         assert!(preflight.signer_matches);
         assert!(preflight.projection_parity);
-        assert!(!preflight.project_view_schema_ready);
-        assert!(!preflight.ready);
+        assert!(preflight.project_view_schema_ready);
+        assert!(preflight.ready);
         let wrong_signer = Keys::generate();
         let wrong_signer_preflight = db
             .project_document_preflight(community_id, &wrong_signer.public_key())

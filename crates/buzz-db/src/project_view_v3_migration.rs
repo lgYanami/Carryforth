@@ -9,8 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{
-    KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
-    KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
     KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::{CommunityId, EventId, PublicKey};
@@ -747,32 +746,12 @@ async fn require_eligible_human_in_tx(
     pubkey: PublicKey,
     owner_only: bool,
 ) -> ProjectViewV3MigrationResult<()> {
-    let bytes = pubkey.to_bytes();
-    let role: Option<String> = sqlx::query_scalar(
-        "SELECT member.role \
-         FROM relay_members member \
-         LEFT JOIN users actor \
-           ON actor.community_id = member.community_id \
-          AND actor.pubkey = decode(member.pubkey, 'hex') \
-         WHERE member.community_id = $1 AND member.pubkey = $2 \
-           AND ($3::boolean = FALSE OR member.role = 'owner') \
-           AND actor.agent_owner_pubkey IS NULL \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM community_bans restriction \
-               WHERE restriction.community_id = member.community_id \
-                 AND restriction.pubkey = $4 \
-                 AND ( \
-                     (restriction.banned AND (restriction.ban_expires_at IS NULL \
-                         OR restriction.ban_expires_at > clock_timestamp())) \
-                     OR restriction.muted_until > clock_timestamp() \
-                 ) \
-           )",
+    let role = crate::relay_members::eligible_direct_human_role_in_tx(
+        tx,
+        community_id,
+        &pubkey,
+        owner_only,
     )
-    .bind(community_id.as_uuid())
-    .bind(pubkey.to_hex())
-    .bind(owner_only)
-    .bind(bytes.as_slice())
-    .fetch_optional(&mut **tx)
     .await?;
     if role.is_none() {
         return Err(ProjectViewV3MigrationError::Forbidden(if owner_only {
@@ -1117,15 +1096,21 @@ async fn live_event_in_tx(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn require_document_projection_ready_in_tx(
+/// Require a disabled, fully verified Project Document migration input.
+///
+/// This is crate-visible so the isolated operator canary can exercise each
+/// fail-closed precondition without exposing a production runtime endpoint.
+pub(crate) async fn require_document_projection_ready_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     relay_pubkey: &PublicKey,
 ) -> ProjectViewV3MigrationResult<()> {
+    // Schema-v2 migration input is deliberately not an advertised Document
+    // runtime. The operator must bootstrap a disabled catalog signed by the
+    // stable Relay key; full canonical/current/history parity is then checked
+    // under the same exclusive Community transaction as cutover.
     let state = sqlx::query(
-        "SELECT community.project_document_enabled, state.catalog_revision, \
-                state.active_document_count, state.projection_generation, \
-                state.projection_pubkey, state.meta_projection_event_id, state.updated_at \
+        "SELECT community.project_document_enabled, state.projection_pubkey \
          FROM communities community \
          JOIN project_document_state state ON state.community_id = community.id \
          WHERE community.id = $1 AND community.archived_at IS NULL \
@@ -1139,131 +1124,33 @@ async fn require_document_projection_ready_in_tx(
             "Project Document state is not bootstrapped".to_owned(),
         )
     })?;
-    if !state.try_get::<bool, _>("project_document_enabled")?
-        || public_key(
-            &state.try_get::<Vec<u8>, _>("projection_pubkey")?,
-            "document.projection_pubkey",
-        )? != *relay_pubkey
+    if state.try_get::<bool, _>("project_document_enabled")? {
+        return Err(ProjectViewV3MigrationError::Unavailable(
+            "schema-v2 migration Document catalog must remain capability-disabled".to_owned(),
+        ));
+    }
+    if public_key(
+        &state.try_get::<Vec<u8>, _>("projection_pubkey")?,
+        "document.projection_pubkey",
+    )? != *relay_pubkey
     {
         return Err(ProjectViewV3MigrationError::Unavailable(
-            "Project Document capability or stable signer is not ready".to_owned(),
+            "Project Document stable signer differs from the cutover signer".to_owned(),
         ));
     }
-    let meta_id = bytes32(
-        state.try_get("meta_projection_event_id")?,
-        "document.meta_projection_event_id",
-    )?;
-    let meta_event = live_event_in_tx(tx, community_id, &meta_id).await?;
-    if u32::from(meta_event.kind.as_u16()) != KIND_PROJECT_DOCUMENT_META {
-        return Err(ProjectViewV3MigrationError::Invalid(
-            "Project Document metadata pointer has the wrong kind".to_owned(),
-        ));
-    }
-    let meta = buzz_sdk::project_document::parse_document_meta(&meta_event, relay_pubkey)
-        .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
-    let catalog_revision = db_u64(state.try_get("catalog_revision")?, "catalog_revision")?;
-    let active_count = db_u64(
-        state.try_get::<i64, _>("active_document_count")?,
-        "active_document_count",
-    )?;
-    let generation = db_u64(
-        state.try_get("projection_generation")?,
-        "document.projection_generation",
-    )?;
-    if meta.projection.project_id != *community_id.as_uuid()
-        || meta.projection.catalog_revision != catalog_revision
-        || meta.projection.active_document_count != active_count
-        || meta.projection.projection_generation != generation
-        || meta.projection.updated_at != state.try_get::<DateTime<Utc>, _>("updated_at")?
+    if !crate::project_document::document_projection_parity(
+        tx,
+        community_id,
+        relay_pubkey,
+        None,
+        None,
+    )
+    .await
+    .map_err(ProjectViewV3MigrationError::Database)?
     {
         return Err(ProjectViewV3MigrationError::Invalid(
-            "Project Document metadata projection differs from canonical state".to_owned(),
+            "Project Document canonical/current/history projection parity failed".to_owned(),
         ));
-    }
-
-    let actual_active: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM project_documents \
-         WHERE community_id = $1 AND state = 'active'",
-    )
-    .bind(community_id.as_uuid())
-    .fetch_one(&mut **tx)
-    .await?;
-    if db_u64(actual_active, "actual_active_document_count")? != active_count {
-        return Err(ProjectViewV3MigrationError::Invalid(
-            "Project Document active count differs from canonical rows".to_owned(),
-        ));
-    }
-    let rows = sqlx::query(
-        "SELECT document_id, current_revision, state, current_source_change_id, \
-                current_head_event_id, current_revision_event_id \
-         FROM project_documents WHERE community_id = $1 ORDER BY document_id FOR SHARE",
-    )
-    .bind(community_id.as_uuid())
-    .fetch_all(&mut **tx)
-    .await?;
-    for row in rows {
-        let document_id: Uuid = row.try_get("document_id")?;
-        let revision = db_u64(row.try_get("current_revision")?, "document_revision")?;
-        let state_name: String = row.try_get("state")?;
-        let source = bytes32(row.try_get("current_source_change_id")?, "document.source")?;
-        let head_id = bytes32(row.try_get("current_head_event_id")?, "document.head")?;
-        let revision_id = bytes32(
-            row.try_get("current_revision_event_id")?,
-            "document.revision",
-        )?;
-        let head_event = live_event_in_tx(tx, community_id, &head_id).await?;
-        let revision_event = live_event_in_tx(tx, community_id, &revision_id).await?;
-        if u32::from(head_event.kind.as_u16()) != KIND_PROJECT_DOCUMENT_HEAD
-            || u32::from(revision_event.kind.as_u16()) != KIND_PROJECT_DOCUMENT_REVISION
-        {
-            return Err(ProjectViewV3MigrationError::Invalid(format!(
-                "Document {document_id} points at an event with the wrong kind"
-            )));
-        }
-        let head = buzz_sdk::project_document::parse_document_head(
-            &head_event,
-            relay_pubkey,
-            community_id,
-        )
-        .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
-        let revision_projection = buzz_sdk::project_document::parse_document_revision(
-            &revision_event,
-            relay_pubkey,
-            community_id,
-        )
-        .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
-        let current =
-            buzz_sdk::project_document::VerifiedCurrentDocument::new(head, revision_projection)
-                .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
-        let (projected_id, projected_revision, projected_state, projected_source) =
-            match &current.head.projection {
-                buzz_project_document::DocumentHeadProjection::Active {
-                    document_id,
-                    document_revision,
-                    source_event_id,
-                    ..
-                } => (*document_id, *document_revision, "active", *source_event_id),
-                buzz_project_document::DocumentHeadProjection::Deleted {
-                    document_id,
-                    document_revision,
-                    source_event_id,
-                    ..
-                } => (
-                    *document_id,
-                    *document_revision,
-                    "deleted",
-                    *source_event_id,
-                ),
-            };
-        if projected_id != document_id
-            || projected_revision != revision
-            || projected_state != state_name
-            || projected_source.to_bytes() != source
-        {
-            return Err(ProjectViewV3MigrationError::Invalid(format!(
-                "Document {document_id} projection differs from canonical state"
-            )));
-        }
     }
     Ok(())
 }
@@ -1851,8 +1738,42 @@ async fn load_cutover_objects_in_tx(
     Ok(objects)
 }
 
+const ALL_CONTINUITY_ENTITIES_SQL: &str = "WITH continuity_entities AS ( \
+         SELECT 1::smallint AS sort_order, 'role_assignment_proposal'::text AS entity_type, \
+                proposal_id AS entity_id, projection_event_id, last_change_id, updated_at \
+         FROM project_role_assignment_proposals \
+         WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 2::smallint, 'role_assignment', assignment_id, projection_event_id, \
+                last_change_id, updated_at \
+         FROM project_role_assignments \
+         WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 3::smallint, 'work_commitment', commitment_id, projection_event_id, \
+                last_change_id, updated_at \
+         FROM project_work_commitments \
+         WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 4::smallint, 'role_checkpoint', checkpoint_id, projection_event_id, \
+                last_change_id, created_at \
+         FROM project_role_checkpoints \
+         WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 5::smallint, 'role_handoff', handoff_id, projection_event_id, \
+                last_change_id, created_at \
+         FROM project_role_handoffs \
+         WHERE community_id = $1 \
+     ) \
+     SELECT sort_order, entity_type, entity_id, projection_event_id, \
+            last_change_id, updated_at \
+     FROM continuity_entities ORDER BY sort_order, entity_id";
+
+/// Load every canonical Role-continuity row for cutover or reprojection.
+///
+/// Closed and superseded history remains addressable, so schema migration must
+/// not reduce this set to operationally current or recent entities.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn load_current_entities_in_tx(
+pub(crate) async fn load_all_continuity_entities_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     schema_version: i16,
@@ -1861,64 +1782,10 @@ pub(crate) async fn load_current_entities_in_tx(
         crate::project_view_v2::load_continuity_state(tx, community_id, schema_version)
             .await
             .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
-    let rows = sqlx::query(
-        "WITH current_entities AS ( \
-             SELECT 1::smallint AS sort_order, 'role_assignment_proposal'::text AS entity_type, \
-                    proposal_id AS entity_id, projection_event_id, last_change_id, updated_at \
-             FROM project_role_assignment_proposals p \
-             WHERE p.community_id = $1 \
-               AND (p.status = 'open' OR EXISTS ( \
-                    SELECT 1 FROM project_role_assignments a \
-                    WHERE a.community_id = p.community_id \
-                      AND a.proposal_id = p.proposal_id AND a.ended_at IS NULL)) \
-             UNION ALL \
-             SELECT 2::smallint, 'role_assignment', assignment_id, projection_event_id, \
-                    last_change_id, updated_at \
-             FROM project_role_assignments \
-             WHERE community_id = $1 AND ended_at IS NULL \
-             UNION ALL \
-             SELECT 3::smallint, 'work_commitment', commitment_id, projection_event_id, \
-                    last_change_id, updated_at \
-             FROM project_work_commitments \
-             WHERE community_id = $1 AND ended_at IS NULL \
-             UNION ALL \
-             SELECT 4::smallint, 'role_checkpoint', checkpoint_id, projection_event_id, \
-                    last_change_id, created_at \
-             FROM ( \
-                 SELECT checkpoint.*, row_number() OVER ( \
-                     PARTITION BY checkpoint.role_id \
-                     ORDER BY checkpoint.project_revision DESC, checkpoint.checkpoint_id DESC \
-                 ) AS history_rank \
-                 FROM project_role_checkpoints checkpoint \
-                 JOIN project_view_objects role \
-                   ON role.community_id = checkpoint.community_id \
-                  AND role.object_id = checkpoint.role_id \
-                  AND role.object_type = 'role' AND role.deleted_at IS NULL \
-                 WHERE checkpoint.community_id = $1 \
-             ) current_checkpoint WHERE history_rank = 1 \
-             UNION ALL \
-             SELECT 5::smallint, 'role_handoff', handoff_id, projection_event_id, \
-                    last_change_id, created_at \
-             FROM ( \
-                 SELECT handoff.*, row_number() OVER ( \
-                     PARTITION BY handoff.role_id \
-                     ORDER BY handoff.project_revision DESC, handoff.handoff_id DESC \
-                 ) AS history_rank \
-                 FROM project_role_handoffs handoff \
-                 JOIN project_view_objects role \
-                   ON role.community_id = handoff.community_id \
-                  AND role.object_id = handoff.role_id \
-                  AND role.object_type = 'role' AND role.deleted_at IS NULL \
-                 WHERE handoff.community_id = $1 \
-             ) current_handoff WHERE history_rank <= 3 \
-         ) \
-         SELECT sort_order, entity_type, entity_id, projection_event_id, \
-                last_change_id, updated_at \
-         FROM current_entities ORDER BY sort_order, entity_id",
-    )
-    .bind(community_id.as_uuid())
-    .fetch_all(&mut **tx)
-    .await?;
+    let rows = sqlx::query(ALL_CONTINUITY_ENTITIES_SQL)
+        .bind(community_id.as_uuid())
+        .fetch_all(&mut **tx)
+        .await?;
     let mut entities = Vec::with_capacity(rows.len());
     for row in rows {
         let entity_type: String = row.try_get("entity_type")?;
@@ -1932,7 +1799,7 @@ pub(crate) async fn load_current_entities_in_tx(
                     .cloned()
                     .ok_or_else(|| {
                         ProjectViewV3MigrationError::Invalid(format!(
-                            "current Proposal {entity_id} is absent from canonical state"
+                            "Proposal {entity_id} is absent from canonical continuity state"
                         ))
                     })?,
             ),
@@ -1944,7 +1811,7 @@ pub(crate) async fn load_current_entities_in_tx(
                     .cloned()
                     .ok_or_else(|| {
                         ProjectViewV3MigrationError::Invalid(format!(
-                            "current Assignment {entity_id} is absent from canonical state"
+                            "Assignment {entity_id} is absent from canonical continuity state"
                         ))
                     })?,
             ),
@@ -1956,7 +1823,7 @@ pub(crate) async fn load_current_entities_in_tx(
                     .cloned()
                     .ok_or_else(|| {
                         ProjectViewV3MigrationError::Invalid(format!(
-                            "current Commitment {entity_id} is absent from canonical state"
+                            "Commitment {entity_id} is absent from canonical continuity state"
                         ))
                     })?,
             ),
@@ -1968,7 +1835,7 @@ pub(crate) async fn load_current_entities_in_tx(
                     .cloned()
                     .ok_or_else(|| {
                         ProjectViewV3MigrationError::Invalid(format!(
-                            "current Checkpoint {entity_id} is absent from canonical state"
+                            "Checkpoint {entity_id} is absent from canonical continuity state"
                         ))
                     })?,
             ),
@@ -1980,13 +1847,13 @@ pub(crate) async fn load_current_entities_in_tx(
                     .cloned()
                     .ok_or_else(|| {
                         ProjectViewV3MigrationError::Invalid(format!(
-                            "current Handoff {entity_id} is absent from canonical state"
+                            "Handoff {entity_id} is absent from canonical continuity state"
                         ))
                     })?,
             ),
             _ => {
                 return Err(ProjectViewV3MigrationError::Invalid(format!(
-                    "unsupported current continuity entity {entity_type}"
+                    "unsupported canonical continuity entity {entity_type}"
                 )));
             }
         };
@@ -1994,7 +1861,7 @@ pub(crate) async fn load_current_entities_in_tx(
             row.try_get::<Option<Vec<u8>>, _>("projection_event_id")?
                 .ok_or_else(|| {
                     ProjectViewV3MigrationError::Invalid(format!(
-                        "current {entity_type} {entity_id} has no projection pointer"
+                        "canonical {entity_type} {entity_id} has no projection pointer"
                     ))
                 })?,
             "entity.projection_event_id",
@@ -2649,7 +2516,7 @@ async fn cutover_project_view_v3_impl(
     if pointer.try_get::<i16, _>("project_view_schema_version")? != 2
         || pointer.try_get::<bool, _>("project_view_enabled")?
         || pointer.try_get::<bool, _>("project_context_enabled")?
-        || !pointer.try_get::<bool, _>("project_document_enabled")?
+        || pointer.try_get::<bool, _>("project_document_enabled")?
         || pointer
             .try_get::<Option<DateTime<Utc>>, _>("archived_at")?
             .is_some()
@@ -2658,7 +2525,7 @@ async fn cutover_project_view_v3_impl(
         || pointer.try_get::<String, _>("outcome")? != "active"
     {
         return Err(ProjectViewV3MigrationError::Unavailable(
-            "fresh cutover requires a non-archived, disabled schema-v2 Community in the exact frozen epoch with Documents enabled"
+            "fresh cutover requires a non-archived, capability-disabled schema-v2 Community in the exact frozen epoch"
                 .to_owned(),
         ));
     }
@@ -2789,7 +2656,7 @@ async fn cutover_project_view_v3_impl(
             "converted v3 object snapshot is invalid: {error}"
         ))
     })?;
-    let entities = load_current_entities_in_tx(&mut tx, community_id, 2).await?;
+    let entities = load_all_continuity_entities_in_tx(&mut tx, community_id, 2).await?;
     let membership = crate::project_view_v2::load_membership(&mut tx, community_id)
         .await
         .map_err(|error| ProjectViewV3MigrationError::Invalid(error.to_string()))?;
@@ -3131,5 +2998,21 @@ mod tests {
         let first = cutover_request_hash(community, 1, &[1; 32]);
         assert_ne!(first, cutover_request_hash(community, 2, &[1; 32]));
         assert_ne!(first, cutover_request_hash(community, 1, &[2; 32]));
+    }
+
+    #[test]
+    fn cutover_selection_includes_all_continuity_history() {
+        for table in [
+            "project_role_assignment_proposals",
+            "project_role_assignments",
+            "project_work_commitments",
+            "project_role_checkpoints",
+            "project_role_handoffs",
+        ] {
+            assert!(ALL_CONTINUITY_ENTITIES_SQL.contains(table));
+        }
+        assert!(!ALL_CONTINUITY_ENTITIES_SQL.contains("status = 'open'"));
+        assert!(!ALL_CONTINUITY_ENTITIES_SQL.contains("ended_at IS NULL"));
+        assert!(!ALL_CONTINUITY_ENTITIES_SQL.contains("history_rank"));
     }
 }

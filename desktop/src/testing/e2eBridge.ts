@@ -86,6 +86,10 @@ import type {
   MeetingSpeech,
 } from "@/shared/api/tauriMeetings";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import {
+  PROJECT_VIEW_V3_META_TAG,
+  PROJECT_VIEW_V3_OBJECT_TAG,
+} from "@/shared/constants/projectView";
 
 type TestIdentity = {
   privateKey: string;
@@ -353,6 +357,8 @@ type E2eConfig = {
     /** Process then return an incomplete receipt this many times. */
     meetingFloorIndeterminateResponses?: number;
     meetingFloorActionDelayMs?: number;
+    /** Fail the native Human Grant renewal ensure boundary. */
+    meetingGrantRenewalError?: string;
     /** Definitive failures for successive Human host submissions. */
     meetingHostErrors?: Array<string | null>;
     /** Process then lose this many Human host command receipts. */
@@ -940,6 +946,8 @@ const GLOBAL_MOCK_SUBSCRIPTION = "*";
 type MockSubscription = {
   channelId: string;
   kinds: number[] | null;
+  /** `#t` values used by strict protocol projection subscriptions. */
+  topicTags: string[];
   /** `#p` values from the REQ filters, if any — lets specs assert an
    *  owner-scoped live subscription (e.g. the observer-archive `24200`
    *  reconciliation gate) independently of channel-scoped ones. */
@@ -952,6 +960,7 @@ type MockFilter = {
   "#e"?: string[];
   "#h"?: string[];
   "#p"?: string[];
+  "#t"?: string[];
   authors?: string[];
   ids?: string[];
   kinds?: number[];
@@ -1286,6 +1295,7 @@ declare global {
     /** Emit one Project View projection signal through the mock live socket. */
     __BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?: (input?: {
       kind?: number;
+      tag?: string;
     }) => RelayEvent;
     __BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?: () => boolean;
     /** Names and payloads of all five Project Document native calls. */
@@ -5227,7 +5237,8 @@ function emitMockLiveEvent(channelId: string, event: RelayEvent) {
       if (
         (subscription.channelId === channelId ||
           subscription.channelId === GLOBAL_MOCK_SUBSCRIPTION) &&
-        (!subscription.kinds || subscription.kinds.includes(event.kind))
+        (!subscription.kinds || subscription.kinds.includes(event.kind)) &&
+        mockSubscriptionMatchesTopicTags(subscription, event)
       ) {
         sendWsText(socket.handler, ["EVENT", subId, event]);
       }
@@ -5241,9 +5252,25 @@ function emitMockGlobalEvent(event: RelayEvent) {
       if (subscription.kinds && !subscription.kinds.includes(event.kind)) {
         continue;
       }
+      if (!mockSubscriptionMatchesTopicTags(subscription, event)) {
+        continue;
+      }
       sendWsText(socket.handler, ["EVENT", subId, event]);
     }
   }
+}
+
+function mockSubscriptionMatchesTopicTags(
+  subscription: MockSubscription,
+  event: RelayEvent,
+): boolean {
+  if (subscription.topicTags.length === 0) return true;
+  const eventTopics = new Set(
+    event.tags
+      .filter((tag) => tag[0] === "t" && typeof tag[1] === "string")
+      .map((tag) => tag[1]),
+  );
+  return subscription.topicTags.some((topic) => eventTopics.has(topic));
 }
 
 function hasMockLiveSubscription(channelId: string, kind?: number) {
@@ -10140,6 +10167,7 @@ function sendToMockSocket(args: {
       const channelIds = new Set<string>();
       const kinds = new Set<number>();
       const ownerPubkeys = new Set<string>();
+      const topicTags = new Set<string>();
       for (const f of filters) {
         const cid = f["#h"]?.[0];
         if (cid) channelIds.add(cid);
@@ -10148,6 +10176,9 @@ function sendToMockSocket(args: {
         }
         for (const p of f["#p"] ?? []) {
           ownerPubkeys.add(p);
+        }
+        for (const topic of f["#t"] ?? []) {
+          topicTags.add(topic);
         }
       }
       const onlyChannelId =
@@ -10167,6 +10198,7 @@ function sendToMockSocket(args: {
       socket.subscriptions.set(subId, {
         channelId: onlyChannelId ?? GLOBAL_MOCK_SUBSCRIPTION,
         kinds: kinds.size > 0 ? [...kinds] : null,
+        topicTags: [...topicTags],
         ownerPubkeys: [...ownerPubkeys],
       });
       sendWsText(socket.handler, ["EOSE", subId]);
@@ -10790,7 +10822,15 @@ export function maybeInstallE2eTauriMocks() {
     const event = createMockEvent(
       input?.kind ?? KIND_PROJECT_VIEW_META,
       "",
-      [],
+      [
+        [
+          "t",
+          input?.tag ??
+            (input?.kind === undefined || input.kind === KIND_PROJECT_VIEW_META
+              ? PROJECT_VIEW_V3_META_TAG
+              : PROJECT_VIEW_V3_OBJECT_TAG),
+        ],
+      ],
       relayPubkey,
     );
     emitMockGlobalEvent(event);
@@ -11767,6 +11807,11 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig,
         );
       case "ensure_meeting_action_renewal":
+        return { status: "already_active" };
+      case "ensure_meeting_human_grant_renewal":
+        if (activeConfig?.mock?.meetingGrantRenewalError) {
+          throw new Error(activeConfig.mock.meetingGrantRenewalError);
+        }
         return { status: "already_active" };
       case "list_meetings": {
         const { meetingIds } = payload as { meetingIds: string[] };

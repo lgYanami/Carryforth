@@ -46,6 +46,10 @@ pub(crate) enum ProjectDocumentCommand {
         /// Exact normalized Community host.
         #[arg(long)]
         community: String,
+        /// Explicitly acknowledge schema-v2 input is being prepared only for
+        /// an immediate, capability-disabled v3 cutover.
+        #[arg(long)]
+        for_v3_cutover: bool,
         /// File containing the Relay private key; must not be group/world readable.
         #[arg(long)]
         relay_key_file: Option<PathBuf>,
@@ -86,6 +90,10 @@ pub(crate) enum ProjectDocumentCommand {
         /// Exact normalized Community host.
         #[arg(long)]
         community: String,
+        /// Explicitly acknowledge schema-v2 input is being reprojected only
+        /// for an immediate, capability-disabled v3 cutover.
+        #[arg(long)]
+        for_v3_cutover: bool,
         /// Required acknowledgement that the complete immutable history is in scope.
         #[arg(long)]
         all_revisions: bool,
@@ -136,9 +144,19 @@ pub(crate) async fn run(command: ProjectDocumentCommand) -> Result<i32> {
         } => preflight(&db, &community, &expected_pubkey).await?,
         ProjectDocumentCommand::Bootstrap {
             community,
+            for_v3_cutover,
             relay_key_file,
             expected_pubkey,
-        } => bootstrap(&db, &community, relay_key_file.as_deref(), &expected_pubkey).await?,
+        } => {
+            bootstrap(
+                &db,
+                &community,
+                for_v3_cutover,
+                relay_key_file.as_deref(),
+                &expected_pubkey,
+            )
+            .await?
+        }
         ProjectDocumentCommand::Verify {
             community,
             expected_pubkey,
@@ -151,6 +169,7 @@ pub(crate) async fn run(command: ProjectDocumentCommand) -> Result<i32> {
         ProjectDocumentCommand::Disable { community } => disable(&db, &community).await?,
         ProjectDocumentCommand::Reproject {
             community,
+            for_v3_cutover,
             all_revisions,
             relay_key_file,
             expected_pubkey,
@@ -158,7 +177,14 @@ pub(crate) async fn run(command: ProjectDocumentCommand) -> Result<i32> {
             if !all_revisions {
                 bail!("Project Document reproject requires --all-revisions");
             }
-            reproject(&db, &community, relay_key_file.as_deref(), &expected_pubkey).await?
+            reproject(
+                &db,
+                &community,
+                for_v3_cutover,
+                relay_key_file.as_deref(),
+                &expected_pubkey,
+            )
+            .await?
         }
         ProjectDocumentCommand::CapacityProbe {
             community,
@@ -262,15 +288,17 @@ async fn verify(db: &Db, community: &str, expected_pubkey: &str) -> Result<()> {
 async fn bootstrap(
     db: &Db,
     community: &str,
+    for_v3_cutover: bool,
     relay_key_file: Option<&std::path::Path>,
     expected_pubkey: &str,
 ) -> Result<()> {
     let status = status_for_host(db, community).await?;
     if status.archived || status.enabled || !matches!(status.project_view_schema_version, 2 | 3) {
         bail!(
-            "Project Document bootstrap requires an active, disabled Project View v2/v3 Community"
+            "Project Document bootstrap requires an active, disabled Project View schema-3 Community or explicit schema-2 v3-cutover input"
         );
     }
+    require_explicit_schema_v2_cutover(status.project_view_schema_version, for_v3_cutover)?;
     let keys = checked_relay_keys(relay_key_file, expected_pubkey)?;
     if status.projection_pubkey.is_some() {
         let report = db
@@ -354,15 +382,17 @@ async fn disable(db: &Db, community: &str) -> Result<()> {
 async fn reproject(
     db: &Db,
     community: &str,
+    for_v3_cutover: bool,
     relay_key_file: Option<&std::path::Path>,
     expected_pubkey: &str,
 ) -> Result<()> {
     let status = status_for_host(db, community).await?;
     if status.archived || status.enabled || !matches!(status.project_view_schema_version, 2 | 3) {
         bail!(
-            "Project Document full-history reproject requires an active, disabled Project View v2/v3 Community"
+            "Project Document full-history reproject requires an active, disabled Project View schema-3 Community or explicit schema-2 v3-cutover input"
         );
     }
+    require_explicit_schema_v2_cutover(status.project_view_schema_version, for_v3_cutover)?;
     let keys = checked_relay_keys(relay_key_file, expected_pubkey)?;
     if status.projection_pubkey == Some(keys.public_key()) {
         let latest = db
@@ -864,6 +894,20 @@ fn normalize_required_host(host: &str) -> Result<String> {
     Ok(normalized)
 }
 
+fn require_explicit_schema_v2_cutover(
+    project_view_schema_version: i16,
+    for_v3_cutover: bool,
+) -> Result<()> {
+    match (project_view_schema_version, for_v3_cutover) {
+        (2, true) | (3, false) => Ok(()),
+        (2, false) => {
+            bail!("Project View schema-2 Document input is migration-only; pass --for-v3-cutover")
+        }
+        (3, true) => bail!("--for-v3-cutover is only valid for Project View schema 2"),
+        _ => bail!("Project Document requires Project View schema 2 or 3"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,6 +943,24 @@ mod tests {
             ProjectDocumentCommand::Preflight { .. }
         ));
 
+        let migration_bootstrap = TestCli::try_parse_from([
+            "test",
+            "bootstrap",
+            "--community",
+            "relay.example",
+            "--expected-pubkey",
+            &"01".repeat(32),
+            "--for-v3-cutover",
+        ])
+        .expect("parse explicit schema-v2 migration bootstrap");
+        assert!(matches!(
+            migration_bootstrap.command,
+            ProjectDocumentCommand::Bootstrap {
+                for_v3_cutover: true,
+                ..
+            }
+        ));
+
         let disable = TestCli::try_parse_from(["test", "disable", "--community", "relay.example"])
             .expect("parse disable");
         assert!(matches!(
@@ -914,5 +976,14 @@ mod tests {
             "relay.example"
         );
         assert!(normalize_required_host("   ").is_err());
+    }
+
+    #[test]
+    fn schema_v2_document_control_requires_explicit_v3_cutover_acknowledgement() {
+        assert!(require_explicit_schema_v2_cutover(2, false).is_err());
+        assert!(require_explicit_schema_v2_cutover(2, true).is_ok());
+        assert!(require_explicit_schema_v2_cutover(3, false).is_ok());
+        assert!(require_explicit_schema_v2_cutover(3, true).is_err());
+        assert!(require_explicit_schema_v2_cutover(1, true).is_err());
     }
 }

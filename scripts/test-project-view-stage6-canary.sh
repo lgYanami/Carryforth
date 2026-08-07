@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run the Stage 6 Context/Role Brief acceptance path against real local
-# PostgreSQL, Redis, Relay, CLI, admin, ACP supervisor, and Agent child
-# processes. The Stage 5 canary prepares the exact schema-v3 prerequisite.
+# Run the Stage 6 Context/Role Brief acceptance path against a self-contained
+# schema-v3 greenfield scratch Community. No legacy migration fixture or old
+# Project View runtime participates in this canary.
 
 set -euo pipefail
 
@@ -34,9 +34,11 @@ fi
 port="${PROJECT_VIEW_STAGE6_PORT:-$((30000 + ($$ % 4000)))}"
 health_port="$((port + 1))"
 metrics_port="$((port + 2))"
-legacy_host="localhost:${port}"
-legacy_community_id="00000000-0000-4000-8000-000000005005"
-database_name="buzz_pv_stage5_canary_$$_${RANDOM}"
+test_host="localhost:${port}"
+community_id="00000000-0000-4000-8000-0000000060c0"
+database_name="buzz_pv_stage6_canary_$$_${RANDOM}"
+[[ "${database_name}" =~ ^buzz_pv_stage6_canary_[0-9_]+$ ]] \
+  || fail "refusing unsafe scratch database name: ${database_name}"
 artifact_root="${PROJECT_VIEW_STAGE6_ARTIFACT_ROOT:-${REPO_ROOT}/test-results/stage6-canary}"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 artifact_dir="${artifact_root}/${run_id}"
@@ -45,11 +47,21 @@ artifact_dir="$(cd "${artifact_dir}" && pwd)"
 temporary_dir="$(mktemp -d)"
 
 relay_private_key=0000000000000000000000000000000000000000000000000000000000000001
+relay_signer_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 owner_private_key=0000000000000000000000000000000000000000000000000000000000000002
 owner_pubkey=c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
 agent_private_key=0000000000000000000000000000000000000000000000000000000000000003
+agent_pubkey=f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
 supervisor_private_key=0000000000000000000000000000000000000000000000000000000000000004
-supplemental_document_id=60000000-0000-4000-8000-000000006006
+supervisor_pubkey=e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13
+owner_role_id=60000000-0000-4000-8000-000000006001
+owner_proposal_id=60000000-0000-4000-8000-000000006002
+owner_assignment_id=60000000-0000-4000-8000-000000006003
+goal_id=60000000-0000-4000-8000-000000006004
+role_id=60000000-0000-4000-8000-000000006005
+resource_id=60000000-0000-4000-8000-000000006006
+guide_id=60000000-0000-4000-8000-000000006007
+supplemental_document_id=60000000-0000-4000-8000-000000006008
 
 relay_pid=""
 acp_pid=""
@@ -95,6 +107,8 @@ cleanup() {
   stop_acp
   stop_relay
   if [[ "${database_created}" == "1" ]] && [[ "${PROJECT_VIEW_STAGE6_KEEP_DB:-0}" != "1" ]]; then
+    [[ "${database_name}" =~ ^buzz_pv_stage6_canary_[0-9_]+$ ]] \
+      || fail "refusing unsafe scratch database cleanup: ${database_name}"
     docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
       psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
       -c "DROP DATABASE IF EXISTS ${database_name} WITH (FORCE)" >/dev/null || true
@@ -124,11 +138,44 @@ pv_admin() {
     "${bin_dir}/buzz-admin" project-view "$@"
 }
 
+runtime_status() {
+  env \
+    DATABASE_URL="${database_url}" \
+    BUZZ_PRIVATE_KEY="${owner_private_key}" \
+    "${bin_dir}/buzz-admin" project-runtime status \
+    --host "${test_host}" --assignment "${assignment_id}"
+}
+
+wait_for_current_runtime_status() {
+  local runtime_id="$1"
+  local runtime_epoch="$2"
+  local retired_runtime_id="$3"
+  local output_path="$4"
+  for _ in $(seq 1 60); do
+    if runtime_status >"${output_path}" 2>/dev/null \
+      && jq -e --arg supervisor "${supervisor_pubkey}" \
+        --arg runtime "${runtime_id}" --argjson epoch "${runtime_epoch}" \
+        --arg retired "${retired_runtime_id}" '
+          .status.managed == true
+          and .status.availability == "available"
+          and .status.binding.supervisor_pubkey == $supervisor
+          and ($retired == "" or all(.status.runtimes[]; .runtime_id != $retired))
+          and any(.status.runtimes[];
+            .runtime_id == $runtime and .runtime_epoch == $epoch
+            and .availability == "available")
+        ' "${output_path}" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  fail "Runtime ${runtime_id}:${runtime_epoch} did not become the only expected current lease"
+}
+
 buzz_as() {
   local private_key="$1"
   shift
   env \
-    BUZZ_RELAY_URL="http://${legacy_host}" \
+    BUZZ_RELAY_URL="http://${test_host}" \
     BUZZ_PRIVATE_KEY="${private_key}" \
     "${bin_dir}/buzz" "$@"
 }
@@ -137,9 +184,9 @@ buzz_managed() {
   local fence_path="$1"
   shift
   env \
-    BUZZ_RELAY_URL="http://${legacy_host}" \
+    BUZZ_RELAY_URL="http://${test_host}" \
     BUZZ_PRIVATE_KEY="${agent_private_key}" \
-    BUZZ_MANAGED_AGENT=1 \
+    BUZZ_MANAGED_RUNTIME=1 \
     BUZZ_RUNTIME_FENCE_PATH="${fence_path}" \
     "${bin_dir}/buzz" "$@"
 }
@@ -166,7 +213,7 @@ start_acp() {
   acp_generation=$((acp_generation + 1))
   local acp_log="${artifact_dir}/acp-generation-${acp_generation}.log"
   env \
-    BUZZ_RELAY_URL="ws://${legacy_host}" \
+    BUZZ_RELAY_URL="ws://${test_host}" \
     BUZZ_PRIVATE_KEY="${agent_private_key}" \
     BUZZ_ACP_AGENT_OWNER="${owner_pubkey}" \
     BUZZ_ACP_AGENT_COMMAND="${REPO_ROOT}/desktop/tests/e2e/fixtures/fake-acp-agent.mjs" \
@@ -203,37 +250,74 @@ start_acp() {
 }
 
 info_for() {
-  curl --noproxy '*' -fsS "http://${legacy_host}/info"
+  curl --noproxy '*' -fsS "http://${test_host}/info"
 }
 
-echo "[1/6] Preparing the exact Stage 5 schema-v3 prerequisite"
-stage5_root="${artifact_dir}/stage5-prerequisite"
-mkdir -p "${stage5_root}"
-database_created=1
-PROJECT_VIEW_STAGE5_KEEP_DB=1 \
-PROJECT_VIEW_STAGE5_DATABASE_NAME="${database_name}" \
-PROJECT_VIEW_STAGE5_ARTIFACT_ROOT="${stage5_root}" \
-PROJECT_VIEW_STAGE5_PORT="${port}" \
-PROJECT_VIEW_STAGE5_PROFILE="${profile}" \
-CARGO_INCREMENTAL=0 \
-  "${REPO_ROOT}/scripts/test-project-view-stage5-canary.sh" \
-  >"${artifact_dir}/stage5-prerequisite.stdout" \
-  2>"${artifact_dir}/stage5-prerequisite.stderr"
-stage5_summary="$(find "${stage5_root}" -type f -name acceptance-summary.json -print | sort | tail -1)"
-[[ -n "${stage5_summary}" ]] || fail "Stage 5 prerequisite produced no acceptance summary"
-stage5_run_dir="$(dirname "${stage5_summary}")"
-resource_id="$(jq -er '.legacy_cutover.resource_id' "${stage5_summary}")"
-guide_id="$(jq -er '.legacy_cutover.guide_document_id' "${stage5_summary}")"
-old_assignment_id="$(jq -er '.legacy_cutover.assignment_id' "${stage5_summary}")"
-role_id="$(psql_query "SELECT role_id FROM project_role_assignments WHERE community_id = '${legacy_community_id}' AND assignment_id = '${old_assignment_id}'")"
-[[ -n "${role_id}" ]] || fail "Stage 5 prerequisite has no assigned Role"
+echo "[1/6] Creating the isolated schema-v3 greenfield prerequisite"
+docker compose up -d postgres redis >/dev/null
+for container in buzz-postgres buzz-redis; do
+  status=""
+  for _ in $(seq 1 60); do
+    status="$(docker inspect --format='{{.State.Health.Status}}' "${container}" 2>/dev/null || true)"
+    [[ "${status}" == "healthy" ]] && break
+    sleep 2
+  done
+  [[ "${status}" == "healthy" ]] || fail "${container} did not become healthy"
+done
 
-echo "[2/6] Starting the real Relay and atomically enabling Context"
+docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE DATABASE ${database_name}" >/dev/null
+database_created=1
+
+export PGHOST=localhost
+export PGPORT=5432
+export PGUSER=buzz
+export PGPASSWORD=buzz_dev
+export PGDATABASE="${database_name}"
+export PGSCHEMA_PLAN_HOST=localhost
+export PGSCHEMA_PLAN_PORT=5432
+export PGSCHEMA_PLAN_DB=postgres
+export PGSCHEMA_PLAN_USER=buzz
+export PGSCHEMA_PLAN_PASSWORD=buzz_dev
+./bin/pgschema apply --file schema/schema.sql --auto-approve >/dev/null
+docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
+  < scripts/attach-schema-partitions.sql
+
+psql_query "
+  INSERT INTO communities (id, host, project_view_schema_version)
+  VALUES ('${community_id}'::uuid, '${test_host}', 3);
+  INSERT INTO relay_members (community_id, pubkey, role)
+  VALUES
+    ('${community_id}'::uuid, '${owner_pubkey}', 'owner'),
+    ('${community_id}'::uuid, '${agent_pubkey}', 'member');
+  INSERT INTO users (
+    community_id, pubkey, display_name, agent_type,
+    agent_owner_pubkey, channel_add_policy
+  ) VALUES
+    ('${community_id}'::uuid, decode('${owner_pubkey}', 'hex'),
+     'Stage 6 owner', NULL, NULL, 'anyone'),
+    ('${community_id}'::uuid, decode('${agent_pubkey}', 'hex'),
+     'Stage 6 managed Agent', 'codex', decode('${owner_pubkey}', 'hex'), 'anyone');
+" >/dev/null
+
+if [[ "${PROJECT_VIEW_STAGE6_NO_BUILD:-0}" != "1" ]]; then
+  if [[ "${profile}" == "dev" ]]; then
+    cargo build -p buzz-relay -p buzz-cli -p buzz-admin -p buzz-acp
+  else
+    cargo build --profile "${profile}" -p buzz-relay -p buzz-cli -p buzz-admin -p buzz-acp
+  fi
+fi
+for binary in buzz-relay buzz buzz-admin buzz-acp; do
+  [[ -x "${bin_dir}/${binary}" ]] || fail "missing executable ${bin_dir}/${binary}"
+done
+
 relay_log="${artifact_dir}/relay.log"
 env \
   DATABASE_URL="${database_url}" \
   REDIS_URL=redis://localhost:6379 \
-  RELAY_URL="ws://${legacy_host}" \
+  RELAY_URL="ws://${test_host}" \
   BUZZ_BIND_ADDR="0.0.0.0:${port}" \
   BUZZ_HEALTH_PORT="${health_port}" \
   BUZZ_METRICS_PORT="${metrics_port}" \
@@ -259,7 +343,157 @@ for _ in $(seq 1 60); do
 done
 [[ "${status_code}" == "200" ]] || fail "Relay did not become ready"
 
-before_status="$(pv_admin context status --community "${legacy_host}" \
+pre_initialize_info="$(info_for | tee "${artifact_dir}/info-v3-bootstrap.json")"
+jq -e '
+  (.supported_extensions // []) as $extensions
+  | ($extensions | index("buzz-project-view-v3-bootstrap")) != null
+    and ($extensions | index("buzz-project-view-v3")) == null
+' <<<"${pre_initialize_info}" >/dev/null
+
+prepare_receipt="$(pv_admin prepare-v3 \
+  --community "${test_host}" \
+  --idempotency-key "stage6-prepare-${database_name}" \
+  --operator-pubkey "${owner_pubkey}" \
+  | tee "${artifact_dir}/project-view-prepare-v3.json")"
+preparation_operation_id="$(jq -er '.operation_id' <<<"${prepare_receipt}")"
+initialize_file="${temporary_dir}/initialize-v3.json"
+jq -n \
+  --arg preparation_operation_id "${preparation_operation_id}" \
+  --arg owner_pubkey "${owner_pubkey}" \
+  --arg goal_id "${goal_id}" \
+  --arg owner_role_id "${owner_role_id}" \
+  --arg owner_proposal_id "${owner_proposal_id}" \
+  --arg owner_assignment_id "${owner_assignment_id}" '{
+    schema_version: 3,
+    expected_project_revision: 0,
+    request: {
+      type: "initialize",
+      preparation_operation_id: $preparation_operation_id,
+      profile: {
+        name: "Stage 6 Context canary",
+        positioning: "Independent schema-v3 greenfield fixture",
+        purpose: "Exercise Context and Role Brief closure",
+        problem: "Context governance needs a repeatable current-runtime acceptance path",
+        scope: "Isolated local scratch Community only"
+      },
+      goals: [{
+        id: $goal_id,
+        title: "Accept Stage 6 Context governance",
+        desired_outcome: "Verified Context, Role Brief, and Runtime fences",
+        directions: ["Keep every ordinary Project View operation on schema v3"]
+      }],
+      initial_roles: [{
+        role_id: $owner_role_id,
+        name: "Stage 6 owner",
+        purpose: "Govern the isolated canary",
+        responsibilities: ["Create the member Role and offer"],
+        boundaries: ["Scratch Community only"],
+        level: "admin",
+        active: true,
+        context_references: []
+      }],
+      initial_governance_assignments: [{
+        member_pubkey: $owner_pubkey,
+        role_id: $owner_role_id,
+        proposal_id: $owner_proposal_id,
+        assignment_id: $owner_assignment_id
+      }]
+    }
+  }' >"${initialize_file}"
+buzz_as "${owner_private_key}" --format compact project-view init-v3 \
+  --command "${initialize_file}" >"${artifact_dir}/project-view-init-v3.json"
+pv_admin enable --community "${test_host}" >"${artifact_dir}/project-view-enable-v3.json"
+info_for | tee "${artifact_dir}/info-project-view-v3.json" \
+  | jq -e '
+      (.supported_extensions // []) as $extensions
+      | ($extensions | index("buzz-project-view-v3")) != null
+        and ($extensions | index("buzz-project-view-v3-bootstrap")) == null
+        and ($extensions | all(
+          (startswith("buzz-project-view-") | not)
+          or . == "buzz-project-view-v3"
+        ))
+    ' >/dev/null
+
+env DATABASE_URL="${database_url}" BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
+  "${bin_dir}/buzz-admin" project-document bootstrap \
+  --community "${test_host}" --expected-pubkey "${relay_signer_pubkey}" \
+  >"${artifact_dir}/document-bootstrap.json"
+env DATABASE_URL="${database_url}" BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
+  "${bin_dir}/buzz-admin" project-document verify \
+  --community "${test_host}" --expected-pubkey "${relay_signer_pubkey}" \
+  >"${artifact_dir}/document-verify.json"
+env DATABASE_URL="${database_url}" BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
+  "${bin_dir}/buzz-admin" project-document enable \
+  --community "${test_host}" --expected-pubkey "${relay_signer_pubkey}" \
+  >"${artifact_dir}/document-enable.json"
+
+guide_body="${temporary_dir}/resource-guide.md"
+printf '%s\n' '# Stage 6 Resource Guide' '' \
+  'STAGE6_GUIDE_BODY_MUST_REQUIRE_EXPLICIT_FETCH' >"${guide_body}"
+buzz_as "${owner_private_key}" --format compact documents create \
+  --document-id "${guide_id}" --title "Stage 6 Resource Guide" \
+  --summary "Mandatory Guide for the isolated Resource" \
+  --content-file "${guide_body}" >"${artifact_dir}/guide-create.json"
+
+resource_file="${temporary_dir}/resource.json"
+jq -n --arg guide "${guide_id}" '{
+  name: "Stage 6 managed context resource",
+  resource_kind: "local_canary",
+  summary: "Resource created entirely inside the schema-v3 Stage 6 fixture",
+  guide_document_id: $guide,
+  context_references: []
+}' >"${resource_file}"
+buzz_as "${owner_private_key}" --format compact project-view create resource \
+  --expected-project-revision "$(project_revision)" --id "${resource_id}" \
+  --data "${resource_file}" >"${artifact_dir}/resource-create-v3.json"
+
+role_file="${temporary_dir}/role.json"
+jq -n '{
+  name: "Stage 6 Context operator",
+  purpose: "Exercise verified Role Context and Runtime fences",
+  responsibilities: ["Maintain the isolated Context set"],
+  boundaries: ["Do not operate outside the scratch Community"],
+  active: true,
+  context_references: []
+}' >"${role_file}"
+buzz_as "${owner_private_key}" --format compact project-view create role \
+  --expected-project-revision "$(project_revision)" --id "${role_id}" \
+  --role-level member --data "${role_file}" >"${artifact_dir}/role-create-v3.json"
+
+buzz_as "${owner_private_key}" --format compact roles offer \
+  --role "${role_id}" --member "${agent_pubkey}" \
+  --expected-project-revision "$(project_revision)" \
+  --reason "Assign the isolated Stage 6 Context Role" \
+  >"${artifact_dir}/role-offer-v3.json"
+agent_proposals="$(buzz_as "${agent_private_key}" --format compact roles proposals \
+  --status open --limit 20 | tee "${artifact_dir}/agent-open-proposals-v3.json")"
+proposal_id="$(jq -er --arg role "${role_id}" --arg member "${agent_pubkey}" '
+  [.proposals[]
+   | select(.role_id == $role and .candidate_pubkey == $member
+            and .effective_status == "open")]
+  | if length == 1 then .[0].proposal_id else error("expected one open Stage 6 proposal") end
+' <<<"${agent_proposals}")"
+proposal_revision="$(jq -er '.project_revision' <<<"${agent_proposals}")"
+buzz_as "${agent_private_key}" --format compact roles proposal accept "${proposal_id}" \
+  --expected-project-revision "${proposal_revision}" \
+  >"${artifact_dir}/role-accept-v3.json"
+assignment_id="$(psql_query "
+  SELECT assignment_id FROM project_role_assignments
+  WHERE community_id = '${community_id}'::uuid
+    AND member_pubkey = '${agent_pubkey}'
+    AND role_id = '${role_id}'::uuid AND ended_at IS NULL
+")"
+[[ "${assignment_id}" =~ ^[0-9a-f-]{36}$ ]] || fail "managed Agent has no active v3 Assignment"
+
+env DATABASE_URL="${database_url}" BUZZ_PRIVATE_KEY="${owner_private_key}" \
+  "${bin_dir}/buzz-admin" project-runtime bind \
+  --host "${test_host}" --assignment "${assignment_id}" \
+  --supervisor-pubkey "${supervisor_pubkey}" --operator-pubkey "${owner_pubkey}" \
+  >"${artifact_dir}/runtime-supervisor-binding.json"
+
+echo "[2/6] Atomically enabling Context on the current v3 fixture"
+
+before_status="$(pv_admin context status --community "${test_host}" \
   | tee "${artifact_dir}/context-status-before.json")"
 jq -e '
   .project_view_schema_version == 3
@@ -280,13 +514,13 @@ set -e
 rg -q "unavailable:project_view:context_capability" \
   "${artifact_dir}/context-add-disabled.stderr"
 
-enable_receipt="$(pv_admin context enable --community "${legacy_host}" \
+enable_receipt="$(pv_admin context enable --community "${test_host}" \
   --idempotency-key "stage6-enable-${database_name}" --operator-pubkey "${owner_pubkey}" \
   | tee "${artifact_dir}/context-enable.json")"
 enable_operation_id="$(jq -er '.operation_id' <<<"${enable_receipt}")"
 jq -e '.enabled == true and .replayed == false and .closure_protocol_version == 1' \
   <<<"${enable_receipt}" >/dev/null
-pv_admin context enable --community "${legacy_host}" \
+pv_admin context enable --community "${test_host}" \
   --idempotency-key "stage6-enable-${database_name}" --operator-pubkey "${owner_pubkey}" \
   >"${artifact_dir}/context-enable-replay.json"
 jq -e --arg operation "${enable_operation_id}" '
@@ -308,26 +542,22 @@ jq -e --arg document "${supplemental_document_id}" '
 ' "${artifact_dir}/supplemental-create.json" >/dev/null
 
 start_acp
-buzz_managed "${current_fence_path}" --format compact project-view context add \
-  "${role_id}" --resource "${resource_id}" >"${artifact_dir}/context-add-resource.json"
 first_runtime_id="${current_runtime_id}"
 first_runtime_epoch="${current_runtime_epoch}"
-first_fence="${temporary_dir}/first-runtime-fence.json"
-cp "${current_fence_path}" "${first_fence}"
+wait_for_current_runtime_status "${first_runtime_id}" "${first_runtime_epoch}" "" \
+  "${artifact_dir}/runtime-status-generation-1.json"
+buzz_managed "${current_fence_path}" --format compact project-view context add \
+  "${role_id}" --resource "${resource_id}" >"${artifact_dir}/context-add-resource.json"
 
 stop_acp
 start_acp "${first_runtime_id}"
 second_runtime_id="${current_runtime_id}"
 second_runtime_epoch="${current_runtime_epoch}"
-set +e
-buzz_managed "${first_fence}" project-view context add "${role_id}" \
-  --document "${supplemental_document_id}" >"${artifact_dir}/stale-runtime.stdout" \
-  2>"${artifact_dir}/stale-runtime.stderr"
-stale_runtime_status=$?
-set -e
-[[ "${stale_runtime_status}" != "0" ]] || fail "retired Runtime fence mutated Context"
-rg -qi "runtime.fence|runtime_fence|conflict:project_view" \
-  "${artifact_dir}/stale-runtime.stdout" "${artifact_dir}/stale-runtime.stderr"
+wait_for_current_runtime_status "${second_runtime_id}" "${second_runtime_epoch}" \
+  "${first_runtime_id}" "${artifact_dir}/runtime-status-generation-2.json"
+# Context is governed by Community/Role authority, not by the operational
+# supervisor lease. The current fence stays in the harness environment, but
+# Context mutation authorization depends on the active Assignment below.
 buzz_managed "${current_fence_path}" --format compact project-view context add \
   "${role_id}" --document "${supplemental_document_id}" \
   >"${artifact_dir}/context-add-live.json"
@@ -344,36 +574,6 @@ jq -e --arg resource "${resource_id}" --arg document "${supplemental_document_id
   and any(.context_references[]; .type == "document" and .document_id == $document and .mode == "live")
   and any(.context_references[]; .type == "document" and .document_id == $document and .mode == "pinned" and .document_revision == 1)
 ' <<<"${context_before_assignment_change}" >/dev/null
-
-stale_assignment_command="${temporary_dir}/stale-assignment-command.json"
-stale_assignment_event="${temporary_dir}/stale-assignment-event.json"
-stale_assignment_revision="$(project_revision)"
-jq -n \
-  --argjson revision "${stale_assignment_revision}" \
-  --arg assignment "${old_assignment_id}" \
-  --arg runtime "${second_runtime_id}" \
-  --argjson epoch "${second_runtime_epoch}" \
-  --arg role "${role_id}" \
-  --arg resource "${resource_id}" \
-  --arg document "${supplemental_document_id}" '{
-    schema_version: 3,
-    expected_project_revision: $revision,
-    acting_assignment_id: $assignment,
-    runtime_fence: {runtime_id: $runtime, runtime_epoch: $epoch},
-    request: {
-      type: "update",
-      object_type: "role",
-      object_id: $role,
-      patch: {context_references: [
-        {type: "resource", resource_id: $resource},
-        {type: "document", document_id: $document, mode: "live"},
-        {type: "document", document_id: $document, mode: "pinned", document_revision: 1}
-      ]}
-    }
-  }' >"${stale_assignment_command}"
-env BUZZ_PRIVATE_KEY="${agent_private_key}" node \
-  desktop/scripts/stage6-canary-sign-project-view-event.mjs \
-  "${stale_assignment_command}" "${stale_assignment_event}"
 
 echo "[4/6] Verifying Role closure, body-free metadata, and explicit Guide fetch"
 brief_v1="$(buzz_managed "${current_fence_path}" --format compact roles brief \
@@ -392,7 +592,7 @@ jq -e --arg resource "${resource_id}" --arg guide "${guide_id}" \
 
 buzz_managed "${current_fence_path}" resources guide "${resource_id}" --content-only \
   >"${artifact_dir}/agent-explicit-guide.md"
-cmp "${stage5_run_dir}/legacy-resource-guide.md" "${artifact_dir}/agent-explicit-guide.md"
+cmp "${guide_body}" "${artifact_dir}/agent-explicit-guide.md"
 ! rg -q "STAGE6_DOCUMENT_BODY_MUST_REQUIRE_EXPLICIT_FETCH" \
   "${artifact_dir}"/acp-generation-*.log
 
@@ -426,7 +626,7 @@ rg -qi "referenc|conflict|protected" \
   "${artifact_dir}/live-delete-protected.stdout" "${artifact_dir}/live-delete-protected.stderr"
 
 echo "[5/6] Verifying disable preservation, subset cleanup, and re-enable"
-pv_admin context disable --community "${legacy_host}" \
+pv_admin context disable --community "${test_host}" \
   --idempotency-key "stage6-disable-${database_name}" --operator-pubkey "${owner_pubkey}" \
   >"${artifact_dir}/context-disable.json"
 info_for | tee "${artifact_dir}/info-context-disabled.json" \
@@ -457,10 +657,10 @@ buzz_as "${owner_private_key}" --format compact project-view context remove \
   "${role_id}" --document "${supplemental_document_id}" \
   >"${artifact_dir}/disabled-remove-live.json"
 
-pv_admin context enable --community "${legacy_host}" \
+pv_admin context enable --community "${test_host}" \
   --idempotency-key "stage6-reenable-${database_name}" --operator-pubkey "${owner_pubkey}" \
   >"${artifact_dir}/context-reenable.json"
-context_status_final="$(pv_admin context status --community "${legacy_host}" \
+context_status_final="$(pv_admin context status --community "${test_host}" \
   | tee "${artifact_dir}/context-status-reenabled.json")"
 jq -e '
   .context_enabled == true and .advertised_ready == true
@@ -520,21 +720,51 @@ final_context="$(buzz_as "${owner_private_key}" --format compact project-view co
 jq -e '.context_capability == true and (.context_references | length) == 0' \
   <<<"${final_context}" >/dev/null
 
-operation_count="$(psql_query "SELECT count(*) FROM project_view_context_operations WHERE community_id = '${legacy_community_id}'")"
+operation_count="$(psql_query "SELECT count(*) FROM project_view_context_operations WHERE community_id = '${community_id}'")"
 [[ "${operation_count}" == "3" ]] || fail "Context idempotency replay appended another ledger row"
-audit_count="$(psql_query "SELECT count(*) FROM audit_log WHERE community_id = '${legacy_community_id}' AND action = 'project_context_control'")"
+audit_count="$(psql_query "SELECT count(*) FROM audit_log WHERE community_id = '${community_id}' AND action = 'project_context_control'")"
 [[ "${audit_count}" == "3" ]] || fail "Context control audit count is incomplete"
 
-stop_acp
 revision="$(project_revision)"
+stale_assignment_command="${temporary_dir}/stale-assignment-command.json"
+stale_assignment_event="${temporary_dir}/stale-assignment-event.json"
+expected_revision_after_assignment_end="$((revision + 1))"
+jq -n \
+  --argjson revision "${expected_revision_after_assignment_end}" \
+  --arg assignment "${assignment_id}" \
+  --arg role "${role_id}" \
+  --arg resource "${resource_id}" '{
+    schema_version: 3,
+    expected_project_revision: $revision,
+    acting_assignment_id: $assignment,
+    request: {
+      type: "update",
+      object_type: "role",
+      object_id: $role,
+      patch: {context_references: [
+        {type: "resource", resource_id: $resource}
+      ]}
+    }
+  }' >"${stale_assignment_command}"
+env BUZZ_PRIVATE_KEY="${agent_private_key}" node \
+  desktop/scripts/stage6-canary-sign-project-view-event.mjs \
+  "${stale_assignment_command}" "${stale_assignment_event}"
+stop_acp
 buzz_as "${owner_private_key}" --format compact roles assignment end \
-  "${old_assignment_id}" --expected-project-revision "${revision}" \
+  "${assignment_id}" --expected-project-revision "${revision}" \
   --reason "Stage 6 stale Assignment fence canary" \
   >"${artifact_dir}/old-assignment-end.json"
+ended_runtime_status="$(runtime_status | tee "${artifact_dir}/runtime-status-assignment-ended.json")"
+jq -e '
+  .status.managed == false
+  and (.status | has("binding") | not)
+  and (.status | has("availability") | not)
+  and (.status.runtimes | length) == 0
+' <<<"${ended_runtime_status}" >/dev/null
 set +e
 env BUZZ_PRIVATE_KEY="${agent_private_key}" node \
-  desktop/scripts/stage5-canary-nip98-post.mjs \
-  "http://${legacy_host}/events" "${stale_assignment_event}" \
+  desktop/scripts/project-view-canary-nip98-post.mjs \
+  "http://${test_host}/events" "${stale_assignment_event}" \
   >"${artifact_dir}/stale-assignment-response.json" \
   2>"${artifact_dir}/stale-assignment-request.stderr"
 stale_assignment_request=$?
@@ -547,12 +777,12 @@ stop_relay
 jq -n \
   --arg accepted_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg database "${database_name}" \
-  --arg host "${legacy_host}" \
+  --arg host "${test_host}" \
   --arg role_id "${role_id}" \
   --arg resource_id "${resource_id}" \
   --arg guide_id "${guide_id}" \
   --arg document_id "${supplemental_document_id}" \
-  --arg old_assignment_id "${old_assignment_id}" \
+  --arg assignment_id "${assignment_id}" \
   --arg first_runtime_id "${first_runtime_id}" \
   --argjson first_runtime_epoch "${first_runtime_epoch}" \
   --arg second_runtime_id "${second_runtime_id}" \
@@ -561,6 +791,8 @@ jq -n \
   --argjson resource_revision "${resource_revision}" '{
     accepted_at: $accepted_at,
     execution: "real_local",
+    fixture_origin: "greenfield_v3",
+    project_view: {schema_version: 3, ordinary_runtime: "v3_only"},
     services: ["PostgreSQL", "Redis", "Relay", "buzz-cli", "buzz-admin", "buzz-acp", "ACP child"],
     context_control: {status: "passed", closure_protocol_version: 1, replay_first: true, audit_rows: 3},
     role_context: {
@@ -575,7 +807,10 @@ jq -n \
     },
     fences: {
       status: "passed",
-      ended_assignment_rejected: $old_assignment_id,
+      purpose: "operational_supervision_not_context_acl",
+      first_runtime_retired: true,
+      binding_revoked_with_assignment: true,
+      ended_assignment_rejected: $assignment_id,
       runtimes: [
         {runtime_id: $first_runtime_id, runtime_epoch: $first_runtime_epoch},
         {runtime_id: $second_runtime_id, runtime_epoch: $second_runtime_epoch}

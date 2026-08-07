@@ -14,26 +14,18 @@ use buzz_sdk::project_document::{
     document_head_coordinate, document_meta_coordinate, parse_document_head, parse_document_meta,
     VerifiedDocumentHead, VerifiedDocumentMeta,
 };
-use buzz_sdk::project_view_v2::{
-    parse_entity_projection as parse_v2_entity_projection, parse_membership_projection,
-    parse_meta_projection as parse_v2_meta_projection,
-    parse_project_object_projection as parse_v2_project_object_projection, V2EntityProjection,
-    V2MembershipProjection, V2MetaProjection,
-};
 use buzz_sdk::project_view_v3::{
-    parse_entity_projection as parse_v3_entity_projection,
+    parse_entity_projection as parse_v3_entity_projection, parse_membership_projection,
     parse_meta_projection as parse_v3_meta_projection,
     parse_project_object_projection as parse_v3_project_object_projection, V3EntityProjection,
-    V3MetaProjection,
+    V3MembershipProjection, V3MetaProjection, PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
+    PROJECT_VIEW_V3_ENTITY_TAG, PROJECT_VIEW_V3_EXTENSION, PROJECT_VIEW_V3_META_TAG,
+    PROJECT_VIEW_V3_OBJECT_TAG,
 };
-use buzz_sdk::role_brief::{
-    render_role_binding_markdown, render_role_brief_markdown, unavailable_role_brief_markdown,
-    VerifiedRoleBriefSnapshot,
-};
+use buzz_sdk::role_brief::unavailable_role_brief_markdown;
 use buzz_sdk::role_brief_v3::{
-    render_role_binding_markdown_v3, render_role_brief_markdown_v3, ResolvedRoleBrief,
-    RoleBriefDocumentEnrichmentV3, RoleBriefV3, VerifiedDocumentMetadataV3,
-    VerifiedRoleBriefSnapshotV3,
+    render_role_binding_markdown_v3, render_role_brief_markdown_v3, RoleBriefDocumentEnrichmentV3,
+    RoleBriefV3, VerifiedDocumentMetadataV3, VerifiedRoleBriefSnapshotV3,
 };
 use chrono::Utc;
 use nostr::{Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag};
@@ -45,8 +37,6 @@ use uuid::Uuid;
 
 use crate::relay::RestClient;
 
-const PROJECT_VIEW_V2_EXTENSION: &str = "buzz-project-view-v2";
-const PROJECT_VIEW_V3_EXTENSION: &str = "buzz-project-view-v3";
 const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 const ROLE_BRIEF_TIMEOUT: Duration = Duration::from_secs(12);
@@ -57,60 +47,10 @@ const DOCUMENT_SNAPSHOT_ATTEMPTS: usize = 3;
 const ENTITY_PAGE_SIZE: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectViewSchema {
-    V2,
-    V3,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProjectViewIdentity {
     relay_pubkey: PublicKey,
-    schema: ProjectViewSchema,
     context_enabled: bool,
     document_enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-enum VerifiedMeta {
-    V2(V2MetaProjection),
-    V3(V3MetaProjection),
-}
-
-impl VerifiedMeta {
-    const fn schema(&self) -> ProjectViewSchema {
-        match self {
-            Self::V2(_) => ProjectViewSchema::V2,
-            Self::V3(_) => ProjectViewSchema::V3,
-        }
-    }
-
-    const fn event_id(&self) -> EventId {
-        match self {
-            Self::V2(meta) => meta.event_id,
-            Self::V3(meta) => meta.event_id,
-        }
-    }
-
-    const fn project_id(&self) -> buzz_core::CommunityId {
-        match self {
-            Self::V2(meta) => meta.project_id,
-            Self::V3(meta) => meta.project_id,
-        }
-    }
-
-    const fn project_revision(&self) -> u64 {
-        match self {
-            Self::V2(meta) => meta.project_revision,
-            Self::V3(meta) => meta.project_revision,
-        }
-    }
-
-    const fn projection_generation(&self) -> u64 {
-        match self {
-            Self::V2(meta) => meta.projection_generation,
-            Self::V3(meta) => meta.projection_generation,
-        }
-    }
 }
 
 /// Whether a turn may use an exact-meta compact binding or must rebuild the
@@ -167,48 +107,24 @@ impl RoleContextResolution {
         }
     }
 
-    fn full(brief: &ResolvedRoleBrief) -> Self {
-        match brief {
-            ResolvedRoleBrief::V2(brief) => {
-                let directory = &brief.role_directory;
-                Self {
-                    markdown: render_role_brief_markdown(brief),
-                    status: brief.state.status(),
-                    mode: "full",
-                    assignment_id: brief.assignment_id(),
-                    project_revision: Some(brief.project_revision),
-                    projection_generation: Some(brief.projection_generation),
-                    meta_event_id: Some(brief.source_revisions.meta_event_id),
-                    error_code: None,
-                    role_directory_total: Some(directory.total_active_roles),
-                    role_directory_shown: Some(
-                        directory
-                            .total_active_roles
-                            .saturating_sub(directory.omitted_active_roles),
-                    ),
-                    role_directory_omitted: Some(directory.omitted_active_roles),
-                }
-            }
-            ResolvedRoleBrief::V3(brief) => {
-                let directory = &brief.role_directory;
-                Self {
-                    markdown: render_role_brief_markdown_v3(brief),
-                    status: brief.state.status(),
-                    mode: "full",
-                    assignment_id: brief.assignment_id(),
-                    project_revision: Some(brief.project_revision),
-                    projection_generation: Some(brief.projection_generation),
-                    meta_event_id: Some(brief.source_revisions.meta_event_id),
-                    error_code: None,
-                    role_directory_total: Some(directory.total_active_roles),
-                    role_directory_shown: Some(
-                        directory
-                            .total_active_roles
-                            .saturating_sub(directory.omitted_active_roles),
-                    ),
-                    role_directory_omitted: Some(directory.omitted_active_roles),
-                }
-            }
+    fn full(brief: &RoleBriefV3) -> Self {
+        let directory = &brief.role_directory;
+        Self {
+            markdown: render_role_brief_markdown_v3(brief),
+            status: brief.state.status(),
+            mode: "full",
+            assignment_id: brief.assignment_id(),
+            project_revision: Some(brief.project_revision),
+            projection_generation: Some(brief.projection_generation),
+            meta_event_id: Some(brief.source_revisions.meta_event_id),
+            error_code: None,
+            role_directory_total: Some(directory.total_active_roles),
+            role_directory_shown: Some(
+                directory
+                    .total_active_roles
+                    .saturating_sub(directory.omitted_active_roles),
+            ),
+            role_directory_omitted: Some(directory.omitted_active_roles),
         }
     }
 }
@@ -216,7 +132,6 @@ impl RoleContextResolution {
 #[derive(Debug, Clone)]
 struct CachedRoleBinding {
     relay_pubkey: PublicKey,
-    schema: ProjectViewSchema,
     context_enabled: bool,
     document_enabled: bool,
     project_id: Uuid,
@@ -227,42 +142,24 @@ struct CachedRoleBinding {
     markdown: String,
     status: &'static str,
     assignment_id: Option<Uuid>,
-    document_metadata: Option<DocumentMetadataSourceV3>,
+    document_metadata: DocumentMetadataSourceV3,
 }
 
 impl CachedRoleBinding {
-    fn from_brief(identity: ProjectViewIdentity, brief: &ResolvedRoleBrief) -> Self {
-        match brief {
-            ResolvedRoleBrief::V2(brief) => Self {
-                relay_pubkey: identity.relay_pubkey,
-                schema: ProjectViewSchema::V2,
-                context_enabled: identity.context_enabled,
-                document_enabled: identity.document_enabled,
-                project_id: brief.project_id,
-                member_pubkey: brief.member_pubkey,
-                meta_event_id: brief.source_revisions.meta_event_id,
-                project_revision: brief.project_revision,
-                projection_generation: brief.projection_generation,
-                markdown: render_role_binding_markdown(brief),
-                status: brief.state.status(),
-                assignment_id: brief.assignment_id(),
-                document_metadata: None,
-            },
-            ResolvedRoleBrief::V3(brief) => Self {
-                relay_pubkey: identity.relay_pubkey,
-                schema: ProjectViewSchema::V3,
-                context_enabled: identity.context_enabled,
-                document_enabled: identity.document_enabled,
-                project_id: brief.project_id,
-                member_pubkey: brief.member_pubkey,
-                meta_event_id: brief.source_revisions.meta_event_id,
-                project_revision: brief.project_revision,
-                projection_generation: brief.projection_generation,
-                markdown: render_role_binding_markdown_v3(brief),
-                status: brief.state.status(),
-                assignment_id: brief.assignment_id(),
-                document_metadata: Some(brief.source_revisions.document_metadata.clone()),
-            },
+    fn from_brief(identity: ProjectViewIdentity, brief: &RoleBriefV3) -> Self {
+        Self {
+            relay_pubkey: identity.relay_pubkey,
+            context_enabled: identity.context_enabled,
+            document_enabled: identity.document_enabled,
+            project_id: brief.project_id,
+            member_pubkey: brief.member_pubkey,
+            meta_event_id: brief.source_revisions.meta_event_id,
+            project_revision: brief.project_revision,
+            projection_generation: brief.projection_generation,
+            markdown: render_role_binding_markdown_v3(brief),
+            status: brief.state.status(),
+            assignment_id: brief.assignment_id(),
+            document_metadata: brief.source_revisions.document_metadata.clone(),
         }
     }
 
@@ -270,17 +167,16 @@ impl CachedRoleBinding {
         &self,
         identity: ProjectViewIdentity,
         member_pubkey: PublicKey,
-        meta: &VerifiedMeta,
+        meta: &V3MetaProjection,
     ) -> bool {
         self.relay_pubkey == identity.relay_pubkey
-            && self.schema == meta.schema()
             && self.context_enabled == identity.context_enabled
             && self.document_enabled == identity.document_enabled
-            && self.project_id == *meta.project_id().as_uuid()
+            && self.project_id == *meta.project_id.as_uuid()
             && self.member_pubkey == member_pubkey
-            && self.meta_event_id == meta.event_id()
-            && self.project_revision == meta.project_revision()
-            && self.projection_generation == meta.projection_generation()
+            && self.meta_event_id == meta.event_id
+            && self.project_revision == meta.project_revision
+            && self.projection_generation == meta.projection_generation
     }
 
     fn resolution(&self) -> RoleContextResolution {
@@ -305,7 +201,7 @@ fn cached_resolution(
     refresh: RoleContextRefresh,
     identity: ProjectViewIdentity,
     member_pubkey: PublicKey,
-    meta: &VerifiedMeta,
+    meta: &V3MetaProjection,
 ) -> Option<RoleContextResolution> {
     (refresh == RoleContextRefresh::Incremental)
         .then_some(cache.as_ref())
@@ -313,9 +209,8 @@ fn cached_resolution(
         .filter(|cached| cached.matches(identity, member_pubkey, meta))
         .filter(|cached| {
             !matches!(
-                cached.document_metadata,
-                Some(DocumentMetadataSourceV3::Unavailable)
-                    | Some(DocumentMetadataSourceV3::Verified { .. })
+                &cached.document_metadata,
+                DocumentMetadataSourceV3::Unavailable | DocumentMetadataSourceV3::Verified { .. }
             )
         })
         .map(CachedRoleBinding::resolution)
@@ -510,7 +405,6 @@ impl RoleBriefResolver {
         // following meta read fails.
         if cache.as_ref().is_some_and(|cached| {
             cached.relay_pubkey != identity.relay_pubkey
-                || cached.schema != identity.schema
                 || cached.context_enabled != identity.context_enabled
                 || cached.document_enabled != identity.document_enabled
         }) {
@@ -537,11 +431,11 @@ impl RoleBriefResolver {
             .flatten()
             .filter(|cached| cached.matches(identity, self.member_pubkey, &meta))
             .and_then(|cached| match &cached.document_metadata {
-                Some(DocumentMetadataSourceV3::Verified {
+                DocumentMetadataSourceV3::Verified {
                     meta_event_id,
                     catalog_revision,
                     projection_generation,
-                }) if identity.context_enabled && identity.document_enabled => Some((
+                } if identity.context_enabled && identity.document_enabled => Some((
                     *meta_event_id,
                     *catalog_revision,
                     *projection_generation,
@@ -556,7 +450,7 @@ impl RoleBriefResolver {
                 deadline.min(tokio::time::Instant::now() + DOCUMENT_ENRICHMENT_TIMEOUT);
             let current = tokio::time::timeout_at(
                 document_deadline,
-                self.read_document_meta(identity, meta.project_id()),
+                self.read_document_meta(identity, meta.project_id),
             )
             .await;
             match current {
@@ -582,50 +476,27 @@ impl RoleBriefResolver {
         // A non-matching or explicitly refreshed cache must not survive a
         // failed full rebuild and accidentally look eligible later.
         *cache = None;
-        let brief = match meta {
-            VerifiedMeta::V2(meta) => {
-                let snapshot =
-                    tokio::time::timeout_at(deadline, self.resolve_verified_v2(identity, meta))
-                        .await
-                        .map_err(|_| {
-                            ResolutionFailure::Project(
-                                "Role Brief v2 snapshot resolution timed out".to_owned(),
-                            )
-                        })?
-                        .map_err(ResolutionFailure::Project)?;
-                let brief = snapshot
-                    .brief_for(self.member_pubkey, Utc::now())
-                    .map_err(|error| ResolutionFailure::Project(error.to_string()))?;
-                self.reconcile_runtime(deadline, brief.assignment_id())
-                    .await?;
-                ResolvedRoleBrief::V2(brief)
-            }
-            VerifiedMeta::V3(meta) => {
-                let snapshot =
-                    tokio::time::timeout_at(deadline, self.resolve_verified_v3(identity, meta))
-                        .await
-                        .map_err(|_| {
-                            ResolutionFailure::Project(
-                                "Role Brief v3 authority resolution timed out".to_owned(),
-                            )
-                        })?
-                        .map_err(ResolutionFailure::Project)?;
-                let base = snapshot
-                    .brief_for(self.member_pubkey, Utc::now())
-                    .map_err(|error| ResolutionFailure::Project(error.to_string()))?;
+        let snapshot = tokio::time::timeout_at(deadline, self.resolve_verified_v3(identity, meta))
+            .await
+            .map_err(|_| {
+                ResolutionFailure::Project(
+                    "Role Brief v3 authority resolution timed out".to_owned(),
+                )
+            })?
+            .map_err(ResolutionFailure::Project)?;
+        let base = snapshot
+            .brief_for(self.member_pubkey, Utc::now())
+            .map_err(|error| ResolutionFailure::Project(error.to_string()))?;
 
-                // Assignment authority is complete before optional Document
-                // enrichment. A metadata outage must not skip reconciliation.
-                self.reconcile_runtime(deadline, base.assignment_id())
-                    .await?;
-                let brief = if identity.context_enabled {
-                    self.resolve_optional_v3_context(deadline, identity, &snapshot)
-                        .await?
-                } else {
-                    base
-                };
-                ResolvedRoleBrief::V3(brief)
-            }
+        // Assignment authority is complete before optional Document
+        // enrichment. A metadata outage must not skip reconciliation.
+        self.reconcile_runtime(deadline, base.assignment_id())
+            .await?;
+        let brief = if identity.context_enabled {
+            self.resolve_optional_v3_context(deadline, identity, &snapshot)
+                .await?
+        } else {
+            base
         };
 
         let resolution = RoleContextResolution::full(&brief);
@@ -823,68 +694,6 @@ impl RoleBriefResolver {
         Ok(heads)
     }
 
-    async fn resolve_verified_v2(
-        &self,
-        identity: ProjectViewIdentity,
-        mut before: V2MetaProjection,
-    ) -> Result<VerifiedRoleBriefSnapshot, String> {
-        let relay_pubkey = identity.relay_pubkey;
-        for attempt in 0..SNAPSHOT_ATTEMPTS {
-            let t_tag = SingleLetterTag::lowercase(Alphabet::T);
-            let ordinary_filter = Filter::new()
-                .kind(Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
-                .author(relay_pubkey)
-                .custom_tags(t_tag, ["buzz-project-view-v2-object"]);
-            let ordinary_events = parse_events(
-                self.rest_client
-                    .query(&[ordinary_filter])
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )?;
-            let entity_projections = self
-                .read_current_entity_projections(relay_pubkey, &before)
-                .await?;
-
-            let mut event_ids =
-                HashSet::with_capacity(ordinary_events.len() + entity_projections.len());
-            let mut object_projections = Vec::with_capacity(ordinary_events.len());
-            for event in ordinary_events {
-                if !event_ids.insert(event.id) {
-                    return Err("ordinary-object query returned a duplicate event".to_owned());
-                }
-                object_projections.push(
-                    parse_v2_project_object_projection(&event, &relay_pubkey, before.project_id)
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            for projection in &entity_projections {
-                if !event_ids.insert(projection.event_id) {
-                    return Err("entity query returned a duplicate event".to_owned());
-                }
-            }
-            let membership = self.read_membership(relay_pubkey, &before).await?;
-            let VerifiedMeta::V2(after) = self.read_meta(identity).await? else {
-                return Err("Project View schema changed during v2 snapshot assembly".to_owned());
-            };
-            if before.event_id != after.event_id {
-                if attempt + 1 < SNAPSHOT_ATTEMPTS {
-                    before = after;
-                    tokio::time::sleep(Duration::from_millis(25_u64 << attempt)).await;
-                    continue;
-                }
-                return Err("Project View changed during every bounded snapshot attempt".to_owned());
-            }
-            return VerifiedRoleBriefSnapshot::new_with_partial_history(
-                before,
-                membership,
-                object_projections,
-                entity_projections,
-            )
-            .map_err(|error| error.to_string());
-        }
-        Err("Project View snapshot could not be stabilized".to_owned())
-    }
-
     async fn resolve_verified_v3(
         &self,
         identity: ProjectViewIdentity,
@@ -896,7 +705,7 @@ impl RoleBriefResolver {
             let ordinary_filter = Filter::new()
                 .kind(Kind::Custom(KIND_PROJECT_VIEW_OBJECT as u16))
                 .author(relay_pubkey)
-                .custom_tags(t_tag, ["buzz-project-view-v3-object"]);
+                .custom_tags(t_tag, [PROJECT_VIEW_V3_OBJECT_TAG]);
             let ordinary_events = parse_events(
                 self.rest_client
                     .query(&[ordinary_filter])
@@ -927,9 +736,7 @@ impl RoleBriefResolver {
             let membership = self
                 .read_membership_event(relay_pubkey, before.membership_snapshot_event_id)
                 .await?;
-            let VerifiedMeta::V3(after) = self.read_meta(identity).await? else {
-                return Err("Project View schema changed during v3 snapshot assembly".to_owned());
-            };
+            let after = self.read_meta(identity).await?;
             if before.event_id != after.event_id {
                 if attempt + 1 < SNAPSHOT_ATTEMPTS {
                     before = after;
@@ -951,59 +758,6 @@ impl RoleBriefResolver {
         Err("Project View v3 snapshot could not be stabilized".to_owned())
     }
 
-    async fn read_current_entity_projections(
-        &self,
-        relay_pubkey: PublicKey,
-        meta: &V2MetaProjection,
-    ) -> Result<Vec<V2EntityProjection>, String> {
-        let mut projections = Vec::new();
-        let mut event_ids = HashSet::new();
-        let mut after: Option<Value> = None;
-        loop {
-            let mut extension = json!({
-                "scope": "v2_current_entities",
-                "revision": meta.project_revision,
-                "projection_generation": meta.projection_generation,
-            });
-            if let Some(cursor) = &after {
-                extension["after"] = cursor.clone();
-            }
-            let filter = json!({
-                "kinds": [KIND_PROJECT_VIEW_OBJECT],
-                "authors": [relay_pubkey.to_hex()],
-                "#t": ["buzz-project-view-v2-entity"],
-                "limit": ENTITY_PAGE_SIZE,
-                "buzz_project_view": extension,
-            });
-            let events = parse_events(
-                self.rest_client
-                    .query_raw(&[filter])
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )?;
-            if events.len() > ENTITY_PAGE_SIZE {
-                return Err("current-entity page exceeded its requested limit".to_owned());
-            }
-            let page_len = events.len();
-            for event in events {
-                if !event_ids.insert(event.id) {
-                    return Err("current-entity pages returned a duplicate signed event".to_owned());
-                }
-                let projection = parse_v2_entity_projection(&event, &relay_pubkey, meta.project_id)
-                    .map_err(|error| error.to_string())?;
-                after = Some(json!({
-                    "entity_type": projection.entity.entity_type().as_str(),
-                    "entity_id": projection.entity.entity_id(),
-                }));
-                projections.push(projection);
-            }
-            if page_len < ENTITY_PAGE_SIZE {
-                break;
-            }
-        }
-        Ok(projections)
-    }
-
     async fn read_current_entity_projections_v3(
         &self,
         relay_pubkey: PublicKey,
@@ -1014,7 +768,7 @@ impl RoleBriefResolver {
         let mut after: Option<Value> = None;
         loop {
             let mut extension = json!({
-                "scope": "v3_current_entities",
+                "scope": PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
                 "revision": meta.project_revision,
                 "projection_generation": meta.projection_generation,
             });
@@ -1024,7 +778,7 @@ impl RoleBriefResolver {
             let filter = json!({
                 "kinds": [KIND_PROJECT_VIEW_OBJECT],
                 "authors": [relay_pubkey.to_hex()],
-                "#t": ["buzz-project-view-v3-entity"],
+                "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
                 "limit": ENTITY_PAGE_SIZE,
                 "buzz_project_view": extension,
             });
@@ -1067,23 +821,15 @@ impl RoleBriefResolver {
             .map_err(|error| error.to_string())?;
         let info: Nip11Document =
             serde_json::from_value(value).map_err(|error| error.to_string())?;
-        let schema = if info
+        if !info
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_VIEW_V3_EXTENSION)
         {
-            ProjectViewSchema::V3
-        } else if info
-            .supported_extensions
-            .iter()
-            .any(|extension| extension == PROJECT_VIEW_V2_EXTENSION)
-        {
-            ProjectViewSchema::V2
-        } else {
             return Err(format!(
-                "Relay does not advertise {PROJECT_VIEW_V2_EXTENSION} or {PROJECT_VIEW_V3_EXTENSION}"
+                "Relay does not advertise required {PROJECT_VIEW_V3_EXTENSION}"
             ));
-        };
+        }
         let relay_self = info
             .relay_self
             .ok_or_else(|| "NIP-11 has no Relay `self` key".to_owned())?;
@@ -1091,27 +837,27 @@ impl RoleBriefResolver {
         if relay_pubkey.to_hex() != relay_self {
             return Err("NIP-11 Relay `self` key is not canonical lowercase hex".to_owned());
         }
-        let context_enabled = schema == ProjectViewSchema::V3
-            && info
-                .supported_extensions
-                .iter()
-                .any(|extension| extension == PROJECT_CONTEXT_EXTENSION);
+        let context_enabled = info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_CONTEXT_EXTENSION);
         let document_enabled = info
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_DOCUMENT_EXTENSION);
         Ok(ProjectViewIdentity {
             relay_pubkey,
-            schema,
             context_enabled,
             document_enabled,
         })
     }
 
-    async fn read_meta(&self, identity: ProjectViewIdentity) -> Result<VerifiedMeta, String> {
+    async fn read_meta(&self, identity: ProjectViewIdentity) -> Result<V3MetaProjection, String> {
+        let t_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::T);
         let filter = Filter::new()
             .kind(Kind::Custom(KIND_PROJECT_VIEW_META as u16))
             .author(identity.relay_pubkey)
+            .custom_tags(t_tag, [PROJECT_VIEW_V3_META_TAG])
             .limit(2);
         let events = parse_events(
             self.rest_client
@@ -1122,14 +868,7 @@ impl RoleBriefResolver {
         let [event] = events.as_slice() else {
             return Err("metadata query did not return exactly one current head".to_owned());
         };
-        match identity.schema {
-            ProjectViewSchema::V2 => parse_v2_meta_projection(event, &identity.relay_pubkey)
-                .map(VerifiedMeta::V2)
-                .map_err(|error| error.to_string()),
-            ProjectViewSchema::V3 => parse_v3_meta_projection(event, &identity.relay_pubkey)
-                .map(VerifiedMeta::V3)
-                .map_err(|error| error.to_string()),
-        }
+        parse_v3_meta_projection(event, &identity.relay_pubkey).map_err(|error| error.to_string())
     }
 
     async fn read_document_meta(
@@ -1162,20 +901,11 @@ impl RoleBriefResolver {
         Ok(meta)
     }
 
-    async fn read_membership(
-        &self,
-        relay_pubkey: PublicKey,
-        meta: &V2MetaProjection,
-    ) -> Result<V2MembershipProjection, String> {
-        self.read_membership_event(relay_pubkey, meta.membership_snapshot_event_id)
-            .await
-    }
-
     async fn read_membership_event(
         &self,
         relay_pubkey: PublicKey,
         membership_event_id: EventId,
-    ) -> Result<V2MembershipProjection, String> {
+    ) -> Result<V3MembershipProjection, String> {
         let filter = Filter::new()
             .id(membership_event_id)
             .kind(Kind::Custom(KIND_NIP43_MEMBERSHIP_LIST as u16))
@@ -1243,17 +973,10 @@ mod tests {
         canonicalize_context_references, DocumentReferenceMode, ProjectContextReference,
         ProjectResourceV3, ProjectViewEntryV3, ProjectViewObjectDataV3, ProjectViewObjectV3,
     };
-    use buzz_project_view::{
-        Goal, ProjectProfile, ProjectViewEntry, ProjectViewObject, ProjectViewObjectData,
-        ProjectViewObjectType, ProjectViewRelations,
-    };
+    use buzz_project_view::{Goal, ProjectProfile, ProjectViewObjectType, ProjectViewRelations};
     use buzz_sdk::project_document::{
         build_document_head_projection, build_document_meta_projection,
         build_document_revision_projection, changed_head_for,
-    };
-    use buzz_sdk::project_view_v2::{
-        build_meta_projection, build_project_object_projection, changed_head_for_project_object,
-        V2EntityCounts, V2ProjectionContext, V2ProjectionSource,
     };
     use buzz_sdk::project_view_v3::{
         build_meta_projection as build_meta_projection_v3,
@@ -1273,7 +996,7 @@ mod tests {
         let member = Keys::generate();
         let project_id = CommunityId::from_uuid(Uuid::new_v4());
         let goal_id = Uuid::new_v4();
-        let first = snapshot_events(
+        let first = snapshot_events_v3_at(
             &relay,
             owner,
             member.public_key(),
@@ -1284,7 +1007,7 @@ mod tests {
         );
         let state = StdArc::new(StdMutex::new(MockProjectViewApi::new(
             relay.public_key(),
-            vec![PROJECT_VIEW_V2_EXTENSION],
+            vec![PROJECT_VIEW_V3_EXTENSION],
             first,
         )));
         let (client, server) =
@@ -1294,7 +1017,7 @@ mod tests {
         let full = resolver.resolve_bounded(RoleContextRefresh::Full).await;
         assert_eq!(full.status, "candidate", "{}", full.markdown);
         assert_eq!(full.mode, "full");
-        assert!(full.markdown.starts_with("[Role Brief]"));
+        assert!(full.markdown.starts_with("[Role Brief v3]"));
         assert!(full.markdown.contains("Project: Lora v1"));
         assert_eq!(full.role_directory_total, Some(0));
         assert_eq!(full.role_directory_shown, Some(0));
@@ -1314,7 +1037,7 @@ mod tests {
             .resolve_bounded(RoleContextRefresh::Incremental)
             .await;
         assert_eq!(compact.mode, "compact");
-        assert!(compact.markdown.starts_with("[Role Binding]"));
+        assert!(compact.markdown.starts_with("[Role Binding v3]"));
         assert!(!compact.markdown.contains("Purpose:"));
         assert!(compact.role_directory_total.is_none());
         assert!(compact.role_directory_shown.is_none());
@@ -1376,7 +1099,7 @@ mod tests {
 
         {
             let mut state = state.lock().expect("mock state");
-            state.snapshot = snapshot_events(
+            state.snapshot = snapshot_events_v3_at(
                 &relay,
                 owner,
                 member.public_key(),
@@ -1400,6 +1123,44 @@ mod tests {
                 ordinary: 3,
                 entities: 3,
                 membership: 3,
+            }
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resolver_fails_closed_when_relay_only_advertises_project_view_v2() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key();
+        let member = Keys::generate();
+        let project_id = CommunityId::from_uuid(Uuid::new_v4());
+        let snapshot = snapshot_events_v3(
+            &relay,
+            owner,
+            member.public_key(),
+            project_id,
+            Uuid::new_v4(),
+        );
+        let state = StdArc::new(StdMutex::new(MockProjectViewApi::new(
+            relay.public_key(),
+            vec!["buzz-project-view-v2"],
+            snapshot,
+        )));
+        let (client, server) =
+            mock_project_view_client(StdArc::clone(&state), member.clone()).await;
+        let resolver = RoleBriefResolver::new(client, member.public_key());
+
+        let resolution = resolver.resolve_bounded(RoleContextRefresh::Full).await;
+        assert_eq!(resolution.status, "unavailable");
+        assert_eq!(resolution.mode, "unavailable");
+        assert_eq!(resolution.error_code, Some("project_view_unavailable"));
+        assert!(resolution.markdown.contains(PROJECT_VIEW_V3_EXTENSION));
+        assert_eq!(
+            state.lock().expect("mock state").counts,
+            MockQueryCounts {
+                info: 1,
+                ..MockQueryCounts::default()
             }
         );
 
@@ -1688,7 +1449,6 @@ mod tests {
         let assignment_id = Uuid::new_v4();
         let identity = ProjectViewIdentity {
             relay_pubkey: relay,
-            schema: ProjectViewSchema::V2,
             context_enabled: false,
             document_enabled: false,
         };
@@ -1698,7 +1458,6 @@ mod tests {
         };
         let cache = Some(CachedRoleBinding {
             relay_pubkey: relay,
-            schema: ProjectViewSchema::V2,
             context_enabled: false,
             document_enabled: false,
             project_id: *project_id.as_uuid(),
@@ -1709,7 +1468,7 @@ mod tests {
             markdown: "[Role Binding]\nState: assigned\n".to_owned(),
             status: "assigned",
             assignment_id: Some(assignment_id),
-            document_metadata: None,
+            document_metadata: DocumentMetadataSourceV3::NotRequired,
         });
 
         let exact = cached_resolution(
@@ -1799,13 +1558,13 @@ mod tests {
         meta_event_id: EventId,
         project_revision: u64,
         projection_generation: u64,
-    ) -> VerifiedMeta {
-        VerifiedMeta::V2(V2MetaProjection {
+    ) -> V3MetaProjection {
+        V3MetaProjection {
             event_id: meta_event_id,
             project_id,
             projection_generation,
             project_revision,
-            entity_counts: V2EntityCounts {
+            entity_counts: V3EntityCounts {
                 active_objects: 0,
                 open_proposals: 0,
                 active_assignments: 0,
@@ -1814,14 +1573,14 @@ mod tests {
                 handoffs: 0,
             },
             membership_snapshot_event_id: event_id(9),
-            reset: false,
+            reset: true,
             changed_heads: Vec::new(),
-            source: V2ProjectionSource::NostrEvent {
+            source: V3ProjectionSource::NostrEvent {
                 change_id: event_id(8),
                 event_id: event_id(8),
             },
             updated_at: Utc::now(),
-        })
+        }
     }
 
     fn event_id(byte: u8) -> EventId {
@@ -2151,7 +1910,20 @@ mod tests {
         )
     }
 
-    fn snapshot_events(
+    fn snapshot_events_v3(
+        relay: &Keys,
+        owner: PublicKey,
+        member: PublicKey,
+        project_id: CommunityId,
+        goal_id: Uuid,
+    ) -> SnapshotEvents {
+        snapshot_events_v3_fixture(
+            relay, owner, member, project_id, goal_id, 1, "Lora v3", None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_events_v3_at(
         relay: &Keys,
         owner: PublicKey,
         member: PublicKey,
@@ -2160,135 +1932,16 @@ mod tests {
         project_revision: u64,
         project_name: &str,
     ) -> SnapshotEvents {
-        let created_at = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture timestamp");
-        let updated_at = created_at
-            + TimeDelta::seconds(i64::try_from(project_revision).expect("small revision") - 1);
-        let source_id = event_id(
-            u8::try_from(project_revision)
-                .expect("small revision")
-                .saturating_add(20),
-        );
-        let context = V2ProjectionContext {
+        snapshot_events_v3_fixture(
+            relay,
+            owner,
+            member,
             project_id,
-            projection_generation: 1,
+            goal_id,
             project_revision,
-            source: V2ProjectionSource::NostrEvent {
-                change_id: source_id,
-                event_id: source_id,
-            },
-            updated_at,
-        };
-        let profile = ProjectViewEntry::Active(ProjectViewObject {
-            id: *project_id.as_uuid(),
-            object_type: ProjectViewObjectType::ProjectProfile,
-            object_revision: project_revision,
-            project_revision,
-            created_at,
-            updated_at,
-            created_by: member,
-            updated_by: member,
-            data: ProjectViewObjectData::ProjectProfile(ProjectProfile {
-                name: project_name.to_owned(),
-                positioning: "Project-owned continuity".to_owned(),
-                purpose: "Keep project context available across runtimes".to_owned(),
-                problem: "Runtime-local context is discontinuous".to_owned(),
-                scope: "One Community Project".to_owned(),
-            }),
-            relations: ProjectViewRelations::default(),
-        });
-        let ordinary = build_project_object_projection(&context, &profile)
-            .expect("build profile projection")
-            .sign_with_keys(relay)
-            .expect("sign profile projection");
-        let initial_source_id = event_id(21);
-        let initial_context = V2ProjectionContext {
-            project_id,
-            projection_generation: 1,
-            project_revision: 1,
-            source: V2ProjectionSource::NostrEvent {
-                change_id: initial_source_id,
-                event_id: initial_source_id,
-            },
-            updated_at: created_at,
-        };
-        let goal = ProjectViewEntry::Active(ProjectViewObject {
-            id: goal_id,
-            object_type: ProjectViewObjectType::Goal,
-            object_revision: 1,
-            project_revision: 1,
-            created_at,
-            updated_at: created_at,
-            created_by: member,
-            updated_by: member,
-            data: ProjectViewObjectData::Goal(Goal {
-                title: "Continuous project work".to_owned(),
-                desired_outcome: "A successor resumes from verified state".to_owned(),
-                directions: vec!["Keep context project-owned".to_owned()],
-            }),
-            relations: ProjectViewRelations::default(),
-        });
-        let goal = build_project_object_projection(&initial_context, &goal)
-            .expect("build Goal projection")
-            .sign_with_keys(relay)
-            .expect("sign Goal projection");
-
-        let mut members = [
-            (owner, CommunityMemberRole::Owner),
-            (member, CommunityMemberRole::Member),
-        ];
-        members.sort_by_key(|(pubkey, _)| *pubkey);
-        let membership_tags = std::iter::once(Tag::parse(["-"]).expect("protection tag"))
-            .chain(members.iter().map(|(pubkey, role)| {
-                Tag::parse(["member", pubkey.to_hex().as_str(), role.as_str()]).expect("member tag")
-            }))
-            .collect::<Vec<_>>();
-        let membership = EventBuilder::new(Kind::Custom(KIND_NIP43_MEMBERSHIP_LIST as u16), "")
-            .tags(membership_tags)
-            .custom_created_at(Timestamp::from(created_at.timestamp() as u64))
-            .sign_with_keys(relay)
-            .expect("sign membership projection");
-
-        let changed_heads = if project_revision == 1 {
-            Vec::new()
-        } else {
-            vec![
-                changed_head_for_project_object(&context, &profile, &ordinary)
-                    .expect("profile changed head"),
-            ]
-        };
-        let meta = build_meta_projection(
-            &context,
-            V2EntityCounts {
-                active_objects: 2,
-                open_proposals: 0,
-                active_assignments: 0,
-                active_commitments: 0,
-                checkpoints: 0,
-                handoffs: 0,
-            },
-            membership.id,
-            project_revision == 1,
-            &changed_heads,
+            project_name,
+            None,
         )
-        .expect("build meta projection")
-        .sign_with_keys(relay)
-        .expect("sign meta projection");
-
-        SnapshotEvents {
-            meta,
-            ordinary: vec![ordinary, goal],
-            membership,
-        }
-    }
-
-    fn snapshot_events_v3(
-        relay: &Keys,
-        owner: PublicKey,
-        member: PublicKey,
-        project_id: CommunityId,
-        goal_id: Uuid,
-    ) -> SnapshotEvents {
-        snapshot_events_v3_fixture(relay, owner, member, project_id, goal_id, None)
     }
 
     fn snapshot_events_v3_with_context(
@@ -2305,41 +1958,63 @@ mod tests {
             member,
             project_id,
             goal_id,
+            1,
+            "Lora v3",
             Some(context_fixture),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn snapshot_events_v3_fixture(
         relay: &Keys,
         owner: PublicKey,
         member: PublicKey,
         project_id: CommunityId,
         goal_id: Uuid,
+        project_revision: u64,
+        project_name: &str,
         context_fixture: Option<ContextFixture>,
     ) -> SnapshotEvents {
         let created_at = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture timestamp");
-        let source_id = event_id(71);
+        let updated_at = created_at
+            + TimeDelta::seconds(i64::try_from(project_revision).expect("small revision") - 1);
+        let source_id = event_id(
+            u8::try_from(project_revision)
+                .expect("small revision")
+                .saturating_add(70),
+        );
         let context = V3ProjectionContext {
+            project_id,
+            projection_generation: 1,
+            project_revision,
+            source: V3ProjectionSource::NostrEvent {
+                change_id: source_id,
+                event_id: source_id,
+            },
+            updated_at,
+        };
+        let initial_source_id = event_id(71);
+        let initial_context = V3ProjectionContext {
             project_id,
             projection_generation: 1,
             project_revision: 1,
             source: V3ProjectionSource::NostrEvent {
-                change_id: source_id,
-                event_id: source_id,
+                change_id: initial_source_id,
+                event_id: initial_source_id,
             },
             updated_at: created_at,
         };
         let profile = ProjectViewEntryV3::Active(Box::new(ProjectViewObjectV3 {
             id: *project_id.as_uuid(),
             object_type: ProjectViewObjectType::ProjectProfile,
-            object_revision: 1,
-            project_revision: 1,
+            object_revision: project_revision,
+            project_revision,
             created_at,
-            updated_at: created_at,
+            updated_at,
             created_by: member,
             updated_by: member,
             data: ProjectViewObjectDataV3::ProjectProfile(ProjectProfile {
-                name: "Lora v3".to_owned(),
+                name: project_name.to_owned(),
                 positioning: "Project-owned continuity".to_owned(),
                 purpose: "Keep project context available across runtimes".to_owned(),
                 problem: "Runtime-local context is discontinuous".to_owned(),
@@ -2373,7 +2048,7 @@ mod tests {
             relations: ProjectViewRelations::default(),
             context_references: Vec::new(),
         }));
-        let goal = build_project_object_projection_v3(&context, &goal, None)
+        let goal = build_project_object_projection_v3(&initial_context, &goal, None)
             .expect("build v3 Goal projection")
             .sign_with_keys(relay)
             .expect("sign v3 Goal projection");
@@ -2409,7 +2084,7 @@ mod tests {
                 relations: ProjectViewRelations::default(),
                 context_references,
             }));
-            build_project_object_projection_v3(&context, &resource, None)
+            build_project_object_projection_v3(&initial_context, &resource, None)
                 .expect("build v3 Resource projection")
                 .sign_with_keys(relay)
                 .expect("sign v3 Resource projection")

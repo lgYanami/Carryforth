@@ -20,7 +20,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::client::BuzzClient;
-use crate::commands::project_view_v2_snapshot::{
+use crate::commands::project_view_snapshot::{
     v3_integrity_error, ProjectViewIdentity, ProjectViewSchema,
 };
 use crate::error::CliError;

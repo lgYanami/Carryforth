@@ -78,8 +78,14 @@ jobs:
               - 'migrations/**'
               - 'schema/**'
               - 'scripts/test-project-view-*.sh'
+              - 'scripts/check-project-view-v3-runtime.sh'
+              - 'scripts/meeting-v2-actions-live-acceptance.sh'
               - 'scripts/build-sprig.sh'
               - 'docs/nips/NIP-PV.md'
+              - 'docs/nips/NIP-PV3.md'
+              - 'docs/lora/stage/project-view/**'
+              - 'docs/lora/stage/bug/project-view-v3-*.md'
+              - 'docs/lora/stage/meeting/**'
               - 'docs/project-view-operations.md'
               - 'deploy/charts/buzz/**'
               - 'deploy/compose/**'
@@ -137,6 +143,8 @@ jobs:
           scripts/test-mobile-release-candidate-publisher.sh
       - name: Project View release contract
         run: scripts/test-project-view-release-contract.sh
+      - name: Project View v3-only runtime contract
+        run: scripts/check-project-view-v3-runtime.sh
       - name: Project Document release contract
         run: scripts/test-project-document-release-contract.sh
 
@@ -1012,7 +1020,7 @@ jobs:
         run: just project-document-test-e2e
 
   project-view-pre-feature-rollback:
-    name: Project View Rollback Boundaries
+    name: Project View Pre-feature Database Boundary
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: [changes, desktop-e2e-relay]
@@ -1022,12 +1030,10 @@ jobs:
     env:
       # Last upstream source revision before any Project View crate, kind,
       # migration, or read gate existed. Keep this fixed so the smoke remains
-      # a real pre-feature binary after Project View reaches main.
+      # a real pre-feature binary after Project View reaches main. This proves
+      # additive schema safety before Project View is initialized; it is not a
+      # supported post-mutation application rollback path.
       PROJECT_VIEW_PRE_FEATURE_REF: ab3af828714ab699dfc87644d234014987a4fe6b
-      # Last completed Project View slice before the release/observability
-      # slice. It is old application code that deliberately retains migration
-      # 25, protocol classifiers, and the strict read gate.
-      PROJECT_VIEW_COMPATIBLE_REF: 8ef125c12a9b488a2c047361bf1c1072b735b738
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -1039,16 +1045,10 @@ jobs:
         with:
           path: target/pre-feature/buzz-relay
           key: project-view-pre-feature-relay-${{ runner.os }}-ab3af828-rust-1.95
-      - name: Restore fixed compatible Relay
-        id: compatible-cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: target/compatible/buzz-relay
-          key: project-view-compatible-relay-${{ runner.os }}-8ef125c1-rust-1.95
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-        if: steps.pre-feature-cache.outputs.cache-hit != 'true' || steps.compatible-cache.outputs.cache-hit != 'true'
+        if: steps.pre-feature-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: steps.pre-feature-cache.outputs.cache-hit != 'true' || steps.compatible-cache.outputs.cache-hit != 'true'
+        if: steps.pre-feature-cache.outputs.cache-hit != 'true'
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Build fixed pre-feature Relay
@@ -1076,40 +1076,12 @@ jobs:
         with:
           path: target/pre-feature/buzz-relay
           key: project-view-pre-feature-relay-${{ runner.os }}-ab3af828-rust-1.95
-      - name: Build fixed compatible Relay
-        if: steps.compatible-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          baseline_parent="$(mktemp -d)"
-          baseline_dir="${baseline_parent}/source"
-          cleanup() {
-            git worktree remove --force "${baseline_dir}" 2>/dev/null || true
-            rmdir "${baseline_parent}" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          if ! git cat-file -e "${PROJECT_VIEW_COMPATIBLE_REF}^{commit}"; then
-            git fetch --no-tags origin "${PROJECT_VIEW_COMPATIBLE_REF}"
-          fi
-          git worktree add --detach "${baseline_dir}" "${PROJECT_VIEW_COMPATIBLE_REF}"
-          CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" \
-            cargo build \
-              --manifest-path "${baseline_dir}/Cargo.toml" \
-              --profile ci \
-              -p buzz-relay
-          mkdir -p target/compatible
-          mv target/ci/buzz-relay target/compatible/buzz-relay
-      - name: Save fixed compatible Relay
-        if: steps.compatible-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: target/compatible/buzz-relay
-          key: project-view-compatible-relay-${{ runner.os }}-8ef125c1-rust-1.95
       - name: Download current Project View artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: desktop-e2e-relay
           path: target/current
-      - name: Migration 25 with pre-feature Relay smoke
+      - name: Current additive schema with pre-feature Relay smoke
         env:
           PROJECT_VIEW_PRE_FEATURE_RELAY_BIN: ${{ github.workspace }}/target/pre-feature/buzz-relay
           PROJECT_VIEW_CURRENT_ADMIN_BIN: ${{ github.workspace }}/target/current/buzz-admin
@@ -1118,19 +1090,6 @@ jobs:
             "${PROJECT_VIEW_PRE_FEATURE_RELAY_BIN}" \
             "${PROJECT_VIEW_CURRENT_ADMIN_BIN}"
           scripts/test-project-view-rollback-smoke.sh
-      - name: Post-mutation compatible rollback smoke
-        env:
-          PROJECT_VIEW_COMPATIBLE_RELAY_BIN: ${{ github.workspace }}/target/compatible/buzz-relay
-          PROJECT_VIEW_CURRENT_RELAY_BIN: ${{ github.workspace }}/target/current/buzz-relay
-          PROJECT_VIEW_CURRENT_ADMIN_BIN: ${{ github.workspace }}/target/current/buzz-admin
-          PROJECT_VIEW_CURRENT_BUZZ_BIN: ${{ github.workspace }}/target/current/buzz
-        run: |
-          chmod +x \
-            "${PROJECT_VIEW_COMPATIBLE_RELAY_BIN}" \
-            "${PROJECT_VIEW_CURRENT_RELAY_BIN}" \
-            "${PROJECT_VIEW_CURRENT_ADMIN_BIN}" \
-            "${PROJECT_VIEW_CURRENT_BUZZ_BIN}"
-          scripts/test-project-view-compatible-rollback-smoke.sh
 
   relay-e2e:
     name: Relay E2E

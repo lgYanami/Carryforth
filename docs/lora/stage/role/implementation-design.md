@@ -6,6 +6,13 @@
 >
 > 本文是一份实现设计，不在本阶段提交 Rust、SQL 或客户端代码。
 
+> 2026-08-07 协议覆盖：本文保留的 v2 wire/cutover 描述仅作为历史设计背景。当前
+> Role Continuity 普通运行时已经收敛为 Project View v3-only；完整历史迁移、
+> `v3_role_history` 与防回归边界以
+> [Project View v3 Role History 运行时全量迁移修复设计](../bug/project-view-v3-role-history-runtime-migration-fix-design.md)
+> 为准。v2 只可作为 operator migration/recovery 输入，不再是 CLI、Desktop 或 ACP 的
+> fallback。
+
 > 2026-08-03 局部覆盖：第 9.1 节中“普通 Role 沿用 Project View member 能力”的旧结论已被
 > [Project Role 治理授权与 admin Role 创建修复设计](../bug/project-role-governance-authorization-and-admin-role-creation-fix-design.md)
 > 收敛。普通 member 不再能维护 Role 定义；owner 可治理 admin/member，Active Leader 只可

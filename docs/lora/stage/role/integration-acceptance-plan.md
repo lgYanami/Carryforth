@@ -6,6 +6,11 @@
 > Runtime supervision 与 Role Brief 增量刷新。它定义验收范围、环境、场景、证据和
 > 发布判定，不修改既有概念设计或实现设计。
 >
+> 2026-08-07 覆盖说明：本文的 v2 Role runtime 场景只保留为历史验收记录。当前发布门槛
+> 以 v3-only Role runtime 为准；schema v2 只作为 operator migration 输入，不能作为 CLI、
+> Desktop 或 ACP fallback。见
+> [Project View v3 Role History 运行时全量迁移修复设计](../bug/project-view-v3-role-history-runtime-migration-fix-design.md)。
+>
 > 关联文档：
 >
 > - [项目定位与目标](../../project-positioning.md)

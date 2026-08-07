@@ -327,7 +327,7 @@ Community transaction gate
 - `crates/buzz-cli/src/commands/roles.rs`
 - `crates/buzz-cli/src/commands/project_view.rs`
 - `crates/buzz-cli/src/commands/documents.rs`
-- `crates/buzz-cli/src/commands/project_view_v2_snapshot.rs`
+- `crates/buzz-cli/src/commands/project_view_snapshot.rs`
 
 调整如下：
 

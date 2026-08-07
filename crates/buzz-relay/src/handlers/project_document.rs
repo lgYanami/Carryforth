@@ -137,7 +137,9 @@ async fn handle_command_inner(
             "unavailable:project_document:disabled".to_owned(),
         ));
     }
-    if !matches!(status.project_view_schema_version, 2 | 3) {
+    // Explicit migration/bootstrap/reprojection uses operator-controlled DB
+    // paths. Ordinary Relay ingress is a schema-v3 runtime surface only.
+    if status.project_view_schema_version != 3 {
         return Err(IngestError::Unsupported(
             "unsupported:project_document:schema".to_owned(),
         ));

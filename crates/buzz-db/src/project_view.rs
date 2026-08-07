@@ -6,15 +6,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use buzz_core::kind::{
-    KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION, KIND_PROJECT_VIEW_OBJECT,
-};
+#[cfg(test)]
+use buzz_core::kind::KIND_PROJECT_VIEW_MUTATION;
+use buzz_core::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
 use buzz_core::{CommunityId, PublicKey, StoredEvent};
 use buzz_project_view::{
-    v2::RoleContinuityEntity, DomainError, Mutation, MutationOutcome, MutationRequest,
-    ProjectViewEntry, ProjectViewObject, ProjectViewObjectData, ProjectViewObjectType,
-    ProjectViewRelations, ProjectViewState, ProjectViewTombstone, MUTATION_SCHEMA_VERSION,
+    v2::RoleContinuityEntity, DomainError, ProjectViewEntry, ProjectViewObject,
+    ProjectViewObjectData, ProjectViewObjectType, ProjectViewRelations, ProjectViewState,
+    ProjectViewTombstone,
 };
+#[cfg(test)]
+use buzz_project_view::{Mutation, MutationOutcome, MutationRequest, MUTATION_SCHEMA_VERSION};
 use chrono::{DateTime, Utc};
 use nostr::Event;
 use serde_json::Value;
@@ -89,18 +91,18 @@ pub struct ProjectViewSnapshotCursor {
     pub object_id: Uuid,
 }
 
-/// Keyset cursor for a revision-pinned page of current Role-continuity heads.
+/// Schema-neutral keyset cursor for a revision-pinned page of current Role-continuity heads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProjectViewV2EntityCursor {
+pub struct ProjectViewEntityCursor {
     /// Last entity type returned by the preceding page.
     pub entity_type: RoleContinuityEntity,
     /// Last entity identifier returned by the preceding page.
     pub entity_id: Uuid,
 }
 
-/// Keyset cursor for a revision-pinned Role history page.
+/// Keyset cursor for a revision-pinned schema-v3 Role history page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProjectViewRoleHistoryCursor {
+pub struct ProjectViewV3RoleHistoryCursor {
     /// Canonical project revision of the last history head.
     pub project_revision: u64,
     /// Entity type of the last history head.
@@ -109,9 +111,9 @@ pub struct ProjectViewRoleHistoryCursor {
     pub entity_id: Uuid,
 }
 
-/// Closed filters accepted by the Role history projection reader.
+/// Closed filters accepted by the schema-v3 Role history projection reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectViewRoleHistoryFilter {
+pub struct ProjectViewV3RoleHistoryFilter {
     /// Historical entity types to include.
     pub entity_types: Vec<RoleContinuityEntity>,
     /// Optional Role boundary.
@@ -122,17 +124,17 @@ pub struct ProjectViewRoleHistoryFilter {
     pub member_pubkey: Option<PublicKey>,
 }
 
-/// Complete request for one revision-pinned Role history page.
+/// Complete request for one revision-pinned schema-v3 Role history page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectViewRoleHistoryPageRequest {
+pub struct ProjectViewV3RoleHistoryPageRequest {
     /// Exact Project revision that every returned page must share.
     pub project_revision: u64,
     /// Exact projection generation that every returned page must share.
     pub projection_generation: u64,
     /// Closed Role-history filter.
-    pub filter: ProjectViewRoleHistoryFilter,
+    pub filter: ProjectViewV3RoleHistoryFilter,
     /// Last item returned by the preceding page.
-    pub after: Option<ProjectViewRoleHistoryCursor>,
+    pub after: Option<ProjectViewV3RoleHistoryCursor>,
     /// Maximum number of signed projection events to return.
     pub limit: u16,
 }
@@ -146,7 +148,7 @@ pub struct ProjectViewSnapshotPage {
 
 /// Locked canonical state used to prepare a signer-rotation reprojection.
 #[derive(Debug, Clone)]
-pub struct ProjectViewReprojectContext {
+pub struct LegacyV1ProjectViewReprojectContext {
     /// Complete canonical state, including tombstones.
     pub state: ProjectViewState,
     /// Durable state metadata before the generation change.
@@ -155,7 +157,7 @@ pub struct ProjectViewReprojectContext {
 
 /// Fully signed replacement generation prepared by operator tooling.
 #[derive(Debug, Clone)]
-pub struct PreparedProjectViewReprojection {
+pub struct LegacyV1PreparedProjectViewReprojection {
     /// Canonical state from the locked reprojection context.
     pub state: ProjectViewState,
     /// One new relay-signed head for every occupied object identity.
@@ -168,7 +170,7 @@ pub struct PreparedProjectViewReprojection {
 
 /// Committed replacement generation returned to operator tooling for fan-out.
 #[derive(Debug, Clone)]
-pub struct ProjectViewReprojectOutcome {
+pub struct LegacyV1ProjectViewReprojectOutcome {
     /// New object heads followed by the reset metadata head.
     pub events: Vec<Event>,
     /// Newly committed projection generation.
@@ -199,6 +201,7 @@ pub struct ProjectViewStateMetadata {
 }
 
 /// Locked canonical state and database-derived time for one mutation attempt.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct ProjectViewWriteContext {
     /// Reconstructed pure domain state. Revision zero means uninitialized.
@@ -237,8 +240,9 @@ impl PreparedObjectProjection {
 }
 
 /// Fully prepared inputs for one atomic Project View database commit.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct PreparedProjectViewCommit {
+pub(crate) struct PreparedProjectViewCommit {
     /// Accepted member-signed command event.
     pub command_event: Event,
     /// Parsed typed mutation carried by the command.
@@ -258,6 +262,7 @@ pub struct PreparedProjectViewCommit {
 }
 
 /// Durable idempotency receipt for one accepted Project View mutation.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectViewReceipt {
     /// Signed member command event ID.
@@ -279,8 +284,9 @@ pub struct ProjectViewReceipt {
 }
 
 /// Result of committing or replaying a prepared mutation.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProjectViewCommitOutcome {
+pub(crate) struct ProjectViewCommitOutcome {
     /// Stored receipt returned to the caller.
     pub receipt: ProjectViewReceipt,
     /// `true` when no write occurred because this event ID was already accepted.
@@ -296,8 +302,21 @@ pub struct ProjectViewFeatureStatus {
     pub host: String,
     /// Whether the Community has been archived.
     pub archived: bool,
+    /// Persisted Project View schema discriminator.
+    pub schema_version: i16,
+    /// Whether an exact unconsumed schema-v3 preparation receipt is active.
+    pub prepared: bool,
+    /// Whether canonical Project View state has been initialized.
+    pub initialized: bool,
     /// Centralized Project View write/capability flag.
     pub enabled: bool,
+    /// Whether canonical pointers and every signed projection pass the strict
+    /// schema-v3 verifier against the persisted projection signer.
+    ///
+    /// Ordinary runtime status reads leave this unevaluated so that a cheap
+    /// feature-flag lookup cannot trigger a full cryptographic projection
+    /// scan. Operator status readers populate it explicitly.
+    pub strict_ready: Option<bool>,
     /// Current project revision when initialized.
     pub project_revision: Option<u64>,
     /// Current projection generation when initialized.
@@ -310,25 +329,28 @@ pub struct ProjectViewFeatureStatus {
 ///
 /// Dropping this value before [`Self::commit_mutation`] rolls the SQL
 /// transaction back.
-pub struct ProjectViewWriteTx {
+#[cfg(test)]
+pub(crate) struct ProjectViewWriteTx {
     tx: Transaction<'static, Postgres>,
     community_id: CommunityId,
     loaded_basis: Option<ProjectViewLoadedBasis>,
 }
 
 /// Caller-owned maintenance transaction holding the exclusive Community lock.
-pub struct ProjectViewReprojectTx {
+pub struct LegacyV1ProjectViewReprojectTx {
     tx: Transaction<'static, Postgres>,
     community_id: CommunityId,
-    loaded: Option<ProjectViewReprojectContext>,
+    loaded: Option<LegacyV1ProjectViewReprojectContext>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ProjectViewLoadedBasis {
     state: ProjectViewState,
     canonical_time: DateTime<Utc>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for ProjectViewWriteTx {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -338,10 +360,10 @@ impl std::fmt::Debug for ProjectViewWriteTx {
     }
 }
 
-impl std::fmt::Debug for ProjectViewReprojectTx {
+impl std::fmt::Debug for LegacyV1ProjectViewReprojectTx {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ProjectViewReprojectTx")
+            .debug_struct("LegacyV1ProjectViewReprojectTx")
             .field("community_id", &self.community_id)
             .finish_non_exhaustive()
     }
@@ -465,14 +487,61 @@ impl Db {
         Ok(ready)
     }
 
+    /// Count active Communities that have Project View enabled but still need
+    /// an explicit migration to the schema-v3 runtime.
+    ///
+    /// The catalog probe deliberately tolerates rolling deployments. Before
+    /// `project_view_schema_version` exists, every active enabled Community is
+    /// migration-required. Before the feature column itself exists, the count
+    /// is zero because Project View cannot have been enabled yet.
+    pub async fn project_view_migration_required_count(&self) -> crate::Result<i64> {
+        let (feature_column_exists, schema_column_exists): (bool, bool) = sqlx::query_as(
+            "SELECT \
+                 EXISTS ( \
+                     SELECT 1 FROM pg_attribute \
+                     WHERE attrelid = 'communities'::regclass \
+                       AND attname = 'project_view_enabled' AND NOT attisdropped \
+                 ), \
+                 EXISTS ( \
+                     SELECT 1 FROM pg_attribute \
+                     WHERE attrelid = 'communities'::regclass \
+                       AND attname = 'project_view_schema_version' AND NOT attisdropped \
+                 )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !feature_column_exists {
+            return Ok(0);
+        }
+
+        let count = if schema_column_exists {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM communities \
+                 WHERE project_view_enabled AND archived_at IS NULL \
+                   AND project_view_schema_version IS DISTINCT FROM 3",
+            )
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM communities \
+                 WHERE project_view_enabled AND archived_at IS NULL",
+            )
+            .fetch_one(&self.pool)
+            .await?
+        };
+        Ok(count)
+    }
+
     /// Return whether Project View's deployment-global prerequisites permit
     /// this Relay pod to stay ready.
     ///
     /// A pre-migration database and an all-disabled deployment remain ready so
-    /// binaries can roll out before migration. Once any Community is enabled,
-    /// the complete catalog and an explicitly configured stable signer are
-    /// mandatory. Per-Community projection repair is intentionally excluded
-    /// from this global probe and only suppresses that Host's capability.
+    /// binaries can roll out before migration. Every active enabled Community
+    /// must already be on schema v3; the complete catalog and an explicitly
+    /// configured stable signer are then mandatory. Per-Community projection
+    /// repair is intentionally excluded from this global probe and only
+    /// suppresses that Host's capability.
     pub async fn project_view_deployment_ready(
         &self,
         stable_signer_configured: bool,
@@ -501,105 +570,19 @@ impl Db {
         if !any_enabled {
             return Ok(true);
         }
+        if self.project_view_migration_required_count().await? != 0 {
+            return Ok(false);
+        }
         if !stable_signer_configured {
             return Ok(false);
         }
         self.project_view_schema_ready().await
     }
 
-    /// Return whether one Community may advertise `buzz-project-view-v1`.
-    ///
-    /// Besides the centralized flag, this verifies the stable signer and all
-    /// current canonical projection pointers. An uninitialized Community is
-    /// ready once its schema, flag, and signer are ready.
-    pub async fn project_view_capability_ready(
-        &self,
-        community_id: CommunityId,
-        relay_pubkey: &PublicKey,
-    ) -> crate::Result<bool> {
-        if !self.project_view_schema_ready().await? {
-            return Ok(false);
-        }
-        if crate::relay_members::project_view_schema_version(&self.pool, community_id).await? != 1 {
-            // This reader only understands NIP-PV v1. A v2 Community must
-            // never be advertised through the v1 capability.
-            return Ok(false);
-        }
-
-        let row = sqlx::query(
-            "SELECT c.project_view_enabled, s.project_revision, \
-                    s.active_object_count, s.meta_projection_event_id, \
-                    s.projection_pubkey, s.projection_generation \
-             FROM communities c \
-             LEFT JOIN project_view_state s ON s.community_id = c.id \
-             WHERE c.id = $1 AND c.archived_at IS NULL",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(false);
-        };
-        if !row.try_get::<bool, _>("project_view_enabled")? {
-            return Ok(false);
-        }
-
-        let project_revision: Option<i64> = row.try_get("project_revision")?;
-        let Some(project_revision) = project_revision else {
-            return Ok(true);
-        };
-        if project_revision < 1 {
-            return Ok(false);
-        }
-
-        let stored_pubkey: Option<Vec<u8>> = row.try_get("projection_pubkey")?;
-        let generation: Option<i64> = row.try_get("projection_generation")?;
-        let meta_event_id: Option<Vec<u8>> = row.try_get("meta_projection_event_id")?;
-        let active_object_count: Option<i32> = row.try_get("active_object_count")?;
-        let relay_pubkey_bytes = relay_pubkey.to_bytes();
-        if stored_pubkey.as_deref() != Some(relay_pubkey_bytes.as_slice())
-            || generation.is_none_or(|value| value < 1)
-            || meta_event_id.as_ref().is_none_or(|value| value.len() != 32)
-            || active_object_count.is_none_or(|value| value < 0)
-        {
-            return Ok(false);
-        }
-
-        let consistent: bool = sqlx::query_scalar(
-            "SELECT \
-                (SELECT count(*)::integer FROM project_view_objects o \
-                 WHERE o.community_id = $1 AND o.deleted_at IS NULL) = $4 \
-                AND EXISTS ( \
-                    SELECT 1 FROM events e \
-                    WHERE e.community_id = $1 AND e.id = $2 \
-                      AND e.kind = $5 AND e.pubkey = $3 AND e.deleted_at IS NULL \
-                ) \
-                AND NOT EXISTS ( \
-                    SELECT 1 FROM project_view_objects o \
-                    WHERE o.community_id = $1 \
-                      AND NOT EXISTS ( \
-                          SELECT 1 FROM events e \
-                          WHERE e.community_id = $1 \
-                            AND e.id = o.projection_event_id \
-                            AND e.kind = $6 AND e.pubkey = $3 \
-                            AND e.deleted_at IS NULL \
-                      ) \
-                )",
-        )
-        .bind(community_id.as_uuid())
-        .bind(meta_event_id)
-        .bind(relay_pubkey_bytes.as_slice())
-        .bind(active_object_count)
-        .bind(KIND_PROJECT_VIEW_META as i32)
-        .bind(KIND_PROJECT_VIEW_OBJECT as i32)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(consistent)
-    }
-
     /// Read one active-object page pinned to an exact projection generation
     /// and project revision.
-    pub async fn project_view_snapshot_page(
+    #[cfg(test)]
+    pub(crate) async fn legacy_v1_project_view_snapshot_page(
         &self,
         community_id: CommunityId,
         relay_pubkey: &PublicKey,
@@ -719,23 +702,233 @@ impl Db {
         Ok(ProjectViewSnapshotPage { events })
     }
 
-    /// Read one bounded page containing current Role-continuity heads and the
-    /// small history slice required to assemble Role Briefs.
+    /// Read one page of canonical schema-v2 ordinary-object heads solely for
+    /// the explicit operator v2-to-v3 migration/recovery workflow.
+    ///
+    /// This is deliberately not an ordinary projection query. The page is
+    /// pinned to one exact schema, Relay signer, project revision, and
+    /// projection generation under the Community lock. Every canonical
+    /// projection pointer is resolved and strictly parsed before it is
+    /// returned. Deleted heads are included because tombstones are part of the
+    /// canonical migration snapshot; active Roles remain on the entity page.
+    pub async fn project_view_v2_migration_objects_page(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+        project_revision: u64,
+        projection_generation: u64,
+        after: Option<ProjectViewSnapshotCursor>,
+        limit: u16,
+    ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
+        if !(1..=500).contains(&limit) {
+            return Err(ProjectViewReadError::Inconsistent(
+                "migration object limit must be in 1..=500".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let schema_version = pin_project_view_snapshot_in_tx(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+            project_revision,
+            projection_generation,
+        )
+        .await?;
+        if schema_version != 2 {
+            return Err(ProjectViewReadError::Conflict);
+        }
+        if let Some(cursor) = after {
+            validate_v2_migration_object_cursor(&mut tx, community_id, cursor).await?;
+        }
+
+        let after_type = after.map(|cursor| cursor.object_type.as_str().to_owned());
+        let after_id = after.map(|cursor| cursor.object_id);
+        let rows = sqlx::query(
+            "SELECT object_id, object_type, schema_version, object_revision, \
+                    project_revision, deleted_at, responsible_role_id, projection_event_id \
+             FROM project_view_objects \
+             WHERE community_id = $1 \
+               AND (object_type <> 'role' OR deleted_at IS NOT NULL) \
+               AND ( \
+                   $2::text IS NULL \
+                   OR object_type > $2 \
+                   OR (object_type = $2 AND object_id > $3) \
+               ) \
+             ORDER BY object_type ASC, object_id ASC \
+             LIMIT $4",
+        )
+        .bind(community_id.as_uuid())
+        .bind(after_type)
+        .bind(after_id)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let pointers = v2_migration_object_pointers_from_rows(rows, project_revision)?;
+        let load_pointers = pointers
+            .iter()
+            .map(|pointer| ProjectionPointer {
+                entity_id: pointer.object_id,
+                entity_type: pointer.object_type.as_str().to_owned(),
+                project_revision: pointer.project_revision,
+                event_id: pointer.event_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let events = load_projection_events(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+            KIND_PROJECT_VIEW_OBJECT,
+            &load_pointers,
+        )
+        .await?;
+        validate_v2_migration_object_projections(
+            &pointers,
+            &events,
+            relay_pubkey,
+            community_id,
+            projection_generation,
+        )?;
+        tx.commit().await?;
+        Ok(ProjectViewSnapshotPage { events })
+    }
+
+    /// Read one bounded page of legacy current Role-continuity heads solely as
+    /// input to the explicit operator v2-to-v3 migration/review workflow.
     ///
     /// Historical Proposals, ended Assignments, ended Commitments, and the
     /// complete Checkpoint/Handoff history are deliberately excluded. The consumed Proposal
     /// referenced by an active Assignment remains in the page so a client can
     /// validate the active Assignment's provenance. At most the latest
     /// Checkpoint and three latest Handoffs per Role are included, so this
-    /// default read stays independent of total Role-history length.
-    pub async fn project_view_v2_current_entities_page(
+    /// migration read stays independent of total Role-history length. Ordinary
+    /// Role Brief readers use the strict schema-v3 entry points below.
+    pub async fn project_view_v2_migration_current_entities_page(
         &self,
         community_id: CommunityId,
         relay_pubkey: &PublicKey,
         project_revision: u64,
         projection_generation: u64,
-        after: Option<ProjectViewV2EntityCursor>,
+        after: Option<ProjectViewEntityCursor>,
         limit: u16,
+    ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
+        self.project_view_current_entities_page(
+            community_id,
+            relay_pubkey,
+            project_revision,
+            projection_generation,
+            after,
+            limit,
+            2,
+        )
+        .await
+    }
+
+    /// Read the exact schema-v2 metadata pointer solely for an explicit
+    /// operator v2-to-v3 migration/recovery workflow.
+    ///
+    /// Ordinary Project View readers are v3-only. This deliberately named
+    /// seam pins schema 2 under the Community lock and strictly verifies the
+    /// retained metadata wire before returning it.
+    pub async fn project_view_v2_migration_meta(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+    ) -> ProjectViewReadResult<StoredEvent> {
+        let mut tx = self.pool.begin().await?;
+        acquire_project_view_lock(&mut tx, community_id, true)
+            .await
+            .map_err(project_view_write_to_read)?;
+        let row = sqlx::query(
+            "SELECT community.project_view_schema_version, state.project_revision, \
+                    state.projection_generation, state.projection_pubkey, \
+                    state.meta_projection_event_id \
+             FROM communities community \
+             JOIN project_view_state state ON state.community_id = community.id \
+             WHERE community.id = $1 AND community.archived_at IS NULL FOR SHARE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(ProjectViewReadError::Conflict);
+        };
+        if row.try_get::<i16, _>("project_view_schema_version")? != 2
+            || row.try_get::<Vec<u8>, _>("projection_pubkey")?.as_slice() != relay_pubkey.as_bytes()
+        {
+            return Err(ProjectViewReadError::Conflict);
+        }
+        let project_revision =
+            db_revision_to_u64(row.try_get("project_revision")?, "project_revision")?;
+        let projection_generation = db_revision_to_u64(
+            row.try_get("projection_generation")?,
+            "projection_generation",
+        )?;
+        let event_id: Vec<u8> = row.try_get("meta_projection_event_id")?;
+        if event_id.len() != 32 {
+            return Err(ProjectViewReadError::Inconsistent(
+                "schema-v2 metadata pointer is not 32 bytes".to_owned(),
+            ));
+        }
+        let events =
+            crate::event::get_events_by_ids_in_tx(&mut tx, community_id, &[event_id.as_slice()])
+                .await?;
+        let [stored] = events.as_slice() else {
+            return Err(ProjectViewReadError::Inconsistent(
+                "schema-v2 metadata pointer does not resolve exactly once".to_owned(),
+            ));
+        };
+        let parsed = buzz_sdk::project_view_v2::parse_meta_projection(&stored.event, relay_pubkey)
+            .map_err(|error| {
+                ProjectViewReadError::Inconsistent(format!(
+                    "schema-v2 metadata wire is invalid: {error}"
+                ))
+            })?;
+        if parsed.project_id != community_id
+            || parsed.project_revision != project_revision
+            || parsed.projection_generation != projection_generation
+        {
+            return Err(ProjectViewReadError::Inconsistent(
+                "schema-v2 metadata differs from its canonical pointer".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(stored.clone())
+    }
+
+    /// Read one bounded page of strict schema-v3 current Role-continuity heads.
+    pub async fn project_view_v3_current_entities_page(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+        project_revision: u64,
+        projection_generation: u64,
+        after: Option<ProjectViewEntityCursor>,
+        limit: u16,
+    ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
+        self.project_view_current_entities_page(
+            community_id,
+            relay_pubkey,
+            project_revision,
+            projection_generation,
+            after,
+            limit,
+            3,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn project_view_current_entities_page(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+        project_revision: u64,
+        projection_generation: u64,
+        after: Option<ProjectViewEntityCursor>,
+        limit: u16,
+        expected_schema_version: i16,
     ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
         if !(1..=500).contains(&limit) {
             return Err(ProjectViewReadError::Inconsistent(
@@ -749,7 +942,7 @@ impl Db {
         }
 
         let mut tx = self.pool.begin().await?;
-        pin_project_view_snapshot_in_tx(
+        let schema_version = pin_project_view_snapshot_in_tx(
             &mut tx,
             community_id,
             relay_pubkey,
@@ -757,6 +950,9 @@ impl Db {
             projection_generation,
         )
         .await?;
+        if schema_version != expected_schema_version {
+            return Err(ProjectViewReadError::Conflict);
+        }
 
         if let Some(cursor) = after {
             validate_v2_current_entity_cursor(&mut tx, community_id, cursor).await?;
@@ -851,19 +1047,29 @@ impl Db {
             community_id,
             relay_pubkey,
             KIND_PROJECT_VIEW_OBJECT,
-            pointers,
+            &pointers,
         )
         .await?;
+        if expected_schema_version == 3 {
+            validate_v3_entity_projections(
+                &pointers,
+                &events,
+                relay_pubkey,
+                community_id,
+                projection_generation,
+                "current entity",
+            )?;
+        }
         tx.commit().await?;
         Ok(ProjectViewSnapshotPage { events })
     }
 
-    /// Read one newest-first Role history page pinned to one exact v2 snapshot.
-    pub async fn project_view_role_history_page(
+    /// Read one newest-first Role history page pinned to one exact v3 snapshot.
+    pub async fn project_view_v3_role_history_page(
         &self,
         community_id: CommunityId,
         relay_pubkey: &PublicKey,
-        request: &ProjectViewRoleHistoryPageRequest,
+        request: &ProjectViewV3RoleHistoryPageRequest,
     ) -> ProjectViewReadResult<ProjectViewSnapshotPage> {
         let project_revision = request.project_revision;
         let projection_generation = request.projection_generation;
@@ -896,7 +1102,7 @@ impl Db {
         }
 
         let mut tx = self.pool.begin().await?;
-        pin_project_view_snapshot_in_tx(
+        let schema_version = pin_project_view_snapshot_in_tx(
             &mut tx,
             community_id,
             relay_pubkey,
@@ -904,8 +1110,11 @@ impl Db {
             projection_generation,
         )
         .await?;
+        if schema_version != 3 {
+            return Err(ProjectViewReadError::Conflict);
+        }
         if let Some(cursor) = after {
-            validate_role_history_cursor(&mut tx, community_id, filter, cursor).await?;
+            validate_v3_role_history_cursor(&mut tx, community_id, filter, cursor).await?;
         }
 
         let requested_types = entity_types
@@ -987,18 +1196,26 @@ impl Db {
             community_id,
             relay_pubkey,
             KIND_PROJECT_VIEW_OBJECT,
-            pointers,
+            &pointers,
         )
         .await?;
+        validate_v3_entity_projections(
+            &pointers,
+            &events,
+            relay_pubkey,
+            community_id,
+            projection_generation,
+            "Role history",
+        )?;
         tx.commit().await?;
         Ok(ProjectViewSnapshotPage { events })
     }
 
     /// Begin a disabled-only signer-rotation maintenance transaction.
-    pub async fn begin_project_view_reproject(
+    pub async fn begin_legacy_v1_project_view_reproject(
         &self,
         community_id: CommunityId,
-    ) -> ProjectViewWriteResult<ProjectViewReprojectTx> {
+    ) -> ProjectViewWriteResult<LegacyV1ProjectViewReprojectTx> {
         let mut tx = self.pool.begin().await?;
         acquire_project_view_lock(&mut tx, community_id, false).await?;
         if crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id).await?
@@ -1014,7 +1231,7 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
         match enabled {
-            Some(false) => Ok(ProjectViewReprojectTx {
+            Some(false) => Ok(LegacyV1ProjectViewReprojectTx {
                 tx,
                 community_id,
                 loaded: None,
@@ -1031,7 +1248,8 @@ impl Db {
     /// This acquires the shared namespace's exclusive advisory lock and checks
     /// the centralized feature flag from the writer database before exposing
     /// any canonical state.
-    pub async fn begin_project_view_write(
+    #[cfg(test)]
+    pub(crate) async fn begin_project_view_write(
         &self,
         community_id: CommunityId,
     ) -> ProjectViewWriteResult<ProjectViewWriteTx> {
@@ -1066,7 +1284,15 @@ impl Db {
     pub async fn list_project_view_statuses(&self) -> crate::Result<Vec<ProjectViewFeatureStatus>> {
         let rows = sqlx::query(
             "SELECT c.id, c.host, c.archived_at IS NOT NULL AS archived, \
-                    c.project_view_enabled, s.project_revision, \
+                    c.project_view_schema_version, c.project_view_enabled, \
+                    s.community_id IS NOT NULL AS initialized, \
+                    EXISTS (SELECT 1 FROM project_view_provisioning_operations preparation \
+                            WHERE preparation.community_id = c.id \
+                              AND preparation.operation_id = c.project_view_preparation_operation_id \
+                              AND preparation.operation = 'prepare_v3' \
+                              AND preparation.target_schema_version = 3 \
+                              AND preparation.consumed_by_change_id IS NULL) AS prepared, \
+                    s.project_revision, \
                     s.projection_generation, s.projection_pubkey \
              FROM communities c \
              LEFT JOIN project_view_state s ON s.community_id = c.id \
@@ -1075,7 +1301,9 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(status_from_row).collect()
+        rows.into_iter()
+            .map(status_from_row)
+            .collect::<crate::Result<Vec<_>>>()
     }
 
     /// Return Project View status for one normalized Community host.
@@ -1085,7 +1313,15 @@ impl Db {
     ) -> crate::Result<Option<ProjectViewFeatureStatus>> {
         let row = sqlx::query(
             "SELECT c.id, c.host, c.archived_at IS NOT NULL AS archived, \
-                    c.project_view_enabled, s.project_revision, \
+                    c.project_view_schema_version, c.project_view_enabled, \
+                    s.community_id IS NOT NULL AS initialized, \
+                    EXISTS (SELECT 1 FROM project_view_provisioning_operations preparation \
+                            WHERE preparation.community_id = c.id \
+                              AND preparation.operation_id = c.project_view_preparation_operation_id \
+                              AND preparation.operation = 'prepare_v3' \
+                              AND preparation.target_schema_version = 3 \
+                              AND preparation.consumed_by_change_id IS NULL) AS prepared, \
+                    s.project_revision, \
                     s.projection_generation, s.projection_pubkey \
              FROM communities c \
              LEFT JOIN project_view_state s ON s.community_id = c.id \
@@ -1098,12 +1334,57 @@ impl Db {
         row.map(status_from_row).transpose()
     }
 
-    /// Atomically enable or disable Project View for one Community.
+    /// Return Project View status for every Community and evaluate strict
+    /// schema-v3 projection readiness for operator observability.
+    pub async fn list_project_view_statuses_with_strict_readiness(
+        &self,
+    ) -> crate::Result<Vec<ProjectViewFeatureStatus>> {
+        let mut statuses = self.list_project_view_statuses().await?;
+        self.populate_project_view_strict_readiness(&mut statuses)
+            .await?;
+        Ok(statuses)
+    }
+
+    /// Return Project View status for one host and evaluate strict schema-v3
+    /// projection readiness for operator observability.
+    pub async fn project_view_status_by_host_with_strict_readiness(
+        &self,
+        normalized_host: &str,
+    ) -> crate::Result<Option<ProjectViewFeatureStatus>> {
+        let Some(mut status) = self.project_view_status_by_host(normalized_host).await? else {
+            return Ok(None);
+        };
+        self.populate_project_view_strict_readiness(std::slice::from_mut(&mut status))
+            .await?;
+        Ok(Some(status))
+    }
+
+    async fn populate_project_view_strict_readiness(
+        &self,
+        statuses: &mut [ProjectViewFeatureStatus],
+    ) -> crate::Result<()> {
+        for status in statuses {
+            status.strict_ready = Some(if status.schema_version == 3 && status.initialized {
+                if let Some(relay_pubkey) = status.projection_pubkey {
+                    self.project_view_v3_structural_ready(status.community_id, &relay_pubkey)
+                        .await?
+                } else {
+                    false
+                }
+            } else {
+                false
+            });
+        }
+        Ok(())
+    }
+
+    /// Legacy schema-v1 fixture switch used only by this module's tests.
     ///
     /// The same exclusive advisory lock is used by mutation writers, so a
     /// successful disable cannot race with a later commit from an in-flight
     /// transaction.
-    pub async fn set_project_view_enabled(
+    #[cfg(test)]
+    pub(crate) async fn set_project_view_enabled(
         &self,
         community_id: CommunityId,
         enabled: bool,
@@ -1156,27 +1437,14 @@ impl Db {
             let schema_version =
                 crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
                     .await?;
-            let ready = match schema_version {
-                1 => project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
-                    .await
-                    .map_err(project_view_error_to_db)?,
-                2 => crate::project_view_v2::project_view_v2_enable_ready_in_tx(
-                    &mut tx,
-                    community_id,
-                    relay_pubkey,
-                )
-                .await
-                .map_err(project_view_v2_error_to_db)?,
-                3 => {
-                    Self::project_view_v3_structural_ready_in_tx(
-                        &mut tx,
-                        community_id,
-                        relay_pubkey,
-                    )
-                    .await?
-                }
-                _ => false,
-            };
+            if schema_version != 3 {
+                return Err(DbError::InvalidData(
+                    "Project View enable requires completed schema-v3 migration".to_owned(),
+                ));
+            }
+            let ready =
+                Self::project_view_v3_structural_ready_in_tx(&mut tx, community_id, relay_pubkey)
+                    .await?;
             if !ready {
                 return Err(DbError::InvalidData(
                     "Project View schema, signer, or projection state is not ready".to_owned(),
@@ -1195,11 +1463,12 @@ impl Db {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Atomically enable or disable Project View for all active Communities.
+    /// Legacy schema-v1 bulk fixture switch used only by this module's tests.
     ///
     /// Locks are acquired in UUID order inside one transaction to prevent
     /// cross-admin deadlocks and mutation interleaving.
-    pub async fn set_all_project_views_enabled(&self, enabled: bool) -> crate::Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn set_all_project_views_enabled(&self, enabled: bool) -> crate::Result<u64> {
         let mut tx = self.pool.begin().await?;
         let community_ids: Vec<Uuid> =
             sqlx::query_scalar("SELECT id FROM communities WHERE archived_at IS NULL ORDER BY id")
@@ -1263,19 +1532,17 @@ impl Db {
                 let schema_version =
                     crate::relay_members::project_view_schema_version_in_tx(&mut tx, community_id)
                         .await?;
-                let ready = if schema_version == 2 {
-                    crate::project_view_v2::project_view_v2_enable_ready_in_tx(
-                        &mut tx,
-                        community_id,
-                        relay_pubkey,
-                    )
-                    .await
-                    .map_err(project_view_v2_error_to_db)?
-                } else {
-                    project_view_enable_ready_in_tx(&mut tx, community_id, relay_pubkey)
-                        .await
-                        .map_err(project_view_error_to_db)?
-                };
+                if schema_version != 3 {
+                    return Err(DbError::InvalidData(format!(
+                        "Project View enable requires completed schema-v3 migration for Community {community_id}"
+                    )));
+                }
+                let ready = Self::project_view_v3_structural_ready_in_tx(
+                    &mut tx,
+                    community_id,
+                    relay_pubkey,
+                )
+                .await?;
                 if !ready {
                     return Err(DbError::InvalidData(format!(
                         "Project View is not ready for Community {community_id}"
@@ -1294,13 +1561,8 @@ impl Db {
     }
 }
 
+#[cfg(test)]
 impl ProjectViewWriteTx {
-    /// Return the Community protected by this transaction.
-    #[must_use]
-    pub const fn community_id(&self) -> CommunityId {
-        self.community_id
-    }
-
     /// Explicitly roll back this transaction and release its advisory lock.
     pub async fn rollback(self) -> ProjectViewWriteResult<()> {
         self.tx.rollback().await?;
@@ -1839,7 +2101,7 @@ impl ProjectViewWriteTx {
     }
 }
 
-impl ProjectViewReprojectTx {
+impl LegacyV1ProjectViewReprojectTx {
     /// Return the Community protected by this maintenance transaction.
     #[must_use]
     pub const fn community_id(&self) -> CommunityId {
@@ -1854,7 +2116,9 @@ impl ProjectViewReprojectTx {
 
     /// Lock and reconstruct the initialized canonical state, including every
     /// tombstone whose immutable object identity needs a replacement head.
-    pub async fn load_current(&mut self) -> ProjectViewWriteResult<ProjectViewReprojectContext> {
+    pub async fn load_current(
+        &mut self,
+    ) -> ProjectViewWriteResult<LegacyV1ProjectViewReprojectContext> {
         let state_row = sqlx::query(
             "SELECT project_revision, active_object_count, initialized_at, updated_at, \
                     last_event_id, last_actor_pubkey, meta_projection_event_id, \
@@ -1901,7 +2165,7 @@ impl ProjectViewReprojectTx {
             ));
         }
 
-        let context = ProjectViewReprojectContext { state, metadata };
+        let context = LegacyV1ProjectViewReprojectContext { state, metadata };
         self.loaded = Some(context.clone());
         Ok(context)
     }
@@ -1910,8 +2174,8 @@ impl ProjectViewReprojectTx {
     /// newly signed generation, without changing the domain project revision.
     pub async fn commit_reprojection(
         mut self,
-        prepared: PreparedProjectViewReprojection,
-    ) -> ProjectViewWriteResult<ProjectViewReprojectOutcome> {
+        prepared: LegacyV1PreparedProjectViewReprojection,
+    ) -> ProjectViewWriteResult<LegacyV1ProjectViewReprojectOutcome> {
         let loaded = self.loaded.as_ref().ok_or_else(|| {
             ProjectViewWriteError::InvalidCommit(
                 "reprojection must be prepared from load_current on the same transaction"
@@ -2119,19 +2383,21 @@ impl ProjectViewReprojectTx {
             .await?;
         published_events.push(prepared.meta_projection);
         self.tx.commit().await?;
-        Ok(ProjectViewReprojectOutcome {
+        Ok(LegacyV1ProjectViewReprojectOutcome {
             events: published_events,
             projection_generation: prepared.projection_generation,
         })
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ProjectViewEntryStorageMetadata<'a> {
     pub(crate) schema_version: i16,
     pub(crate) role_level: Option<&'a str>,
     pub(crate) responsible_role_id: Option<Uuid>,
 }
 
+#[cfg(test)]
 pub(crate) async fn write_project_view_entry(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -2308,119 +2574,6 @@ async fn acquire_project_view_lock(
     Ok(())
 }
 
-async fn project_view_schema_ready_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-) -> ProjectViewWriteResult<bool> {
-    let ready: bool = sqlx::query_scalar(
-        "SELECT \
-            EXISTS ( \
-                SELECT 1 FROM pg_attribute \
-                WHERE attrelid = 'communities'::regclass \
-                  AND attname = 'project_view_enabled' AND NOT attisdropped \
-            ) \
-            AND to_regclass('project_view_state') IS NOT NULL \
-            AND to_regclass('project_view_objects') IS NOT NULL \
-            AND to_regclass('project_view_mutations') IS NOT NULL \
-            AND to_regclass('idx_project_view_objects_active_type') IS NOT NULL \
-            AND to_regclass('idx_project_view_objects_project_revision') IS NOT NULL \
-            AND EXISTS ( \
-                SELECT 1 FROM pg_attribute \
-                WHERE attrelid = to_regclass('project_view_state') \
-                  AND attname = 'projection_generation' AND NOT attisdropped \
-            ) \
-            AND EXISTS ( \
-                SELECT 1 FROM pg_attribute \
-                WHERE attrelid = to_regclass('project_view_objects') \
-                  AND attname = 'projection_event_id' AND NOT attisdropped \
-            )",
-    )
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(ready)
-}
-
-async fn project_view_enable_ready_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    relay_pubkey: &PublicKey,
-) -> ProjectViewWriteResult<bool> {
-    if !project_view_schema_ready_in_tx(tx).await? {
-        return Ok(false);
-    }
-    if crate::relay_members::project_view_schema_version_in_tx(tx, community_id).await? != 1 {
-        return Ok(false);
-    }
-
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL \
-         )",
-    )
-    .bind(community_id.as_uuid())
-    .fetch_one(&mut **tx)
-    .await?;
-    if !active {
-        return Ok(false);
-    }
-
-    let row = sqlx::query(
-        "SELECT project_revision, active_object_count, meta_projection_event_id, \
-                projection_pubkey, projection_generation \
-         FROM project_view_state WHERE community_id = $1 FOR SHARE",
-    )
-    .bind(community_id.as_uuid())
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some(row) = row else {
-        return Ok(true);
-    };
-
-    let project_revision: i64 = row.try_get("project_revision")?;
-    let active_object_count: i32 = row.try_get("active_object_count")?;
-    let meta_event_id: Vec<u8> = row.try_get("meta_projection_event_id")?;
-    let projection_pubkey: Vec<u8> = row.try_get("projection_pubkey")?;
-    let projection_generation: i64 = row.try_get("projection_generation")?;
-    if project_revision < 1
-        || active_object_count < 0
-        || meta_event_id.len() != 32
-        || projection_generation < 1
-        || projection_pubkey.as_slice() != relay_pubkey.as_bytes()
-    {
-        return Ok(false);
-    }
-
-    let consistent: bool = sqlx::query_scalar(
-        "SELECT \
-            (SELECT count(*)::integer FROM project_view_objects o \
-             WHERE o.community_id = $1 AND o.deleted_at IS NULL) = $4 \
-            AND EXISTS ( \
-                SELECT 1 FROM events e \
-                WHERE e.community_id = $1 AND e.id = $2 \
-                  AND e.kind = $5 AND e.pubkey = $3 AND e.deleted_at IS NULL \
-            ) \
-            AND NOT EXISTS ( \
-                SELECT 1 FROM project_view_objects o \
-                WHERE o.community_id = $1 \
-                  AND NOT EXISTS ( \
-                      SELECT 1 FROM events e \
-                      WHERE e.community_id = $1 \
-                        AND e.id = o.projection_event_id \
-                        AND e.kind = $6 AND e.pubkey = $3 \
-                        AND e.deleted_at IS NULL \
-                  ) \
-            )",
-    )
-    .bind(community_id.as_uuid())
-    .bind(meta_event_id)
-    .bind(relay_pubkey.as_bytes())
-    .bind(active_object_count)
-    .bind(KIND_PROJECT_VIEW_META as i32)
-    .bind(KIND_PROJECT_VIEW_OBJECT as i32)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(consistent)
-}
-
 fn status_from_row(row: sqlx::postgres::PgRow) -> crate::Result<ProjectViewFeatureStatus> {
     let community_id: Uuid = row.try_get("id")?;
     let project_revision: Option<i64> = row.try_get("project_revision")?;
@@ -2431,7 +2584,11 @@ fn status_from_row(row: sqlx::postgres::PgRow) -> crate::Result<ProjectViewFeatu
         community_id: CommunityId::from_uuid(community_id),
         host: row.try_get("host")?,
         archived: row.try_get("archived")?,
+        schema_version: row.try_get("project_view_schema_version")?,
+        prepared: row.try_get("prepared")?,
+        initialized: row.try_get("initialized")?,
         enabled: row.try_get("project_view_enabled")?,
+        strict_ready: None,
         project_revision: project_revision
             .map(|revision| db_revision_to_u64(revision, "project_revision"))
             .transpose()?,
@@ -2532,6 +2689,7 @@ pub(crate) fn entry_from_row(
     }))
 }
 
+#[cfg(test)]
 fn receipt_from_row(row: sqlx::postgres::PgRow) -> ProjectViewWriteResult<ProjectViewReceipt> {
     let event_id: Vec<u8> = row.try_get("event_id")?;
     let actor_pubkey: Vec<u8> = row.try_get("actor_pubkey")?;
@@ -2650,19 +2808,193 @@ const fn role_history_entity_order(entity_type: RoleContinuityEntity) -> Option<
     }
 }
 
+#[derive(Debug, Clone)]
+struct V2MigrationObjectPointer {
+    object_id: Uuid,
+    object_type: ProjectViewObjectType,
+    object_revision: u64,
+    project_revision: u64,
+    deleted: bool,
+    responsible_role_id: Option<Uuid>,
+    event_id: Vec<u8>,
+}
+
+async fn validate_v2_migration_object_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    cursor: ProjectViewSnapshotCursor,
+) -> ProjectViewReadResult<()> {
+    let row = sqlx::query(
+        "SELECT object_type, schema_version, deleted_at \
+         FROM project_view_objects \
+         WHERE community_id = $1 AND object_id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(cursor.object_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(ProjectViewReadError::InvalidCursor(
+            "migration object cursor is not a canonical object head".to_owned(),
+        ));
+    };
+    let object_type: String = row.try_get("object_type")?;
+    let schema_version: i16 = row.try_get("schema_version")?;
+    let deleted = row
+        .try_get::<Option<DateTime<Utc>>, _>("deleted_at")?
+        .is_some();
+    if object_type != cursor.object_type.as_str()
+        || schema_version != 2
+        || (cursor.object_type == ProjectViewObjectType::Role && !deleted)
+    {
+        return Err(ProjectViewReadError::InvalidCursor(
+            "migration object cursor is outside the schema-v2 ordinary-head set".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn v2_migration_object_pointers_from_rows(
+    rows: Vec<sqlx::postgres::PgRow>,
+    pinned_revision: u64,
+) -> ProjectViewReadResult<Vec<V2MigrationObjectPointer>> {
+    let mut pointers = Vec::with_capacity(rows.len());
+    let mut event_ids = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let object_id: Uuid = row.try_get("object_id")?;
+        let object_type_text: String = row.try_get("object_type")?;
+        let object_type = project_view_object_type_for_read(&object_type_text)?;
+        let schema_version: i16 = row.try_get("schema_version")?;
+        let object_revision =
+            db_revision_to_u64(row.try_get("object_revision")?, "object_revision")?;
+        let project_revision =
+            db_revision_to_u64(row.try_get("project_revision")?, "project_revision")?;
+        let deleted = row
+            .try_get::<Option<DateTime<Utc>>, _>("deleted_at")?
+            .is_some();
+        let responsible_role_id: Option<Uuid> = row.try_get("responsible_role_id")?;
+        let event_id: Option<Vec<u8>> = row.try_get("projection_event_id")?;
+        let Some(event_id) = event_id.filter(|event_id| event_id.len() == 32) else {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "migration object {object_type_text} {object_id} has an invalid projection pointer"
+            )));
+        };
+        if schema_version != 2
+            || object_revision == 0
+            || project_revision == 0
+            || project_revision > pinned_revision
+            || (object_type == ProjectViewObjectType::Role && !deleted)
+        {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "migration object {object_type_text} {object_id} is outside the pinned schema-v2 ordinary-head set"
+            )));
+        }
+        if !event_ids.insert(event_id.clone()) {
+            return Err(ProjectViewReadError::Inconsistent(
+                "migration object page contains a duplicate projection pointer".to_owned(),
+            ));
+        }
+        pointers.push(V2MigrationObjectPointer {
+            object_id,
+            object_type,
+            object_revision,
+            project_revision,
+            deleted,
+            responsible_role_id,
+            event_id,
+        });
+    }
+    Ok(pointers)
+}
+
+fn project_view_object_type_for_read(value: &str) -> ProjectViewReadResult<ProjectViewObjectType> {
+    match value {
+        "project_profile" => Ok(ProjectViewObjectType::ProjectProfile),
+        "goal" => Ok(ProjectViewObjectType::Goal),
+        "role" => Ok(ProjectViewObjectType::Role),
+        "plan" => Ok(ProjectViewObjectType::Plan),
+        "stage" => Ok(ProjectViewObjectType::Stage),
+        "requirement" => Ok(ProjectViewObjectType::Requirement),
+        "issue" => Ok(ProjectViewObjectType::Issue),
+        "work" => Ok(ProjectViewObjectType::Work),
+        "resource" => Ok(ProjectViewObjectType::Resource),
+        other => Err(ProjectViewReadError::Inconsistent(format!(
+            "unknown canonical Project View object type: {other}"
+        ))),
+    }
+}
+
+fn validate_v2_migration_object_projections(
+    pointers: &[V2MigrationObjectPointer],
+    events: &[StoredEvent],
+    relay_pubkey: &PublicKey,
+    community_id: CommunityId,
+    projection_generation: u64,
+) -> ProjectViewReadResult<()> {
+    if pointers.len() != events.len() {
+        return Err(ProjectViewReadError::Inconsistent(
+            "migration object projection count disagrees with canonical state".to_owned(),
+        ));
+    }
+    for (pointer, event) in pointers.iter().zip(events) {
+        let projection = buzz_sdk::project_view_v2::parse_project_object_projection(
+            &event.event,
+            relay_pubkey,
+            community_id,
+        )
+        .map_err(|error| {
+            ProjectViewReadError::Inconsistent(format!(
+                "migration object {} {} is not a strict schema-v2 projection: {error}",
+                pointer.object_type.as_str(),
+                pointer.object_id
+            ))
+        })?;
+        let deletion_matches = matches!(
+            (&projection.object, pointer.deleted),
+            (
+                buzz_sdk::project_view_v2::V2ProjectedObject::Active(_),
+                false
+            ) | (
+                buzz_sdk::project_view_v2::V2ProjectedObject::Tombstone(_),
+                true
+            )
+        );
+        if projection.object.id() != pointer.object_id
+            || projection.object.object_type() != pointer.object_type
+            || projection.object.object_revision() != pointer.object_revision
+            || projection.project_revision != pointer.project_revision
+            || projection.projection_generation != projection_generation
+            || projection.responsible_role_id != pointer.responsible_role_id
+            || !deletion_matches
+        {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "migration object {} {} projection metadata disagrees with canonical state",
+                pointer.object_type.as_str(),
+                pointer.object_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn pin_project_view_snapshot_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     relay_pubkey: &PublicKey,
     project_revision: u64,
     projection_generation: u64,
-) -> ProjectViewReadResult<()> {
+) -> ProjectViewReadResult<i16> {
     acquire_project_view_lock(tx, community_id, true)
         .await
         .map_err(project_view_write_to_read)?;
     let state_row = sqlx::query(
-        "SELECT project_revision, projection_generation, projection_pubkey \
-         FROM project_view_state WHERE community_id = $1 FOR SHARE",
+        "SELECT state.project_revision, state.projection_generation, \
+                state.projection_pubkey, state.schema_version, \
+                community.project_view_schema_version \
+         FROM project_view_state state \
+         JOIN communities community ON community.id = state.community_id \
+         WHERE state.community_id = $1 AND community.archived_at IS NULL \
+         FOR SHARE OF state, community",
     )
     .bind(community_id.as_uuid())
     .fetch_optional(&mut **tx)
@@ -2677,19 +3009,22 @@ async fn pin_project_view_snapshot_in_tx(
         "projection_generation",
     )?;
     let current_pubkey: Vec<u8> = state_row.try_get("projection_pubkey")?;
+    let schema_version: i16 = state_row.try_get("schema_version")?;
+    let community_schema_version: i16 = state_row.try_get("project_view_schema_version")?;
     if current_revision != project_revision
         || current_generation != projection_generation
         || current_pubkey.as_slice() != relay_pubkey.as_bytes()
+        || community_schema_version != schema_version
     {
         return Err(ProjectViewReadError::Conflict);
     }
-    Ok(())
+    Ok(schema_version)
 }
 
 async fn validate_v2_current_entity_cursor(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
-    cursor: ProjectViewV2EntityCursor,
+    cursor: ProjectViewEntityCursor,
 ) -> ProjectViewReadResult<()> {
     let exists = match cursor.entity_type {
         RoleContinuityEntity::Role => {
@@ -2811,11 +3146,11 @@ async fn validate_v2_current_entity_cursor(
     Ok(())
 }
 
-async fn validate_role_history_cursor(
+async fn validate_v3_role_history_cursor(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
-    filter: &ProjectViewRoleHistoryFilter,
-    cursor: ProjectViewRoleHistoryCursor,
+    filter: &ProjectViewV3RoleHistoryFilter,
+    cursor: ProjectViewV3RoleHistoryCursor,
 ) -> ProjectViewReadResult<()> {
     let cursor_revision = i64::try_from(cursor.project_revision).map_err(|_| {
         ProjectViewReadError::Inconsistent(
@@ -2920,11 +3255,19 @@ async fn validate_role_history_cursor(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ProjectionPointer {
+    entity_id: Uuid,
+    entity_type: String,
+    project_revision: u64,
+    event_id: Vec<u8>,
+}
+
 fn projection_pointers_from_rows(
     rows: Vec<sqlx::postgres::PgRow>,
     pinned_revision: u64,
     label: &str,
-) -> ProjectViewReadResult<Vec<(Uuid, String, Vec<u8>)>> {
+) -> ProjectViewReadResult<Vec<ProjectionPointer>> {
     let mut pointers = Vec::with_capacity(rows.len());
     let mut event_ids = HashSet::with_capacity(rows.len());
     for row in rows {
@@ -2948,7 +3291,12 @@ fn projection_pointers_from_rows(
                 "{label} contains a duplicate projection pointer"
             )));
         }
-        pointers.push((entity_id, entity_type, event_id));
+        pointers.push(ProjectionPointer {
+            entity_id,
+            entity_type,
+            project_revision: entity_revision,
+            event_id,
+        });
     }
     Ok(pointers)
 }
@@ -2958,11 +3306,11 @@ async fn load_projection_events(
     community_id: CommunityId,
     relay_pubkey: &PublicKey,
     expected_kind: u32,
-    pointers: Vec<(Uuid, String, Vec<u8>)>,
+    pointers: &[ProjectionPointer],
 ) -> ProjectViewReadResult<Vec<StoredEvent>> {
     let id_refs = pointers
         .iter()
-        .map(|(_, _, event_id)| event_id.as_slice())
+        .map(|pointer| pointer.event_id.as_slice())
         .collect::<Vec<_>>();
     let stored = crate::event::get_events_by_ids_in_tx(tx, community_id, &id_refs).await?;
     let by_id = stored
@@ -2970,15 +3318,17 @@ async fn load_projection_events(
         .map(|event| (event.event.id.to_bytes(), event))
         .collect::<HashMap<_, _>>();
     let mut events = Vec::with_capacity(pointers.len());
-    for (entity_id, entity_type, event_id) in pointers {
-        let event_id: [u8; 32] = event_id.try_into().map_err(|_| {
+    for pointer in pointers {
+        let event_id: [u8; 32] = pointer.event_id.as_slice().try_into().map_err(|_| {
             ProjectViewReadError::Inconsistent(format!(
-                "{entity_type} {entity_id} has an invalid projection pointer"
+                "{} {} has an invalid projection pointer",
+                pointer.entity_type, pointer.entity_id
             ))
         })?;
         let event = by_id.get(&event_id).ok_or_else(|| {
             ProjectViewReadError::Inconsistent(format!(
-                "{entity_type} {entity_id} points at a missing projection"
+                "{} {} points at a missing projection",
+                pointer.entity_type, pointer.entity_id
             ))
         })?;
         if event.event.kind.as_u16() as u32 != expected_kind
@@ -2986,12 +3336,52 @@ async fn load_projection_events(
             || event.channel_id.is_some()
         {
             return Err(ProjectViewReadError::Inconsistent(format!(
-                "{entity_type} {entity_id} points at an invalid projection"
+                "{} {} points at an invalid projection",
+                pointer.entity_type, pointer.entity_id
             )));
         }
         events.push(event.clone());
     }
     Ok(events)
+}
+
+fn validate_v3_entity_projections(
+    pointers: &[ProjectionPointer],
+    events: &[StoredEvent],
+    relay_pubkey: &PublicKey,
+    community_id: CommunityId,
+    projection_generation: u64,
+    label: &str,
+) -> ProjectViewReadResult<()> {
+    if pointers.len() != events.len() {
+        return Err(ProjectViewReadError::Inconsistent(format!(
+            "{label} projection count disagrees with canonical state"
+        )));
+    }
+    for (pointer, event) in pointers.iter().zip(events) {
+        let projection = buzz_sdk::project_view_v3::parse_entity_projection(
+            &event.event,
+            relay_pubkey,
+            community_id,
+        )
+        .map_err(|error| {
+            ProjectViewReadError::Inconsistent(format!(
+                "{label} {} {} is not a strict schema-v3 projection: {error}",
+                pointer.entity_type, pointer.entity_id
+            ))
+        })?;
+        if projection.entity.entity_id() != pointer.entity_id
+            || projection.entity.entity_type().as_str() != pointer.entity_type
+            || projection.project_revision != pointer.project_revision
+            || projection.projection_generation != projection_generation
+        {
+            return Err(ProjectViewReadError::Inconsistent(format!(
+                "{label} {} {} projection metadata disagrees with canonical state",
+                pointer.entity_type, pointer.entity_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn revision_to_i64(value: u64, field: &str) -> ProjectViewWriteResult<i64> {
@@ -3008,14 +3398,6 @@ fn project_view_error_to_db(error: ProjectViewWriteError) -> DbError {
     }
 }
 
-fn project_view_v2_error_to_db(error: crate::project_view_v2::ProjectViewV2WriteError) -> DbError {
-    match error {
-        crate::project_view_v2::ProjectViewV2WriteError::Database(error) => error,
-        crate::project_view_v2::ProjectViewV2WriteError::Sqlx(error) => DbError::Sqlx(error),
-        other => DbError::InvalidData(other.to_string()),
-    }
-}
-
 fn project_view_write_to_read(error: ProjectViewWriteError) -> ProjectViewReadError {
     match error {
         ProjectViewWriteError::Database(error) => ProjectViewReadError::Database(error),
@@ -3024,6 +3406,7 @@ fn project_view_write_to_read(error: ProjectViewWriteError) -> ProjectViewReadEr
     }
 }
 
+#[cfg(test)]
 fn mutation_identity(
     mutation: &Mutation,
 ) -> (&'static str, Option<ProjectViewObjectType>, Option<Uuid>) {
@@ -3045,6 +3428,7 @@ fn mutation_identity(
     }
 }
 
+#[cfg(test)]
 fn object_body(data: &ProjectViewObjectData) -> ProjectViewWriteResult<Value> {
     let mut value = serde_json::to_value(data).map_err(DbError::from)?;
     value.get_mut("data").map(Value::take).ok_or_else(|| {
@@ -3062,6 +3446,7 @@ fn active_count(state: &ProjectViewState) -> ProjectViewWriteResult<i32> {
     })
 }
 
+#[cfg(test)]
 fn validate_prepared_commit(commit: &PreparedProjectViewCommit) -> ProjectViewWriteResult<()> {
     if commit.command_event.kind.as_u16() as u32 != KIND_PROJECT_VIEW_MUTATION {
         return Err(ProjectViewWriteError::InvalidCommit(format!(
@@ -3171,7 +3556,8 @@ mod tests {
         RUNTIME_SUPERVISION_SCHEMA_VERSION,
     };
     use buzz_project_view::v3::{
-        MaintenanceAckCommand, MaintenanceAckRequest, PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
+        MaintenanceAckCommand, MaintenanceAckRequest, ResourceMappingManifestV1,
+        PROJECT_VIEW_MAINTENANCE_ACK_SCHEMA_VERSION,
     };
     use buzz_project_view::{
         CreateMutation, DeleteMutation, Goal, InitializeGoal, InitializeMutation,
@@ -3191,6 +3577,7 @@ mod tests {
         parse_project_object_projection, V2EntityCounts, V2ProjectionContext, V2ProjectionSource,
     };
     use buzz_sdk::role_brief::VerifiedRoleBriefSnapshot;
+    use chrono::TimeZone as _;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
@@ -3204,6 +3591,96 @@ mod tests {
         ProjectViewV2CutoverPlan, ProjectViewV2PrepareOutcome,
         ProjectViewV2ProjectObjectPrepareOutcome, ProjectViewV2WriteError,
     };
+
+    #[test]
+    fn v2_migration_object_projection_validation_is_strict_and_tombstone_aware() {
+        let relay = Keys::generate();
+        let actor = Keys::generate();
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let object_id = Uuid::new_v4();
+        let created_at = Utc
+            .timestamp_opt(1_900_000_000, 0)
+            .single()
+            .expect("valid canonical time");
+        let deleted_at = Utc
+            .timestamp_opt(1_900_000_060, 0)
+            .single()
+            .expect("valid canonical time");
+        let source_event = EventBuilder::new(Kind::TextNote, "delete migration object")
+            .custom_created_at(Timestamp::from(1_900_000_060_u64))
+            .sign_with_keys(&actor)
+            .expect("sign migration source event");
+        let entry = ProjectViewEntry::Tombstone(ProjectViewTombstone {
+            id: object_id,
+            object_type: ProjectViewObjectType::Goal,
+            object_revision: 2,
+            project_revision: 7,
+            created_at,
+            deleted_at,
+            created_by: actor.public_key(),
+            deleted_by: actor.public_key(),
+        });
+        let context = V2ProjectionContext {
+            project_id: community_id,
+            projection_generation: 2,
+            project_revision: 7,
+            source: V2ProjectionSource::NostrEvent {
+                change_id: source_event.id,
+                event_id: source_event.id,
+            },
+            updated_at: deleted_at,
+        };
+        let event = build_project_object_projection_with_responsibility(&context, &entry, None)
+            .expect("build v2 migration tombstone")
+            .sign_with_keys(&relay)
+            .expect("sign v2 migration tombstone");
+        let stored = StoredEvent::new(event.clone(), None);
+        let pointer = V2MigrationObjectPointer {
+            object_id,
+            object_type: ProjectViewObjectType::Goal,
+            object_revision: 2,
+            project_revision: 7,
+            deleted: true,
+            responsible_role_id: None,
+            event_id: event.id.to_bytes().to_vec(),
+        };
+
+        validate_v2_migration_object_projections(
+            std::slice::from_ref(&pointer),
+            std::slice::from_ref(&stored),
+            &relay.public_key(),
+            community_id,
+            2,
+        )
+        .expect("strict canonical tombstone must pass");
+
+        let mut active_pointer = pointer.clone();
+        active_pointer.deleted = false;
+        assert!(validate_v2_migration_object_projections(
+            &[active_pointer],
+            std::slice::from_ref(&stored),
+            &relay.public_key(),
+            community_id,
+            2,
+        )
+        .is_err());
+        assert!(validate_v2_migration_object_projections(
+            std::slice::from_ref(&pointer),
+            std::slice::from_ref(&stored),
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .is_err());
+        assert!(validate_v2_migration_object_projections(
+            &[pointer],
+            &[stored],
+            &Keys::generate().public_key(),
+            community_id,
+            2,
+        )
+        .is_err());
+    }
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
@@ -3249,16 +3726,124 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres and CREATE DATABASE"]
+    async fn deployment_readiness_rejects_enabled_legacy_schema_but_allows_disabled_cutover() {
+        let scratch = ScratchDatabase::create("buzz_pv_v3_readiness").await;
+        let db = Db::from_pool(scratch.pool.clone());
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+
+        let mut fixture = scratch.pool.begin().await.expect("begin legacy fixture");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *fixture)
+            .await
+            .expect("suspend cross-domain fixture triggers");
+        sqlx::query(
+            "INSERT INTO communities \
+                 (id, host, project_view_enabled, project_view_schema_version) \
+             VALUES ($1, $2, TRUE, 2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(format!("project-view-v3-readiness-{community_id}.test"))
+        .execute(&mut *fixture)
+        .await
+        .expect("seed enabled schema-v2 fixture");
+        fixture.commit().await.expect("commit legacy fixture");
+
+        assert_eq!(
+            db.project_view_migration_required_count()
+                .await
+                .expect("count enabled legacy Communities"),
+            1
+        );
+        assert!(!db
+            .project_view_deployment_ready(true)
+            .await
+            .expect("enabled legacy Community fails deployment readiness"));
+
+        let mut disable = scratch.pool.begin().await.expect("begin fixture disable");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *disable)
+            .await
+            .expect("suspend fixture triggers for disable");
+        sqlx::query("UPDATE communities SET project_view_enabled = FALSE WHERE id = $1")
+            .bind(community_id.as_uuid())
+            .execute(&mut *disable)
+            .await
+            .expect("disable legacy fixture");
+        disable.commit().await.expect("commit fixture disable");
+
+        assert_eq!(
+            db.project_view_migration_required_count()
+                .await
+                .expect("disabled legacy Community needs no active-runtime migration"),
+            0
+        );
+        assert!(db
+            .project_view_deployment_ready(false)
+            .await
+            .expect("all-disabled legacy deployment stays ready for operator migration"));
+
+        scratch.cleanup().await;
+    }
+
     async fn seed_community(pool: &PgPool, enabled: bool) -> CommunityId {
         let community_id = CommunityId::from_uuid(Uuid::new_v4());
-        sqlx::query("INSERT INTO communities (id, host, project_view_enabled) VALUES ($1, $2, $3)")
-            .bind(community_id.as_uuid())
-            .bind(format!("project-view-{}.test", community_id.as_uuid()))
-            .bind(enabled)
-            .execute(pool)
-            .await
-            .expect("seed Project View community");
+        // This module contains explicit v1/v2 migration and recovery tests.
+        // Never let those fixtures silently follow the schema-v3 greenfield
+        // default; tests that need v3 advance their coordinate explicitly.
+        sqlx::query(
+            "INSERT INTO communities \
+                (id, host, project_view_enabled, project_view_schema_version) \
+             VALUES ($1, $2, $3, 1)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(format!("project-view-{}.test", community_id.as_uuid()))
+        .bind(enabled)
+        .execute(pool)
+        .await
+        .expect("seed Project View community");
         community_id
+    }
+
+    /// Enable only a canonical schema-v2 test fixture after the legacy
+    /// structural/signer preflight succeeds. Ordinary production enable is
+    /// v3-only; this helper deliberately has no runtime or CLI surface.
+    async fn enable_canonical_legacy_v2_fixture_if_ready(
+        pool: &PgPool,
+        community_id: CommunityId,
+        relay_pubkey: &PublicKey,
+    ) -> bool {
+        let mut tx = pool.begin().await.expect("begin legacy v2 fixture enable");
+        acquire_project_view_lock(&mut tx, community_id, false)
+            .await
+            .expect("lock legacy v2 fixture enable");
+        let ready = crate::project_view_v2::project_view_v2_enable_ready_in_tx(
+            &mut tx,
+            community_id,
+            relay_pubkey,
+        )
+        .await
+        .expect("verify canonical legacy v2 fixture");
+        if !ready {
+            tx.rollback()
+                .await
+                .expect("release rejected legacy v2 fixture enable");
+            return false;
+        }
+        let updated = sqlx::query(
+            "UPDATE communities SET project_view_enabled = TRUE \
+             WHERE id = $1 AND project_view_schema_version = 2 \
+               AND NOT project_view_enabled",
+        )
+        .bind(community_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("enable canonical legacy v2 fixture");
+        tx.commit()
+            .await
+            .expect("commit canonical legacy v2 fixture enable");
+        updated.rows_affected() == 1
     }
 
     #[tokio::test]
@@ -3746,7 +4331,7 @@ mod tests {
         state: ProjectViewState,
         projection_generation: u64,
         canonical_time: DateTime<Utc>,
-    ) -> PreparedProjectViewReprojection {
+    ) -> LegacyV1PreparedProjectViewReprojection {
         let object_projections = state
             .entries()
             .values()
@@ -3787,7 +4372,7 @@ mod tests {
             vec![Tag::parse(["d", meta_coordinate.as_str()]).expect("meta d tag")],
             canonical_time,
         );
-        PreparedProjectViewReprojection {
+        LegacyV1PreparedProjectViewReprojection {
             state,
             object_projections,
             meta_projection,
@@ -5213,7 +5798,7 @@ mod tests {
         .await;
 
         assert!(
-            !db.project_view_capability_ready(community_id, &relay.public_key())
+            !db.project_view_v3_advertised_write_ready(community_id, &relay.public_key())
                 .await
                 .expect("v1 capability check must understand the v2 boundary"),
             "a v2 Community must never advertise buzz-project-view-v1"
@@ -5563,7 +6148,7 @@ mod tests {
         old_event_ids.push(old_meta);
 
         let mut maintenance = db
-            .begin_project_view_reproject(community_id)
+            .begin_legacy_v1_project_view_reproject(community_id)
             .await
             .expect("begin disabled reprojection");
         let context = maintenance
@@ -5625,13 +6210,27 @@ mod tests {
         assert_eq!(new_live_count, 4);
 
         let page = db
-            .project_view_snapshot_page(community_id, &new_relay.public_key(), 3, 2, None, 500)
+            .legacy_v1_project_view_snapshot_page(
+                community_id,
+                &new_relay.public_key(),
+                3,
+                2,
+                None,
+                500,
+            )
             .await
             .expect("read revision-pinned active snapshot");
         assert_eq!(page.events.len(), 2, "tombstone is not in active snapshot");
         assert!(matches!(
-            db.project_view_snapshot_page(community_id, &new_relay.public_key(), 3, 1, None, 500,)
-                .await,
+            db.legacy_v1_project_view_snapshot_page(
+                community_id,
+                &new_relay.public_key(),
+                3,
+                1,
+                None,
+                500,
+            )
+            .await,
             Err(ProjectViewReadError::Conflict)
         ));
 
@@ -5642,27 +6241,32 @@ mod tests {
         assert!(db
             .set_project_view_enabled_checked(community_id, true, Some(&new_relay.public_key()))
             .await
-            .expect("enable after successful reprojection"));
-        assert!(db
-            .project_view_capability_ready(community_id, &new_relay.public_key())
-            .await
-            .expect("verify rotated capability"));
+            .is_err());
         assert!(!db
+            .project_view_v3_advertised_write_ready(community_id, &new_relay.public_key())
+            .await
+            .expect("legacy reprojection must not advertise the v3 runtime"));
+        assert!(db
             .project_view_deployment_ready(false)
             .await
-            .expect("enabled Project View requires stable signer"));
+            .expect("disabled legacy Project View does not require a runtime signer"));
         assert!(db
             .project_view_deployment_ready(true)
             .await
-            .expect("enabled Project View accepts configured signer"));
-        assert!(db.begin_project_view_reproject(community_id).await.is_err());
+            .expect("disabled legacy Project View remains deployment-safe"));
+        db.begin_legacy_v1_project_view_reproject(community_id)
+            .await
+            .expect("legacy recovery may rotate another disabled generation")
+            .rollback()
+            .await
+            .expect("release second legacy recovery transaction");
 
         scratch.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
-    async fn v2_cutover_assignment_replacement_and_stale_fence_form_one_vertical_slice() {
+    async fn legacy_v2_to_v3_operator_cutover_preserves_full_continuity_history() {
         let scratch = ScratchDatabase::create("buzz_pv_v2_role_slice").await;
         let db = Db::from_pool(scratch.pool.clone());
         let community_id = seed_community(&scratch.pool, true).await;
@@ -5791,9 +6395,12 @@ mod tests {
         .await
         .expect("temporarily retire one v2 head");
         assert!(
-            db.set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()),)
-                .await
-                .is_err(),
+            !enable_canonical_legacy_v2_fixture_if_ready(
+                &scratch.pool,
+                community_id,
+                &relay.public_key(),
+            )
+            .await,
             "enable preflight must reject an incomplete signed v2 generation"
         );
         sqlx::query(
@@ -5806,10 +6413,14 @@ mod tests {
         .await
         .expect("restore v2 head after enable preflight check");
 
-        assert!(db
-            .set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()),)
+        assert!(
+            enable_canonical_legacy_v2_fixture_if_ready(
+                &scratch.pool,
+                community_id,
+                &relay.public_key(),
+            )
             .await
-            .expect("enable verified v2 projection"));
+        );
         assert!(db
             .project_view_v2_capability_ready(community_id, &relay.public_key())
             .await
@@ -6475,7 +7086,7 @@ mod tests {
             .expect("verify final v2 capability"));
 
         let current_page = db
-            .project_view_v2_current_entities_page(
+            .project_view_v2_migration_current_entities_page(
                 community_id,
                 &relay.public_key(),
                 16,
@@ -6493,12 +7104,12 @@ mod tests {
         )
         .expect("parse current-page cursor");
         let current_next = db
-            .project_view_v2_current_entities_page(
+            .project_view_v2_migration_current_entities_page(
                 community_id,
                 &relay.public_key(),
                 16,
                 2,
-                Some(ProjectViewV2EntityCursor {
+                Some(ProjectViewEntityCursor {
                     entity_type: current_last.entity.entity_type(),
                     entity_id: current_last.entity.entity_id(),
                 }),
@@ -6507,8 +7118,20 @@ mod tests {
             .await
             .expect("continue bounded current Role heads");
         assert_eq!(current_next.events.len(), 2);
+        assert!(matches!(
+            db.project_view_v3_current_entities_page(
+                community_id,
+                &relay.public_key(),
+                16,
+                2,
+                None,
+                2,
+            )
+            .await,
+            Err(ProjectViewReadError::Conflict)
+        ));
 
-        let history_filter = ProjectViewRoleHistoryFilter {
+        let history_filter = ProjectViewV3RoleHistoryFilter {
             entity_types: vec![
                 RoleContinuityEntity::RoleAssignmentProposal,
                 RoleContinuityEntity::RoleAssignment,
@@ -6519,11 +7142,11 @@ mod tests {
             assignment_id: None,
             member_pubkey: None,
         };
-        let history_page = db
-            .project_view_role_history_page(
+        assert!(matches!(
+            db.project_view_v3_role_history_page(
                 community_id,
                 &relay.public_key(),
-                &ProjectViewRoleHistoryPageRequest {
+                &ProjectViewV3RoleHistoryPageRequest {
                     project_revision: 16,
                     projection_generation: 2,
                     filter: history_filter.clone(),
@@ -6531,59 +7154,381 @@ mod tests {
                     limit: 2,
                 },
             )
-            .await
-            .expect("read first revision-pinned Role history page");
-        assert_eq!(history_page.events.len(), 2);
-        let history_last = buzz_sdk::project_view_v2::parse_entity_projection(
-            &history_page.events[1].event,
-            &relay.public_key(),
-            community_id,
-        )
-        .expect("parse Role history cursor");
-        let history_cursor = ProjectViewRoleHistoryCursor {
-            project_revision: history_last.project_revision,
-            entity_type: history_last.entity.entity_type(),
-            entity_id: history_last.entity.entity_id(),
-        };
-        let history_next = db
-            .project_view_role_history_page(
-                community_id,
-                &relay.public_key(),
-                &ProjectViewRoleHistoryPageRequest {
-                    project_revision: 16,
-                    projection_generation: 2,
-                    filter: history_filter.clone(),
-                    after: Some(history_cursor),
-                    limit: 2,
-                },
-            )
-            .await
-            .expect("continue revision-pinned Role history");
-        assert_eq!(history_next.events.len(), 2);
-        assert!(history_page.events.iter().all(|first| history_next
-            .events
-            .iter()
-            .all(|next| first.event.id != next.event.id)));
+            .await,
+            Err(ProjectViewReadError::Conflict)
+        ));
 
-        let wrong_role_filter = ProjectViewRoleHistoryFilter {
-            role_id: Some(Uuid::new_v4()),
-            ..history_filter
-        };
+        // The ordinary CLI/Relay v1/v2 runtime no longer exists. Complete the
+        // compatibility proof through the explicit operator APIs against this
+        // real canonical schema-v2 fixture instead.
+        let legacy_history: Vec<(String, Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT 'role_assignment_proposal'::text, proposal_id, projection_event_id \
+             FROM project_role_assignment_proposals WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'role_assignment'::text, assignment_id, projection_event_id \
+             FROM project_role_assignments WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'work_commitment'::text, commitment_id, projection_event_id \
+             FROM project_work_commitments WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'role_checkpoint'::text, checkpoint_id, projection_event_id \
+             FROM project_role_checkpoints WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'role_handoff'::text, handoff_id, projection_event_id \
+             FROM project_role_handoffs WHERE community_id = $1 \
+             ORDER BY 1, 2",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_all(&scratch.pool)
+        .await
+        .expect("capture complete schema-v2 continuity history");
+        assert!(
+            legacy_history.len() >= 8,
+            "fixture must contain multiple current and historical continuity heads"
+        );
+        assert!(legacy_history.iter().all(|(_, _, event_id)| {
+            event_id
+                .as_ref()
+                .is_some_and(|event_id| event_id.len() == 32)
+        }));
+
+        let mut unbootstrapped = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin unbootstrapped Document preflight");
         assert!(matches!(
-            db.project_view_role_history_page(
+            crate::project_view_v3_migration::require_document_projection_ready_in_tx(
+                &mut unbootstrapped,
                 community_id,
                 &relay.public_key(),
-                &ProjectViewRoleHistoryPageRequest {
-                    project_revision: 16,
-                    projection_generation: 2,
-                    filter: wrong_role_filter,
-                    after: Some(history_cursor),
-                    limit: 2,
-                },
             )
             .await,
-            Err(ProjectViewReadError::InvalidCursor(_))
+            Err(crate::project_view_v3_migration::ProjectViewV3MigrationError::Unavailable(_))
         ));
+        unbootstrapped
+            .rollback()
+            .await
+            .expect("release unbootstrapped Document preflight");
+
+        let document_time = db
+            .project_document_canonical_now()
+            .await
+            .expect("read Document bootstrap time");
+        let document_catalog = DocumentCatalog::empty(community_id, 1, document_time)
+            .expect("build empty Document catalog for migration");
+        let document_plan = DocumentProjectionPlan::for_bootstrap(&document_catalog)
+            .expect("build Document bootstrap projection plan");
+        let document_meta = build_document_meta_projection(&document_plan, &[])
+            .expect("build Document bootstrap metadata")
+            .sign_with_keys(&relay)
+            .expect("sign Document bootstrap metadata");
+        db.bootstrap_empty_project_document_catalog(PreparedProjectDocumentBootstrap {
+            catalog: document_catalog,
+            meta_projection: document_meta,
+        })
+        .await
+        .expect("bootstrap empty Document catalog for migration");
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT project_document_enabled FROM communities WHERE id = $1",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_one(&scratch.pool)
+            .await
+            .expect("read migration Document capability"),
+            "schema-v2 migration input must remain unadvertised"
+        );
+        let mut valid_document = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin valid Document migration preflight");
+        crate::project_view_v3_migration::require_document_projection_ready_in_tx(
+            &mut valid_document,
+            community_id,
+            &relay.public_key(),
+        )
+        .await
+        .expect("disabled, signer-pinned Document history is valid migration input");
+        valid_document
+            .rollback()
+            .await
+            .expect("release valid Document migration preflight");
+
+        let wrong_document_signer = Keys::generate();
+        let mut wrong_signer = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin wrong Document signer preflight");
+        assert!(matches!(
+            crate::project_view_v3_migration::require_document_projection_ready_in_tx(
+                &mut wrong_signer,
+                community_id,
+                &wrong_document_signer.public_key(),
+            )
+            .await,
+            Err(crate::project_view_v3_migration::ProjectViewV3MigrationError::Unavailable(_))
+        ));
+        wrong_signer
+            .rollback()
+            .await
+            .expect("release wrong Document signer preflight");
+
+        let document_meta_event_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT meta_projection_event_id FROM project_document_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read Document metadata pointer");
+        let mut missing_projection = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin missing Document projection preflight");
+        sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&document_meta_event_id)
+        .execute(&mut *missing_projection)
+        .await
+        .expect("retire Document metadata inside negative transaction");
+        assert!(matches!(
+            crate::project_view_v3_migration::require_document_projection_ready_in_tx(
+                &mut missing_projection,
+                community_id,
+                &relay.public_key(),
+            )
+            .await,
+            Err(crate::project_view_v3_migration::ProjectViewV3MigrationError::Invalid(_))
+        ));
+        missing_projection
+            .rollback()
+            .await
+            .expect("restore missing Document projection negative fixture");
+
+        let mut inconsistent_projection = scratch
+            .pool
+            .begin()
+            .await
+            .expect("begin inconsistent Document projection preflight");
+        sqlx::query(
+            "UPDATE project_document_state SET active_document_count = 1 \
+             WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .execute(&mut *inconsistent_projection)
+        .await
+        .expect("stage inconsistent Document count inside negative transaction");
+        assert!(matches!(
+            crate::project_view_v3_migration::require_document_projection_ready_in_tx(
+                &mut inconsistent_projection,
+                community_id,
+                &relay.public_key(),
+            )
+            .await,
+            Err(crate::project_view_v3_migration::ProjectViewV3MigrationError::Invalid(_))
+        ));
+        inconsistent_projection
+            .rollback()
+            .await
+            .expect("restore inconsistent Document projection negative fixture");
+
+        let draft = db
+            .export_project_view_v3_resource_draft(
+                community_id,
+                owner.public_key(),
+                &relay.public_key(),
+            )
+            .await
+            .expect("export exact empty Resource mapping set");
+        assert!(
+            draft.entries.is_empty(),
+            "the compatibility fixture intentionally has no legacy Resources"
+        );
+        let base_meta_event_id: [u8; 32] = hex::decode(&draft.base_meta_event_id)
+            .expect("decode v2 base metadata event ID")
+            .try_into()
+            .expect("v2 base metadata event ID must contain 32 bytes");
+        let manifest = ResourceMappingManifestV1 {
+            schema_version: 1,
+            community_id: *community_id.as_uuid().as_bytes(),
+            base_meta_event_id,
+            base_project_revision: draft.base_project_revision,
+            base_projection_generation: draft.base_projection_generation,
+            entries: Vec::new(),
+        };
+        db.validate_project_view_v3_resource_manifest(community_id, &manifest, &relay.public_key())
+            .await
+            .expect("validate exact empty Resource mapping set");
+
+        let begin = db
+            .begin_project_view_v3_maintenance(
+                community_id,
+                owner.public_key(),
+                1,
+                "legacy-v2-to-v3-canary-begin",
+                &relay.public_key(),
+            )
+            .await
+            .expect("begin explicit schema-v2 drain");
+        let epoch = begin.maintenance_epoch;
+        let readiness = db
+            .project_view_maintenance_readiness(community_id, epoch, 30)
+            .await
+            .expect("read maintenance readiness");
+        assert_eq!(readiness["ready_to_freeze"], true);
+        assert_eq!(readiness["assignments"], serde_json::json!([]));
+        assert_eq!(readiness["runtimes"], serde_json::json!([]));
+        db.freeze_project_view_v3_maintenance(
+            community_id,
+            epoch,
+            owner.public_key(),
+            "legacy-v2-to-v3-canary-freeze",
+        )
+        .await
+        .expect("freeze exact drained schema-v2 epoch");
+
+        let v3_cutover = db
+            .cutover_project_view_v3(
+                community_id,
+                epoch,
+                owner.public_key(),
+                "legacy-v2-to-v3-canary-cutover",
+                &manifest,
+                &relay,
+            )
+            .await
+            .expect("cut canonical schema-v2 state over to schema v3");
+        assert_eq!(v3_cutover.project_revision, 17);
+        assert_eq!(v3_cutover.projection_generation, 3);
+        assert!(!v3_cutover.replayed);
+        db.verify_project_view_v3_maintenance(
+            community_id,
+            epoch,
+            owner.public_key(),
+            "legacy-v2-to-v3-canary-verify",
+            &relay.public_key(),
+        )
+        .await
+        .expect("verify strict schema-v3 projection closure");
+        db.resume_project_view_v3_maintenance(
+            community_id,
+            epoch,
+            owner.public_key(),
+            "legacy-v2-to-v3-canary-resume",
+            &relay.public_key(),
+        )
+        .await
+        .expect("resume verified schema-v3 runtime");
+        assert!(db
+            .project_view_v3_advertised_write_ready(community_id, &relay.public_key())
+            .await
+            .expect("verify strict schema-v3 advertised readiness"));
+        assert!(db
+            .set_project_document_enabled_checked(community_id, true, Some(&relay.public_key()),)
+            .await
+            .expect("enable Document only after verified schema-v3 resume"));
+
+        let migrated_history: Vec<(String, Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT 'role_assignment_proposal'::text, proposal_id, projection_event_id \
+             FROM project_role_assignment_proposals WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'role_assignment'::text, assignment_id, projection_event_id \
+             FROM project_role_assignments WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'work_commitment'::text, commitment_id, projection_event_id \
+             FROM project_work_commitments WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'role_checkpoint'::text, checkpoint_id, projection_event_id \
+             FROM project_role_checkpoints WHERE community_id = $1 \
+             UNION ALL \
+             SELECT 'role_handoff'::text, handoff_id, projection_event_id \
+             FROM project_role_handoffs WHERE community_id = $1 \
+             ORDER BY 1, 2",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_all(&scratch.pool)
+        .await
+        .expect("read complete schema-v3 continuity history");
+        assert_eq!(
+            migrated_history
+                .iter()
+                .map(|(kind, id, _)| (kind, id))
+                .collect::<Vec<_>>(),
+            legacy_history
+                .iter()
+                .map(|(kind, id, _)| (kind, id))
+                .collect::<Vec<_>>(),
+            "cutover must preserve every canonical continuity identity"
+        );
+        for (legacy, migrated) in legacy_history.iter().zip(&migrated_history) {
+            let legacy_event_id = legacy.2.as_ref().expect("v2 history projection pointer");
+            let migrated_event_id = migrated.2.as_ref().expect("v3 history projection pointer");
+            assert_eq!(migrated_event_id.len(), 32);
+            assert_ne!(
+                migrated_event_id, legacy_event_id,
+                "every retained continuity row must receive a strict v3 projection"
+            );
+        }
+
+        let expected_role_history: i64 = sqlx::query_scalar(
+            "SELECT \
+                 (SELECT count(*) FROM project_role_assignment_proposals \
+                  WHERE community_id = $1 AND role_id = $2) + \
+                 (SELECT count(*) FROM project_role_assignments \
+                  WHERE community_id = $1 AND role_id = $2) + \
+                 (SELECT count(*) FROM project_role_checkpoints \
+                  WHERE community_id = $1 AND role_id = $2) + \
+                 (SELECT count(*) FROM project_role_handoffs \
+                  WHERE community_id = $1 AND role_id = $2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(role_id)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("count retained Role history");
+        let mut history_cursor = None;
+        let mut paged_role_history = 0_usize;
+        loop {
+            let page = db
+                .project_view_v3_role_history_page(
+                    community_id,
+                    &relay.public_key(),
+                    &ProjectViewV3RoleHistoryPageRequest {
+                        project_revision: 17,
+                        projection_generation: 3,
+                        filter: history_filter.clone(),
+                        after: history_cursor,
+                        limit: 2,
+                    },
+                )
+                .await
+                .expect("page retained Role history through the strict v3 reader");
+            let Some(last) = page.events.last() else {
+                break;
+            };
+            let last = buzz_sdk::project_view_v3::parse_entity_projection(
+                &last.event,
+                &relay.public_key(),
+                community_id,
+            )
+            .expect("parse strict v3 Role history cursor");
+            history_cursor = Some(ProjectViewV3RoleHistoryCursor {
+                project_revision: last.project_revision,
+                entity_type: last.entity.entity_type(),
+                entity_id: last.entity.entity_id(),
+            });
+            paged_role_history = paged_role_history.saturating_add(page.events.len());
+        }
+        assert_eq!(
+            paged_role_history,
+            usize::try_from(expected_role_history).expect("non-negative Role history count")
+        );
 
         scratch.cleanup().await;
     }
@@ -6726,7 +7671,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
-    async fn trusted_runtime_supervision_fails_closed_and_commits_one_system_change() {
+    async fn legacy_v2_runtime_supervision_commits_one_system_change() {
         let scratch = ScratchDatabase::create("buzz_pv_runtime_supervision").await;
         let db = Db::from_pool(scratch.pool.clone());
         let community_id = seed_community(&scratch.pool, true).await;
@@ -6788,10 +7733,15 @@ mod tests {
             .await
             .expect("cut runtime fixture over to v2");
         assert_eq!(cutover.project_revision, 3);
-        assert!(db
-            .set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()))
-            .await
-            .expect("enable verified runtime fixture"));
+        assert!(
+            enable_canonical_legacy_v2_fixture_if_ready(
+                &scratch.pool,
+                community_id,
+                &relay.public_key(),
+            )
+            .await,
+            "enable verified runtime fixture"
+        );
 
         let proposal_id = Uuid::new_v4();
         commit_v2_role_for_test(
@@ -7449,7 +8399,7 @@ mod tests {
         );
 
         let system = db
-            .end_unrecoverable_assignment(&claims[0], &relay)
+            .end_unrecoverable_assignment_legacy_v2_for_test(&claims[0], &relay)
             .await
             .expect("commit atomic unrecoverable system change");
         assert_eq!(system.project_revision, 7);
@@ -7459,7 +8409,7 @@ mod tests {
             event.kind.as_u16() as u32 == buzz_core::kind::KIND_PROJECT_VIEW_META
         }));
         let replay = db
-            .end_unrecoverable_assignment(&claims[0], &relay)
+            .end_unrecoverable_assignment_legacy_v2_for_test(&claims[0], &relay)
             .await
             .expect("replay system idempotency receipt");
         assert!(replay.replayed);
@@ -7659,10 +8609,15 @@ mod tests {
             )
             .await
             .expect("cut readiness fixture to v2");
-        assert!(db
-            .set_project_view_enabled_checked(community_id, true, Some(&relay.public_key()))
-            .await
-            .expect("enable readiness fixture"));
+        assert!(
+            enable_canonical_legacy_v2_fixture_if_ready(
+                &scratch.pool,
+                community_id,
+                &relay.public_key(),
+            )
+            .await,
+            "enable readiness fixture"
+        );
         let proposal_id = Uuid::new_v4();
         commit_v2_role_for_test(
             &db,

@@ -565,6 +565,15 @@ export type EnsureMeetingActionRenewalResult = {
   status: "started" | "already_active";
 };
 
+export type EnsureMeetingHumanGrantRenewalInput = {
+  meetingId: string;
+  grantId: string;
+};
+
+export type EnsureMeetingHumanGrantRenewalResult = {
+  status: "started" | "already_active";
+};
+
 export async function getMeetingCapability(): Promise<MeetingCapability> {
   return invokeTauri<MeetingCapability>("get_meeting_capability");
 }
@@ -605,6 +614,15 @@ export async function ensureMeetingActionRenewal(
 ): Promise<EnsureMeetingActionRenewalResult> {
   return invokeTauri<EnsureMeetingActionRenewalResult>(
     "ensure_meeting_action_renewal",
+    { input },
+  );
+}
+
+export async function ensureMeetingHumanGrantRenewal(
+  input: EnsureMeetingHumanGrantRenewalInput,
+): Promise<EnsureMeetingHumanGrantRenewalResult> {
+  return invokeTauri<EnsureMeetingHumanGrantRenewalResult>(
+    "ensure_meeting_human_grant_renewal",
     { input },
   );
 }

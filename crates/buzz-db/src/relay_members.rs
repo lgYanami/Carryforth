@@ -7,6 +7,7 @@
 //! lowercase hex strings.
 
 use chrono::{DateTime, Utc};
+use nostr::PublicKey;
 use sqlx::{PgPool, Postgres, Row as _, Transaction};
 
 use crate::error::{DbError, Result};
@@ -46,7 +47,9 @@ pub(crate) async fn project_view_schema_version_in_tx(
     .fetch_one(&mut **tx)
     .await?;
     if !column_exists {
-        return Ok(1);
+        return Err(DbError::InvalidData(
+            "Project View schema migration 0026 is required".to_owned(),
+        ));
     }
     // The caller already holds the Community/Project advisory lock. Taking a
     // row-level UPDATE lock here would unnecessarily block unrelated event
@@ -60,8 +63,9 @@ pub(crate) async fn project_view_schema_version_in_tx(
 
 /// Return one Community's Project View schema version.
 ///
-/// Before migration 0026 exists, the established schema is v1. This fallback
-/// keeps server-first rollouts and migration-disabled deployments compatible.
+/// The schema coordinate is mandatory. A database older than migration 0026
+/// is not a supported ordinary runtime and fails closed instead of being
+/// silently interpreted as Project View v1.
 pub async fn project_view_schema_version(pool: &PgPool, community: CommunityId) -> Result<i16> {
     let column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS ( \
@@ -74,7 +78,9 @@ pub async fn project_view_schema_version(pool: &PgPool, community: CommunityId) 
     .fetch_one(pool)
     .await?;
     if !column_exists {
-        return Ok(1);
+        return Err(DbError::InvalidData(
+            "Project View schema migration 0026 is required".to_owned(),
+        ));
     }
     sqlx::query_scalar("SELECT project_view_schema_version FROM communities WHERE id = $1")
         .bind(community.as_uuid())
@@ -83,7 +89,7 @@ pub async fn project_view_schema_version(pool: &PgPool, community: CommunityId) 
         .ok_or_else(|| DbError::NotFound(format!("community {community}")))
 }
 
-async fn is_governed_in_tx(
+async fn uses_project_view_membership_governance_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community: CommunityId,
 ) -> Result<bool> {
@@ -93,8 +99,74 @@ async fn is_governed_in_tx(
     ))
 }
 
-fn v2_membership_coordinator_unavailable() -> DbError {
-    DbError::AccessDenied("unavailable:project_view_v2:membership_coordinator".to_owned())
+fn membership_coordinator_unavailable() -> DbError {
+    DbError::AccessDenied("unavailable:project_view:membership_coordinator".to_owned())
+}
+
+fn greenfield_v3_owner_bootstrap_allowed(
+    schema_version: i16,
+    project_view_enabled: bool,
+    has_preparation: bool,
+    has_project_view_state: bool,
+    owner_count: usize,
+    relay_member_count: usize,
+) -> bool {
+    schema_version == 3
+        && !project_view_enabled
+        && !has_preparation
+        && !has_project_view_state
+        && owner_count == 0
+        && relay_member_count == 0
+}
+
+async fn greenfield_v3_owner_bootstrap_allowed_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    owner_count: usize,
+) -> Result<bool> {
+    // Every committed canonical Project View object, change, and continuity
+    // row is directly or transitively constrained to project_view_state for
+    // the same Community. Therefore absence of that root proves absence of
+    // committed canonical children. The shared Community advisory lock also
+    // prevents a concurrent Project View transaction from creating the root
+    // after this check and before the owner insert.
+    let (
+        schema_version,
+        project_view_enabled,
+        has_preparation,
+        has_project_view_state,
+        relay_member_count,
+        bootstrap_lifecycle_valid,
+    ): (i16, bool, bool, bool, i64, bool) = sqlx::query_as(
+        "SELECT community.project_view_schema_version, community.project_view_enabled, \
+                community.project_view_preparation_operation_id IS NOT NULL, \
+                EXISTS (SELECT 1 FROM project_view_state state \
+                        WHERE state.community_id = community.id), \
+                (SELECT count(*) FROM relay_members member \
+                 WHERE member.community_id = community.id), \
+                project_view_v3_bootstrap_lifecycle_valid(community.id) \
+         FROM communities community WHERE community.id = $1",
+    )
+    .bind(community.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DbError::NotFound(format!("community {community}")))?;
+
+    let relay_member_count = usize::try_from(relay_member_count).map_err(|_| {
+        DbError::InvalidData(format!(
+            "negative relay member count for community {community}"
+        ))
+    })?;
+
+    Ok(bootstrap_lifecycle_valid
+        && greenfield_v3_owner_bootstrap_allowed(
+            schema_version,
+            project_view_enabled,
+            has_preparation,
+            has_project_view_state,
+            owner_count,
+            relay_member_count,
+        ))
 }
 
 pub(crate) async fn insert_relay_member_in_tx(
@@ -160,7 +232,7 @@ pub(crate) async fn has_owned_managed_agent_assignment_in_tx(
 /// Derive the non-owner Community level implied by a Member's active Role
 /// Assignment inside an already locked membership transaction.
 ///
-/// The v2 coordinator uses this when an owner is transferred or an Assignment
+/// Project View membership governance uses this when an owner is transferred or an Assignment
 /// ends; Community `owner` itself remains an out-of-band governance root.
 pub async fn assignment_derived_member_role_in_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -221,6 +293,64 @@ pub struct RelayMembershipIdentity {
     /// Whether the managed Agent and owner currently satisfy the complete
     /// owner-backed membership rule.
     pub managed_owner_eligible: bool,
+}
+
+const ELIGIBLE_DIRECT_HUMAN_ROLE_SQL: &str = "SELECT member.role \
+     FROM relay_members member \
+     LEFT JOIN users actor \
+       ON actor.community_id = member.community_id \
+      AND actor.pubkey = decode(member.pubkey, 'hex') \
+     WHERE member.community_id = $1 AND member.pubkey = $2 \
+       AND ($3::boolean = FALSE OR member.role = 'owner') \
+       AND actor.agent_owner_pubkey IS NULL \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM community_bans restriction \
+           WHERE restriction.community_id = member.community_id \
+             AND restriction.pubkey = $4 \
+             AND ( \
+                 (restriction.banned AND (restriction.ban_expires_at IS NULL \
+                     OR restriction.ban_expires_at > clock_timestamp())) \
+                 OR restriction.muted_until > clock_timestamp() \
+             ) \
+       )";
+
+/// Resolve the current eligible direct-Human role inside an existing
+/// Community transaction.
+///
+/// This is the canonical identity predicate for reviewed Project View
+/// migration input. Managed Agents, owner-delegated identities, active bans,
+/// and active timeouts all fail closed.
+pub(crate) async fn eligible_direct_human_role_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    pubkey: &PublicKey,
+    owner_only: bool,
+) -> Result<Option<String>> {
+    let bytes = pubkey.to_bytes();
+    Ok(sqlx::query_scalar(ELIGIBLE_DIRECT_HUMAN_ROLE_SQL)
+        .bind(community.as_uuid())
+        .bind(pubkey.to_hex())
+        .bind(owner_only)
+        .bind(bytes.as_slice())
+        .fetch_optional(&mut **tx)
+        .await?)
+}
+
+/// Resolve the current eligible direct-Human role in one database snapshot.
+pub async fn eligible_direct_human_role(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &PublicKey,
+    owner_only: bool,
+) -> Result<Option<String>> {
+    let bytes = pubkey.to_bytes();
+    Ok(sqlx::query_scalar(ELIGIBLE_DIRECT_HUMAN_ROLE_SQL)
+        .bind(community.as_uuid())
+        .bind(pubkey.to_hex())
+        .bind(owner_only)
+        .bind(bytes.as_slice())
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// Resolve one principal's direct and managed-Agent membership state in one
@@ -412,13 +542,13 @@ pub async fn add_relay_member(
     added_by: Option<&str>,
 ) -> Result<bool> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_governed_in_tx(&mut tx, community).await? {
+    if uses_project_view_membership_governance_in_tx(&mut tx, community).await? {
         if matches!(role, "admin" | "owner") {
             return Err(DbError::AccessDenied(
                 "forbidden:membership:role_requires_governance".to_owned(),
             ));
         }
-        return Err(v2_membership_coordinator_unavailable());
+        return Err(membership_coordinator_unavailable());
     }
     let inserted = insert_relay_member_in_tx(&mut tx, community, pubkey, role, added_by).await?;
     tx.commit().await?;
@@ -438,13 +568,13 @@ pub async fn claim_relay_membership(
     policy_version: Option<&str>,
 ) -> Result<bool> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_governed_in_tx(&mut tx, community).await? {
+    if uses_project_view_membership_governance_in_tx(&mut tx, community).await? {
         if role != "member" {
             return Err(DbError::AccessDenied(
                 "forbidden:membership:invite_cannot_grant_role".to_owned(),
             ));
         }
-        return Err(v2_membership_coordinator_unavailable());
+        return Err(membership_coordinator_unavailable());
     }
     let inserted =
         insert_relay_member_in_tx(&mut tx, community, pubkey, role, Some("invite")).await?;
@@ -495,7 +625,7 @@ pub enum RemoveResult {
     NotFound,
     /// The member exists but their role doesn't match the expected role.
     RoleMismatch,
-    /// Project View v2 still has an active Assignment for this Member.
+    /// Project View still has an active Assignment for this Member.
     AssignmentActive,
     /// The Human owns a managed Agent with an active Assignment.
     ManagedAgentAssignmentActive,
@@ -525,14 +655,14 @@ pub async fn remove_relay_member_with_revocation(
 ) -> Result<RemoveResult> {
     let revoked_pubkey = decode_pubkey(pubkey)?;
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_governed_in_tx(&mut tx, community).await? {
+    if uses_project_view_membership_governance_in_tx(&mut tx, community).await? {
         if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
             return Ok(RemoveResult::AssignmentActive);
         }
         if has_owned_managed_agent_assignment_in_tx(&mut tx, community, pubkey).await? {
             return Ok(RemoveResult::ManagedAgentAssignmentActive);
         }
-        return Err(v2_membership_coordinator_unavailable());
+        return Err(membership_coordinator_unavailable());
     }
     let result = sqlx::query(
         "DELETE FROM relay_members \
@@ -614,14 +744,14 @@ pub async fn remove_relay_member_if_role_with_revocation(
 ) -> Result<RemoveResult> {
     let revoked_pubkey = decode_pubkey(pubkey)?;
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_governed_in_tx(&mut tx, community).await? {
+    if uses_project_view_membership_governance_in_tx(&mut tx, community).await? {
         if has_active_assignment_in_tx(&mut tx, community, pubkey).await? {
             return Ok(RemoveResult::AssignmentActive);
         }
         if has_owned_managed_agent_assignment_in_tx(&mut tx, community, pubkey).await? {
             return Ok(RemoveResult::ManagedAgentAssignmentActive);
         }
-        return Err(v2_membership_coordinator_unavailable());
+        return Err(membership_coordinator_unavailable());
     }
     let result = sqlx::query(
         "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3",
@@ -692,7 +822,7 @@ pub async fn update_relay_member_role(
     new_role: &str,
 ) -> Result<bool> {
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_governed_in_tx(&mut tx, community).await? {
+    if uses_project_view_membership_governance_in_tx(&mut tx, community).await? {
         let current_role: Option<String> = sqlx::query_scalar(
             "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2 FOR UPDATE",
         )
@@ -712,7 +842,7 @@ pub async fn update_relay_member_role(
                 "forbidden:membership:assignment_active".to_owned(),
             ));
         }
-        return Err(v2_membership_coordinator_unavailable());
+        return Err(membership_coordinator_unavailable());
     }
 
     let result = sqlx::query(
@@ -730,15 +860,25 @@ pub async fn update_relay_member_role(
 }
 
 /// Ensures the configured owner pubkey holds the `"owner"` role in
-/// `community`. In v1, any former owner becomes `admin`. A v2 call is a no-op
-/// when the configured owner already matches and otherwise fails closed until
-/// the source/audit/projection coordinator can perform the rotation. The
-/// operation remains scoped to one Community.
+/// `community`.
+///
+/// A fresh schema-v3 Community has no canonical Project View state yet, so its
+/// first Human owner must exist before that owner can authorize `prepare-v3`
+/// and `initialize-v3`. This deployment-root path permits exactly that empty,
+/// disabled, unprepared state with no Relay Members. Once any membership
+/// exists, preparation starts, or canonical state exists, Project View
+/// membership governance fails closed; an owner rotation must use its
+/// coordinated governance path. Repeating the bootstrap with the already-sole
+/// owner remains an idempotent no-op.
+///
+/// Legacy schema v1 retains its historical bootstrap-and-demote behavior for
+/// explicit migration/recovery use. The operation remains scoped to one
+/// Community.
 ///
 /// Runs in a single transaction. Safe to call at every startup — idempotent.
 ///
 /// **Deployment-root authority exception:** This function is called only by
-/// startup initialization and legacy operator provisioning
+/// startup initialization and operator provisioning
 /// (`community_provisioning.rs`). It is NOT an end-user path and does NOT
 /// enforce the per-owner community limit (`MAX_COMMUNITIES_PER_OWNER`) or
 /// acquire the per-recipient advisory lock. The per-owner limit is an
@@ -751,13 +891,13 @@ pub async fn bootstrap_owner(
 ) -> Result<()> {
     let pubkey = owner_pubkey.to_ascii_lowercase();
     let mut tx = begin_membership_write(pool, community).await?;
-    let is_v2 = is_governed_in_tx(&mut tx, community).await?;
-    if is_v2 && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
+    let governed = uses_project_view_membership_governance_in_tx(&mut tx, community).await?;
+    if governed && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
         return Err(DbError::AccessDenied(
             "forbidden:managed_agent:owner_ineligible".to_owned(),
         ));
     }
-    if is_v2 {
+    if governed {
         let current_owners: Vec<String> = sqlx::query_scalar(
             "SELECT pubkey FROM relay_members \
              WHERE community_id = $1 AND role = 'owner' FOR UPDATE",
@@ -769,7 +909,11 @@ pub async fn bootstrap_owner(
             tx.rollback().await?;
             return Ok(());
         }
-        return Err(v2_membership_coordinator_unavailable());
+        if !greenfield_v3_owner_bootstrap_allowed_in_tx(&mut tx, community, current_owners.len())
+            .await?
+        {
+            return Err(membership_coordinator_unavailable());
+        }
     }
 
     // 1. Upsert the configured owner for this community.
@@ -783,9 +927,10 @@ pub async fn bootstrap_owner(
     .execute(&mut *tx)
     .await?;
 
-    // 2. v1 preserves the existing bootstrap behaviour. A v2 owner change
-    // returned above because it requires the future source/audit/projection
-    // coordinator.
+    // 2. Schema v1 preserves the legacy demotion behaviour. The schema-v3
+    // greenfield exception can reach this point only with zero current owners,
+    // so this update is a no-op there. Every governed owner rotation returned
+    // above because it requires the source/audit/projection coordinator.
     sqlx::query(
         "UPDATE relay_members SET role = 'admin', updated_at = now() \
          WHERE community_id = $1 AND role = 'owner' AND pubkey <> $2",
@@ -857,7 +1002,7 @@ pub fn owner_count_advisory_lock_key(pubkey_hex: &str) -> i64 {
 /// 5. Demotes every other owner in this Community to `member`.
 ///
 /// Scoped to one community — an ownership transfer in A never touches B.
-/// A v2 Community fails closed until the source/audit/projection coordinator
+/// A Project View-governed Community fails closed until the source/audit/projection coordinator
 /// can commit the ownership change and its derived old-owner level together.
 pub async fn transfer_ownership(
     pool: &PgPool,
@@ -868,12 +1013,12 @@ pub async fn transfer_ownership(
     let pubkey = new_owner_pubkey.to_ascii_lowercase();
     let expected_owner = expected_owner_pubkey.to_ascii_lowercase();
     let mut tx = begin_membership_write(pool, community).await?;
-    let is_v2 = is_governed_in_tx(&mut tx, community).await?;
-    if is_v2 && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
+    let governed = uses_project_view_membership_governance_in_tx(&mut tx, community).await?;
+    if governed && known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
         return Ok(TransferResult::ManagedAgentIneligible);
     }
-    if is_v2 {
-        return Err(v2_membership_coordinator_unavailable());
+    if governed {
+        return Err(membership_coordinator_unavailable());
     }
 
     // 1. Serialize on the transferee so concurrent transfers to the same
@@ -987,7 +1132,7 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
     }
 
     let mut tx = begin_membership_write(pool, community).await?;
-    if is_governed_in_tx(&mut tx, community).await? {
+    if uses_project_view_membership_governance_in_tx(&mut tx, community).await? {
         tx.rollback().await?;
         return Ok(0);
     }
@@ -1041,12 +1186,33 @@ mod tests {
     async fn make_test_community(pool: &PgPool) -> CommunityId {
         let id = Uuid::new_v4();
         let host = format!("relay-members-test-{}.example", id.simple());
-        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
-            .bind(id)
-            .bind(host)
-            .execute(pool)
-            .await
-            .expect("insert test community");
+        // These tests exercise the explicit legacy membership paths. Pin the
+        // fixture instead of inheriting the schema-v3 greenfield default.
+        sqlx::query(
+            "INSERT INTO communities (id, host, project_view_schema_version) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(id)
+        .bind(host)
+        .execute(pool)
+        .await
+        .expect("insert test community");
+        CommunityId::from_uuid(id)
+    }
+
+    async fn make_test_v3_community(pool: &PgPool) -> CommunityId {
+        let id = Uuid::new_v4();
+        let host = format!("relay-members-v3-test-{}.example", id.simple());
+        sqlx::query(
+            "INSERT INTO communities \
+                (id, host, project_view_schema_version, project_view_enabled) \
+             VALUES ($1, $2, 3, FALSE)",
+        )
+        .bind(id)
+        .bind(host)
+        .execute(pool)
+        .await
+        .expect("insert schema-v3 test community");
         CommunityId::from_uuid(id)
     }
 
@@ -1072,6 +1238,104 @@ mod tests {
             .await
             .expect("bootstrap owner");
         (community, owner)
+    }
+
+    #[test]
+    fn greenfield_v3_owner_bootstrap_boundary_is_exact() {
+        assert!(greenfield_v3_owner_bootstrap_allowed(
+            3, false, false, false, 0, 0
+        ));
+
+        for denied in [
+            (1, false, false, false, 0, 0),
+            (2, false, false, false, 0, 0),
+            (3, true, false, false, 0, 0),
+            (3, false, true, false, 0, 0),
+            (3, false, false, true, 0, 0),
+            (3, false, false, false, 1, 1),
+            (3, false, false, false, 0, 1),
+        ] {
+            assert!(
+                !greenfield_v3_owner_bootstrap_allowed(
+                    denied.0, denied.1, denied.2, denied.3, denied.4, denied.5,
+                ),
+                "unexpectedly allowed bootstrap state {denied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn governed_membership_error_is_not_bound_to_a_legacy_schema_name() {
+        assert_eq!(
+            membership_coordinator_unavailable().to_string(),
+            "access denied: unavailable:project_view:membership_coordinator"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn bootstrap_owner_allows_only_the_first_greenfield_v3_human_owner() {
+        let pool = setup_pool().await;
+        let community = make_test_v3_community(&pool).await;
+        let owner = test_pubkey();
+        let replacement = test_pubkey();
+
+        bootstrap_owner(&pool, community, &owner)
+            .await
+            .expect("bootstrap first schema-v3 owner");
+        assert_role(&pool, community, &owner, "owner").await;
+
+        // Startup convergence with the same configured owner is idempotent.
+        bootstrap_owner(&pool, community, &owner)
+            .await
+            .expect("repeat schema-v3 owner bootstrap");
+
+        let error = bootstrap_owner(&pool, community, &replacement)
+            .await
+            .expect_err("schema-v3 owner rotation must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "access denied: unavailable:project_view:membership_coordinator"
+        );
+        assert_role(&pool, community, &owner, "owner").await;
+        assert!(get_relay_member(&pool, community, &replacement)
+            .await
+            .expect("read rejected replacement")
+            .is_none());
+
+        let state: (i16, bool, Option<Uuid>, bool) = sqlx::query_as(
+            "SELECT community.project_view_schema_version, \
+                    community.project_view_enabled, \
+                    community.project_view_preparation_operation_id, \
+                    EXISTS (SELECT 1 FROM project_view_state state \
+                            WHERE state.community_id = community.id) \
+             FROM communities community WHERE community.id = $1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read schema-v3 bootstrap boundary");
+        assert_eq!(state, (3, false, None, false));
+
+        let anomalous = make_test_v3_community(&pool).await;
+        let preexisting_member = test_pubkey();
+        let invalid_membership = sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+             VALUES ($1, $2, 'member', NULL)",
+        )
+        .bind(anomalous.as_uuid())
+        .bind(&preexisting_member)
+        .execute(&pool)
+        .await;
+        assert!(
+            invalid_membership.is_err(),
+            "schema-v3 bootstrap lifecycle must reject ownerless membership"
+        );
+        let anomalous_owner = test_pubkey();
+        bootstrap_owner(&pool, anomalous, &anomalous_owner)
+            .await
+            .expect("failed ownerless mutation must not poison owner bootstrap");
+        assert_role(&pool, anomalous, &anomalous_owner, "owner").await;
     }
 
     #[tokio::test]

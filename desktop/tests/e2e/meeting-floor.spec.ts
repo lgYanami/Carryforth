@@ -189,6 +189,29 @@ test("Human completes Request, Offer, Grant, Speech and atomic Directed Handoff"
   await page.getByTestId("meeting-offer-accept").click();
   await expect(page.getByTestId("meeting-speech-composer")).toHaveCount(0);
   await expect(page.getByTestId("meeting-speech-composer")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+            .filter(
+              (entry) => entry.command === "ensure_meeting_human_grant_renewal",
+            )
+            .at(-1)?.payload.input ?? null,
+      ),
+    )
+    .not.toBeNull();
+  const renewalInput = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+        .filter(
+          (entry) => entry.command === "ensure_meeting_human_grant_renewal",
+        )
+        .at(-1)?.payload.input,
+  );
+  expect(renewalInput).toBeDefined();
+  expect(renewalInput).toMatchObject({ meetingId: MEETING_ID });
+  expect(renewalInput?.grantId).toMatch(/^[0-9a-f]{64}$/);
 
   const speechInput = page.getByTestId("meeting-speech-input");
   await speechInput.fill("The exact-retry boundary is ready for review.");
@@ -326,6 +349,39 @@ test("expired Offer disables local action and only refreshes authoritative state
       ).length,
   );
   expect(floorWrites).toBe(0);
+});
+
+test("Agent Grant never starts a Human Desktop renewal", async ({ page }) => {
+  await installMockBridge(page, { meetings: [meetingSeed("grant_other")] });
+  await openMeeting(page);
+
+  await expect(page.getByTestId("meeting-status-strip")).toContainText(
+    "has the floor",
+  );
+  const renewals = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter(
+        (entry) => entry.command === "ensure_meeting_human_grant_renewal",
+      ).length,
+  );
+  expect(renewals).toBe(0);
+});
+
+test("Human Grant renewal failure is visible without discarding the draft", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetingGrantRenewalError: "mock renewal unavailable",
+    meetings: [meetingSeed("grant_self")],
+  });
+  await openMeeting(page);
+
+  const speechInput = page.getByTestId("meeting-speech-input");
+  await speechInput.fill("Preserve this contribution while renewal recovers.");
+  await expect(page.getByTestId("meeting-grant-renewal-error")).toBeVisible();
+  await expect(speechInput).toHaveValue(
+    "Preserve this contribution while renewal recovers.",
+  );
 });
 
 test("Yield consumes the Grant and preserves a non-replayable stale draft", async ({

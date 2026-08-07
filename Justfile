@@ -104,7 +104,11 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+check: project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+
+# Keep every ordinary Project View runtime surface on one schema-v3 contract.
+project-view-v3-runtime-check:
+    bash scripts/check-project-view-v3-runtime.sh
 
 # Format all Rust code
 fmt:
@@ -419,8 +423,13 @@ project-document-stage7-recovery:
 project-document-stage7-capacity:
     ./scripts/test-project-document-stage7-capacity.sh
 
-# Complete Stage 7 local gate. Stage 5/6 canaries are intentionally rerun on
-# the final code rather than treated as historical evidence.
+# Run the independent schema-v3 greenfield Context / Role Brief canary.
+project-document-stage6-context:
+    ./scripts/test-project-view-stage6-canary.sh
+
+# Complete Stage 7 local gate. Stage 5 and the independent greenfield Stage 6
+# canary are intentionally rerun on the final code rather than treated as
+# historical evidence.
 project-document-stage7-test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -437,7 +446,7 @@ project-document-stage7-test:
     just project-document-stage7-recovery
     just project-document-stage7-capacity
     ./scripts/test-project-view-stage5-canary.sh
-    ./scripts/test-project-view-stage6-canary.sh
+    just project-document-stage6-context
 
 # Run integration tests only (starts services if needed)
 test-integration:
@@ -926,7 +935,7 @@ _release-pr lane version:
             TAG_PREFIX="relay-v"
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
-            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/buzz-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/project-view-operations.md deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-compatible-rollback-smoke.sh scripts/test-project-view-release-contract.sh)
+            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/buzz-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
             ARTIFACT="Buzz Relay" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"

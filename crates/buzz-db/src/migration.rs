@@ -100,8 +100,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintKind {
         ForeignKey,
@@ -560,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 47);
+        assert_eq!(migrations.len(), 48);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1168,6 +1166,33 @@ mod tests {
         assert!(meeting_v2_action_leases.contains("CREATE TABLE meeting_v2_action_lease_renewals"));
         assert!(meeting_v2_action_leases
             .contains("action IN ('begin', 'renew', 'block', 'retry', 'return-to-board')"));
+
+        // Greenfield Communities start on the only ordinary runtime schema
+        // major. Existing rows are intentionally untouched and retain their
+        // explicit migration/recovery coordinate.
+        assert_eq!(migrations[47].version, 48);
+        let project_view_v3_greenfield_default = migrations[47].sql.as_str();
+        assert!(project_view_v3_greenfield_default
+            .contains("ALTER COLUMN project_view_schema_version SET DEFAULT 3"));
+        for required in [
+            "CREATE FUNCTION project_view_v3_bootstrap_lifecycle_valid",
+            "CREATE OR REPLACE FUNCTION project_view_v3_validate_row",
+            "CREATE OR REPLACE FUNCTION project_role_continuity_validate_community",
+            "maintenance.state = 'normal'",
+            "maintenance.current_epoch IS NULL",
+            "project_view_maintenance_epochs epoch",
+            "project_view_v3_resource_mappings mapping",
+            "project_view_context_operations context_operation",
+            "project_view_provisioning_operations preparation",
+            "project_role_continuity_references reference",
+        ] {
+            assert!(
+                project_view_v3_greenfield_default.contains(required),
+                "migration 0048 must preserve the v3 greenfield invariant {required}"
+            );
+        }
+        assert!(!project_view_v3_greenfield_default.contains("UPDATE communities"));
+        assert!(!project_view_v3_greenfield_default.contains("DELETE FROM communities"));
     }
 
     #[test]
@@ -1275,7 +1300,14 @@ mod tests {
             "project_view_validate_object",
             "project_view_state_validate",
             "project_view_objects_validate",
-            "project_view_schema_version SMALLINT NOT NULL DEFAULT 1",
+            "ADD COLUMN project_view_schema_version SMALLINT NOT NULL DEFAULT 1",
+            "ALTER COLUMN project_view_schema_version SET DEFAULT 3",
+            "Project View state missing outside the valid schema-v3 bootstrap lifecycle",
+            "CREATE FUNCTION project_view_v3_bootstrap_lifecycle_valid",
+            "CREATE OR REPLACE FUNCTION project_view_v3_validate_row",
+            "project_view_maintenance_epochs epoch",
+            "project_view_v3_resource_mappings mapping",
+            "project_view_context_operations context_operation",
             "CREATE TABLE project_view_changes",
             "CREATE TABLE project_role_assignments",
             "idx_project_role_assignments_active_role",
@@ -1329,7 +1361,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn direct_action_upgrade_blocks_active_planned_session_then_removes_old_runtime() {
-        let admin_url = test_database_url();
+        let admin_url = isolated_test_database_url();
         let admin = PgPool::connect(&admin_url)
             .await
             .expect("connect database server");
@@ -1498,7 +1530,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn checked_in_schema_builds_project_view_without_a_migration_ledger() {
-        let admin_url = test_database_url();
+        let admin_url = isolated_test_database_url();
         let admin = PgPool::connect(&admin_url)
             .await
             .expect("connect database server");
@@ -1708,20 +1740,47 @@ mod tests {
     }
 
     async fn connect_test_pool() -> PgPool {
-        let database_url = test_database_url();
+        let database_url = isolated_test_database_url();
 
         PgPool::connect(&database_url)
             .await
             .expect("connect to test DB")
     }
 
-    fn test_database_url() -> String {
-        std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned())
+    fn isolated_test_database_url() -> String {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL").expect(
+            "destructive migration tests require an explicit BUZZ_TEST_DATABASE_URL; DATABASE_URL is never accepted",
+        );
+        let database_name = database_name_from_url(&database_url)
+            .expect("BUZZ_TEST_DATABASE_URL must include a database name");
+        assert!(
+            is_disposable_test_database_name(database_name),
+            "destructive migration tests require a disposable database whose name starts with buzz_; refused database {database_name}"
+        );
+        database_url
+    }
+
+    fn database_name_from_url(database_url: &str) -> Option<&str> {
+        let without_query = database_url
+            .split_once('?')
+            .map_or(database_url, |(url, _)| url);
+        let database_name = without_query.rsplit('/').next()?;
+        (!database_name.is_empty()).then_some(database_name)
+    }
+
+    fn is_disposable_test_database_name(database_name: &str) -> bool {
+        database_name.starts_with("buzz_")
     }
 
     async fn reset_public_schema(pool: &PgPool) {
+        let database_name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .expect("read current test database name before destructive reset");
+        assert!(
+            is_disposable_test_database_name(&database_name),
+            "refusing to reset public schema outside a disposable buzz_ test database: {database_name}"
+        );
         sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
             .execute(pool)
             .await
@@ -1863,7 +1922,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(48));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -1929,7 +1988,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn project_view_upgrade_from_0024_is_additive_and_disabled() {
-        let admin_url = test_database_url();
+        let admin_url = isolated_test_database_url();
         let admin = PgPool::connect(&admin_url)
             .await
             .expect("connect database server");
@@ -1968,32 +2027,105 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0047");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
-        let flags: Vec<(uuid::Uuid, bool)> =
-            sqlx::query_as("SELECT id, project_view_enabled FROM communities ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .expect("read upgraded feature flags");
+            .expect("upgrade scratch database through 0048");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(48));
+        let flags: Vec<(uuid::Uuid, bool, i16)> = sqlx::query_as(
+            "SELECT id, project_view_enabled, project_view_schema_version \
+             FROM communities ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read upgraded feature flags");
         assert_eq!(flags.len(), 2);
-        assert!(flags.iter().all(|(_, enabled)| !enabled));
+        assert!(flags
+            .iter()
+            .all(|(_, enabled, schema)| !enabled && *schema == 1));
         let legacy_rows: Vec<(uuid::Uuid, String)> =
             sqlx::query_as("SELECT id, host FROM communities ORDER BY id")
                 .fetch_all(&pool)
                 .await
                 .expect("pre-feature community projection remains readable");
         assert_eq!(legacy_rows.len(), 2);
-        let legacy_insert_id = uuid::Uuid::new_v4();
-        let legacy_insert_flag: bool = sqlx::query_scalar(
+        let greenfield_id = uuid::Uuid::new_v4();
+        let greenfield: (bool, i16) = sqlx::query_as(
             "INSERT INTO communities (id, host) VALUES ($1, $2) \
-             RETURNING project_view_enabled",
+             RETURNING project_view_enabled, project_view_schema_version",
         )
-        .bind(legacy_insert_id)
-        .bind(format!("legacy-insert-{}.test", legacy_insert_id.simple()))
+        .bind(greenfield_id)
+        .bind(format!("greenfield-{}.test", greenfield_id.simple()))
         .fetch_one(&pool)
         .await
-        .expect("pre-feature insert shape remains compatible");
-        assert!(!legacy_insert_flag);
+        .expect("read greenfield Project View defaults");
+        assert_eq!(greenfield, (false, 3));
+        let maintenance: (String, Option<i64>) = sqlx::query_as(
+            "SELECT state, current_epoch FROM project_view_maintenance \
+             WHERE community_id = $1",
+        )
+        .bind(greenfield_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read greenfield Project View maintenance seed");
+        assert_eq!(maintenance, ("normal".to_owned(), None));
+        let has_state: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM project_view_state WHERE community_id = $1)",
+        )
+        .bind(greenfield_id)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect greenfield Project View state");
+        assert!(!has_state);
+
+        let greenfield_owner = "11".repeat(32);
+        let greenfield_member = "22".repeat(32);
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+             VALUES ($1, $2, 'owner', NULL), ($1, $3, 'member', $2)",
+        )
+        .bind(greenfield_id)
+        .bind(&greenfield_owner)
+        .bind(&greenfield_member)
+        .execute(&pool)
+        .await
+        .expect("retain ordinary membership before Project View initialization");
+
+        // Archiving is Community lifecycle state, not Project View canonical
+        // state. It must remain possible before initialization.
+        sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+            .bind(greenfield_id)
+            .execute(&pool)
+            .await
+            .expect("archive uninitialized schema-v3 Community");
+        sqlx::query("UPDATE communities SET archived_at = NULL WHERE id = $1")
+            .bind(greenfield_id)
+            .execute(&pool)
+            .await
+            .expect("unarchive uninitialized schema-v3 Community");
+
+        for (schema_version, view_enabled, context_enabled, label) in [
+            (2_i16, false, false, "schema-v2 missing state"),
+            (3_i16, true, false, "enabled schema-v3 missing state"),
+            (3_i16, true, true, "context-enabled schema-v3 missing state"),
+        ] {
+            let invalid_id = uuid::Uuid::new_v4();
+            let invalid = sqlx::query(
+                "INSERT INTO communities \
+                    (id, host, project_view_schema_version, project_view_enabled, \
+                     project_context_enabled) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(invalid_id)
+            .bind(format!(
+                "invalid-{}-{}.test",
+                label.replace(' ', "-"),
+                invalid_id.simple()
+            ))
+            .bind(schema_version)
+            .bind(view_enabled)
+            .bind(context_enabled)
+            .execute(&pool)
+            .await;
+            assert!(invalid.is_err(), "{label} must fail closed");
+        }
         let legacy_event_id = vec![0x25_u8; 32];
         let legacy_actor = vec![0x26_u8; 32];
         let legacy_meta_id = vec![0x27_u8; 32];
@@ -2010,7 +2142,7 @@ mod tests {
              ) VALUES ($1, 1, 0, now(), now(), $2, $3, $4, $5, 1) \
              RETURNING schema_version, last_change_id, last_source_event_id",
         )
-        .bind(legacy_insert_id)
+        .bind(active_id)
         .bind(&legacy_event_id)
         .bind(&legacy_actor)
         .bind(&legacy_meta_id)
@@ -2030,7 +2162,7 @@ mod tests {
              WHERE community_id = $1 \
              RETURNING last_change_id",
         )
-        .bind(legacy_insert_id)
+        .bind(active_id)
         .bind(&next_legacy_event_id)
         .fetch_one(&mut *legacy_tx)
         .await
@@ -2074,7 +2206,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn project_document_upgrade_from_0031_is_additive_and_disabled() {
-        let admin_url = test_database_url();
+        let admin_url = isolated_test_database_url();
         let admin = PgPool::connect(&admin_url)
             .await
             .expect("connect database server");
@@ -2105,8 +2237,8 @@ mod tests {
 
         run_migrations(&pool)
             .await
-            .expect("upgrade scratch database through 0047");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
+            .expect("upgrade scratch database through 0048");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(48));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -2156,7 +2288,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn concurrent_migrators_reach_project_view_schema_once() {
-        let admin_url = test_database_url();
+        let admin_url = isolated_test_database_url();
         let admin = PgPool::connect(&admin_url)
             .await
             .expect("connect database server");
@@ -2183,7 +2315,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(47));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(48));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -2271,7 +2403,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(47));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(48));
     }
 
     #[tokio::test]
@@ -2334,85 +2466,25 @@ mod tests {
         assert_eq!(after, vec![(1, Some(true)), (30_350, None)]);
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn run_migrations_applies_consolidated_initial_schema_on_fresh_database() {
-        let pool = connect_test_pool().await;
-        reset_public_schema(&pool).await;
+    #[test]
+    fn destructive_migration_tests_only_accept_disposable_database_names() {
+        assert!(is_disposable_test_database_name("buzz_migration_test"));
+        assert!(is_disposable_test_database_name(
+            "buzz_meeting_contract_123"
+        ));
+        assert!(!is_disposable_test_database_name("buzz"));
+        assert!(!is_disposable_test_database_name("postgres"));
+        assert!(!is_disposable_test_database_name("production"));
 
-        run_migrations(&pool).await.expect("run migrations");
-
-        // Every embedded migration must apply, in order. Derive the expected
-        // list from the MIGRATOR itself so this doesn't go stale as additive
-        // migrations land (it previously hardcoded [1, 2, 3] and rotted).
-        let expected: Vec<i64> = {
-            let mut versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
-            versions.sort_unstable();
-            versions
-        };
-        assert_eq!(applied_versions(&pool).await, expected);
-        let sql = migration_sql();
-        let tables = create_tables(sql.as_str());
-        for table in [
-            "communities",
-            "events",
-            "channels",
-            "scheduled_workflow_fires",
-            "audit_log",
-            "project_view_state",
-            "project_view_objects",
-            "project_view_mutations",
-        ] {
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-            )
-            .bind(table)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|err| panic!("check table {table}: {err}"));
-            assert!(
-                tables.contains(table),
-                "migration parser should see {table}"
-            );
-            assert!(exists, "migration should create {table}");
-        }
-
-        let search_expression: String = sqlx::query_scalar(
-            "SELECT pg_get_expr(adbin, adrelid) \
-             FROM pg_attrdef \
-             WHERE adrelid = 'events'::regclass \
-               AND adnum = (SELECT attnum FROM pg_attribute \
-                            WHERE attrelid = 'events'::regclass \
-                              AND attname = 'search_tsv')",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read fresh-install search expression");
-        assert!(
-            search_expression.contains("ARRAY[0, 9, 40002, 45001, 45003]"),
-            "fresh-install search allowlist has the wrong kinds: {search_expression}"
+        assert_eq!(
+            database_name_from_url("postgres://user:secret@localhost:5432/buzz_migration_test"),
+            Some("buzz_migration_test")
         );
-        assert!(
-            search_expression.contains("ELSE NULL::tsvector"),
-            "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
-        );
-
-        let community_id = uuid::Uuid::new_v4();
-        let project_view_enabled: bool = sqlx::query_scalar(
-            "INSERT INTO communities (id, host) VALUES ($1, $2) \
-             RETURNING project_view_enabled",
-        )
-        .bind(community_id)
-        .bind(format!(
-            "project-view-default-{}.test",
-            community_id.simple()
-        ))
-        .fetch_one(&pool)
-        .await
-        .expect("read fresh Community Project View default");
-        assert!(
-            !project_view_enabled,
-            "fresh Communities must keep Project View disabled"
+        assert_eq!(
+            database_name_from_url(
+                "postgres://user:secret@localhost:5432/buzz_migration_test?sslmode=disable"
+            ),
+            Some("buzz_migration_test")
         );
     }
 }

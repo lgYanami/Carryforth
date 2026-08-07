@@ -1,17 +1,33 @@
-# NIP-PV3: Project View v3 Stage 0 Contract
+# NIP-PV3: Project View v3 Contract
 
 `draft` `optional`
 
 ## Purpose
 
-This document freezes the Project View v3 contracts needed by Project
-Document. It supplements [NIP-PV](NIP-PV.md); it does not enable a v3 Relay
-route. Project View v3 keeps kinds `44300`, `40903`, and `40904` and is selected
+This document defines the current Project View runtime contract. The older
+[NIP-PV](NIP-PV.md) majors are historical migration inputs only; ordinary
+Relay, CLI, Desktop, and ACP runtime paths do not negotiate or fall back to
+them. Project View v3 keeps kinds `44300`, `40903`, and `40904` and is selected
 by closed content `schema_version:3` plus the verified NIP-11 capability:
 
 ```text
 buzz-project-view-v3
 ```
+
+An empty, disabled schema-v3 Community instead advertises the discovery-only
+marker:
+
+```text
+buzz-project-view-v3-bootstrap
+```
+
+The two markers are mutually exclusive. `buzz-project-view-v3-bootstrap` is
+present only while the Community is not archived, is disabled, and has no
+canonical `project_view_state`. It lets a client present the operator/owner
+setup instructions; it does not authorize projection queries, subscriptions,
+mutations, Role history, Project Document, or Project Context. It disappears
+as soon as initialization creates canonical state, and
+`buzz-project-view-v3` appears only after checked enable and strict readiness.
 
 Non-empty Context Reference writes require the separate sub-capability:
 
@@ -24,15 +40,16 @@ Project Document v1 is advertised independently as
 
 ## Version and client matrix
 
-One Community advertises only one Project View major. A v3 parser never falls
-back to v2 after a v3 parse error, and a v1/v2 parser must reject v3 fields.
+One Community advertises the ordinary Project View runtime only when its
+canonical state is ready at schema v3. The bootstrap marker above is a closed
+discovery state, not a second runtime major. A v3 parser never falls back after
+a v3 parse error. Schema v1/v2 Communities must use the explicit operator
+cutover/recovery surface before any ordinary Project View client can use them.
 
-| Client | Document v1 | PV v2 | PV v3 | Context writes |
+| Client/runtime | Document v1 | PV v1/v2 | PV v3 | Context writes |
 |---|---:|---:|---:|---:|
-| pre-v3 client | unsupported | yes | unsupported | unsupported |
-| base dual client | yes | yes | yes | no; strict preserve/remove only |
-| Context-ready dual client | yes | yes | yes | yes |
-| later v3-only client | yes | optional read compatibility | yes | yes |
+| current Relay / CLI / Desktop / ACP | yes | unsupported | yes | capability-gated |
+| operator migration/recovery tools | migration input | explicit only | yes | not an ordinary runtime |
 
 Support for v3 is not proof that Context is ready. Without
 `buzz-project-context-v1`, create requires an empty Context set. An update may
@@ -158,6 +175,11 @@ first creates an immutable `prepare_v3` provisioning receipt while Project View
 is disabled and uninitialized. The eligible direct Human owner then signs this
 only accepted prepared-state command shape:
 
+During both the empty and prepared states NIP-11 exposes only
+`buzz-project-view-v3-bootstrap`. Initialization consumes the preparation and
+creates canonical state, so the bootstrap marker is then removed even though
+the ordinary runtime remains absent until checked enable.
+
 ```json
 {
   "schema_version":3,
@@ -217,10 +239,10 @@ Project View disabled pending structural verification and explicit enable.
 
 ## Base RoleBriefV3
 
-The v2 serialized Role Brief remains byte-compatible for v2. A v3 Community
-returns a separate strict top-level value with all existing logical sections,
-plus `project_view_schema_version:3`, `context`, and the Document metadata
-member of `source_revisions`:
+A v3 Community returns the strict top-level Role Brief value with all existing
+logical sections, plus `project_view_schema_version:3`, `context`, and the
+Document metadata member of `source_revisions`. The older serialized Role Brief
+shape is not an ordinary runtime fallback:
 
 ```text
 RoleBriefV3
@@ -247,8 +269,8 @@ RoleBriefV3
     └── document_metadata
 ```
 
-The `role_directory` follows the shared bounded Role Directory contract used
-by schema v2: it is derived from the same verified v3 snapshot, lists active
+The `role_directory` follows the shared bounded Role Directory semantics: it is
+derived from the same verified v3 snapshot, lists active
 Roles only, marks the current Member's exact Assignment, reports omissions
 explicitly, and never acts as an authorization cache.
 

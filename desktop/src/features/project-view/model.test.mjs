@@ -10,15 +10,14 @@ import {
 } from "./model.ts";
 import {
   assembleProjectViewV3,
-  normalizeProjectView,
-  normalizeProjectViewObject,
+  normalizeProjectViewObjectV3,
   serializeProjectViewMutationIntent,
 } from "../../shared/api/tauriProjectView.ts";
 
 const actor = "a".repeat(64);
 const now = "2026-07-27T08:00:00Z";
 
-function object(objectType, id, data, relations = {}) {
+function objectV3(objectType, id, data, relations = {}) {
   return {
     id,
     object_type: objectType,
@@ -30,30 +29,24 @@ function object(objectType, id, data, relations = {}) {
     updated_by: actor,
     data: { object_type: objectType, data },
     relations,
-  };
-}
-
-function objectV3(objectType, id, data, relations = {}) {
-  return {
-    ...object(objectType, id, data, relations),
     context_references: [],
   };
 }
 
 test("normalization preserves the canonical hierarchy and camel-cases typed data", () => {
-  const profile = object("project_profile", "profile", {
+  const profile = objectV3("project_profile", "profile", {
     name: "Lora",
     positioning: "Shared context",
     purpose: "Coordinate",
     problem: "Fragmentation",
     scope: "Project context",
   });
-  const goal = object("goal", "goal", {
+  const goal = objectV3("goal", "goal", {
     title: "Ship",
     desired_outcome: "A legible project",
     directions: ["Verify first"],
   });
-  const plan = object(
+  const plan = objectV3(
     "plan",
     "plan",
     {
@@ -63,7 +56,7 @@ test("normalization preserves the canonical hierarchy and camel-cases typed data
     },
     { under_goal_id: "goal" },
   );
-  const stage = object(
+  const stage = objectV3(
     "stage",
     "stage",
     {
@@ -74,26 +67,7 @@ test("normalization preserves the canonical hierarchy and camel-cases typed data
     { under_plan_id: "plan" },
   );
 
-  const view = normalizeProjectView({
-    profile,
-    goals: [
-      {
-        goal,
-        plans: [
-          {
-            plan,
-            stages: [{ stage, requirements: [], issues: [] }],
-          },
-        ],
-      },
-    ],
-    unbound_plans: [],
-    unplanned_requirements: [],
-    unplanned_issues: [],
-    roles: [],
-    resources: [],
-    issue_references_by_target: {},
-  });
+  const view = assembleProjectViewV3([profile, goal, plan, stage]);
 
   assert.equal(view.goals[0].goal.data.desiredOutcome, "A legible project");
   assert.equal(indexProjectViewObjects(view).size, 4);
@@ -126,7 +100,7 @@ test("normalization preserves the canonical hierarchy and camel-cases typed data
 });
 
 test("normalization rejects a mismatched outer and inner object type", () => {
-  const invalid = object("goal", "goal", {
+  const invalid = objectV3("goal", "goal", {
     title: "Ship",
     desired_outcome: "A legible project",
     directions: [],
@@ -134,49 +108,12 @@ test("normalization rejects a mismatched outer and inner object type", () => {
   invalid.data.object_type = "issue";
 
   assert.throws(
-    () => normalizeProjectViewObject(invalid),
+    () => normalizeProjectViewObjectV3(invalid),
     /object type does not match its data/,
   );
 });
 
 test("typed Human intents serialize optional relation clears without raw event fields", () => {
-  assert.deepEqual(
-    serializeProjectViewMutationIntent({
-      operation: "initialize",
-      profile: {
-        name: "Lora",
-        positioning: "Shared context",
-        purpose: "Coordinate",
-        problem: "Fragmentation",
-        scope: "Project context",
-      },
-      goals: [
-        {
-          title: "Ship",
-          desiredOutcome: "One View",
-          directions: ["Verify first"],
-        },
-      ],
-    }),
-    {
-      operation: "initialize",
-      profile: {
-        name: "Lora",
-        positioning: "Shared context",
-        purpose: "Coordinate",
-        problem: "Fragmentation",
-        scope: "Project context",
-      },
-      goals: [
-        {
-          title: "Ship",
-          desired_outcome: "One View",
-          directions: ["Verify first"],
-        },
-      ],
-    },
-  );
-
   assert.deepEqual(
     serializeProjectViewMutationIntent({
       operation: "update",

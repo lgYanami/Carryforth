@@ -470,8 +470,9 @@ buzz notes rm --name does-not-exist   # exits non-zero
 
 ### 6.13 Project Documents
 
-Project Document 必须先由 operator 在 Project View v2/v3 Community 上 bootstrap、verify 并
-enable；Relay 需要稳定 signer。不要把 Secret、token 或 private key 写入测试正文。
+Project Document 必须先由 operator 在已初始化、strict-ready 的 Project View v3 Community
+上 bootstrap、verify 并 enable；Relay 需要稳定 signer。普通 CLI 不再把 schema v2 当作
+可运行的 Document 治理前置条件。不要把 Secret、token 或 private key 写入测试正文。
 
 ```bash
 export COMMUNITY_HOST="localhost:3000"
@@ -514,10 +515,10 @@ buzz documents history "$DOCUMENT_ID" | jq .
 buzz documents get "$DOCUMENT_ID" --revision 1 | jq .
 ```
 
-`--format compact` 是 global flag，必须放在 `documents` 之前。Managed Agent 不手工伪造
-Assignment / Runtime tag：在 ACP 管理的环境中，CLI 从 verified Project View v2 identity 和
-注入的 runtime fence 自动绑定 active Assignment。运输结果不明确时，CLI 只在 exact revision 的
-`source_event_id` 证明同一 signed command 已提交后报告成功；否则返回 exit 2
+`--format compact` 是 global flag，必须放在 `documents` 之前。普通 Document CRUD 使用
+Community member identity，不把 Role Assignment 或 Runtime fence 当作 Document ACL；调用者也
+不得手工伪造这些归因字段。运输结果不明确时，CLI 只在 exact revision 的 `source_event_id`
+证明同一 signed command 已提交后报告成功；否则返回 exit 2
 `delivery_unknown`，调用者不得自动重签重发。
 
 ---

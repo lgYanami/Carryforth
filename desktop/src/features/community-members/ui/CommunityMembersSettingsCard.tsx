@@ -273,16 +273,13 @@ export function CommunityMembersSettingsCard({
   const myMembershipQuery = useMyRelayMembershipLookupQuery();
   const projectViewQuery = useProjectViewQuery();
   const roleContinuity =
-    projectViewQuery.data?.status === "ready" &&
-    projectViewQuery.data.schemaVersion === 2
+    projectViewQuery.data?.status === "ready"
       ? projectViewQuery.data.roleContinuity
       : undefined;
   const roleGoverned = Boolean(roleContinuity);
   const directMembershipAllowed =
     projectViewQuery.data?.status === "unsupported" ||
-    projectViewQuery.data?.status === "uninitialized" ||
-    (projectViewQuery.data?.status === "ready" &&
-      projectViewQuery.data.schemaVersion === 1);
+    projectViewQuery.data?.status === "uninitialized";
   const roleNamesByMember = React.useMemo(() => {
     const names = new Map<string, string>();
     if (!roleContinuity) return names;

@@ -1,5 +1,9 @@
 # 角色连续性待办
 
+> 2026-08-07 版本边界：本文中的 v2 投影名称是当时的实现背景。当前普通运行时
+> 只读取严格 Project View v3 meta/object/entity；增量刷新若继续实现，也必须绑定
+> v3 revision/generation/meta，不得增加 v2 fallback。
+
 ## Role Brief 按 revision 增量刷新
 
 ### 当前状态
@@ -7,7 +11,7 @@
 阶段 4 采用正确性优先的实现：
 
 - 每个完整 ACP channel turn 和 heartbeat 开始前，重新读取 NIP-11 Relay identity、
-  Project View v2 meta、全部 object/entity heads，以及 meta 精确指向的 membership
+  Project View v3 meta、全部 object/entity heads，以及 meta 精确指向的 membership
   snapshot；
 - 使用前后 meta bracket 和共享 `VerifiedRoleBriefSnapshot` 验证完整快照；
 - 每个完整 turn 都把完整最小 Role Brief 作为动态 user-context block 发送；

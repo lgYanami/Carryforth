@@ -17,12 +17,24 @@ require_literal() {
   fi
 }
 
+reject_literal() {
+  local literal="$1"
+  local path="$2"
+  if rg -Fq -- "${literal}" "${path}"; then
+    echo "Project View release contract: retired token '${literal}' remains in ${path}" >&2
+    exit 1
+  fi
+}
+
 for script in \
   scripts/test-project-view-db.sh \
   scripts/test-project-view-migrations.sh \
   scripts/test-project-view-e2e.sh \
-  scripts/test-project-view-rollback-smoke.sh \
-  scripts/test-project-view-compatible-rollback-smoke.sh; do
+  scripts/test-project-view-stage5-canary.sh \
+  scripts/test-project-view-stage6-canary.sh \
+  scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh \
+  scripts/check-project-view-v3-runtime.sh \
+  scripts/test-project-view-rollback-smoke.sh; do
   if [[ ! -x "${script}" ]]; then
     echo "Project View release contract: ${script} must be executable" >&2
     exit 1
@@ -43,11 +55,40 @@ require_literal "target/ci/buzz-admin" .github/workflows/ci.yml
 require_literal "--test e2e_project_view" .github/workflows/ci.yml
 require_literal "just test-migrations" .github/workflows/ci.yml
 require_literal "just project-view-test-e2e" .github/workflows/ci.yml
+require_literal "- 'scripts/check-project-view-v3-runtime.sh'" .github/workflows/ci.yml
+require_literal "- name: Project View v3-only runtime contract" .github/workflows/ci.yml
+require_literal "run: scripts/check-project-view-v3-runtime.sh" .github/workflows/ci.yml
+require_literal "- 'scripts/meeting-v2-actions-live-acceptance.sh'" .github/workflows/ci.yml
+require_literal "- 'docs/nips/NIP-PV3.md'" .github/workflows/ci.yml
 require_literal "PROJECT_VIEW_PRE_FEATURE_REF: ab3af828714ab699dfc87644d234014987a4fe6b" .github/workflows/ci.yml
-require_literal "PROJECT_VIEW_COMPATIBLE_REF: 8ef125c12a9b488a2c047361bf1c1072b735b738" .github/workflows/ci.yml
 require_literal "BUZZ_AUTO_MIGRATE=false" scripts/test-project-view-rollback-smoke.sh
-require_literal "BUZZ_AUTO_MIGRATE=false" scripts/test-project-view-compatible-rollback-smoke.sh
-require_literal "Post-mutation compatible rollback smoke" .github/workflows/ci.yml
+require_literal "Current additive schema with pre-feature Relay smoke" .github/workflows/ci.yml
+require_literal "version = 48 AND success" scripts/test-project-view-rollback-smoke.sh
+reject_literal "PROJECT_VIEW_COMPATIBLE_REF" .github/workflows/ci.yml
+reject_literal "test-project-view-compatible-rollback-smoke.sh" .github/workflows/ci.yml
+reject_literal "test-project-view-compatible-rollback-smoke.sh" Justfile
+require_literal "docs/nips/NIP-PV3.md" Justfile
+require_literal "scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh" Justfile
+require_literal "scripts/check-project-view-v3-runtime.sh" Justfile
+require_literal "scripts/meeting-v2-actions-live-acceptance.sh" Justfile
+require_literal "docs/lora/stage/meeting/" Justfile
+if [[ -e scripts/test-project-view-compatible-rollback-smoke.sh ]]; then
+  echo "Project View release contract: retired old-runtime rollback smoke must stay removed" >&2
+  exit 1
+fi
+require_literal "ALTER COLUMN project_view_schema_version SET DEFAULT 3" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "CREATE OR REPLACE FUNCTION project_role_continuity_validate_community" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "CREATE FUNCTION project_view_v3_bootstrap_lifecycle_valid" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "CREATE OR REPLACE FUNCTION project_view_v3_validate_row" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "maintenance.state = 'normal'" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "project_view_context_operations context_operation" migrations/0048_project_view_v3_greenfield_default.sql
+reject_literal "UPDATE communities" migrations/0048_project_view_v3_greenfield_default.sql
+reject_literal "DELETE FROM communities" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "read_project_document_identity_at(state, &api_base_url)" desktop/src-tauri/src/commands/project_document.rs
+reject_literal "require_runtime_ready(\"Project Document\")" desktop/src-tauri/src/commands/project_document.rs
+require_literal "PROJECT_VIEW_E2E_SCRATCH_DATABASE=1" scripts/test-project-view-e2e.sh
+require_literal "fixture_origin: \"greenfield_v3\"" scripts/test-project-view-stage6-canary.sh
+require_literal "project-document-stage6-context" Justfile
 
 # Observability names are an operator API; keep the full documented set wired.
 require_literal "buzz_project_view_mutations_total" crates/buzz-relay/src/handlers/project_view.rs
@@ -58,6 +99,10 @@ require_literal "buzz_project_view_snapshot_retries_total" crates/buzz-relay/src
 require_literal "buzz_project_view_objects" crates/buzz-relay/src/main.rs
 require_literal "buzz_project_view_projection_dispatch_errors_total" crates/buzz-relay/src/handlers/event.rs
 require_literal "buzz_project_view_schema_ready" crates/buzz-relay/src/main.rs
+require_literal "buzz_project_view_migration_required_communities" crates/buzz-relay/src/main.rs
+require_literal "buzz_project_document_migration_required_communities" crates/buzz-relay/src/main.rs
+require_literal "project_view_migration_required_count" crates/buzz-db/src/project_view.rs
+require_literal "project_document_migration_required_count" crates/buzz-db/src/project_document.rs
 
 # Kubernetes and Compose must use the centralized database flag. A Pod-local
 # Project View env flag would make mixed-version rollouts unsafe.
@@ -69,11 +114,17 @@ if rg -n "BUZZ_PROJECT_VIEW_ENABLED" deploy/charts/buzz deploy/compose; then
   exit 1
 fi
 
-# The runbook must retain both sides of the operational safety boundary.
+# The runbook must retain the one-way v3 operational safety boundary.
 require_literal "Server-first rollout" docs/project-view-operations.md
 require_literal "buzz-admin project-view enable" docs/project-view-operations.md
 require_literal "buzz-admin project-view disable" docs/project-view-operations.md
 require_literal "After any Project View mutation has been accepted" docs/project-view-operations.md
+require_literal "forward-fix the current schema-v3 runtime" docs/project-view-operations.md
 require_literal "BUZZ_AUTO_MIGRATE=false" docs/project-view-operations.md
+require_literal "buzz-project-view-v3-bootstrap" docs/project-view-operations.md
+require_literal "buzz-admin project-view prepare-v3" docs/project-view-operations.md
+require_literal "buzz --format compact project-view init-v3" docs/project-view-operations.md
+require_literal "test-project-view-legacy-v2-to-v3-migration-canary.sh" docs/project-view-operations.md
+require_literal "--for-v3-cutover" docs/project-view-operations.md
 
 echo "Project View release contract passed."

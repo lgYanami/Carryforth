@@ -75,7 +75,7 @@ Incident owner 至少评估以下位置，并按组织流程通知 / 升级：
       --expected-pubkey "${EXPECTED_RELAY_PUBKEY:?}"
   ```
 
-  `verify` 必须确认 schema、Project View v2/v3、bootstrap、stable signer 和全部 canonical /
+  `verify` 必须确认 schema、ready 的 Project View v3、bootstrap、stable signer 和全部 canonical /
   projection pointer parity。重新启用后只用坐标验证 current / pinned revision；不要把正文复制到
   incident 记录。
 

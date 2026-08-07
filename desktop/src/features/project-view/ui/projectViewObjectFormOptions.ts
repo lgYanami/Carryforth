@@ -45,18 +45,3 @@ export const WORK_STATUSES = [
   "cancelled",
 ] as const;
 export const PRIORITIES = ["low", "normal", "high", "urgent"] as const;
-export const RESOURCE_TYPES = [
-  "repository",
-  "document",
-  "design",
-  "service",
-  "environment",
-  "artifact",
-  "url",
-] as const;
-export const LOCATOR_TYPES = [
-  "url",
-  "nostr_address",
-  "nostr_event",
-  "buzz_deep_link",
-] as const;

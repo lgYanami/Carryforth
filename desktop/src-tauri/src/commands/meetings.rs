@@ -12,6 +12,8 @@ mod actions;
 pub use actions::{ensure_meeting_action_renewal, submit_meeting_action_finalization};
 mod floor;
 pub use floor::submit_meeting_floor_action;
+mod grant_renewal;
+pub use grant_renewal::ensure_meeting_human_grant_renewal;
 mod host;
 pub use host::submit_meeting_host_action;
 mod directory;
@@ -645,6 +647,11 @@ fn floor_from_projection(projection: &StateProjection) -> MeetingFloorState {
             soft_lease_expires_at_ms: grant.soft_lease_expires_at_ms,
             hard_deadline_ms: grant.hard_deadline_ms,
             progress_seq: grant.progress_seq as u64,
+            progress_interval_ms: projection
+                .state
+                .baton_config
+                .as_ref()
+                .and_then(|config| u64::try_from(config.progress_interval_ms).ok()),
         }),
     }
 }

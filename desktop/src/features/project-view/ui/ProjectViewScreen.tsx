@@ -36,12 +36,7 @@ import { ProjectViewMap } from "@/features/project-view/ui/ProjectViewMap";
 import { ProjectViewObjectDialog } from "@/features/project-view/ui/ProjectViewObjectDialog";
 import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
 import { ProjectRoleCard } from "@/features/project-view/ui/ProjectRoleCard";
-import {
-  createProjectViewInitializationDraft,
-  isProjectViewInitializationDraftDirty,
-  ProjectViewInitialize,
-  type ProjectViewInitializationDraft,
-} from "@/features/project-view/ui/ProjectViewInitialize";
+import { ProjectViewV3SetupGuide } from "@/features/project-view/ui/ProjectViewV3SetupGuide";
 import {
   ProjectViewErrorState,
   ProjectViewForbiddenState,
@@ -53,7 +48,6 @@ import { isProjectViewIntegrityError } from "@/shared/api/tauriProjectView";
 import type {
   ProjectView,
   ProjectViewLoadResult,
-  ProjectViewMutationResult,
   ProjectViewObject,
   ProjectViewObjectType,
   ProjectViewRoleContinuity,
@@ -316,88 +310,13 @@ function SupportingObjects({
   );
 }
 
-function InitializationDraftRecovery({
-  conflict,
-  draft,
-  onDiscard,
-  projectRevision,
-}: {
-  conflict?: Extract<ProjectViewMutationResult, { status: "conflict" }>;
-  draft: ProjectViewInitializationDraft;
-  onDiscard: () => void;
-  projectRevision: number;
-}) {
-  return (
-    <section
-      className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4"
-      data-testid="project-view-initialization-draft"
-      role="status"
-    >
-      <div className="flex flex-wrap items-start gap-3">
-        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-        <div className="min-w-0 flex-1">
-          <h2 className="text-sm font-semibold">
-            Initialization draft preserved
-          </h2>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            {conflict
-              ? `Your atomic initialization was based on revision ${conflict.expectedProjectRevision}; this verified View is revision ${projectRevision}. Nothing from the draft was written.`
-              : `This View became initialized at revision ${projectRevision} while you were drafting. The draft was not submitted or merged.`}
-            {
-              " Review it below, then apply anything still relevant through normal object edits."
-            }
-          </p>
-          <details className="mt-3 rounded-lg border border-border/70 bg-background/70 p-3">
-            <summary className="cursor-pointer text-xs font-semibold">
-              Review preserved draft
-            </summary>
-            <div className="mt-3 space-y-3 text-xs text-muted-foreground">
-              <div>
-                <span className="font-semibold text-foreground">
-                  {draft.profile.name || "Untitled project"}
-                </span>
-                {draft.profile.positioning ? (
-                  <p className="mt-1 whitespace-pre-wrap">
-                    {draft.profile.positioning}
-                  </p>
-                ) : null}
-              </div>
-              <ul className="space-y-2">
-                {draft.goals.map((goal) => (
-                  <li key={goal.key}>
-                    <span className="font-semibold text-foreground">
-                      {goal.title || "Untitled goal"}
-                    </span>
-                    {goal.desiredOutcome ? (
-                      <p className="mt-0.5 whitespace-pre-wrap">
-                        {goal.desiredOutcome}
-                      </p>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </details>
-        </div>
-        <Button onClick={onDiscard} size="sm" type="button" variant="outline">
-          Discard preserved draft
-        </Button>
-      </div>
-    </section>
-  );
-}
-
 function ReadyProjectView({
   activeObjectCount,
-  initializationConflict,
-  initializationDraft,
-  onDiscardInitializationDraft,
   onSelectObject,
   projectRevision,
   projectionGeneration,
   relayPubkey,
   roleContinuity,
-  schemaVersion,
   contextCapability,
   onRefresh,
   selectedObjectId,
@@ -407,12 +326,6 @@ function ReadyProjectView({
   view,
 }: Extract<ProjectViewLoadResult, { status: "ready" }> &
   ProjectViewScreenProps & {
-    initializationConflict?: Extract<
-      ProjectViewMutationResult,
-      { status: "conflict" }
-    >;
-    initializationDraft?: ProjectViewInitializationDraft;
-    onDiscardInitializationDraft: () => void;
     onRefresh: () => Promise<unknown>;
     syncMessage?: string;
     syncState?: "refreshing" | "stale";
@@ -484,14 +397,6 @@ function ReadyProjectView({
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
       <main className="min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-7xl space-y-6 p-3 pb-12 sm:p-5">
-          {initializationDraft ? (
-            <InitializationDraftRecovery
-              conflict={initializationConflict}
-              draft={initializationDraft}
-              onDiscard={onDiscardInitializationDraft}
-              projectRevision={projectRevision}
-            />
-          ) : null}
           <div className="flex items-start gap-3">
             {syncMessage ? (
               <div
@@ -607,7 +512,6 @@ function ReadyProjectView({
           onSelectObject={selectObject}
           projectionGeneration={projectionGeneration}
           projectRevision={projectRevision}
-          schemaVersion={schemaVersion}
           roleContinuity={roleContinuity}
           roleDefinition={selectedRoleDefinition}
           roleGovernance={roleGovernance}
@@ -660,7 +564,6 @@ function ReadyProjectView({
             )
           }
           roleActingAssignmentId={roleGovernance.actingAssignmentId}
-          schemaVersion={schemaVersion}
           view={view}
         />
       ) : null}
@@ -686,18 +589,10 @@ export function ProjectViewScreen({
   selectedObjectId,
 }: ProjectViewScreenProps) {
   const { activeCommunity } = useCommunities();
-  const [initializationDraft, setInitializationDraft] = React.useState(
-    createProjectViewInitializationDraft,
-  );
-  const [initializationConflict, setInitializationConflict] = React.useState<
-    Extract<ProjectViewMutationResult, { status: "conflict" }> | undefined
-  >();
   const query = useProjectViewQuery();
   const relayConnection = useRelayConnection();
   const relayPubkey =
-    query.data?.status === "ready" || query.data?.status === "uninitialized"
-      ? query.data.relayPubkey
-      : undefined;
+    query.data?.status === "ready" ? query.data.relayPubkey : undefined;
   const snapshotUpdatedAt =
     query.data?.status === "ready" ? query.data.updatedAt : undefined;
   const liveStatus = useProjectViewLiveSync({
@@ -735,18 +630,6 @@ export function ProjectViewScreen({
     fatalError instanceof Error
       ? fatalError.message
       : "The Relay returned an unexpected Project View response.";
-  const openOverview = React.useCallback(() => {
-    if (
-      isProjectViewInitializationDraftDirty(initializationDraft) &&
-      !window.confirm(
-        "Leave the full Project View and discard this unsubmitted initialization draft?",
-      )
-    ) {
-      return;
-    }
-    onOpenOverview?.();
-  }, [initializationDraft, onOpenOverview]);
-
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <TopChromeInsetHeader flush>
@@ -758,7 +641,7 @@ export function ProjectViewScreen({
             className="-ml-2 min-w-0 max-w-48 shrink justify-start px-2"
             data-testid="return-community-overview"
             disabled={!onOpenOverview}
-            onClick={openOverview}
+            onClick={onOpenOverview}
             size="sm"
             type="button"
             variant="ghost"
@@ -777,9 +660,7 @@ export function ProjectViewScreen({
               Verified project map and maintenance
             </div>
           </div>
-          {!degraded &&
-          (query.data?.status === "ready" ||
-            query.data?.status === "uninitialized") ? (
+          {!degraded && query.data?.status === "ready" ? (
             <Badge className="hidden sm:inline-flex" variant="outline">
               Editable
             </Badge>
@@ -832,34 +713,15 @@ export function ProjectViewScreen({
         <ProjectViewForbiddenState />
       ) : null}
       {query.data?.status === "uninitialized" ? (
-        <ProjectViewInitialize
-          draft={initializationDraft}
-          onApplied={() => {
-            setInitializationDraft(createProjectViewInitializationDraft());
-            setInitializationConflict(undefined);
-          }}
-          onChange={setInitializationDraft}
-          onConflict={setInitializationConflict}
-          onDiscardAndOpenLatest={async () => {
-            setInitializationDraft(createProjectViewInitializationDraft());
-            setInitializationConflict(undefined);
-            await query.refetch();
-          }}
+        <ProjectViewV3SetupGuide
+          onRefresh={() => void query.refetch()}
+          refreshing={query.isFetching}
+          relayPubkey={query.data.relayPubkey}
         />
       ) : null}
       {query.data?.status === "ready" ? (
         <ReadyProjectView
           {...query.data}
-          initializationConflict={initializationConflict}
-          initializationDraft={
-            isProjectViewInitializationDraftDirty(initializationDraft)
-              ? initializationDraft
-              : undefined
-          }
-          onDiscardInitializationDraft={() => {
-            setInitializationDraft(createProjectViewInitializationDraft());
-            setInitializationConflict(undefined);
-          }}
           onRefresh={async () => {
             await query.refetch();
           }}

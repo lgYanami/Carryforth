@@ -347,7 +347,7 @@ Document 权限的默认前置条件。
 涉及：
 
 - `crates/buzz-cli/src/commands/roles.rs`
-- `crates/buzz-cli/src/commands/project_view_v2_snapshot.rs`
+- `crates/buzz-cli/src/commands/project_view_snapshot.rs`
 
 修改 managed Role command 组装逻辑：
 

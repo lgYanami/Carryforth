@@ -555,6 +555,37 @@ Human 可读 reason，也没有终止来源的稳定表达。
 - 曾进入 action 时提示外部效果可能保留；
 - 不声称 Meeting 掌握外部业务操作清单。
 
+### MFX-018（P1，代码修复完成）：Meeting Board 与进程面板的宽屏布局层级错误
+
+**状态：代码与自动化已完成，待真实 Desktop 视觉验收。**
+
+**交付结果（2026-08-07）**
+
+Desktop 已将 Speech timeline 与 `MeetingFloorDock` 组合为完整左列，Meeting Board 作为右列覆盖
+主工作区完整高度；Agent host progress 的 `max-w-4xl` 限宽已移除。宽屏 Board 展开、收起、
+resize、草稿和 timeline 位置，以及窄屏 Sheet 降级均有自动化覆盖。Meeting 相关 23 条 Playwright
+用例、Desktop 3562 条 JavaScript 单测、TypeScript、Biome、E2E build 和三个仓库 guard 均通过。
+本次没有修改 Relay、协议、数据库或 Meeting 数据。
+
+**原现状**
+
+宽屏 `MeetingScreen` 当前先渲染 Speech timeline 与 Board 的横向 row，再在 row 之后渲染全宽
+`MeetingFloorDock`。因此 Board 只能占据 timeline 对应高度，无法延伸到工作区底部；进程面板则
+横跨 Board 下方。Agent 主持观察面还带有 `mx-auto max-w-4xl`，在左侧已有足够空间时仍窄居中并
+留下无意义空白。
+
+**期望**
+
+- 宽屏主工作区为左右两列：左列上方 Speech timeline、下方 Meeting process/Floor Dock，右列为
+  覆盖完整工作区高度的 Meeting Board；
+- Board 收起后左列占满可用宽度，重新打开和 resize 不丢失草稿或 Meeting 状态；
+- Agent host progress 填满左列的可用内容宽度；
+- timeline、Board 和长进程内容保持独立、有界滚动；
+- 中窄屏继续使用既有 Board Sheet，不改变 Meeting 协议或生命周期。
+
+完整实现方案见
+[Meeting Desktop Board 与进程面板布局修复设计](./meeting-desktop-board-floor-layout-fix-design.md)。
+
 ## 7. 文档与验收缺陷
 
 ### MFX-016（P2）：Desktop spec 状态仍写“待实现”
@@ -604,7 +635,7 @@ Human/Agent 发起意图
 2. **Agent 工具边界**：MFX-003、MFX-004、MFX-005；明确并尽可能确定性执行“讨论只读、Board
    记录、最终物化”。
 3. **Desktop 核心可见性**：MFX-007、MFX-008、MFX-010、MFX-011、MFX-012、MFX-013、
-   MFX-014。
+   MFX-014、MFX-018。
 4. **产品与文档收口**：MFX-009、MFX-015、MFX-016，并执行一次完整真实 Tauri 穿行。
 
 每个阶段分别 review 和提交。真实创建链路未通过前，不能因为 MeetingScreen 的 mock E2E 已通过

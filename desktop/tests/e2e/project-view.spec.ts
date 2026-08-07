@@ -2,7 +2,6 @@ import { expect, test } from "@playwright/test";
 
 import type {
   RawProjectViewLoadResult,
-  RawProjectViewObject,
   RawProjectViewObjectV3,
   ProjectViewObjectType,
 } from "../../src/shared/api/tauriProjectView";
@@ -11,6 +10,11 @@ import type {
   ProjectDocumentMeta,
 } from "../../src/shared/api/tauriProjectDocument";
 import type { RawProjectRoleHistoryPage } from "../../src/shared/api/tauriProjectViewRoleHistory";
+import { KIND_PROJECT_VIEW_OBJECT } from "../../src/shared/constants/kinds";
+import {
+  PROJECT_VIEW_V3_ENTITY_TAG,
+  PROJECT_VIEW_V3_OBJECT_TAG,
+} from "../../src/shared/constants/projectView";
 import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
@@ -53,7 +57,7 @@ function object(
   id: string,
   data: Record<string, unknown>,
   relations: Record<string, unknown> = {},
-): RawProjectViewObject {
+): RawProjectViewObjectV3 {
   return {
     id,
     object_type: objectType,
@@ -65,7 +69,8 @@ function object(
     updated_by: ACTOR,
     data: { object_type: objectType, data },
     relations,
-  } as RawProjectViewObject;
+    context_references: [],
+  } as RawProjectViewObjectV3;
 }
 
 const profile = object("project_profile", IDS.profile, {
@@ -153,51 +158,10 @@ const role = object("role", IDS.role, {
 });
 const resource = object("resource", IDS.resource, {
   name: "Buzz repository",
-  resource_type: "repository",
-  locator: {
-    locator_type: "url",
-    value: "https://github.com/block/buzz",
-  },
-  description: "Source repository for the Buzz implementation.",
+  resource_kind: "repository",
+  summary: "Source repository for the Buzz implementation.",
+  guide_document_id: GUIDE_ID,
 });
-
-const READY_VIEW = {
-  status: "ready",
-  relay_pubkey: "b".repeat(64),
-  schema_version: 1,
-  project_revision: 7,
-  projection_generation: 2,
-  active_object_count: 10,
-  updated_at: NOW,
-  view: {
-    profile,
-    goals: [
-      {
-        goal,
-        plans: [
-          {
-            plan,
-            stages: [
-              {
-                stage,
-                requirements: [{ requirement, works: [work] }],
-                issues: [{ issue, works: [] }],
-              },
-            ],
-          },
-        ],
-      },
-    ],
-    unbound_plans: [],
-    unplanned_requirements: [],
-    unplanned_issues: [{ issue: looseIssue, works: [] }],
-    roles: [role],
-    resources: [resource],
-    issue_references_by_target: {
-      [IDS.profile]: [{ object_type: "issue", object_id: IDS.issue }],
-    },
-  },
-} as RawProjectViewLoadResult;
 
 const ROLE_STATE_IDS = {
   currentAssignment: "20000000-0000-4000-8000-000000000001",
@@ -216,375 +180,309 @@ const ROLE_BRIEF_SOURCE = {
   source_type: "nostr_event",
 };
 
-const V2_READY_VIEW = {
-  ...structuredClone(READY_VIEW),
-  schema_version: 2,
-  role_continuity: {
-    roles: [
-      {
-        role_id: IDS.role,
-        name: "Context steward",
-        purpose: "Keep project intent coherent.",
-        responsibilities: ["Review project structure"],
-        boundaries: ["Does not grant unscoped authority"],
-        level: "admin",
-        active: true,
-        object_revision: 1,
-        project_revision: 7,
-        created_at: NOW,
-        updated_at: NOW,
-        created_by: ACTOR,
-        updated_by: ACTOR,
-      },
-    ],
-    proposals: [
-      {
-        proposal_id: ROLE_STATE_IDS.proposal,
-        role_id: IDS.role,
-        candidate_pubkey: FORMER_ASSIGNEE,
-        proposal_type: "request",
-        candidate_accepted_at: NOW,
-        expected_target_assignment_id: ROLE_STATE_IDS.currentAssignment,
-        expires_at: "2026-08-01T08:00:00Z",
-        status: "open",
-        reason: "Return to project context stewardship.",
-        created_by: FORMER_ASSIGNEE,
-        created_at: NOW,
-        entity_revision: 1,
-        project_revision: 7,
-      },
-    ],
-    assignments: [
-      {
-        assignment_id: ROLE_STATE_IDS.currentAssignment,
-        role_id: IDS.role,
-        member_pubkey: ACTOR,
-        started_at: NOW,
-        started_by: HUMAN,
-        entity_revision: 1,
-        project_revision: 7,
-      },
-      {
-        assignment_id: ROLE_STATE_IDS.formerAssignment,
-        role_id: IDS.role,
-        member_pubkey: FORMER_ASSIGNEE,
-        started_at: "2026-07-20T08:00:00Z",
-        started_by: HUMAN,
-        ended_at: "2026-07-26T08:00:00Z",
-        ended_by: HUMAN,
-        ended_reason: "replaced",
-        replaced_by_assignment_id: ROLE_STATE_IDS.currentAssignment,
-        entity_revision: 2,
-        project_revision: 6,
-      },
-    ],
-    commitments: [
-      {
-        commitment_id: ROLE_STATE_IDS.commitment,
-        work_id: IDS.work,
-        assignment_id: ROLE_STATE_IDS.currentAssignment,
-        member_pubkey: ACTOR,
-        started_at: NOW,
-        started_by: ACTOR,
-        entity_revision: 1,
-        project_revision: 7,
-      },
-    ],
-    workResponsibilities: [{ workId: IDS.work, roleId: IDS.role }],
-    checkpoints: [
-      {
-        checkpoint_id: ROLE_STATE_IDS.checkpoint,
-        role_id: IDS.role,
-        assignment_id: ROLE_STATE_IDS.currentAssignment,
-        based_on_project_revision: 6,
-        content: {
-          summary: "The View is usable; finish the continuity timeline.",
-          current_focus: ["Role continuity timeline"],
-          progress: ["Trusted Role Brief is visible"],
-          blockers: [],
-          risks: ["A stale projection could hide new context"],
-          open_questions: ["How much history should load initially?"],
-          next_steps: ["Ship paginated Checkpoint history"],
-          references: [
-            {
-              reference_type: "object",
-              object_id: IDS.work,
-              label: "Add the View entry",
-            },
-          ],
-        },
-        created_by: ACTOR,
-        created_at: NOW,
-        entity_revision: 1,
-        project_revision: 7,
-      },
-    ],
-    handoffs: [
-      {
-        handoff_id: ROLE_STATE_IDS.handoff,
-        role_id: IDS.role,
-        from_assignment_id: ROLE_STATE_IDS.formerAssignment,
-        to_assignment_id: ROLE_STATE_IDS.currentAssignment,
-        affected_commitment_ids: [],
-        content: {
-          summary: "Continue from the verified Project View.",
-          unresolved_items: ["Keep Role context current"],
-          references: [],
-        },
-        cause: "replaced",
-        system_generated: true,
-        created_at: "2026-07-26T08:00:00Z",
-        entity_revision: 1,
-        project_revision: 6,
-      },
-    ],
-    members: [
-      { pubkey: HUMAN, role: "owner" },
-      { pubkey: ACTOR, role: "admin" },
-      { pubkey: FORMER_ASSIGNEE, role: "member" },
-    ],
-    briefs: [
-      {
-        generated_at: NOW,
-        project_id: IDS.profile,
-        project_revision: 7,
-        projection_generation: 2,
-        member_pubkey: ACTOR,
-        community_role: "admin",
-        project: {
-          profile: {
-            object: profile,
-            source: ROLE_BRIEF_SOURCE,
-          },
-          goals: [
-            {
-              object: goal,
-              source: ROLE_BRIEF_SOURCE,
-            },
-          ],
-        },
-        role_directory: {
-          total_active_roles: 1,
-          entries: [
-            {
-              role_id: IDS.role,
-              name: "Context steward",
-              level: "admin",
-              purpose_summary: "Keep project intent coherent.",
-              assignment: {
-                status: "assigned",
-                assignment_id: ROLE_STATE_IDS.currentAssignment,
-                member_pubkey: ACTOR,
-                source: ROLE_BRIEF_SOURCE,
-              },
-              is_current_member_role: true,
-              role_source: ROLE_BRIEF_SOURCE,
-            },
-          ],
-          omitted_active_roles: 0,
-        },
-        state: {
-          status: "assigned",
-          role: {
-            role: {
-              role_id: IDS.role,
-              name: "Context steward",
-              purpose: "Keep project intent coherent.",
-              responsibilities: ["Review project structure"],
-              boundaries: ["Does not grant unscoped authority"],
-              level: "admin",
-              active: true,
-              object_revision: 1,
-              project_revision: 7,
-              created_at: NOW,
-              updated_at: NOW,
-              created_by: ACTOR,
-              updated_by: ACTOR,
-            },
-            source: ROLE_BRIEF_SOURCE,
-          },
-          assignment: {
-            assignment: {
-              assignment_id: ROLE_STATE_IDS.currentAssignment,
-              role_id: IDS.role,
-              member_pubkey: ACTOR,
-              proposal_id: ROLE_STATE_IDS.proposal,
-              started_at: NOW,
-              started_by: HUMAN,
-              entity_revision: 1,
-              project_revision: 7,
-            },
-            source: ROLE_BRIEF_SOURCE,
-          },
-        },
-        responsible_work: [
+const ROLE_CONTINUITY_V3 = {
+  roles: [
+    {
+      role_id: IDS.role,
+      name: "Context steward",
+      purpose: "Keep project intent coherent.",
+      responsibilities: ["Review project structure"],
+      boundaries: ["Does not grant unscoped authority"],
+      level: "admin",
+      active: true,
+      object_revision: 1,
+      project_revision: 7,
+      created_at: NOW,
+      updated_at: NOW,
+      created_by: ACTOR,
+      updated_by: ACTOR,
+      context_references: [],
+    },
+  ],
+  proposals: [
+    {
+      proposal_id: ROLE_STATE_IDS.proposal,
+      role_id: IDS.role,
+      candidate_pubkey: FORMER_ASSIGNEE,
+      proposal_type: "request",
+      candidate_accepted_at: NOW,
+      expected_target_assignment_id: ROLE_STATE_IDS.currentAssignment,
+      expires_at: "2026-08-01T08:00:00Z",
+      status: "open",
+      reason: "Return to project context stewardship.",
+      created_by: FORMER_ASSIGNEE,
+      created_at: NOW,
+      entity_revision: 1,
+      project_revision: 7,
+    },
+  ],
+  assignments: [
+    {
+      assignment_id: ROLE_STATE_IDS.currentAssignment,
+      role_id: IDS.role,
+      member_pubkey: ACTOR,
+      started_at: NOW,
+      started_by: HUMAN,
+      entity_revision: 1,
+      project_revision: 7,
+    },
+    {
+      assignment_id: ROLE_STATE_IDS.formerAssignment,
+      role_id: IDS.role,
+      member_pubkey: FORMER_ASSIGNEE,
+      started_at: "2026-07-20T08:00:00Z",
+      started_by: HUMAN,
+      ended_at: "2026-07-26T08:00:00Z",
+      ended_by: HUMAN,
+      ended_reason: "replaced",
+      replaced_by_assignment_id: ROLE_STATE_IDS.currentAssignment,
+      entity_revision: 2,
+      project_revision: 6,
+    },
+  ],
+  commitments: [
+    {
+      commitment_id: ROLE_STATE_IDS.commitment,
+      work_id: IDS.work,
+      assignment_id: ROLE_STATE_IDS.currentAssignment,
+      member_pubkey: ACTOR,
+      started_at: NOW,
+      started_by: ACTOR,
+      entity_revision: 1,
+      project_revision: 7,
+    },
+  ],
+  workResponsibilities: [{ workId: IDS.work, roleId: IDS.role }],
+  checkpoints: [
+    {
+      checkpoint_id: ROLE_STATE_IDS.checkpoint,
+      role_id: IDS.role,
+      assignment_id: ROLE_STATE_IDS.currentAssignment,
+      based_on_project_revision: 6,
+      content: {
+        summary: "The View is usable; finish the continuity timeline.",
+        current_focus: ["Role continuity timeline"],
+        progress: ["Trusted Role Brief is visible"],
+        blockers: [],
+        risks: ["A stale projection could hide new context"],
+        open_questions: ["How much history should load initially?"],
+        next_steps: ["Ship paginated Checkpoint history"],
+        references: [
           {
-            work: {
-              object: work,
-              responsible_role_id: IDS.role,
-              source: ROLE_BRIEF_SOURCE,
-            },
-            state: {
-              status: "committed",
-              commitment: {
-                commitment: {
-                  commitment_id: ROLE_STATE_IDS.commitment,
-                  work_id: IDS.work,
-                  assignment_id: ROLE_STATE_IDS.currentAssignment,
-                  member_pubkey: ACTOR,
-                  started_at: NOW,
-                  started_by: ACTOR,
-                  entity_revision: 1,
-                  project_revision: 7,
-                },
-                source: ROLE_BRIEF_SOURCE,
-              },
-            },
+            reference_type: "object",
+            object_id: IDS.work,
+            label: "Add the View entry",
           },
         ],
-        related_objects: [],
-        latest_checkpoint: {
-          checkpoint: {
-            checkpoint_id: ROLE_STATE_IDS.checkpoint,
+      },
+      created_by: ACTOR,
+      created_at: NOW,
+      entity_revision: 1,
+      project_revision: 7,
+    },
+  ],
+  handoffs: [
+    {
+      handoff_id: ROLE_STATE_IDS.handoff,
+      role_id: IDS.role,
+      from_assignment_id: ROLE_STATE_IDS.formerAssignment,
+      to_assignment_id: ROLE_STATE_IDS.currentAssignment,
+      affected_commitment_ids: [],
+      content: {
+        summary: "Continue from the verified Project View.",
+        unresolved_items: ["Keep Role context current"],
+        references: [],
+      },
+      cause: "replaced",
+      system_generated: true,
+      created_at: "2026-07-26T08:00:00Z",
+      entity_revision: 1,
+      project_revision: 6,
+    },
+  ],
+  members: [
+    { pubkey: HUMAN, role: "owner" },
+    { pubkey: ACTOR, role: "admin" },
+    { pubkey: FORMER_ASSIGNEE, role: "member" },
+  ],
+  briefs: [
+    {
+      project_view_schema_version: 3,
+      generated_at: NOW,
+      project_id: IDS.profile,
+      project_revision: 7,
+      projection_generation: 3,
+      member_pubkey: ACTOR,
+      community_role: "admin",
+      project: {
+        profile: {
+          object: profile,
+          source: ROLE_BRIEF_SOURCE,
+        },
+        goals: [
+          {
+            object: goal,
+            source: ROLE_BRIEF_SOURCE,
+          },
+        ],
+      },
+      role_directory: {
+        total_active_roles: 1,
+        entries: [
+          {
             role_id: IDS.role,
-            assignment_id: ROLE_STATE_IDS.currentAssignment,
-            based_on_project_revision: 6,
-            content: {
-              summary: "The View is usable; finish the continuity timeline.",
-              current_focus: ["Role continuity timeline"],
-              progress: ["Trusted Role Brief is visible"],
-              blockers: [],
-              risks: ["A stale projection could hide new context"],
-              open_questions: ["How much history should load initially?"],
-              next_steps: ["Ship paginated Checkpoint history"],
-              references: [
-                {
-                  reference_type: "object",
-                  object_id: IDS.work,
-                  label: "Add the View entry",
-                },
-              ],
+            name: "Context steward",
+            level: "admin",
+            purpose_summary: "Keep project intent coherent.",
+            assignment: {
+              status: "assigned",
+              assignment_id: ROLE_STATE_IDS.currentAssignment,
+              member_pubkey: ACTOR,
+              source: ROLE_BRIEF_SOURCE,
             },
-            created_by: ACTOR,
+            is_current_member_role: true,
+            role_source: ROLE_BRIEF_SOURCE,
+          },
+        ],
+        omitted_active_roles: 0,
+      },
+      state: {
+        status: "assigned",
+        role: {
+          role: {
+            role_id: IDS.role,
+            name: "Context steward",
+            purpose: "Keep project intent coherent.",
+            responsibilities: ["Review project structure"],
+            boundaries: ["Does not grant unscoped authority"],
+            level: "admin",
+            active: true,
+            object_revision: 1,
+            project_revision: 7,
             created_at: NOW,
+            updated_at: NOW,
+            created_by: ACTOR,
+            updated_by: ACTOR,
+            context_references: [],
+          },
+          source: ROLE_BRIEF_SOURCE,
+        },
+        assignment: {
+          assignment: {
+            assignment_id: ROLE_STATE_IDS.currentAssignment,
+            role_id: IDS.role,
+            member_pubkey: ACTOR,
+            proposal_id: ROLE_STATE_IDS.proposal,
+            started_at: NOW,
+            started_by: HUMAN,
             entity_revision: 1,
             project_revision: 7,
           },
           source: ROLE_BRIEF_SOURCE,
         },
-        recent_handoffs: [
-          {
-            handoff: {
-              handoff_id: ROLE_STATE_IDS.handoff,
-              role_id: IDS.role,
-              from_assignment_id: ROLE_STATE_IDS.formerAssignment,
-              to_assignment_id: ROLE_STATE_IDS.currentAssignment,
-              affected_commitment_ids: [],
-              content: {
-                summary: "Continue from the verified Project View.",
-                unresolved_items: ["Keep Role context current"],
-                references: [],
-              },
-              cause: "replaced",
-              system_generated: true,
-              created_at: "2026-07-26T08:00:00Z",
-              entity_revision: 1,
-              project_revision: 6,
-            },
+      },
+      responsible_work: [
+        {
+          work: {
+            object: work,
+            responsible_role_id: IDS.role,
             source: ROLE_BRIEF_SOURCE,
           },
-        ],
-        source_revisions: {
-          meta_event_id: "f".repeat(64),
-          meta_change_id: "a".repeat(64),
-          membership_event_id: "c".repeat(64),
-          project_updated_at: NOW,
+          state: {
+            status: "committed",
+            commitment: {
+              commitment: {
+                commitment_id: ROLE_STATE_IDS.commitment,
+                work_id: IDS.work,
+                assignment_id: ROLE_STATE_IDS.currentAssignment,
+                member_pubkey: ACTOR,
+                started_at: NOW,
+                started_by: ACTOR,
+                entity_revision: 1,
+                project_revision: 7,
+              },
+              source: ROLE_BRIEF_SOURCE,
+            },
+          },
+        },
+      ],
+      related_objects: [],
+      latest_checkpoint: {
+        checkpoint: {
+          checkpoint_id: ROLE_STATE_IDS.checkpoint,
+          role_id: IDS.role,
+          assignment_id: ROLE_STATE_IDS.currentAssignment,
+          based_on_project_revision: 6,
+          content: {
+            summary: "The View is usable; finish the continuity timeline.",
+            current_focus: ["Role continuity timeline"],
+            progress: ["Trusted Role Brief is visible"],
+            blockers: [],
+            risks: ["A stale projection could hide new context"],
+            open_questions: ["How much history should load initially?"],
+            next_steps: ["Ship paginated Checkpoint history"],
+            references: [
+              {
+                reference_type: "object",
+                object_id: IDS.work,
+                label: "Add the View entry",
+              },
+            ],
+          },
+          created_by: ACTOR,
+          created_at: NOW,
+          entity_revision: 1,
+          project_revision: 7,
+        },
+        source: ROLE_BRIEF_SOURCE,
+      },
+      recent_handoffs: [
+        {
+          handoff: {
+            handoff_id: ROLE_STATE_IDS.handoff,
+            role_id: IDS.role,
+            from_assignment_id: ROLE_STATE_IDS.formerAssignment,
+            to_assignment_id: ROLE_STATE_IDS.currentAssignment,
+            affected_commitment_ids: [],
+            content: {
+              summary: "Continue from the verified Project View.",
+              unresolved_items: ["Keep Role context current"],
+              references: [],
+            },
+            cause: "replaced",
+            system_generated: true,
+            created_at: "2026-07-26T08:00:00Z",
+            entity_revision: 1,
+            project_revision: 6,
+          },
+          source: ROLE_BRIEF_SOURCE,
+        },
+      ],
+      source_revisions: {
+        meta_event_id: "f".repeat(64),
+        meta_change_id: "a".repeat(64),
+        membership_event_id: "c".repeat(64),
+        project_updated_at: NOW,
+        document_metadata: { state: "not_required" },
+      },
+      context: {
+        availability: { state: "not_advertised_empty" },
+        resources: [],
+        live_documents: [],
+        pinned_documents: [],
+        truncation: {
+          truncated: false,
+          omitted_resources: 0,
+          omitted_live_documents: 0,
+          omitted_pinned_documents: 0,
         },
       },
-    ],
-  },
-} as RawProjectViewLoadResult;
-
-function legacyObjectAsV3(value: RawProjectViewObject): RawProjectViewObjectV3 {
-  if (value.object_type === "resource") {
-    throw new Error("legacy Resource data cannot be used in a v3 fixture");
-  }
-  return {
-    ...structuredClone(value),
-    context_references: [],
-  } as RawProjectViewObjectV3;
-}
-
-function roleContinuityFixture() {
-  if (
-    V2_READY_VIEW.status !== "ready" ||
-    V2_READY_VIEW.schema_version === 3 ||
-    !V2_READY_VIEW.role_continuity
-  ) {
-    throw new Error("v2 Role continuity fixture is unavailable");
-  }
-  return structuredClone(V2_READY_VIEW.role_continuity);
-}
-
-function roleContinuityFixtureV3() {
-  const continuity = roleContinuityFixture();
-  for (const role of continuity.roles) role.context_references = [];
-  for (const brief of continuity.briefs) {
-    brief.project_view_schema_version = 3;
-    brief.projection_generation = 3;
-    brief.project.profile.object = legacyObjectAsV3(
-      brief.project.profile.object,
-    );
-    for (const goal of brief.project.goals) {
-      goal.object = legacyObjectAsV3(goal.object);
-    }
-    for (const item of brief.responsible_work) {
-      item.work.object = legacyObjectAsV3(item.work.object);
-    }
-    for (const related of brief.related_objects) {
-      related.object = legacyObjectAsV3(related.object);
-    }
-    if (brief.state.status === "assigned") {
-      brief.state.role.role.context_references = [];
-    }
-    brief.context = {
-      availability: { state: "not_advertised_empty" },
-      resources: [],
-      live_documents: [],
-      pinned_documents: [],
-      truncation: {
-        truncated: false,
-        omitted_resources: 0,
-        omitted_live_documents: 0,
-        omitted_pinned_documents: 0,
-      },
-    };
-    brief.source_revisions.document_metadata = { state: "not_required" };
-  }
-  return continuity;
-}
-
-const resourceV3 = {
-  id: IDS.resource,
-  object_type: "resource",
-  object_revision: 2,
-  project_revision: 7,
-  created_at: NOW,
-  updated_at: NOW,
-  created_by: ACTOR,
-  updated_by: HUMAN,
-  data: {
-    object_type: "resource",
-    data: {
-      name: "Buzz repository",
-      resource_kind: "repository",
-      summary: "Source repository for the Buzz implementation.",
-      guide_document_id: GUIDE_ID,
     },
-  },
-  relations: {},
-  context_references: [],
-} satisfies RawProjectViewObjectV3;
+  ],
+} satisfies Extract<
+  RawProjectViewLoadResult,
+  { status: "ready" }
+>["role_continuity"];
 
 const V3_READY_VIEW = {
   status: "ready",
@@ -595,19 +493,21 @@ const V3_READY_VIEW = {
   active_object_count: 10,
   updated_at: NOW,
   objects_v3: [
-    legacyObjectAsV3(profile),
-    legacyObjectAsV3(goal),
-    legacyObjectAsV3(plan),
-    legacyObjectAsV3(stage),
-    legacyObjectAsV3(requirement),
-    legacyObjectAsV3(issue),
-    legacyObjectAsV3(work),
-    legacyObjectAsV3(looseIssue),
-    legacyObjectAsV3(role),
-    resourceV3,
+    profile,
+    goal,
+    plan,
+    stage,
+    requirement,
+    issue,
+    work,
+    looseIssue,
+    role,
+    resource,
   ],
-  role_continuity: roleContinuityFixtureV3(),
+  role_continuity: structuredClone(ROLE_CONTINUITY_V3),
 } satisfies RawProjectViewLoadResult;
+
+const READY_VIEW = V3_READY_VIEW;
 
 function contextReadyV3View(): RawProjectViewLoadResult {
   return {
@@ -684,13 +584,24 @@ function readyViewAtRevision(
     issueUpdatedBy?: string;
   },
 ) {
-  const next = structuredClone(READY_VIEW) as Extract<
+  const next = structuredClone(V3_READY_VIEW) as Extract<
     RawProjectViewLoadResult,
     { status: "ready" }
   >;
   next.project_revision = revision;
   next.updated_at = `2026-07-27T08:0${revision}:00Z`;
-  const nextIssue = next.view.goals[0]?.plans[0]?.stages[0]?.issues[0]?.issue;
+  for (const object of next.objects_v3) {
+    object.project_revision = revision;
+  }
+  for (const role of next.role_continuity.roles) {
+    role.project_revision = revision;
+  }
+  for (const brief of next.role_continuity.briefs) {
+    brief.project_revision = revision;
+  }
+  const nextIssue = next.objects_v3.find(
+    (candidate) => candidate.id === IDS.issue,
+  );
   if (nextIssue) {
     nextIssue.project_revision = revision;
     nextIssue.object_revision =
@@ -701,6 +612,23 @@ function readyViewAtRevision(
     }
   }
   return next;
+}
+
+function emptyRoleContinuity() {
+  return {
+    roles: [],
+    proposals: [],
+    assignments: [],
+    commitments: [],
+    workResponsibilities: [],
+    checkpoints: [],
+    handoffs: [],
+    members: [{ pubkey: HUMAN, role: "owner" as const }],
+    briefs: [],
+  } satisfies Extract<
+    RawProjectViewLoadResult,
+    { status: "ready" }
+  >["role_continuity"];
 }
 
 function minimalReadyView(name: string, revision = 7) {
@@ -720,35 +648,26 @@ function minimalReadyView(name: string, revision = 7) {
     desired_outcome: "One isolated verified View.",
     directions: [],
   });
+  minimalProfile.project_revision = revision;
+  minimalGoal.project_revision = revision;
   return {
     status: "ready",
     relay_pubkey: "c".repeat(64),
-    schema_version: 1,
+    schema_version: 3,
     project_revision: revision,
-    projection_generation: 1,
+    projection_generation: 3,
     active_object_count: 2,
     updated_at: NOW,
-    view: {
-      profile: minimalProfile,
-      goals: [{ goal: minimalGoal, plans: [] }],
-      unbound_plans: [],
-      unplanned_requirements: [],
-      unplanned_issues: [],
-      roles: [],
-      resources: [],
-      issue_references_by_target: {},
-    },
-  } as RawProjectViewLoadResult;
+    objects_v3: [minimalProfile, minimalGoal],
+    role_continuity: emptyRoleContinuity(),
+  } satisfies RawProjectViewLoadResult;
 }
 
-function vacantV2View() {
-  const next = structuredClone(V2_READY_VIEW) as Extract<
+function vacantV3View() {
+  const next = structuredClone(V3_READY_VIEW) as Extract<
     RawProjectViewLoadResult,
     { status: "ready" }
   >;
-  if (!next.role_continuity) {
-    throw new Error("v2 fixture must include Role continuity");
-  }
   next.relay_pubkey = "c".repeat(64);
   next.role_continuity.proposals = [];
   next.role_continuity.assignments = [];
@@ -764,11 +683,8 @@ function vacantV2View() {
   return next;
 }
 
-function memberViewerV2View() {
-  const next = vacantV2View();
-  if (!next.role_continuity) {
-    throw new Error("v2 fixture must include Role continuity");
-  }
+function memberViewerV3View() {
+  const next = vacantV3View();
   next.role_continuity.members = [
     { pubkey: "f".repeat(64), role: "owner" },
     { pubkey: HUMAN, role: "member" },
@@ -777,15 +693,12 @@ function memberViewerV2View() {
   return next;
 }
 
-function activeLeaderV2View() {
-  const next = structuredClone(V2_READY_VIEW) as Extract<
+function activeLeaderV3View() {
+  const next = structuredClone(V3_READY_VIEW) as Extract<
     RawProjectViewLoadResult,
     { status: "ready" }
   >;
   const continuity = next.role_continuity;
-  if (!continuity) {
-    throw new Error("v2 fixture must include Role continuity");
-  }
   continuity.members = [
     { pubkey: "f".repeat(64), role: "owner" },
     { pubkey: HUMAN, role: "admin" },
@@ -810,15 +723,12 @@ function activeLeaderV2View() {
   return next;
 }
 
-function humanAssignedV2View() {
-  const next = structuredClone(V2_READY_VIEW) as Extract<
+function humanAssignedV3View() {
+  const next = structuredClone(V3_READY_VIEW) as Extract<
     RawProjectViewLoadResult,
     { status: "ready" }
   >;
   const continuity = next.role_continuity;
-  if (!continuity) {
-    throw new Error("v2 fixture must include Role continuity");
-  }
   const assignment = continuity.assignments.find(
     (candidate) => candidate.assignment_id === ROLE_STATE_IDS.currentAssignment,
   );
@@ -836,7 +746,7 @@ function humanAssignedV2View() {
     !brief ||
     brief.state.status !== "assigned"
   ) {
-    throw new Error("assigned v2 fixture is incomplete");
+    throw new Error("assigned v3 fixture is incomplete");
   }
   assignment.member_pubkey = HUMAN;
   commitment.member_pubkey = HUMAN;
@@ -888,7 +798,7 @@ test("Community overview presents Project View and Role context before the full 
 }) => {
   await installMockBridge(page, {
     managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
   });
   await page.goto("/");
 
@@ -948,7 +858,7 @@ test("Community overview keeps its stable shell when Project View preview is dis
 }) => {
   await installMockBridge(
     page,
-    { projectView: V2_READY_VIEW },
+    { projectView: V3_READY_VIEW },
     { seedPreviewFeatures: false },
   );
   await page.goto("/#/community");
@@ -1247,12 +1157,12 @@ test("v3 Resource saga preserves a newly committed Guide when the Resource confl
   await expect(page.getByLabel("Guide")).toHaveValue(guideId ?? "");
 });
 
-test("v2 Role cards and Inspector show one verified continuity state", async ({
+test("v3 Role cards and Inspector show one verified continuity state", async ({
   page,
 }) => {
   await installMockBridge(page, {
     managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
   });
   await page.goto("/");
   await openFullProjectView(page);
@@ -1310,7 +1220,7 @@ test("v2 Role cards and Inspector show one verified continuity state", async ({
 test("ordinary member can inspect and request Roles but cannot govern them", async ({
   page,
 }) => {
-  await installMockBridge(page, { projectView: memberViewerV2View() });
+  await installMockBridge(page, { projectView: memberViewerV3View() });
   await page.goto("/");
   await openFullProjectView(page);
 
@@ -1333,7 +1243,7 @@ test("ordinary member can inspect and request Roles but cannot govern them", asy
 test("owner creates an admin Role with an explicit signed level", async ({
   page,
 }) => {
-  await installMockBridge(page, { projectView: V2_READY_VIEW });
+  await installMockBridge(page, { projectView: V3_READY_VIEW });
   await page.goto("/");
   await openFullProjectView(page);
 
@@ -1365,7 +1275,7 @@ test("active Leader creates only member Roles through the exact Assignment", asy
   page,
 }) => {
   await installMockBridge(page, {
-    projectView: activeLeaderV2View(),
+    projectView: activeLeaderV3View(),
   });
   await page.goto("/");
   await openFullProjectView(page);
@@ -1400,7 +1310,7 @@ test("active Leader creates only member Roles through the exact Assignment", asy
 test("an open Role Proposal blocks deletion and deactivation", async ({
   page,
 }) => {
-  const projectView = structuredClone(V2_READY_VIEW);
+  const projectView = structuredClone(V3_READY_VIEW);
   projectView.role_continuity.assignments = [];
   projectView.role_continuity.commitments = [];
   projectView.role_continuity.workResponsibilities = [];
@@ -1494,7 +1404,7 @@ test("Role Inspector loads the next history page through the native boundary", a
     },
   ];
   await installMockBridge(page, {
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
     projectViewRoleHistoryPages: pages,
   });
   await page.goto("/");
@@ -1520,7 +1430,7 @@ test("Role Inspector loads the next history page through the native boundary", a
   expect(requests).toHaveLength(2);
   expect(requests?.[1]).toMatchObject({
     project_revision: 7,
-    projection_generation: 2,
+    projection_generation: 3,
     role_id: IDS.role,
     before: {
       project_revision: 5,
@@ -1534,7 +1444,7 @@ test("Work Inspector shows the verified responsibility and Commitment", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
   });
   await page.goto("/");
   await openFullProjectView(page);
@@ -1552,7 +1462,7 @@ test("owner assigns uncommitted Work to a Role with a revision fence", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    projectView: vacantV2View(),
+    projectView: vacantV3View(),
   });
   await page.goto("/");
   await openFullProjectView(page);
@@ -1599,7 +1509,7 @@ test("owner creates a revision-fenced Role offer from the Inspector", async ({
         lifecycle: "ready",
       },
     ],
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
   });
   await page.goto("/");
   await openFullProjectView(page);
@@ -1644,7 +1554,7 @@ test("the current assignee appends Checkpoint and Handoff context", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    projectView: humanAssignedV2View(),
+    projectView: humanAssignedV3View(),
   });
   await page.goto("/");
   await openFullProjectView(page);
@@ -1723,12 +1633,12 @@ test("a concurrent Role replacement refreshes state without replaying intent", a
   page,
 }) => {
   await installMockBridge(page, {
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
     projectViewRoleMutationResult: {
       status: "conflict",
       expected_project_revision: 7,
       current_project_revision: 8,
-      message: "conflict:project_view_v2:revision_conflict",
+      message: "conflict:project_view_v3:revision_conflict",
     },
   });
   await page.goto("/");
@@ -1753,11 +1663,11 @@ test("a concurrent Role replacement refreshes state without replaying intent", a
     .toBe(1);
 });
 
-test("v2 Community settings route Role changes through View", async ({
+test("v3 Community settings route Role changes through View", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    projectView: V2_READY_VIEW,
+    projectView: V3_READY_VIEW,
     relayRequiresMembership: true,
   });
   await page.goto("/");
@@ -1824,14 +1734,14 @@ test("View rejects a self-contradictory snapshot without rendering partial data"
 test("View rejects a Role Directory that disagrees with verified continuity", async ({
   page,
 }) => {
-  const invalid = structuredClone(V2_READY_VIEW) as Extract<
+  const invalid = structuredClone(V3_READY_VIEW) as Extract<
     RawProjectViewLoadResult,
     { status: "ready" }
   >;
   const directoryAssignment =
     invalid.role_continuity?.briefs[0]?.role_directory.entries[0]?.assignment;
   if (directoryAssignment?.status !== "assigned") {
-    throw new Error("v2 fixture must include an assigned Role Directory entry");
+    throw new Error("v3 fixture must include an assigned Role Directory entry");
   }
   directoryAssignment.member_pubkey = FORMER_ASSIGNEE;
 
@@ -1923,7 +1833,7 @@ test("the Inspector becomes a focus-trapped drawer in a narrow window", async ({
   await expect(issueCard).toBeFocused();
 });
 
-test("Human initializes an uninitialized View as one atomic mutation", async ({
+test("an uninitialized v3 View exposes only the operator and owner setup guide", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1931,43 +1841,28 @@ test("Human initializes an uninitialized View as one atomic mutation", async ({
       status: "uninitialized",
       relay_pubkey: "b".repeat(64),
     },
-    projectViewMutationResult: {
-      status: "applied",
-      event_id: "c".repeat(64),
-      project_revision: 1,
-    },
-    projectViewAfterMutation: READY_VIEW,
   });
   await page.goto("/");
   await openFullProjectView(page);
 
   await expect(
-    page.getByRole("heading", { name: "Initialize this View" }),
+    page.getByRole("heading", {
+      name: "Project View v3 requires owner initialization",
+    }),
   ).toBeVisible();
-
-  await page.getByLabel("Project name").fill("Human Project");
-  page.once("dialog", async (dialog) => {
-    expect(dialog.message()).toContain("discard this unsubmitted");
-    await dialog.dismiss();
-  });
-  await page.getByTestId("return-community-overview").click();
-  await expect(page).toHaveURL(/\/view$/);
-  await expect(page.getByLabel("Project name")).toHaveValue("Human Project");
-  await page
-    .getByLabel("Positioning")
-    .fill("One shared context for Humans and Agents.");
-  await page.getByLabel("Purpose").fill("Coordinate project work.");
-  await page.getByLabel("Problem").fill("Context is fragmented.");
-  await page.getByLabel("Scope").fill("Project context and execution.");
-  await page.getByLabel("Title").fill("Establish one shared map");
-  await page
-    .getByLabel("Desired outcome")
-    .fill("Everyone reads the same Project View.");
-  await page.getByRole("button", { name: "Review foundation" }).click();
-  await expect(page.getByText("Human Project")).toBeVisible();
-  await page.getByRole("button", { name: "Initialize View" }).click();
-
-  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
+  await expect(
+    page.getByText(
+      /Desktop did not find an initialized canonical Project View/,
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/buzz-admin project-view prepare-v3/),
+  ).toBeVisible();
+  await expect(page.getByText(/buzz project-view init-v3/)).toBeVisible();
+  await expect(page.getByLabel("Project name")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Initialize View" }),
+  ).toHaveCount(0);
   const mutations = await page.evaluate(
     () =>
       (
@@ -1976,17 +1871,7 @@ test("Human initializes an uninitialized View as one atomic mutation", async ({
         }
       ).__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__,
   );
-  expect(mutations).toHaveLength(1);
-  expect(mutations?.[0]).toMatchObject({
-    operation: "initialize",
-    profile: { name: "Human Project" },
-    goals: [
-      {
-        title: "Establish one shared map",
-        desired_outcome: "Everyone reads the same Project View.",
-      },
-    ],
-  });
+  expect(mutations ?? []).toHaveLength(0);
 });
 
 test("context creation preselects only a legal parent relation", async ({
@@ -2135,10 +2020,20 @@ test("projection events invalidate into a new complete verified snapshot", async
     issueTitle: "Agent refreshed this issue",
     issueObjectRevision: 2,
   });
-  await page.evaluate((next) => {
-    window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
-    window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.();
-  }, revisionEight);
+  await page.evaluate(
+    ({ next, kind, tag }) => {
+      window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
+      window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.({
+        kind,
+        tag,
+      });
+    },
+    {
+      next: revisionEight,
+      kind: KIND_PROJECT_VIEW_OBJECT,
+      tag: PROJECT_VIEW_V3_OBJECT_TAG,
+    },
+  );
 
   await expect(page.getByText("Project revision 8")).toBeVisible();
   await expect(page.getByTestId("project-view-map")).toContainText(
@@ -2187,10 +2082,20 @@ test("Human and Agent changes alternate through one trusted View", async ({
     issueTitle: "Agent incorporated the Human decision",
     issueUpdatedBy: ACTOR,
   });
-  await page.evaluate((next) => {
-    window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
-    window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.();
-  }, agentRevision);
+  await page.evaluate(
+    ({ next, kind, tag }) => {
+      window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
+      window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.({
+        kind,
+        tag,
+      });
+    },
+    {
+      next: agentRevision,
+      kind: KIND_PROJECT_VIEW_OBJECT,
+      tag: PROJECT_VIEW_V3_ENTITY_TAG,
+    },
+  );
 
   await expect(page.getByText("Project revision 9")).toBeVisible();
   await expect(page.getByTestId("project-view-inspector")).toContainText(
@@ -2201,7 +2106,7 @@ test("Human and Agent changes alternate through one trusted View", async ({
   );
 });
 
-test("a live initialization preserves the Human foundation draft", async ({
+test("the v3 setup guide stays read-only and refreshes after owner initialization", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -2212,7 +2117,7 @@ test("a live initialization preserves the Human foundation draft", async ({
   });
   await page.goto("/");
   await openFullProjectView(page);
-  await page.getByLabel("Project name").fill("Human draft");
+  await expect(page.getByTestId("project-view-v3-setup-guide")).toBeVisible();
 
   await expect
     .poll(() =>
@@ -2220,20 +2125,19 @@ test("a live initialization preserves the Human foundation draft", async ({
         () => window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__?.() ?? false,
       ),
     )
-    .toBe(true);
+    .toBe(false);
   await page.evaluate((next) => {
     window.__BUZZ_E2E_SET_PROJECT_VIEW__?.(next);
-    window.__BUZZ_E2E_EMIT_PROJECT_VIEW_EVENT__?.();
   }, readyViewAtRevision(8));
+  await page
+    .getByRole("button", { name: "Check for initialized View" })
+    .click();
 
-  const recovery = page.getByTestId("project-view-initialization-draft");
-  await expect(recovery).toContainText("Initialization draft preserved");
-  await recovery.getByText("Review preserved draft").click();
-  await expect(recovery).toContainText("Human draft");
+  await expect(page.getByTestId("project-view-v3-setup-guide")).toHaveCount(0);
   await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
 });
 
-test("Community switching does not carry View data, selection, or drafts across Relays", async ({
+test("Community switching does not carry View data or selection across Relays", async ({
   page,
 }) => {
   await installMockBridge(
@@ -2252,7 +2156,7 @@ test("Community switching does not carry View data, selection, or drafts across 
   await seedCommunities(page);
   await page.goto("/");
   await openFullProjectView(page);
-  await page.getByLabel("Project name").fill("Alpha-only unsaved draft");
+  await expect(page.getByTestId("project-view-v3-setup-guide")).toBeVisible();
 
   await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
   await expect(
@@ -2262,7 +2166,6 @@ test("Community switching does not carry View data, selection, or drafts across 
   await expect(page.getByTestId("project-view-profile")).toContainText(
     "Bravo project",
   );
-  await expect(page.getByText("Alpha-only unsaved draft")).toHaveCount(0);
   await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
   await expect(page).not.toHaveURL(/object=/);
   await page
@@ -2276,9 +2179,10 @@ test("Community switching does not carry View data, selection, or drafts across 
   ).toHaveAttribute("aria-current", "true");
   await openFullProjectView(page);
   await expect(
-    page.getByRole("heading", { name: "Initialize this View" }),
+    page.getByRole("heading", {
+      name: "Project View v3 requires owner initialization",
+    }),
   ).toBeVisible();
-  await expect(page.getByLabel("Project name")).toHaveValue("");
   await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
   await expect(page).not.toHaveURL(/object=/);
 });
@@ -2291,8 +2195,8 @@ test("Community switching does not carry an Assignment into another View", async
     {
       managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
       projectViewsByRelayUrl: {
-        [COMMUNITY_A.relayUrl]: structuredClone(V2_READY_VIEW),
-        [COMMUNITY_B.relayUrl]: vacantV2View(),
+        [COMMUNITY_A.relayUrl]: structuredClone(V3_READY_VIEW),
+        [COMMUNITY_B.relayUrl]: vacantV3View(),
       },
     },
     { skipCommunitySeed: true },

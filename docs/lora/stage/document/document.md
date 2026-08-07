@@ -716,9 +716,9 @@ Reference 本身没有执行副作用”这一边界。
 - Guide Document 成为主要使用说明；
 - 不再要求为每个 `resource_kind` 预先实现专用 Resolver。
 
-当前 Project View v1 Resource body 是封闭 schema；当前分支的 Project View v2 Role
-Continuity 扩展也没有加入 `resource_kind` 或 Guide。该变化需要新的显式 schema /
-capability，不能被描述成当前已经存在的能力。
+上述 v1 Resource body 和 v2 Role Continuity 是该概念方案形成时的历史前提。
+当前普通运行时已收敛到 Project View v3，`resource_kind` 与 Guide-backed Resource
+已是 v3 规范能力；旧 locator 只作为显式迁移输入，不得被客户端当作 fallback。
 
 在目标模型中，Guide 是资源地址和使用步骤的规范项目来源。现有 required `locator` 是
 legacy / 迁移输入，不与 Guide 长期并列为两个权威来源。具体如何演进、兼容和迁移属于

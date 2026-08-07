@@ -53,7 +53,7 @@ pub async fn run(state: Arc<AppState>) {
         for claim in claims {
             match state
                 .db
-                .end_unrecoverable_assignment(&claim, &state.relay_keypair)
+                .end_unrecoverable_assignment_v3(&claim, &state.relay_keypair)
                 .await
             {
                 Ok(outcome) => {
@@ -62,7 +62,7 @@ pub async fn run(state: Arc<AppState>) {
                             claim.community_id,
                             claim.community_host.clone(),
                         );
-                        crate::handlers::project_view::dispatch_v2_committed_events(
+                        crate::handlers::project_view::dispatch_project_view_committed_events(
                             &tenant,
                             &state,
                             &outcome.events,

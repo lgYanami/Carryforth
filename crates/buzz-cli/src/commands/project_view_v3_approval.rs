@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::client::BuzzClient;
 use crate::commands::documents::read_verified_document;
-use crate::commands::project_view_v2_snapshot::{
-    is_managed_runtime, read_identity, read_verified_v2_snapshot, ProjectViewSchema,
+use crate::commands::project_view_snapshot::{
+    is_managed_runtime, read_legacy_v2_identity, read_legacy_v2_migration_snapshot,
 };
 use crate::error::CliError;
 use crate::validate::read_bounded_file_or_stdin;
@@ -81,15 +81,8 @@ async fn approve(client: &BuzzClient, draft_path: &str, out: &str) -> Result<(),
             "Resource review draft schema_version must be one".to_owned(),
         ));
     }
-    let identity = read_identity(client).await?.ok_or_else(|| {
-        CliError::Other("unsupported: Resource approval requires Project View v2".to_owned())
-    })?;
-    if identity.schema != ProjectViewSchema::V2 {
-        return Err(CliError::Other(
-            "unsupported: Resource approval is only valid before a v2-to-v3 cutover".to_owned(),
-        ));
-    }
-    let snapshot = read_verified_v2_snapshot(client, identity).await?;
+    let identity = read_legacy_v2_identity(client).await?;
+    let snapshot = read_legacy_v2_migration_snapshot(client, identity).await?;
     let expected_meta = lower_hex::<32>(&draft.base_meta_event_id, "base_meta_event_id")?;
     if snapshot.meta().project_id.as_uuid() != &draft.community_id
         || snapshot.meta().event_id.to_bytes() != expected_meta

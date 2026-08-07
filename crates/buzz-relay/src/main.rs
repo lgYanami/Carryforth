@@ -170,6 +170,24 @@ async fn main() -> anyhow::Result<()> {
         info!("Skipping database migrations because BUZZ_AUTO_MIGRATE is not enabled");
     }
 
+    match tokio::try_join!(
+        db.project_view_migration_required_count(),
+        db.project_document_migration_required_count(),
+    ) {
+        Ok((0, 0)) => {}
+        Ok((project_view_communities, project_document_communities)) => {
+            warn!(
+                project_view_communities,
+                project_document_communities,
+                "Active enabled Communities require an explicit Project View v3 migration; readiness will remain unavailable"
+            );
+        }
+        Err(error) => warn!(
+            error = %error,
+            "Could not inspect Project View v3 migration requirements"
+        ),
+    }
+
     if let Err(e) = db.ensure_future_partitions(3).await {
         error!("Failed to ensure partitions: {e}");
     }
@@ -1509,6 +1527,9 @@ async fn emit_db_usage_metrics(
     let workflow_rows = state.db.usage_workflow_counts().await?;
     let git_repo_rows = state.db.usage_git_repo_counts().await?;
     let project_view_schema_ready = state.db.project_view_schema_ready().await?;
+    let project_view_migration_required = state.db.project_view_migration_required_count().await?;
+    let project_document_migration_required =
+        state.db.project_document_migration_required_count().await?;
     let project_view_object_rows = if project_view_schema_ready {
         state.db.usage_project_view_object_counts().await?
     } else {
@@ -1748,6 +1769,10 @@ async fn emit_db_usage_metrics(
     } else {
         0.0
     });
+    metrics::gauge!("buzz_project_view_migration_required_communities")
+        .set(project_view_migration_required as f64);
+    metrics::gauge!("buzz_project_document_migration_required_communities")
+        .set(project_document_migration_required as f64);
     {
         const PROJECT_VIEW_OBJECT_TYPES: &[&str] = &[
             "project_profile",

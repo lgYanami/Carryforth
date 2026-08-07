@@ -376,7 +376,22 @@ impl SubscriptionRegistry {
     ) {
         if let Some(conn_subs) = self.subs.get(&conn_id) {
             if let Some((filters, _, _)) = conn_subs.get(sub_id) {
-                if filters_match(filters, event) {
+                let projection_kind = buzz_core::kind::is_project_view_projection_kind(
+                    event.event.kind.as_u16() as u32,
+                );
+                let matches = if projection_kind {
+                    // The registry can enforce only the closed v3 coordinate:
+                    // it deliberately owns no Relay key material. The shared
+                    // local/Redis final fan-out gate verifies the exact Relay
+                    // signer before any frame is sent.
+                    filters.iter().any(|filter| {
+                        crate::handlers::project_view::filter_allows_v3_projections(filter)
+                            && filters_match(std::slice::from_ref(filter), event)
+                    })
+                } else {
+                    filters_match(filters, event)
+                };
+                if matches {
                     let entry = (conn_id, sub_id.to_string());
                     if seen.insert(entry.clone()) {
                         results.push(entry);

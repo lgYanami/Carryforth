@@ -79,8 +79,8 @@ docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
   < scripts/attach-schema-partitions.sql
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
-  -c "INSERT INTO communities (id, host)
-      VALUES ('00000000-0000-4000-8000-00000000c0de', '${test_host}')
+  -c "INSERT INTO communities (id, host, project_view_schema_version)
+      VALUES ('00000000-0000-4000-8000-00000000c0de', '${test_host}', 3)
       ON CONFLICT (lower(host)) DO NOTHING" >/dev/null
 
 if [[ "${PROJECT_VIEW_E2E_NO_BUILD:-0}" != "1" ]]; then
@@ -100,11 +100,8 @@ done
 database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 relay_url="ws://${test_host}"
 relay_private_key=0000000000000000000000000000000000000000000000000000000000000001
-relay_owner_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
-env \
-  DATABASE_URL="${database_url}" \
-  BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
-  "${bin_dir}/buzz-admin" project-view enable --community "${test_host}"
+owner_private_key=0000000000000000000000000000000000000000000000000000000000000002
+relay_owner_pubkey=c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
 
 env \
   DATABASE_URL="${database_url}" \
@@ -142,6 +139,8 @@ export PROJECT_VIEW_E2E_RELAY_URL="${relay_url}"
 export PROJECT_VIEW_E2E_BUZZ_BIN="${bin_dir}/buzz"
 export PROJECT_VIEW_E2E_ADMIN_BIN="${bin_dir}/buzz-admin"
 export PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY="${relay_private_key}"
+export PROJECT_VIEW_E2E_OWNER_PRIVATE_KEY="${owner_private_key}"
+export PROJECT_VIEW_E2E_SCRATCH_DATABASE=1
 export REDIS_URL=redis://localhost:6379
 
 if [[ -n "${PROJECT_VIEW_TEST_ARCHIVE:-}" ]]; then

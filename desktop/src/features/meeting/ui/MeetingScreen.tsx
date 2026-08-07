@@ -19,7 +19,10 @@ import type {
   MeetingSnapshot,
   MeetingSpeech,
 } from "@/shared/api/tauriMeetings";
-import { ensureMeetingActionRenewal } from "@/shared/api/tauriMeetings";
+import {
+  ensureMeetingActionRenewal,
+  ensureMeetingHumanGrantRenewal,
+} from "@/shared/api/tauriMeetings";
 import { setVisibleChannel } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
@@ -158,6 +161,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
   const currentParticipant = snapshot?.participants.find(
     (participant) => participant.pubkey === normalizedPubkey,
   );
+  const activeGrant = snapshot?.floor?.grant ?? null;
   const humanAction =
     snapshot?.policy === "moderated-board-actions-v3" &&
     snapshot.lifecycle === "finalizing_actions" &&
@@ -167,6 +171,18 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
     currentParticipant?.participantType === "human"
       ? snapshot.action
       : null;
+  const humanGrant =
+    snapshot?.lifecycle === "active" &&
+    snapshot.phase === "granted" &&
+    currentParticipant?.participantType === "human" &&
+    activeGrant?.holderPubkey === normalizedPubkey
+      ? activeGrant
+      : null;
+  const humanGrantId = humanGrant?.grantId ?? null;
+  const [grantRenewalFailure, setGrantRenewalFailure] = React.useState<{
+    grantId: string;
+    message: string;
+  } | null>(null);
   React.useEffect(() => {
     if (!humanAction || meetingAuthority.status !== "current") return;
     void ensureMeetingActionRenewal({
@@ -178,6 +194,36 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
       console.error("Failed to retain the Human Meeting Action lease", error);
     });
   }, [humanAction, meetingAuthority.status, meetingId]);
+  const refetchSnapshot = snapshotQuery.refetch;
+  React.useEffect(() => {
+    if (!humanGrantId || meetingAuthority.status !== "current") {
+      setGrantRenewalFailure(null);
+      return;
+    }
+    let disposed = false;
+    let retryTimer: number | null = null;
+    const ensureRenewal = async () => {
+      try {
+        await ensureMeetingHumanGrantRenewal({
+          meetingId,
+          grantId: humanGrantId,
+        });
+        if (!disposed) setGrantRenewalFailure(null);
+      } catch (error) {
+        if (disposed) return;
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("Failed to retain the Human Meeting Grant", error);
+        setGrantRenewalFailure({ grantId: humanGrantId, message });
+        void refetchSnapshot();
+        retryTimer = window.setTimeout(() => void ensureRenewal(), 2_000);
+      }
+    };
+    void ensureRenewal();
+    return () => {
+      disposed = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [humanGrantId, meetingAuthority.status, meetingId, refetchSnapshot]);
   const boardEditable = Boolean(
     snapshot &&
       snapshot.lifecycle === "active" &&
@@ -570,28 +616,51 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
         </div>
       ) : null}
 
-      <div className="flex min-h-0 min-w-0 flex-1">
-        <main
-          className="min-w-0 flex-1 overflow-y-auto"
-          data-testid="meeting-timeline-scroll"
+      <div
+        className="flex min-h-0 min-w-0 flex-1 overflow-hidden"
+        data-testid="meeting-work-area"
+      >
+        <div
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+          data-testid="meeting-left-workspace"
         >
-          <MeetingSpeechTimeline
-            hasOlder={Boolean(speechesQuery.hasNextPage)}
-            isFetchingOlder={speechesQuery.isFetchingNextPage}
-            onFetchOlder={() => void speechesQuery.fetchNextPage()}
+          <main
+            className="min-h-0 min-w-0 flex-1 overflow-y-auto"
+            data-testid="meeting-timeline-scroll"
+          >
+            <MeetingSpeechTimeline
+              hasOlder={Boolean(speechesQuery.hasNextPage)}
+              isFetchingOlder={speechesQuery.isFetchingNextPage}
+              onFetchOlder={() => void speechesQuery.fetchNextPage()}
+              profiles={profiles}
+              speeches={speeches}
+            />
+            {speechesQuery.error ? (
+              <div className="mx-auto mb-5 max-w-xl rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+                Formal Speech could not be verified. Retry the Meeting read.
+              </div>
+            ) : null}
+          </main>
+          <MeetingFloorDock
+            abortDialogOpen={abortDialogOpen}
+            authorityAvailable={meetingAuthority.authorityAvailable}
+            boardDraft={boardDraft}
+            currentPubkey={identityQuery.data?.pubkey}
+            grantRenewalError={
+              grantRenewalFailure?.grantId === humanGrantId
+                ? grantRenewalFailure.message
+                : null
+            }
+            onAbortDialogOpenChange={setAbortDialogOpen}
+            onRefresh={() => void snapshotQuery.refetch()}
             profiles={profiles}
-            speeches={speeches}
+            snapshot={readySnapshot}
           />
-          {speechesQuery.error ? (
-            <div className="mx-auto mb-5 max-w-xl rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-              Formal Speech could not be verified. Retry the Meeting read.
-            </div>
-          ) : null}
-        </main>
+        </div>
         {!boardPanelIsOverlay && wideBoardOpen ? (
           <aside
             aria-label="Meeting board panel"
-            className="relative flex shrink-0"
+            className="relative flex min-h-0 shrink-0"
             data-testid="meeting-board-wide"
             id="meeting-board-wide-panel"
             style={{ width: boardWidth.widthPx }}
@@ -626,16 +695,6 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
           </aside>
         ) : null}
       </div>
-      <MeetingFloorDock
-        abortDialogOpen={abortDialogOpen}
-        authorityAvailable={meetingAuthority.authorityAvailable}
-        boardDraft={boardDraft}
-        currentPubkey={identityQuery.data?.pubkey}
-        onAbortDialogOpenChange={setAbortDialogOpen}
-        onRefresh={() => void snapshotQuery.refetch()}
-        profiles={profiles}
-        snapshot={readySnapshot}
-      />
     </div>
   );
 }

@@ -1,4 +1,9 @@
-//! Project View v2 Role continuity command and Relay projection wire format.
+//! Legacy Project View v2 Role continuity command and projection wire format.
+//!
+//! These types remain available only to explicit operator migration/recovery,
+//! audit fixtures, and the v3 conversion implementation. They are not an
+//! ordinary runtime compatibility surface and must not be used as fallback by
+//! Relay, CLI, Desktop, or ACP.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -350,8 +355,7 @@ pub struct V2ProjectObjectProjection {
     pub updated_at: DateTime<Utc>,
 }
 
-/// One verified member row from the exact NIP-43 snapshot referenced by v2
-/// metadata.
+/// One verified member row from an exact Project View NIP-43 snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2MembershipMember {
     /// Stable member identity.
@@ -360,7 +364,7 @@ pub struct V2MembershipMember {
     pub role: CommunityMemberRole,
 }
 
-/// Verified Relay-authored NIP-43 snapshot bound by a v2 metadata head.
+/// Verified Relay-authored NIP-43 snapshot bound by Project View metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2MembershipProjection {
     /// Signed snapshot event identifier.
@@ -605,8 +609,7 @@ pub fn parse_project_object_projection(
     })
 }
 
-/// Strictly parse and verify the NIP-43 membership snapshot referenced by v2
-/// metadata.
+/// Strictly parse and verify a Project View NIP-43 membership snapshot.
 pub fn parse_membership_projection(
     event: &Event,
     expected_relay: &PublicKey,
@@ -614,13 +617,13 @@ pub fn parse_membership_projection(
     verify_envelope(event, expected_relay, KIND_NIP43_MEMBERSHIP_LIST)?;
     if !event.content.is_empty() {
         return Err(invalid_projection(
-            "v2 membership snapshot content must be empty",
+            "Project View membership snapshot content must be empty",
         ));
     }
     let tags = event.tags.iter().map(Tag::as_slice).collect::<Vec<_>>();
     if tags.first().copied() != Some(["-".to_owned()].as_slice()) {
         return Err(invalid_projection(
-            "v2 membership snapshot must begin with one protection tag",
+            "Project View membership snapshot must begin with one protection tag",
         ));
     }
     let mut seen = BTreeSet::new();
@@ -628,18 +631,18 @@ pub fn parse_membership_projection(
     for tag in tags.iter().skip(1) {
         if tag.len() != 3 || tag.first().map(String::as_str) != Some("member") {
             return Err(invalid_projection(
-                "v2 membership snapshot contains a non-canonical tag",
+                "Project View membership snapshot contains a non-canonical tag",
             ));
         }
-        let pubkey_text = tag
-            .get(1)
-            .ok_or_else(|| invalid_projection("v2 membership snapshot member pubkey is missing"))?;
+        let pubkey_text = tag.get(1).ok_or_else(|| {
+            invalid_projection("Project View membership snapshot member pubkey is missing")
+        })?;
         let pubkey = PublicKey::from_hex(pubkey_text).map_err(|error| {
             invalid_projection(format!("invalid membership public key: {error}"))
         })?;
         if pubkey.to_hex() != *pubkey_text || !seen.insert(pubkey) {
             return Err(invalid_projection(
-                "v2 membership snapshot pubkeys must be unique canonical lowercase hex",
+                "Project View membership snapshot pubkeys must be unique canonical lowercase hex",
             ));
         }
         let role = match tag.get(2).map(String::as_str) {
@@ -648,7 +651,7 @@ pub fn parse_membership_projection(
             Some("member") => CommunityMemberRole::Member,
             _ => {
                 return Err(invalid_projection(
-                    "v2 membership snapshot contains an invalid Community role",
+                    "Project View membership snapshot contains an invalid Community role",
                 ));
             }
         };
@@ -659,7 +662,7 @@ pub fn parse_membership_projection(
         .any(|window| window[0].pubkey >= window[1].pubkey)
     {
         return Err(invalid_projection(
-            "v2 membership snapshot is not in canonical public-key order",
+            "Project View membership snapshot is not in canonical public-key order",
         ));
     }
     if members
@@ -669,7 +672,7 @@ pub fn parse_membership_projection(
         != 1
     {
         return Err(invalid_projection(
-            "v2 membership snapshot must contain exactly one owner",
+            "Project View membership snapshot must contain exactly one owner",
         ));
     }
     Ok(V2MembershipProjection {

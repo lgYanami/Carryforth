@@ -46,10 +46,7 @@ import type {
   ProjectViewObjectOf,
   ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
-import {
-  isProjectResourceDataV3,
-  isProjectViewIntegrityError,
-} from "@/shared/api/tauriProjectView";
+import { isProjectViewIntegrityError } from "@/shared/api/tauriProjectView";
 import {
   isRelayConnectionDegraded,
   useRelayConnection,
@@ -668,11 +665,7 @@ function ReadyCommunityOverview({
                   type="button"
                 >
                   <Badge variant="outline">
-                    {formatProjectViewTerm(
-                      isProjectResourceDataV3(resource.data)
-                        ? resource.data.resourceKind
-                        : resource.data.resourceType,
-                    )}
+                    {formatProjectViewTerm(resource.data.resourceKind)}
                   </Badge>
                   <h3 className="mt-2 text-sm font-semibold">
                     {resource.data.name}
@@ -716,9 +709,7 @@ export function CommunityProjectOverviewScreen({
   const query = useProjectViewQuery({ enabled: projectViewEnabled });
   const relayConnection = useRelayConnection();
   const relayPubkey =
-    query.data?.status === "ready" || query.data?.status === "uninitialized"
-      ? query.data.relayPubkey
-      : undefined;
+    query.data?.status === "ready" ? query.data.relayPubkey : undefined;
   const snapshotUpdatedAt =
     query.data?.status === "ready" ? query.data.updatedAt : undefined;
   const liveStatus = useProjectViewLiveSync({
@@ -885,18 +876,18 @@ export function CommunityProjectOverviewScreen({
             <CommunityOverviewState
               action={
                 <Button
-                  data-testid="initialize-project-view"
+                  data-testid="open-project-view-v3-setup"
                   onClick={onOpenFullView}
                   type="button"
                 >
-                  Initialize Project View
+                  Open v3 setup guide
                   <ArrowRight />
                 </Button>
               }
-              description="This Community is already a Project Space, but its shared Project Profile and first Goal have not been established yet."
+              description="Desktop did not find an initialized canonical Project View. A Relay operator must prepare the v3 bootstrap before the Community owner initializes its Project Profile, Goal, and governance."
               icon={<Flag className="h-5 w-5" />}
               testId="community-project-uninitialized"
-              title="Establish this Project's shared context"
+              title="Project View v3 requires owner initialization"
             />
           ) : null}
           {projectViewEnabled &&

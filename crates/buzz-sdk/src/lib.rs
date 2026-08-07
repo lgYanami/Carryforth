@@ -18,11 +18,13 @@ pub mod nip_oa;
 /// Project Document v1 command and verified Relay projection wire format.
 pub mod project_document;
 pub mod project_view;
-/// Project View v2 Role continuity command and projection wire format.
+/// Legacy Project View v2 wire types retained only for explicit migration,
+/// audit fixtures, and v3 domain conversion; ordinary clients must use v3.
 pub mod project_view_v2;
 /// Project View v3 command and strict Relay projection wire format.
 pub mod project_view_v3;
-/// Verified Project View v2 Role Brief assembly and Markdown rendering.
+/// Legacy Project View v2 Role Brief assembly retained for migration fixtures;
+/// ordinary clients and ACP must use [`role_brief_v3`].
 pub mod role_brief;
 /// Strict Project View v3 snapshot and base Role Brief assembly.
 pub mod role_brief_v3;

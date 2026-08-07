@@ -20,7 +20,7 @@ use serde_json::json;
 use tauri::State;
 use uuid::Uuid;
 
-use super::project_view::read_identity_at;
+use super::project_view::read_project_document_identity_at;
 use crate::app_state::AppState;
 use crate::relay::{
     query_relay_at_with_keys_typed, relay_api_base_url_with_override,
@@ -123,18 +123,15 @@ async fn capture_context(
     let keys = state
         .signing_keys()
         .map_err(ProjectDocumentCommandError::from)?;
-    let identity = read_identity_at(state, &api_base_url)
+    let relay_pubkey = read_project_document_identity_at(state, &api_base_url)
         .await
         .map_err(ProjectDocumentCommandError::from)?
         .ok_or_else(ProjectDocumentCommandError::unsupported)?;
-    if !identity.project_document_supported {
-        return Err(ProjectDocumentCommandError::unsupported());
-    }
     Ok(DocumentContext {
         community_key,
         api_base_url,
         keys,
-        relay_pubkey: identity.relay_pubkey,
+        relay_pubkey,
     })
 }
 

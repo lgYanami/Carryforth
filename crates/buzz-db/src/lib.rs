@@ -56,7 +56,8 @@ pub mod project_runtime;
 pub mod project_view;
 /// Durable Project View v3 maintenance and provisioning operations.
 pub mod project_view_maintenance;
-/// Project View v2 Role Proposal/Assignment transaction coordinator.
+/// Legacy v2 transaction/domain implementation retained for explicit
+/// migration, recovery, tests, and v3 domain reuse; not an ordinary runtime.
 pub mod project_view_v2;
 /// Project View v3 canonical transactions and readiness checks.
 pub mod project_view_v3;
@@ -214,6 +215,10 @@ pub struct Db {
     /// advances it after each verified writer→replica LSN handshake. When
     /// closed or stale, every cursor page routes to the writer.
     pub(crate) fence: std::sync::Arc<replica_fence::ReplicaFence>,
+    /// Per-database, process-shared strict Project View v3 readiness results.
+    /// Cloned handles share attestations; independent/scratch databases do not.
+    pub(crate) project_view_v3_readiness:
+        std::sync::Arc<project_view_v3::V3ReadinessAttestationCache>,
 }
 
 /// Snapshot of Postgres connection pool utilisation.
@@ -397,6 +402,9 @@ impl Db {
             max_connections: config.max_connections,
             read_pool,
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
+            project_view_v3_readiness: std::sync::Arc::new(
+                project_view_v3::V3ReadinessAttestationCache::default(),
+            ),
         })
     }
 
@@ -435,6 +443,9 @@ impl Db {
             pool,
             read_pool: None,
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
+            project_view_v3_readiness: std::sync::Arc::new(
+                project_view_v3::V3ReadinessAttestationCache::default(),
+            ),
         }
     }
 
@@ -451,6 +462,9 @@ impl Db {
             pool,
             read_pool: Some(read_pool),
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
+            project_view_v3_readiness: std::sync::Arc::new(
+                project_view_v3::V3ReadinessAttestationCache::default(),
+            ),
         }
     }
 
@@ -878,8 +892,8 @@ impl Db {
     ) -> Result<EnsuredCommunityRecord> {
         let row = sqlx::query(
             r#"
-            INSERT INTO communities (host)
-            VALUES ($1)
+            INSERT INTO communities (host, project_view_schema_version, project_view_enabled)
+            VALUES ($1, 3, FALSE)
             ON CONFLICT (lower(host)) DO UPDATE SET host = communities.host
             RETURNING id, host, (xmax = 0) AS created
             "#,
@@ -921,8 +935,8 @@ impl Db {
 
         let row = sqlx::query(
             r#"
-            INSERT INTO communities (host)
-            VALUES ($1)
+            INSERT INTO communities (host, project_view_schema_version, project_view_enabled)
+            VALUES ($1, 3, FALSE)
             ON CONFLICT (lower(host)) DO NOTHING
             RETURNING id, host
             "#,
@@ -937,9 +951,9 @@ impl Db {
             let community_id = CommunityId::from_uuid(id);
 
             // Membership and Project View share one Community-scoped lock.
-            // Even though a fresh Community is schema v1, using the common
-            // primitive here prevents provisioning from becoming a future
-            // bypass when defaults or cutover tooling evolve.
+            // A fresh Community starts at schema v3 but remains disabled and
+            // uninitialized until the explicit owner-authorized prepare-v3 /
+            // initialize-v3 workflow establishes its canonical ledger.
             relay_members::acquire_membership_write_lock(&mut tx, community_id).await?;
 
             // Enforce the limit before inserting the new owner row.
@@ -3063,6 +3077,23 @@ impl Db {
         relay_members::relay_membership_identity(&self.pool, community, pubkey).await
     }
 
+    /// Return whether a principal is a current eligible direct Human member.
+    ///
+    /// This is intentionally stricter than ordinary Project View membership:
+    /// managed Agents and owner-delegated identities cannot read retained v2
+    /// source pages used for Human-reviewed v3 migration.
+    pub async fn project_view_v3_migration_reader_authorized_pubkey(
+        &self,
+        community: CommunityId,
+        pubkey: &nostr::PublicKey,
+    ) -> Result<bool> {
+        Ok(
+            relay_members::eligible_direct_human_role(&self.pool, community, pubkey, false)
+                .await?
+                .is_some(),
+        )
+    }
+
     /// Check a self-proving NIP-OA Agent/owner pair against current membership
     /// and persistent-ban state.
     pub async fn delegated_agent_owner_is_eligible(
@@ -3200,10 +3231,10 @@ impl Db {
         relay_members::bootstrap_owner(&self.pool, community, owner_pubkey).await
     }
 
-    /// Atomically transfers ownership of a v1 `community` to
-    /// `new_owner_pubkey`, demoting previous owners to `member`. A v2
-    /// Community fails closed until its source/audit/projection coordinator is
-    /// available. Verifies
+    /// Atomically transfers ownership of a legacy schema-v1 `community` to
+    /// `new_owner_pubkey`, demoting previous owners to `member`. A Project
+    /// View-governed Community fails closed until its source/audit/projection
+    /// coordinator is available. Verifies
     /// `expected_owner_pubkey` matches the current owner inside the same
     /// transaction to prevent stale-owner races.
     pub async fn transfer_ownership(
@@ -4196,12 +4227,18 @@ mod tests {
     async fn make_community(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
         let host = format!("communities-of-channels-{}.example", id.simple());
-        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
-            .bind(id)
-            .bind(host)
-            .execute(pool)
-            .await
-            .expect("insert community");
+        // Most callers in this legacy integration module exercise mutable
+        // membership setup. Pin schema v1 instead of inheriting the current
+        // greenfield schema-v3 default.
+        sqlx::query(
+            "INSERT INTO communities (id, host, project_view_schema_version) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(id)
+        .bind(host)
+        .execute(pool)
+        .await
+        .expect("insert community");
         id
     }
 
@@ -4988,6 +5025,16 @@ mod tests {
             panic!("expected new community");
         };
         assert_eq!(created.host, host);
+        let project_view_defaults: (i16, bool, Option<Uuid>) = sqlx::query_as(
+            "SELECT project_view_schema_version, project_view_enabled, \
+                    project_view_preparation_operation_id \
+             FROM communities WHERE id = $1",
+        )
+        .bind(created.id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read greenfield Project View defaults");
+        assert_eq!(project_view_defaults, (3, false, None));
         let owner_role: Option<String> = sqlx::query_scalar(
             "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2",
         )
@@ -5022,16 +5069,22 @@ mod tests {
         .expect("community roles");
         assert_eq!(roles, vec![(owner.to_string(), "owner".to_string())]);
 
-        db.bootstrap_owner(created.id, other)
+        let bootstrap_error = db
+            .bootstrap_owner(created.id, other)
             .await
-            .expect("rotate owner");
+            .expect_err("schema-v3 owner rotation must use governance");
+        assert_eq!(
+            bootstrap_error.to_string(),
+            "access denied: unavailable:project_view:membership_coordinator"
+        );
         let post_rotation_retry = db
             .create_community_with_owner(&host, owner)
             .await
             .expect("post-rotation retry");
         assert_eq!(
             post_rotation_retry,
-            CreateCommunityWithOwnerResult::HostExists
+            CreateCommunityWithOwnerResult::Created(created),
+            "rejected bootstrap must preserve the original owner"
         );
     }
 
@@ -5169,6 +5222,16 @@ mod tests {
             .expect("first ensure");
         assert!(first.created, "first ensure should report created");
         assert_eq!(first.host, host);
+        let project_view_defaults: (i16, bool, Option<Uuid>) = sqlx::query_as(
+            "SELECT project_view_schema_version, project_view_enabled, \
+                    project_view_preparation_operation_id \
+             FROM communities WHERE id = $1",
+        )
+        .bind(first.id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read configured Community Project View defaults");
+        assert_eq!(project_view_defaults, (3, false, None));
 
         let second = db
             .ensure_configured_community(&host)
@@ -5177,6 +5240,31 @@ mod tests {
         assert!(!second.created, "second ensure should report existed");
         assert_eq!(second.id, first.id);
         assert_eq!(second.host, host);
+
+        let owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let replacement = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        db.bootstrap_owner(first.id, &owner)
+            .await
+            .expect("first Human owner bootstraps empty schema-v3 Community");
+        db.bootstrap_owner(first.id, &owner)
+            .await
+            .expect("same configured owner converges idempotently");
+        let error = db
+            .bootstrap_owner(first.id, &replacement)
+            .await
+            .expect_err("schema-v3 owner replacement must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "access denied: unavailable:project_view:membership_coordinator"
+        );
+        let roles: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pubkey, role FROM relay_members WHERE community_id = $1 ORDER BY pubkey",
+        )
+        .bind(first.id.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("read configured Community owners");
+        assert_eq!(roles, vec![(owner, "owner".to_owned())]);
     }
 
     #[tokio::test]

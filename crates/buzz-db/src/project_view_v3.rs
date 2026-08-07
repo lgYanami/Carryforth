@@ -5,14 +5,17 @@
 //! Context/provenance persistence, and projection-pointer publication.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
+use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{
     KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_MUTATION,
     KIND_PROJECT_VIEW_OBJECT,
 };
-use buzz_core::{CommunityId, EventId, PublicKey};
+use buzz_core::{CommunityId, EventId, PublicKey, StoredEvent};
 use buzz_project_view::v2::{
-    GeneratedRoleContinuityIds, ProposalStatus, ProposalType, RoleAssignment,
+    ChangeSource, GeneratedRoleContinuityIds, ProposalStatus, ProposalType, RoleAssignment,
     RoleAssignmentProposal, RoleContinuityChange, RoleContinuityEntity, RoleContinuityError,
     RoleLevel, WorkResponsibility,
 };
@@ -35,9 +38,698 @@ use uuid::Uuid;
 
 use crate::project_view::PreparedObjectProjection;
 use crate::project_view_v2::{
+    apply_membership_roles, load_counts, load_membership, load_old_projection_ids, persist_changes,
+    retire_membership_heads, update_projection_pointer, verify_membership_projection,
     PreparedV2EntityProjection, ProjectViewV2Receipt, V2CanonicalCounts, V2MembershipEntry,
 };
 use crate::{Db, DbError};
+
+const ALL_V3_PROJECTION_POINTERS_READY_SQL: &str = "SELECT NOT EXISTS ( \
+         SELECT 1 \
+         FROM ( \
+             SELECT projection_event_id FROM project_view_objects \
+             WHERE community_id = $1 \
+             UNION ALL \
+             SELECT projection_event_id FROM project_role_assignment_proposals \
+             WHERE community_id = $1 \
+             UNION ALL \
+             SELECT projection_event_id FROM project_role_assignments \
+             WHERE community_id = $1 \
+             UNION ALL \
+             SELECT projection_event_id FROM project_work_commitments \
+             WHERE community_id = $1 \
+             UNION ALL \
+             SELECT projection_event_id FROM project_role_checkpoints \
+             WHERE community_id = $1 \
+             UNION ALL \
+             SELECT projection_event_id FROM project_role_handoffs \
+             WHERE community_id = $1 \
+         ) head \
+         LEFT JOIN events projection \
+           ON projection.community_id = state.community_id \
+          AND projection.id = head.projection_event_id \
+          AND projection.kind = $3 \
+          AND projection.pubkey = $2 \
+          AND projection.deleted_at IS NULL \
+         WHERE head.projection_event_id IS NULL \
+            OR projection.id IS NULL \
+            OR projection.content::jsonb->>'schema_version' IS DISTINCT FROM '3' \
+            OR projection.content::jsonb->>'projection_generation' \
+               IS DISTINCT FROM state.projection_generation::text \
+     ) \
+     FROM project_view_state state \
+     WHERE state.community_id = $1 AND state.schema_version = 3";
+
+const V3_BOOTSTRAP_DISCOVERABLE_SQL: &str = "SELECT EXISTS ( \
+     SELECT 1 FROM communities community \
+     WHERE community.id = $1 \
+       AND community.archived_at IS NULL \
+       AND project_view_v3_bootstrap_lifecycle_valid(community.id) \
+ )";
+
+const V3_UNRECOVERABLE_ASSIGNMENT_STATE_UPDATE_SQL: &str = "UPDATE project_view_state SET \
+     project_revision = $2, updated_at = $3, last_event_id = $4, \
+     last_actor_pubkey = $5, meta_projection_event_id = $6, \
+     schema_version = 3, last_change_id = $4, \
+     last_source_event_id = NULL, open_proposal_count = $7, \
+     active_assignment_count = $8, active_commitment_count = $9, \
+     checkpoint_count = $10, handoff_count = $11, \
+     membership_snapshot_event_id = $12 \
+ WHERE community_id = $1 AND project_revision = $13 \
+   AND schema_version = 3";
+
+const V3_RUNTIME_SYSTEM_WRITE_AVAILABLE_SQL: &str = "SELECT \
+     community.project_view_schema_version = 3 \
+       AND community.project_view_enabled \
+       AND community.archived_at IS NULL \
+       AND maintenance.state = 'normal' \
+ FROM communities community \
+ JOIN project_view_maintenance maintenance \
+   ON maintenance.community_id = community.id \
+ WHERE community.id = $1 \
+ FOR UPDATE OF community, maintenance";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V3ObjectProjectionPointer {
+    object_id: Uuid,
+    object_type: String,
+    object_revision: u64,
+    project_revision: u64,
+    deleted: bool,
+    event_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V3EntityProjectionPointer {
+    entity_id: Uuid,
+    entity_type: String,
+    entity_revision: u64,
+    project_revision: u64,
+    event_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V3ProjectionVariant {
+    Entity(RoleContinuityEntity),
+    Object(ProjectViewObjectType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V3ExpectedChangedHead {
+    event_id: EventId,
+    revision: u64,
+    variant: V3ProjectionVariant,
+    project_revision: u64,
+    source: buzz_sdk::project_view_v3::V3ProjectionSource,
+}
+
+const V3_READINESS_ATTESTATION_TTL: Duration = Duration::from_secs(10);
+const V3_READINESS_FAILURE_THROTTLE_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct V3ReadinessAttestationKey {
+    community_id: Uuid,
+    relay_pubkey: [u8; 32],
+    projection_generation: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct V3ReadinessAttestationCache {
+    results: Mutex<BTreeMap<V3ReadinessAttestationKey, V3ReadinessCachedResult>>,
+    gates: Mutex<BTreeMap<V3ReadinessAttestationKey, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V3ReadinessCachedResult {
+    ready: bool,
+    valid_until: Instant,
+}
+
+impl V3ReadinessAttestationCache {
+    fn result_at(&self, key: V3ReadinessAttestationKey, now: Instant) -> Option<bool> {
+        let mut entries = unpoisoned_lock(&self.results);
+        entries.retain(|_, result| result.valid_until > now);
+        entries.get(&key).map(|result| result.ready)
+    }
+
+    fn record_result_at(&self, key: V3ReadinessAttestationKey, ready: bool, now: Instant) {
+        let mut entries = unpoisoned_lock(&self.results);
+        entries.retain(|_, result| result.valid_until > now);
+        let ttl = if ready {
+            V3_READINESS_ATTESTATION_TTL
+        } else {
+            // Failure is not an attestation. This tiny throttle merely lets
+            // same-key waiters consume the completed scan result instead of
+            // serially repeating an O(history) failure.
+            V3_READINESS_FAILURE_THROTTLE_TTL
+        };
+        entries.insert(
+            key,
+            V3ReadinessCachedResult {
+                ready,
+                valid_until: now + ttl,
+            },
+        );
+    }
+
+    fn gate(&self, key: V3ReadinessAttestationKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = unpoisoned_lock(&self.gates);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+}
+
+fn unpoisoned_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Indexed, constant-cardinality gate used on every advertised/runtime check.
+///
+/// A successful strict attestation deliberately survives ordinary Project
+/// revisions within the same projection generation. Normal writes can extend
+/// that attested baseline because their changed projections are built and
+/// strictly parsed by the Relay before SQL pointer publication. Generation
+/// changes, TTL expiry, or a failed indexed gate force another complete scan.
+const FAST_V3_ADVERTISED_ATTESTATION_KEY_SQL: &str = "SELECT state.projection_generation \
+     FROM communities community \
+     JOIN project_view_state state ON state.community_id = community.id \
+     JOIN project_view_maintenance maintenance ON maintenance.community_id = community.id \
+     JOIN events meta \
+       ON meta.community_id = community.id \
+      AND meta.id = state.meta_projection_event_id \
+      AND meta.kind = $3 AND meta.pubkey = $2 \
+      AND meta.deleted_at IS NULL AND meta.channel_id IS NULL \
+      AND meta.content::jsonb->>'schema_version' = '3' \
+      AND meta.content::jsonb->>'project_revision' = state.project_revision::text \
+      AND meta.content::jsonb->>'projection_generation' = state.projection_generation::text \
+     JOIN events membership \
+       ON membership.community_id = community.id \
+      AND membership.id = state.membership_snapshot_event_id \
+      AND membership.kind = $4 AND membership.pubkey = $2 \
+      AND membership.deleted_at IS NULL AND membership.channel_id IS NULL \
+      AND membership.content = '' \
+     WHERE community.id = $1 \
+       AND community.archived_at IS NULL \
+       AND community.project_view_enabled \
+       AND community.project_view_schema_version = 3 \
+       AND state.schema_version = 3 \
+       AND state.projection_pubkey = $2 \
+       AND state.active_object_count >= 0 \
+       AND state.open_proposal_count >= 0 \
+       AND state.active_assignment_count >= 0 \
+       AND state.active_commitment_count >= 0 \
+       AND state.checkpoint_count >= 0 \
+       AND state.handoff_count >= 0 \
+       AND maintenance.state = 'normal'";
+
+async fn fast_v3_advertised_attestation_key_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    relay_pubkey: &PublicKey,
+) -> crate::Result<Option<V3ReadinessAttestationKey>> {
+    let relay = relay_pubkey.to_bytes();
+    let generation: Option<i64> = sqlx::query_scalar(FAST_V3_ADVERTISED_ATTESTATION_KEY_SQL)
+        .bind(community_id.as_uuid())
+        .bind(relay.as_slice())
+        .bind(kind_i32(KIND_PROJECT_VIEW_META)?)
+        .bind(kind_i32(KIND_NIP43_MEMBERSHIP_LIST)?)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(projection_generation) = generation.and_then(readiness_revision) else {
+        return Ok(None);
+    };
+    Ok(Some(V3ReadinessAttestationKey {
+        community_id: *community_id.as_uuid(),
+        relay_pubkey: relay,
+        projection_generation,
+    }))
+}
+
+/// Perform the cryptographic half of v3 readiness. SQL remains a useful cheap
+/// shape preflight, but JSON predicates cannot prove a Nostr signature or the
+/// exact canonical tag/coordinate sequence.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn strict_v3_projection_wires_ready_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    relay_pubkey: &PublicKey,
+) -> crate::Result<bool> {
+    let Some(state) = sqlx::query(
+        "SELECT project_revision, projection_generation, meta_projection_event_id, \
+                membership_snapshot_event_id, active_object_count, open_proposal_count, \
+                active_assignment_count, active_commitment_count, checkpoint_count, \
+                handoff_count \
+         FROM project_view_state \
+         WHERE community_id = $1 AND schema_version = 3",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(false);
+    };
+    let Some(project_revision) = readiness_revision(state.try_get("project_revision")?) else {
+        return Ok(false);
+    };
+    let Some(projection_generation) = readiness_revision(state.try_get("projection_generation")?)
+    else {
+        return Ok(false);
+    };
+    let Some(meta_event_id) =
+        readiness_event_id(state.try_get::<Option<Vec<u8>>, _>("meta_projection_event_id")?)
+    else {
+        return Ok(false);
+    };
+    let Some(membership_event_id) =
+        readiness_event_id(state.try_get::<Option<Vec<u8>>, _>("membership_snapshot_event_id")?)
+    else {
+        return Ok(false);
+    };
+    let Some(expected_counts) = readiness_counts(&state)? else {
+        return Ok(false);
+    };
+
+    let object_rows = sqlx::query(
+        "SELECT object_id, object_type, object_revision, project_revision, deleted_at, \
+                projection_event_id \
+         FROM project_view_objects \
+         WHERE community_id = $1 \
+         ORDER BY object_type, object_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut objects = Vec::with_capacity(object_rows.len());
+    for row in object_rows {
+        let Some(object_revision) = readiness_revision(row.try_get("object_revision")?) else {
+            return Ok(false);
+        };
+        let Some(object_project_revision) = readiness_revision(row.try_get("project_revision")?)
+        else {
+            return Ok(false);
+        };
+        if object_project_revision > project_revision {
+            return Ok(false);
+        }
+        let Some(event_id) =
+            readiness_event_id(row.try_get::<Option<Vec<u8>>, _>("projection_event_id")?)
+        else {
+            return Ok(false);
+        };
+        objects.push(V3ObjectProjectionPointer {
+            object_id: row.try_get("object_id")?,
+            object_type: row.try_get("object_type")?,
+            object_revision,
+            project_revision: object_project_revision,
+            deleted: row
+                .try_get::<Option<DateTime<Utc>>, _>("deleted_at")?
+                .is_some(),
+            event_id,
+        });
+    }
+
+    let entity_rows = sqlx::query(
+        "SELECT 'role_assignment_proposal'::text AS entity_type, \
+                proposal_id AS entity_id, entity_revision, project_revision, projection_event_id \
+         FROM project_role_assignment_proposals WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 'role_assignment', assignment_id, entity_revision, project_revision, \
+                projection_event_id \
+         FROM project_role_assignments WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 'work_commitment', commitment_id, entity_revision, project_revision, \
+                projection_event_id \
+         FROM project_work_commitments WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 'role_checkpoint', checkpoint_id, entity_revision, project_revision, \
+                projection_event_id \
+         FROM project_role_checkpoints WHERE community_id = $1 \
+         UNION ALL \
+         SELECT 'role_handoff', handoff_id, entity_revision, project_revision, \
+                projection_event_id \
+         FROM project_role_handoffs WHERE community_id = $1 \
+         ORDER BY entity_type, entity_id",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut entities = Vec::with_capacity(entity_rows.len());
+    for row in entity_rows {
+        let Some(entity_revision) = readiness_revision(row.try_get("entity_revision")?) else {
+            return Ok(false);
+        };
+        let Some(entity_project_revision) = readiness_revision(row.try_get("project_revision")?)
+        else {
+            return Ok(false);
+        };
+        if entity_project_revision > project_revision {
+            return Ok(false);
+        }
+        let Some(event_id) =
+            readiness_event_id(row.try_get::<Option<Vec<u8>>, _>("projection_event_id")?)
+        else {
+            return Ok(false);
+        };
+        entities.push(V3EntityProjectionPointer {
+            entity_id: row.try_get("entity_id")?,
+            entity_type: row.try_get("entity_type")?,
+            entity_revision,
+            project_revision: entity_project_revision,
+            event_id,
+        });
+    }
+
+    let mut event_ids = objects
+        .iter()
+        .map(|pointer| pointer.event_id)
+        .chain(entities.iter().map(|pointer| pointer.event_id))
+        .collect::<BTreeSet<_>>();
+    event_ids.insert(meta_event_id);
+    event_ids.insert(membership_event_id);
+    let Some(events) = load_v3_readiness_events_in_tx(tx, community_id, &event_ids).await? else {
+        return Ok(false);
+    };
+
+    let mut expected_heads = BTreeMap::new();
+    for pointer in &objects {
+        let Some(event) = events.get(&pointer.event_id) else {
+            return Ok(false);
+        };
+        let Some(expected_head) = strict_v3_object_pointer_projection(
+            pointer,
+            event,
+            relay_pubkey,
+            community_id,
+            projection_generation,
+        ) else {
+            return Ok(false);
+        };
+        let coordinate = format!(
+            "project-view:{}:{}:{}",
+            community_id.as_uuid(),
+            pointer.object_type,
+            pointer.object_id
+        );
+        if expected_heads.insert(coordinate, expected_head).is_some() {
+            return Ok(false);
+        }
+    }
+    for pointer in &entities {
+        let Some(event) = events.get(&pointer.event_id) else {
+            return Ok(false);
+        };
+        let Some(expected_head) = strict_v3_entity_pointer_projection(
+            pointer,
+            event,
+            relay_pubkey,
+            community_id,
+            projection_generation,
+        ) else {
+            return Ok(false);
+        };
+        let coordinate = format!(
+            "project-view:{}:{}:{}",
+            community_id.as_uuid(),
+            pointer.entity_type,
+            pointer.entity_id
+        );
+        if expected_heads.insert(coordinate, expected_head).is_some() {
+            return Ok(false);
+        }
+    }
+
+    let Some(meta_event) = events.get(&meta_event_id) else {
+        return Ok(false);
+    };
+    if !strict_v3_meta_matches_state(
+        meta_event,
+        relay_pubkey,
+        community_id,
+        project_revision,
+        projection_generation,
+        expected_counts,
+        EventId::from_byte_array(membership_event_id),
+        &expected_heads,
+    ) {
+        return Ok(false);
+    }
+
+    let Some(membership_event) = events.get(&membership_event_id) else {
+        return Ok(false);
+    };
+    let membership_rows = sqlx::query(
+        "SELECT pubkey, role FROM relay_members \
+         WHERE community_id = $1 ORDER BY pubkey, role",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    let membership = membership_rows
+        .into_iter()
+        .map(|row| {
+            Ok(V2MembershipEntry {
+                pubkey: row.try_get("pubkey")?,
+                role: row.try_get("role")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    if !strict_v3_membership_matches_state(membership_event, relay_pubkey, &membership) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn load_v3_readiness_events_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event_ids: &BTreeSet<[u8; 32]>,
+) -> crate::Result<Option<BTreeMap<[u8; 32], StoredEvent>>> {
+    let event_ids = event_ids.iter().collect::<Vec<_>>();
+    let mut events = BTreeMap::new();
+    for chunk in event_ids.chunks(500) {
+        let refs = chunk.iter().map(|id| id.as_slice()).collect::<Vec<_>>();
+        for event in crate::event::get_events_by_ids_in_tx(tx, community_id, &refs).await? {
+            events.insert(event.event.id.to_bytes(), event);
+        }
+    }
+    Ok((events.len() == event_ids.len()).then_some(events))
+}
+
+fn strict_v3_object_pointer_projection(
+    pointer: &V3ObjectProjectionPointer,
+    event: &StoredEvent,
+    relay_pubkey: &PublicKey,
+    community_id: CommunityId,
+    projection_generation: u64,
+) -> Option<V3ExpectedChangedHead> {
+    if event.channel_id.is_some() || event.event.id.to_bytes() != pointer.event_id {
+        return None;
+    }
+    if pointer.object_type == ProjectViewObjectType::Role.as_str() && !pointer.deleted {
+        let Ok(projection) = buzz_sdk::project_view_v3::parse_entity_projection(
+            &event.event,
+            relay_pubkey,
+            community_id,
+        ) else {
+            return None;
+        };
+        return (projection.entity.entity_type() == RoleContinuityEntity::Role
+            && projection.entity.entity_id() == pointer.object_id
+            && projection.entity_revision == pointer.object_revision
+            && projection.project_revision == pointer.project_revision
+            && projection.projection_generation == projection_generation)
+            .then_some(V3ExpectedChangedHead {
+                event_id: projection.event_id,
+                revision: projection.entity_revision,
+                variant: V3ProjectionVariant::Entity(RoleContinuityEntity::Role),
+                project_revision: projection.project_revision,
+                source: projection.source,
+            });
+    }
+    let Ok(projection) = buzz_sdk::project_view_v3::parse_project_object_projection(
+        &event.event,
+        relay_pubkey,
+        community_id,
+    ) else {
+        return None;
+    };
+    (projection.object.id() == pointer.object_id
+        && projection.object.object_type().as_str() == pointer.object_type
+        && projection.object.object_revision() == pointer.object_revision
+        && projection.project_revision == pointer.project_revision
+        && projection.projection_generation == projection_generation
+        && matches!(
+            (&projection.object, pointer.deleted),
+            (
+                buzz_sdk::project_view_v3::V3ProjectedObject::Active(_),
+                false
+            ) | (
+                buzz_sdk::project_view_v3::V3ProjectedObject::Tombstone(_),
+                true
+            )
+        ))
+    .then_some(V3ExpectedChangedHead {
+        event_id: projection.event_id,
+        revision: projection.object.object_revision(),
+        variant: V3ProjectionVariant::Object(projection.object.object_type()),
+        project_revision: projection.project_revision,
+        source: projection.source,
+    })
+}
+
+fn strict_v3_entity_pointer_projection(
+    pointer: &V3EntityProjectionPointer,
+    event: &StoredEvent,
+    relay_pubkey: &PublicKey,
+    community_id: CommunityId,
+    projection_generation: u64,
+) -> Option<V3ExpectedChangedHead> {
+    if event.channel_id.is_some() || event.event.id.to_bytes() != pointer.event_id {
+        return None;
+    }
+    let Ok(projection) = buzz_sdk::project_view_v3::parse_entity_projection(
+        &event.event,
+        relay_pubkey,
+        community_id,
+    ) else {
+        return None;
+    };
+    (projection.entity.entity_id() == pointer.entity_id
+        && projection.entity.entity_type().as_str() == pointer.entity_type
+        && projection.entity_revision == pointer.entity_revision
+        && projection.project_revision == pointer.project_revision
+        && projection.projection_generation == projection_generation)
+        .then_some(V3ExpectedChangedHead {
+            event_id: projection.event_id,
+            revision: projection.entity_revision,
+            variant: V3ProjectionVariant::Entity(projection.entity.entity_type()),
+            project_revision: projection.project_revision,
+            source: projection.source,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strict_v3_meta_matches_state(
+    event: &StoredEvent,
+    relay_pubkey: &PublicKey,
+    community_id: CommunityId,
+    project_revision: u64,
+    projection_generation: u64,
+    expected_counts: buzz_sdk::project_view_v3::V3EntityCounts,
+    membership_event_id: EventId,
+    expected_heads: &BTreeMap<String, V3ExpectedChangedHead>,
+) -> bool {
+    if event.channel_id.is_some() {
+        return false;
+    }
+    let Ok(meta) = buzz_sdk::project_view_v3::parse_meta_projection(&event.event, relay_pubkey)
+    else {
+        return false;
+    };
+    let changed_heads_ready = if meta.reset {
+        meta.changed_heads.is_empty()
+    } else {
+        let expected_incremental_count = expected_heads
+            .values()
+            .filter(|expected| {
+                expected.project_revision == meta.project_revision && expected.source == meta.source
+            })
+            .count();
+        !meta.changed_heads.is_empty()
+            && meta.changed_heads.len() == expected_incremental_count
+            && meta.changed_heads.iter().all(|head| {
+                let variant = match head {
+                    buzz_sdk::project_view_v3::V3ChangedHead::Entity { entity_type, .. } => {
+                        V3ProjectionVariant::Entity(*entity_type)
+                    }
+                    buzz_sdk::project_view_v3::V3ChangedHead::Object { object_type, .. } => {
+                        V3ProjectionVariant::Object(*object_type)
+                    }
+                };
+                expected_heads
+                    .get(head.coordinate())
+                    .is_some_and(|expected| {
+                        expected.event_id == head.event_id()
+                            && expected.revision == head.revision()
+                            && expected.variant == variant
+                            && expected.project_revision == meta.project_revision
+                            && expected.source == meta.source
+                    })
+            })
+    };
+    meta.event_id == event.event.id
+        && meta.project_id == community_id
+        && meta.project_revision == project_revision
+        && meta.projection_generation == projection_generation
+        && meta.entity_counts == expected_counts
+        && meta.membership_snapshot_event_id == membership_event_id
+        && changed_heads_ready
+}
+
+fn strict_v3_membership_matches_state(
+    event: &StoredEvent,
+    relay_pubkey: &PublicKey,
+    membership: &[V2MembershipEntry],
+) -> bool {
+    if event.channel_id.is_some() {
+        return false;
+    }
+    let Some(canonical_time) = i64::try_from(event.event.created_at.as_secs())
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+    else {
+        return false;
+    };
+    crate::project_view_v2::verify_membership_projection(
+        &event.event,
+        *relay_pubkey,
+        membership,
+        canonical_time,
+    )
+    .is_ok()
+}
+
+fn readiness_event_id(value: Option<Vec<u8>>) -> Option<[u8; 32]> {
+    value?.try_into().ok()
+}
+
+fn readiness_revision(value: i64) -> Option<u64> {
+    u64::try_from(value).ok().filter(|revision| *revision > 0)
+}
+
+fn readiness_counts(
+    row: &sqlx::postgres::PgRow,
+) -> crate::Result<Option<buzz_sdk::project_view_v3::V3EntityCounts>> {
+    let values = [
+        row.try_get::<i32, _>("active_object_count")?,
+        row.try_get::<i32, _>("open_proposal_count")?,
+        row.try_get::<i32, _>("active_assignment_count")?,
+        row.try_get::<i32, _>("active_commitment_count")?,
+        row.try_get::<i32, _>("checkpoint_count")?,
+        row.try_get::<i32, _>("handoff_count")?,
+    ];
+    let [Ok(active_objects), Ok(open_proposals), Ok(active_assignments), Ok(active_commitments), Ok(checkpoints), Ok(handoffs)] =
+        values.map(u32::try_from)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(buzz_sdk::project_view_v3::V3EntityCounts {
+        active_objects,
+        open_proposals,
+        active_assignments,
+        active_commitments,
+        checkpoints,
+        handoffs,
+    }))
+}
 
 /// Stable failures from a Project View v3 write transaction.
 #[derive(Debug, thiserror::Error)]
@@ -268,6 +960,19 @@ pub struct ProjectViewV3InitializeOutcome {
     pub replayed: bool,
 }
 
+/// Result of one trusted internal Project View v3 system change.
+#[derive(Debug, Clone)]
+pub struct ProjectViewV3SystemOutcome {
+    /// New or replayed Project revision.
+    pub project_revision: u64,
+    /// Stable successful receipt.
+    pub result: Value,
+    /// Newly stored Relay-signed v3 projections in dispatch order.
+    pub events: Vec<Event>,
+    /// Whether the idempotent system change was already committed.
+    pub replayed: bool,
+}
+
 /// Preparation either finds an existing receipt or stages a new transition.
 #[derive(Debug, Clone)]
 pub enum ProjectViewV3ProjectObjectPrepareOutcome {
@@ -328,6 +1033,23 @@ impl std::fmt::Debug for ProjectViewV3WriteTx {
 }
 
 impl Db {
+    /// Return whether one Community may advertise the discovery-only v3
+    /// bootstrap marker.
+    ///
+    /// This is deliberately a lightweight scalar rather than the operator
+    /// status reader: an initialized maintenance Community must not trigger a
+    /// strict projection scan merely to prove that it is not greenfield.
+    pub async fn project_view_v3_bootstrap_discoverable(
+        &self,
+        community_id: CommunityId,
+    ) -> crate::Result<bool> {
+        let discoverable: bool = sqlx::query_scalar(V3_BOOTSTRAP_DISCOVERABLE_SQL)
+            .bind(community_id.as_uuid())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(discoverable)
+    }
+
     /// Validate schema-v3 canonical and projection structure without requiring
     /// operational enablement or a normal maintenance pointer.
     pub async fn project_view_v3_structural_ready(
@@ -336,6 +1058,7 @@ impl Db {
         relay_pubkey: &PublicKey,
     ) -> crate::Result<bool> {
         let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, true).await?;
         let ready =
             Self::project_view_v3_structural_ready_in_tx(&mut tx, community_id, relay_pubkey)
                 .await?;
@@ -401,8 +1124,8 @@ impl Db {
                           AND meta.kind = $3 AND meta.pubkey = $2 \
                           AND meta.deleted_at IS NULL \
                           AND meta.content::jsonb->>'schema_version' = '3' \
-                          AND (meta.content::jsonb->>'project_revision')::bigint = s.project_revision \
-                          AND (meta.content::jsonb->>'projection_generation')::bigint = s.projection_generation \
+                          AND meta.content::jsonb->>'project_revision' = s.project_revision::text \
+                          AND meta.content::jsonb->>'projection_generation' = s.projection_generation::text \
                     ) \
                     AND EXISTS ( \
                         SELECT 1 FROM events membership \
@@ -416,67 +1139,6 @@ impl Db {
                         WHERE object.community_id = c.id \
                           AND (object.schema_version <> 3 OR object.source_provenance_id IS NULL) \
                     ) \
-                    AND NOT EXISTS ( \
-                        SELECT 1 \
-                        FROM ( \
-                            SELECT projection_event_id FROM project_view_objects \
-                            WHERE community_id = $1 \
-                            UNION ALL \
-                            SELECT proposal.projection_event_id \
-                            FROM project_role_assignment_proposals proposal \
-                            WHERE proposal.community_id = $1 \
-                              AND (proposal.status = 'open' OR EXISTS ( \
-                                  SELECT 1 FROM project_role_assignments assignment \
-                                  WHERE assignment.community_id = proposal.community_id \
-                                    AND assignment.proposal_id = proposal.proposal_id \
-                                    AND assignment.ended_at IS NULL)) \
-                            UNION ALL \
-                            SELECT projection_event_id FROM project_role_assignments \
-                            WHERE community_id = $1 AND ended_at IS NULL \
-                            UNION ALL \
-                            SELECT projection_event_id FROM project_work_commitments \
-                            WHERE community_id = $1 AND ended_at IS NULL \
-                            UNION ALL \
-                            SELECT projection_event_id FROM ( \
-                                SELECT checkpoint.projection_event_id, \
-                                       row_number() OVER (PARTITION BY checkpoint.role_id \
-                                           ORDER BY checkpoint.project_revision DESC, \
-                                                    checkpoint.checkpoint_id DESC) AS history_rank \
-                                FROM project_role_checkpoints checkpoint \
-                                JOIN project_view_objects role \
-                                  ON role.community_id = checkpoint.community_id \
-                                 AND role.object_id = checkpoint.role_id \
-                                 AND role.object_type = 'role' \
-                                 AND role.deleted_at IS NULL \
-                                WHERE checkpoint.community_id = $1 \
-                            ) current_checkpoint WHERE history_rank = 1 \
-                            UNION ALL \
-                            SELECT projection_event_id FROM ( \
-                                SELECT handoff.projection_event_id, \
-                                       row_number() OVER (PARTITION BY handoff.role_id \
-                                           ORDER BY handoff.project_revision DESC, \
-                                                    handoff.handoff_id DESC) AS history_rank \
-                                FROM project_role_handoffs handoff \
-                                JOIN project_view_objects role \
-                                  ON role.community_id = handoff.community_id \
-                                 AND role.object_id = handoff.role_id \
-                                 AND role.object_type = 'role' \
-                                 AND role.deleted_at IS NULL \
-                                WHERE handoff.community_id = $1 \
-                            ) current_handoff WHERE history_rank <= 3 \
-                        ) head \
-                        LEFT JOIN events projection \
-                          ON projection.community_id = c.id \
-                         AND projection.id = head.projection_event_id \
-                         AND projection.kind = $5 \
-                         AND projection.pubkey = $2 \
-                         AND projection.deleted_at IS NULL \
-                        WHERE head.projection_event_id IS NULL \
-                           OR projection.id IS NULL \
-                           OR projection.content::jsonb->>'schema_version' IS DISTINCT FROM '3' \
-                           OR (projection.content::jsonb->>'projection_generation')::bigint \
-                              IS DISTINCT FROM s.projection_generation \
-                    ) \
              FROM communities c \
              JOIN project_view_state s ON s.community_id = c.id \
              WHERE c.id = $1",
@@ -485,10 +1147,22 @@ impl Db {
         .bind(relay.as_slice())
         .bind(kind_i32(KIND_PROJECT_VIEW_META)?)
         .bind(kind_i32(KIND_NIP43_MEMBERSHIP_LIST)?)
-        .bind(kind_i32(KIND_PROJECT_VIEW_OBJECT)?)
         .fetch_optional(&mut **tx)
         .await?;
         if ready != Some(true) {
+            return Ok(false);
+        }
+        let all_projection_pointers_ready: Option<bool> =
+            sqlx::query_scalar(ALL_V3_PROJECTION_POINTERS_READY_SQL)
+                .bind(community_id.as_uuid())
+                .bind(relay.as_slice())
+                .bind(kind_i32(KIND_PROJECT_VIEW_OBJECT)?)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if all_projection_pointers_ready != Some(true) {
+            return Ok(false);
+        }
+        if !strict_v3_projection_wires_ready_in_tx(tx, community_id, relay_pubkey).await? {
             return Ok(false);
         }
         sqlx::query("SELECT project_view_v3_validate_community($1)")
@@ -518,22 +1192,51 @@ impl Db {
         community_id: CommunityId,
         relay_pubkey: &PublicKey,
     ) -> crate::Result<bool> {
-        if !self
-            .project_view_v3_pre_enable_ready(community_id, relay_pubkey)
+        let cache = &self.project_view_v3_readiness;
+        loop {
+            let mut coordinate_tx = self.pool.begin().await?;
+            let Some(key) = fast_v3_advertised_attestation_key_in_tx(
+                &mut coordinate_tx,
+                community_id,
+                relay_pubkey,
+            )
             .await?
-        {
-            return Ok(false);
+            else {
+                coordinate_tx.rollback().await?;
+                return Ok(false);
+            };
+            coordinate_tx.rollback().await?;
+            if let Some(ready) = cache.result_at(key, Instant::now()) {
+                return Ok(ready);
+            }
+
+            // One scan per process/key at a time. Different Communities and
+            // signer generations retain independent gates.
+            let gate = cache.gate(key);
+            let _gate_guard = gate.lock().await;
+            if let Some(ready) = cache.result_at(key, Instant::now()) {
+                return Ok(ready);
+            }
+
+            let mut scan_tx = self.pool.begin().await?;
+            crate::community_lock::acquire(&mut scan_tx, community_id, true).await?;
+            let locked_key =
+                fast_v3_advertised_attestation_key_in_tx(&mut scan_tx, community_id, relay_pubkey)
+                    .await?;
+            if locked_key != Some(key) {
+                scan_tx.rollback().await?;
+                continue;
+            }
+            let ready = Self::project_view_v3_structural_ready_in_tx(
+                &mut scan_tx,
+                community_id,
+                relay_pubkey,
+            )
+            .await?;
+            scan_tx.rollback().await?;
+            cache.record_result_at(key, ready, Instant::now());
+            return Ok(ready);
         }
-        let operational: Option<bool> = sqlx::query_scalar(
-            "SELECT c.project_view_enabled AND maintenance.state = 'normal' \
-             FROM communities c \
-             JOIN project_view_maintenance maintenance ON maintenance.community_id = c.id \
-             WHERE c.id = $1",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(operational == Some(true))
     }
 
     /// Read the complete staged Context capability status and independently
@@ -739,7 +1442,8 @@ impl Db {
             initial_governance_assignments,
         } = &command.request;
         let prepared: Option<bool> = sqlx::query_scalar(
-            "SELECT community.project_view_schema_version = 3 \
+            "SELECT project_view_v3_bootstrap_lifecycle_valid(community.id) \
+                    AND community.project_view_schema_version = 3 \
                     AND NOT community.project_view_enabled \
                     AND NOT community.project_context_enabled \
                     AND community.archived_at IS NULL \
@@ -1184,6 +1888,495 @@ impl Db {
         Ok(ProjectViewV3InitializeOutcome {
             project_revision,
             projection_generation,
+            result,
+            events,
+            replayed: false,
+        })
+    }
+
+    /// End one exhaustively recovered managed-Agent Assignment as a trusted
+    /// schema-v3 system action.
+    ///
+    /// Runtime claim revalidation, audit append, canonical Role continuity,
+    /// Community membership, signed v3 projections, and supervisor fencing
+    /// commit in one transaction. Presence and lease expiry are never accepted
+    /// as terminal evidence.
+    #[allow(clippy::too_many_lines)]
+    pub async fn end_unrecoverable_assignment_v3(
+        &self,
+        claim: &crate::project_runtime::RuntimeUnrecoverableClaim,
+        relay_keys: &Keys,
+    ) -> ProjectViewV3WriteResult<ProjectViewV3SystemOutcome> {
+        const OPERATION: &str = "end_unrecoverable_assignment";
+
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, claim.community_id, false).await?;
+
+        if let Some(row) = sqlx::query(
+            "SELECT operation, subject, project_revision, result \
+             FROM project_view_changes \
+             WHERE community_id = $1 AND idempotency_key_hash = $2",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(claim.idempotency_key_hash.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let operation: String = row.try_get("operation")?;
+            let subject: Value = row.try_get("subject")?;
+            if operation != OPERATION
+                || subject.get("binding_id").and_then(Value::as_str)
+                    != Some(claim.binding_id.to_string().as_str())
+                || subject.get("assignment_id").and_then(Value::as_str)
+                    != Some(claim.assignment_id.to_string().as_str())
+            {
+                return Err(ProjectViewV3WriteError::InvalidCommit(
+                    "runtime system idempotency key belongs to another change".to_owned(),
+                ));
+            }
+            let project_revision =
+                revision_u64(row.try_get("project_revision")?, "project_revision")?;
+            let result: Value = row.try_get("result")?;
+            tx.rollback().await?;
+            return Ok(ProjectViewV3SystemOutcome {
+                project_revision,
+                result,
+                events: Vec::new(),
+                replayed: true,
+            });
+        }
+
+        let available: Option<bool> = sqlx::query_scalar(V3_RUNTIME_SYSTEM_WRITE_AVAILABLE_SQL)
+            .bind(claim.community_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if available != Some(true) {
+            return Err(ProjectViewV3WriteError::Unavailable {
+                community_id: claim.community_id,
+            });
+        }
+
+        let evidence_ids =
+            crate::project_runtime::validate_unrecoverable_claim_in_tx(&mut tx, claim).await?;
+        let loaded =
+            crate::project_view_v2::load_continuity_state(&mut tx, claim.community_id, 3).await?;
+        let relay_pubkey = relay_keys.public_key();
+        if loaded.projection_pubkey != relay_pubkey {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "runtime system action is fenced during projection signer rotation".to_owned(),
+            ));
+        }
+        let current_revision = loaded.state.project_revision();
+        let handoff_id = Uuid::new_v4();
+        let (next_state, outcome) = loaded.state.reduce_unrecoverable_assignment(
+            claim.assignment_id,
+            relay_pubkey,
+            loaded.canonical_time,
+            handoff_id,
+        )?;
+        if !outcome.work_changes.is_empty() {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "unrecoverable Assignment unexpectedly rewrote Project Work".to_owned(),
+            ));
+        }
+        let old_projection_ids =
+            load_old_projection_ids(&mut tx, claim.community_id, &outcome.changes).await?;
+        let membership_before = load_membership(&mut tx, claim.community_id).await?;
+        let previous_membership_id = loaded.membership_snapshot_event_id.ok_or_else(|| {
+            ProjectViewV3WriteError::InvalidCommit(
+                "v3 Project View has no membership snapshot".to_owned(),
+            )
+        })?;
+
+        let evidence_hex = evidence_ids.iter().map(hex::encode).collect::<Vec<_>>();
+        let audit_entry = buzz_audit::append_in_transaction(
+            &mut tx,
+            NewAuditEntry {
+                community_id: claim.community_id,
+                action: AuditAction::RuntimeAssignmentUnrecoverable,
+                actor_pubkey: None,
+                object_id: Some(claim.assignment_id.to_string()),
+                detail: json!({
+                    "binding_id": claim.binding_id,
+                    "assignment_id": claim.assignment_id,
+                    "handoff_id": handoff_id,
+                    "evidence_ids": evidence_hex,
+                    "idempotency_key_hash": hex::encode(claim.idempotency_key_hash),
+                }),
+            },
+        )
+        .await
+        .map_err(|error| {
+            ProjectViewV3WriteError::ContinuityStorage(
+                crate::project_view_v2::ProjectViewV2WriteError::Audit(error),
+            )
+        })?;
+        let source =
+            ChangeSource::system(audit_entry.seq, claim.idempotency_key_hash).map_err(|error| {
+                ProjectViewV3WriteError::InvalidCommit(format!(
+                    "invalid runtime system source: {error}"
+                ))
+            })?;
+        let change_id = source.change_id();
+        let change_event_id = EventId::from_slice(&change_id).map_err(|error| {
+            ProjectViewV3WriteError::InvalidCommit(format!(
+                "invalid runtime system change ID: {error}"
+            ))
+        })?;
+        let result = json!({
+            "operation": OPERATION,
+            "project_revision": outcome.project_revision,
+            "assignment_id": claim.assignment_id,
+            "handoff_id": handoff_id,
+            "changed_entities": outcome.changes.iter().map(|change| json!({
+                "entity_type": change.entity_type().as_str(),
+                "entity_id": change.entity_id(),
+                "entity_revision": change.entity_revision(),
+            })).collect::<Vec<_>>(),
+            "evidence_ids": evidence_hex,
+        });
+        let subject = json!({
+            "binding_id": claim.binding_id,
+            "assignment_id": claim.assignment_id,
+            "evidence_ids": evidence_hex,
+        });
+        sqlx::query(
+            "INSERT INTO project_view_changes \
+                (community_id, change_id, source_type, source_audit_seq, \
+                 idempotency_key_hash, actor_pubkey, acting_assignment_id, \
+                 operation, subject, project_revision, result, accepted_at) \
+             VALUES ($1,$2,'system',$3,$4,NULL,NULL,$5,$6,$7,$8,$9)",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(change_id.as_slice())
+        .bind(audit_entry.seq)
+        .bind(claim.idempotency_key_hash.as_slice())
+        .bind(OPERATION)
+        .bind(&subject)
+        .bind(revision_i64(outcome.project_revision, "project_revision")?)
+        .bind(&result)
+        .bind(loaded.canonical_time)
+        .execute(&mut *tx)
+        .await?;
+
+        persist_changes(
+            &mut tx,
+            claim.community_id,
+            &change_id,
+            loaded.canonical_time,
+            &outcome.changes,
+        )
+        .await?;
+        apply_membership_roles(
+            &mut tx,
+            claim.community_id,
+            relay_pubkey,
+            &outcome.membership_roles,
+            loaded.canonical_time,
+        )
+        .await?;
+        let membership_after = load_membership(&mut tx, claim.community_id).await?;
+        let counts = load_counts(&mut tx, claim.community_id).await?;
+        if counts.active_assignments
+            != u32::try_from(
+                next_state
+                    .assignments()
+                    .filter(|assignment| assignment.is_active())
+                    .count(),
+            )
+            .map_err(|_| {
+                ProjectViewV3WriteError::InvalidCommit(
+                    "active Assignment count exceeds u32".to_owned(),
+                )
+            })?
+        {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "runtime reducer and stored active Assignment count disagree".to_owned(),
+            ));
+        }
+
+        let membership_event = if membership_before != membership_after {
+            Some(build_v3_membership_event(
+                &membership_after,
+                loaded.canonical_time,
+                relay_keys,
+            )?)
+        } else {
+            None
+        };
+        let membership_event_id = membership_event
+            .as_ref()
+            .map_or(previous_membership_id, |event| event.id);
+        let audit_seq = u64::try_from(audit_entry.seq).map_err(|_| {
+            ProjectViewV3WriteError::InvalidCommit(
+                "runtime system audit sequence must be positive".to_owned(),
+            )
+        })?;
+        let projection_source = buzz_sdk::project_view_v3::V3ProjectionSource::System {
+            change_id: change_event_id,
+            audit_seq,
+        };
+        let context = buzz_sdk::project_view_v3::V3ProjectionContext {
+            project_id: claim.community_id,
+            projection_generation: loaded.projection_generation,
+            project_revision: outcome.project_revision,
+            source: projection_source.clone(),
+            updated_at: loaded.canonical_time,
+        };
+        let mut entity_projections = Vec::with_capacity(outcome.changes.len());
+        let mut expected_heads = BTreeMap::new();
+        for change in &outcome.changes {
+            let entity = v3_entity_change(change)?;
+            let event = buzz_sdk::project_view_v3::build_entity_projection(&context, &entity)
+                .map_err(|error| {
+                    ProjectViewV3WriteError::InvalidCommit(format!(
+                        "build runtime system v3 entity projection: {error}"
+                    ))
+                })?
+                .sign_with_keys(relay_keys)
+                .map_err(|error| {
+                    ProjectViewV3WriteError::InvalidCommit(format!(
+                        "sign runtime system v3 entity projection: {error}"
+                    ))
+                })?;
+            let parsed = buzz_sdk::project_view_v3::parse_entity_projection(
+                &event,
+                &relay_pubkey,
+                claim.community_id,
+            )
+            .map_err(|error| {
+                ProjectViewV3WriteError::InvalidCommit(format!(
+                    "verify runtime system v3 entity projection: {error}"
+                ))
+            })?;
+            if parsed.entity != entity
+                || parsed.project_revision != outcome.project_revision
+                || parsed.projection_generation != loaded.projection_generation
+                || parsed.source != projection_source
+                || parsed.updated_at != loaded.canonical_time
+            {
+                return Err(ProjectViewV3WriteError::InvalidCommit(
+                    "runtime system v3 entity projection differs from canonical state".to_owned(),
+                ));
+            }
+            let changed_head =
+                buzz_sdk::project_view_v3::changed_head_for_entity(&context, &entity, &event)
+                    .map_err(|error| {
+                        ProjectViewV3WriteError::InvalidCommit(format!(
+                            "bind runtime system v3 changed head: {error}"
+                        ))
+                    })?;
+            if expected_heads
+                .insert(changed_head.coordinate().to_owned(), changed_head)
+                .is_some()
+            {
+                return Err(ProjectViewV3WriteError::InvalidCommit(
+                    "runtime system change generated duplicate v3 head coordinates".to_owned(),
+                ));
+            }
+            entity_projections.push(PreparedV2EntityProjection {
+                entity_type: change.entity_type(),
+                entity_id: change.entity_id(),
+                event,
+            });
+        }
+        let changed_heads = expected_heads.values().cloned().collect::<Vec<_>>();
+        let entity_counts = buzz_sdk::project_view_v3::V3EntityCounts {
+            active_objects: counts.active_objects,
+            open_proposals: counts.open_proposals,
+            active_assignments: counts.active_assignments,
+            active_commitments: counts.active_commitments,
+            checkpoints: counts.checkpoints,
+            handoffs: counts.handoffs,
+        };
+        let meta_event = buzz_sdk::project_view_v3::build_meta_projection(
+            &context,
+            entity_counts,
+            membership_event_id,
+            false,
+            &changed_heads,
+        )
+        .map_err(|error| {
+            ProjectViewV3WriteError::InvalidCommit(format!(
+                "build runtime system v3 metadata projection: {error}"
+            ))
+        })?
+        .sign_with_keys(relay_keys)
+        .map_err(|error| {
+            ProjectViewV3WriteError::InvalidCommit(format!(
+                "sign runtime system v3 metadata projection: {error}"
+            ))
+        })?;
+        let meta = buzz_sdk::project_view_v3::parse_meta_projection(&meta_event, &relay_pubkey)
+            .map_err(|error| {
+                ProjectViewV3WriteError::InvalidCommit(format!(
+                    "verify runtime system v3 metadata projection: {error}"
+                ))
+            })?;
+        let actual_heads = meta
+            .changed_heads
+            .iter()
+            .map(|head| (head.coordinate().to_owned(), head.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if meta.project_id != claim.community_id
+            || meta.project_revision != outcome.project_revision
+            || meta.projection_generation != loaded.projection_generation
+            || meta.entity_counts != entity_counts
+            || meta.membership_snapshot_event_id != membership_event_id
+            || meta.reset
+            || meta.source != projection_source
+            || meta.updated_at != loaded.canonical_time
+            || actual_heads != expected_heads
+            || actual_heads.len() != meta.changed_heads.len()
+        {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "runtime system v3 metadata projection differs from canonical state".to_owned(),
+            ));
+        }
+        if let Some(event) = &membership_event {
+            verify_membership_projection(
+                event,
+                relay_pubkey,
+                &membership_after,
+                loaded.canonical_time,
+            )?;
+        }
+
+        for old_event_id in old_projection_ids.values() {
+            if !crate::event::retire_projection_head_in_tx(
+                &mut tx,
+                claim.community_id,
+                old_event_id,
+                KIND_PROJECT_VIEW_OBJECT,
+            )
+            .await?
+            {
+                return Err(ProjectViewV3WriteError::InvalidCommit(
+                    "stored runtime-affected v3 entity projection is not live".to_owned(),
+                ));
+            }
+        }
+        if !crate::event::retire_projection_head_in_tx(
+            &mut tx,
+            claim.community_id,
+            &loaded.meta_projection_event_id,
+            KIND_PROJECT_VIEW_META,
+        )
+        .await?
+        {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "stored v3 metadata projection is not live".to_owned(),
+            ));
+        }
+
+        let mut events = Vec::with_capacity(entity_projections.len() + 2);
+        if let Some(event) = &membership_event {
+            retire_membership_heads(&mut tx, claim.community_id, relay_pubkey).await?;
+            let (_, inserted) =
+                crate::event::insert_event_in_tx(&mut tx, claim.community_id, event, None).await?;
+            if !inserted {
+                return Err(ProjectViewV3WriteError::InvalidCommit(
+                    "runtime membership projection already exists".to_owned(),
+                ));
+            }
+            events.push(event.clone());
+        }
+        for projection in &entity_projections {
+            let (_, inserted) = crate::event::insert_event_in_tx(
+                &mut tx,
+                claim.community_id,
+                &projection.event,
+                None,
+            )
+            .await?;
+            if !inserted {
+                return Err(ProjectViewV3WriteError::InvalidCommit(format!(
+                    "runtime v3 entity projection {} already exists",
+                    projection.entity_id
+                )));
+            }
+            update_projection_pointer(
+                &mut tx,
+                claim.community_id,
+                projection.entity_type,
+                projection.entity_id,
+                projection.event.id.as_bytes(),
+            )
+            .await?;
+            events.push(projection.event.clone());
+        }
+        let (_, meta_inserted) =
+            crate::event::insert_event_in_tx(&mut tx, claim.community_id, &meta_event, None)
+                .await?;
+        if !meta_inserted {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "runtime v3 metadata projection already exists".to_owned(),
+            ));
+        }
+
+        let relay_bytes = relay_pubkey.to_bytes();
+        let state_update = sqlx::query(V3_UNRECOVERABLE_ASSIGNMENT_STATE_UPDATE_SQL)
+            .bind(claim.community_id.as_uuid())
+            .bind(revision_i64(outcome.project_revision, "project_revision")?)
+            .bind(loaded.canonical_time)
+            .bind(change_id.as_slice())
+            .bind(relay_bytes.as_slice())
+            .bind(meta_event.id.as_bytes())
+            .bind(count_i32(counts.open_proposals, "open_proposals")?)
+            .bind(count_i32(counts.active_assignments, "active_assignments")?)
+            .bind(count_i32(counts.active_commitments, "active_commitments")?)
+            .bind(count_i32(counts.checkpoints, "checkpoints")?)
+            .bind(count_i32(counts.handoffs, "handoffs")?)
+            .bind(membership_event_id.as_bytes())
+            .bind(revision_i64(current_revision, "current_revision")?)
+            .execute(&mut *tx)
+            .await?;
+        if state_update.rows_affected() != 1 {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "Project View v3 state changed during runtime system action".to_owned(),
+            ));
+        }
+        assert_counts_in_tx(&mut tx, claim.community_id, counts).await?;
+        let binding_update = sqlx::query(
+            "UPDATE project_runtime_supervisor_bindings SET \
+                 system_change_id = $4, system_audit_seq = $5, \
+                 automatic_unrecoverable = FALSE, scheduler_claim_token = NULL, \
+                 scheduler_claimed_until = NULL, updated_at = $6 \
+             WHERE community_id = $1 AND binding_id = $2 \
+               AND scheduler_claim_token = $3 AND system_change_id IS NULL",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(claim.binding_id)
+        .bind(claim.claim_token)
+        .bind(change_id.as_slice())
+        .bind(audit_entry.seq)
+        .bind(loaded.canonical_time)
+        .execute(&mut *tx)
+        .await?;
+        if binding_update.rows_affected() != 1 {
+            return Err(ProjectViewV3WriteError::InvalidCommit(
+                "runtime scheduler claim changed during system action".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE project_runtime_leases SET \
+                 lease_expires_at = NULL, recovery_attempt_in_flight = FALSE, \
+                 next_recovery_at = NULL, ended_at = $3, updated_at = $3 \
+             WHERE community_id = $1 AND binding_id = $2 AND ended_at IS NULL",
+        )
+        .bind(claim.community_id.as_uuid())
+        .bind(claim.binding_id)
+        .bind(loaded.canonical_time)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        events.push(meta_event);
+        Ok(ProjectViewV3SystemOutcome {
+            project_revision: outcome.project_revision,
             result,
             events,
             replayed: false,
@@ -3709,4 +4902,668 @@ fn count_i32(value: u32, field: &str) -> ProjectViewV3WriteResult<i32> {
 fn kind_i32(kind: u32) -> crate::Result<i32> {
     i32::try_from(kind)
         .map_err(|_| DbError::InvalidData(format!("event kind {kind} exceeds PostgreSQL INT")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn readiness_context(
+        project_id: CommunityId,
+        updated_at: DateTime<Utc>,
+    ) -> buzz_sdk::project_view_v3::V3ProjectionContext {
+        let source = EventId::all_zeros();
+        buzz_sdk::project_view_v3::V3ProjectionContext {
+            project_id,
+            projection_generation: 3,
+            project_revision: 7,
+            source: buzz_sdk::project_view_v3::V3ProjectionSource::NostrEvent {
+                change_id: source,
+                event_id: source,
+            },
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn structural_readiness_checks_every_continuity_projection_pointer() {
+        for table in [
+            "project_role_assignment_proposals",
+            "project_role_assignments",
+            "project_work_commitments",
+            "project_role_checkpoints",
+            "project_role_handoffs",
+        ] {
+            assert!(ALL_V3_PROJECTION_POINTERS_READY_SQL.contains(table));
+        }
+        assert!(!ALL_V3_PROJECTION_POINTERS_READY_SQL.contains("status = 'open'"));
+        assert!(!ALL_V3_PROJECTION_POINTERS_READY_SQL.contains("ended_at IS NULL"));
+        assert!(!ALL_V3_PROJECTION_POINTERS_READY_SQL.contains("history_rank"));
+        assert!(ALL_V3_PROJECTION_POINTERS_READY_SQL.contains("schema_version'"));
+        assert!(ALL_V3_PROJECTION_POINTERS_READY_SQL.contains("projection_generation'"));
+    }
+
+    #[test]
+    fn bootstrap_discovery_is_greenfield_only_and_does_not_scan_projections() {
+        for required in [
+            "archived_at IS NULL",
+            "project_view_v3_bootstrap_lifecycle_valid",
+        ] {
+            assert!(V3_BOOTSTRAP_DISCOVERABLE_SQL.contains(required));
+        }
+        for forbidden in [
+            "events",
+            "project_view_objects",
+            "project_role_assignments",
+            "project_view_v3_validate_community",
+        ] {
+            assert!(!V3_BOOTSTRAP_DISCOVERABLE_SQL.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn unrecoverable_runtime_system_contract_is_v3_only() {
+        assert!(V3_UNRECOVERABLE_ASSIGNMENT_STATE_UPDATE_SQL.contains("schema_version = 3"));
+        assert!(!V3_UNRECOVERABLE_ASSIGNMENT_STATE_UPDATE_SQL.contains("schema_version = 2"));
+        for required in [
+            "project_view_schema_version = 3",
+            "project_view_enabled",
+            "archived_at IS NULL",
+            "maintenance.state = 'normal'",
+            "FOR UPDATE OF community, maintenance",
+        ] {
+            assert!(V3_RUNTIME_SYSTEM_WRITE_AVAILABLE_SQL.contains(required));
+        }
+
+        let relay = Keys::generate();
+        let actor = Keys::generate().public_key();
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("timestamp");
+        let change_id = EventId::from_byte_array([7; 32]);
+        let source = buzz_sdk::project_view_v3::V3ProjectionSource::System {
+            change_id,
+            audit_seq: 9,
+        };
+        let context = buzz_sdk::project_view_v3::V3ProjectionContext {
+            project_id: community_id,
+            projection_generation: 3,
+            project_revision: 8,
+            source: source.clone(),
+            updated_at: now,
+        };
+        let entity = buzz_sdk::project_view_v3::V3EntityChange::Role(RoleDefinitionV3 {
+            role_id: Uuid::new_v4(),
+            name: "Runtime owner".to_owned(),
+            purpose: "Exercise trusted system projection wire format".to_owned(),
+            responsibilities: vec!["Supervise".to_owned()],
+            boundaries: vec!["No legacy fallback".to_owned()],
+            level: RoleLevel::Admin,
+            active: true,
+            context_references: Vec::new(),
+            object_revision: 2,
+            project_revision: 8,
+            created_at: now,
+            updated_at: now,
+            created_by: actor,
+            updated_by: actor,
+        });
+        let entity_event = buzz_sdk::project_view_v3::build_entity_projection(&context, &entity)
+            .expect("v3 system entity builder")
+            .sign_with_keys(&relay)
+            .expect("v3 system entity signature");
+        let entity_content: Value =
+            serde_json::from_str(&entity_event.content).expect("entity content");
+        assert_eq!(entity_content["schema_version"], 3);
+        let parsed_entity = buzz_sdk::project_view_v3::parse_entity_projection(
+            &entity_event,
+            &relay.public_key(),
+            community_id,
+        )
+        .expect("strict v3 system entity parser");
+        assert_eq!(parsed_entity.source, source);
+        assert_eq!(parsed_entity.entity, entity);
+
+        let changed_head =
+            buzz_sdk::project_view_v3::changed_head_for_entity(&context, &entity, &entity_event)
+                .expect("v3 changed head");
+        let meta_event = buzz_sdk::project_view_v3::build_meta_projection(
+            &context,
+            buzz_sdk::project_view_v3::V3EntityCounts {
+                active_objects: 1,
+                open_proposals: 0,
+                active_assignments: 0,
+                active_commitments: 0,
+                checkpoints: 0,
+                handoffs: 1,
+            },
+            EventId::from_byte_array([8; 32]),
+            false,
+            &[changed_head],
+        )
+        .expect("v3 system metadata builder")
+        .sign_with_keys(&relay)
+        .expect("v3 system metadata signature");
+        let meta_content: Value =
+            serde_json::from_str(&meta_event.content).expect("metadata content");
+        assert_eq!(meta_content["schema_version"], 3);
+        let parsed_meta =
+            buzz_sdk::project_view_v3::parse_meta_projection(&meta_event, &relay.public_key())
+                .expect("strict v3 system metadata parser");
+        assert_eq!(parsed_meta.source, context.source);
+    }
+
+    #[test]
+    fn readiness_attestation_cache_is_generation_scoped_and_expires() {
+        let cache = V3ReadinessAttestationCache::default();
+        let independent_cache = V3ReadinessAttestationCache::default();
+        let now = Instant::now();
+        let key = V3ReadinessAttestationKey {
+            community_id: Uuid::new_v4(),
+            relay_pubkey: [7; 32],
+            projection_generation: 3,
+        };
+        assert_eq!(cache.result_at(key, now), None);
+        cache.record_result_at(key, true, now);
+        assert_eq!(cache.result_at(key, now), Some(true));
+        assert_eq!(independent_cache.result_at(key, now), None);
+        assert_eq!(
+            cache.result_at(
+                V3ReadinessAttestationKey {
+                    projection_generation: 4,
+                    ..key
+                },
+                now,
+            ),
+            None
+        );
+        assert_eq!(
+            cache.result_at(
+                V3ReadinessAttestationKey {
+                    community_id: Uuid::new_v4(),
+                    ..key
+                },
+                now,
+            ),
+            None
+        );
+        assert_eq!(
+            cache.result_at(
+                V3ReadinessAttestationKey {
+                    relay_pubkey: [8; 32],
+                    ..key
+                },
+                now,
+            ),
+            None
+        );
+        assert_eq!(
+            cache.result_at(key, now + V3_READINESS_ATTESTATION_TTL),
+            None
+        );
+
+        cache.record_result_at(key, false, now);
+        assert_eq!(cache.result_at(key, now), Some(false));
+        assert_eq!(
+            cache.result_at(key, now + V3_READINESS_FAILURE_THROTTLE_TTL),
+            None
+        );
+    }
+
+    #[test]
+    fn advertised_attestation_fast_gate_is_v3_only_and_maintenance_sensitive() {
+        let sql = FAST_V3_ADVERTISED_ATTESTATION_KEY_SQL;
+        assert!(sql.contains("community.project_view_schema_version = 3"));
+        assert!(sql.contains("state.schema_version = 3"));
+        assert!(sql.contains("maintenance.state = 'normal'"));
+        assert!(sql.contains("meta.content::jsonb->>'project_revision'"));
+        assert!(sql.contains("meta.content::jsonb->>'projection_generation'"));
+        assert!(sql.contains("membership.content = ''"));
+
+        // Every call is constant-cardinality and immediately notices a
+        // freeze/disable/signer/generation drift before consulting the cached
+        // full-history attestation.
+        for history_table in [
+            "project_view_objects",
+            "project_role_assignment_proposals",
+            "project_role_assignments",
+            "project_work_commitments",
+            "project_role_checkpoints",
+            "project_role_handoffs",
+        ] {
+            assert!(!sql.contains(history_table));
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_attestation_gate_coalesces_concurrent_same_key_scans() {
+        let cache = Arc::new(V3ReadinessAttestationCache::default());
+        let key = V3ReadinessAttestationKey {
+            community_id: Uuid::new_v4(),
+            relay_pubkey: [9; 32],
+            projection_generation: 2,
+        };
+        let first_gate = cache.gate(key);
+        let second_gate = cache.gate(key);
+        assert!(Arc::ptr_eq(&first_gate, &second_gate));
+        let first_guard = first_gate.lock().await;
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired_in_task = Arc::clone(&acquired);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _guard = second_gate.lock().await;
+            acquired_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        started_rx.await.expect("waiter started");
+        tokio::task::yield_now().await;
+        assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+        drop(first_guard);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter released")
+            .expect("waiter task");
+        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn readiness_attestation_concurrent_callers_run_one_verifier() {
+        async fn verify_once(
+            cache: Arc<V3ReadinessAttestationCache>,
+            key: V3ReadinessAttestationKey,
+            verifier_runs: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> bool {
+            if let Some(ready) = cache.result_at(key, Instant::now()) {
+                return ready;
+            }
+            let gate = cache.gate(key);
+            let _guard = gate.lock().await;
+            if let Some(ready) = cache.result_at(key, Instant::now()) {
+                return ready;
+            }
+            verifier_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            cache.record_result_at(key, true, Instant::now());
+            true
+        }
+
+        let cache = Arc::new(V3ReadinessAttestationCache::default());
+        let verifier_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = V3ReadinessAttestationKey {
+            community_id: Uuid::new_v4(),
+            relay_pubkey: [3; 32],
+            projection_generation: 6,
+        };
+        let mut callers = Vec::new();
+        for _ in 0..8 {
+            callers.push(tokio::spawn(verify_once(
+                Arc::clone(&cache),
+                key,
+                Arc::clone(&verifier_runs),
+            )));
+        }
+        for caller in callers {
+            assert!(caller.await.expect("caller"));
+        }
+        assert_eq!(verifier_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn strict_readiness_rejects_object_pointer_or_wire_drift() {
+        let relay = Keys::generate();
+        let actor = Keys::generate().public_key();
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("timestamp");
+        let entry = ProjectViewEntryV3::Active(Box::new(ProjectViewObjectV3 {
+            id: *community_id.as_uuid(),
+            object_type: ProjectViewObjectType::ProjectProfile,
+            object_revision: 2,
+            project_revision: 7,
+            created_at: now,
+            updated_at: now,
+            created_by: actor,
+            updated_by: actor,
+            data: ProjectViewObjectDataV3::ProjectProfile(buzz_project_view::ProjectProfile {
+                name: "Project".to_owned(),
+                positioning: "Local".to_owned(),
+                purpose: "Verify strict readiness".to_owned(),
+                problem: "Projection drift".to_owned(),
+                scope: "Readiness".to_owned(),
+            }),
+            relations: ProjectViewRelations::default(),
+            context_references: Vec::new(),
+        }));
+        let event = buzz_sdk::project_view_v3::build_project_object_projection(
+            &readiness_context(community_id, now),
+            &entry,
+            None,
+        )
+        .expect("builder")
+        .sign_with_keys(&relay)
+        .expect("signed");
+        let pointer = V3ObjectProjectionPointer {
+            object_id: entry.id(),
+            object_type: entry.object_type().as_str().to_owned(),
+            object_revision: entry.object_revision(),
+            project_revision: 7,
+            deleted: false,
+            event_id: event.id.to_bytes(),
+        };
+        let stored = StoredEvent::new(event.clone(), None);
+        assert!(strict_v3_object_pointer_projection(
+            &pointer,
+            &stored,
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .is_some());
+
+        let mut wrong_identity = pointer.clone();
+        wrong_identity.object_id = Uuid::new_v4();
+        assert!(strict_v3_object_pointer_projection(
+            &wrong_identity,
+            &stored,
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .is_none());
+        assert!(strict_v3_object_pointer_projection(
+            &pointer,
+            &stored,
+            &relay.public_key(),
+            community_id,
+            4,
+        )
+        .is_none());
+
+        let mut invalid_signature = event;
+        invalid_signature.content.push(' ');
+        assert!(strict_v3_object_pointer_projection(
+            &pointer,
+            &StoredEvent::new(invalid_signature, None),
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn strict_readiness_requires_exact_active_role_entity_head() {
+        let relay = Keys::generate();
+        let actor = Keys::generate().public_key();
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let role_id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("timestamp");
+        let role = RoleDefinitionV3 {
+            role_id,
+            name: "Maintainer".to_owned(),
+            purpose: "Maintain".to_owned(),
+            responsibilities: vec!["Review".to_owned()],
+            boundaries: vec!["No bypass".to_owned()],
+            level: RoleLevel::Admin,
+            active: true,
+            context_references: Vec::new(),
+            object_revision: 2,
+            project_revision: 7,
+            created_at: now,
+            updated_at: now,
+            created_by: actor,
+            updated_by: actor,
+        };
+        let context = readiness_context(community_id, now);
+        let entity = buzz_sdk::project_view_v3::V3EntityChange::Role(role);
+        let event = buzz_sdk::project_view_v3::build_entity_projection(&context, &entity)
+            .expect("builder")
+            .sign_with_keys(&relay)
+            .expect("signed");
+        let stored = StoredEvent::new(event.clone(), None);
+        let object_pointer = V3ObjectProjectionPointer {
+            object_id: role_id,
+            object_type: ProjectViewObjectType::Role.as_str().to_owned(),
+            object_revision: 2,
+            project_revision: 7,
+            deleted: false,
+            event_id: event.id.to_bytes(),
+        };
+        let expected_head = strict_v3_object_pointer_projection(
+            &object_pointer,
+            &stored,
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .expect("strict role projection");
+
+        let entity_pointer = V3EntityProjectionPointer {
+            entity_id: role_id,
+            entity_type: RoleContinuityEntity::Role.as_str().to_owned(),
+            entity_revision: 2,
+            project_revision: 7,
+            event_id: event.id.to_bytes(),
+        };
+        assert!(strict_v3_entity_pointer_projection(
+            &entity_pointer,
+            &stored,
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .is_some());
+
+        let changed_head =
+            buzz_sdk::project_view_v3::changed_head_for_entity(&context, &entity, &event)
+                .expect("changed head");
+        let counts = buzz_sdk::project_view_v3::V3EntityCounts {
+            active_objects: 1,
+            open_proposals: 0,
+            active_assignments: 0,
+            active_commitments: 0,
+            checkpoints: 0,
+            handoffs: 0,
+        };
+        let membership_event_id = EventId::from_byte_array([4; 32]);
+        let expected_heads =
+            BTreeMap::from([(changed_head.coordinate().to_owned(), expected_head)]);
+        let meta = buzz_sdk::project_view_v3::build_meta_projection(
+            &context,
+            counts,
+            membership_event_id,
+            false,
+            std::slice::from_ref(&changed_head),
+        )
+        .expect("meta builder")
+        .sign_with_keys(&relay)
+        .expect("meta event");
+        let stored_meta = StoredEvent::new(meta, None);
+        assert!(strict_v3_meta_matches_state(
+            &stored_meta,
+            &relay.public_key(),
+            community_id,
+            7,
+            3,
+            counts,
+            membership_event_id,
+            &expected_heads,
+        ));
+        let omitted_id = Uuid::new_v4();
+        let mut expected_with_omitted_head = expected_heads.clone();
+        expected_with_omitted_head.insert(
+            format!("project-view:{}:goal:{omitted_id}", community_id.as_uuid()),
+            V3ExpectedChangedHead {
+                event_id: EventId::from_byte_array([5; 32]),
+                revision: 1,
+                variant: V3ProjectionVariant::Object(ProjectViewObjectType::Goal),
+                project_revision: 7,
+                source: context.source.clone(),
+            },
+        );
+        assert!(!strict_v3_meta_matches_state(
+            &stored_meta,
+            &relay.public_key(),
+            community_id,
+            7,
+            3,
+            counts,
+            membership_event_id,
+            &expected_with_omitted_head,
+        ));
+
+        let wrong_variant = buzz_sdk::project_view_v3::V3ChangedHead::Object {
+            coordinate: changed_head.coordinate().to_owned(),
+            event_id: event.id,
+            object_type: ProjectViewObjectType::Role,
+            object_revision: 2,
+        };
+        let wrong_variant_meta = buzz_sdk::project_view_v3::build_meta_projection(
+            &context,
+            counts,
+            membership_event_id,
+            false,
+            &[wrong_variant],
+        )
+        .expect("wrong variant remains SDK-shaped")
+        .sign_with_keys(&relay)
+        .expect("wrong variant meta");
+        assert!(!strict_v3_meta_matches_state(
+            &StoredEvent::new(wrong_variant_meta, None),
+            &relay.public_key(),
+            community_id,
+            7,
+            3,
+            counts,
+            membership_event_id,
+            &expected_heads,
+        ));
+
+        let alternate_source = EventId::from_byte_array([8; 32]);
+        let alternate_context = buzz_sdk::project_view_v3::V3ProjectionContext {
+            source: buzz_sdk::project_view_v3::V3ProjectionSource::NostrEvent {
+                change_id: alternate_source,
+                event_id: alternate_source,
+            },
+            ..context
+        };
+        let wrong_source_meta = buzz_sdk::project_view_v3::build_meta_projection(
+            &alternate_context,
+            counts,
+            membership_event_id,
+            false,
+            std::slice::from_ref(&changed_head),
+        )
+        .expect("wrong source remains SDK-shaped")
+        .sign_with_keys(&relay)
+        .expect("wrong source meta");
+        assert!(!strict_v3_meta_matches_state(
+            &StoredEvent::new(wrong_source_meta, None),
+            &relay.public_key(),
+            community_id,
+            7,
+            3,
+            counts,
+            membership_event_id,
+            &expected_heads,
+        ));
+
+        let mut extra_tags = event.tags.iter().cloned().collect::<Vec<_>>();
+        extra_tags.push(Tag::parse(["x", "not-canonical"]).expect("tag"));
+        let noncanonical = EventBuilder::new(event.kind, event.content.clone())
+            .tags(extra_tags)
+            .custom_created_at(event.created_at)
+            .sign_with_keys(&relay)
+            .expect("signed noncanonical event");
+        let noncanonical_pointer = V3ObjectProjectionPointer {
+            event_id: noncanonical.id.to_bytes(),
+            ..object_pointer
+        };
+        assert!(strict_v3_object_pointer_projection(
+            &noncanonical_pointer,
+            &StoredEvent::new(noncanonical, None),
+            &relay.public_key(),
+            community_id,
+            3,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn strict_readiness_verifies_meta_and_membership_wires() {
+        let relay = Keys::generate();
+        let member = Keys::generate().public_key().to_hex();
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("timestamp");
+        let membership = vec![V2MembershipEntry {
+            pubkey: member.clone(),
+            role: "owner".to_owned(),
+        }];
+        let membership_event =
+            EventBuilder::new(Kind::Custom(KIND_NIP43_MEMBERSHIP_LIST as u16), "")
+                .tags([
+                    Tag::parse(["-"]).expect("protected tag"),
+                    Tag::parse(["member", member.as_str(), "owner"]).expect("member tag"),
+                ])
+                .custom_created_at(Timestamp::from(now.timestamp() as u64))
+                .sign_with_keys(&relay)
+                .expect("membership event");
+        let stored_membership = StoredEvent::new(membership_event.clone(), None);
+        assert!(strict_v3_membership_matches_state(
+            &stored_membership,
+            &relay.public_key(),
+            &membership,
+        ));
+        assert!(!strict_v3_membership_matches_state(
+            &stored_membership,
+            &relay.public_key(),
+            &[V2MembershipEntry {
+                pubkey: member,
+                role: "admin".to_owned(),
+            }],
+        ));
+        let channel_scoped = StoredEvent::new(membership_event, Some(Uuid::new_v4()));
+        assert!(!strict_v3_membership_matches_state(
+            &channel_scoped,
+            &relay.public_key(),
+            &membership,
+        ));
+        let counts = buzz_sdk::project_view_v3::V3EntityCounts {
+            active_objects: 1,
+            open_proposals: 0,
+            active_assignments: 0,
+            active_commitments: 0,
+            checkpoints: 0,
+            handoffs: 0,
+        };
+        let meta_event = buzz_sdk::project_view_v3::build_meta_projection(
+            &readiness_context(community_id, now),
+            counts,
+            stored_membership.event.id,
+            true,
+            &[],
+        )
+        .expect("meta builder")
+        .sign_with_keys(&relay)
+        .expect("meta event");
+        let stored_meta = StoredEvent::new(meta_event, None);
+        assert!(strict_v3_meta_matches_state(
+            &stored_meta,
+            &relay.public_key(),
+            community_id,
+            7,
+            3,
+            counts,
+            stored_membership.event.id,
+            &BTreeMap::new(),
+        ));
+        assert!(!strict_v3_meta_matches_state(
+            &stored_meta,
+            &relay.public_key(),
+            community_id,
+            7,
+            4,
+            counts,
+            stored_membership.event.id,
+            &BTreeMap::new(),
+        ));
+    }
 }

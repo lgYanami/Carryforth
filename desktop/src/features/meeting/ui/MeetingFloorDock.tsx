@@ -44,6 +44,7 @@ type MeetingFloorDockProps = {
   authorityAvailable: boolean;
   boardDraft: MeetingBoardDraft;
   currentPubkey?: string;
+  grantRenewalError: string | null;
   onAbortDialogOpenChange: (open: boolean) => void;
   onRefresh: () => void;
   profiles: Record<string, UserProfileSummary>;
@@ -77,6 +78,7 @@ export function MeetingFloorDock({
   authorityAvailable,
   boardDraft,
   currentPubkey,
+  grantRenewalError,
   onAbortDialogOpenChange,
   onRefresh,
   profiles,
@@ -260,7 +262,7 @@ export function MeetingFloorDock({
   return (
     <section
       aria-label="Meeting floor"
-      className="shrink-0 border-t bg-muted/20 px-4 py-3"
+      className="min-w-0 shrink-0 border-t bg-muted/20 px-4 py-3"
       data-testid="meeting-floor-dock"
       ref={dockRef}
       tabIndex={-1}
@@ -359,6 +361,16 @@ export function MeetingFloorDock({
           {floorError instanceof Error
             ? floorError.message
             : "The Floor action was rejected."}
+        </div>
+      ) : null}
+
+      {ownGrant && grantRenewalError ? (
+        <div
+          className="mx-auto mb-3 max-w-3xl rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+          data-testid="meeting-grant-renewal-error"
+        >
+          Buzz could not retain this speaking window. Your draft is preserved
+          while the authoritative Meeting state is checked.
         </div>
       ) : null}
 

@@ -22,7 +22,7 @@ async fn delayed_identity(AxumState(state): AxumState<DelayedIdentityState>) -> 
     state.request_started.notify_one();
     state.release_response.notified().await;
     Json(json!({
-        "supported_extensions": ["buzz-project-view-v2", "buzz-project-document-v1"],
+        "supported_extensions": ["buzz-project-view-v3", "buzz-project-document-v1"],
         "self": state.relay_pubkey,
     }))
 }
@@ -53,7 +53,7 @@ struct VerifiedReadState {
 
 async fn verified_read_identity(AxumState(state): AxumState<VerifiedReadState>) -> Json<Value> {
     Json(json!({
-        "supported_extensions": ["buzz-project-view-v2", "buzz-project-document-v1"],
+        "supported_extensions": ["buzz-project-document-v1"],
         "self": state.relay_pubkey,
     }))
 }

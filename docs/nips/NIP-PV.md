@@ -6,6 +6,10 @@ Project View
 
 `draft` `optional` `relay`
 
+> Historical schema specification. Buzz ordinary runtime now implements only
+> Project View v3; see [NIP-PV3](NIP-PV3.md). This document remains as explicit
+> operator migration and audit input and MUST NOT be used for client fallback.
+
 **Depends on**: NIP-01 (event format and filters), NIP-11 (relay information
 document), NIP-42 (authenticated relay access), NIP-45 (COUNT), and NIP-70
 (protected events)

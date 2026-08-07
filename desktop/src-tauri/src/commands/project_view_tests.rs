@@ -5,15 +5,17 @@ use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use buzz_core_pkg::kind::{KIND_NIP43_MEMBERSHIP_LIST, KIND_PROJECT_VIEW_META};
 use buzz_core_pkg::CommunityId;
-use buzz_project_view_pkg::{
-    InitializeGoal, InitializeMutation, Mutation, MutationRequest, ProjectProfile, ProjectionPlan,
+use buzz_project_view_pkg::v3::{ProjectViewEntryV3, ProjectViewObjectDataV3, ProjectViewObjectV3};
+use buzz_project_view_pkg::{Goal, ProjectProfile, ProjectViewObjectType, ProjectViewRelations};
+use buzz_sdk_pkg::project_view_v3::{
+    build_meta_projection, build_project_object_projection, V3EntityCounts, V3ProjectionContext,
+    V3ProjectionSource, PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
 };
-use buzz_sdk_pkg::project_view::{
-    build_meta_projection, build_object_projection, changed_head_for,
-};
-use nostr::Keys;
-use serde_json::Value;
+use chrono::{DateTime, Utc};
+use nostr::{EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -24,14 +26,15 @@ use crate::app_state::build_app_state;
 struct SnapshotServerState {
     relay_pubkey: String,
     meta: Event,
+    membership: Event,
     objects: Vec<Event>,
     meta_queries: Arc<AtomicUsize>,
-    snapshot_queries: Arc<AtomicUsize>,
+    entity_queries: Arc<AtomicUsize>,
 }
 
 async fn snapshot_info(AxumState(state): AxumState<SnapshotServerState>) -> Json<Value> {
     Json(json!({
-        "supported_extensions": [PROJECT_VIEW_V1_EXTENSION],
+        "supported_extensions": [PROJECT_VIEW_V3_EXTENSION],
         "self": state.relay_pubkey,
     }))
 }
@@ -41,13 +44,34 @@ async fn snapshot_query(
     Json(filters): Json<Vec<Value>>,
 ) -> Json<Value> {
     let filter = filters.first().cloned().unwrap_or_else(|| json!({}));
-    if filter.get("buzz_project_view").is_some() {
-        state.snapshot_queries.fetch_add(1, Ordering::SeqCst);
-        Json(serde_json::to_value(state.objects).expect("serialize object projections"))
-    } else {
+    let kinds = filter
+        .get("kinds")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if kinds
+        .iter()
+        .any(|kind| kind.as_u64() == Some(KIND_PROJECT_VIEW_META.into()))
+    {
         state.meta_queries.fetch_add(1, Ordering::SeqCst);
-        Json(serde_json::to_value([state.meta]).expect("serialize metadata projection"))
+        return Json(json!([state.meta]));
     }
+    if kinds
+        .iter()
+        .any(|kind| kind.as_u64() == Some(KIND_NIP43_MEMBERSHIP_LIST.into()))
+    {
+        return Json(json!([state.membership]));
+    }
+    if filter
+        .get("buzz_project_view")
+        .and_then(|value| value.get("scope"))
+        .and_then(Value::as_str)
+        == Some(PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE)
+    {
+        state.entity_queries.fetch_add(1, Ordering::SeqCst);
+        return Json(json!([]));
+    }
+    Json(serde_json::to_value(state.objects).expect("serialize object projections"))
 }
 
 async fn spawn_snapshot_server(state: SnapshotServerState) -> String {
@@ -55,6 +79,47 @@ async fn spawn_snapshot_server(state: SnapshotServerState) -> String {
         .route("/info", get(snapshot_info))
         .route("/query", post(snapshot_query))
         .with_state(state);
+    spawn_server(app).await
+}
+
+#[derive(Clone)]
+struct IdentityServerState {
+    relay_pubkey: String,
+    extensions: Vec<&'static str>,
+    queries: Arc<AtomicUsize>,
+    forbidden: bool,
+}
+
+async fn identity_info(AxumState(state): AxumState<IdentityServerState>) -> Json<Value> {
+    Json(json!({
+        "supported_extensions": state.extensions,
+        "self": state.relay_pubkey,
+    }))
+}
+
+async fn identity_query(
+    AxumState(state): AxumState<IdentityServerState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state.queries.fetch_add(1, Ordering::SeqCst);
+    if state.forbidden {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "not authorized"})),
+        ))
+    } else {
+        Ok(Json(json!([])))
+    }
+}
+
+async fn spawn_identity_server(state: IdentityServerState) -> String {
+    let app = Router::new()
+        .route("/info", get(identity_info))
+        .route("/query", post(identity_query))
+        .with_state(state);
+    spawn_server(app).await
+}
+
+async fn spawn_server(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind Project View test server");
@@ -67,178 +132,138 @@ async fn spawn_snapshot_server(state: SnapshotServerState) -> String {
     format!("http://{address}")
 }
 
-#[derive(Clone)]
-struct IdentityServerState {
-    relay_pubkey: String,
-}
-
-async fn identity_info(AxumState(state): AxumState<IdentityServerState>) -> Json<Value> {
-    Json(json!({
-        "supported_extensions": [PROJECT_VIEW_V1_EXTENSION],
-        "self": state.relay_pubkey,
-    }))
-}
-
-async fn unsupported_info() -> Json<Value> {
-    Json(json!({
-        "supported_extensions": [],
-    }))
-}
-
-async fn empty_query() -> Json<Value> {
-    Json(json!([]))
-}
-
-async fn forbidden_query() -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({"error": "not authorized"})),
-    )
-}
-
-async fn spawn_identity_server(
-    relay_pubkey: String,
-    query_handler: axum::routing::MethodRouter<IdentityServerState>,
-) -> String {
-    let app = Router::new()
-        .route("/info", get(identity_info))
-        .route("/query", query_handler)
-        .with_state(IdentityServerState { relay_pubkey });
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind Project View state test server");
-    let address = listener.local_addr().expect("read test server address");
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve Project View state fixture");
-    });
-    format!("http://{address}")
-}
-
-async fn spawn_unsupported_server() -> String {
-    let app = Router::new().route("/info", get(unsupported_info));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind unsupported Project View test server");
-    let address = listener.local_addr().expect("read test server address");
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve unsupported Project View fixture");
-    });
-    format!("http://{address}")
-}
-
-fn projection_fixture() -> SnapshotServerState {
-    let project_id = CommunityId::from_uuid(Uuid::new_v4());
-    let mutation = Mutation::new(
-        0,
-        MutationRequest::Initialize(InitializeMutation {
-            profile: ProjectProfile {
-                name: "Desktop integration".to_owned(),
-                positioning: "Verified snapshots".to_owned(),
-                purpose: "Exercise the native client boundary".to_owned(),
-                problem: "Untrusted projection input".to_owned(),
-                scope: "Project View".to_owned(),
-            },
-            goals: vec![InitializeGoal {
-                id: Uuid::new_v4(),
-                title: "Ship".to_owned(),
-                desired_outcome: "One consistent desktop read model".to_owned(),
-                directions: Vec::new(),
-            }],
-        }),
-    );
-    let (state, outcome) = ProjectViewState::new(project_id)
-        .reduce(
-            &mutation,
-            Keys::generate().public_key(),
-            DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("fixture timestamp"),
-        )
-        .expect("initialize fixture");
-    let plan = ProjectionPlan::for_mutation(&state, &outcome, [0x44; 32], 1)
-        .expect("build projection plan");
+fn projection_fixture(meta_signer: Option<&Keys>) -> SnapshotServerState {
     let relay = Keys::generate();
-    let mut paired = plan
-        .entries()
-        .iter()
-        .map(|entry| {
-            let event = build_object_projection(&plan, entry)
-                .expect("build object projection")
-                .sign_with_keys(&relay)
-                .expect("sign object projection");
-            let head = changed_head_for(&plan, entry, &event).expect("build changed head");
-            (
-                entry.object_type().as_str().to_owned(),
-                entry.id(),
-                event,
-                head,
-            )
-        })
-        .collect::<Vec<_>>();
-    paired.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
-    });
-    let heads = paired
-        .iter()
-        .map(|(_, _, _, head)| head.clone())
-        .collect::<Vec<_>>();
-    let objects = paired.into_iter().map(|(_, _, event, _)| event).collect();
-    let meta = build_meta_projection(&plan, &heads)
-        .expect("build metadata projection")
+    let actor = Keys::generate().public_key();
+    let project_id = CommunityId::from_uuid(Uuid::new_v4());
+    let canonical_time =
+        DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("fixture timestamp");
+    let source_id = EventId::from_byte_array([0x55; 32]);
+    let context = V3ProjectionContext {
+        project_id,
+        projection_generation: 1,
+        project_revision: 1,
+        source: V3ProjectionSource::System {
+            change_id: source_id,
+            audit_seq: 1,
+        },
+        updated_at: canonical_time,
+    };
+    let profile = ProjectViewEntryV3::Active(Box::new(ProjectViewObjectV3 {
+        id: *project_id.as_uuid(),
+        object_type: ProjectViewObjectType::ProjectProfile,
+        object_revision: 1,
+        project_revision: 1,
+        created_at: canonical_time,
+        updated_at: canonical_time,
+        created_by: actor,
+        updated_by: actor,
+        data: ProjectViewObjectDataV3::ProjectProfile(ProjectProfile {
+            name: "Desktop v3".to_owned(),
+            positioning: "Strict latest-version boundary".to_owned(),
+            purpose: "Verify the native read model".to_owned(),
+            problem: "Legacy schema ambiguity".to_owned(),
+            scope: "One Community Project".to_owned(),
+        }),
+        relations: ProjectViewRelations::default(),
+        context_references: Vec::new(),
+    }));
+    let profile_event = build_project_object_projection(&context, &profile, None)
+        .expect("build v3 profile projection")
         .sign_with_keys(&relay)
-        .expect("sign metadata projection");
+        .expect("sign v3 profile projection");
+    let goal = ProjectViewEntryV3::Active(Box::new(ProjectViewObjectV3 {
+        id: Uuid::new_v4(),
+        object_type: ProjectViewObjectType::Goal,
+        object_revision: 1,
+        project_revision: 1,
+        created_at: canonical_time,
+        updated_at: canonical_time,
+        created_by: actor,
+        updated_by: actor,
+        data: ProjectViewObjectDataV3::Goal(Goal {
+            title: "Ship v3".to_owned(),
+            desired_outcome: "One strict runtime".to_owned(),
+            directions: Vec::new(),
+        }),
+        relations: ProjectViewRelations::default(),
+        context_references: Vec::new(),
+    }));
+    let goal_event = build_project_object_projection(&context, &goal, None)
+        .expect("build v3 goal projection")
+        .sign_with_keys(&relay)
+        .expect("sign v3 goal projection");
+    let membership = EventBuilder::new(Kind::Custom(KIND_NIP43_MEMBERSHIP_LIST as u16), "")
+        .tags(vec![
+            Tag::parse(["-"]).expect("protection tag"),
+            Tag::parse(["member", actor.to_hex().as_str(), "owner"]).expect("owner tag"),
+        ])
+        .custom_created_at(Timestamp::from(canonical_time.timestamp() as u64))
+        .sign_with_keys(&relay)
+        .expect("sign membership projection");
+    let signer = meta_signer.unwrap_or(&relay);
+    let meta = build_meta_projection(
+        &context,
+        V3EntityCounts {
+            active_objects: 2,
+            open_proposals: 0,
+            active_assignments: 0,
+            active_commitments: 0,
+            checkpoints: 0,
+            handoffs: 0,
+        },
+        membership.id,
+        true,
+        &[],
+    )
+    .expect("build v3 metadata projection")
+    .sign_with_keys(signer)
+    .expect("sign v3 metadata projection");
     SnapshotServerState {
         relay_pubkey: relay.public_key().to_hex(),
         meta,
-        objects,
+        membership,
+        objects: vec![profile_event, goal_event],
         meta_queries: Arc::new(AtomicUsize::new(0)),
-        snapshot_queries: Arc::new(AtomicUsize::new(0)),
+        entity_queries: Arc::new(AtomicUsize::new(0)),
     }
 }
 
 #[tokio::test]
-async fn desktop_snapshot_verifies_and_assembles_read_model() {
-    let fixture = projection_fixture();
-    let counters = fixture.clone();
-    let url = spawn_snapshot_server(fixture).await;
+async fn schema_v3_snapshot_is_verified_and_meta_bracketed() {
+    let fixture = projection_fixture(None);
+    let url = spawn_snapshot_server(fixture.clone()).await;
     let state = build_app_state();
     *state
         .relay_url_override
         .lock()
         .expect("lock Relay override") = Some(url);
 
-    let result = load_project_view(&state)
-        .await
-        .expect("load verified Project View");
+    let result = load_project_view(&state).await.expect("load v3 snapshot");
     let ProjectViewLoadResult::Ready {
+        schema_version,
         project_revision,
+        projection_generation,
         active_object_count,
-        view,
+        objects_v3,
         ..
     } = result
     else {
-        panic!("expected initialized Project View");
+        panic!("expected ready v3 Project View");
     };
-
+    assert_eq!(schema_version, 3);
     assert_eq!(project_revision, 1);
+    assert_eq!(projection_generation, 1);
     assert_eq!(active_object_count, 2);
-    assert_eq!(view.expect("legacy View payload").goals.len(), 1);
-    assert_eq!(
-        counters.meta_queries.load(Ordering::SeqCst),
-        2,
-        "snapshot must bracket pagination with metadata reads"
-    );
-    assert_eq!(counters.snapshot_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(objects_v3.len(), 2);
+    assert_eq!(fixture.meta_queries.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.entity_queries.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn desktop_snapshot_rejects_a_projection_from_an_unadvertised_signer() {
-    let mut fixture = projection_fixture();
-    fixture.relay_pubkey = Keys::generate().public_key().to_hex();
+async fn v3_snapshot_rejects_a_projection_signed_by_another_key() {
+    let wrong_signer = Keys::generate();
+    let fixture = projection_fixture(Some(&wrong_signer));
     let url = spawn_snapshot_server(fixture).await;
     let state = build_app_state();
     *state
@@ -248,43 +273,113 @@ async fn desktop_snapshot_rejects_a_projection_from_an_unadvertised_signer() {
 
     let error = load_project_view(&state)
         .await
-        .expect_err("wrongly signed Project View must fail closed");
-    assert!(error.starts_with("Project View integrity error:"));
+        .expect_err("wrong signer must fail closed");
+    assert!(error.contains("integrity"));
 }
 
 #[tokio::test]
-async fn desktop_reports_capability_initialization_and_permission_states() {
-    let unsupported_url = spawn_unsupported_server().await;
-    let unsupported_state = build_app_state();
-    *unsupported_state
-        .relay_url_override
-        .lock()
-        .expect("lock Relay override") = Some(unsupported_url);
-    assert!(matches!(
-        load_project_view(&unsupported_state).await,
-        Ok(ProjectViewLoadResult::Unsupported)
-    ));
+async fn v1_and_v2_only_relays_are_unsupported_without_projection_queries() {
+    for extension in ["buzz-project-view-v1", "buzz-project-view-v2"] {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let state_fixture = IdentityServerState {
+            relay_pubkey: Keys::generate().public_key().to_hex(),
+            extensions: vec![extension],
+            queries: queries.clone(),
+            forbidden: false,
+        };
+        let url = spawn_identity_server(state_fixture).await;
+        let state = build_app_state();
+        *state
+            .relay_url_override
+            .lock()
+            .expect("lock Relay override") = Some(url);
 
-    let relay_pubkey = Keys::generate().public_key().to_hex();
-    let uninitialized_url = spawn_identity_server(relay_pubkey.clone(), post(empty_query)).await;
-    let uninitialized_state = build_app_state();
-    *uninitialized_state
-        .relay_url_override
-        .lock()
-        .expect("lock Relay override") = Some(uninitialized_url);
-    assert!(matches!(
-        load_project_view(&uninitialized_state).await,
-        Ok(ProjectViewLoadResult::Uninitialized { .. })
-    ));
+        assert!(matches!(
+            load_project_view(&state)
+                .await
+                .expect("load unsupported state"),
+            ProjectViewLoadResult::Unsupported
+        ));
+        assert_eq!(queries.load(Ordering::SeqCst), 0);
+    }
+}
 
-    let forbidden_url = spawn_identity_server(relay_pubkey, post(forbidden_query)).await;
-    let forbidden_state = build_app_state();
-    *forbidden_state
+#[tokio::test]
+async fn bootstrap_marker_returns_uninitialized_without_projection_queries() {
+    let queries = Arc::new(AtomicUsize::new(0));
+    let state_fixture = IdentityServerState {
+        relay_pubkey: Keys::generate().public_key().to_hex(),
+        extensions: vec![PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION],
+        queries: queries.clone(),
+        forbidden: false,
+    };
+    let url = spawn_identity_server(state_fixture).await;
+    let state = build_app_state();
+    *state
         .relay_url_override
         .lock()
-        .expect("lock Relay override") = Some(forbidden_url);
+        .expect("lock Relay override") = Some(url);
+
     assert!(matches!(
-        load_project_view(&forbidden_state).await,
-        Ok(ProjectViewLoadResult::Forbidden)
+        load_project_view(&state)
+            .await
+            .expect("load bootstrap discovery state"),
+        ProjectViewLoadResult::Uninitialized { .. }
     ));
+    assert_eq!(queries.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn runtime_capability_without_meta_fails_integrity_or_preserves_forbidden() {
+    for forbidden in [false, true] {
+        let state_fixture = IdentityServerState {
+            relay_pubkey: Keys::generate().public_key().to_hex(),
+            extensions: vec![PROJECT_VIEW_V3_EXTENSION],
+            queries: Arc::new(AtomicUsize::new(0)),
+            forbidden,
+        };
+        let url = spawn_identity_server(state_fixture).await;
+        let state = build_app_state();
+        *state
+            .relay_url_override
+            .lock()
+            .expect("lock Relay override") = Some(url);
+        if forbidden {
+            assert!(matches!(
+                load_project_view(&state)
+                    .await
+                    .expect("load forbidden v3 state"),
+                ProjectViewLoadResult::Forbidden
+            ));
+        } else {
+            let error = load_project_view(&state)
+                .await
+                .expect_err("ready capability without metadata must fail closed");
+            assert!(error.contains("without canonical metadata"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_and_bootstrap_markers_are_mutually_exclusive() {
+    let state_fixture = IdentityServerState {
+        relay_pubkey: Keys::generate().public_key().to_hex(),
+        extensions: vec![
+            PROJECT_VIEW_V3_EXTENSION,
+            PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION,
+        ],
+        queries: Arc::new(AtomicUsize::new(0)),
+        forbidden: false,
+    };
+    let url = spawn_identity_server(state_fixture).await;
+    let state = build_app_state();
+    *state
+        .relay_url_override
+        .lock()
+        .expect("lock Relay override") = Some(url);
+
+    let error = load_project_view(&state)
+        .await
+        .expect_err("ambiguous NIP-11 discovery must fail closed");
+    assert!(error.contains("both Project View v3 runtime and bootstrap"));
 }

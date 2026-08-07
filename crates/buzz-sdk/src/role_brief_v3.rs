@@ -28,10 +28,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::project_document::{VerifiedDocumentHead, VerifiedDocumentMeta};
-use crate::project_view_v2::V2MembershipProjection;
 use crate::project_view_v3::{
-    V3EntityChange, V3EntityProjection, V3MetaProjection, V3ProjectObjectProjection,
-    V3ProjectedObject, V3ProjectionSource,
+    V3EntityChange, V3EntityProjection, V3MembershipProjection, V3MetaProjection,
+    V3ProjectObjectProjection, V3ProjectedObject, V3ProjectionSource,
 };
 use crate::role_brief::{
     finalize_role_directory, render_role_directory, role_directory_purpose_summary, RoleBrief,
@@ -594,7 +593,7 @@ struct ContextClosure {
 #[derive(Debug, Clone)]
 pub struct VerifiedRoleBriefSnapshotV3 {
     meta: V3MetaProjection,
-    membership: V2MembershipProjection,
+    membership: V3MembershipProjection,
     entries: BTreeMap<Uuid, ProjectViewEntryV3>,
     objects: BTreeMap<Uuid, ObjectHeadV3>,
     roles: BTreeMap<Uuid, EntityHead<RoleDefinitionV3>>,
@@ -610,7 +609,7 @@ impl VerifiedRoleBriefSnapshotV3 {
     /// Validate a complete current set including all append-only history.
     pub fn new(
         meta: V3MetaProjection,
-        membership: V2MembershipProjection,
+        membership: V3MembershipProjection,
         object_projections: Vec<V3ProjectObjectProjection>,
         entity_projections: Vec<V3EntityProjection>,
     ) -> Result<Self, SdkError> {
@@ -626,7 +625,7 @@ impl VerifiedRoleBriefSnapshotV3 {
     /// Validate current heads plus the Relay's bounded continuity history slice.
     pub fn new_with_partial_history(
         meta: V3MetaProjection,
-        membership: V2MembershipProjection,
+        membership: V3MembershipProjection,
         object_projections: Vec<V3ProjectObjectProjection>,
         entity_projections: Vec<V3EntityProjection>,
     ) -> Result<Self, SdkError> {
@@ -641,7 +640,7 @@ impl VerifiedRoleBriefSnapshotV3 {
 
     fn build(
         meta: V3MetaProjection,
-        membership: V2MembershipProjection,
+        membership: V3MembershipProjection,
         object_projections: Vec<V3ProjectObjectProjection>,
         entity_projections: Vec<V3EntityProjection>,
         complete_history: bool,
@@ -867,7 +866,7 @@ impl VerifiedRoleBriefSnapshotV3 {
 
     /// Exact membership snapshot referenced by metadata.
     #[must_use]
-    pub const fn membership(&self) -> &V2MembershipProjection {
+    pub const fn membership(&self) -> &V3MembershipProjection {
         &self.membership
     }
 
@@ -1938,7 +1937,7 @@ fn validate_continuity(
     proposals: &BTreeMap<Uuid, EntityHead<RoleAssignmentProposal>>,
     assignments: &BTreeMap<Uuid, EntityHead<RoleAssignment>>,
     commitments: &BTreeMap<Uuid, EntityHead<WorkCommitment>>,
-    membership: &V2MembershipProjection,
+    membership: &V3MembershipProjection,
     complete_history: bool,
 ) -> Result<(), SdkError> {
     for proposal in proposals.values() {

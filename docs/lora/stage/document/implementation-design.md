@@ -5,6 +5,13 @@
 > 规范状态、Relay 事务、SDK、CLI、Desktop、ACP / Role Brief、迁移、测试、发布与
 > 分阶段开发计划。
 >
+> 2026-08-07 协议覆盖：Project View 普通运行时现已全面收敛为 v3-only。本文后续保留的
+> v1/v2、dual-client 与阶段性 rollout 文字只记录当时的迁移设计，不再定义当前 CLI、
+> Desktop、ACP 或 Relay 行为。当前边界以
+> [Project View 普通运行时全面收敛到 v3 的修复设计](../bug/project-view-v3-only-runtime-migration-fix-design.md)
+> 和第 5 节更新后的 capability 矩阵为准；旧 major 只可作为显式 operator
+> migration/recovery 输入。
+>
 > 本文是一份实现设计，不表示本文描述的能力已经存在，也不在本阶段提交 Rust、SQL
 > 或客户端代码。
 >
@@ -363,22 +370,17 @@ buzz-project-view-v3
 buzz-project-context-v1       # PV v3 上的独立 staged sub-capability
 ```
 
-一个 Community 可以同时广告：
-
-```text
-buzz-project-document-v1
-buzz-project-view-v2
-```
-
-或：
+普通运行时只允许同时广告：
 
 ```text
 buzz-project-document-v1
 buzz-project-view-v3
 ```
 
-Document capability 与 Project View capability 分开开关、分开 readiness。Project View
-仍然只能广告 v1、v2、v3 中的一个。
+Document capability 与 Project View capability 分开开关、分开 readiness，但 Document
+只能建立在 ready 的 Project View v3 上。未初始化的新 Community 只广告
+`buzz-project-view-v3-bootstrap`；schema v1/v2 只可进入显式 operator migration/recovery，
+普通 CLI、Desktop、ACP 和 Relay query/subscription 不提供旧版本 fallback。
 
 `buzz-project-context-v1` 只可与 ready 的 `buzz-project-view-v3` 同时广告。v3 wire /
 parser 从一开始就认识 `context_references`，但 Community column
@@ -390,28 +392,31 @@ Resource + mandatory Guide，而不会形成“Context 已可写、CLI / UI / Ro
 Document capability依赖Project View提供稳定的Community / Project身份和跨域引用基础，但
 普通Document写入不依赖Role Continuity的Assignment / Runtime state。本设计规定：
 
-- Project View v1 Community 可以先部署 Document 表和 reader 代码，但不能 enable 或
-  广告 Document capability；
-- `project_document_enabled = true` 的前置条件是该 Community 已经在 Project View
-  v2 或 v3；
+- schema v1/v2 Community 不能 enable 或广告 Document capability；
+- `project_document_enabled = true` 的前置条件是该 Community 已经完成 Project View v3
+  初始化、严格投影校验与 checked enable；
 - Human 与 managed Agent 共享当前 Community eligibility；仅显式携带Assignment的managed
   writer额外要求active Assignment + exact Runtime，普通writer同时省略两者。
+
+显式 v2→v3 operator cutover 可以读取一个保持 disabled、已 bootstrap、由稳定 Relay
+signer 签名且 canonical/current/history projection 全量一致的 Document catalog，作为
+迁移输入。该边界不广告 Document，也不恢复 v2 普通读写；cutover、verify、resume 完成后，
+operator 再通过现有 v3 checked-enable 打开 Document。
 
 这不把 Document revision 合并进 Project View；它只是部署 readiness 的安全依赖。
 
 ### 5.2 兼容矩阵
 
-| Reader / writer | Document v1 | PV v2 | PV v3 | Context sub-capability |
+| Reader / writer | Document v1 | PV v1/v2 | PV v3 | Context sub-capability |
 |---|---:|---:|---:|---:|
-| 当前旧客户端 | unsupported | 支持 | unsupported | unsupported |
-| Stage 5 base dual client | 支持 | 支持 | 支持 | 不写；strict preserve |
-| Stage 6 Context-ready dual client | 支持 | 支持 | 支持 | 支持 |
-| v3-only 后续客户端 | 支持 | 可保留只读兼容 | 支持 | 支持 |
+| 当前 CLI / Desktop / ACP | 仅在 v3 ready 后支持 | unsupported / migration required | 支持 | 按独立 capability |
+| schema-v3 bootstrap client | 不可用 | 不回退 | 仅执行 owner `init-v3` | 不可用 |
+| operator migration/recovery | disabled source validation only | 显式、只读迁移输入 | cutover / verify / resume | cutover 后另行 enable |
 
-Community 切到 v3 之前，SDK、CLI、Desktop、ACP 必须先成为 v2/v3 dual reader。旧客户端
-遇到 v3 应明确报 `unsupported:project_view:schema`，不能回退成 v2 写入。支持 PV v3
-不自动等于 Context-ready；Stage 5 client必须 round-trip字段但不能在 sub-capability
-缺失时新增引用。
+SDK、CLI、Desktop、ACP 的普通路径均为 v3-only。旧 schema 必须先由 operator 完成迁移；
+客户端遇到旧 major 应明确报 `migration_required` 或 unsupported，不能回退读取、写入或
+订阅 v2。支持 PV v3 不自动等于 Context-ready；Context capability 缺失时客户端必须保留
+字段但不得新增引用。
 
 ### 5.3 kinds 与 schema major 的关系
 
@@ -4952,7 +4957,9 @@ Documents         │
 > current / pinned / history、typed ambiguous delivery read-back。Secret incident runbook、隔离 canary
 > 与验证记录见 [`secret-incident-runbook.md`](secret-incident-runbook.md)、
 > [`stage2-canary.md`](stage2-canary.md) 和 [`changelog.md`](changelog.md)。Desktop、Project View v3
-> Resource / Context 与正文 prompt 注入仍不属于本阶段。
+> Resource / Context 与正文 prompt 注入仍不属于本阶段。2026-08-07补充：普通Stage 2 canary已
+> 全面切换到schema-v3 greenfield初始化，不再经过v1 CLI或v2 cutover；legacy版本只属于显式
+> operator migration/recovery验证。
 
 开发内容：
 
@@ -4971,10 +4978,10 @@ Documents         │
 
 首个 canary：
 
-- 只选 Project View v2 Community；
-- 先由 Human 创建普通 Document；
-- 再由 active Assignment managed Agent 读取和更新；
-- 验证 Role / Runtime fence；
+- 只使用名称严格受限、运行结束即清理的schema-v3 scratch Community；
+- 通过`prepare-v3 → direct Human owner签名init-v3 → checked enable`建立Project坐标；
+- 由两个普通Community member分别读取、创建和更新Document，并验证撤权后的final fan-out；
+- managed Assignment / Runtime fence由同批focused DB tests验证，不为canary增加旁路；
 - 验证 body 不进入普通 prompt；
 - 验证 delete / pinned history。
 

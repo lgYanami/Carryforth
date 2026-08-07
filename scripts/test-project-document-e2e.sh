@@ -91,19 +91,23 @@ docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
   < scripts/attach-schema-partitions.sql
 
 relay_private_key=0000000000000000000000000000000000000000000000000000000000000001
-relay_owner_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+relay_signer_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 member_private_key=0000000000000000000000000000000000000000000000000000000000000002
 member_pubkey=c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
 writer_private_key=0000000000000000000000000000000000000000000000000000000000000003
 writer_pubkey=f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
 outsider_private_key=0000000000000000000000000000000000000000000000000000000000000004
+owner_private_key=0000000000000000000000000000000000000000000000000000000000000005
+owner_pubkey=2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4
+[[ "${owner_pubkey}" != "${relay_signer_pubkey}" ]]
 
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
-  -c "INSERT INTO communities (id, host)
-      VALUES ('00000000-0000-4000-8000-00000000d0c0', '${test_host}');
+  -c "INSERT INTO communities (id, host, project_view_schema_version)
+      VALUES ('00000000-0000-4000-8000-00000000d0c0', '${test_host}', 3);
       INSERT INTO relay_members (community_id, pubkey, role)
       VALUES
+        ('00000000-0000-4000-8000-00000000d0c0', '${owner_pubkey}', 'owner'),
         ('00000000-0000-4000-8000-00000000d0c0', '${member_pubkey}', 'member'),
         ('00000000-0000-4000-8000-00000000d0c0', '${writer_pubkey}', 'member');" >/dev/null
 
@@ -126,8 +130,8 @@ relay_url="ws://${test_host}"
 
 start_relay() {
   # Document authorization always consults current relay_members / managed
-  # owner state. The legacy startup allowlist backfill is intentionally off
-  # because Project View v2 forbids that compatibility writer.
+  # owner state. The legacy startup allowlist backfill is intentionally off;
+  # the greenfield schema-v3 fixture declares its owner explicitly.
   env \
     DATABASE_URL="${database_url}" \
     REDIS_URL=redis://localhost:6379 \
@@ -139,7 +143,7 @@ start_relay() {
     BUZZ_REQUIRE_AUTH_TOKEN=false \
     BUZZ_REQUIRE_RELAY_MEMBERSHIP=false \
     BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
-    RELAY_OWNER_PUBKEY="${relay_owner_pubkey}" \
+    RELAY_OWNER_PUBKEY="${owner_pubkey}" \
     "${bin_dir}/buzz-relay" >"${relay_log}" 2>&1 &
   relay_pid=$!
 
@@ -198,6 +202,13 @@ buzz_cli() {
     "${bin_dir}/buzz" "$@"
 }
 
+buzz_owner_cli() {
+  env \
+    BUZZ_RELAY_URL="http://${test_host}" \
+    BUZZ_PRIVATE_KEY="${owner_private_key}" \
+    "${bin_dir}/buzz" "$@"
+}
+
 buzz_admin() {
   env \
     DATABASE_URL="${database_url}" \
@@ -219,13 +230,14 @@ export PROJECT_DOCUMENT_E2E_MEMBER_PRIVATE_KEY="${member_private_key}"
 export PROJECT_DOCUMENT_E2E_WRITER_PRIVATE_KEY="${writer_private_key}"
 export PROJECT_DOCUMENT_E2E_OUTSIDER_PRIVATE_KEY="${outsider_private_key}"
 export PROJECT_DOCUMENT_E2E_RELAY_PRIVATE_KEY="${relay_private_key}"
+export PROJECT_DOCUMENT_E2E_SCRATCH_DATABASE=1
 export REDIS_URL=redis://localhost:6379
 
 status_json="$(buzz_admin status --community "${test_host}")"
 jq -e '
   length == 1
   and .[0].enabled == false
-  and .[0].project_view_schema_version == 1
+  and .[0].project_view_schema_version == 3
   and .[0].catalog_revision == null
   and .[0].revision_count == 0
 ' <<<"${status_json}" >/dev/null
@@ -244,61 +256,134 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
       WHERE community_id = '00000000-0000-4000-8000-00000000d0c0'
         AND kind IN (44301, 40905, 40906, 40907);" >/dev/null
 
-# Establish a real initialized v1 Project View, then use the supported v2
-# cutover. Directly flipping project_view_schema_version is intentionally
-# rejected by the canonical continuity constraints.
-buzz_project_view_admin enable --community "${test_host}" >/dev/null
-profile_file="$(mktemp)"
-goal_file="$(mktemp)"
-temporary_files+=("${profile_file}" "${goal_file}")
-jq -n '{
-  name: "Project Document canary",
-  positioning: "An isolated Project View v2 compatibility fixture",
-  purpose: "Exercise Project Document Stage 2",
-  problem: "Document delivery needs a canonical Project coordinate",
-  scope: "Local canary only"
-}' >"${profile_file}"
-jq -n '{
-  id: "00000000-0000-4000-8000-00000000d002",
-  title: "Deliver Project Document Stage 2",
-  desired_outcome: "Verified private Document CRUD and history",
-  directions: ["Keep capability fail closed"]
-}' >"${goal_file}"
-start_relay
-buzz_cli project-view init --profile "${profile_file}" --goal "${goal_file}" >/dev/null
-stop_relay
-buzz_project_view_admin disable --community "${test_host}" >/dev/null
-buzz_project_view_admin cutover-v2 \
+# Establish the current greenfield Project View lifecycle without routing this
+# ordinary canary through a legacy runtime: operator prepare, owner-signed
+# initialize while still disabled, then strict checked enable.
+prepare_json="$(buzz_project_view_admin prepare-v3 \
   --community "${test_host}" \
-  --idempotency-key "project-document-stage2-${database_name}" \
-  --expected-pubkey "${relay_owner_pubkey}" >/dev/null
+  --idempotency-key "project-document-stage2-v3-${database_name}" \
+  --operator-pubkey "${owner_pubkey}")"
+preparation_operation_id="$(jq -er '.operation_id' <<<"${prepare_json}")"
+
+initialize_v3_file="$(mktemp)"
+temporary_files+=("${initialize_v3_file}")
+jq -n \
+  --arg preparation_operation_id "${preparation_operation_id}" \
+  --arg owner_pubkey "${owner_pubkey}" \
+  '{
+    schema_version: 3,
+    expected_project_revision: 0,
+    request: {
+      type: "initialize",
+      preparation_operation_id: $preparation_operation_id,
+      profile: {
+        name: "Project Document canary",
+        positioning: "An isolated schema-v3 Project View fixture",
+        purpose: "Exercise Project Document Stage 2",
+        problem: "Document delivery needs a canonical Project coordinate",
+        scope: "Local canary only"
+      },
+      goals: [{
+        id: "00000000-0000-4000-8000-00000000d002",
+        title: "Deliver Project Document Stage 2",
+        desired_outcome: "Verified private Document CRUD and history",
+        directions: ["Keep capability fail closed"]
+      }],
+      initial_roles: [{
+        role_id: "00000000-0000-4000-8000-00000000d003",
+        name: "Project Document canary owner",
+        purpose: "Own the isolated canary governance boundary",
+        responsibilities: ["Administer the scratch Project View"],
+        boundaries: ["Scratch canary only"],
+        level: "admin",
+        active: true,
+        context_references: []
+      }],
+      initial_governance_assignments: [{
+        member_pubkey: $owner_pubkey,
+        role_id: "00000000-0000-4000-8000-00000000d003",
+        proposal_id: "00000000-0000-4000-8000-00000000d004",
+        assignment_id: "00000000-0000-4000-8000-00000000d005"
+      }]
+    }
+  }' >"${initialize_v3_file}"
+
+start_relay
+pre_initialize_info="$(curl -fsS "http://${test_host}/info")"
+jq -e '
+  (.supported_extensions // []) as $extensions
+  | ($extensions | index("buzz-project-view-v3-bootstrap")) != null
+    and ($extensions | all(
+      (startswith("buzz-project-view-") | not)
+      or . == "buzz-project-view-v3-bootstrap"
+    ))
+' <<<"${pre_initialize_info}" >/dev/null
+initialize_json="$(buzz_owner_cli --format compact project-view init-v3 \
+  --command "${initialize_v3_file}")"
+jq -e '.accepted == true' <<<"${initialize_json}" >/dev/null
+initialized_disabled_info="$(curl -fsS "http://${test_host}/info")"
+jq -e '
+  (.supported_extensions // [])
+  | all(startswith("buzz-project-view-") | not)
+' <<<"${initialized_disabled_info}" >/dev/null
+stop_relay
 
 project_view_schema="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -Atc \
   "SELECT project_view_schema_version FROM communities
    WHERE id = '00000000-0000-4000-8000-00000000d0c0'")"
-[[ "${project_view_schema}" == "2" ]]
+[[ "${project_view_schema}" == "3" ]]
+project_view_basis="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -Atc \
+  "SELECT project_revision::text || ':' || projection_generation::text
+   FROM project_view_state
+   WHERE community_id = '00000000-0000-4000-8000-00000000d0c0'")"
+[[ "${project_view_basis}" == "1:1" ]]
+project_view_signer="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -Atc \
+  "SELECT encode(projection_pubkey, 'hex')
+   FROM project_view_state
+   WHERE community_id = '00000000-0000-4000-8000-00000000d0c0'")"
+[[ "${project_view_signer}" == "${relay_signer_pubkey}" ]]
+project_view_enabled="$(docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -Atc \
+  "SELECT project_view_enabled FROM communities
+   WHERE id = '00000000-0000-4000-8000-00000000d0c0'")"
+[[ "${project_view_enabled}" == "f" ]]
+
+buzz_project_view_admin enable --community "${test_host}" >/dev/null
 
 buzz_admin bootstrap \
   --community "${test_host}" \
-  --expected-pubkey "${relay_owner_pubkey}" >/dev/null
+  --expected-pubkey "${relay_signer_pubkey}" >/dev/null
 buzz_admin verify \
   --community "${test_host}" \
-  --expected-pubkey "${relay_owner_pubkey}" >/dev/null
+  --expected-pubkey "${relay_signer_pubkey}" >/dev/null
 buzz_admin enable \
   --community "${test_host}" \
-  --expected-pubkey "${relay_owner_pubkey}" >/dev/null
+  --expected-pubkey "${relay_signer_pubkey}" >/dev/null
 
 status_json="$(buzz_admin status --community "${test_host}")"
 jq -e '
   length == 1
   and .[0].enabled == true
   and .[0].ready == true
+  and .[0].project_view_schema_version == 3
   and .[0].catalog_revision == 0
   and .[0].active_document_count == 0
 ' <<<"${status_json}" >/dev/null
 
 start_relay
+enabled_info="$(curl -fsS "http://${test_host}/info")"
+jq -e '
+  (.supported_extensions // []) as $extensions
+  | ($extensions | index("buzz-project-view-v3")) != null
+    and ($extensions | index("buzz-project-view-v3-bootstrap")) == null
+    and ($extensions | all(
+      (startswith("buzz-project-view-") | not)
+      or . == "buzz-project-view-v3"
+    ))
+' <<<"${enabled_info}" >/dev/null
 run_e2e_binary e2e_project_document_enabled
 
 # Real CLI CRUD, metadata-only list/history, pinned reads, exact patch, and
@@ -401,10 +486,10 @@ rotation_assessment="synthetic-external-credential-rotated-and-impact-reviewed"
 
 buzz_admin verify \
   --community "${test_host}" \
-  --expected-pubkey "${relay_owner_pubkey}" >/dev/null
+  --expected-pubkey "${relay_signer_pubkey}" >/dev/null
 buzz_admin enable \
   --community "${test_host}" \
-  --expected-pubkey "${relay_owner_pubkey}" >/dev/null
+  --expected-pubkey "${relay_signer_pubkey}" >/dev/null
 jq -e '.document_revision == 1 and .state == "active"' \
   <<<"$(buzz_cli documents get "${incident_document_id}" --revision 1)" >/dev/null
 buzz_cli documents delete "${incident_document_id}" --expected-revision 1 >/dev/null

@@ -3,7 +3,8 @@
 #
 # This intentionally runs one scenario once. It is not a retrying qualification
 # framework: a provider, continuity, business-tool, or lifecycle failure leaves a
-# failed evidence record for review.
+# failed evidence record for review. Its disposable Project View uses the current
+# greenfield schema-v3 lifecycle; no ordinary v1/v2 runtime is involved.
 set -euo pipefail
 umask 077
 
@@ -32,7 +33,6 @@ relay_host="localhost:${relay_port}"
 relay_url="ws://${relay_host}"
 database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 relay_private_key="0000000000000000000000000000000000000000000000000000000000000001"
-relay_pubkey="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 action_capability="meeting-v2-action-finalization-v3"
 redis_url=""
 relay_pid=""
@@ -225,6 +225,7 @@ generate_identity participant
 supervisor_pubkey="$(<"${secret_dir}/supervisor.pub")"
 moderator_pubkey="$(<"${secret_dir}/moderator.pub")"
 participant_pubkey="$(<"${secret_dir}/participant.pub")"
+supervisor_private_key="$(<"${secret_dir}/supervisor.key")"
 moderator_private_key="$(<"${secret_dir}/moderator.key")"
 
 printf 'role\tmeeting_role\tparticipant_type\tpubkey\n' >"${run_dir}/roster.tsv"
@@ -329,7 +330,7 @@ seed_identity() {
 }
 
 seed_identity owner human "${supervisor_pubkey}"
-seed_identity admin agent "${moderator_pubkey}"
+seed_identity member agent "${moderator_pubkey}"
 seed_identity member human "${participant_pubkey}"
 
 curl -fsS -H 'Accept: application/nostr+json' -H "Host: ${relay_host}" \
@@ -345,6 +346,11 @@ buzz_as_moderator() {
     target/release/buzz --format compact "$@"
 }
 
+buzz_as_supervisor() {
+  BUZZ_RELAY_URL="${relay_url}" BUZZ_PRIVATE_KEY="${supervisor_private_key}" \
+    target/release/buzz --format compact "$@"
+}
+
 admin_project_view() {
   DATABASE_URL="${database_url}" REDIS_URL="${redis_url}" \
     BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}" \
@@ -352,6 +358,7 @@ admin_project_view() {
 }
 
 goal_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+owner_role_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 role_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 jq -n '{
   name: "Meeting action acceptance",
@@ -374,28 +381,98 @@ jq -n '{
   active: true
 }' >"${secret_dir}/role.json"
 
-log "initializing and cutting the disposable Project View over to v2"
-admin_project_view enable --community "${relay_host}" >"${run_dir}/logs/project-view-enable-v1.log"
-buzz_as_moderator project-view init \
-  --profile "${secret_dir}/profile.json" \
-  --goal "${secret_dir}/goal.json" >"${run_dir}/logs/project-view-init.json"
-buzz_as_moderator project-view create role \
+log "preparing and initializing the disposable greenfield Project View on schema v3"
+admin_project_view prepare-v3 \
+  --community "${relay_host}" \
+  --idempotency-key "${run_id}" \
+  --operator-pubkey "${supervisor_pubkey}" \
+  >"${run_dir}/logs/project-view-prepare-v3.json"
+preparation_operation_id="$(jq -r '.operation_id // empty' \
+  "${run_dir}/logs/project-view-prepare-v3.json")"
+[[ "${preparation_operation_id}" =~ ^[0-9a-f-]{36}$ ]] \
+  || fail "prepare-v3 did not return an operation UUID"
+initial_proposal_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+initial_assignment_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+jq -n \
+  --arg preparation_operation_id "${preparation_operation_id}" \
+  --arg owner_role_id "${owner_role_id}" \
+  --arg owner_pubkey "${supervisor_pubkey}" \
+  --arg initial_proposal_id "${initial_proposal_id}" \
+  --arg initial_assignment_id "${initial_assignment_id}" \
+  --slurpfile profile "${secret_dir}/profile.json" \
+  --slurpfile goal "${secret_dir}/goal.json" '
+  {
+    schema_version: 3,
+    expected_project_revision: 0,
+    request: {
+      type: "initialize",
+      preparation_operation_id: $preparation_operation_id,
+      profile: $profile[0],
+      goals: [$goal[0]],
+      initial_roles: [{
+        role_id: $owner_role_id,
+        name: "Meeting acceptance owner",
+        purpose: "Own the disposable Project View governance boundary",
+        responsibilities: ["Administer the disposable acceptance Project"],
+        boundaries: ["Human governance only"],
+        level: "admin",
+        active: true,
+        context_references: []
+      }],
+      initial_governance_assignments: [{
+        member_pubkey: $owner_pubkey,
+        role_id: $owner_role_id,
+        proposal_id: $initial_proposal_id,
+        assignment_id: $initial_assignment_id
+      }]
+    }
+  }' >"${secret_dir}/initialize-v3.json"
+buzz_as_supervisor project-view init-v3 \
+  --command "${secret_dir}/initialize-v3.json" \
+  >"${run_dir}/logs/project-view-init-v3.json"
+admin_project_view enable --community "${relay_host}" \
+  >"${run_dir}/logs/project-view-enable-v3.log"
+buzz_as_supervisor project-view get >"${run_dir}/logs/project-view-v3-initial.json"
+
+log "creating and assigning the moderator Role through ordinary v3 governance"
+buzz_as_supervisor project-view create role \
   --expected-project-revision 1 \
   --id "${role_id}" \
-  --data "${secret_dir}/role.json" >"${run_dir}/logs/project-view-role.json"
-admin_project_view disable --community "${relay_host}" >"${run_dir}/logs/project-view-disable.log"
-admin_project_view cutover-v2 \
-  --community "${relay_host}" \
-  --admin-assignment "${moderator_pubkey}=${role_id}" \
-  --idempotency-key "${run_id}" \
-  --expected-pubkey "${relay_pubkey}" >"${run_dir}/logs/project-view-cutover.json"
-admin_project_view enable --community "${relay_host}" >"${run_dir}/logs/project-view-enable-v2.log"
-buzz_as_moderator project-view get >"${run_dir}/logs/project-view-v2.json"
+  --role-level member \
+  --data "${secret_dir}/role.json" >"${run_dir}/logs/project-view-role-v3.json"
+role_project_revision="$(jq -r '.accepted_project_revision // empty' \
+  "${run_dir}/logs/project-view-role-v3.json")"
+[[ "${role_project_revision}" =~ ^[0-9]+$ ]] \
+  || fail "Role create did not return a Project revision"
+buzz_as_supervisor roles offer \
+  --role "${role_id}" \
+  --member "${moderator_pubkey}" \
+  --expected-project-revision "${role_project_revision}" \
+  --reason "Bind the disposable Meeting action moderator" \
+  >"${run_dir}/logs/project-view-role-offer-v3.json"
+buzz_as_moderator roles proposals --status open --limit 20 \
+  >"${run_dir}/logs/project-view-open-proposals-v3.json"
+proposal_id="$(jq -r --arg role_id "${role_id}" --arg member "${moderator_pubkey}" '
+  [.proposals[]
+   | select(.role_id == $role_id and .candidate_pubkey == $member
+            and .effective_status == "open")]
+  | if length == 1 then .[0].proposal_id else empty end
+' "${run_dir}/logs/project-view-open-proposals-v3.json")"
+proposal_project_revision="$(jq -r '.project_revision // empty' \
+  "${run_dir}/logs/project-view-open-proposals-v3.json")"
+[[ "${proposal_id}" =~ ^[0-9a-f-]{36}$ ]] \
+  || fail "could not resolve the moderator's unique open Role proposal"
+[[ "${proposal_project_revision}" =~ ^[0-9]+$ ]] \
+  || fail "Role proposal read did not return a Project revision"
+buzz_as_moderator roles proposal accept "${proposal_id}" \
+  --expected-project-revision "${proposal_project_revision}" \
+  >"${run_dir}/logs/project-view-role-accept-v3.json"
+buzz_as_moderator project-view get >"${run_dir}/logs/project-view-v3.json"
 
 project_schema="$(docker exec -e PGPASSWORD=buzz_dev "${postgres_container}" \
   psql -U buzz -d "${database_name}" -qtA \
   -c "SELECT project_view_schema_version FROM communities WHERE id='${community_id}'::uuid;")"
-[[ "${project_schema}" == 2 ]] || fail "Project View did not reach schema v2"
+[[ "${project_schema}" == 3 ]] || fail "Project View did not remain on schema v3"
 assignment_id="$(docker exec -e PGPASSWORD=buzz_dev "${postgres_container}" \
   psql -U buzz -d "${database_name}" -qtA \
   -c "SELECT assignment_id FROM project_role_assignments

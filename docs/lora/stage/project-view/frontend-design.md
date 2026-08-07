@@ -1,5 +1,9 @@
 # Project View 客户端 v0 设计
 
+> 版本说明（2026-08-07）：本文保留客户端 v0 的产品与交互背景；其中旧 schema 的读取、
+> 写入和 fallback 不再适用于当前实现。Desktop 普通运行时只接受 Project View v3。见
+> [Project View 普通运行时全面收敛到 v3](../bug/project-view-v3-only-runtime-migration-fix-design.md)。
+
 > 本文定义 Project View 首个 Human 客户端的产品边界、信息结构、主要交互和交付标准。
 > 首版以 Buzz Desktop 为目标客户端，不深入规定组件拆分、状态管理、接口函数、缓存实现
 > 或具体视觉参数；这些细节在实现阶段结合现有客户端架构决定。

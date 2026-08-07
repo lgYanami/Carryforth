@@ -326,6 +326,9 @@ materializer。
 
 - 真实 ACP adapter 和 model；
 - direct v2 capability、NIP-11 和 Create gate；
+- 在独立 scratch database 中以当前 Project View v3 greenfield
+  `prepare-v3 → owner init-v3 → checked enable` 初始化业务目标，并通过 v3 Role
+  Offer/Accept 建立主持 Assignment；不启动 Project View v1/v2 普通运行时；
 - Board Maintenance → Floor `FINALIZE_ACTIONS`；
 - 同一 Agent slot 和 ACP Session 执行 action Turn；
 - Agent 直接使用普通 `buzz project-view` CLI 创建旧 materializer 不支持的 Resource；

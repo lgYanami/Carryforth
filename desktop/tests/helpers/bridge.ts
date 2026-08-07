@@ -165,6 +165,7 @@ type MockBridgeOptions = {
   meetingFloorErrors?: Array<string | null>;
   meetingFloorIndeterminateResponses?: number;
   meetingFloorActionDelayMs?: number;
+  meetingGrantRenewalError?: string;
   meetingHostErrors?: Array<string | null>;
   meetingHostIndeterminateResponses?: number;
   meetingHostActionDelayMs?: number;

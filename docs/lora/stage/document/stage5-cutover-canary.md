@@ -1,5 +1,11 @@
 # Project Document 阶段 5 v3 cutover 与 canary
 
+> 2026-08-07 边界说明：本文只保留为显式 schema-v2→v3 operator migration/recovery
+> 记录，不是当前普通运行手册。新 Community 直接从 schema v3 greenfield 初始化；当前
+> CLI、Desktop、ACP 与 Relay 普通读写不提供 v2 capability 或 dual-client fallback。
+> 可执行的隔离迁移验证入口以
+> `scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh` 为准。
+
 执行边界：只允许一个或事先声明的小规模 Community cohort。第一方图形客户端范围仅为
 Desktop；Mobile 与 Web 不在阶段 5 的兼容性或 rollout 声明内。`project_context_enabled` 在整个
 阶段保持 `false`。

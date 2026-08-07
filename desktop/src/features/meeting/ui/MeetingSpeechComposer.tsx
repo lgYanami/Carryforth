@@ -103,7 +103,7 @@ export function MeetingSpeechComposer({
           <Clock3 className="size-3.5" />
           {expired
             ? "Checking authoritative state…"
-            : `${Math.max(1, Math.ceil(remainingMs / 1_000))}s`}
+            : `Hard limit · ${Math.max(1, Math.ceil(remainingMs / 1_000))}s`}
         </span>
       </div>
       <Textarea

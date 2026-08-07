@@ -1,6 +1,9 @@
-//! Verified, deterministic Role Brief assembly from Project View v2 heads.
+//! Legacy, deterministic Role Brief assembly from Project View v2 heads.
 //!
-//! This module deliberately performs no network I/O. Callers first fetch and
+//! This module is retained only for explicit migration/audit fixtures. Ordinary
+//! CLI, Desktop, Relay, and ACP runtime paths must use [`crate::role_brief_v3`]
+//! and must never fall back here. It deliberately performs no network I/O.
+//! Migration callers first fetch and
 //! cryptographically verify the Relay-authored projections with
 //! [`crate::project_view_v2`], then pass the complete bounded snapshot here.
 //! JSON consumers, prompt rendering, and desktop presentation therefore share
@@ -301,7 +304,7 @@ impl RoleBrief {
     }
 }
 
-/// A complete, internally consistent Project View v2 projection snapshot.
+/// A complete, internally consistent legacy Project View v2 projection snapshot.
 ///
 /// Construction validates projection basis, counts, Project View relations,
 /// Role/Assignment uniqueness, and NIP-43 membership coupling before any

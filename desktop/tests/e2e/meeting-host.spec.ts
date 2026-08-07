@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Locator, test } from "@playwright/test";
 
 import type {
   MeetingHostState,
@@ -220,6 +220,13 @@ async function openMeeting(
   await page.goto("/");
   await page.getByTestId(`meeting-row-${meetingId}`).click();
   await expect(page.getByTestId("meeting-screen")).toBeVisible();
+}
+
+async function elementBox(locator: Locator) {
+  return locator.evaluate((element) => {
+    const { height, width, x, y } = element.getBoundingClientRect();
+    return { height, width, x, y };
+  });
 }
 
 test("Human host completes Board, self Intent, Offer, Grant, Speech and direct Close", async ({
@@ -583,6 +590,7 @@ test("host selects an open Directed Handoff into an Offer without creating a Gra
 test("Agent-hosted Meeting exposes no Human host mutations", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 1920, height: 1080 });
   await installMockBridge(page, {
     meetings: [
       meetingSeed({
@@ -642,6 +650,33 @@ test("Agent-hosted Meeting exposes no Human host mutations", async ({
   await expect(
     observation.locator("button, input, select, textarea"),
   ).toHaveCount(0);
+
+  const workAreaBox = await elementBox(page.getByTestId("meeting-work-area"));
+  const leftWorkspaceBox = await elementBox(
+    page.getByTestId("meeting-left-workspace"),
+  );
+  const boardBox = await elementBox(page.getByTestId("meeting-board-wide"));
+  const dockBox = await elementBox(page.getByTestId("meeting-floor-dock"));
+  const observationBox = await elementBox(observation);
+  expect(Math.abs(boardBox.y - workAreaBox.y)).toBeLessThanOrEqual(2);
+  expect(
+    Math.abs(
+      boardBox.y + boardBox.height - (workAreaBox.y + workAreaBox.height),
+    ),
+  ).toBeLessThanOrEqual(2);
+  expect(
+    Math.abs(leftWorkspaceBox.x + leftWorkspaceBox.width - boardBox.x),
+  ).toBeLessThanOrEqual(2);
+  expect(dockBox.x + dockBox.width).toBeLessThanOrEqual(boardBox.x + 2);
+  expect(Math.abs(observationBox.x - (dockBox.x + 16))).toBeLessThanOrEqual(2);
+  expect(
+    Math.abs(
+      observationBox.x +
+        observationBox.width -
+        (dockBox.x + dockBox.width - 16),
+    ),
+  ).toBeLessThanOrEqual(2);
+
   await expect(page.getByTestId("meeting-host-console")).toHaveCount(0);
   await expect(page.getByTestId("meeting-board-editor")).toHaveCount(0);
   await expect(page.getByTestId("meeting-host-close")).toHaveCount(0);

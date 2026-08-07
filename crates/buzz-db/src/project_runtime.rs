@@ -125,7 +125,7 @@ impl Db {
              JOIN project_view_maintenance maintenance \
                ON maintenance.community_id = assignment.community_id \
              WHERE assignment.community_id = $1 AND assignment.assignment_id = $2 \
-               AND community.project_view_schema_version IN (2, 3) \
+               AND community.project_view_schema_version = 3 \
                AND community.project_view_enabled \
                AND community.archived_at IS NULL \
                AND maintenance.state = 'normal' \

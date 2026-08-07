@@ -784,6 +784,7 @@ mod tests {
             soft_lease_expires_at_ms: 2,
             hard_deadline_ms: 3,
             progress_seq: 0,
+            progress_interval_ms: Some(1),
         });
         let action = MeetingFloorAction::Speech {
             content: "A canonical Speech".to_string(),

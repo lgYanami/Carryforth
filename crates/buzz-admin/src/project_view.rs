@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use buzz_audit::{AuditAction, AuditService, NewAuditEntry};
 use buzz_core::tenant::{normalize_host, TenantContext};
 use buzz_db::project_view::{
-    PreparedObjectProjection, PreparedProjectViewReprojection, ProjectViewFeatureStatus,
+    LegacyV1PreparedProjectViewReprojection, PreparedObjectProjection, ProjectViewFeatureStatus,
 };
 use buzz_db::project_view_v2::{ProjectViewV2AdminAssignment, ProjectViewV2CutoverPlan};
 use buzz_db::Db;
@@ -43,8 +43,8 @@ pub(crate) enum ProjectViewCommand {
         #[command(flatten)]
         target: ProjectViewTarget,
     },
-    /// Re-sign every projection after the feature has been disabled.
-    Reproject {
+    /// Explicit legacy schema-v1 projection recovery before migration.
+    LegacyV1Reproject {
         #[command(flatten)]
         target: ProjectViewTarget,
         /// File containing the relay private key; must not be group/world accessible.
@@ -339,12 +339,12 @@ pub(crate) async fn run(command: ProjectViewCommand) -> Result<i32> {
         ProjectViewCommand::Disable { target } => {
             set_enabled(&db, target, false).await?;
         }
-        ProjectViewCommand::Reproject {
+        ProjectViewCommand::LegacyV1Reproject {
             target,
             relay_key_file,
             expected_pubkey,
         } => {
-            reproject(&db, target, relay_key_file.as_deref(), &expected_pubkey).await?;
+            legacy_v1_reproject(&db, target, relay_key_file.as_deref(), &expected_pubkey).await?;
         }
         ProjectViewCommand::CutoverV2 {
             community,
@@ -1072,11 +1072,12 @@ async fn show_status(db: &Db, community: Option<&str>) -> Result<()> {
     let statuses = if let Some(host) = community {
         let host = normalize_required_host(host)?;
         vec![db
-            .project_view_status_by_host(&host)
+            .project_view_status_by_host_with_strict_readiness(&host)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Community host '{host}' was not found"))?]
     } else {
-        db.list_project_view_statuses().await?
+        db.list_project_view_statuses_with_strict_readiness()
+            .await?
     };
 
     if statuses.is_empty() {
@@ -1085,8 +1086,17 @@ async fn show_status(db: &Db, community: Option<&str>) -> Result<()> {
     }
 
     println!(
-        "{:<38} {:<32} {:<9} {:<8} {:<12} {:<12} projection_pubkey",
-        "community_id", "host", "archived", "enabled", "revision", "generation"
+        "{:<38} {:<32} {:<9} {:<6} {:<9} {:<11} {:<12} {:<8} {:<12} {:<12} projection_pubkey",
+        "community_id",
+        "host",
+        "archived",
+        "schema",
+        "prepared",
+        "initialized",
+        "strict-ready",
+        "enabled",
+        "revision",
+        "generation"
     );
     println!("{}", "-".repeat(190));
     for status in statuses {
@@ -1130,7 +1140,7 @@ async fn set_enabled(db: &Db, target: ProjectViewTarget, enabled: bool) -> Resul
     Ok(())
 }
 
-async fn reproject(
+async fn legacy_v1_reproject(
     db: &Db,
     target: ProjectViewTarget,
     relay_key_file: Option<&Path>,
@@ -1180,7 +1190,8 @@ async fn reproject(
     let pubsub = super::connect_pubsub().await?;
     let mut publish_failures = Vec::new();
     for status in initialized {
-        let generation = reproject_one(db, &pubsub, &keys, &status, &mut publish_failures).await?;
+        let generation =
+            legacy_v1_reproject_one(db, &pubsub, &keys, &status, &mut publish_failures).await?;
         println!(
             "reprojected {} ({}) at generation {generation} with signer {}",
             status.host,
@@ -1199,14 +1210,16 @@ async fn reproject(
     Ok(())
 }
 
-async fn reproject_one(
+async fn legacy_v1_reproject_one(
     db: &Db,
     pubsub: &PubSubManager,
     keys: &Keys,
     status: &ProjectViewFeatureStatus,
     publish_failures: &mut Vec<String>,
 ) -> Result<u64> {
-    let mut write = db.begin_project_view_reproject(status.community_id).await?;
+    let mut write = db
+        .begin_legacy_v1_project_view_reproject(status.community_id)
+        .await?;
     let context = write.load_current().await?;
     let projection_generation = context
         .metadata
@@ -1226,7 +1239,7 @@ async fn reproject_one(
         .sign_with_keys(keys)
         .map_err(|error| anyhow::anyhow!("sign metadata projection: {error}"))?;
     let outcome = write
-        .commit_reprojection(PreparedProjectViewReprojection {
+        .commit_reprojection(LegacyV1PreparedProjectViewReprojection {
             state: context.state,
             object_projections,
             meta_projection,
@@ -1329,11 +1342,18 @@ fn print_status(status: &ProjectViewFeatureStatus) {
     let projection_pubkey = status
         .projection_pubkey
         .map_or_else(|| "-".to_owned(), |value| value.to_hex());
+    let strict_ready = status
+        .strict_ready
+        .map_or_else(|| "-".to_owned(), |value| value.to_string());
     println!(
-        "{:<38} {:<32} {:<9} {:<8} {:<12} {:<12} {}",
+        "{:<38} {:<32} {:<9} {:<6} {:<9} {:<11} {:<12} {:<8} {:<12} {:<12} {}",
         status.community_id,
         status.host,
         status.archived,
+        status.schema_version,
+        status.prepared,
+        status.initialized,
+        strict_ready,
         status.enabled,
         revision,
         generation,
@@ -1352,6 +1372,36 @@ mod tests {
             "relay.example"
         );
         assert!(normalize_required_host("   ").is_err());
+    }
+
+    #[test]
+    fn schema_v1_reproject_is_explicitly_legacy_named() {
+        let legacy = <crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "project-view",
+            "legacy-v1-reproject",
+            "--community",
+            "relay.example",
+            "--expected-pubkey",
+            "00",
+        ])
+        .expect("parse explicitly legacy v1 reproject command");
+        assert!(matches!(
+            legacy.command,
+            crate::Command::ProjectView {
+                command: ProjectViewCommand::LegacyV1Reproject { .. }
+            }
+        ));
+        assert!(<crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "project-view",
+            "reproject",
+            "--community",
+            "relay.example",
+            "--expected-pubkey",
+            "00",
+        ])
+        .is_err());
     }
 
     #[test]

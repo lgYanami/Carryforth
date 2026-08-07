@@ -1,5 +1,9 @@
 # Community 展示页中的 Project View 前端设计
 
+> 版本说明（2026-08-07）：本文的信息架构继续有效；底层 Project View 普通运行时现已
+> 固定为 schema v3，不再进行 v1/v2 客户端 fallback。见
+> [Project View 普通运行时全面收敛到 v3](../bug/project-view-v3-only-runtime-migration-fix-design.md)。
+
 > 本文重新对齐 Buzz Desktop 中 Community 与 Project View 的前端信息架构。
 > 核心变化是：Project View 不再被表现为与 Inbox、Pulse、Projects 并列的独立功能，
 > 而是成为 Community 自身展示页中的项目当前视图。

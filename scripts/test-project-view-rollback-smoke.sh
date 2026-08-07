@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Start the last pre-Project-View Relay against a database migrated to v27.
-# This proves the only permitted pre-feature rollback boundary: migration has
-# run, every Community remains disabled, and no Project View mutation exists.
+# Start the last pre-Project-View Relay against the current additive schema.
+# This proves only the pre-initialization database boundary: migrations have
+# run, every Community remains disabled, and no Project View state exists. It
+# does not qualify an old binary for post-mutation Project View traffic.
 
 set -euo pipefail
 
@@ -78,7 +79,11 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
         AND
         (SELECT count(*) FROM _sqlx_migrations WHERE version = 27 AND success) = 1
         AND
+        (SELECT count(*) FROM _sqlx_migrations WHERE version = 48 AND success) = 1
+        AND
         (SELECT bool_and(NOT project_view_enabled) FROM communities)
+        AND
+        NOT EXISTS (SELECT 1 FROM project_view_state)
       THEN 'ok' ELSE 'bad' END" |
   grep -qx ok
 
@@ -122,10 +127,10 @@ info="$(
     "http://${community_host}/info"
 )"
 jq -e '(.supported_nips | type) == "array"' <<<"${info}" >/dev/null
-if jq -e '.supported_extensions[]? == "buzz-project-view-v1"' <<<"${info}" >/dev/null; then
+if jq -e '.supported_extensions[]? | startswith("buzz-project-view-")' <<<"${info}" >/dev/null; then
   echo "Project View rollback smoke: baseline unexpectedly advertises Project View" >&2
   exit 1
 fi
 kill -0 "${relay_pid}"
 
-echo "Project View pre-feature rollback smoke passed on migration 27."
+echo "Project View pre-feature database smoke passed on the current additive schema."

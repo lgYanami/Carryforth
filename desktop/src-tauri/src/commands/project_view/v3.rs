@@ -11,12 +11,11 @@ use buzz_project_view_pkg::v2::{
 };
 use buzz_project_view_pkg::v3::{ProjectViewObjectV3, RoleDefinitionV3};
 use buzz_project_view_pkg::ProjectViewObjectType;
-use buzz_sdk_pkg::project_view_v2::{
-    parse_membership_projection as parse_v2_membership_projection, V2MembershipProjection,
-};
 use buzz_sdk_pkg::project_view_v3::{
-    parse_entity_projection, parse_meta_projection, parse_project_object_projection,
-    V3MetaProjection, V3ProjectedObject,
+    parse_entity_projection, parse_membership_projection, parse_meta_projection,
+    parse_project_object_projection, V3MembershipProjection, V3MetaProjection, V3ProjectedObject,
+    PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE, PROJECT_VIEW_V3_ENTITY_TAG, PROJECT_VIEW_V3_META_TAG,
+    PROJECT_VIEW_V3_OBJECT_TAG,
 };
 use buzz_sdk_pkg::role_brief_v3::{RoleBriefV3, VerifiedRoleBriefSnapshotV3};
 use chrono::Utc;
@@ -84,7 +83,7 @@ async fn fetch_v3_snapshot_once(
         &[json!({
             "kinds": [KIND_PROJECT_VIEW_OBJECT],
             "authors": [identity.relay_pubkey.to_hex()],
-            "#t": ["buzz-project-view-v3-object"],
+            "#t": [PROJECT_VIEW_V3_OBJECT_TAG],
         })],
     )
     .await?;
@@ -211,7 +210,7 @@ async fn query_v3_current_entities(
     let mut after: Option<serde_json::Value> = None;
     loop {
         let mut extension = json!({
-            "scope": "v3_current_entities",
+            "scope": PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE,
             "revision": meta.project_revision,
             "projection_generation": meta.projection_generation,
         });
@@ -223,7 +222,7 @@ async fn query_v3_current_entities(
             &[json!({
                 "kinds": [KIND_PROJECT_VIEW_OBJECT],
                 "authors": [identity.relay_pubkey.to_hex()],
-                "#t": ["buzz-project-view-v3-entity"],
+                "#t": [PROJECT_VIEW_V3_ENTITY_TAG],
                 "limit": SNAPSHOT_PAGE_SIZE,
                 "buzz_project_view": extension,
             })],
@@ -261,7 +260,7 @@ async fn read_v3_membership(
     state: &AppState,
     identity: ProjectViewIdentity,
     meta: &V3MetaProjection,
-) -> ProjectViewReadResult<V2MembershipProjection> {
+) -> ProjectViewReadResult<V3MembershipProjection> {
     let events = query_project_view(
         state,
         &[json!({
@@ -282,7 +281,7 @@ async fn read_v3_membership(
             "v3 membership query returned an event other than the metadata pointer",
         ));
     }
-    parse_v2_membership_projection(event, &identity.relay_pubkey)
+    parse_membership_projection(event, &identity.relay_pubkey)
         .map_err(|error| integrity_read_error(error.to_string()))
 }
 
@@ -295,6 +294,7 @@ pub(super) async fn read_v3_meta(
         &[json!({
             "kinds": [KIND_PROJECT_VIEW_META],
             "authors": [identity.relay_pubkey.to_hex()],
+            "#t": [PROJECT_VIEW_V3_META_TAG],
             "limit": 2,
         })],
     )

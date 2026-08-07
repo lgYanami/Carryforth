@@ -14,7 +14,8 @@ mod patch;
 mod projection;
 mod read_model;
 mod state;
-/// Project View v2 role-continuity primitives.
+/// Legacy v2 role-continuity primitives retained as wire-neutral domain types
+/// for v3 and explicit migration; not an ordinary runtime compatibility API.
 pub mod v2;
 /// Project View v3 wire, cutover, and maintenance contracts.
 pub mod v3;

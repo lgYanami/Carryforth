@@ -6459,6 +6459,12 @@ ALTER TABLE communities
     ADD CONSTRAINT communities_project_context_gate_check
         CHECK (NOT project_context_enabled OR project_view_schema_version = 3);
 
+-- Project View v3 greenfield default (keep in sync with migration 0048).
+-- Existing Community rows retain their exact schema coordinate. Only future
+-- inserts inherit schema v3, disabled and uninitialized.
+ALTER TABLE communities
+    ALTER COLUMN project_view_schema_version SET DEFAULT 3;
+
 ALTER TABLE project_view_state
     DROP CONSTRAINT project_view_state_schema_version_check,
     ADD CONSTRAINT project_view_state_schema_version_check
@@ -8489,6 +8495,182 @@ CREATE CONSTRAINT TRIGGER project_view_maintenance_runtime_ack_validate
     AFTER INSERT OR UPDATE OR DELETE ON project_view_maintenance_acks
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION project_view_maintenance_validate_ack_row();
+
+CREATE FUNCTION project_view_v3_bootstrap_lifecycle_valid(target_community UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+STRICT
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM communities community
+        JOIN project_view_maintenance maintenance
+          ON maintenance.community_id = community.id
+        WHERE community.id = target_community
+          AND community.project_view_schema_version = 3
+          AND NOT community.project_view_enabled
+          AND NOT community.project_context_enabled
+          AND maintenance.state = 'normal'
+          AND maintenance.current_epoch IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_state state
+              WHERE state.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_maintenance_epochs epoch
+              WHERE epoch.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_v3_resource_mappings mapping
+              WHERE mapping.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_context_operations context_operation
+              WHERE context_operation.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_objects object
+              WHERE object.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_mutations mutation
+              WHERE mutation.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_view_changes change
+              WHERE change.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_role_assignments assignment
+              WHERE assignment.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_role_assignment_proposals proposal
+              WHERE proposal.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_work_commitments commitment
+              WHERE commitment.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_role_checkpoints checkpoint
+              WHERE checkpoint.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_role_handoffs handoff
+              WHERE handoff.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM project_role_continuity_references reference
+              WHERE reference.community_id = community.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM relay_members member
+              WHERE member.community_id = community.id
+                AND member.pubkey !~ '^[0-9a-f]{64}$'
+          )
+          AND (
+              SELECT count(*)
+              FROM relay_members owner
+              WHERE owner.community_id = community.id
+                AND owner.role = 'owner'
+          ) <= 1
+          AND (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM relay_members member
+                  WHERE member.community_id = community.id
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM relay_members owner
+                  WHERE owner.community_id = community.id
+                    AND owner.role = 'owner'
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM relay_members owner
+              JOIN users actor
+                ON actor.community_id = owner.community_id
+               AND encode(actor.pubkey, 'hex') = owner.pubkey
+              WHERE owner.community_id = community.id
+                AND owner.role = 'owner'
+                AND actor.agent_owner_pubkey IS NOT NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM relay_members owner
+              JOIN community_bans restriction
+                ON restriction.community_id = owner.community_id
+               AND restriction.pubkey = decode(owner.pubkey, 'hex')
+              WHERE owner.community_id = community.id
+                AND owner.role = 'owner'
+                AND restriction.banned
+                AND (
+                    restriction.ban_expires_at IS NULL
+                    OR restriction.ban_expires_at > CURRENT_TIMESTAMP
+                )
+          )
+          AND (
+              (
+                  community.project_view_preparation_operation_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM project_view_provisioning_operations preparation
+                      WHERE preparation.community_id = community.id
+                  )
+              )
+              OR (
+                  community.project_view_preparation_operation_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM relay_members owner
+                      WHERE owner.community_id = community.id
+                        AND owner.role = 'owner'
+                  )
+                  AND (
+                      SELECT count(*)
+                      FROM project_view_provisioning_operations preparation
+                      WHERE preparation.community_id = community.id
+                  ) = 1
+                  AND EXISTS (
+                      SELECT 1
+                      FROM project_view_provisioning_operations preparation
+                      WHERE preparation.community_id = community.id
+                        AND preparation.operation_id =
+                            community.project_view_preparation_operation_id
+                        AND preparation.operation = 'prepare_v3'
+                        AND preparation.target_schema_version = 3
+                        AND preparation.consumed_by_change_id IS NULL
+                        AND preparation.consumed_at IS NULL
+                  )
+              )
+          )
+    )
+$$;
+
+CREATE OR REPLACE FUNCTION project_view_v3_validate_row() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    target_community UUID;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        target_community := OLD.community_id;
+    ELSE
+        target_community := NEW.community_id;
+    END IF;
+    IF TG_TABLE_NAME IN ('project_documents', 'project_document_revisions')
+       AND project_view_v3_bootstrap_lifecycle_valid(target_community) THEN
+        RETURN NULL;
+    END IF;
+    PERFORM project_view_v3_validate_community(target_community);
+    RETURN NULL;
+END
+$$;
+
 -- Role-continuity invariants apply unchanged to schema v2 and v3.
 
 CREATE OR REPLACE FUNCTION project_role_continuity_validate_community(target_community UUID)
@@ -8514,23 +8696,11 @@ BEGIN
     WHERE community_id = target_community;
 
     IF NOT FOUND THEN
-        IF target_schema = 3 AND EXISTS (
-            SELECT 1
-            FROM communities community
-            JOIN project_view_provisioning_operations preparation
-              ON preparation.community_id = community.id
-             AND preparation.operation_id = community.project_view_preparation_operation_id
-            WHERE community.id = target_community
-              AND NOT community.project_view_enabled
-              AND NOT community.project_context_enabled
-              AND preparation.operation = 'prepare_v3'
-              AND preparation.target_schema_version = 3
-              AND preparation.consumed_by_change_id IS NULL
-              AND preparation.consumed_at IS NULL
-        ) THEN
+        IF target_schema = 3
+           AND project_view_v3_bootstrap_lifecycle_valid(target_community) THEN
             RETURN;
         END IF;
-        RAISE EXCEPTION 'Project View state missing for community %', target_community
+        RAISE EXCEPTION 'Project View state missing outside the valid schema-v3 bootstrap lifecycle for community %', target_community
             USING ERRCODE = 'check_violation';
     END IF;
 
@@ -8546,7 +8716,7 @@ BEGIN
       AND role = 'owner';
 
     IF owner_count <> 1 THEN
-        RAISE EXCEPTION 'Project View v2 requires exactly one Community owner'
+        RAISE EXCEPTION 'Project View requires exactly one Community owner'
             USING ERRCODE = 'check_violation';
     END IF;
 
@@ -8556,7 +8726,7 @@ BEGIN
         WHERE member.community_id = target_community
           AND member.pubkey !~ '^[0-9a-f]{64}$'
     ) THEN
-        RAISE EXCEPTION 'Project View v2 membership pubkeys must be lowercase 32-byte hex'
+        RAISE EXCEPTION 'Project View membership pubkeys must be lowercase 32-byte hex'
             USING ERRCODE = 'check_violation';
     END IF;
 
@@ -8599,7 +8769,7 @@ BEGIN
           AND object.deleted_at IS NULL
           AND object.schema_version IS DISTINCT FROM target_schema
     ) THEN
-        RAISE EXCEPTION 'Active Project View objects must use schema version 2 after cutover'
+        RAISE EXCEPTION 'Active Project View objects must match the Community schema version'
             USING ERRCODE = 'check_violation';
     END IF;
 
