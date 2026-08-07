@@ -8,7 +8,8 @@ use tracing::{debug, warn};
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
     has_indexed_d_tag, is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM,
-    KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_PERSONA, P_GATED_KINDS, RESULT_GATED_KINDS,
+    KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_PERSONA, KIND_PROJECT_CONTEXT_EDGE_BINDING,
+    P_GATED_KINDS, RESULT_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -158,6 +159,66 @@ pub async fn handle_req(
             }
         }
     };
+
+    let project_context_can_match = filters
+        .iter()
+        .any(super::community_private::filter_can_match_project_context);
+    let project_context_exclusive =
+        super::community_private::filters_are_exclusively_project_context(&filters);
+    let project_context_decision = if project_context_can_match {
+        match super::community_private::project_context_read_decision(
+            &state,
+            conn.tenant.community(),
+            &pubkey_bytes,
+            &auth_scopes,
+            token_channel_ids.as_deref(),
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(conn_id = %conn_id, "Project Context read authorization failed: {error}");
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "error:project_context:database",
+                ));
+                return;
+            }
+        }
+    } else {
+        super::community_private::ProjectContextReadDecision::Restricted
+    };
+    if project_context_exclusive {
+        match project_context_decision {
+            super::community_private::ProjectContextReadDecision::Allowed => {}
+            super::community_private::ProjectContextReadDecision::Restricted => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted:project_context:membership_required",
+                ));
+                return;
+            }
+            super::community_private::ProjectContextReadDecision::Unavailable(reason) => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    &format!("unavailable:project_context:{reason}"),
+                ));
+                return;
+            }
+        }
+    }
+    let project_context_read_allowed = project_context_decision.allowed();
+    if project_context_read_allowed
+        && filters
+            .iter()
+            .any(super::community_private::filter_is_project_context_search)
+    {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:project_context:search",
+        ));
+        return;
+    }
 
     let project_document_can_match = filters
         .iter()
@@ -534,6 +595,11 @@ pub async fn handle_req(
                 filter,
                 project_document_read_allowed,
             );
+            super::community_private::exclude_project_context_kinds(
+                &mut params,
+                filter,
+                project_context_read_allowed,
+            );
             (idx, per_filter_channel, params)
         })
         .collect();
@@ -641,6 +707,7 @@ pub async fn handle_req(
             if !super::community_private::event_is_visible(
                 stored.event.kind.as_u16() as u32,
                 project_document_read_allowed,
+                project_context_read_allowed,
             ) {
                 continue;
             }
@@ -984,6 +1051,7 @@ async fn handle_search_req(
                     if !super::community_private::event_is_visible(
                         stored.event.kind.as_u16() as u32,
                         false,
+                        false,
                     ) {
                         continue;
                     }
@@ -1048,7 +1116,7 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
 ///
 /// Pushed constraints: kinds, authors (single or multi), ids, since, until,
 /// channel_id (#h single), #p (single), #d (single or multi, indexed-d kinds), #e (any),
-/// channel_ids (injected by caller).
+/// Project Context binding #c/#g/#s, and channel_ids (injected by caller).
 ///
 /// Anything else (multi-#p, #t, #a, search, multi-#h, #d on non-indexed kinds)
 /// requires post-filtering and cannot use the fast COUNT path.
@@ -1079,6 +1147,14 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
             "e" => {
                 // #e is fully pushed (any count) via JSONB containment.
             }
+            "c" | "g" | "s" => {
+                // These custom tags are pushed only for the Relay-owned
+                // Project Context binding projection kind. A mixed or
+                // kindless filter must retain generic NIP-01 post-filtering.
+                if !tag_values.is_empty() && !filter_targets_only_project_context_bindings(filter) {
+                    return false;
+                }
+            }
             _ => {
                 // Any other generic tag (#t, #a, etc.) is not pushed.
                 if !tag_values.is_empty() {
@@ -1106,6 +1182,17 @@ fn filter_targets_only_indexed_d_tag_kinds(filter: &Filter) -> bool {
             && kinds
                 .iter()
                 .all(|kind| has_indexed_d_tag(kind.as_u16() as u32))
+    })
+}
+
+/// Return whether a filter explicitly and exclusively targets Relay-owned
+/// Project Context binding heads.
+fn filter_targets_only_project_context_bindings(filter: &Filter) -> bool {
+    filter.kinds.as_ref().is_some_and(|kinds| {
+        !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|kind| u32::from(kind.as_u16()) == KIND_PROJECT_CONTEXT_EDGE_BINDING)
     })
 }
 
@@ -1249,6 +1336,10 @@ fn filter_to_query_params(
         (None, None)
     };
 
+    let project_context_c_tags = project_context_tag_values(filter, "c");
+    let project_context_g_tags = project_context_tag_values(filter, "g");
+    let project_context_s_tags = project_context_tag_values(filter, "s");
+
     EventQuery {
         channel_id,
         kinds,
@@ -1262,8 +1353,22 @@ fn filter_to_query_params(
         authors,
         ids,
         e_tags,
+        project_context_c_tags,
+        project_context_g_tags,
+        project_context_s_tags,
         ..EventQuery::for_community(community)
     }
+}
+
+fn project_context_tag_values(filter: &Filter, expected_key: &str) -> Option<Vec<String>> {
+    if !filter_targets_only_project_context_bindings(filter) {
+        return None;
+    }
+    filter
+        .generic_tags
+        .iter()
+        .find(|(key, _)| key.to_string() == expected_key)
+        .map(|(_, values)| values.iter().map(ToString::to_string).collect())
 }
 
 /// Push the caller's authorized channel set into logically global historical
@@ -1988,6 +2093,61 @@ mod tests {
             ]
         );
         assert!(filter_fully_pushable(&filter));
+    }
+
+    #[test]
+    fn project_context_binding_custom_tags_are_fully_pushed_only_for_kind_40908() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        let coordinate = "pv:project:requirement:coordinate";
+        let edge = "project-context-edge:project:key";
+        let context_filter = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_PROJECT_CONTEXT_EDGE_BINDING as u16,
+            ))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::C), [coordinate])
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::G), [edge])
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::S), ["active"]);
+
+        let query = filter_to_query_params(&context_filter, None, community);
+        assert_eq!(
+            query.project_context_c_tags.as_deref(),
+            Some([coordinate.to_owned()].as_slice())
+        );
+        assert_eq!(
+            query.project_context_g_tags.as_deref(),
+            Some([edge.to_owned()].as_slice())
+        );
+        assert_eq!(
+            query.project_context_s_tags.as_deref(),
+            Some(["active".to_owned()].as_slice())
+        );
+        assert!(filter_fully_pushable(&context_filter));
+
+        let mixed_filter = Filter::new()
+            .kinds([
+                nostr::Kind::Custom(buzz_core::kind::KIND_PROJECT_CONTEXT_EDGE_BINDING as u16),
+                nostr::Kind::Custom(1),
+            ])
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::S), ["active"]);
+        let mixed_query = filter_to_query_params(&mixed_filter, None, community);
+        assert!(mixed_query.project_context_s_tags.is_none());
+        assert!(!filter_fully_pushable(&mixed_filter));
+
+        let kindless_filter =
+            Filter::new().custom_tags(SingleLetterTag::lowercase(Alphabet::C), [coordinate]);
+        assert!(!filter_fully_pushable(&kindless_filter));
+
+        let empty_state_filter = serde_json::from_value::<Filter>(serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_PROJECT_CONTEXT_EDGE_BINDING],
+            "#s": []
+        }))
+        .expect("deserialize empty custom tag filter");
+        let empty_query = filter_to_query_params(&empty_state_filter, None, community);
+        assert!(empty_query
+            .project_context_s_tags
+            .as_ref()
+            .is_some_and(Vec::is_empty));
+        assert!(filter_fully_pushable(&empty_state_filter));
     }
 
     #[test]

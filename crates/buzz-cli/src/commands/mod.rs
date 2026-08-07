@@ -14,6 +14,7 @@ pub mod notes;
 pub mod pack;
 pub mod patches;
 pub mod pr;
+pub mod project_context;
 pub mod project_view;
 pub(crate) mod project_view_snapshot;
 pub(crate) mod project_view_v3_approval;

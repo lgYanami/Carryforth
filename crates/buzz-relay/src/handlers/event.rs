@@ -10,10 +10,12 @@ use tracing::{debug, error, info, warn};
 
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
-    event_kind_u32, is_ephemeral, is_project_document_protocol_kind, is_project_view_protocol_kind,
-    is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP,
-    KIND_PRESENCE_UPDATE, KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
-    KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT,
+    event_kind_u32, is_ephemeral, is_project_context_protocol_kind,
+    is_project_document_protocol_kind, is_project_view_protocol_kind, is_unshared_persona_event,
+    AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META, KIND_PROJECT_DOCUMENT_HEAD,
+    KIND_PROJECT_DOCUMENT_META, KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META,
+    KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -45,11 +47,11 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         20000..=29999 => kind.to_string(),
         30023 | 30315 | 39000..=39003 => kind.to_string(),
         40002..=40100 => kind.to_string(),
-        40903..=40907 => kind.to_string(),
+        40903..=40909 => kind.to_string(),
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
-        44200 | 44300..=44301 => kind.to_string(),
+        44200 | 44300..=44302 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
@@ -79,6 +81,18 @@ fn record_private_projection_dispatch_error(kind: u32) {
     if let Some(projection_type) = document_projection_type {
         metrics::counter!(
             "buzz_project_document_projection_dispatch_errors_total",
+            "projection_type" => projection_type,
+        )
+        .increment(1);
+    }
+    let context_projection_type = match kind {
+        KIND_PROJECT_CONTEXT_EDGE_BINDING => Some("binding"),
+        KIND_PROJECT_CONTEXT_META => Some("meta"),
+        _ => None,
+    };
+    if let Some(projection_type) = context_projection_type {
+        metrics::counter!(
+            "buzz_project_context_projection_dispatch_errors_total",
             "projection_type" => projection_type,
         )
         .increment(1);
@@ -167,6 +181,65 @@ pub async fn filter_fanout_by_access(
             state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
         })
         .collect();
+
+    // Project Context is Community-global and private. Structural readiness is
+    // independent of the attach capability flag so disabled Communities retain
+    // member reads and detach recovery. This chokepoint covers local and Redis
+    // fan-out paths.
+    let matches = if is_project_context_protocol_kind(kind) {
+        if state.config.relay_private_key.is_none() {
+            return Vec::new();
+        }
+        match state
+            .db
+            .project_context_structural_read_ready(community_id, &state.relay_keypair.public_key())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Vec::new(),
+            Err(error) => {
+                warn!(
+                    community_id = %community_id,
+                    "Project Context fan-out readiness failed closed: {error}"
+                );
+                return Vec::new();
+            }
+        }
+        let credential_eligible: Vec<_> = matches
+            .into_iter()
+            .filter(|(conn_id, _)| state.conn_manager.community_private_read_eligible(*conn_id))
+            .collect();
+        let pubkeys: HashSet<Vec<u8>> = credential_eligible
+            .iter()
+            .filter_map(|(conn_id, _)| state.conn_manager.pubkey_for_conn(*conn_id))
+            .collect();
+        let pubkeys: Vec<Vec<u8>> = pubkeys.into_iter().collect();
+        let authorized = match state
+            .db
+            .project_context_authorized_pubkeys(community_id, &pubkeys)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                warn!(
+                    community_id = %community_id,
+                    "Project Context fan-out authorization failed closed: {error}"
+                );
+                return Vec::new();
+            }
+        };
+        credential_eligible
+            .into_iter()
+            .filter(|(conn_id, _)| {
+                state
+                    .conn_manager
+                    .pubkey_for_conn(*conn_id)
+                    .is_some_and(|pubkey| authorized.contains(&pubkey))
+            })
+            .collect()
+    } else {
+        matches
+    };
 
     // Project View is Community-global but never public. Revalidate both
     // halves of its read gate at the final send chokepoint: the connection's
@@ -2547,6 +2620,28 @@ mod tests {
             )
             .await;
             assert_eq!(out, matches);
+        }
+
+        #[tokio::test]
+        async fn project_context_live_fanout_is_closed_before_readiness() {
+            let state = test_state().await;
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+            let conn = register_conn_in_community(&state, community_id, Some(vec![1u8; 32]));
+
+            for kind in [
+                buzz_core::kind::KIND_PROJECT_CONTEXT_COMMAND,
+                buzz_core::kind::KIND_PROJECT_CONTEXT_EDGE_BINDING,
+                buzz_core::kind::KIND_PROJECT_CONTEXT_META,
+            ] {
+                let event = EventBuilder::new(Kind::Custom(kind as u16), "{}")
+                    .sign_with_keys(&Keys::generate())
+                    .expect("sign Project Context fixture");
+                let stored = StoredEvent::new(event, None);
+                let matches = vec![(conn, format!("context-{kind}"))];
+                let out =
+                    filter_fanout_by_access(&state, community_id, &stored, matches, None).await;
+                assert!(out.is_empty(), "kind {kind} escaped live fan-out");
+            }
         }
 
         #[tokio::test]

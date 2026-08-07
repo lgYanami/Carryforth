@@ -46,6 +46,7 @@ buzz-sdk = { workspace = true }
 buzz-core = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-project-document = { workspace = true }
+buzz-project-context = { workspace = true }
 
 # Base64 encoding — NIP-98 event serialization for Authorization header
 base64 = "0.22"

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 buzz-db = { workspace = true }
 buzz-core = { workspace = true }
+buzz-project-context = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-project-document = { workspace = true }
 buzz-sdk = { workspace = true }

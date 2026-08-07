@@ -31,7 +31,7 @@ test("shouldBounceForChannelNotification_allowsBroadcastReplies", () => {
   );
 });
 
-test("deriveShellRoute distinguishes View from existing Projects", () => {
+test("deriveShellRoute distinguishes Project Space views from existing Projects", () => {
   assert.deepEqual(deriveShellRoute("/community"), {
     selectedChannelId: null,
     selectedView: "community",
@@ -39,6 +39,10 @@ test("deriveShellRoute distinguishes View from existing Projects", () => {
   assert.deepEqual(deriveShellRoute("/view"), {
     selectedChannelId: null,
     selectedView: "view",
+  });
+  assert.deepEqual(deriveShellRoute("/project-context"), {
+    selectedChannelId: null,
+    selectedView: "project-context",
   });
   assert.deepEqual(deriveShellRoute("/projects"), {
     selectedChannelId: null,

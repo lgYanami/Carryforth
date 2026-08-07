@@ -128,6 +128,7 @@ export function AppShell() {
     goDocuments,
     goHome,
     goNewMessage,
+    goProjectContext,
     goProjects,
     goPulse,
     goSettings,
@@ -847,6 +848,7 @@ export function AppShell() {
                           }}
                           onSelectAgents={() => void goAgents()}
                           onSelectCommunity={() => void openCommunityOverview()}
+                          onSelectProjectContext={() => void goProjectContext()}
                           onSelectDocuments={() => void goDocuments()}
                           onSelectChannel={(channelId) =>
                             void goChannel(channelId)

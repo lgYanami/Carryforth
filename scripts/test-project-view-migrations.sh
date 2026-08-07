@@ -75,6 +75,10 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 48 AND success" \
   | grep -qx ok
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 -qtA \
+  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 50 AND success" \
+  | grep -qx ok
+docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
   -c "SELECT id, host FROM communities LIMIT 0" >/dev/null
 
@@ -97,8 +101,8 @@ project_protocol_drift="$(
   jq '[
     .groups[].steps[]?
     | select(
-        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document"; "i"))
-        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document"; "i"))
+        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document|project_context_edge"; "i"))
+        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document|project_context_edge"; "i"))
       )
   ]' "${plan_file}"
 )"
@@ -108,4 +112,4 @@ if [[ "$(jq 'length' <<<"${project_protocol_drift}")" != "0" ]]; then
   exit 1
 fi
 
-echo "Project View / Project Document migration and schema-drift gates passed."
+echo "Project View / Project Document / Project Context migration and schema-drift gates passed."

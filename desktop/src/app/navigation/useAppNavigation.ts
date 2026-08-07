@@ -8,6 +8,11 @@ import {
 
 import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { resolveSearchHitDestination } from "@/app/navigation/resolveSearchHitDestination";
+import {
+  projectContextRouteSearchForState,
+  type ProjectContextRouteSelection,
+} from "@/features/project-context/routeState";
+import type { ProjectContextQuery } from "@/shared/api/tauriProjectContext";
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
@@ -114,10 +119,33 @@ export function useAppNavigation() {
   );
 
   const goDocuments = React.useCallback(
-    (behavior?: NavigationBehavior) =>
+    (behavior?: NavigationBehavior & { documentId?: string }) =>
       commitNavigation(
         {
           to: "/documents",
+          search: behavior?.documentId ? { document: behavior.documentId } : {},
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goProjectContext = React.useCallback(
+    (
+      behavior?: NavigationBehavior & {
+        query?: ProjectContextQuery;
+        selection?: ProjectContextRouteSelection | null;
+      },
+    ) =>
+      commitNavigation(
+        {
+          to: "/project-context",
+          search: behavior?.query
+            ? projectContextRouteSearchForState(
+                behavior.query,
+                behavior.selection,
+              )
+            : {},
         },
         behavior,
       ),
@@ -337,6 +365,7 @@ export function useAppNavigation() {
     goHome,
     goNewMessage,
     goProject,
+    goProjectContext,
     goProjects,
     goPulse,
     goSettings,

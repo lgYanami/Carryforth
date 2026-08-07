@@ -13,23 +13,25 @@ use buzz_project_view_pkg::v3::{ProjectViewObjectV3, RoleDefinitionV3};
 use buzz_project_view_pkg::ProjectViewObjectType;
 use buzz_sdk_pkg::project_view_v3::{
     parse_entity_projection, parse_membership_projection, parse_meta_projection,
-    parse_project_object_projection, V3MembershipProjection, V3MetaProjection, V3ProjectedObject,
+    parse_project_object_projection, V3MembershipProjection, V3MetaProjection,
     PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE, PROJECT_VIEW_V3_ENTITY_TAG, PROJECT_VIEW_V3_META_TAG,
     PROJECT_VIEW_V3_OBJECT_TAG,
 };
 use buzz_sdk_pkg::role_brief_v3::{RoleBriefV3, VerifiedRoleBriefSnapshotV3};
 use chrono::Utc;
-use nostr::Event;
+use nostr::{Event, Keys};
 use serde::Serialize;
 use serde_json::json;
 
 use crate::app_state::AppState;
 
 use super::{
-    conflict_error, integrity_read_error, query_project_view, ProjectViewIdentity,
-    ProjectViewMembershipMember, ProjectViewReadError, ProjectViewReadResult,
+    conflict_error, integrity_read_error, query_project_view, query_project_view_at_with_keys,
+    ProjectViewIdentity, ProjectViewMembershipMember, ProjectViewReadError, ProjectViewReadResult,
     ProjectViewWorkResponsibility, SNAPSHOT_MAX_ATTEMPTS, SNAPSHOT_PAGE_SIZE,
 };
+
+type CapturedQuery<'a> = Option<(&'a str, &'a Keys)>;
 
 pub(super) struct V3ProjectSnapshot {
     pub(super) meta: V3MetaProjection,
@@ -56,8 +58,29 @@ pub(super) async fn fetch_consistent_v3_snapshot(
     state: &AppState,
     identity: ProjectViewIdentity,
 ) -> ProjectViewReadResult<Option<V3ProjectSnapshot>> {
+    fetch_consistent_verified_v3_snapshot(state, identity, None)
+        .await?
+        .map(desktop_v3_snapshot)
+        .transpose()
+}
+
+/// Read one complete verified v3 snapshot without retargeting captured Community state.
+pub(crate) async fn fetch_consistent_verified_v3_snapshot_at(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+    api_base_url: &str,
+    keys: &Keys,
+) -> ProjectViewReadResult<Option<VerifiedRoleBriefSnapshotV3>> {
+    fetch_consistent_verified_v3_snapshot(state, identity, Some((api_base_url, keys))).await
+}
+
+async fn fetch_consistent_verified_v3_snapshot(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+    captured: CapturedQuery<'_>,
+) -> ProjectViewReadResult<Option<VerifiedRoleBriefSnapshotV3>> {
     for attempt in 0..SNAPSHOT_MAX_ATTEMPTS {
-        match fetch_v3_snapshot_once(state, identity).await {
+        match fetch_verified_v3_snapshot_once(state, identity, captured).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(ProjectViewReadError::Conflict(_)) if attempt + 1 < SNAPSHOT_MAX_ATTEMPTS => {
                 let backoff_ms = 25_u64 << attempt;
@@ -71,15 +94,17 @@ pub(super) async fn fetch_consistent_v3_snapshot(
     ))
 }
 
-async fn fetch_v3_snapshot_once(
+async fn fetch_verified_v3_snapshot_once(
     state: &AppState,
     identity: ProjectViewIdentity,
-) -> ProjectViewReadResult<Option<V3ProjectSnapshot>> {
-    let Some(meta) = read_v3_meta(state, identity).await? else {
+    captured: CapturedQuery<'_>,
+) -> ProjectViewReadResult<Option<VerifiedRoleBriefSnapshotV3>> {
+    let Some(meta) = read_v3_meta_with_query(state, identity, captured).await? else {
         return Ok(None);
     };
-    let ordinary_events = query_project_view(
+    let ordinary_events = query_v3(
         state,
+        captured,
         &[json!({
             "kinds": [KIND_PROJECT_VIEW_OBJECT],
             "authors": [identity.relay_pubkey.to_hex()],
@@ -87,7 +112,7 @@ async fn fetch_v3_snapshot_once(
         })],
     )
     .await?;
-    let entity_events = query_v3_current_entities(state, identity, &meta).await?;
+    let entity_events = query_v3_current_entities(state, identity, &meta, captured).await?;
 
     let object_projections = ordinary_events
         .iter()
@@ -96,22 +121,6 @@ async fn fetch_v3_snapshot_once(
                 .map_err(|error| integrity_read_error(error.to_string()))
         })
         .collect::<ProjectViewReadResult<Vec<_>>>()?;
-    let mut work_responsibilities = object_projections
-        .iter()
-        .filter_map(|projection| match &projection.object {
-            V3ProjectedObject::Active(object)
-                if object.object_type == ProjectViewObjectType::Work =>
-            {
-                projection
-                    .responsible_role_id
-                    .map(|role_id| ProjectViewWorkResponsibility {
-                        work_id: object.id,
-                        role_id,
-                    })
-            }
-            V3ProjectedObject::Active(_) | V3ProjectedObject::Tombstone(_) => None,
-        })
-        .collect::<Vec<_>>();
     let entity_projections = entity_events
         .iter()
         .map(|event| {
@@ -119,9 +128,9 @@ async fn fetch_v3_snapshot_once(
                 .map_err(|error| integrity_read_error(error.to_string()))
         })
         .collect::<ProjectViewReadResult<Vec<_>>>()?;
-    let membership = read_v3_membership(state, identity, &meta).await?;
+    let membership = read_v3_membership(state, identity, &meta, captured).await?;
 
-    let final_meta = read_v3_meta(state, identity)
+    let final_meta = read_v3_meta_with_query(state, identity, captured)
         .await?
         .ok_or_else(|| conflict_error("Project View v3 metadata disappeared"))?;
     if final_meta.event_id != meta.event_id {
@@ -129,13 +138,34 @@ async fn fetch_v3_snapshot_once(
             "Project View v3 changed while assembling the snapshot",
         ));
     }
-    let verified = VerifiedRoleBriefSnapshotV3::new_with_partial_history(
+    VerifiedRoleBriefSnapshotV3::new_with_partial_history(
         meta.clone(),
         membership,
         object_projections,
         entity_projections,
     )
-    .map_err(|error| integrity_read_error(error.to_string()))?;
+    .map(Some)
+    .map_err(|error| integrity_read_error(error.to_string()))
+}
+
+fn desktop_v3_snapshot(
+    verified: VerifiedRoleBriefSnapshotV3,
+) -> ProjectViewReadResult<V3ProjectSnapshot> {
+    let meta = verified.meta().clone();
+    let mut work_responsibilities = verified
+        .state()
+        .active_objects()
+        .filter(|object| object.object_type == ProjectViewObjectType::Work)
+        .filter_map(|object| {
+            verified
+                .active_object(object.id)
+                .and_then(|value| value.responsible_role_id)
+                .map(|role_id| ProjectViewWorkResponsibility {
+                    work_id: object.id,
+                    role_id,
+                })
+        })
+        .collect::<Vec<_>>();
 
     let brief_members = verified
         .assignments()
@@ -183,7 +213,7 @@ async fn fetch_v3_snapshot_once(
             role: member.role,
         })
         .collect();
-    Ok(Some(V3ProjectSnapshot {
+    Ok(V3ProjectSnapshot {
         meta,
         objects,
         role_continuity: ProjectViewRoleContinuityV3 {
@@ -197,13 +227,14 @@ async fn fetch_v3_snapshot_once(
             members,
             briefs,
         },
-    }))
+    })
 }
 
 async fn query_v3_current_entities(
     state: &AppState,
     identity: ProjectViewIdentity,
     meta: &V3MetaProjection,
+    captured: CapturedQuery<'_>,
 ) -> ProjectViewReadResult<Vec<Event>> {
     let mut events = Vec::new();
     let mut event_ids = HashSet::new();
@@ -217,8 +248,9 @@ async fn query_v3_current_entities(
         if let Some(cursor) = &after {
             extension["after"] = cursor.clone();
         }
-        let page = query_project_view(
+        let page = query_v3(
             state,
+            captured,
             &[json!({
                 "kinds": [KIND_PROJECT_VIEW_OBJECT],
                 "authors": [identity.relay_pubkey.to_hex()],
@@ -260,9 +292,11 @@ async fn read_v3_membership(
     state: &AppState,
     identity: ProjectViewIdentity,
     meta: &V3MetaProjection,
+    captured: CapturedQuery<'_>,
 ) -> ProjectViewReadResult<V3MembershipProjection> {
-    let events = query_project_view(
+    let events = query_v3(
         state,
+        captured,
         &[json!({
             "ids": [meta.membership_snapshot_event_id.to_hex()],
             "kinds": [KIND_NIP43_MEMBERSHIP_LIST],
@@ -289,8 +323,17 @@ pub(super) async fn read_v3_meta(
     state: &AppState,
     identity: ProjectViewIdentity,
 ) -> ProjectViewReadResult<Option<V3MetaProjection>> {
-    let events = query_project_view(
+    read_v3_meta_with_query(state, identity, None).await
+}
+
+async fn read_v3_meta_with_query(
+    state: &AppState,
+    identity: ProjectViewIdentity,
+    captured: CapturedQuery<'_>,
+) -> ProjectViewReadResult<Option<V3MetaProjection>> {
+    let events = query_v3(
         state,
+        captured,
         &[json!({
             "kinds": [KIND_PROJECT_VIEW_META],
             "authors": [identity.relay_pubkey.to_hex()],
@@ -307,5 +350,18 @@ pub(super) async fn read_v3_meta(
         _ => Err(integrity_read_error(
             "v3 metadata query returned multiple current heads",
         )),
+    }
+}
+
+async fn query_v3(
+    state: &AppState,
+    captured: CapturedQuery<'_>,
+    filters: &[serde_json::Value],
+) -> ProjectViewReadResult<Vec<Event>> {
+    match captured {
+        Some((api_base_url, keys)) => {
+            query_project_view_at_with_keys(state, api_base_url, keys, filters).await
+        }
+        None => query_project_view(state, filters).await,
     }
 }

@@ -1,6 +1,7 @@
 import {
   ArrowRight,
   Link2,
+  Network,
   Pencil,
   ShieldCheck,
   Trash2,
@@ -54,6 +55,7 @@ type ProjectViewInspectorProps = {
   onEdit: (object: ProjectViewObject) => void;
   onRefresh: () => Promise<unknown>;
   onSelectObject: (objectId: string) => void;
+  onShowInProjectContext?: (object: ProjectViewObject) => void;
   projectionGeneration: number;
   projectRevision: number;
   roleContinuity?: ProjectViewRoleContinuity;
@@ -211,6 +213,7 @@ function ProjectViewInspectorContent({
   onEdit,
   onRefresh,
   onSelectObject,
+  onShowInProjectContext,
   projectionGeneration,
   projectRevision,
   roleContinuity,
@@ -304,6 +307,18 @@ function ProjectViewInspectorContent({
       </div>
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
+        {onShowInProjectContext ? (
+          <Button
+            className="w-full"
+            data-testid="project-view-show-in-project-context"
+            onClick={() => onShowInProjectContext(object)}
+            type="button"
+            variant="outline"
+          >
+            <Network />
+            Show in Project Context
+          </Button>
+        ) : null}
         {canGovernRoleDefinition ? (
           <section className="grid grid-cols-2 gap-2">
             <Button

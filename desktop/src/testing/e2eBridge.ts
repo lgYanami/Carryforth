@@ -37,6 +37,7 @@ import {
   KIND_MEMBER_REMOVED_NOTIFICATION,
   KIND_MEETING_END,
   KIND_MEETING_STATE,
+  KIND_PROJECT_CONTEXT_META,
   KIND_PROJECT_DOCUMENT_META,
   KIND_PROJECT_VIEW_META,
   KIND_REPO_ANNOUNCEMENT,
@@ -68,6 +69,10 @@ import type {
   ProjectDocumentMeta,
   ProjectDocumentMutationResult,
 } from "@/shared/api/tauriProjectDocument";
+import type {
+  ProjectContextErrorPayload,
+  ProjectContextQueryResult,
+} from "@/shared/api/tauriProjectContext";
 import type {
   CreateMeetingInput,
   CreateMeetingResult,
@@ -175,6 +180,15 @@ export type MockProjectDocumentState = {
   documents: ProjectDocumentListItem[];
   /** Oldest-to-newest verified full snapshots, keyed by Document UUID. */
   revisions: Record<string, ProjectDocument[]>;
+};
+
+export type MockProjectContextReadStep = {
+  /** Per-read latency, overriding the persistent Relay or global delay. */
+  delayMs?: number;
+  /** A structured native failure for this read; null explicitly succeeds. */
+  error?: ProjectContextErrorPayload | null;
+  /** A trusted result for this read, overriding query and Relay fixtures. */
+  result?: ProjectContextQueryResult;
 };
 
 type MockMeetingSeed = {
@@ -383,6 +397,17 @@ type E2eConfig = {
     projectViewRoleMutationResults?: RawProjectViewRoleMutationResult[];
     projectViewAfterRoleMutation?: RawProjectViewLoadResult;
     projectViewRoleHistoryPages?: RawProjectRoleHistoryPage[];
+    /** Trusted, body-free Project Context query result. */
+    projectContext?: ProjectContextQueryResult;
+    /** Community-isolated Context results keyed by applied Relay URL. */
+    projectContextsByRelayUrl?: Record<string, ProjectContextQueryResult>;
+    /** Query-specific Context results keyed by canonical query JSON. */
+    projectContextsByQuery?: Record<string, ProjectContextQueryResult>;
+    projectContextReadDelayMs?: number;
+    projectContextReadDelayMsByRelayUrl?: Record<string, number>;
+    projectContextReadError?: ProjectContextErrorPayload;
+    /** Success/failure sequence for successive trusted Context reads. */
+    projectContextReadSequence?: MockProjectContextReadStep[];
     /** Verified Project Document catalog and immutable revision fixtures. */
     projectDocument?: MockProjectDocumentState;
     /** Community-isolated Document fixtures keyed by applied Relay URL. */
@@ -1289,6 +1314,29 @@ declare global {
     __BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__?: unknown[];
     /** Revision-pinned Role history page requests made during the current test. */
     __BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__?: unknown[];
+    /** Trusted Project Context native query calls made during the test. */
+    __BUZZ_E2E_PROJECT_CONTEXT_CALLS__?: Array<{
+      payload: unknown;
+      relayUrl: string;
+    }>;
+    /** Replace the trusted Project Context result for one Relay. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT__?: (
+      result: ProjectContextQueryResult,
+      relayUrl?: string,
+    ) => void;
+    /** Set or clear the structured Project Context native read error. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT_ERROR__?: (
+      error?: ProjectContextErrorPayload,
+    ) => void;
+    /** Replace and rewind the trusted Project Context read sequence. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT_READ_SEQUENCE__?: (
+      sequence: MockProjectContextReadStep[],
+    ) => void;
+    /** Emit an untrusted Context projection hint through the mock live socket. */
+    __BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__?: (input?: {
+      kind?: number;
+    }) => RelayEvent;
+    __BUZZ_E2E_HAS_PROJECT_CONTEXT_SUBSCRIPTION__?: () => boolean;
     /** Replace the next trusted Project View command result. */
     __BUZZ_E2E_SET_PROJECT_VIEW__?: (
       result: RawProjectViewLoadResult,
@@ -10447,6 +10495,7 @@ function disconnectMockSocket(id: number) {
   sendWsClose(socket.handler);
 }
 
+let mockProjectContextReadSequenceIndex = 0;
 let mockProjectDocumentSequence = 1;
 
 function projectDocumentState(
@@ -10799,7 +10848,9 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_PROJECT_VIEW_MUTATIONS__ = [];
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__ = [];
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__ = [];
+  window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ = [];
   window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ = [];
+  mockProjectContextReadSequenceIndex = 0;
   mockProjectDocumentSequence = 1;
   window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
     if (!config.mock) {
@@ -10840,6 +10891,51 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_HAS_PROJECT_VIEW_SUBSCRIPTION__ = () =>
     hasMockLiveSubscription(GLOBAL_MOCK_SUBSCRIPTION, KIND_PROJECT_VIEW_META);
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT__ = (result, relayUrl) => {
+    if (!config.mock) {
+      throw new Error("Mock Project Context is unavailable in relay mode.");
+    }
+    const targetRelayUrl = relayUrl ?? mockAppliedRelayUrl;
+    if (config.mock.projectContextsByRelayUrl && targetRelayUrl) {
+      config.mock.projectContextsByRelayUrl[targetRelayUrl] =
+        structuredClone(result);
+    } else {
+      config.mock.projectContext = structuredClone(result);
+    }
+  };
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT_ERROR__ = (error) => {
+    if (!config.mock) {
+      throw new Error("Mock Project Context is unavailable in relay mode.");
+    }
+    config.mock.projectContextReadError = error
+      ? structuredClone(error)
+      : undefined;
+  };
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT_READ_SEQUENCE__ = (sequence) => {
+    if (!config.mock) {
+      throw new Error("Mock Project Context is unavailable in relay mode.");
+    }
+    config.mock.projectContextReadSequence = structuredClone(sequence);
+    mockProjectContextReadSequenceIndex = 0;
+  };
+  window.__BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__ = (input) => {
+    const result =
+      config.mock?.projectContextsByRelayUrl?.[mockAppliedRelayUrl] ??
+      config.mock?.projectContext;
+    const event = createMockEvent(
+      input?.kind ?? KIND_PROJECT_CONTEXT_META,
+      "untrusted-live-context-must-not-render",
+      [],
+      result?.relayPubkey ?? "b".repeat(64),
+    );
+    emitMockGlobalEvent(event);
+    return event;
+  };
+  window.__BUZZ_E2E_HAS_PROJECT_CONTEXT_SUBSCRIPTION__ = () =>
+    hasMockLiveSubscription(
+      GLOBAL_MOCK_SUBSCRIPTION,
+      KIND_PROJECT_CONTEXT_META,
+    );
   window.__BUZZ_E2E_SET_PROJECT_DOCUMENT_STATE__ = (state, relayUrl) => {
     if (!config.mock) {
       throw new Error("Mock Project Documents are unavailable in relay mode.");
@@ -12823,6 +12919,67 @@ export function maybeInstallE2eTauriMocks() {
           );
         }
         return activeConfig?.mock?.relaySelf ?? null;
+      case "query_project_context": {
+        // Mirror the native command's community fence: an in-flight read stays
+        // bound to the Relay active when it started, even if the test switches
+        // Communities before the delayed response completes.
+        const requestRelayUrl = mockAppliedRelayUrl;
+        window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.push({
+          payload: structuredClone(payload),
+          relayUrl: requestRelayUrl,
+        });
+        const readSequence = activeConfig?.mock?.projectContextReadSequence;
+        const readStep = readSequence?.length
+          ? readSequence[
+              Math.min(
+                mockProjectContextReadSequenceIndex,
+                readSequence.length - 1,
+              )
+            ]
+          : undefined;
+        if (readStep) {
+          mockProjectContextReadSequenceIndex += 1;
+        }
+        const delayMs =
+          readStep?.delayMs ??
+          activeConfig?.mock?.projectContextReadDelayMsByRelayUrl?.[
+            requestRelayUrl
+          ] ??
+          activeConfig?.mock?.projectContextReadDelayMs ??
+          0;
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        if (readStep?.error) {
+          throw structuredClone(readStep.error);
+        }
+        if (!readStep && activeConfig?.mock?.projectContextReadError) {
+          throw structuredClone(activeConfig.mock.projectContextReadError);
+        }
+        const input = ((payload as { input?: unknown }).input ?? payload) as {
+          communityKey: string;
+          query: ProjectContextQueryResult["query"];
+        };
+        const result =
+          readStep?.result ??
+          activeConfig?.mock?.projectContextsByQuery?.[
+            JSON.stringify(input.query)
+          ] ??
+          activeConfig?.mock?.projectContextsByRelayUrl?.[requestRelayUrl] ??
+          activeConfig?.mock?.projectContext;
+        if (!result) {
+          throw {
+            code: "unsupported",
+            message: "This Community does not support Project Context.",
+            retryable: false,
+          } satisfies ProjectContextErrorPayload;
+        }
+        return {
+          ...structuredClone(result),
+          communityKey: input.communityKey,
+          query: structuredClone(input.query),
+        };
+      }
       case "get_project_document_meta": {
         recordProjectDocumentCall(command, payload);
         if ((activeConfig?.mock?.projectDocumentReadDelayMs ?? 0) > 0) {

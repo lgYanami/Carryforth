@@ -769,6 +769,10 @@ async fn submit_write(
 
     match client.submit_project_command(&event).await? {
         ProjectCommandDelivery::Accepted { raw, receipt } => {
+            let receipt: ProjectDocumentReceipt =
+                serde_json::from_value(receipt).map_err(|_| {
+                    integrity_error("Relay returned a receipt for another Project protocol")
+                })?;
             validate_receipt(
                 &receipt,
                 &event,

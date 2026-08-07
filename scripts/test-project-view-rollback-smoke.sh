@@ -81,6 +81,8 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
         AND
         (SELECT count(*) FROM _sqlx_migrations WHERE version = 48 AND success) = 1
         AND
+        (SELECT count(*) FROM _sqlx_migrations WHERE version = 50 AND success) = 1
+        AND
         (SELECT bool_and(NOT project_view_enabled) FROM communities)
         AND
         NOT EXISTS (SELECT 1 FROM project_view_state)

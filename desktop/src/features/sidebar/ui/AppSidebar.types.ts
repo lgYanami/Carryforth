@@ -70,6 +70,7 @@ export type AppSidebarProps = {
   onCreateAgent: () => void;
   onSelectAgents: () => void;
   onSelectCommunity: () => void;
+  onSelectProjectContext: () => void;
   onSelectDocuments: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;

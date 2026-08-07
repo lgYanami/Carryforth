@@ -113,6 +113,7 @@ export function AppSidebar({
   onCreateAgent,
   onSelectAgents,
   onSelectCommunity,
+  onSelectProjectContext,
   onSelectDocuments,
   onSelectProjects,
   onSelectPulse,
@@ -478,6 +479,7 @@ export function AppSidebar({
           onOpenDm={onOpenDm}
           onOpenSearchResult={onOpenSearchResult}
           onSelectCommunity={onSelectCommunity}
+          onSelectProjectContext={onSelectProjectContext}
           onSelectDocuments={onSelectDocuments}
           onSelectChannel={onSelectChannel}
           searchChannels={searchChannels}

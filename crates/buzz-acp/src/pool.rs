@@ -5654,6 +5654,11 @@ mod tests {
         assert!(framed.contains("versioned Project Documents"));
         assert!(framed.contains("Guide Document"));
         assert!(framed.contains("Context References"));
+        assert!(framed.contains("Project Context Edges"));
+        assert!(framed.contains("`buzz project-context exact`"));
+        assert!(framed.contains("`buzz project-context incident`"));
+        assert!(framed.contains("`buzz project-context contains-all`"));
+        assert!(framed.contains("does not automatically produce a Gap"));
         assert!(framed.contains("materially changes"));
     }
 
@@ -6391,13 +6396,18 @@ mod tests {
     }
 
     #[test]
-    fn changed_project_space_contract_invalidates_session_before_role_refresh() {
+    fn previous_project_space_contract_invalidates_session_before_role_refresh() {
         let (mut state, channel_id, other_channel_id) = make_state();
-        let changed_id = [0x5a; 32];
+        let previous_id = [0x03; 32];
+        let current_id = crate::project_space::contract_id();
+        state
+            .project_space_contract_ids
+            .insert(channel_id, previous_id);
+        state.heartbeat_project_space_contract_id = Some(previous_id);
 
         assert!(state.invalidate_stale_project_space_contract(
             &PromptSource::Channel(channel_id),
-            changed_id
+            current_id
         ));
         assert!(!state.has_channel_state(&channel_id));
         assert!(state.has_channel_state(&other_channel_id));
@@ -6406,7 +6416,7 @@ mod tests {
             crate::role_brief::RoleContextRefresh::Full
         );
 
-        assert!(state.invalidate_stale_project_space_contract(&PromptSource::Heartbeat, changed_id));
+        assert!(state.invalidate_stale_project_space_contract(&PromptSource::Heartbeat, current_id));
         assert!(state.heartbeat_session.is_none());
         assert!(state.heartbeat_project_space_contract_id.is_none());
         assert_eq!(

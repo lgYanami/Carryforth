@@ -1409,6 +1409,7 @@ fn exclude_private_protocols_if_unauthorized(
     filter: &nostr::Filter,
     project_view_read_allowed: bool,
     project_document_read_allowed: bool,
+    project_context_read_allowed: bool,
 ) {
     if !project_view_read_allowed && crate::handlers::project_view::filter_can_match(filter) {
         query.excluded_kinds = Some(vec![
@@ -1432,6 +1433,11 @@ fn exclude_private_protocols_if_unauthorized(
         query,
         filter,
         project_document_read_allowed,
+    );
+    crate::handlers::community_private::exclude_project_context_kinds(
+        query,
+        filter,
+        project_context_read_allowed,
     );
 }
 
@@ -1941,6 +1947,53 @@ async fn query_events_authed(
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported:project_view:v3_projection_filter_required",
+        ));
+    }
+
+    let project_context_can_match = filters
+        .iter()
+        .any(crate::handlers::community_private::filter_can_match_project_context);
+    let project_context_exclusive =
+        crate::handlers::community_private::filters_are_exclusively_project_context(&filters);
+    let project_context_decision = if project_context_can_match {
+        crate::handlers::community_private::project_context_read_decision(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            &[],
+            None,
+        )
+        .await
+        .map_err(|_| internal_error("Project Context authorization lookup failed"))?
+    } else {
+        crate::handlers::community_private::ProjectContextReadDecision::Restricted
+    };
+    if project_context_exclusive {
+        match project_context_decision {
+            crate::handlers::community_private::ProjectContextReadDecision::Allowed => {}
+            crate::handlers::community_private::ProjectContextReadDecision::Restricted => {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted:project_context:membership_required",
+                ));
+            }
+            crate::handlers::community_private::ProjectContextReadDecision::Unavailable(reason) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("unavailable:project_context:{reason}"),
+                ));
+            }
+        }
+    }
+    let project_context_read_allowed = project_context_decision.allowed();
+    if project_context_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::community_private::filter_is_project_context_search)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_context:search",
         ));
     }
 
@@ -2551,6 +2604,7 @@ async fn query_events_authed(
             filter,
             project_view_read_allowed,
             project_document_read_allowed,
+            project_context_read_allowed,
         );
 
         match extract_before_id(raw) {
@@ -2635,6 +2689,7 @@ async fn query_events_authed(
                     if !crate::handlers::community_private::event_is_visible(
                         se.event.kind.as_u16() as u32,
                         project_document_read_allowed,
+                        project_context_read_allowed,
                     ) {
                         continue;
                     }
@@ -2761,6 +2816,53 @@ async fn count_events_authed(
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported:project_view:v3_projection_filter_required",
+        ));
+    }
+
+    let project_context_can_match = filters
+        .iter()
+        .any(crate::handlers::community_private::filter_can_match_project_context);
+    let project_context_exclusive =
+        crate::handlers::community_private::filters_are_exclusively_project_context(&filters);
+    let project_context_decision = if project_context_can_match {
+        crate::handlers::community_private::project_context_read_decision(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            &[],
+            None,
+        )
+        .await
+        .map_err(|_| internal_error("Project Context authorization lookup failed"))?
+    } else {
+        crate::handlers::community_private::ProjectContextReadDecision::Restricted
+    };
+    if project_context_exclusive {
+        match project_context_decision {
+            crate::handlers::community_private::ProjectContextReadDecision::Allowed => {}
+            crate::handlers::community_private::ProjectContextReadDecision::Restricted => {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted:project_context:membership_required",
+                ));
+            }
+            crate::handlers::community_private::ProjectContextReadDecision::Unavailable(reason) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("unavailable:project_context:{reason}"),
+                ));
+            }
+        }
+    }
+    let project_context_read_allowed = project_context_decision.allowed();
+    if project_context_read_allowed
+        && filters
+            .iter()
+            .any(crate::handlers::community_private::filter_is_project_context_search)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:project_context:search",
         ));
     }
 
@@ -2897,6 +2999,7 @@ async fn count_events_authed(
     let mut total: u64 = 0;
     for filter in &filters {
         let document_visible_for_filter = project_document_read_allowed && filter.search.is_none();
+        let context_visible_for_filter = project_context_read_allowed && filter.search.is_none();
         let needs_author_only_filtering =
             crate::handlers::req::filter_can_match_author_only_kinds(filter);
         // Same result-gated guard as the WS COUNT handler: force the per-event
@@ -2937,6 +3040,7 @@ async fn count_events_authed(
                 filter,
                 project_view_read_allowed,
                 document_visible_for_filter,
+                context_visible_for_filter,
             );
             // Persona visibility pushdown: same as REQ and /query paths, so the
             // fallback's query_events call doesn't over-fetch private persona rows.
@@ -3002,6 +3106,7 @@ async fn count_events_authed(
                             if !crate::handlers::community_private::event_is_visible(
                                 se.event.kind.as_u16() as u32,
                                 document_visible_for_filter,
+                                context_visible_for_filter,
                             ) {
                                 continue;
                             }
@@ -3028,6 +3133,7 @@ async fn count_events_authed(
                 filter,
                 project_view_read_allowed,
                 document_visible_for_filter,
+                context_visible_for_filter,
             );
             query.channel_ids = Some(accessible_channels.to_vec());
             // Persona visibility pushdown: pre-filter before ORDER/LIMIT on the
@@ -3095,6 +3201,7 @@ async fn count_events_authed(
                             if !crate::handlers::community_private::event_is_visible(
                                 se.event.kind.as_u16() as u32,
                                 document_visible_for_filter,
+                                context_visible_for_filter,
                             ) {
                                 continue;
                             }
@@ -3305,6 +3412,7 @@ async fn handle_bridge_search(
             }
             if !crate::handlers::community_private::event_is_visible(
                 stored.event.kind.as_u16() as u32,
+                false,
                 false,
             ) {
                 continue;

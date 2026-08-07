@@ -38,6 +38,7 @@ use crate::client::BuzzClient;
 use crate::error::CliError;
 
 pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
+pub(crate) const PROJECT_CONTEXT_EDGE_EXTENSION: &str = "buzz-project-context-edge-v1";
 pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_OBJECT_PAGE_SIZE: usize = 500;
@@ -58,6 +59,7 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) relay_pubkey: PublicKey,
     pub(crate) schema: ProjectViewSchema,
     pub(crate) context_enabled: bool,
+    pub(crate) context_edge_enabled: bool,
     pub(crate) document_enabled: bool,
 }
 
@@ -138,6 +140,10 @@ fn identity_from_nip11(
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_CONTEXT_EXTENSION),
+        context_edge_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_CONTEXT_EDGE_EXTENSION),
         document_enabled: info
             .supported_extensions
             .iter()

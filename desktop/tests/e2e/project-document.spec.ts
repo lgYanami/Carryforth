@@ -4,6 +4,7 @@ import type {
   ProjectDocument,
   ProjectDocumentMeta,
 } from "../../src/shared/api/tauriProjectDocument";
+import type { ProjectContextQueryResult } from "../../src/shared/api/tauriProjectContext";
 import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
@@ -88,6 +89,36 @@ function documentState(
   };
 }
 
+function documentContextResult(): ProjectContextQueryResult {
+  return {
+    communityKey: "fixture",
+    projectId: PROJECT_ID,
+    relayPubkey: RELAY,
+    context: {
+      contextRevision: 1,
+      projectionGeneration: 1,
+      activeEdgeCount: 0,
+      boundDocumentCount: 0,
+      updatedAt: "2026-07-30T08:00:00Z",
+      metaEventId: "c".repeat(64),
+      capabilityEnabled: true,
+    },
+    query: { type: "contains_all", coordinates: [] },
+    projectViewObservation: { state: "not_requested" },
+    documentObservation: { state: "observed" },
+    edges: [],
+    coordinateDetails: [
+      {
+        coordinateKey: `document:${DOCUMENT_ID}`,
+        coordinate: { type: "document", documentId: DOCUMENT_ID },
+        state: "active",
+        title: "Release runbook",
+      },
+    ],
+    documentDetails: [],
+  };
+}
+
 async function openDocuments(page: import("@playwright/test").Page) {
   await page.goto("/");
   await page.getByTestId("open-documents").click();
@@ -149,6 +180,44 @@ test("metadata-first list lazily reads safe Markdown and isolates pinned history
       .getByRole("heading", { name: "Release runbook" }),
   ).toBeVisible();
   await expect(page.getByText("Current", { exact: true })).toBeVisible();
+});
+
+test("active Document opens Incident Project Context and browser Back returns", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: documentContextResult(),
+    projectDocument: documentState(),
+  });
+  await page.goto(`/#/documents?document=${DOCUMENT_ID}`);
+  await expect(page.getByTestId("document-viewer")).toBeVisible();
+  await page.getByTestId("document-show-in-project-context").click();
+
+  await expect(page).toHaveURL(/project-context/);
+  await expect(page).toHaveURL(/mode=incident/);
+  await expect(page).toHaveURL(
+    new RegExp(`coordinates=document(%3A|:)${DOCUMENT_ID}`),
+  );
+  await expect(page.getByTestId("project-context-query-summary")).toContainText(
+    "0 matching edges",
+  );
+  const calls = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__,
+  );
+  expect(calls?.at(-1)?.payload).toMatchObject({
+    input: {
+      query: {
+        type: "incident",
+        coordinate: { type: "document", documentId: DOCUMENT_ID },
+      },
+    },
+  });
+
+  await page.goBack();
+  await expect(page).toHaveURL(
+    new RegExp(`/documents\\?document=${DOCUMENT_ID}$`),
+  );
+  await expect(page.getByTestId("document-viewer")).toBeVisible();
 });
 
 test("create, update, and tombstone stay on verified full snapshots", async ({

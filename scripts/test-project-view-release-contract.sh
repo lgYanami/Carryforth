@@ -64,6 +64,7 @@ require_literal "PROJECT_VIEW_PRE_FEATURE_REF: ab3af828714ab699dfc87644d23401498
 require_literal "BUZZ_AUTO_MIGRATE=false" scripts/test-project-view-rollback-smoke.sh
 require_literal "Current additive schema with pre-feature Relay smoke" .github/workflows/ci.yml
 require_literal "version = 48 AND success" scripts/test-project-view-rollback-smoke.sh
+require_literal "version = 50 AND success" scripts/test-project-view-rollback-smoke.sh
 reject_literal "PROJECT_VIEW_COMPATIBLE_REF" .github/workflows/ci.yml
 reject_literal "test-project-view-compatible-rollback-smoke.sh" .github/workflows/ci.yml
 reject_literal "test-project-view-compatible-rollback-smoke.sh" Justfile
@@ -78,6 +79,8 @@ if [[ -e scripts/test-project-view-compatible-rollback-smoke.sh ]]; then
 fi
 require_literal "ALTER COLUMN project_view_schema_version SET DEFAULT 3" migrations/0048_project_view_v3_greenfield_default.sql
 require_literal "CREATE OR REPLACE FUNCTION project_role_continuity_validate_community" migrations/0048_project_view_v3_greenfield_default.sql
+require_literal "ADD COLUMN project_context_edge_enabled BOOLEAN NOT NULL DEFAULT FALSE" migrations/0049_project_context_edge.sql
+require_literal "RETURN sha256(payload)" migrations/0050_project_context_edge_builtin_sha256.sql
 require_literal "CREATE FUNCTION project_view_v3_bootstrap_lifecycle_valid" migrations/0048_project_view_v3_greenfield_default.sql
 require_literal "CREATE OR REPLACE FUNCTION project_view_v3_validate_row" migrations/0048_project_view_v3_greenfield_default.sql
 require_literal "maintenance.state = 'normal'" migrations/0048_project_view_v3_greenfield_default.sql

@@ -15,6 +15,8 @@ use super::{
     PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
 };
 
+const PROJECT_CONTEXT_EDGE_EXTENSION: &str = buzz_project_context_pkg::PROJECT_CONTEXT_CAPABILITY;
+
 #[derive(Debug, Deserialize)]
 struct Nip11Document {
     #[serde(default)]
@@ -54,10 +56,18 @@ pub(crate) async fn read_identity_at(
         relay_pubkey,
         schema: ProjectViewSchema::V3,
         runtime_ready,
-        project_context_supported: info
+        project_context_reference_supported: info
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_CONTEXT_EXTENSION),
+        project_document_supported: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_DOCUMENT_CAPABILITY),
+        project_context_edge_supported: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == PROJECT_CONTEXT_EDGE_EXTENSION),
     }))
 }
 

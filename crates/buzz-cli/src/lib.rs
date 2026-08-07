@@ -352,6 +352,9 @@ enum Cmd {
     /// Read and maintain independent versioned Project Documents
     #[command(subcommand)]
     Documents(DocumentsCmd),
+    /// Discover and maintain Project Context hyperedges
+    #[command(subcommand, name = "project-context")]
+    ProjectContext(ProjectContextCmd),
     /// Resolve Project View Resources and their mandatory Guides
     #[command(subcommand)]
     Resources(ResourcesCmd),
@@ -672,6 +675,74 @@ pub enum DocumentsCmd {
         #[arg(long)]
         expected_revision: u64,
     },
+}
+
+/// Commands for Project Context Edge discovery and maintenance.
+#[derive(Subcommand)]
+pub enum ProjectContextCmd {
+    /// Find the unique Edge with exactly this unordered coordinate set
+    Exact {
+        /// Typed coordinate token; repeat for every endpoint.
+        #[arg(long = "coordinate", required = true)]
+        coordinates: Vec<String>,
+    },
+    /// Find every Edge incident to one coordinate
+    Incident {
+        /// Typed coordinate token.
+        coordinate: String,
+    },
+    /// Find every Edge containing all supplied coordinates; none means all Edges
+    #[command(name = "contains-all")]
+    ContainsAll {
+        /// Typed coordinate token; repeat to form the required subset.
+        #[arg(long = "coordinate")]
+        coordinates: Vec<String>,
+    },
+    /// Attach one existing Project Document to an exact coordinate set
+    Attach {
+        /// Existing active Project Document carrying the explanatory context.
+        #[arg(long = "context-document")]
+        context_document_id: Uuid,
+        /// Typed coordinate token; repeat for every endpoint.
+        #[arg(long = "coordinate", required = true)]
+        coordinates: Vec<String>,
+        #[command(flatten)]
+        attribution: ProjectContextAttributionArgs,
+    },
+    /// Detach one Project Document from its exact coordinate set
+    Detach {
+        /// Currently bound Project Document.
+        #[arg(long = "context-document")]
+        context_document_id: Uuid,
+        /// Typed coordinate token; repeat for every endpoint.
+        #[arg(long = "coordinate", required = true)]
+        coordinates: Vec<String>,
+        #[command(flatten)]
+        attribution: ProjectContextAttributionArgs,
+    },
+}
+
+/// Optional explicit managed-Agent attribution for a Context write.
+#[derive(clap::Args)]
+pub struct ProjectContextAttributionArgs {
+    /// Active Assignment to which the write is explicitly attributed.
+    #[arg(
+        long = "acting-assignment",
+        requires_all = ["runtime_id", "runtime_epoch"]
+    )]
+    acting_assignment_id: Option<Uuid>,
+    /// Stable supervised Runtime UUID paired with the Assignment.
+    #[arg(
+        long = "runtime-id",
+        requires_all = ["acting_assignment_id", "runtime_epoch"]
+    )]
+    runtime_id: Option<Uuid>,
+    /// Current supervised Runtime epoch paired with the Assignment.
+    #[arg(
+        long = "runtime-epoch",
+        requires_all = ["acting_assignment_id", "runtime_id"]
+    )]
+    runtime_epoch: Option<u64>,
 }
 
 /// Commands for locator-free schema-v3 Resources.
@@ -3272,6 +3343,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::ProjectView(sub) => commands::project_view::dispatch(sub, &client, &cli.format).await,
         Cmd::Documents(sub) => commands::documents::dispatch(sub, &client, &cli.format).await,
+        Cmd::ProjectContext(sub) => {
+            commands::project_context::dispatch(sub, &client, &cli.format).await
+        }
         Cmd::Resources(sub) => commands::resources::dispatch(sub, &client, &cli.format).await,
         Cmd::Roles(sub) => commands::roles::dispatch(sub, &client, &cli.format).await,
         Cmd::Runtime(sub) => commands::runtime::dispatch(sub, &client).await,
@@ -3289,6 +3363,90 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn project_context_query_and_write_surface_is_parseable() {
+        let requirement_a = "10000000-0000-4000-8000-000000000001";
+        let requirement_b = "10000000-0000-4000-8000-000000000002";
+        let document = "20000000-0000-4000-8000-000000000001";
+        let assignment = "30000000-0000-4000-8000-000000000001";
+        let runtime = "40000000-0000-4000-8000-000000000001";
+
+        for args in [
+            vec![
+                "buzz",
+                "project-context",
+                "exact",
+                "--coordinate",
+                requirement_a,
+                "--coordinate",
+                requirement_b,
+            ],
+            vec!["buzz", "project-context", "incident", requirement_a],
+            vec!["buzz", "project-context", "contains-all"],
+            vec![
+                "buzz",
+                "project-context",
+                "contains-all",
+                "--coordinate",
+                requirement_a,
+            ],
+            vec![
+                "buzz",
+                "project-context",
+                "attach",
+                "--context-document",
+                document,
+                "--coordinate",
+                requirement_a,
+                "--coordinate",
+                requirement_b,
+                "--acting-assignment",
+                assignment,
+                "--runtime-id",
+                runtime,
+                "--runtime-epoch",
+                "7",
+            ],
+            vec![
+                "buzz",
+                "project-context",
+                "detach",
+                "--context-document",
+                document,
+                "--coordinate",
+                requirement_a,
+                "--coordinate",
+                requirement_b,
+            ],
+        ] {
+            Cli::try_parse_from(args).expect("parse Project Context command");
+        }
+    }
+
+    #[test]
+    fn project_context_explicit_attribution_must_be_complete() {
+        let result = Cli::try_parse_from([
+            "buzz",
+            "project-context",
+            "attach",
+            "--context-document",
+            "20000000-0000-4000-8000-000000000001",
+            "--coordinate",
+            "requirement:10000000-0000-4000-8000-000000000001",
+            "--coordinate",
+            "requirement:10000000-0000-4000-8000-000000000002",
+            "--acting-assignment",
+            "30000000-0000-4000-8000-000000000001",
+        ]);
+        let Err(error) = result else {
+            panic!("partial attribution must be rejected by clap");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
@@ -3711,6 +3869,7 @@ mod tests {
             "pack",
             "patches",
             "pr",
+            "project-context",
             "project-view",
             "reactions",
             "repos",
@@ -3799,6 +3958,10 @@ mod tests {
             ]
         );
         assert_eq!(names(&cmd, "resources"), vec!["guide"]);
+        assert_eq!(
+            names(&cmd, "project-context"),
+            vec!["attach", "contains-all", "detach", "exact", "incident"]
+        );
         let project_view = cmd
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "project-view")

@@ -102,7 +102,7 @@ pub struct ProjectDocumentWriteContext {
     pub current: Option<CurrentDocument>,
     /// Monotonic canonical time to pass to the pure reducer.
     pub canonical_time: DateTime<Utc>,
-    /// Whether a locked incoming Live/Guide reference blocks deletion.
+    /// Whether any locked active cross-domain reference blocks deletion.
     pub deletion_blocked: bool,
 }
 
@@ -2195,7 +2195,8 @@ impl ProjectDocumentWriteTx {
         .await?;
 
         // The shared Community lock serializes Document deletion with Project
-        // View Resource/Context mutation. Guides and Live references protect
+        // View Resource/Context mutation and Project Context attach/detach.
+        // Guides, Live references, and active Context Edge bindings protect
         // the current Document; Pinned references deliberately preserve only
         // an immutable historical revision and do not block ordinary delete.
         let deletion_blocked: bool = sqlx::query_scalar(
@@ -2211,6 +2212,11 @@ impl ProjectDocumentWriteTx {
                     WHERE reference.community_id = $1 \
                       AND reference.target_document_id = $2 \
                       AND reference.reference_mode = 'live' \
+                ) OR EXISTS ( \
+                    SELECT 1 FROM project_context_document_bindings binding \
+                    WHERE binding.community_id = $1 \
+                      AND binding.context_document_id = $2 \
+                      AND binding.state = 'active' \
                 )",
         )
         .bind(self.community_id.as_uuid())
@@ -2581,7 +2587,7 @@ async fn require_document_read_state_in_tx(
     Ok(())
 }
 
-async fn validate_actor_in_tx(
+pub(crate) async fn validate_actor_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     actor: PublicKey,
@@ -3363,6 +3369,32 @@ async fn project_document_event_by_id(
     row.map(crate::event::row_to_stored_event)
         .transpose()
         .map(Option::flatten)
+}
+
+#[cfg(test)]
+pub(crate) async fn begin_project_document_storage_test_write(
+    db: &Db,
+    community_id: CommunityId,
+    expected_projection_pubkey: PublicKey,
+) -> ProjectDocumentWriteResult<ProjectDocumentWriteTx> {
+    let mut tx = db.pool.begin().await?;
+    crate::community_lock::acquire(&mut tx, community_id, false).await?;
+    let enabled: Option<bool> = sqlx::query_scalar(
+        "SELECT project_document_enabled FROM communities \
+         WHERE id = $1 AND archived_at IS NULL FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if enabled != Some(true) {
+        return Err(ProjectDocumentWriteError::Unavailable { community_id });
+    }
+    Ok(ProjectDocumentWriteTx {
+        tx,
+        community_id,
+        expected_projection_pubkey,
+        loaded: None,
+    })
 }
 
 fn verified_current_identity(

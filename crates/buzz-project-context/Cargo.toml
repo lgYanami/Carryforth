@@ -1,0 +1,23 @@
+[package]
+name = "buzz-project-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Project Context Edge domain and wire contracts"
+
+[dependencies]
+buzz-core = { workspace = true }
+buzz-project-view = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+nostr = { workspace = true }
+proptest = { workspace = true }

@@ -386,7 +386,14 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 
     let check = async {
-        let (pg_ok, redis_ok, project_view_ok, project_document_ok, meeting_v2_ok) = tokio::join!(
+        let (
+            pg_ok,
+            redis_ok,
+            project_view_ok,
+            project_document_ok,
+            project_context_ok,
+            meeting_v2_ok,
+        ) = tokio::join!(
             state.db.ping(),
             async { state.redis_pool.get().await.is_ok() },
             async {
@@ -400,6 +407,13 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                 state
                     .db
                     .project_document_deployment_ready(state.config.relay_private_key.is_some())
+                    .await
+                    .unwrap_or(false)
+            },
+            async {
+                state
+                    .db
+                    .project_context_deployment_ready(state.config.relay_private_key.is_some())
                     .await
                     .unwrap_or(false)
             },
@@ -420,16 +434,23 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
             redis_ok,
             project_view_ok,
             project_document_ok,
+            project_context_ok,
             meeting_v2_ok,
         )
     };
 
-    let (pg_ok, redis_ok, project_view_ok, project_document_ok, meeting_v2_ok) =
+    let (pg_ok, redis_ok, project_view_ok, project_document_ok, project_context_ok, meeting_v2_ok) =
         tokio::time::timeout(Duration::from_secs(2), check)
             .await
-            .unwrap_or((false, false, false, false, false));
+            .unwrap_or((false, false, false, false, false, false));
 
-    if pg_ok && redis_ok && project_view_ok && project_document_ok && meeting_v2_ok {
+    if pg_ok
+        && redis_ok
+        && project_view_ok
+        && project_document_ok
+        && project_context_ok
+        && meeting_v2_ok
+    {
         (
             StatusCode::OK,
             Json(json!({"status": "ready", "meeting_v2": true})),
@@ -444,6 +465,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                 "redis": redis_ok,
                 "project_view": project_view_ok,
                 "project_document": project_document_ok,
+                "project_context": project_context_ok,
                 "meeting_v2": meeting_v2_ok
             })),
         )

@@ -9,6 +9,7 @@ description = "Typed Nostr event builders for Buzz operations"
 
 [dependencies]
 buzz-core = { workspace = true }
+buzz-project-context = { workspace = true }
 buzz-project-document = { workspace = true }
 buzz-project-view = { workspace = true }
 nostr = { workspace = true }

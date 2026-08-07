@@ -313,6 +313,9 @@ test-unit:
         # private read/write surface, agent CLI, ACP guidance, and admin control
         # plane. Keep its complete no-infrastructure slice in the ordinary gate.
         just project-document-test-unit
+        # Project Context Stage 1 freezes the pure domain, wire contract, and
+        # fail-closed Relay registration before canonical storage exists.
+        just project-context-test-unit
         # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
@@ -413,6 +416,94 @@ project-document-test-e2e:
 
 # Run every Project Document Stage 2 quality gate.
 project-document-test: project-document-test-unit project-document-test-db test-migrations project-document-test-e2e
+
+# Run the complete no-infrastructure Project Context Stage 1 contract.
+project-context-test-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        cargo nextest run -p buzz-project-context
+        cargo nextest run -p buzz-sdk --test project_context
+        cargo nextest run -p buzz-sdk --test project_document
+        cargo nextest run \
+          -p buzz-core \
+          -p buzz-relay \
+          --lib \
+          -E 'test(project_context)'
+        cargo nextest run -p buzz-db --lib -E 'test(project_context)'
+        cargo nextest run -p buzz-admin -E 'test(project_context)'
+        cargo nextest run -p buzz-cli -E 'test(project_context)'
+    else
+        cargo test -p buzz-project-context
+        cargo test -p buzz-sdk --test project_context
+        cargo test -p buzz-sdk --test project_document
+        cargo test -p buzz-core --lib project_context
+        cargo test -p buzz-relay --lib project_context
+        cargo test -p buzz-db --lib project_context
+        cargo test -p buzz-admin project_context
+        cargo test -p buzz-cli project_context
+    fi
+
+# Run isolated PostgreSQL-backed Project Context canonical storage tests.
+project-context-test-db:
+    ./scripts/test-project-context-db.sh
+
+# Run the real Relay/event-store Stage 1 privacy floor in an isolated database.
+project-context-test-e2e:
+    PROJECT_CONTEXT_STAGE1_ONLY=1 ./scripts/test-project-document-e2e.sh
+
+# Run the real direct-v3 Relay, private protocol, and operation-gate E2E.
+project-context-test-e2e-stage3:
+    ./scripts/test-project-context-stage3-e2e.sh
+
+# Run the real Project Context cross-domain lifecycle E2E. The Stage 3
+# protocol path remains part of this cumulative acceptance scenario.
+project-context-test-e2e-stage4:
+    ./scripts/test-project-context-stage3-e2e.sh
+
+# Run the cumulative Project Context scenario through verified query and Agent
+# CLI delivery. Earlier protocol and lifecycle stages remain part of the gate.
+project-context-test-e2e-stage5:
+    ./scripts/test-project-context-stage3-e2e.sh
+
+# Run the cumulative real Relay scenario plus disabled-only reprojection,
+# recovery verification, checked re-enable, and Context Reference regression.
+project-context-test-e2e-stage7:
+    PROJECT_CONTEXT_E2E_STAGE7=1 ./scripts/test-project-context-stage3-e2e.sh
+
+# Run every Project Context Stage 1 quality gate.
+project-context-stage1-test: project-context-test-unit project-context-test-e2e
+
+# Run every Project Context Stage 2 quality gate.
+project-context-stage2-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e
+
+# Run every Project Context Stage 3 quality gate.
+project-context-stage3-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage3
+
+# Run every Project Context Stage 4 quality gate.
+project-context-stage4-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage4
+
+# Run every Project Context Stage 5 quality gate.
+project-context-stage5-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage5
+
+# Run the complete ACP package contract for Project Context stable discovery.
+project-context-test-acp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &>/dev/null; then
+        cargo nextest run -p buzz-acp --lib
+    else
+        cargo test -p buzz-acp --lib
+    fi
+
+# Run every Project Context Stage 6 quality gate. Stage 5 remains cumulative;
+# ACP adds only stable capability discovery and no dynamic Edge injection.
+project-context-stage6-test: project-context-stage5-test project-context-test-acp
+
+# Run the complete Project Context backend/Agent acceptance gate. The Stage 7
+# Relay scenario is cumulative through Stages 3-5; ACP remains a separate
+# stable-contract regression gate.
+project-context-stage7-test: project-context-test-unit project-context-test-db test-migrations project-context-test-e2e project-context-test-e2e-stage7 project-context-test-acp
 
 # Run the real local signer-rotation, backup/restore, Secret incident, and
 # bounded admission-burst drill against an exact scratch database.

@@ -38,6 +38,8 @@ pub enum AuditAction {
     ProjectViewSecurityInvalidation,
     /// The staged Project Context sub-capability was enabled or disabled.
     ProjectContextControl,
+    /// A controlled Project Context Edge bootstrap or capability transition.
+    ProjectContextEdgeControl,
     /// A controlled Project Document bootstrap or capability transition.
     ProjectDocumentControl,
     /// A trusted runtime supervisor was bound to an exact Assignment.
@@ -68,6 +70,7 @@ impl AuditAction {
             Self::ProjectViewProvisioning => "project_view_provisioning",
             Self::ProjectViewSecurityInvalidation => "project_view_security_invalidation",
             Self::ProjectContextControl => "project_context_control",
+            Self::ProjectContextEdgeControl => "project_context_edge_control",
             Self::ProjectDocumentControl => "project_document_control",
             Self::RuntimeSupervisorRegistered => "runtime_supervisor_registered",
             Self::RuntimeSupervisorRevoked => "runtime_supervisor_revoked",
@@ -92,6 +95,7 @@ impl AuditAction {
         Self::ProjectViewProvisioning,
         Self::ProjectViewSecurityInvalidation,
         Self::ProjectContextControl,
+        Self::ProjectContextEdgeControl,
         Self::ProjectDocumentControl,
         Self::RuntimeSupervisorRegistered,
         Self::RuntimeSupervisorRevoked,

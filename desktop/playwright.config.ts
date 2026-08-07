@@ -100,6 +100,7 @@ export default defineConfig({
         "**/project-commit-detail.spec.ts",
         "**/project-pr-review.spec.ts",
         "**/project-view.spec.ts",
+        "**/project-context.spec.ts",
         "**/project-document.spec.ts",
         "**/meeting-read-only.spec.ts",
         "**/meeting-create.spec.ts",

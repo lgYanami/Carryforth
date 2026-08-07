@@ -5,6 +5,7 @@ import {
   FolderGit2,
   Inbox,
   LayoutDashboard,
+  Network,
   Zap,
 } from "lucide-react";
 
@@ -24,6 +25,7 @@ export type SidebarSelectedView =
   | "home"
   | "channel"
   | "documents"
+  | "project-context"
   | "messages"
   | "agents"
   | "workflows"
@@ -43,6 +45,7 @@ type AppSidebarPinnedHeaderProps = {
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
   onOpenSearchResult: (hit: SearchHit) => void;
   onSelectCommunity: () => void;
+  onSelectProjectContext: () => void;
   onSelectDocuments: () => void;
   onSelectChannel: (channelId: string) => void;
   searchChannels: Channel[];
@@ -71,6 +74,7 @@ export function AppSidebarPinnedHeader({
   onOpenDm,
   onOpenSearchResult,
   onSelectCommunity,
+  onSelectProjectContext,
   onSelectDocuments,
   onSelectChannel,
   searchChannels,
@@ -106,6 +110,18 @@ export function AppSidebarPinnedHeader({
           </SidebarMenuButton>
         </SidebarMenuItem>
         <FeatureGate feature="projectView">
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              data-testid="open-project-context"
+              isActive={selectedView === "project-context"}
+              onClick={onSelectProjectContext}
+              tooltip={`${activeCommunityName} project context`}
+              type="button"
+            >
+              <Network className="h-4 w-4" />
+              <SidebarMenuLabel>Project Context</SidebarMenuLabel>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton
               data-testid="open-documents"

@@ -466,6 +466,13 @@ pub const KIND_PROJECT_DOCUMENT_REVISION: u32 = 40906;
 /// This kind carries an indexed `d` tag but uses the Document catalog revision
 /// and projection generation rather than NIP-33 last-write-wins semantics.
 pub const KIND_PROJECT_DOCUMENT_META: u32 = 40907;
+/// NIP-PCE: relay-signed current one-Document Project Context Edge binding.
+///
+/// This kind carries indexed `d`, `c`, `g`, and `s` tags, but replacement is
+/// controlled by the Context domain revision rather than NIP-33 LWW.
+pub const KIND_PROJECT_CONTEXT_EDGE_BINDING: u32 = 40908;
+/// NIP-PCE: relay-signed current Project Context catalog metadata head.
+pub const KIND_PROJECT_CONTEXT_META: u32 = 40909;
 
 // Direct messages (41000–41999)
 /// Open/create DM (p-tags = participants).
@@ -543,6 +550,8 @@ pub const KIND_AGENT_TURN_METRIC: u32 = 44200;
 pub const KIND_PROJECT_VIEW_MUTATION: u32 = 44300;
 /// NIP-PD: member-signed, append-only Project Document command.
 pub const KIND_PROJECT_DOCUMENT_COMMAND: u32 = 44301;
+/// NIP-PCE: member-signed, append-only Project Context attach/detach command.
+pub const KIND_PROJECT_CONTEXT_COMMAND: u32 = 44302;
 
 // Forum / social (45000–45999)
 // V1 used addressable range (30001–30003) — wrong.
@@ -705,6 +714,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PROJECT_DOCUMENT_HEAD,
     KIND_PROJECT_DOCUMENT_REVISION,
     KIND_PROJECT_DOCUMENT_META,
+    KIND_PROJECT_CONTEXT_EDGE_BINDING,
+    KIND_PROJECT_CONTEXT_META,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -734,6 +745,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_AGENT_TURN_METRIC,
     KIND_PROJECT_VIEW_MUTATION,
     KIND_PROJECT_DOCUMENT_COMMAND,
+    KIND_PROJECT_CONTEXT_COMMAND,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
     KIND_USER_STATUS,
@@ -795,7 +807,7 @@ pub const fn is_parameterized_replaceable(kind: u32) -> bool {
 /// Returns `true` when the event store materializes this kind's `d` tag.
 ///
 /// NIP-33 addressable events use `d` as part of their replacement key.
-/// Project View and Project Document projections use `d` only as a
+/// Project View, Project Document, and Project Context projections use `d` only as a
 /// relay-managed query coordinate; they deliberately retain separate domain
 /// revision and replacement semantics.
 pub const fn has_indexed_d_tag(kind: u32) -> bool {
@@ -807,6 +819,8 @@ pub const fn has_indexed_d_tag(kind: u32) -> bool {
                 | KIND_PROJECT_DOCUMENT_HEAD
                 | KIND_PROJECT_DOCUMENT_REVISION
                 | KIND_PROJECT_DOCUMENT_META
+                | KIND_PROJECT_CONTEXT_EDGE_BINDING
+                | KIND_PROJECT_CONTEXT_META
         )
 }
 
@@ -850,13 +864,33 @@ pub const fn is_project_document_protocol_kind(kind: u32) -> bool {
     is_project_document_projection_kind(kind) || is_project_document_command_kind(kind)
 }
 
+/// Returns `true` for relay-signed Project Context Edge projections.
+pub const fn is_project_context_projection_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_PROJECT_CONTEXT_EDGE_BINDING | KIND_PROJECT_CONTEXT_META
+    )
+}
+
+/// Returns `true` for the member-signed Project Context attach/detach command.
+pub const fn is_project_context_command_kind(kind: u32) -> bool {
+    kind == KIND_PROJECT_CONTEXT_COMMAND
+}
+
+/// Returns `true` for every event kind in the Project Context Edge protocol.
+pub const fn is_project_context_protocol_kind(kind: u32) -> bool {
+    is_project_context_projection_kind(kind) || is_project_context_command_kind(kind)
+}
+
 /// Returns `true` for Community-global protocols with member-only reads.
 ///
 /// This classifier is the protocol registry boundary. Relay read paths still
 /// keep their capability-specific readiness checks and must not infer that a
 /// newly registered protocol is enabled merely because it appears here.
 pub const fn is_community_private_protocol_kind(kind: u32) -> bool {
-    is_project_view_protocol_kind(kind) || is_project_document_protocol_kind(kind)
+    is_project_view_protocol_kind(kind)
+        || is_project_document_protocol_kind(kind)
+        || is_project_context_protocol_kind(kind)
 }
 
 /// Returns `true` if `kind` is a workflow execution event (46001–46012).
@@ -910,6 +944,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_APPROVAL_DENY
             | KIND_PROJECT_VIEW_MUTATION
             | KIND_PROJECT_DOCUMENT_COMMAND
+            | KIND_PROJECT_CONTEXT_COMMAND
     )
 }
 
@@ -926,6 +961,8 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_PROJECT_DOCUMENT_HEAD
             | KIND_PROJECT_DOCUMENT_REVISION
             | KIND_PROJECT_DOCUMENT_META
+            | KIND_PROJECT_CONTEXT_EDGE_BINDING
+            | KIND_PROJECT_CONTEXT_META
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -999,6 +1036,29 @@ const _: () = assert!(is_project_document_protocol_kind(
 ));
 const _: () = assert!(is_project_document_protocol_kind(
     KIND_PROJECT_DOCUMENT_COMMAND
+));
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_CONTEXT_EDGE_BINDING));
+const _: () = assert!(has_indexed_d_tag(KIND_PROJECT_CONTEXT_META));
+const _: () = assert!(!is_parameterized_replaceable(
+    KIND_PROJECT_CONTEXT_EDGE_BINDING
+));
+const _: () = assert!(!is_parameterized_replaceable(KIND_PROJECT_CONTEXT_META));
+const _: () = assert!(!has_indexed_d_tag(KIND_PROJECT_CONTEXT_COMMAND));
+const _: () = assert!(is_project_context_projection_kind(
+    KIND_PROJECT_CONTEXT_EDGE_BINDING
+));
+const _: () = assert!(is_project_context_projection_kind(
+    KIND_PROJECT_CONTEXT_META
+));
+const _: () = assert!(is_project_context_command_kind(
+    KIND_PROJECT_CONTEXT_COMMAND
+));
+const _: () = assert!(is_project_context_protocol_kind(
+    KIND_PROJECT_CONTEXT_EDGE_BINDING
+));
+const _: () = assert!(is_project_context_protocol_kind(KIND_PROJECT_CONTEXT_META));
+const _: () = assert!(is_project_context_protocol_kind(
+    KIND_PROJECT_CONTEXT_COMMAND
 ));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
@@ -1092,8 +1152,11 @@ mod tests {
         assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_HEAD));
         assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_REVISION));
         assert!(has_indexed_d_tag(KIND_PROJECT_DOCUMENT_META));
+        assert!(has_indexed_d_tag(KIND_PROJECT_CONTEXT_EDGE_BINDING));
+        assert!(has_indexed_d_tag(KIND_PROJECT_CONTEXT_META));
         assert!(!has_indexed_d_tag(KIND_PROJECT_VIEW_MUTATION));
         assert!(!has_indexed_d_tag(KIND_PROJECT_DOCUMENT_COMMAND));
+        assert!(!has_indexed_d_tag(KIND_PROJECT_CONTEXT_COMMAND));
         assert!(!has_indexed_d_tag(KIND_TEXT_NOTE));
 
         assert!(!is_parameterized_replaceable(KIND_PROJECT_VIEW_OBJECT));
@@ -1103,6 +1166,10 @@ mod tests {
             KIND_PROJECT_DOCUMENT_REVISION
         ));
         assert!(!is_parameterized_replaceable(KIND_PROJECT_DOCUMENT_META));
+        assert!(!is_parameterized_replaceable(
+            KIND_PROJECT_CONTEXT_EDGE_BINDING
+        ));
+        assert!(!is_parameterized_replaceable(KIND_PROJECT_CONTEXT_META));
     }
 
     #[test]
@@ -1162,6 +1229,31 @@ mod tests {
         ));
         assert!(!is_project_document_protocol_kind(KIND_TEXT_NOTE));
         assert!(!is_community_private_protocol_kind(KIND_TEXT_NOTE));
+    }
+
+    #[test]
+    fn project_context_protocol_classifiers_cover_commands_and_projections() {
+        for kind in [KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META] {
+            assert!(is_project_context_projection_kind(kind));
+            assert!(is_project_context_protocol_kind(kind));
+            assert!(is_relay_only_kind(kind));
+            assert!(is_community_private_protocol_kind(kind));
+        }
+        assert!(!is_project_context_projection_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(is_project_context_command_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(is_command_kind(KIND_PROJECT_CONTEXT_COMMAND));
+        assert!(!is_relay_only_kind(KIND_PROJECT_CONTEXT_COMMAND));
+        assert!(is_project_context_protocol_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(is_community_private_protocol_kind(
+            KIND_PROJECT_CONTEXT_COMMAND
+        ));
+        assert!(!is_project_context_protocol_kind(KIND_TEXT_NOTE));
     }
 
     #[test]

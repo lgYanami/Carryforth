@@ -820,6 +820,7 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "buzz-pubsub",
@@ -908,6 +909,7 @@ dependencies = [
  "base64",
  "buzz-core",
  "buzz-persona",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
@@ -970,6 +972,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-audit",
  "buzz-core",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
@@ -1093,6 +1096,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-project-context"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "buzz-project-view",
+ "chrono",
+ "hex",
+ "nostr",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-project-document"
 version = "0.1.0"
 dependencies = [
@@ -1195,6 +1215,7 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "buzz-media",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "buzz-pubsub",
@@ -1277,6 +1298,7 @@ name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "chrono",
@@ -1308,6 +1330,7 @@ dependencies = [
  "buzz-audit",
  "buzz-core",
  "buzz-db",
+ "buzz-project-context",
  "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",

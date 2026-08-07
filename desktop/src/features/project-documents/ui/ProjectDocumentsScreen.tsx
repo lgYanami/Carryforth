@@ -24,10 +24,12 @@ import { Button } from "@/shared/ui/button";
 
 export function ProjectDocumentsScreen({
   onSelectDocument,
+  onShowInProjectContext,
   selectedDocumentId,
   selectedRevision,
 }: {
   onSelectDocument: (documentId?: string, revision?: number) => void;
+  onShowInProjectContext?: (documentId: string) => void;
   selectedDocumentId?: string;
   selectedRevision?: number;
 }) {
@@ -217,6 +219,7 @@ export function ProjectDocumentsScreen({
               onSelectRevision={(revision) =>
                 onSelectDocument(selectedDocumentId, revision)
               }
+              onShowInProjectContext={onShowInProjectContext}
               selectedRevision={selectedRevision}
             />
           ) : (
