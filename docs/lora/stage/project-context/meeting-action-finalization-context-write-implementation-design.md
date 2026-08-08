@@ -1,6 +1,6 @@
 # Meeting Action Finalization 中维护 Project Context 的实现设计
 
-> 状态：已实现，待真实 Meeting 验收  
+> 状态：已实现并完成无活跃会议全量切换，待 Human 发起真实 Meeting 验收
 > 日期：2026-08-08  
 > 范围：Meeting / Project Context Relay 与 DB、ACP System Contract、逐 Turn Meeting Envelope、CLI、Desktop、测试与发布  
 > 前置设计：[Meeting 作为 Project Context 坐标与 Community 可见性实现设计](./meeting-coordinate-implementation-design.md)、[Project Context](./project-context.md)、[Meeting Project Context TODO](./TODO.md)
@@ -662,6 +662,31 @@ Project Space contract `5 -> 6` 和 Meeting contract `2 -> 3` 会改变 contract
 - Mock Bridge E2E 已验证 finalizing Meeting 的冻结、待关闭 Inspector；Rust、Desktop 原生层、Desktop
   类型/静态检查与单元测试已通过；
 - 未运行任何会清空、重建或迁移本地验收数据库的命令，也未新增 SQL migration。
+
+阶段 4 的无活跃会议全量切换也已完成：
+
+- 切换前以只读查询确认 `active Meeting = 0`、`non-terminal Action Run = 0`；没有为了部署而
+  abort、删除或伪造任何 Meeting / Action Run；
+- 从 `version/v1.0.0` 的同一 HEAD 统一重建并启动 Relay、CLI、ACP 与 Desktop；所有 Desktop
+  sidecar 均与本次 `target/debug` 产物逐字节一致，运行中的 ACP 进程均在本次切换后启动；
+- Project Space contract 已为 `6`，Meeting contract 已为 `3`，Meeting turn context 已为
+  `meeting-context-v2`；contract hash 变化会使旧 Session 失效并重建，不保留旧合同兼容分支；
+- Relay 在 `localhost:3000` 公告 `buzz-project-view-v3`、`buzz-project-document-v1`、
+  `buzz-project-context-edge-v2`、`buzz-meeting-community-read-v1` 与 Meeting V2 / Direct Actions
+  能力；readiness 正常；
+- 标准 migration runner 确认数据库 migration 仍为 `53`，没有新增或回放 SQL migration；本地
+  Community seed 返回 `INSERT 0 0`，未创建新 Community；
+- 切换前后业务数据指纹完全一致：Project View `schema 3 / revision 60 / 18 objects / 10 checkpoints`，
+  Document `schema 1 / revision 18 / 18 active`，Project Context `schema 2 / revision 19 / 14 active
+  edges / 15 bound documents`；`1310` 条 Event、`13` 个 Channel、`11` 场历史 Meeting 与 `4` 个
+  Action Run 均无增删，且切换后仍为零 active / non-terminal；
+- ACP contract、旧合同拒绝复用与 Action Finalization turn envelope 的聚焦测试共 `19` 项通过；
+  启动日志无 error / panic / migration failure。
+
+这里的 Project Space `5 -> 6` 与 Meeting `2 -> 3` 是 ACP System Contract 的版本/hash 切换，
+不是 Project View、Project Context 或 Postgres schema 的数据迁移。阶段 4 因而不需要改写已有业务数据；
+“迁移干净”体现在旧 ACP 进程/Session 不再继续运行、所有组件来自同一构建，以及既有 canonical revision
+在切换前后保持一致。
 
 剩余验收仅为第 8.5 节的真实 Agent 主持 Meeting 流程；该验收会写入真实业务数据，应由 Human 明确发起，
 不在实现测试中自动创建或删除 Meeting、Document、Project View 对象或 Context Edge。
