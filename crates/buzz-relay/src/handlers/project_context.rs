@@ -308,8 +308,8 @@ fn map_write_error(error: ProjectContextWriteError) -> IngestError {
         ProjectContextWriteError::NotAMeeting => {
             IngestError::Rejected("invalid:project_context:not_a_meeting".to_owned())
         }
-        ProjectContextWriteError::MeetingNotTerminal => {
-            IngestError::Rejected("invalid:project_context:meeting_not_terminal".to_owned())
+        ProjectContextWriteError::MeetingNotAttachable => {
+            IngestError::Rejected("invalid:project_context:meeting_not_attachable".to_owned())
         }
         ProjectContextWriteError::MeetingTerminalInvalid => {
             IngestError::Rejected("invalid:project_context:meeting_terminal_invalid".to_owned())
@@ -460,9 +460,9 @@ mod tests {
                 if message == "invalid:project_context:not_a_meeting"
         ));
         assert!(matches!(
-            map_write_error(ProjectContextWriteError::MeetingNotTerminal),
+            map_write_error(ProjectContextWriteError::MeetingNotAttachable),
             IngestError::Rejected(message)
-                if message == "invalid:project_context:meeting_not_terminal"
+                if message == "invalid:project_context:meeting_not_attachable"
         ));
         assert!(matches!(
             map_write_error(ProjectContextWriteError::MeetingTerminalInvalid),

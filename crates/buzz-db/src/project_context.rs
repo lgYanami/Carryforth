@@ -72,9 +72,9 @@ pub enum ProjectContextWriteError {
     /// The supplied UUID names an ordinary Channel rather than a Meeting.
     #[error("Project Context coordinate is not a Meeting")]
     NotAMeeting,
-    /// The supplied Meeting is still active.
-    #[error("Project Context Meeting coordinate is not terminal")]
-    MeetingNotTerminal,
+    /// The supplied Meeting is neither terminal nor in verified action finalization.
+    #[error("Project Context Meeting coordinate is not attachable")]
+    MeetingNotAttachable,
     /// The supplied Meeting has an incomplete or inconsistent terminal chain.
     #[error("Project Context Meeting terminal evidence is invalid")]
     MeetingTerminalInvalid,
@@ -1664,9 +1664,10 @@ impl ProjectContextWriteTx {
                 )
                 .await?
                 {
-                    crate::meeting::MeetingCoordinateResolution::Terminal { .. } => true,
+                    crate::meeting::MeetingCoordinateResolution::Terminal { .. }
+                    | crate::meeting::MeetingCoordinateResolution::FinalizingActions { .. } => true,
                     crate::meeting::MeetingCoordinateResolution::Active => {
-                        return Err(ProjectContextWriteError::MeetingNotTerminal);
+                        return Err(ProjectContextWriteError::MeetingNotAttachable);
                     }
                     crate::meeting::MeetingCoordinateResolution::OrdinaryChannel => {
                         return Err(ProjectContextWriteError::NotAMeeting);
@@ -2021,6 +2022,7 @@ async fn coordinate_active_in_tx(
         ProjectContextCoordinate::Meeting { meeting_id } => Ok(matches!(
             crate::meeting::resolve_meeting_coordinate_tx(tx, community_id, *meeting_id).await?,
             crate::meeting::MeetingCoordinateResolution::Terminal { .. }
+                | crate::meeting::MeetingCoordinateResolution::FinalizingActions { .. }
         )),
     }
 }
@@ -3195,6 +3197,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MeetingFixtureLifecycle {
         Active,
+        FinalizingActions,
         Closed,
         Aborted,
         InvalidTerminal,
@@ -3208,6 +3211,7 @@ mod tests {
         lifecycle: MeetingFixtureLifecycle,
     ) -> Uuid {
         let meeting_id = Uuid::new_v4();
+        let action_run_id = Uuid::new_v4();
         let meeting_tag = Tag::parse(["h", &meeting_id.to_string()]).expect("Meeting h tag");
         let create = EventBuilder::new(
             Kind::Custom(buzz_core::kind::KIND_MEETING_CREATE as u16),
@@ -3216,9 +3220,58 @@ mod tests {
         .tags([meeting_tag.clone()])
         .sign_with_keys(host)
         .expect("sign Meeting Create fixture");
+        let board = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_BOARD as u16),
+            "# Frozen Board",
+        )
+        .tags([meeting_tag.clone()])
+        .sign_with_keys(host)
+        .expect("sign Meeting Board fixture");
+        let action_begin = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_ACTION_COMMAND as u16),
+            "{}",
+        )
+        .tags([meeting_tag.clone()])
+        .sign_with_keys(host)
+        .expect("sign Meeting action begin fixture");
+        let transition_effects = serde_json::json!([{
+            "type": "action_finalization_began",
+            "object_type": "meeting_action_run",
+            "object_id": action_run_id,
+            "from": "floor_ready",
+            "to": "runnable",
+        }]);
+        let state_content = if matches!(lifecycle, MeetingFixtureLifecycle::FinalizingActions) {
+            serde_json::json!({
+                "phase": "moderator_idle",
+                "state_revision": 1,
+                "control_epoch": 1,
+                "transition": {
+                    "primary_type": "action_finalization_began",
+                    "primary_object_id": hex::encode(action_run_id.as_bytes()),
+                    "effects": transition_effects.clone(),
+                },
+                "board_control": {
+                    "phase": "finalizing_actions",
+                    "control_epoch": 1,
+                    "board_window": 1,
+                    "action": {
+                        "action_run_id": action_run_id,
+                        "board_event_id": hex::encode(board.id.as_bytes()),
+                        "control_epoch": 1,
+                        "board_window": 1,
+                        "condition": "runnable",
+                        "terminal_status": null,
+                    },
+                },
+            })
+            .to_string()
+        } else {
+            "{}".to_owned()
+        };
         let state = EventBuilder::new(
             Kind::Custom(buzz_core::kind::KIND_MEETING_STATE as u16),
-            "{}",
+            state_content,
         )
         .tags([meeting_tag.clone()])
         .sign_with_keys(relay)
@@ -3244,7 +3297,11 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert Meeting Channel fixture");
-        for event in [&create, &state] {
+        let mut evidence = vec![&create, &state];
+        if matches!(lifecycle, MeetingFixtureLifecycle::FinalizingActions) {
+            evidence.extend([&board, &action_begin]);
+        }
+        for event in evidence {
             let (_, inserted) =
                 crate::event::insert_event_in_tx(&mut tx, community_id, event, Some(meeting_id))
                     .await
@@ -3262,7 +3319,12 @@ mod tests {
             assert!(inserted);
         }
 
-        let terminal = !matches!(lifecycle, MeetingFixtureLifecycle::Active);
+        let terminal = matches!(
+            lifecycle,
+            MeetingFixtureLifecycle::Closed
+                | MeetingFixtureLifecycle::Aborted
+                | MeetingFixtureLifecycle::InvalidTerminal
+        );
         let end_event_id = if matches!(lifecycle, MeetingFixtureLifecycle::InvalidTerminal) {
             vec![0x55; 32]
         } else {
@@ -3273,7 +3335,7 @@ mod tests {
                 Some("closed")
             }
             MeetingFixtureLifecycle::Aborted => Some("aborted"),
-            MeetingFixtureLifecycle::Active => None,
+            MeetingFixtureLifecycle::Active | MeetingFixtureLifecycle::FinalizingActions => None,
         };
         let terminal_reason =
             matches!(lifecycle, MeetingFixtureLifecycle::Aborted).then_some("fixture_abort");
@@ -3300,16 +3362,29 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert Meeting Session fixture");
+        let transition_primary_type =
+            if matches!(lifecycle, MeetingFixtureLifecycle::FinalizingActions) {
+                "action_finalization_began"
+            } else {
+                "project_context_fixture"
+            };
+        let history_effects = if matches!(lifecycle, MeetingFixtureLifecycle::FinalizingActions) {
+            transition_effects
+        } else {
+            serde_json::json!([])
+        };
         sqlx::query(
             "INSERT INTO meeting_baton_state_history \
                  (community_id, session_id, state_revision, state_event_id, \
                   floor_revision, intent_revision, speech_revision, control_epoch, \
-                  decision_epoch, transition_primary_type) \
-             VALUES ($1, $2, 1, $3, 1, 0, 0, 1, 0, 'project_context_fixture')",
+                  decision_epoch, transition_primary_type, transition_effects_json) \
+             VALUES ($1, $2, 1, $3, 1, 0, 0, 1, 0, $4, $5)",
         )
         .bind(community_id.as_uuid())
         .bind(meeting_id)
         .bind(state.id.as_bytes().as_slice())
+        .bind(transition_primary_type)
+        .bind(history_effects)
         .execute(&mut *tx)
         .await
         .expect("insert Meeting State history fixture");
@@ -3327,6 +3402,48 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert current Meeting State fixture");
+        if matches!(lifecycle, MeetingFixtureLifecycle::FinalizingActions) {
+            sqlx::query(
+                "INSERT INTO meeting_current_boards \
+                     (community_id, session_id, board_event_id, board_format, board_content) \
+                 VALUES ($1, $2, $3, 'markdown', '# Frozen Board')",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .bind(board.id.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .expect("insert current Meeting Board fixture");
+            sqlx::query(
+                "INSERT INTO meeting_v2_bootstrap_state \
+                     (community_id, session_id, runtime_phase, control_epoch, board_window, \
+                      board_started_at, board_completed_at, board_outcome) \
+                 VALUES ($1, $2, 'finalizing_actions', 1, 1, \
+                         clock_timestamp() - interval '2 seconds', \
+                         clock_timestamp() - interval '1 second', 'updated')",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert Meeting finalizing Runtime fixture");
+            sqlx::query(
+                "INSERT INTO meeting_v2_action_runs \
+                     (community_id, session_id, action_run_id, begin_event_id, \
+                      board_event_id, control_epoch, board_window, action_condition, \
+                      action_deadline_at) \
+                 VALUES ($1, $2, $3, $4, $5, 1, 1, 'runnable', \
+                         clock_timestamp() + interval '5 minutes')",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .bind(action_run_id)
+            .bind(action_begin.id.as_bytes().as_slice())
+            .bind(board.id.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .expect("insert current Meeting action run fixture");
+        }
         tx.commit()
             .await
             .expect("commit Meeting coordinate fixture");
@@ -4827,7 +4944,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
-    async fn meeting_coordinate_requires_verified_terminal_evidence_and_detaches_after_archive() {
+    async fn meeting_coordinate_accepts_verified_finalization_or_terminal_evidence() {
         let scratch = ScratchDatabase::create("buzz_project_context_meeting").await;
         let db = Db::from_pool(scratch.pool.clone());
         let actor = Keys::generate();
@@ -4861,6 +4978,14 @@ mod tests {
             MeetingFixtureLifecycle::Aborted,
         )
         .await;
+        let finalizing_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::FinalizingActions,
+        )
+        .await;
         assert!(matches!(
             crate::meeting::resolve_meeting_coordinate_tx(
                 &mut scratch.pool.begin().await.expect("begin closed resolver"),
@@ -4873,6 +4998,25 @@ mod tests {
                 normalized_outcome: crate::meeting::MeetingCoordinateTerminalOutcome::Closed,
                 ..
             }
+        ));
+        assert!(matches!(
+            crate::meeting::resolve_meeting_coordinate_tx(
+                &mut scratch
+                    .pool
+                    .begin()
+                    .await
+                    .expect("begin finalizing resolver"),
+                community_id,
+                finalizing_meeting,
+            )
+            .await
+            .expect("resolve finalizing Meeting"),
+            crate::meeting::MeetingCoordinateResolution::FinalizingActions {
+                meeting_id,
+                control_epoch: 1,
+                board_window: 1,
+                ..
+            } if meeting_id == finalizing_meeting
         ));
         assert!(matches!(
             crate::meeting::resolve_meeting_coordinate_tx(
@@ -4947,6 +5091,53 @@ mod tests {
             ProjectContextBindingState::Deleted
         );
 
+        let finalizing_context_document = Uuid::new_v4();
+        create_document(
+            &db,
+            community_id,
+            finalizing_context_document,
+            &actor,
+            &relay,
+        )
+        .await;
+        let finalizing_coordinates = vec![
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_document_id,
+            },
+            ProjectContextCoordinate::Meeting {
+                meeting_id: finalizing_meeting,
+            },
+        ];
+        let attach_finalizing = ProjectContextCommand::new(
+            2,
+            ProjectContextOperation::Attach,
+            finalizing_coordinates.clone(),
+            finalizing_context_document,
+        )
+        .expect("build finalizing Meeting attach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, attach_finalizing, &actor, &relay).await;
+        let attached_finalizing = write
+            .commit(prepared)
+            .await
+            .expect("commit finalizing Meeting attach");
+        assert_eq!(attached_finalizing.receipt.context_revision, 3);
+
+        let detach_finalizing = ProjectContextCommand::new(
+            3,
+            ProjectContextOperation::Detach,
+            finalizing_coordinates,
+            finalizing_context_document,
+        )
+        .expect("build finalizing Meeting detach");
+        let (write, prepared) =
+            prepare_storage_commit(&db, community_id, detach_finalizing, &actor, &relay).await;
+        let detached_finalizing = write
+            .commit(prepared)
+            .await
+            .expect("commit finalizing Meeting detach");
+        assert_eq!(detached_finalizing.receipt.context_revision, 4);
+
         let active_meeting = seed_meeting_coordinate_fixture(
             &scratch.pool,
             community_id,
@@ -4955,6 +5146,23 @@ mod tests {
             MeetingFixtureLifecycle::Active,
         )
         .await;
+        let drifted_finalizing_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::FinalizingActions,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE meeting_v2_action_runs SET control_epoch = 2 \
+             WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(drifted_finalizing_meeting)
+        .execute(&scratch.pool)
+        .await
+        .expect("drift finalizing Meeting action fence fixture");
         let invalid_meeting = seed_meeting_coordinate_fixture(
             &scratch.pool,
             community_id,
@@ -4988,6 +5196,7 @@ mod tests {
 
         for (meeting_id, expected) in [
             (active_meeting, "active"),
+            (drifted_finalizing_meeting, "active"),
             (invalid_meeting, "invalid"),
             (ordinary_channel, "ordinary"),
             (Uuid::new_v4(), "missing"),
@@ -4996,7 +5205,7 @@ mod tests {
             let candidate_document = Uuid::new_v4();
             create_document(&db, community_id, candidate_document, &actor, &relay).await;
             let command = ProjectContextCommand::new(
-                2,
+                4,
                 ProjectContextOperation::Attach,
                 vec![
                     ProjectContextCoordinate::Document {
@@ -5022,7 +5231,7 @@ mod tests {
             match expected {
                 "active" => assert!(matches!(
                     error,
-                    ProjectContextWriteError::MeetingNotTerminal
+                    ProjectContextWriteError::MeetingNotAttachable
                 )),
                 "invalid" => assert!(matches!(
                     error,
@@ -5041,6 +5250,16 @@ mod tests {
                 .await
                 .expect("rollback rejected Meeting attach");
         }
+
+        let unchanged_context: (i64, i64, i64) = sqlx::query_as(
+            "SELECT context_revision, active_edge_count, bound_document_count \
+             FROM project_context_edge_state WHERE community_id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read Context state after rejected Meeting attaches");
+        assert_eq!(unchanged_context, (4, 0, 0));
 
         db.verify_project_context_storage(community_id, &relay.public_key())
             .await

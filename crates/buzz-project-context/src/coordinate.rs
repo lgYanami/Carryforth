@@ -12,7 +12,7 @@ use crate::{ProjectContextError, ProjectContextResult};
 /// One v2 endpoint of a Project Context hyperedge.
 ///
 /// The closed union admits Project View objects, Project Documents, and
-/// terminal Meetings. New coordinate families must be appended after the
+/// attachable Meetings. New coordinate families must be appended after the
 /// explicit ranks allocated here so existing edge identities remain stable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(
@@ -33,7 +33,7 @@ pub enum ProjectContextCoordinate {
         /// Stable Document UUID.
         document_id: Uuid,
     },
-    /// A terminal Meeting coordinate.
+    /// A Meeting coordinate. Attach eligibility is verified by the Relay.
     Meeting {
         /// Stable Meeting UUID.
         meeting_id: Uuid,

@@ -133,7 +133,25 @@ pub enum MeetingCoordinateResolution {
         /// Signed Meeting End event ID.
         end_event_id: Vec<u8>,
     },
-    /// The Meeting exists but is still active.
+    /// The Meeting is active, but its formal discussion and Board are frozen
+    /// while the current action run materializes the decided outputs.
+    FinalizingActions {
+        /// Stable Meeting identity.
+        meeting_id: Uuid,
+        /// Current Relay-signed Meeting State revision.
+        state_revision: u64,
+        /// Current Relay-signed Meeting State event ID.
+        state_event_id: Vec<u8>,
+        /// Frozen current Board event ID referenced by the action run.
+        board_event_id: Vec<u8>,
+        /// Current non-terminal action run.
+        action_run_id: Uuid,
+        /// Runtime/action/state control epoch.
+        control_epoch: u64,
+        /// Runtime/action frozen Board window.
+        board_window: u64,
+    },
+    /// The Meeting exists but is active outside a verified action-finalization window.
     Active,
     /// The UUID belongs to an ordinary Channel in this Community.
     OrdinaryChannel,
@@ -155,8 +173,8 @@ pub async fn resolve_meeting_coordinate_tx(
     // Meeting mutations lock Session before Channel. Keep the same order here
     // so a concurrent End and Project Context attach cannot deadlock.
     let session = sqlx::query(
-        "SELECT create_event_id, host_pubkey, schema_version, status, ended_by, \
-                end_event_id, current_round, terminal_outcome \
+        "SELECT create_event_id, host_pubkey, schema_version, floor_policy_version, \
+                status, ended_by, end_event_id, current_round, terminal_outcome \
          FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
     )
@@ -206,6 +224,25 @@ pub async fn resolve_meeting_coordinate_tx(
 
     let status: String = session.try_get("status")?;
     if status == "active" {
+        let schema_version: i32 = session.try_get("schema_version")?;
+        let floor_policy_version: String = session.try_get("floor_policy_version")?;
+        if schema_version == crate::meeting_v2::SCHEMA_VERSION
+            && floor_policy_version == crate::meeting_v2::ACTIONS_POLICY_VERSION
+        {
+            let create_event_id: Vec<u8> = session.try_get("create_event_id")?;
+            let host_pubkey: Vec<u8> = session.try_get("host_pubkey")?;
+            if let Some(resolution) = resolve_finalizing_meeting_coordinate_tx(
+                tx,
+                community_id,
+                meeting_id,
+                &create_event_id,
+                &host_pubkey,
+            )
+            .await?
+            {
+                return Ok(resolution);
+            }
+        }
         return Ok(MeetingCoordinateResolution::Active);
     }
     if status != "ended" {
@@ -332,6 +369,320 @@ pub async fn resolve_meeting_coordinate_tx(
         create_event_id,
         state_event_id,
         end_event_id,
+    })
+}
+
+async fn resolve_finalizing_meeting_coordinate_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    meeting_id: Uuid,
+    create_event_id: &[u8],
+    host_pubkey: &[u8],
+) -> Result<Option<MeetingCoordinateResolution>> {
+    if create_event_id.len() != 32
+        || host_pubkey.len() != 32
+        || !meeting_coordinate_event_exists_tx(
+            tx,
+            community_id,
+            meeting_id,
+            create_event_id,
+            buzz_core::kind::KIND_MEETING_CREATE,
+            Some(host_pubkey),
+        )
+        .await?
+    {
+        return Ok(None);
+    }
+
+    let runtime = sqlx::query(
+        "SELECT runtime_phase, control_epoch, board_window \
+         FROM meeting_v2_bootstrap_state \
+         WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    if runtime.try_get::<String, _>("runtime_phase")? != "finalizing_actions" {
+        return Ok(None);
+    }
+    let runtime_control_epoch: i64 = runtime.try_get("control_epoch")?;
+    let runtime_board_window: i64 = runtime.try_get("board_window")?;
+
+    let run = sqlx::query(
+        "SELECT action_run_id, begin_event_id, board_event_id, control_epoch, board_window, \
+                action_condition \
+         FROM meeting_v2_action_runs \
+         WHERE community_id = $1 AND session_id = $2 AND terminal_status IS NULL \
+         FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    let action_run_id: Uuid = run.try_get("action_run_id")?;
+    let begin_event_id: Vec<u8> = run.try_get("begin_event_id")?;
+    let board_event_id: Vec<u8> = run.try_get("board_event_id")?;
+    let run_control_epoch: i64 = run.try_get("control_epoch")?;
+    let run_board_window: i64 = run.try_get("board_window")?;
+    let action_condition: String = run.try_get("action_condition")?;
+    if begin_event_id.len() != 32
+        || board_event_id.len() != 32
+        || run_control_epoch <= 0
+        || run_board_window <= 0
+        || runtime_control_epoch != run_control_epoch
+        || runtime_board_window != run_board_window
+        || !matches!(action_condition.as_str(), "runnable" | "blocked")
+        || !meeting_coordinate_event_exists_tx(
+            tx,
+            community_id,
+            meeting_id,
+            &begin_event_id,
+            buzz_core::kind::KIND_MEETING_ACTION_COMMAND,
+            Some(host_pubkey),
+        )
+        .await?
+    {
+        return Ok(None);
+    }
+
+    let current_board_event_id: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT board_event_id FROM meeting_current_boards \
+         WHERE community_id = $1 AND session_id = $2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    if current_board_event_id.as_deref() != Some(board_event_id.as_slice())
+        || !meeting_coordinate_event_exists_tx(
+            tx,
+            community_id,
+            meeting_id,
+            &board_event_id,
+            buzz_core::kind::KIND_MEETING_BOARD,
+            Some(host_pubkey),
+        )
+        .await?
+    {
+        return Ok(None);
+    }
+
+    let state = sqlx::query(
+        "SELECT current_state.phase, current_state.state_revision, \
+                current_state.state_event_id, current_state.control_epoch, \
+                current_state.active_offer_id, current_state.active_grant_id, \
+                current_state.active_decision_attempt_id, current_state.next_action_at, \
+                history.transition_primary_type, history.transition_effects_json \
+         FROM meeting_baton_state current_state \
+         JOIN meeting_baton_state_history history \
+           ON history.community_id = current_state.community_id \
+          AND history.session_id = current_state.session_id \
+          AND history.state_revision = current_state.state_revision \
+          AND history.state_event_id = current_state.state_event_id \
+         WHERE current_state.community_id = $1 AND current_state.session_id = $2 \
+         FOR UPDATE OF current_state, history",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let phase: String = state.try_get("phase")?;
+    let state_revision: i64 = state.try_get("state_revision")?;
+    let state_event_id: Vec<u8> = state.try_get("state_event_id")?;
+    let state_control_epoch: i64 = state.try_get("control_epoch")?;
+    let active_offer_id: Option<Vec<u8>> = state.try_get("active_offer_id")?;
+    let active_grant_id: Option<Vec<u8>> = state.try_get("active_grant_id")?;
+    let active_decision_attempt_id: Option<Vec<u8>> =
+        state.try_get("active_decision_attempt_id")?;
+    let next_action_at: Option<DateTime<Utc>> = state.try_get("next_action_at")?;
+    let transition_primary_type: String = state.try_get("transition_primary_type")?;
+    let transition_effects: serde_json::Value = state.try_get("transition_effects_json")?;
+    let Ok(state_revision) = u64::try_from(state_revision) else {
+        return Ok(None);
+    };
+    let Ok(control_epoch) = u64::try_from(run_control_epoch) else {
+        return Ok(None);
+    };
+    let Ok(board_window) = u64::try_from(run_board_window) else {
+        return Ok(None);
+    };
+    if state_revision == 0
+        || state_event_id.len() != 32
+        || phase != "moderator_idle"
+        || state_control_epoch != run_control_epoch
+        || active_offer_id.is_some()
+        || active_grant_id.is_some()
+        || active_decision_attempt_id.is_some()
+        || next_action_at.is_some()
+        || !action_transition_matches(
+            &transition_primary_type,
+            &transition_effects,
+            action_run_id,
+            &action_condition,
+        )
+        || !meeting_action_state_event_matches_tx(
+            tx,
+            community_id,
+            meeting_id,
+            &state_event_id,
+            state_revision,
+            run_control_epoch,
+            run_board_window,
+            &board_event_id,
+            action_run_id,
+            &action_condition,
+            &transition_primary_type,
+            &transition_effects,
+        )
+        .await?
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(MeetingCoordinateResolution::FinalizingActions {
+        meeting_id,
+        state_revision,
+        state_event_id,
+        board_event_id,
+        action_run_id,
+        control_epoch,
+        board_window,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn meeting_action_state_event_matches_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    meeting_id: Uuid,
+    state_event_id: &[u8],
+    state_revision: u64,
+    control_epoch: i64,
+    board_window: i64,
+    board_event_id: &[u8],
+    action_run_id: Uuid,
+    action_condition: &str,
+    transition_primary_type: &str,
+    transition_effects: &serde_json::Value,
+) -> Result<bool> {
+    let content: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM events \
+         WHERE community_id = $1 AND channel_id = $2 AND id = $3 AND kind = $4 \
+           AND deleted_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(meeting_id)
+    .bind(state_event_id)
+    .bind(buzz_core::kind::KIND_MEETING_STATE as i32)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(content) = content else {
+        return Ok(false);
+    };
+    let Ok(content) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ok(false);
+    };
+    let expected_run = action_run_id.to_string();
+    let expected_run_hex = hex::encode(action_run_id.as_bytes());
+    let expected_board_hex = hex::encode(board_event_id);
+    let transition = &content["transition"];
+    let board_control = &content["board_control"];
+    let action = &board_control["action"];
+    Ok(
+        content.get("phase").and_then(serde_json::Value::as_str) == Some("moderator_idle")
+            && content
+                .get("state_revision")
+                .and_then(serde_json::Value::as_u64)
+                == Some(state_revision)
+            && content
+                .get("control_epoch")
+                .and_then(serde_json::Value::as_i64)
+                == Some(control_epoch)
+            && transition
+                .get("primary_type")
+                .and_then(serde_json::Value::as_str)
+                == Some(transition_primary_type)
+            && transition
+                .get("primary_object_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_run_hex.as_str())
+            && transition.get("effects") == Some(transition_effects)
+            && board_control
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                == Some("finalizing_actions")
+            && board_control
+                .get("control_epoch")
+                .and_then(serde_json::Value::as_i64)
+                == Some(control_epoch)
+            && board_control
+                .get("board_window")
+                .and_then(serde_json::Value::as_i64)
+                == Some(board_window)
+            && action
+                .get("action_run_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_run.as_str())
+            && action
+                .get("board_event_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_board_hex.as_str())
+            && action
+                .get("control_epoch")
+                .and_then(serde_json::Value::as_i64)
+                == Some(control_epoch)
+            && action
+                .get("board_window")
+                .and_then(serde_json::Value::as_i64)
+                == Some(board_window)
+            && action.get("condition").and_then(serde_json::Value::as_str)
+                == Some(action_condition)
+            && action
+                .get("terminal_status")
+                .is_some_and(serde_json::Value::is_null),
+    )
+}
+
+fn action_transition_matches(
+    primary_type: &str,
+    effects: &serde_json::Value,
+    action_run_id: Uuid,
+    action_condition: &str,
+) -> bool {
+    if !matches!(
+        primary_type,
+        "action_finalization_began"
+            | "action_lease_renewed"
+            | "action_blocked"
+            | "action_retried"
+            | "action_deadline_exceeded"
+            | "action_lease_expired"
+            | "action_operator_deadline_exceeded"
+    ) {
+        return false;
+    }
+    let expected_run = action_run_id.to_string();
+    effects.as_array().is_some_and(|effects| {
+        effects.iter().any(|effect| {
+            effect.get("type").and_then(serde_json::Value::as_str) == Some(primary_type)
+                && effect
+                    .get("object_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("meeting_action_run")
+                && effect.get("object_id").and_then(serde_json::Value::as_str)
+                    == Some(expected_run.as_str())
+                && effect.get("to").and_then(serde_json::Value::as_str) == Some(action_condition)
+        })
     })
 }
 
@@ -1437,6 +1788,42 @@ pub async fn active_meeting_reader_pubkeys_for_channel(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn finalizing_coordinate_requires_the_current_action_transition() {
+        let action_run_id = Uuid::new_v4();
+        let effects = json!([{
+            "type": "action_finalization_began",
+            "object_type": "meeting_action_run",
+            "object_id": action_run_id,
+            "from": "floor_ready",
+            "to": "runnable",
+        }]);
+        assert!(action_transition_matches(
+            "action_finalization_began",
+            &effects,
+            action_run_id,
+            "runnable",
+        ));
+        assert!(!action_transition_matches(
+            "action_finalization_began",
+            &effects,
+            Uuid::new_v4(),
+            "runnable",
+        ));
+        assert!(!action_transition_matches(
+            "action_returned_to_board",
+            &effects,
+            action_run_id,
+            "runnable",
+        ));
+        assert!(!action_transition_matches(
+            "action_finalization_began",
+            &effects,
+            action_run_id,
+            "blocked",
+        ));
+    }
 
     fn create_params<'a>(
         host: &'a [u8],
