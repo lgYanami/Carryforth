@@ -1,6 +1,6 @@
 # Meeting Action Finalization 逻辑主持人 ACK 与同步简化实现设计
 
-> 状态：方案确认，待实现
+> 状态：代码实现完成；阶段四验收进行中（独立 scratch DB 与真实 Provider 结果待验证）
 >
 > 日期：2026-08-08
 >
@@ -730,7 +730,8 @@ terminal State 确认最终结果。若 canonical 已终态则直接结束；若
 4. Meeting Contract 4、Project Space 7、meeting-context-v3 各自令旧 Session 正确重建；
 5. 历史 `affinity_lost` snapshot/terminal record 仍可读；
 6. 新验收 DB 无新增 `BLOCK(reason=affinity_lost)`，observer 无 continuity-lost event；
-7. 旧 ledger v7 fixture 保留 prepared End/renewal 与 canonical Action state。
+7. 旧 ledger v7 fixture 可兼容读取 retired `v2_continuity`、prepared End/renewal 与 canonical
+   Action state；运行时恢复只重放 exact current-fence prepared End，不跨重启重放 prepared renewal。
 
 ### 11.8 真实 Provider 验收
 
@@ -873,11 +874,36 @@ ledger 时不再生成它。不得以简化为由删除整个 `~/.local/state/bu
 
 ## 16. 实施记录
 
-待实现后补充：
+截至 2026-08-08，阶段一至阶段三的代码与文档切换已经完成；阶段四已完成不接触数据库的自动化
+回归，但尚未执行独立 scratch DB 失败矩阵和两场真实 Provider Meeting，因此本文仍不标记为“已实现”：
 
-- 分阶段提交；
-- 删除和保留的最终代码清单；
-- Contract 切换结果；
-- 自动化测试命令及结果；
-- 真实 Provider Meeting、Action Run、Board、ACK 与 End 证据；
-- 数据安全检查与构建缓存清理结果。
+- `buzz-acp`：删除 Meeting slot/session binding 与 result-side affinity 判断，改为 channel-aware
+  preferred-slot claim、ActionRunKey 去重、canonical preemption/停止屏障及进程级 renewal；
+- SDK / Relay / DB：保留 Action Run wire/表与 atomic End，切换 current runtime capability v4，停止
+  接受新的 `affinity_lost` BLOCK reason，同时保留历史读取；
+- System Contract：Meeting `4`、Project Space `7`、逐 Turn `meeting-context-v3`，不保留旧代际作为
+  current create gate；
+- Desktop / Tauri：roster capability 与 profile reconcile 切换到 v4；Human completion ACK 语义不变，
+  UI 不暴露物理槽/Session 恢复操作；
+- 文档：现行 Meeting、Desktop 与 Project Context 规范迁移到逻辑主持语义；历史 fix/bug 文档只追加
+  superseded 注记，不重写事故事实。
+
+自动化结果：
+
+- `cargo fmt --all`、Tauri Rust fmt、`git diff --check`、两份验收脚本 `bash -n`：通过；
+- `cargo clippy -p buzz-acp --lib -- -D warnings`：通过；
+- `cargo check -p buzz-sdk -p buzz-db -p buzz-relay` 与 Tauri 定向编译：通过；
+- `cargo test -p buzz-acp --lib`：`827 passed / 0 failed`；
+- Desktop `pnpm typecheck`、相关文件 Biome：通过；Meeting Create 定向 unit：`6/6`；
+- Tauri capability probe、profile reconcile、current BLOCK reason contract：`3/3`；
+- `meeting-create.spec.ts` mock E2E：`4/4`；
+- 交付后仅清理仓库内 Rust `incremental` 目录，释放约 `17.4 GiB`；依赖缓存、最终二进制和运行数据
+  均保留；
+- Desktop 全量 unit 当前为 `3624 passed / 2 failed`。两项失败均位于工作区既有、非本次交付所有的
+  `desktop/src/shared/lib/linkPreview.test.mjs`，其期望小写 Linear issue key，而现有实现返回 canonical
+  大写 key；本次未覆盖、修改或提交该用户文件。
+
+本轮没有运行任何 migration、truncate、fixture reset、主数据库 integration 或 live Relay 写入测试，
+也没有删除或重建 Relay volume、Meeting、Project View、Document、Context 或 ACP 本地状态。仍待补充：
+独立 scratch DB 失败矩阵，以及两场真实 Provider Meeting 的 Action Run/Board/renewal/ACK/End 证据；
+这些事实完成前不得把本文状态标记为“已实现”。

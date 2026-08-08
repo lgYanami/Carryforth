@@ -1217,7 +1217,6 @@ fn is_block_reason(reason: &str) -> bool {
             | "external_state_conflict"
             | "tool_unavailable"
             | "provider_failure"
-            | "affinity_lost"
             | "action_deadline_exceeded"
             | "action_lease_expired"
             | "action_operator_deadline_exceeded"
@@ -1522,19 +1521,19 @@ mod tests {
     }
 
     #[test]
-    fn direct_block_reasons_are_target_agnostic() {
+    fn current_direct_block_reasons_are_target_agnostic_without_affinity() {
         for reason in [
             "external_operation_failed",
             "external_state_conflict",
             "tool_unavailable",
             "provider_failure",
-            "affinity_lost",
             "action_deadline_exceeded",
             "action_lease_expired",
             "action_operator_deadline_exceeded",
         ] {
             assert!(is_block_reason(reason));
         }
+        assert!(!is_block_reason("affinity_lost"));
         assert!(!is_block_reason("assignee_unresolved"));
     }
 }

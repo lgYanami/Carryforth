@@ -605,8 +605,9 @@ attach，直到 operator 修复或补齐可验证投影；系统不得把它猜�
 建模为独立坐标。Inspector 可以把这些作为 Meeting 状态摘要显示。
 
 Action Finalization 允许主持 Human / Agent 显式维护 Context，但 Relay 不从 Board、Meeting End 或物化结果
-自动推断 Edge。主持人应在同一 Turn / ACP Session 内按顺序完成业务写入与回读、Context Document 写入、
-Meeting + 物化坐标 attach 和 canonical Edge 回读；没有真实关系时不得伪造 Edge。若 Meeting 后续
+自动推断 Edge。主持人应在同一 Action Finalization Turn、同一逻辑主持身份下按顺序完成业务写入与回读、
+Context Document 写入、Meeting + 物化坐标 attach 和 canonical Edge 回读；该 Turn 可由任意健康槽执行，
+不要求继承讨论阶段的 ACP Session。没有真实关系时不得伪造 Edge。若 Meeting 后续
 RETURN_TO_BOARD，已经提交的 Edge 不自动删除，hydration 显示其真实 active lifecycle。
 
 ### 9.3 归档、不可用和 detach

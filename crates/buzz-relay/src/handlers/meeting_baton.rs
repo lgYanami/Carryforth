@@ -420,6 +420,19 @@ fn action_reason_metric_label(value: Option<&str>) -> &'static str {
     }
 }
 
+fn is_current_action_block_reason(value: &str) -> bool {
+    matches!(
+        value,
+        "external_operation_failed"
+            | "external_state_conflict"
+            | "tool_unavailable"
+            | "provider_failure"
+            | "action_deadline_exceeded"
+            | "action_lease_expired"
+            | "action_operator_deadline_exceeded"
+    )
+}
+
 fn action_progress_stage_metric_label(value: &str) -> Option<&'static str> {
     match value {
         "reasoning" => Some("reasoning"),
@@ -486,6 +499,11 @@ fn parse_action_command(
             validate_clean_action_text(&event.content, 1_024, true, "block reason")?;
             let reason_code = require_single_tag(event, "reason-code")?;
             validate_clean_action_text(&reason_code, 128, false, "block reason code")?;
+            if !is_current_action_block_reason(&reason_code) {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: unsupported Meeting action block reason code: {reason_code}"
+                )));
+            }
             buzz_db::meeting_v2_actions::ActionCommand::Block {
                 fence: parse_action_run_fence(event)?,
                 reason_code,
@@ -1950,6 +1968,8 @@ mod tests {
             "affinity_lost"
         );
         assert_eq!(action_reason_metric_label(Some("private-id")), "other");
+        assert!(!is_current_action_block_reason("affinity_lost"));
+        assert!(is_current_action_block_reason("provider_failure"));
         assert_eq!(
             action_metric_transition("block", &serde_json::json!({})),
             Some(("action/runnable", "action/blocked"))

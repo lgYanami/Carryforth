@@ -2,7 +2,7 @@
 # Run one bounded real-Codex acceptance of Meeting V2 action finalization.
 #
 # This intentionally runs one scenario once. It is not a retrying qualification
-# framework: a provider, continuity, business-tool, or lifecycle failure leaves a
+# framework: a provider, logical-host, business-tool, or lifecycle failure leaves a
 # failed evidence record for review. Its disposable Project View uses the current
 # greenfield schema-v3 lifecycle; no ordinary v1/v2 runtime is involved.
 set -euo pipefail
@@ -33,7 +33,7 @@ relay_host="localhost:${relay_port}"
 relay_url="ws://${relay_host}"
 database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 relay_private_key="0000000000000000000000000000000000000000000000000000000000000001"
-action_capability="meeting-v2-action-finalization-v3"
+action_capability="meeting-v2-action-finalization-v4"
 redis_url=""
 relay_pid=""
 agent_pid=""
@@ -183,7 +183,8 @@ jq -e --arg capability "${action_capability}" '
     .schemaVersion == "3"
       and .policy == "moderated-board-actions-v3"
       and .capability == $capability
-      and .moderatorContinuity == "exact_agent_slot_and_acp_session"
+      and .moderatorExecution == "logical_agent_channel_session_preferred"
+      and .actionCompletion == "explicit_actions_recorded_ack"
       and (.turns | index("action_finalization") != null)
   )
 ' "${run_dir}/preflight/acp-capabilities.json" >/dev/null \
@@ -629,7 +630,13 @@ jq -e '
 printf '%s\n' "${db_state}" | jq . >"${run_dir}/database-invariants.json"
 
 observer_summary="$(jq -sc '
-  [ .[] | select(.kind == "meeting_v2_continuity_bound") ] as $bindings
+  [ .[] | select(
+    .kind == "meeting_v2_action_turn_queued"
+    or (
+      .kind == "meeting_v2_direct_action_turn_completed"
+      and .payload.action == "COMPLETE"
+    )
+  ) | [.payload.action_run_id, .payload.action_window_epoch, .payload.board_event_id] ] as $action_keys
   | {
       boardTurns: ([.[] | select(.kind == "meeting_v2_board_turn_completed")] | length),
       finalizingFloors: ([.[] | select(
@@ -645,11 +652,16 @@ observer_summary="$(jq -sc '
         and .payload.action == "COMPLETE"
       )] | length),
       formatRetries: ([.[] | select(.kind == "meeting_v2_action_format_retry")] | length),
-      continuityLost: ([.[] | select(.kind == "meeting_v2_continuity_lost")] | length),
-      continuityTuples: ($bindings
-        | map([.payload.agent_index, .payload.acp_session_id])
-        | unique),
-      continuityPhases: ($bindings | map(.payload.phase) | unique | sort)
+      continuityEvents: ([.[] | select(
+        .kind == "meeting_v2_continuity_bound"
+        or .kind == "meeting_v2_continuity_lost"
+      )] | length),
+      affinityBlocks: ([.[] | select(
+        .kind == "meeting_v2_direct_action_turn_completed"
+        and .payload.action == "BLOCK"
+        and .payload.reason_code == "affinity_lost"
+      )] | length),
+      logicalHostActionKeys: ($action_keys | unique)
     }
 ' "${run_dir}/acceptance-events.ndjson")"
 jq -e '
@@ -658,14 +670,13 @@ jq -e '
   and .actionTurns >= 1
   and .directCompletions == 1
   and .formatRetries <= 1
-  and .continuityLost == 0
-  and (.continuityTuples | length) == 1
-  and (.continuityTuples[0][0] == 0)
-  and (.continuityTuples[0][1] | type == "string" and length > 0)
-  and (.continuityPhases | index("final_control_cycle") != null)
-  and (.continuityPhases | index("pending_action") != null)
-  and (.continuityPhases | index("action") != null)
-' <<<"${observer_summary}" >/dev/null || fail "observer continuity or semantic-turn evidence did not pass"
+  and .continuityEvents == 0
+  and .affinityBlocks == 0
+  and (.logicalHostActionKeys | length) == 1
+  and (.logicalHostActionKeys[0][0] | type == "string" and length == 36)
+  and (.logicalHostActionKeys[0][1] == 1)
+  and (.logicalHostActionKeys[0][2] | type == "string" and length == 64)
+' <<<"${observer_summary}" >/dev/null || fail "observer logical-host or semantic-turn evidence did not pass"
 printf '%s\n' "${observer_summary}" | jq . >"${run_dir}/observer-invariants.json"
 
 curl -fsS "http://127.0.0.1:${metrics_port}/metrics" >"${run_dir}/metrics.prom"
@@ -701,6 +712,7 @@ jq -n \
   --arg status_sha "${workspace_status_sha256}" \
   --arg diff_sha "${workspace_diff_sha256}" \
   --arg model "${model}[max]" \
+  --arg capability "${action_capability}" \
   --arg meeting_id "${meeting_id}" \
   --arg assignment_id "${assignment_id}" \
   --arg role_id "${role_id}" \
@@ -716,7 +728,7 @@ jq -n \
     protocol: {
       schemaVersion: "3",
       policy: "moderated-board-actions-v3",
-      capability: "meeting-v2-action-finalization-v3"
+      capability: $capability
     },
     provider: {
       real: true,

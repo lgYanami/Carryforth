@@ -60,7 +60,14 @@ fn reconcile_meeting_capability_list(
 ) -> Vec<String> {
     let mut capabilities = existing
         .iter()
-        .filter(|capability| capability.as_str() != buzz_sdk_pkg::MEETING_V2_ACTIONS_CAPABILITY)
+        .filter(|capability| {
+            !matches!(
+                capability.as_str(),
+                buzz_sdk_pkg::MEETING_V2_ACTIONS_V2_CAPABILITY
+                    | buzz_sdk_pkg::MEETING_V2_ACTIONS_V3_CAPABILITY
+                    | buzz_sdk_pkg::MEETING_V2_ACTIONS_CAPABILITY
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     if supports_meeting_actions {
@@ -262,6 +269,8 @@ mod tests {
     fn meeting_capability_reconciliation_preserves_unknowns_and_can_withdraw() {
         let existing = vec![
             "z-capability".to_string(),
+            buzz_sdk_pkg::MEETING_V2_ACTIONS_V2_CAPABILITY.to_string(),
+            buzz_sdk_pkg::MEETING_V2_ACTIONS_V3_CAPABILITY.to_string(),
             buzz_sdk_pkg::MEETING_V2_ACTIONS_CAPABILITY.to_string(),
             "a-capability".to_string(),
         ];

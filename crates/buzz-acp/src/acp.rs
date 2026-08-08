@@ -233,6 +233,10 @@ pub struct AcpClient {
     /// compacted or reset during an in-flight turn. The next complete turn
     /// consumes the hint and requests a Full Role Brief.
     pending_context_resets: HashMap<String, String>,
+    /// Test seam for exercising the fatal unconfirmed-stop delivery path
+    /// without depending on an OS process that can resist SIGKILL.
+    #[cfg(test)]
+    force_shutdown_unconfirmed: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -417,55 +421,112 @@ fn build_client_capabilities() -> serde_json::Value {
 }
 
 impl AcpClient {
-    /// Kill the agent subprocess and wait for it to exit (no zombies).
+    /// Kill the agent subprocess and prove that its process group exited.
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
-    pub async fn shutdown(&mut self) {
+    ///
+    /// Returns `true` only after the direct child has been reaped and the
+    /// durable child registry proves that no process-group member remains.
+    /// A `false` result is deliberately not treated as cleanup: the process
+    /// group coordinate stays registered so a caller that owns a stop barrier
+    /// can retry, or a later harness generation can reap it fail-closed.
+    pub async fn shutdown(&mut self) -> bool {
         self.observe_process_terminal("shutdown_requested");
-        // Kill the entire process group when possible. The child was spawned
-        // with process_group(0), so its PID == its PGID. Killing the group
-        // ensures subprocesses (MCP servers, tool processes) are cleaned up
-        // rather than orphaned to init.
-        //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
+        #[cfg(test)]
+        if self.force_shutdown_unconfirmed {
+            return false;
+        }
+        let direct_child_live = matches!(self.child.try_wait(), Ok(None));
+        let mut group_signalled = false;
+        if let Some(process_group) = self.registered_process_group {
+            if crate::child_registry::is_configured() {
+                match crate::child_registry::signal_current_process_group(process_group) {
+                    Ok(()) => group_signalled = true,
+                    Err(error) => tracing::warn!(
+                        process_group,
+                        "refusing unverified Agent process-group kill: {error}"
+                    ),
+                }
+            } else if direct_child_live && self.child.id() == Some(process_group) {
+                // Unit/embedded use without the durable registry still has an
+                // exact live identity while the owned direct child retains
+                // this PID. Never use the raw PGID after the leader exited.
+                group_signalled = kill_process_group(process_group);
             }
+        }
+        if !group_signalled {
+            // Direct-child kill is identity-safe through the owned Child
+            // handle. It may leave descendants, so confirmation below still
+            // fails closed unless the whole group disappears.
+            let _ = self.child.start_kill();
         }
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
-        let reaped = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.child.wait(),
-        )
-        .await
-        {
-            Ok(Ok(_)) => true,
-            Ok(Err(e)) => {
-                tracing::debug!("child wait error after kill: {e}");
-                false
-            }
-            Err(_) => {
-                tracing::warn!("child did not exit within 5s after SIGKILL — abandoning");
-                false
-            }
-        };
-        if reaped {
-            if let Some(process_group) = self.registered_process_group.take() {
-                if let Err(error) = crate::child_registry::unregister_reaped(process_group) {
+        let reaped = if direct_child_live {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    tracing::debug!("child wait error after kill: {e}");
+                    false
+                }
+                Err(_) => {
                     tracing::warn!(
-                        process_group,
-                        "failed to retire child registry entry: {error}"
+                        "child did not exit within 5s after SIGKILL — shutdown remains unconfirmed"
                     );
+                    false
                 }
             }
+        } else {
+            matches!(self.child.try_wait(), Ok(Some(_)))
+        };
+        if !reaped {
+            return false;
         }
+
+        let Some(process_group) = self.registered_process_group else {
+            return true;
+        };
+        let confirmation = if crate::child_registry::is_configured() {
+            // The durable identity is authoritative here. Its start-time/token
+            // proof can distinguish an old generation from an unrelated
+            // process that later reused the same PID/PGID; a raw signal-0
+            // existence check cannot.
+            crate::child_registry::reap_registered_process_group(process_group).await
+        } else if process_group_exited(process_group) {
+            crate::child_registry::unregister_reaped(process_group)
+        } else {
+            Err(format!(
+                "unconfigured Agent process group {process_group} still exists"
+            ))
+        };
+        match confirmation {
+            Ok(()) => {
+                self.registered_process_group = None;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    process_group,
+                    "failed to confirm and retire child process group: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Test-only proof that the process stop coordinate was retired only
+    /// after shutdown confirmation.
+    #[cfg(test)]
+    pub(crate) fn shutdown_confirmed(&mut self) -> bool {
+        self.registered_process_group.is_none() && matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_shutdown_unconfirmed_for_test(&mut self, forced: bool) {
+        self.force_shutdown_unconfirmed = forced;
     }
 
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
@@ -622,6 +683,8 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             current_agent_message: String::new(),
             pending_context_resets: HashMap::new(),
+            #[cfg(test)]
+            force_shutdown_unconfirmed: false,
         })
     }
 
@@ -655,6 +718,12 @@ impl AcpClient {
     /// Return the pool slot index for this agent process.
     pub(crate) fn observer_agent_index(&self) -> Option<usize> {
         self.observer_agent_index
+    }
+
+    /// Durable process-group coordinate used by panic recovery after task
+    /// unwinding has dropped this client and its owned `Child` handle.
+    pub(crate) fn process_group(&self) -> Option<u32> {
+        self.registered_process_group
     }
 
     /// Emit a semantic event to the local observer feed, if enabled.
@@ -2449,6 +2518,26 @@ fn kill_process_group(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) -> bool {
     false
+}
+
+/// Return `true` only when the OS proves that no member of `pid`'s process
+/// group remains. Signal 0 performs an existence check without delivering a
+/// signal. Permission errors and all unexpected errors remain uncertain and
+/// therefore fail closed.
+#[cfg(unix)]
+fn process_group_exited(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    matches!(killpg(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
+}
+
+/// Non-Unix has no process-group coordinate in this client. Reaping the direct
+/// child is the strongest available confirmation.
+#[cfg(not(unix))]
+fn process_group_exited(_pid: u32) -> bool {
+    true
 }
 
 /// Suppress the console window that Windows otherwise allocates for every

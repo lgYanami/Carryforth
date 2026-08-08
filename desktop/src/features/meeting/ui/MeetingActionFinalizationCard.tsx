@@ -41,12 +41,12 @@ const BLOCK_LABELS: Record<MeetingActionBlockReason, string> = {
   external_state_conflict: "External state conflicts with the Board decision",
   tool_unavailable: "A required tool is unavailable",
   provider_failure: "An external provider is unavailable",
-  affinity_lost: "The original execution context was lost",
   action_deadline_exceeded: "The action window expired",
 };
 
 const BLOCKED_STATUS_LABELS: Record<string, string> = {
   ...BLOCK_LABELS,
+  affinity_lost: "The original execution context was lost",
   action_lease_expired: "The action host stopped renewing its lease",
   action_operator_deadline_exceeded: "The operator safety limit was reached",
 };

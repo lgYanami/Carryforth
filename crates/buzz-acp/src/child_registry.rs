@@ -172,6 +172,76 @@ pub(crate) fn unregister_reaped(process_group: u32) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn is_configured() -> bool {
+    REGISTRY.get().is_some()
+}
+
+/// Signal one exact registered group after validating its durable leader/token
+/// identity. Callers must not fall back to a raw PGID signal when this rejects
+/// an uncertain or leaderless group.
+pub(crate) fn signal_current_process_group(process_group: u32) -> Result<(), String> {
+    let registry = REGISTRY
+        .get()
+        .ok_or_else(|| "child process registry is not configured".to_owned())?;
+    let entry = registry
+        .process_groups
+        .lock()
+        .map_err(|_| "child process registry lock was poisoned".to_owned())?
+        .get(&process_group)
+        .cloned()
+        .ok_or_else(|| format!("Agent process group {process_group} is not registered"))?;
+    signal_registered_group(process_group, &entry)
+}
+
+/// Kill and prove absence of one exact registered Agent process group.
+///
+/// This is the panic-path counterpart to [`crate::acp::AcpClient::shutdown`]:
+/// task unwinding has already dropped the owned `Child`, so the main harness
+/// can only recover through the durable identity recorded here. The wait is
+/// bounded; callers must fail closed (normally by exiting the harness) when
+/// confirmation cannot be obtained.
+pub(crate) async fn reap_registered_process_group(process_group: u32) -> Result<(), String> {
+    let registry = REGISTRY
+        .get()
+        .ok_or_else(|| "child process registry is not configured".to_owned())?;
+    let entry = registry
+        .process_groups
+        .lock()
+        .map_err(|_| "child process registry lock was poisoned".to_owned())?
+        .get(&process_group)
+        .cloned();
+
+    let Some(entry) = entry else {
+        // Absence from a configured durable registry is itself the proof that
+        // this harness no longer owns the coordinate. Do not consult the raw
+        // PGID here: an unrelated process group may have reused it after the
+        // registered generation exited.
+        return Ok(());
+    };
+
+    signal_registered_group(process_group, &entry)?;
+    let deadline = tokio::time::Instant::now() + REAP_TIMEOUT;
+    loop {
+        terminate_marked_processes(&entry)?;
+        if !registered_group_survives(process_group, &entry) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "owned Agent process group {process_group} survived forced cleanup"
+            ));
+        }
+        tokio::time::sleep(REAP_POLL_INTERVAL).await;
+    }
+
+    let mut registered = registry
+        .process_groups
+        .lock()
+        .map_err(|_| "child process registry lock was poisoned".to_owned())?;
+    registered.remove(&process_group);
+    persist(&registry.path, &registered)
+}
+
 /// Kill and prove absence of every process group left by a previous harness
 /// generation. This must run before maintenance polling or Runtime admission.
 pub(crate) async fn reap_previous_generation() -> Result<(), String> {
@@ -449,5 +519,44 @@ mod tests {
             .expect("bounded child wait")
             .expect("reap registry fixture");
         assert!(!registered_group_survives(process_group, &entry));
+    }
+
+    #[tokio::test]
+    async fn leaderless_token_descendant_is_terminated_without_raw_group_identity() {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & sleep 0.5")
+            .env(CHILD_REGISTRY_TOKEN_ENV, &token)
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn leaderless registry fixture");
+        let process_group = child.id().expect("fixture process ID");
+        let entry = observe_spawned_identity(process_group, &token)
+            .await
+            .expect("observe fixture leader identity");
+
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("fixture leader exits")
+            .expect("reap fixture leader");
+        assert!(
+            !matching_processes(&entry).is_empty(),
+            "token-bearing descendant must outlive the process-group leader"
+        );
+
+        // With no leader, this must kill only token-matching descendants. It
+        // must not issue raw killpg against a potentially reused PGID.
+        signal_registered_group(process_group, &entry)
+            .expect("signal exact token-bearing descendants");
+        let deadline = tokio::time::Instant::now() + REAP_TIMEOUT;
+        while registered_group_survives(process_group, &entry) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "leaderless token descendant survived exact cleanup"
+            );
+            terminate_marked_processes(&entry).expect("repeat exact descendant kill");
+            tokio::time::sleep(REAP_POLL_INTERVAL).await;
+        }
     }
 }

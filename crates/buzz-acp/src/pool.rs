@@ -51,6 +51,11 @@ const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 pub struct TaskMeta {
     pub agent_index: usize,
     pub channel_id: Option<Uuid>,
+    /// Exact durable PGID for a controller-owned Meeting task. If that task
+    /// panics before returning its `OwnedAgent`, the main loop must reap this
+    /// registered process group before releasing coordinator busy state.
+    /// Ordinary channel turns and heartbeats store `None`.
+    pub meeting_process_group: Option<u32>,
     /// Identifies terminal events when the task panics before returning a result.
     pub turn_id: String,
     /// Clone of batch for Queue mode panic recovery.
@@ -107,9 +112,6 @@ pub struct SessionState {
     pub turn_counts: HashMap<Uuid, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
-    /// Channel sessions whose proactive rotation was deferred by a
-    /// continuity-sensitive Meeting control/action Turn.
-    deferred_channel_rotations: HashSet<Uuid>,
     /// channel_id → rendered NIP-AE core prompt section, populated once at
     /// session creation per Tyler's spec (no mid-session refresh).
     pub core_sections: HashMap<Uuid, String>,
@@ -196,7 +198,6 @@ impl SessionState {
         self.canvas_sections.remove(channel_id);
         self.project_space_contract_ids.remove(channel_id);
         self.meeting_contract_ids.remove(channel_id);
-        self.deferred_channel_rotations.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -208,7 +209,6 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.project_space_contract_ids.clear();
         self.meeting_contract_ids.clear();
-        self.deferred_channel_rotations.clear();
         self.heartbeat_project_space_contract_id = None;
         self.core_sections.clear();
         self.canvas_sections.clear();
@@ -319,21 +319,6 @@ impl SessionState {
         }
     }
 
-    fn defer_rotation(&mut self, source: &PromptSource) {
-        if let PromptSource::Channel(channel_id) = source {
-            self.deferred_channel_rotations.insert(*channel_id);
-        }
-    }
-
-    fn rotation_deferred(&self, source: &PromptSource) -> bool {
-        match source {
-            PromptSource::Channel(channel_id) => {
-                self.deferred_channel_rotations.contains(channel_id)
-            }
-            PromptSource::Heartbeat => false,
-        }
-    }
-
     #[cfg(test)]
     fn has_channel_state(&self, channel_id: &Uuid) -> bool {
         self.sessions.contains_key(channel_id)
@@ -415,10 +400,6 @@ pub struct AgentPool {
     /// Additional idle slots held briefly while a Meeting V2 participant Turn
     /// reads its current Board or waits for immediate model dispatch.
     reserved_meeting_board_slots: usize,
-    /// Exclusive Agent-slot bindings owned by action-capable Meeting V2
-    /// moderator control cycles. Ordinary work and every other Meeting must
-    /// treat these slots as unavailable even while the process is idle.
-    meeting_slot_bindings: HashMap<Uuid, MeetingSlotBinding>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
@@ -435,48 +416,8 @@ pub struct PromptResult {
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
-    /// Channel ACP Session retained after this Turn. A missing value on a
-    /// continuity-sensitive Meeting result is an affinity failure.
-    pub resolved_session_id: Option<String>,
-    /// Proactive rotation was requested but intentionally held until the
-    /// Meeting continuity chain is released.
-    pub rotation_deferred: bool,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
-}
-
-/// Local continuity phase for an action-capable Meeting moderator slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MeetingSlotBindingPhase {
-    /// A successful Board Turn is waiting for its matching Floor Turn.
-    FinalControlCycle,
-    /// A Floor result selected FINALIZE_ACTIONS but Relay authority has not
-    /// yet confirmed the action run.
-    PendingAction,
-    /// Relay authority confirmed the active action-finalization run.
-    Action,
-    /// RETURN_TO_BOARD kept the same moderator slot for the next control cycle.
-    ModeratorMeeting,
-}
-
-/// Exact local identity retained for one Meeting moderator continuity chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MeetingSlotBinding {
-    pub(crate) meeting_id: Uuid,
-    pub(crate) agent_index: usize,
-    pub(crate) acp_session_id: String,
-    pub(crate) phase: MeetingSlotBindingPhase,
-    /// A provider/session rotation requested by the completed Turn but delayed
-    /// until the continuity chain is definitively released.
-    pub(crate) deferred_rotation: bool,
-}
-
-/// Why an exact Meeting claim could not return its bound slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactMeetingClaimError {
-    MissingBinding,
-    Busy,
-    AffinityLost,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -595,9 +536,9 @@ pub enum ControlSignal {
     /// turn re-creates the session and re-applies `desired_model`. Runtime-only
     /// — never persisted, gone on restart/respawn.
     SwitchModel(String),
-    /// A Relay-signed Meeting transition made this exact turn obsolete while
-    /// the moderator's slot/session affinity remains authoritative. The ACP
-    /// prompt is drained, but its channel session is deliberately preserved.
+    /// A Relay-signed Meeting transition made this exact turn obsolete. The
+    /// ACP prompt is drained, while its healthy channel session is preserved
+    /// only as a best-effort preference for later work.
     MeetingCanonicalAdvance,
 }
 
@@ -746,6 +687,43 @@ pub enum PromptOutcome {
     /// `CancelReason` on the batch (steer/interrupt requeue, explicit cancel
     /// drops) rather than the hard-cap's unconditional dead-letter.
     CancelDrainTimeout(Duration),
+    /// A controller-owned Meeting process-replacement outcome could not prove
+    /// physical process stop within the bounded shutdown attempt. This is a
+    /// fatal harness sentinel, not an ordinary completed turn: the main loop
+    /// must exit before clearing coordinator busy state or dispatching work.
+    MeetingProcessStopUnconfirmed,
+}
+
+impl PromptOutcome {
+    /// Whether this value is a fatal harness-control sentinel rather than an
+    /// ordinary turn result.
+    pub(crate) fn requires_harness_exit(&self) -> bool {
+        matches!(self, Self::MeetingProcessStopUnconfirmed)
+    }
+
+    /// Whether the main loop will replace the owning Agent process rather than
+    /// return it to the idle pool.
+    ///
+    /// Controller-owned Meeting turns use this exact predicate to establish a
+    /// physical process-stop barrier before publishing their `PromptResult`.
+    /// Keep it aligned with `handle_prompt_result`'s respawn branches.
+    pub(crate) fn requires_process_replacement(&self) -> bool {
+        match self {
+            Self::AgentExited | Self::Timeout(_) | Self::CancelDrainTimeout(_) => true,
+            Self::Error(error) => matches!(
+                error,
+                AcpError::Io(_)
+                    | AcpError::WriteTimeout(_)
+                    | AcpError::Timeout(_)
+                    | AcpError::Protocol(_)
+            ),
+            Self::Ok(_)
+            | Self::LeaseExpired
+            | Self::Cancelled
+            | Self::MeetingSuperseded
+            | Self::MeetingProcessStopUnconfirmed => false,
+        }
+    }
 }
 
 /// Immutable config subset shared (via `Arc`) by all spawned prompt tasks.
@@ -881,7 +859,6 @@ impl AgentPool {
             agents: slots,
             reserved_meeting_slots: 0,
             reserved_meeting_board_slots: 0,
-            meeting_slot_bindings: HashMap::new(),
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -926,12 +903,9 @@ impl AgentPool {
     fn try_claim_inner(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this channel.
         if let Some(cid) = channel_id {
-            let idx = self.agents.iter().enumerate().position(|(index, slot)| {
-                !self.slot_is_meeting_bound(index)
-                    && slot
-                        .as_ref()
-                        .map(|a| a.state.sessions.contains_key(&cid))
-                        .unwrap_or(false)
+            let idx = self.agents.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|agent| agent.state.sessions.contains_key(&cid))
             });
             if let Some(i) = idx {
                 return self.agents[i].take();
@@ -939,151 +913,8 @@ impl AgentPool {
         }
 
         // Pass 2: first idle agent.
-        let idx = self
-            .agents
-            .iter()
-            .enumerate()
-            .position(|(index, slot)| !self.slot_is_meeting_bound(index) && slot.is_some());
+        let idx = self.agents.iter().position(Option::is_some);
         idx.map(|i| self.agents[i].take().unwrap())
-    }
-
-    /// Install the exclusive continuity identity captured from a completed
-    /// action-capable moderator Board Turn. The slot may still be checked out;
-    /// binding therefore happens before the `OwnedAgent` is returned.
-    pub(crate) fn bind_meeting_slot(
-        &mut self,
-        meeting_id: Uuid,
-        agent_index: usize,
-        acp_session_id: String,
-        phase: MeetingSlotBindingPhase,
-        deferred_rotation: bool,
-    ) -> Result<(), &'static str> {
-        if acp_session_id.is_empty() || agent_index >= self.agents.len() {
-            return Err("invalid_binding_identity");
-        }
-        if let Some(existing) = self.meeting_slot_bindings.get_mut(&meeting_id) {
-            if existing.agent_index != agent_index || existing.acp_session_id != acp_session_id {
-                return Err("meeting_binding_conflict");
-            }
-            existing.phase = phase;
-            existing.deferred_rotation |= deferred_rotation;
-            return Ok(());
-        }
-        if self
-            .meeting_slot_bindings
-            .values()
-            .any(|binding| binding.agent_index == agent_index)
-        {
-            return Err("slot_already_bound");
-        }
-        self.meeting_slot_bindings.insert(
-            meeting_id,
-            MeetingSlotBinding {
-                meeting_id,
-                agent_index,
-                acp_session_id,
-                phase,
-                deferred_rotation,
-            },
-        );
-        Ok(())
-    }
-
-    /// Claim only the slot/session previously bound to this Meeting.
-    pub(crate) fn claim_exact_meeting(
-        &mut self,
-        meeting_id: Uuid,
-    ) -> Result<OwnedAgent, ExactMeetingClaimError> {
-        let Some(binding) = self.meeting_slot_bindings.get(&meeting_id).cloned() else {
-            return Err(ExactMeetingClaimError::MissingBinding);
-        };
-        let Some(slot) = self.agents.get_mut(binding.agent_index) else {
-            return Err(ExactMeetingClaimError::AffinityLost);
-        };
-        let Some(agent) = slot.as_ref() else {
-            return Err(
-                if self
-                    .task_map
-                    .values()
-                    .any(|task| task.agent_index == binding.agent_index)
-                {
-                    ExactMeetingClaimError::Busy
-                } else {
-                    ExactMeetingClaimError::AffinityLost
-                },
-            );
-        };
-        if agent.state.sessions.get(&meeting_id) != Some(&binding.acp_session_id) {
-            return Err(ExactMeetingClaimError::AffinityLost);
-        }
-        slot.take().ok_or(ExactMeetingClaimError::Busy)
-    }
-
-    pub(crate) fn meeting_slot_binding(&self, meeting_id: Uuid) -> Option<&MeetingSlotBinding> {
-        self.meeting_slot_bindings.get(&meeting_id)
-    }
-
-    pub(crate) fn idle_bound_meeting_ids(&self) -> HashSet<Uuid> {
-        self.meeting_slot_bindings
-            .iter()
-            .filter_map(|(meeting_id, binding)| {
-                self.agents
-                    .get(binding.agent_index)
-                    .is_some_and(Option::is_some)
-                    .then_some(*meeting_id)
-            })
-            .collect()
-    }
-
-    pub(crate) fn promote_meeting_slot_binding(
-        &mut self,
-        meeting_id: Uuid,
-        phase: MeetingSlotBindingPhase,
-    ) -> bool {
-        let Some(binding) = self.meeting_slot_bindings.get_mut(&meeting_id) else {
-            return false;
-        };
-        binding.phase = phase;
-        true
-    }
-
-    /// Release a Meeting binding. Deferred proactive rotation is applied only
-    /// now, after the continuity-sensitive chain is known not to need it.
-    pub(crate) fn release_meeting_slot_binding(&mut self, meeting_id: Uuid) -> bool {
-        let Some(binding) = self.meeting_slot_bindings.remove(&meeting_id) else {
-            return false;
-        };
-        if binding.deferred_rotation {
-            if let Some(agent) = self
-                .agents
-                .get_mut(binding.agent_index)
-                .and_then(Option::as_mut)
-            {
-                agent.state.invalidate_channel(&meeting_id);
-            }
-        }
-        true
-    }
-
-    /// Drop every binding owned by a failed/replaced physical Agent slot.
-    pub(crate) fn lose_meeting_slot_bindings_for_agent(&mut self, agent_index: usize) -> Vec<Uuid> {
-        let lost: Vec<_> = self
-            .meeting_slot_bindings
-            .iter()
-            .filter_map(|(meeting_id, binding)| {
-                (binding.agent_index == agent_index).then_some(*meeting_id)
-            })
-            .collect();
-        for meeting_id in &lost {
-            self.meeting_slot_bindings.remove(meeting_id);
-        }
-        lost
-    }
-
-    fn slot_is_meeting_bound(&self, agent_index: usize) -> bool {
-        self.meeting_slot_bindings
-            .values()
-            .any(|binding| binding.agent_index == agent_index)
     }
 
     /// Hold this many live slots for accepted moderated Meeting Offers/Grants.
@@ -1125,22 +956,15 @@ impl AgentPool {
 
     /// Idle physical slots available to ordinary work or another Meeting.
     pub(crate) fn claimable_unleased_count(&self) -> usize {
-        self.agents
-            .iter()
-            .enumerate()
-            .filter(|(index, slot)| slot.is_some() && !self.slot_is_meeting_bound(*index))
-            .count()
+        self.agents.iter().filter(|slot| slot.is_some()).count()
     }
 
     /// Whether any idle agent already has a session for `channel_id`.
     /// Used to compute `affinity_hit` before calling `try_claim`.
     pub fn has_session_for(&self, channel_id: Uuid) -> bool {
-        self.agents.iter().enumerate().any(|(index, slot)| {
-            !self.slot_is_meeting_bound(index)
-                && slot
-                    .as_ref()
-                    .map(|a| a.state.sessions.contains_key(&channel_id))
-                    .unwrap_or(false)
+        self.agents.iter().any(|slot| {
+            slot.as_ref()
+                .is_some_and(|agent| agent.state.sessions.contains_key(&channel_id))
         })
     }
 
@@ -1155,7 +979,6 @@ impl AgentPool {
 
     pub(crate) fn claimable_unleased_live_count(&self) -> usize {
         self.live_count()
-            .saturating_sub(self.meeting_slot_bindings.len())
     }
 
     pub fn task_map(&self) -> &HashMap<tokio::task::Id, TaskMeta> {
@@ -1931,24 +1754,40 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
 /// can never trigger the assert.
 ///
 /// On the happy path the read loop has already called `take()`, so this is a no-op.
-fn send_prompt_result(
+///
+/// A process-replacing controller-owned Meeting outcome is additionally held
+/// behind a physical stop barrier. `PromptResult` is the coordinator's busy-
+/// state release edge, so it must not become observable until the old ACP child
+/// and its process group are confirmed absent. A bounded confirmation failure
+/// becomes a dedicated fatal sentinel; the main loop exits before interpreting
+/// it as a completed turn.
+async fn send_prompt_result(
     result_tx: &mpsc::UnboundedSender<PromptResult>,
     turn_id: &str,
     mut agent: OwnedAgent,
     source: PromptSource,
-    outcome: PromptOutcome,
+    mut outcome: PromptOutcome,
     batch: Option<FlushBatch>,
+    meeting_process_stop_barrier: bool,
 ) {
+    if meeting_process_stop_barrier && outcome.requires_process_replacement() {
+        agent.state.invalidate_all();
+        if !agent.acp.shutdown().await {
+            tracing::error!(
+                target: "pool::meeting_stop_barrier",
+                agent = agent.index,
+                turn_id,
+                "Meeting process stop remains unconfirmed; sending fatal harness sentinel"
+            );
+            outcome = PromptOutcome::MeetingProcessStopUnconfirmed;
+        }
+    }
     agent.acp.clear_steer_rx();
-    let resolved_session_id = agent.state.session_id(&source).map(str::to_owned);
-    let rotation_deferred = agent.state.rotation_deferred(&source);
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
-        resolved_session_id,
-        rotation_deferred,
         batch,
     });
 }
@@ -1984,10 +1823,11 @@ pub(crate) struct PromptExecution {
     /// Authoritative same-turn lease replacements. Present only for an exact
     /// Meeting Action turn; updates do not count as ACP activity.
     pub(crate) deadline_updates: Option<tokio::sync::watch::Receiver<tokio::time::Instant>>,
+    /// This is a coordinator-owned Meeting turn whose process-replacing
+    /// outcome must not release coordinator busy state before process exit is
+    /// confirmed.
+    pub(crate) meeting_process_stop_barrier: bool,
     pub(crate) turn_id: String,
-    /// Keep an otherwise-rotatable successful channel Session alive until the
-    /// main loop has installed/released its Meeting continuity binding.
-    pub(crate) defer_session_rotation: bool,
 }
 
 pub async fn run_prompt_task(
@@ -2002,8 +1842,8 @@ pub async fn run_prompt_task(
         mut control_rx,
         absolute_hard_deadline,
         mut deadline_updates,
+        meeting_process_stop_barrier,
         turn_id,
-        defer_session_rotation,
     } = execution;
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
@@ -2111,7 +1951,9 @@ pub async fn run_prompt_task(
                         source.clone(),
                         PromptOutcome::Cancelled,
                         retry_batch,
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                     return;
                 }
                 result = $future => result,
@@ -2386,7 +2228,9 @@ pub async fn run_prompt_task(
                             source,
                             PromptOutcome::AgentExited,
                             requeue_batch_if_queue(&ctx, batch),
-                        );
+                            meeting_process_stop_barrier,
+                        )
+                        .await;
                         return;
                     }
                     Err(e) => {
@@ -2399,7 +2243,9 @@ pub async fn run_prompt_task(
                             source,
                             PromptOutcome::Error(e),
                             requeue_batch_if_queue(&ctx, batch),
-                        );
+                            meeting_process_stop_barrier,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -2436,7 +2282,9 @@ pub async fn run_prompt_task(
                             source,
                             PromptOutcome::AgentExited,
                             None,
-                        );
+                            meeting_process_stop_barrier,
+                        )
+                        .await;
                         return;
                     }
                     Err(e) => {
@@ -2447,7 +2295,9 @@ pub async fn run_prompt_task(
                             source,
                             PromptOutcome::Error(e),
                             None,
-                        );
+                            meeting_process_stop_barrier,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -2527,7 +2377,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::AgentExited,
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                     return;
                 }
                 Err(AcpError::IdleTimeout(_)) => {
@@ -2552,7 +2404,9 @@ pub async fn run_prompt_task(
                                 source,
                                 PromptOutcome::AgentExited,
                                 requeue_batch_if_queue(&ctx, batch),
-                            );
+                                meeting_process_stop_barrier,
+                            )
+                            .await;
                             return;
                         }
                         Err(e) => {
@@ -2570,7 +2424,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                     return;
                 }
                 Err(AcpError::HardTimeout { silence }) => {
@@ -2588,7 +2444,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                     return;
                 }
                 Err(e) => {
@@ -2604,7 +2462,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::Error(e),
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -2693,7 +2553,9 @@ pub async fn run_prompt_task(
             source,
             PromptOutcome::Error(AcpError::Protocol("no batch and no prompt_text".into())),
             None,
-        );
+            meeting_process_stop_barrier,
+        )
+        .await;
         return;
     };
 
@@ -2750,7 +2612,9 @@ pub async fn run_prompt_task(
                 PromptOutcome::Cancelled
             },
             retry_batch,
-        );
+            meeting_process_stop_barrier,
+        )
+        .await;
         return;
     }
 
@@ -2825,7 +2689,9 @@ pub async fn run_prompt_task(
                         source.clone(),
                         PromptOutcome::Cancelled,
                         retry_batch,
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                     return;
                 }
                 result = agent.acp.session_prompt_blocks_with_deadline_updates(
@@ -2898,10 +2764,18 @@ pub async fn run_prompt_task(
                                         PromptOutcome::Cancelled
                                     },
                                     retry_batch,
-                                );
+                                    meeting_process_stop_barrier,
+                                )
+                                .await;
                                 return;
                             }
                             Err(error) => {
+                                tracing::error!(
+                                    target: "pool::prompt",
+                                    error = %error,
+                                    meeting_canonical_advance,
+                                    "control-signal cancellation did not drain cleanly"
+                                );
                                 // Single production arm: classify the error→outcome
                                 // and outcome→batch-fate boundary once via the seam
                                 // shared with tests, then invalidate/publish/send once.
@@ -2934,7 +2808,9 @@ pub async fn run_prompt_task(
                                     source,
                                     failure.outcome,
                                     failure.retry_batch,
-                                );
+                                    meeting_process_stop_barrier,
+                                )
+                                .await;
                                 return;
                             }
                         }
@@ -2997,7 +2873,9 @@ pub async fn run_prompt_task(
                                 PromptOutcome::Ok(StopReason::EndTurn)
                             },
                             None, // turn succeeded — batch was processed, no requeue
-                        );
+                            meeting_process_stop_barrier,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -3037,19 +2915,11 @@ pub async fn run_prompt_task(
             };
 
             if should_rotate {
-                if defer_session_rotation && matches!(source, PromptSource::Channel(_)) {
-                    tracing::info!(
-                        target: "pool::session",
-                        "deferring Meeting session rotation for {source:?} after {stop_reason:?}",
-                    );
-                    agent.state.defer_rotation(&source);
-                } else {
-                    tracing::info!(
-                        target: "pool::session",
-                        "rotating session for {source:?} after {stop_reason:?}",
-                    );
-                    agent.state.invalidate(&source);
-                }
+                tracing::info!(
+                    target: "pool::session",
+                    "rotating session for {source:?} after {stop_reason:?}",
+                );
+                agent.state.invalidate(&source);
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -3071,7 +2941,9 @@ pub async fn run_prompt_task(
                 source,
                 PromptOutcome::Ok(stop_reason),
                 None,
-            );
+                meeting_process_stop_barrier,
+            )
+            .await;
         }
         Err(AcpError::AgentExited) => {
             tracing::error!(target: "pool::prompt", "agent {} exited during prompt", agent.index);
@@ -3093,7 +2965,9 @@ pub async fn run_prompt_task(
                 source,
                 PromptOutcome::AgentExited,
                 requeue_batch_if_queue(&ctx, batch),
-            );
+                meeting_process_stop_barrier,
+            )
+            .await;
         }
         Err(AcpError::IdleTimeout(_)) => {
             tracing::warn!(
@@ -3127,7 +3001,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                 }
                 Err(AcpError::AgentExited) => {
                     tracing::error!(
@@ -3153,7 +3029,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::AgentExited,
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -3178,7 +3056,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                 }
             }
         }
@@ -3207,7 +3087,9 @@ pub async fn run_prompt_task(
                 source,
                 PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
                 requeue_batch_if_queue(&ctx, batch),
-            );
+                meeting_process_stop_barrier,
+            )
+            .await;
         }
         Err(AcpError::LeaseExpired { silence }) => {
             tracing::warn!(
@@ -3238,7 +3120,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::LeaseExpired,
                         None,
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                 }
                 Err(AcpError::AgentExited) => {
                     agent.state.invalidate_all();
@@ -3249,7 +3133,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::AgentExited,
                         requeue_batch_if_queue(&ctx, batch),
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                 }
                 Err(error) => {
                     tracing::error!(
@@ -3264,7 +3150,9 @@ pub async fn run_prompt_task(
                         source,
                         PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
                         None,
-                    );
+                        meeting_process_stop_barrier,
+                    )
+                    .await;
                 }
             }
         }
@@ -3293,7 +3181,9 @@ pub async fn run_prompt_task(
                 source,
                 PromptOutcome::Error(e),
                 requeue_batch_if_queue(&ctx, batch),
-            );
+                meeting_process_stop_barrier,
+            )
+            .await;
         }
     }
     // _reaction_guard drops here → spawns clear_reactions for all exit paths.
@@ -4126,20 +4016,40 @@ fn classify_control_cancel_failure(
     signal: ControlSignal,
     batch: Option<FlushBatch>,
 ) -> ControlCancelFailure {
-    let (outcome, invalidate_all) = match error {
-        AcpError::AgentExited => (PromptOutcome::AgentExited, true),
-        AcpError::IdleTimeout(_) => (PromptOutcome::Timeout(TimeoutKind::Idle), false),
-        AcpError::CancelDrainTimeout(grace) => (PromptOutcome::CancelDrainTimeout(grace), false),
-        // Defense in depth: this bounded cancellation API is documented to
-        // translate its own HardTimeout into CancelDrainTimeout, so this arm
-        // should be unreachable in practice. If it ever fires anyway, still
-        // report the truthful non-hard outcome rather than the real hard-cap
-        // (which would dead-letter the batch and claim the configured cap).
-        AcpError::HardTimeout { .. } => (
-            PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
-            false,
-        ),
-        other => (PromptOutcome::Error(other), false),
+    let meeting_canonical_advance = matches!(signal, ControlSignal::MeetingCanonicalAdvance);
+    let (outcome, invalidate_all) = if meeting_canonical_advance {
+        // Any failure to confirm canonical cancellation poisons the old
+        // physical Agent generation. Normalize it to a replacement outcome so
+        // `send_prompt_result` establishes the process-exit barrier and the
+        // main loop cannot accidentally return the now-killed Agent to the
+        // pool. Preserve AgentExited when the provider already reported EOF;
+        // both variants take the same confirmed-stop + respawn path.
+        match error {
+            AcpError::AgentExited => (PromptOutcome::AgentExited, true),
+            AcpError::CancelDrainTimeout(grace) => (PromptOutcome::CancelDrainTimeout(grace), true),
+            _ => (
+                PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                true,
+            ),
+        }
+    } else {
+        match error {
+            AcpError::AgentExited => (PromptOutcome::AgentExited, true),
+            AcpError::IdleTimeout(_) => (PromptOutcome::Timeout(TimeoutKind::Idle), false),
+            AcpError::CancelDrainTimeout(grace) => {
+                (PromptOutcome::CancelDrainTimeout(grace), false)
+            }
+            // Defense in depth: this bounded cancellation API is documented to
+            // translate its own HardTimeout into CancelDrainTimeout, so this arm
+            // should be unreachable in practice. If it ever fires anyway, still
+            // report the truthful non-hard outcome rather than the real hard-cap
+            // (which would dead-letter the batch and claim the configured cap).
+            AcpError::HardTimeout { .. } => (
+                PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                false,
+            ),
+            other => (PromptOutcome::Error(other), false),
+        }
     };
     ControlCancelFailure {
         outcome,
@@ -4938,8 +4848,8 @@ mod tests {
                     control_rx: None,
                     absolute_hard_deadline: None,
                     deadline_updates: None,
+                    meeting_process_stop_barrier: true,
                     turn_id: "meeting-granted-turn-test".into(),
-                    defer_session_rotation: false,
                 },
             ),
         )
@@ -5005,8 +4915,8 @@ mod tests {
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: None,
                     deadline_updates: None,
+                    meeting_process_stop_barrier: true,
                     turn_id: "pre-prompt-cancel-test".into(),
-                    defer_session_rotation: false,
                 },
             ),
         )
@@ -5069,8 +4979,8 @@ mod tests {
                     control_rx: Some(control_rx),
                     absolute_hard_deadline: None,
                     deadline_updates: None,
+                    meeting_process_stop_barrier: true,
                     turn_id: "pre-prompt-meeting-superseded-test".into(),
-                    defer_session_rotation: false,
                 },
             ),
         )
@@ -5136,8 +5046,8 @@ mod tests {
                 control_rx: Some(control_rx),
                 absolute_hard_deadline: None,
                 deadline_updates: None,
+                meeting_process_stop_barrier: true,
                 turn_id: "in-flight-meeting-superseded-test".into(),
-                defer_session_rotation: false,
             },
         ));
 
@@ -5224,80 +5134,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn action_meeting_binding_keeps_board_floor_and_action_on_one_slot_and_session() {
+    async fn channel_aware_claims_prefer_existing_session_and_fall_back_across_four_slots() {
         let meeting_id = Uuid::new_v4();
-        let mut moderator = meeting_pool_test_agent(0).await;
-        moderator
+        let first = meeting_pool_test_agent(0).await;
+        let second = meeting_pool_test_agent(1).await;
+        let mut preferred = meeting_pool_test_agent(2).await;
+        let fourth = meeting_pool_test_agent(3).await;
+        preferred
             .state
             .sessions
-            .insert(meeting_id, "moderator-meeting-session".into());
-        let ordinary = meeting_pool_test_agent(1).await;
-        let mut pool = AgentPool::from_slots(vec![Some(moderator), Some(ordinary)]);
+            .insert(meeting_id, "preferred-meeting-session".into());
+        let mut pool = AgentPool::from_slots(vec![
+            Some(first),
+            Some(second),
+            Some(preferred),
+            Some(fourth),
+        ]);
+        pool.set_reserved_meeting_slots(1);
+        pool.set_reserved_meeting_board_slots(1);
 
-        pool.bind_meeting_slot(
-            meeting_id,
-            0,
-            "moderator-meeting-session".into(),
-            MeetingSlotBindingPhase::FinalControlCycle,
-            false,
-        )
-        .expect("bind final Board control slot");
         let ordinary_claim = pool
             .try_claim(Some(meeting_id))
-            .expect("ordinary work may use only the unbound slot");
-        assert_eq!(ordinary_claim.index, 1);
-
-        let floor_claim = pool
-            .claim_exact_meeting(meeting_id)
-            .expect("Floor must exact-claim the Board slot");
-        assert_eq!(floor_claim.index, 0);
+            .expect("ordinary channel work may use capacity above both reservation floors");
+        assert_eq!(ordinary_claim.index, 2);
         assert_eq!(
-            floor_claim
+            ordinary_claim
                 .state
                 .sessions
                 .get(&meeting_id)
                 .map(String::as_str),
-            Some("moderator-meeting-session")
+            Some("preferred-meeting-session")
         );
-        pool.return_agent(floor_claim);
+        let fallback_claim = pool
+            .try_claim_meeting_board(meeting_id)
+            .expect("a Meeting Board turn may fall back while the preferred slot is busy");
+        assert_eq!(fallback_claim.index, 0);
         assert!(
-            pool.promote_meeting_slot_binding(meeting_id, MeetingSlotBindingPhase::PendingAction)
+            !fallback_claim.state.sessions.contains_key(&meeting_id),
+            "fallback does not require inherited ACP session state"
         );
-
-        let action_claim = pool
-            .claim_exact_meeting(meeting_id)
-            .expect("Action Finalization must exact-claim the same slot");
-        assert_eq!(action_claim.index, 0);
-        assert_eq!(
-            action_claim
-                .state
-                .sessions
-                .get(&meeting_id)
-                .map(String::as_str),
-            Some("moderator-meeting-session")
-        );
-        pool.return_agent(action_claim);
-        pool.bind_meeting_slot(
-            meeting_id,
-            0,
-            "moderator-meeting-session".into(),
-            MeetingSlotBindingPhase::Action,
-            true,
-        )
-        .expect("promote the exact binding and defer rotation");
-        assert!(pool.release_meeting_slot_binding(meeting_id));
-        assert!(pool.agents[0]
-            .as_ref()
-            .is_some_and(|agent| !agent.state.sessions.contains_key(&meeting_id)));
 
         pool.return_agent(ordinary_claim);
+        let preferred_claim = pool
+            .try_claim_meeting_board(meeting_id)
+            .expect("an available channel session remains the Meeting preference");
+        assert_eq!(preferred_claim.index, 2);
+
+        let final_board_claim = pool
+            .try_claim_meeting_board(meeting_id)
+            .expect("Board turns may consume idle capacity above the Grant floor");
+        assert_eq!(final_board_claim.index, 1);
+        assert!(
+            pool.try_claim_meeting_board(meeting_id).is_none(),
+            "Board turns must leave the final Offer/Grant-reserved slot idle"
+        );
+
+        pool.return_agent(fallback_claim);
+        pool.return_agent(preferred_claim);
+        pool.return_agent(final_board_claim);
         for agent in pool.agents.iter_mut().flatten() {
             agent.acp.shutdown().await;
         }
     }
 
     #[tokio::test]
-    async fn exact_action_meeting_claim_fails_closed_when_the_session_changes() {
+    async fn single_slot_board_claim_accepts_a_rotated_channel_session() {
         let meeting_id = Uuid::new_v4();
         let mut moderator = meeting_pool_test_agent(0).await;
         moderator
@@ -5305,14 +5206,7 @@ mod tests {
             .sessions
             .insert(meeting_id, "original-session".into());
         let mut pool = AgentPool::from_slots(vec![Some(moderator)]);
-        pool.bind_meeting_slot(
-            meeting_id,
-            0,
-            "original-session".into(),
-            MeetingSlotBindingPhase::Action,
-            false,
-        )
-        .expect("bind action slot");
+        pool.set_reserved_meeting_board_slots(1);
         pool.agents[0]
             .as_mut()
             .expect("idle moderator slot")
@@ -5320,16 +5214,21 @@ mod tests {
             .sessions
             .insert(meeting_id, "replacement-session".into());
 
-        assert!(matches!(
-            pool.claim_exact_meeting(meeting_id),
-            Err(ExactMeetingClaimError::AffinityLost)
-        ));
-        assert!(pool.try_claim(Some(meeting_id)).is_none());
-
-        pool.release_meeting_slot_binding(meeting_id);
+        assert!(
+            pool.try_claim(Some(meeting_id)).is_none(),
+            "ordinary work must preserve the single Board reservation"
+        );
         let mut moderator = pool
-            .try_claim(Some(meeting_id))
-            .expect("released slot returns to ordinary capacity");
+            .try_claim_meeting_board(meeting_id)
+            .expect("Meeting dispatch accepts the current session without an exact binding");
+        assert_eq!(
+            moderator
+                .state
+                .sessions
+                .get(&meeting_id)
+                .map(String::as_str),
+            Some("replacement-session")
+        );
         moderator.acp.shutdown().await;
     }
 
@@ -5586,7 +5485,7 @@ mod tests {
     #[test]
     fn complete_meeting_turn_places_current_role_context_before_the_envelope() {
         let prompt_sections = vec![
-            "MEETING TURN ENVELOPE:\n{\"context_version\":\"meeting-context-v2\"}\n\nCURRENT MEETING BOARD:\n{\"current_board\":{}}"
+            "MEETING TURN ENVELOPE:\n{\"context_version\":\"meeting-context-v3\"}\n\nCURRENT MEETING BOARD:\n{\"current_board\":{}}"
                 .to_string(),
         ];
         for role_context in [
@@ -6290,6 +6189,7 @@ mod tests {
             TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                meeting_process_group: None,
                 turn_id: "turn-a".to_owned(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6821,6 +6721,7 @@ mod tests {
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::MeetingSuperseded => "MeetingSuperseded",
+            PromptOutcome::MeetingProcessStopUnconfirmed => "MeetingProcessStopUnconfirmed",
             PromptOutcome::Ok(_) => "Ok",
         };
         assert_eq!(
@@ -6891,7 +6792,16 @@ mod tests {
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: false,
                 expected_reason: None,
-                invalidate_all: false,
+                invalidate_all: true,
+            },
+            Case {
+                name: "transport failure + Meeting advance forces process replacement",
+                error: || AcpError::Protocol("cancel transport desynchronized".into()),
+                signal: ControlSignal::MeetingCanonicalAdvance,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: false,
+                expected_reason: None,
+                invalidate_all: true,
             },
             Case {
                 name: "CancelDrainTimeout + SwitchModel preserves batch with Interrupt reason",
@@ -7278,6 +7188,114 @@ mod tests {
         );
     }
 
+    // ── Meeting process-stop barrier ─────────────────────────────────────
+
+    /// `PromptResult` is the Meeting coordinator's busy-state release edge.
+    /// Every outcome that the main loop handles by respawning the Agent must
+    /// therefore carry proof that the old child/process group was already
+    /// stopped when the result became observable. This covers the three
+    /// reviewer-required replacement sources: failed canonical cancel drain,
+    /// provider timeout, and ACP transport/protocol failure.
+    #[tokio::test]
+    async fn meeting_replacement_prompt_result_waits_for_shutdown_confirmation() {
+        let cases: [(&str, fn() -> PromptOutcome); 3] = [
+            ("canonical_cancel_timeout", || {
+                PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE)
+            }),
+            ("provider_timeout", || {
+                PromptOutcome::Timeout(TimeoutKind::Idle)
+            }),
+            ("transport_failure", || {
+                PromptOutcome::Error(AcpError::Protocol(
+                    "simulated ACP transport desynchronization".into(),
+                ))
+            }),
+        ];
+
+        for (label, make_outcome) in cases {
+            let agent = meeting_pool_test_agent(0).await;
+            let outcome = make_outcome();
+            assert!(
+                outcome.requires_process_replacement(),
+                "{label}: test outcome must take the main-loop respawn path"
+            );
+            let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
+
+            send_prompt_result(
+                &result_tx,
+                label,
+                agent,
+                PromptSource::Channel(Uuid::new_v4()),
+                outcome,
+                None,
+                true,
+            )
+            .await;
+
+            let mut result = result_rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("{label}: PromptResult must be delivered"));
+            assert!(
+                result.agent.acp.shutdown_confirmed(),
+                "{label}: PromptResult became observable before process-stop confirmation"
+            );
+            assert!(
+                result.outcome.requires_process_replacement(),
+                "{label}: returned outcome must still trigger respawn"
+            );
+        }
+    }
+
+    /// An unconfirmed stop must terminate the harness control path in bounded
+    /// time. It must not leave the turn runnable forever, and it must not
+    /// publish the original timeout/transport outcome as an ordinary result
+    /// that could release coordinator busy state.
+    #[tokio::test]
+    async fn unconfirmed_meeting_stop_emits_fatal_sentinel_in_bounded_time() {
+        let mut agent = meeting_pool_test_agent(0).await;
+        agent.acp.force_shutdown_unconfirmed_for_test(true);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            send_prompt_result(
+                &result_tx,
+                "unconfirmed-stop",
+                agent,
+                PromptSource::Channel(Uuid::new_v4()),
+                PromptOutcome::Timeout(TimeoutKind::Idle),
+                None,
+                true,
+            ),
+        )
+        .await
+        .expect("unconfirmed Meeting stop must not retry forever");
+
+        let mut result = result_rx
+            .recv()
+            .await
+            .expect("fatal sentinel must be emitted");
+        assert!(
+            result.outcome.requires_harness_exit(),
+            "unconfirmed stop must select the main-loop abnormal-exit branch"
+        );
+        assert!(matches!(
+            &result.outcome,
+            PromptOutcome::MeetingProcessStopUnconfirmed
+        ));
+        assert!(
+            !result.outcome.requires_process_replacement(),
+            "fatal sentinel must never enter ordinary result/respawn handling"
+        );
+
+        result.agent.acp.force_shutdown_unconfirmed_for_test(false);
+        assert!(
+            result.agent.acp.shutdown().await,
+            "test Agent cleanup must be confirmed"
+        );
+    }
+
     // ── steer_rx invariant tests ──────────────────────────────────────────
     //
     // These pin the `send_prompt_result` invariant: `steer_rx` is always
@@ -7335,7 +7353,9 @@ mod tests {
             source,
             PromptOutcome::Error(AcpError::Protocol("simulated session-create error".into())),
             None,
-        );
+            false,
+        )
+        .await;
 
         // Receive the PromptResult back from the channel.
         let mut result = result_rx.recv().await.expect("PromptResult must be sent");
@@ -7393,7 +7413,9 @@ mod tests {
             source,
             PromptOutcome::Ok(StopReason::EndTurn),
             None,
-        );
+            false,
+        )
+        .await;
 
         let mut result = result_rx.recv().await.expect("PromptResult must be sent");
 

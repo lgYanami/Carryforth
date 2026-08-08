@@ -66,7 +66,17 @@ fn parse_control_head(value: &Value) -> Option<AgentControlHead> {
 }
 
 fn desired_capabilities(existing: &[String]) -> Vec<String> {
-    let mut capabilities = existing.iter().cloned().collect::<BTreeSet<_>>();
+    let mut capabilities = existing
+        .iter()
+        .filter(|capability| {
+            !matches!(
+                capability.as_str(),
+                buzz_sdk::MEETING_V2_ACTIONS_V2_CAPABILITY
+                    | buzz_sdk::MEETING_V2_ACTIONS_V3_CAPABILITY
+            )
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
     capabilities.insert(buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY.to_string());
     capabilities.into_iter().collect()
 }
@@ -242,9 +252,14 @@ mod tests {
     }
 
     #[test]
-    fn desired_capability_preserves_other_capabilities_and_sorts() {
+    fn desired_capability_replaces_retired_generations_and_sorts() {
         assert_eq!(
-            desired_capabilities(&["z-capability".to_string()]),
+            desired_capabilities(&[
+                "z-capability".to_string(),
+                buzz_sdk::MEETING_V2_ACTIONS_V2_CAPABILITY.to_string(),
+                buzz_sdk::MEETING_V2_ACTIONS_V3_CAPABILITY.to_string(),
+                buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY.to_string(),
+            ]),
             vec![
                 buzz_sdk::MEETING_V2_ACTIONS_CAPABILITY.to_string(),
                 "z-capability".to_string(),

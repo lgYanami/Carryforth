@@ -46,8 +46,10 @@ pub const MEETING_V2_ACTIONS_V2_POLICY: &str = "moderated-board-actions-v2";
 pub const MEETING_V2_ACTIONS_POLICY: &str = "moderated-board-actions-v3";
 /// Retired runtime capability retained only for historical diagnostics.
 pub const MEETING_V2_ACTIONS_V2_CAPABILITY: &str = "meeting-v2-action-finalization-v2";
-/// Runtime capability required for renewable action-capable Meeting V2 sessions.
-pub const MEETING_V2_ACTIONS_CAPABILITY: &str = "meeting-v2-action-finalization-v3";
+/// Retired exact-affinity runtime capability retained only for historical diagnostics.
+pub const MEETING_V2_ACTIONS_V3_CAPABILITY: &str = "meeting-v2-action-finalization-v3";
+/// Runtime capability required for logical-host action-capable Meeting V2 sessions.
+pub const MEETING_V2_ACTIONS_CAPABILITY: &str = "meeting-v2-action-finalization-v4";
 /// Maximum number of bounded runtime capabilities in one Agent control profile.
 pub const MAX_AGENT_PROFILE_CAPABILITIES: usize = 64;
 /// Initial/current Meeting V2 board format.
@@ -2888,7 +2890,6 @@ pub fn build_meeting_v2_action_block(
             | "external_state_conflict"
             | "tool_unavailable"
             | "provider_failure"
-            | "affinity_lost"
             | "action_deadline_exceeded"
             | "action_lease_expired"
             | "action_operator_deadline_exceeded"
@@ -4791,6 +4792,42 @@ mod tests {
             value["capabilities"],
             serde_json::json!([MEETING_V2_ACTIONS_CAPABILITY, "z-capability"])
         );
+    }
+
+    #[test]
+    fn meeting_action_runtime_capability_generations_are_explicit() {
+        assert_eq!(
+            MEETING_V2_ACTIONS_V2_CAPABILITY,
+            "meeting-v2-action-finalization-v2"
+        );
+        assert_eq!(
+            MEETING_V2_ACTIONS_V3_CAPABILITY,
+            "meeting-v2-action-finalization-v3"
+        );
+        assert_eq!(
+            MEETING_V2_ACTIONS_CAPABILITY,
+            "meeting-v2-action-finalization-v4"
+        );
+        assert_ne!(
+            MEETING_V2_ACTIONS_CAPABILITY,
+            MEETING_V2_ACTIONS_V3_CAPABILITY
+        );
+    }
+
+    #[test]
+    fn meeting_action_block_builder_rejects_retired_affinity_reason() {
+        let board_event_id = "a".repeat(64);
+        let result = build_meeting_v2_action_block(MeetingV2ActionBlockParams {
+            session_id: Uuid::new_v4(),
+            fence: MeetingV2ActionRunFence {
+                action_run_id: Uuid::new_v4(),
+                action_window: 1,
+                board_event_id: &board_event_id,
+            },
+            reason_code: "affinity_lost",
+            reason: Some("historical exact-session failure"),
+        });
+        assert!(matches!(result, Err(SdkError::InvalidInput(_))));
     }
 
     #[test]

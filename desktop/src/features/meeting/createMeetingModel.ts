@@ -1,7 +1,7 @@
 import type { RelayAgent, UserSearchResult } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 
-export const MEETING_ACTION_CAPABILITY = "meeting-v2-action-finalization-v3";
+export const MEETING_ACTION_CAPABILITY = "meeting-v2-action-finalization-v4";
 export const MAX_MEETING_BOARD_BYTES = 65_536;
 export const MAX_MEETING_PARTICIPANTS = 12;
 export const MAX_OTHER_MEETING_PARTICIPANTS = MAX_MEETING_PARTICIPANTS - 1;

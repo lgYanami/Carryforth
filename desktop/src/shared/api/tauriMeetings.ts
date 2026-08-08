@@ -545,7 +545,6 @@ export type MeetingActionBlockReason =
   | "external_state_conflict"
   | "tool_unavailable"
   | "provider_failure"
-  | "affinity_lost"
   | "action_deadline_exceeded";
 
 export type MeetingActionFinalizationAction =

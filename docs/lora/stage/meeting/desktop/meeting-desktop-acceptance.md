@@ -1,6 +1,7 @@
 # Meeting Desktop 发布候选验收
 
-> 状态：阶段六代码与自动化已完成；真实 Tauri 人工穿行待执行且只执行一次，不以重复观察形成无限验收循环。
+> 状态：Desktop 阶段六历史候选已完成；逻辑主持 runtime v4 / Contract `4/7` 适配实施中，current
+> 自动化与真实 fallback 槽穿行尚未确认
 >
 > 范围：Desktop Meeting V2。后端及真实 Agent 证据见
 > [`meeting-v2-qualification-report.md`](../v2/meeting-v2-qualification-report.md)。
@@ -11,7 +12,8 @@ Meeting Desktop 的发布证据由三层组成：
 
 1. native Rust 测试证明签名、身份、Community、协议和 opaque command fence；
 2. Playwright E2E 证明 Desktop 产品状态、Human 操作、响应式、恢复和隔离；
-3. 既有真实 Provider qualification 证明 Agent 主持/参会、同 Session 行动收口和终态。
+3. 真实 Provider qualification 证明 Agent 主持/参会、逻辑主持 Action Turn、显式
+   `actions-recorded` ACK 和终态；当前验收还必须覆盖 fallback 槽或 Session 轮换。
 
 Mock E2E 不替代 native wire 验证，真实 Agent qualification 也不冒充 Desktop UI 验收。三层证据按
 各自边界组合，不要求用人工操作重复穷举所有已自动化分支。
@@ -31,7 +33,7 @@ Mock E2E 不替代 native wire 验证，真实 Agent qualification 也不冒充 
 | 窄窗口 Board/participant Sheet 与草稿保持 | `meeting-recovery.spec.ts` |
 | Desktop preview gate 与 Meeting/Channel 隔离 | `meeting-recovery.spec.ts` |
 | Agent host、Agent participant、真实 Provider | `../v2/meeting-v2-qualification-report.md` |
-| Agent direct-action Project View CLI 与同 Session | `../v2/meeting-v2-backend-operations.md` 第 11 节 |
+| Agent direct-action CLI、逻辑主持调度与 fallback Session | `../v2/meeting-v2-backend-operations.md` 第 11 节 |
 
 阶段六针对性命令：
 
@@ -56,7 +58,7 @@ pnpm exec playwright test \
 just ci
 ```
 
-### 2.1 当前候选自动化结果（2026-08-04）
+### 2.1 历史 Desktop 候选自动化结果（2026-08-04）
 
 - Meeting Desktop 合并回归：34/34 通过；
 - 阶段六 recovery/Community/bounded query/narrow sheet/preview gate：5/5 通过；
@@ -69,6 +71,10 @@ just ci
 这些结果冻结本候选的自动化门槛；除非后续真实穿行发现新的语义、数据安全或恢复缺陷，不重复运行
 相同成功矩阵来制造额外发布门槛。
 
+这些数字不证明 2026-08-08 的 logical-host v4 cutover 已通过。current 候选必须重新验证 roster
+capability v4、换槽/Session 后 UI 不显示 affinity block，以及同一 `actions-recorded` ACK 终态；实际结果
+补入后才能恢复“发布候选已验收”状态。
+
 ## 3. 一次性真实 Tauri 穿行
 
 在支持 Meeting V2 direct actions 的真实 Relay 上，用当前 release candidate 只执行一轮：
@@ -79,7 +85,7 @@ just ci
 | Human host + Agent participant | Agent Intent/Speech 可见；Human 不能替 Agent ACK 或 Speech |
 | Agent host + Human participant | Human Floor 可用；Host Console 只读；Agent 推进 Board/Floor |
 | Human host action | 打开现有 Project View、返回、confirm；另做一次零写入 confirm |
-| Agent host action | 原 ACP Session 完成或 blocked；Desktop 不出现接管按钮 |
+| Agent host action | 同一逻辑主持 Agent 完成；换槽/Session 不产生 affinity block；真实 provider/lease 故障可 blocked；Desktop 不出现接管按钮 |
 | Recovery | 断开 Relay、重连、A→B→A；重读成功前所有 window 写入保持禁用 |
 | Terminal | direct closed、actions-recorded closed、discussion abort、action abort |
 

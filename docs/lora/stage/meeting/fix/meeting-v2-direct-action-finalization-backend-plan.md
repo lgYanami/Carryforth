@@ -10,6 +10,13 @@
 > [会议行动收口实现设计](../v2/meeting-v2-action-finalization-design.md) 中强制
 > `Materialization Intent → Action Plan → Step → Materializer` 的设计。后端修正完成前，
 > 不修改 Desktop spec；后端完成后再单独适配 Desktop。
+>
+> **后续取代说明（2026-08-08）：**本文保留从 Plan/Step materializer 迁移到 direct action 的
+> 历史设计背景；其中“同一物理槽、同一 ACP Session”、exact affinity 与
+> `affinity_lost` 恢复条款，已由
+> [Meeting Action Finalization 逻辑主持人 ACK 与同步简化实现设计](./meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)
+> 取代。现行语义是逻辑主持身份 + frozen Board + current run/window/Board fence + 显式
+> `actions-recorded` ACK；已有 Meeting channel Session 仅为调度偏好。
 
 ## 1. 结论
 

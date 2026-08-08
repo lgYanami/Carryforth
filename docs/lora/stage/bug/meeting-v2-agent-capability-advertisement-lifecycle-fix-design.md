@@ -6,6 +6,12 @@
 >
 > 范围：Meeting V2 direct actions、Agent Profile kind `10100`、`buzz-acp`、
 > Desktop managed Agent 生命周期、Agent discovery 与 Meeting 创建体验
+>
+> **后续代际说明（2026-08-08）：**本文记录的 capability 宣告/reconcile 生命周期机制继续有效，
+> 但其中 `meeting-v2-action-finalization-v2` / actions-v2 数字是事故当时事实。current create gate
+> 只接受 `meeting-v2-action-finalization-v4` + `moderated-board-actions-v3`；profile reconcile
+> 必须移除旧 v2/v3，而不是同时保留多个 active 代际。现行执行语义见
+> [逻辑主持人 ACK 与同步简化实现设计](../meeting/fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)。
 
 ## 1. 结论
 

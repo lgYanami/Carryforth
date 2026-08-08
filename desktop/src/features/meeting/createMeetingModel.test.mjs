@@ -136,9 +136,12 @@ test("deduplicates roster sources and classifies Agent capability tri-state", ()
     [
       {
         pubkey: AGENT,
+        capabilities: ["meeting-v2-action-finalization-v4"],
+      },
+      {
+        pubkey: INCOMPATIBLE,
         capabilities: ["meeting-v2-action-finalization-v3"],
       },
-      { pubkey: INCOMPATIBLE, capabilities: [] },
     ],
   );
   assert.equal(candidates.length, 4);
@@ -160,7 +163,7 @@ test("deduplicates roster sources and classifies Agent capability tri-state", ()
 test("maps a Relay roster-capability race back to Agent names", () => {
   assert.equal(
     describeMeetingCapabilityRejection(
-      `relay returned 400: restricted:meeting:roster_capability_missing capability=meeting-v2-action-finalization-v3 missing_agent_pubkeys=${AGENT},${INCOMPATIBLE}`,
+      `relay returned 400: restricted:meeting:roster_capability_missing capability=meeting-v2-action-finalization-v4 missing_agent_pubkeys=${AGENT},${INCOMPATIBLE}`,
       [
         { pubkey: AGENT, displayName: "Ready before submit" },
         { pubkey: INCOMPATIBLE, displayName: "Downgraded Agent" },

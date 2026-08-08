@@ -255,6 +255,12 @@ fn desktop_action_contract_accepts_every_camel_case_variant() {
         ))
         .is_err()
     );
+    assert!(
+        serde_json::from_value::<MeetingActionFinalizationInput>(desktop_action_input(
+            serde_json::json!({"type": "block", "reasonCode": "affinity_lost"})
+        ))
+        .is_err()
+    );
 }
 
 #[test]

@@ -1,11 +1,13 @@
 # Meeting Desktop 产品规格
 
-> 状态：产品设计已确认，已适配 direct-action V2 后端，待实现。
+> 状态：主体产品已实现；逻辑主持 runtime v4 / Contract `4/7` 适配实施中，current 验收待确认
 >
 > 目标客户端：Buzz Desktop。
 >
 > 依赖协议：[Meeting V2：主持人维护的共享会议看板](../v2/meeting-v2.md)与
-> [Meeting V2：主持人直接完成行动收口的后端修正方案](../fix/meeting-v2-direct-action-finalization-backend-plan.md)。
+> [Meeting Action Finalization 逻辑主持人 ACK 与同步简化实现设计](../fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)。
+> [主持人直接完成行动收口的后端修正方案](../fix/meeting-v2-direct-action-finalization-backend-plan.md)
+> 仅保留 Plan/Step 退役的历史背景。
 >
 > 本文定义 Meeting 在 Desktop 中的产品语义、信息架构、页面状态和 Human 交互，不重新
 > 定义后端协议，不规定组件拆分、Tauri command、缓存实现、具体视觉尺寸或阶段开发计划。
@@ -356,7 +358,7 @@ Human 可以从：
 
 新建 action-capable Meeting V2 时，完整 Agent roster 还必须满足 runtime capability gate：
 
-- 每个选中的 Agent runtime 都声明 `meeting-v2-action-finalization-v2`；
+- 每个选中的 Agent runtime 都声明 `meeting-v2-action-finalization-v4`；
 - Human participant 不需要该 Agent runtime capability；
 - 已知不兼容的 Agent 在选择器中明确标记，并阻止提交；
 - capability 暂时未知时，提交前重新确认，Relay 拒绝时保留完整创建草稿；
@@ -955,12 +957,14 @@ Board 订阅、版本协商或通知机制。
 
 ### 15.3 槽与 Session
 
-Agent 的槽分配和 ACP Session 连续性是 runtime 责任，不成为 Human 手动选择项：
+Agent 的槽分配和 ACP Session 是 runtime 实现细节，不成为 Human 手动选择项或 Meeting
+correctness gate：
 
 - Human 不选择某个具体 Agent 槽入会；
 - Human 不把一个普通 Agent Turn“拖入会议”；
-- 同一 Meeting 中 Agent 的连续性由后端调度维护；
-- Agent 主持的最终 Board、Floor 和 Action Finalization 同槽同 Session 继续执行；
+- 后端优先复用持有 Meeting channel Session 的健康槽，但可由同一逻辑 Agent 的其他健康槽执行；
+- 最终 Board、Floor 与 Action Finalization 均以 current canonical envelope、frozen Board 和
+  run/window/Board fence 自包含，不继承物理槽授权；
 - Desktop 只呈现结果与稳定故障状态。
 
 ## 16. 参会者面板
@@ -1050,8 +1054,9 @@ Desktop 不得在行动收口卡片中伪造“Requirement 已创建”“所有
 
 Agent 主持时：
 
-- 原主持 Agent 槽和 ACP Session 继续理解最终 Board；
-- ACP 把精确冻结的 Board 和当前 action window 注入同一 Session 的行动 Turn；
+- ACP 为同一逻辑主持 Agent 调度唯一 Action Turn，优先复用已有 Meeting channel Session，必要时
+  使用其他健康槽；
+- ACP 向实际取得 Turn 的槽注入精确冻结的 Board、current action window、主持身份和完整业务工具边界；
 - Agent 使用自己原本拥有的普通 CLI 和业务工具直接读取、创建、更新或删除目标系统对象；
 - Agent 不生成 Meeting 专用 Plan，Harness 也不编译或重放业务操作；
 - Desktop 只读展示主持 Agent 正在记录行动产出及最终控制结果；
@@ -1063,7 +1068,8 @@ Desktop 可以使用以下稳定文案：
 主持 Agent 正在根据最终会议看板记录行动产出
 ```
 
-Agent 返回 `COMPLETE` 时，ACP 直接提交带完成声明的 End；Relay 接受后页面进入 `closed`。
+Agent 返回 `COMPLETE` 时，ACP 直接提交带 current fence 的 `actions-recorded` End；Relay 原子接受后
+页面进入 `closed`。Action lease 只表示逻辑主持 Harness 仍在线工作，不代表业务完成。
 `BLOCK`、`RETURN_TO_BOARD` 和 `ABORT` 分别映射到 blocked、新 Board window 和 aborted。
 Desktop 不展示模型隐藏推理、工具调用日志，也不根据工具调用猜测行动是否完成。
 
@@ -1110,7 +1116,7 @@ Meeting 不校验 Requirement、Work、Issue、Role、Assignment 或承接人关
 当前权威截止时间，但不能仅凭本地倒计时自行宣布 blocked；截止后重新读取 Relay 状态。
 
 Human 主持人确认当前窗口无法继续时，可以选择`暂时无法完成`，填写用户可理解的稳定原因
-类别和可选简短说明。Relay 接受 block 后才显示 blocked。Agent 主持的 block 由原 ACP Session
+类别和可选简短说明。Relay 接受 block 后才显示 blocked。Agent 主持的 block 由当前逻辑主持 Turn
 提交；deadline 到期也可以由 Relay 自动收敛为 blocked。
 
 Meeting 不追踪普通业务命令的进度、成功数量或 receipt。已经提交的外部操作可能在 action
@@ -1133,8 +1139,8 @@ deadline 后才返回或才被观察到，Meeting 不撤销这些效果。旧 ac
 - 返回成功会终结当前 action run 并打开新的 Board Maintenance，主持人再修改 Board、继续讨论、
   直接关闭或重新进入行动收口；
 - 返回 Board 不以“零外部效果”为前提，也不表示 Relay 已确认存在外部效果；
-- Agent 槽或 Session 连续性丢失时，Desktop 只展示 blocked，不允许 Human 参会者替 Agent 重试
-  或返回 Board；
+- Agent provider/process 真实失败或 lease 到期时，Desktop 只展示 canonical blocked，不允许 Human
+  参会者替 Agent 重试或返回 Board；单纯槽或 Session 变化不应生成 blocked；
 - 主持人随时可以明确中止，并保留已经发生的外部效果。
 
 ### 17.9 确认完成并原子关闭
@@ -1372,7 +1378,7 @@ Desktop 区分：
 - Relay 支持读取已有 Meeting，但当前 create gate 关闭；
 - Relay 支持普通 V2，但某个兼容会议不支持 Action Finalization；
 - 新建 action-capable V2 时，某个 roster Agent 缺少
-  `meeting-v2-action-finalization-v2` runtime capability；
+  `meeting-v2-action-finalization-v4` runtime capability；
 - 当前 Community 的 Project View 页面不可用，但 Action Finalization 本身仍可继续。
 
 不可用能力使用明确说明，不能用永久 loading 或普通网络错误代替。已有 Meeting 的读取能力不
@@ -1406,7 +1412,7 @@ Desktop 必须保持：
 4. 创建成功后，所有 roster 成员可以发现房间，无 RSVP 或 Join。
 5. 非 roster 身份即使得到 deep link 也不能读取 Meeting 内容。
 6. 选择缺少 action-finalization capability 的 Agent 时，Desktop 明确指出目标并阻止创建，
-   不静默降级 policy；检查的 capability 是 `meeting-v2-action-finalization-v2`。
+   不静默降级 policy；检查的 capability 是 `meeting-v2-action-finalization-v4`。
 
 ### 25.2 Board 与主持顺序
 
@@ -1448,7 +1454,8 @@ Desktop 必须保持：
 
 1. 没有行动的 Meeting 可以在最终 Board 后直接 closed。
 2. 进入 Action Finalization 后 Board 和 Floor 均冻结，Meeting 仍非终态。
-3. Agent 主持行动继续由原槽和 ACP Session 使用普通业务工具执行，Desktop 只读展示稳定状态。
+3. Agent 主持行动由同一逻辑主持 Agent 的唯一 Turn 使用普通业务工具执行；fallback 槽也收到完整
+   frozen Board 与 canonical envelope，Desktop 只读展示稳定状态。
 4. Human 主持可以从 Meeting 打开现有 Project View 页面完成任意合法业务操作，再返回 Meeting。
 5. Human 路径不存在 Requirement/Work 专用表单、业务预览、Plan、Step 或 Meeting materializer。
 6. Human 即使没有发生任何外部写入，也可以确认产出已登记或无需新增登记。

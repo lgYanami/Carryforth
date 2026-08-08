@@ -95,7 +95,6 @@ enum ActionBlockReasonInput {
     ExternalStateConflict,
     ToolUnavailable,
     ProviderFailure,
-    AffinityLost,
     ActionDeadlineExceeded,
 }
 
@@ -106,7 +105,6 @@ impl ActionBlockReasonInput {
             Self::ExternalStateConflict => "external_state_conflict",
             Self::ToolUnavailable => "tool_unavailable",
             Self::ProviderFailure => "provider_failure",
-            Self::AffinityLost => "affinity_lost",
             Self::ActionDeadlineExceeded => "action_deadline_exceeded",
         }
     }

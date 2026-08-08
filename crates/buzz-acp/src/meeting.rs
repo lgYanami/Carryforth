@@ -4,7 +4,7 @@
 //! controller owns synchronization, intent scheduling, floor reconciliation,
 //! durable idempotency state, and the only Agent-side meeting sender.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -397,14 +397,6 @@ struct RunningMeetingTurn {
     v0_grant_capacity_credit: bool,
 }
 
-/// Continuity-sensitive identity of one in-flight action-capable moderator
-/// Turn. The main loop reads this before returning the physical Agent slot.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MeetingTurnContinuityInfo {
-    pub(crate) session_id: Uuid,
-    pub(crate) kind: MeetingTurnKind,
-}
-
 /// Whether cancelling one stale Meeting turn may retain its ACP Session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MeetingPreemptionDisposition {
@@ -425,14 +417,6 @@ pub(crate) struct MeetingTurnPreemption {
     pub(crate) disposition: MeetingPreemptionDisposition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MeetingContinuityDirective {
-    Release { session_id: Uuid },
-    ReleaseFinalControl { session_id: Uuid },
-    PromoteAction { session_id: Uuid },
-    PromoteModeratorMeeting { session_id: Uuid },
-}
-
 /// Per-process protocol-neutral coordinator for every visible Meeting room.
 ///
 /// Registration probes the Relay-signed State once, then delegates the room to
@@ -445,7 +429,6 @@ pub(crate) struct MeetingCoordinator {
     v0_observer: Option<ObserverHandle>,
     running_turns: HashMap<String, RunningMeetingTurn>,
     available_agent_slots: usize,
-    exact_meeting_slots: HashSet<Uuid>,
     v0_completion_queue: VecDeque<PendingV0TurnCompletion>,
     v0_completion_task: Option<tokio::task::JoinHandle<FinishedV0TurnCompletion>>,
     v0_deferred_requeues: VecDeque<MeetingTurnRequest>,
@@ -483,7 +466,6 @@ impl MeetingCoordinator {
             v0_observer: observer.clone(),
             running_turns: HashMap::new(),
             available_agent_slots: agent_capacity,
-            exact_meeting_slots: HashSet::new(),
             v0_completion_queue: VecDeque::new(),
             v0_completion_task: None,
             v0_deferred_requeues: VecDeque::new(),
@@ -513,9 +495,7 @@ impl MeetingCoordinator {
     }
 
     pub(crate) fn pop_pending(&mut self) -> Option<MeetingTurnRequest> {
-        if self.available_agent_slots == 0
-            && !self.v1.front_uses_exact_slot(&self.exact_meeting_slots)
-        {
+        if self.available_agent_slots == 0 {
             return None;
         }
         if self.v1.front_kind() == Some(MeetingTurnKind::V1Granted) {
@@ -580,50 +560,6 @@ impl MeetingCoordinator {
 
     pub(crate) fn owns_turn(&self, turn_id: &str) -> bool {
         self.running_turns.contains_key(turn_id)
-    }
-
-    pub(crate) fn turn_continuity_info(&self, turn_id: &str) -> Option<MeetingTurnContinuityInfo> {
-        let request = &self.running_turns.get(turn_id)?.request;
-        let protocol = request.baton_protocol?;
-        (protocol.has_action_finalization() && request.kind.is_v2_moderator()).then_some(
-            MeetingTurnContinuityInfo {
-                session_id: request.session_id,
-                kind: request.kind,
-            },
-        )
-    }
-
-    pub(crate) fn record_continuity_binding(
-        &mut self,
-        session_id: Uuid,
-        agent_index: usize,
-        acp_session_id: &str,
-        phase: &str,
-    ) {
-        self.v1
-            .record_continuity_binding(session_id, agent_index, acp_session_id, phase);
-    }
-
-    pub(crate) fn clear_continuity_binding(&mut self, session_id: Uuid) {
-        self.v1.clear_continuity_binding(session_id);
-    }
-
-    pub(crate) fn mark_continuity_lost(&mut self, request: &MeetingTurnRequest, reason: &str) {
-        self.v1.mark_continuity_lost(request, reason);
-    }
-
-    pub(crate) fn mark_turn_continuity_lost(&mut self, turn_id: &str, reason: &str) {
-        if let Some(request) = self
-            .running_turns
-            .get(turn_id)
-            .map(|running| running.request.clone())
-        {
-            self.v1.mark_continuity_lost(&request, reason);
-        }
-    }
-
-    pub(crate) fn take_continuity_directives(&mut self) -> Vec<MeetingContinuityDirective> {
-        self.v1.take_continuity_directives()
     }
 
     pub(crate) fn attach_action_deadline_sender(
@@ -907,11 +843,6 @@ impl MeetingCoordinator {
         self.available_agent_slots = available;
         self.refresh_v1_external_reclaimable_turns();
         self.v1.set_available_agent_slots(available);
-    }
-
-    pub(crate) fn set_exact_meeting_slots(&mut self, sessions: HashSet<Uuid>) {
-        self.exact_meeting_slots = sessions.clone();
-        self.v1.set_exact_meeting_slots(sessions);
     }
 
     fn refresh_v1_external_reclaimable_turns(&mut self) {

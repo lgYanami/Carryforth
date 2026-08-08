@@ -1,6 +1,7 @@
 # Meeting Action Finalization 中维护 Project Context 的实现设计
 
-> 状态：已实现并完成无活跃会议全量切换，待 Human 发起真实 Meeting 验收
+> 状态：Context 写回语义已实现；物理 affinity 条款已被逻辑主持人 ACK 设计取代，current
+> `7/4/meeting-context-v3` 生命周期迁移实施中
 > 日期：2026-08-08  
 > 范围：Meeting / Project Context Relay 与 DB、ACP System Contract、逐 Turn Meeting Envelope、CLI、Desktop、测试与发布  
 > 前置设计：[Meeting 作为 Project Context 坐标与 Community 可见性实现设计](./meeting-coordinate-implementation-design.md)、[Project Context](./project-context.md)、[Meeting Project Context TODO](./TODO.md)
@@ -8,7 +9,8 @@
 ## 1. 结论
 
 会议的项目物化发生在主持人的 `action_finalization` Turn。若物化创建或修改了 Project View、
-Project Document 等具有长期上下文价值的坐标，主持人应在**同一个 Turn、同一个 ACP Session / 工作槽**中：
+Project Document 等具有长期上下文价值的坐标，主持人应在**同一个 Action Finalization Turn、同一逻辑
+主持 Agent 身份**下：
 
 1. 读取目标的 canonical 状态；
 2. 按冻结 Board 完成 Project View / Document 等业务写入；
@@ -32,7 +34,7 @@ Project Document 仍负责解释“这些坐标为什么相关”。
 - 新的 Meeting 生命周期状态；
 - Context Manifest；
 - 关闭后的后台补写任务；
-- 另一个 ACP 工作槽或新的 Agent Turn；
+- 与 current ActionRunKey 并行的第二个 Agent Turn；
 - Project Context schema / coordinate / edge-key 版本；
 - Relay 自动推断、自动创建或自动扩展 Edge；
 - Project View、Document 与 Project Context 的跨领域分布式事务；
@@ -55,7 +57,9 @@ Project Document 仍负责解释“这些坐标为什么相关”。
 ```
 
 因此，若 Edge 需要包含当前 Meeting，主持人在唯一合法的业务写窗口中反而无法 attach；Meeting End 后，
-原主持 ACP Turn 已结束，也不应把工作转交给另一个槽、另一个 Session 或一个无法看到完整上下文的后台任务。
+主持 Action Turn 已结束，也不应再创建另一个 Agent Turn 或一个仅凭摘要工作的后台任务。Action Turn
+可以由同一逻辑主持 Agent 的任意健康槽执行，但必须从 frozen Board 与 canonical envelope 自包含地取得
+全部协议输入。
 
 `finalizing_actions` 已经具备建立稳定来源关系所需的事实边界：
 
@@ -299,7 +303,8 @@ Run、deadline、Board event、Context revision 或完整图数据绝不能写�
 
 ### 6.2 Project Space System Contract
 
-更新 `crates/buzz-acp/src/project_space.rs`，版本从 `5` 提升为 `6`。稳定语义至少包含：
+当前 `crates/buzz-acp/src/project_space.rs` 的 Project Space Contract 版本为 `7`。本设计首次引入
+Meeting Context 写回语义时由 `5` 提升为 `6`；后续逻辑主持人切换再次升至 `7`。稳定语义至少包含：
 
 ```text
 A verified terminal Meeting, or an active Meeting whose formal discussion is
@@ -324,7 +329,8 @@ action-finalizing Meeting coordinate”。保留以下既有原则：
 
 ### 6.3 Meeting System Contract
 
-更新 `crates/buzz-acp/src/meeting_context.rs`，合同版本从 `2` 提升为 `3`。在
+当前 `crates/buzz-acp/src/meeting_context.rs` 的 Meeting Contract 版本为 `4`。本设计首次交付时由
+`2` 提升为 `3`；后续逻辑主持人切换再次升至 `4`。在
 `Only the moderator's action_finalization Turn...` 之后加入操作规则：
 
 ```text
@@ -332,7 +338,8 @@ If materialization creates or updates durable project coordinates derived from
 this Meeting, maintain their Project Context before COMPLETE. Use a normal
 Project Document to explain the relationship, include the current Meeting
 coordinate, and read the canonical Edge back. Perform these operations in this
-same action_finalization Turn and ACP Session.
+same action_finalization Turn as the same logical moderator Agent. Physical
+work-slot or ACP Session continuity with discussion Turns is not required.
 
 Do not infer or invent an Edge when the frozen Board has no durable output. A
 recoverable Context write or readback failure is BLOCK. If the Board itself is
@@ -345,11 +352,14 @@ required Context update that was not canonically accepted.
 
 ### 6.4 逐 Turn Meeting envelope
 
-更新 `crates/buzz-acp/src/meeting_v1.rs` 的 envelope contract version：
+`crates/buzz-acp/src/meeting_v1.rs` 的 current envelope contract version 为：
 
 ```text
-meeting-context-v1 -> meeting-context-v2
+meeting-context-v3
 ```
+
+本设计首次交付时完成了 `meeting-context-v1 -> meeting-context-v2`；后续逻辑主持人切换要求
+`meeting-context-v3`，且不保留旧 envelope 作为 current runtime 分支。
 
 所有 Meeting Turn 都继续注入当前 `turn_kind` 与 Relay-verified control。增加一个小型、闭合的
 `project_context_policy` 控制块，避免 Agent 从 System 文本猜测当前窗口：
@@ -434,18 +444,23 @@ read canonical target state
 不得新增 `context_manifest`、`edge_ids` 或 mutation receipt 到 Direct Action output。Harness 继续只解析现有
 四种动作，避免再次出现“Agent 已完成工具调用，但因输出 schema 不识别额外字段而被误判超时”的问题。
 
-### 6.6 Session 与工作槽连续性
+### 6.6 单一 Action Turn 与逻辑主持人调度
 
 Context 写入属于现有 Action Finalization Turn 的业务工具调用：
 
-- 不创建新 ACP Session；
-- 不把任务投递给同一逻辑 Agent 的其他工作槽；
-- 不在 Meeting End 后用聊天消息要求另一个槽补写；
-- 不依赖另一个槽能够重建 frozen Board 与当前工具结果；
-- 继续使用现有 Action Run renewable lease 维持长耗时物化窗口。
+- 同一个 ActionRunKey 最多只有一个 pending/running Action Turn；
+- 优先复用已有 Meeting channel Session；没有、繁忙或自然轮换时，可使用同一逻辑主持 Agent 的
+  其他健康槽；
+- 无论使用哪个槽，都注入 current moderator、frozen Board、run/window/Board fence、Role/Project
+  Context 与完整工具策略；
+- 不在 Meeting End 后用聊天消息、另一个 Turn 或后台 worker 补写；
+- 继续使用进程级 Action Run renewable lease 覆盖等待槽、执行和 ACK receipt 不确定窗口；lease
+  不表示 Context 已写入或 Meeting 已完成；
+- `COMPLETE` 只在业务坐标、解释 Document、Context Edge 与 canonical readback 都完成后返回，并由
+  Harness 转换为显式 `actions-recorded` ACK。
 
-这正是放宽 attach 时机的主要收益：主持人已经拥有当前 Meeting、冻结 Board、工具结果和 Project 状态，
-可以在上下文最完整的执行窗口内完成关系治理。
+这正是放宽 attach 时机的主要收益：Action Turn 已拥有当前 Meeting、冻结 Board、工具结果和 Project
+状态，可以在同一逻辑工作窗口内完成关系治理；不需要把讨论阶段的物理 Session 提升为正确性前提。
 
 ## 7. CLI 与 Desktop
 
@@ -525,6 +540,8 @@ database，遵守 [破坏性迁移测试导致主数据库数据丢失](../bug/d
 
 - Project Space contract version / hash 更新；
 - Meeting contract version / hash 更新；
+- current 版本分别为 Project Space `7`、Meeting `4` 与 `meeting-context-v3`，旧合同不能满足
+  current runtime；
 - System Contract 不包含 Meeting ID、revision、Board、Document body 或 render slot；
 - 每个 Turn envelope 含正确 Meeting coordinate 与 Project Context write boolean；
 - 只有 Action Finalization 的 Project Context policy 为 writable；
@@ -551,13 +568,15 @@ Mock Bridge / query model 覆盖：
 
 1. Board 决定创建或修改至少一个 Project View object；
 2. 进入 Action Finalization；
-3. 同一 ACP activity / Session 完成 Project View 写入与回读；
+3. 同一 Action Finalization Turn / 逻辑主持 Agent 完成 Project View 写入与回读；测试至少一次
+   fallback 槽或 Session 轮换；
 4. 创建 Context Document；
 5. attach `{Meeting, materialized coordinates}`；
 6. exact 与 incident 回读命中同一 edge key；
 7. 返回 `COMPLETE`，Meeting 正常 `completed_closed`；
 8. 关闭后再次 exact 回读，edge key、Document body 与 Meeting deep link 不变；
-9. 日志中不存在第二工作槽、post-close worker、Manifest 或伪造 action receipt。
+9. 日志中每个 ActionRunKey 只有一个 pending/running Turn，不存在 post-close worker、Manifest 或
+   伪造 action receipt；物理槽变化不得生成 `affinity_lost`。
 
 另做一次失败验收：让 Context command 返回可恢复失败，确认主持人返回 `BLOCK`、Action Run lease 可续约、
 Meeting 不会假 `COMPLETE`，Retry 后可在同一流程完成。
@@ -580,7 +599,7 @@ Meeting / Context 锁顺序无环。
 - 补 prompt golden / schema tests。
 
 Review 门：确认 System 只含稳定语义，动态事实只在逐 Turn envelope；确认 output parser 未扩展、没有
-Manifest 和跨槽补写。
+Manifest、第二个补写 Turn 或 post-close worker。
 
 ### 阶段 3：CLI / Desktop / 文档
 
@@ -594,9 +613,9 @@ Review 门：确认 UI 不根据本地显示猜 phase，既有 terminal Meeting 
 
 ### 阶段 4：无活跃会议的全量切换
 
-Project Space contract `5 -> 6` 和 Meeting contract `2 -> 3` 会改变 contract hash。现有 Harness 会拒绝继续
-复用携带旧合同的 ACP Session；若在 active Meeting、尤其 Action Finalization 中途重启，会破坏本设计要求
-的同 Session / 工作槽连续性。
+本设计首次交付的 Project Space `5 -> 6`、Meeting `2 -> 3` 与后续逻辑主持人切换到 `7/4` 都会
+改变 contract hash。现有 Harness 会拒绝继续复用携带旧合同的 ACP Session；这用于确保新 Session
+安装 current Contract，而不是维持物理 affinity。
 
 本次不增加 active-session contract pinning。部署前置固定为：
 
@@ -604,10 +623,11 @@ Project Space contract `5 -> 6` 和 Meeting contract `2 -> 3` 会改变 contract
 2. 若存在，等待其正常结束；不得为部署自动 abort、删除或伪造完成；
 3. 在同一交付中构建并切换 Relay、CLI、ACP 与 Desktop；
 4. 启动后验证 Project Context / Meeting capability、合同版本和已有数据 revision；
-5. 创建新的验收 Meeting 执行第 8.5 节 E2E。
+5. 创建新的验收 Meeting 执行第 8.5 节 E2E，其中包含 fallback 槽或 Session 轮换。
 
 切换期间不得初始化新的 Community、清空数据库或重跑 destructive bootstrap。若未来要求 active Meeting
-跨版本无中断升级，应独立设计“按 Meeting 固定合同版本”；不能用另一个 ACP 槽冒充原 Session 连续性。
+跨版本无中断升级不在本次切换范围；旧 Contract 不提供 current runtime 兼容分支，也不能用旧 Session
+绕过 current capability / contract gate。
 
 每阶段完成后应对照本设计 review 代码与测试；发现偏离时在进入下一阶段前修正，但无需引入阶段间人工
 暂停。
@@ -640,8 +660,9 @@ Project Space contract `5 -> 6` 和 Meeting contract `2 -> 3` 会改变 contract
 - verified `finalizing_actions` Meeting 可通过同一现有 CLI attach 为 Meeting Coordinate；
 - 其他 active Meeting 仍被 Relay 拒绝；
 - Community 权限、Meeting roster/action 权限边界没有混合；
-- 主持 Agent 在同一 Action Finalization Turn / ACP Session 完成物化、Context 写入和 canonical 回读；
-- 不新增 Meeting 状态、Manifest、跨槽任务或 post-close worker；
+- 主持 Agent 在同一 Action Finalization Turn / 逻辑主持身份完成物化、Context 写入和 canonical 回读；
+  不要求继承讨论阶段的槽或 ACP Session；
+- 不新增 Meeting 状态、Manifest、第二个补写 Turn 或 post-close worker；
 - 不改变 Direct Action output schema；
 - 不自动推断 Edge，不伪造无输出关系；
 - RETURN_TO_BOARD / ABORT 不自动回滚已提交的外部结果，UI 能显示真实 Meeting lifecycle；
@@ -650,6 +671,9 @@ Project Space contract `5 -> 6` 和 Meeting contract `2 -> 3` 会改变 contract
 - 测试与启动过程没有删除或重置本地验收数据。
 
 ## 12. 实现交付记录
+
+以下为本设计首次交付（`6/3/meeting-context-v2`）的历史验收记录；数字与运行实例事实不因后续
+合同升版而重写。当前规范见本节末尾的取代说明。
 
 截至 2026-08-08，阶段 1～3 已按本设计实现并逐层 review：
 
@@ -690,3 +714,8 @@ Project Space contract `5 -> 6` 和 Meeting contract `2 -> 3` 会改变 contract
 
 剩余验收仅为第 8.5 节的真实 Agent 主持 Meeting 流程；该验收会写入真实业务数据，应由 Human 明确发起，
 不在实现测试中自动创建或删除 Meeting、Document、Project View 对象或 Context Edge。
+
+后续 lifecycle 简化由
+`docs/lora/stage/meeting/fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md`
+取代了物理 affinity 条款：current generation 为 Project Space Contract `7`、Meeting Contract `4`
+与 `meeting-context-v3`。以上 `6/3/v2` 数字只记录本设计首次交付时的历史基线，不再是现行门禁。

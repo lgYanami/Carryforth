@@ -2134,6 +2134,14 @@ mod tests {
         )
         .await
         .expect("advertise first Agent capability");
+        crate::user::set_agent_capabilities(
+            &pool,
+            community_id,
+            &second_agent,
+            &[buzz_sdk::MEETING_V2_ACTIONS_V3_CAPABILITY.to_string()],
+        )
+        .await
+        .expect("advertise retired exact-affinity capability for second Agent");
         let roster = vec![first_agent.clone(), second_agent.clone(), human];
 
         let mut tx = pool.begin().await.expect("begin missing-capability check");

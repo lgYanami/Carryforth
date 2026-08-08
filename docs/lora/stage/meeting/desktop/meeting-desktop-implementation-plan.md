@@ -1,13 +1,16 @@
 # Meeting Desktop-only 分阶段实现计划
 
-> 状态：实施中（阶段一至五已完成；阶段六代码与自动化已完成，待一次真实 Tauri 穿行）
+> 状态：原 Desktop 阶段一至六已交付；逻辑主持 runtime v4 / Contract `4/7` 适配实施中，current
+> 自动化与真实 Tauri fallback 槽穿行待确认
 >
 > 产品规格：
 > [Meeting Desktop 产品规格](./meeting-desktop-spec.md)
 >
 > 后端语义基线：
 > [Meeting V2：主持人维护的共享会议看板](../v2/meeting-v2.md)与
-> [Meeting V2：主持人直接完成行动收口的后端修正方案](../fix/meeting-v2-direct-action-finalization-backend-plan.md)
+> [Meeting Action Finalization 逻辑主持人 ACK 与同步简化实现设计](../fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)；
+> [主持人直接完成行动收口的后端修正方案](../fix/meeting-v2-direct-action-finalization-backend-plan.md)
+> 仅保留 Plan/Step 退役的历史背景
 >
 > 本文只规划 Buzz Desktop 交付，包括 React 前端、Desktop Tauri/Rust 适配层、Desktop
 > mock bridge 和 Desktop 测试。Relay、数据库、CLI、ACP、Meeting 协议与 Project View
@@ -258,7 +261,7 @@ Desktop rollout gate 只控制新 UI 是否公开；Relay capability 决定当�
 - Relay 声明读取能力，但未声明 `buzz-meeting-v2-create`，Create gate 关闭；
 - Relay 声明 `buzz-meeting-v2-direct-actions`，可以继续读取 direct-action V2；
 - Relay 声明 `buzz-meeting-v2-direct-actions-create`，Desktop 才可以创建 direct-action V2；
-- 当前 roster 某个 Agent 缺少 `meeting-v2-action-finalization-v2`；
+- 当前 roster 某个 Agent 缺少 `meeting-v2-action-finalization-v4`；
 - Project View 不可用，但 Meeting action 仍可继续。
 
 关闭 Desktop preview gate 不得改变 Relay 状态；关闭 Relay Create gate 也不得隐藏已有 Meeting。
@@ -290,7 +293,8 @@ Desktop rollout gate 只控制新 UI 是否公开；Relay capability 决定当�
      Create、当前 State 与 End，不能只把 metadata `archived=true` 推断成正常关闭；
    - 使用 Create 时冻结的 moderator、participant type、roster 和 policy，不从当前 Profile 或
      managed-by 关系重推身份；
-   - 对 `v=3 + moderated-board-actions-v2` 和 `v=3 + moderated-board-v1` 建立显式能力；
+   - 对 `v=3 + moderated-board-actions-v3` 和 `v=3 + moderated-board-v1` 建立显式能力；旧 actions
+     policy 只保留历史只读投影，不满足 current create gate；
    - 对无法完整理解的旧协议 fail closed：仍按 Meeting 隔离，不提供普通 Channel Composer，
      显示明确兼容说明。
 
@@ -559,7 +563,8 @@ Desktop rollout gate 只控制新 UI 是否公开；Relay capability 决定当�
 5. **Agent 主持呈现**
    - 显示原主持 Agent 正在记录行动产出或已 blocked；
    - Human roster participant 不获得 confirm/retry/return-to-board；
-   - Desktop 不启动新 Agent Turn，不选择槽，也不改变 ACP Session。
+   - Desktop 不启动新 Agent Turn、不选择槽，也不改变 ACP Session；Harness 可为同一逻辑主持
+     Agent 选择任意健康槽，Desktop 不把物理 affinity 暴露为恢复操作。
 
 #### 自动化与验收
 
@@ -635,7 +640,7 @@ Desktop rollout gate 只控制新 UI 是否公开；Relay capability 决定当�
 | Human host + Agent participant | Agent Intent/Speech 可观察，Human host 可安排，不能代 Agent 操作 |
 | Agent host + Human participant | Human Floor 完整可用，Host Console 只读，Agent 完成 Board/Floor |
 | Human host action | 打开现有 Project View、返回、confirm；以及零写入 confirm |
-| Agent host action | 原 ACP Session 完成或 blocked，Desktop 无接管按钮 |
+| Agent host action | 逻辑主持 Turn 完成或因真实 provider/lease 故障 blocked；换槽/Session 不影响，Desktop 无接管按钮 |
 | Recovery | Relay reconnect、Desktop restart、Community A→B→A、stale command |
 | Terminal | direct closed、actions-recorded closed、discussion abort、action abort |
 
@@ -703,7 +708,8 @@ Meeting Desktop 可以认为交付完成，需要同时满足：
 2. Human 可以创建 action-capable V2，自己成为主持人并冻结 Human/Agent roster；
 3. Human participant 可以完成完整 Floor 生命周期；
 4. Human host 可以完成 Board、Intent、Floor、self Speech、Close、Abort 和 action 操作；
-5. Agent host/participant 状态可观察，但 Human 不能替 Agent 签名或选择 slot/session；
+5. Agent host/participant 状态可观察，但 Human 不能替 Agent 签名或选择 slot/session；Desktop 也不把
+   物理 slot/session 当作 Meeting correctness 或恢复条件；
 6. Board 与 canonical Speech timeline 同时可读，Board 无版本、Diff 或更新通知产品；
 7. Board Maintenance 与 Floor Decision 的界面、提交和 deadline 完全分离；
 8. Human Request、Directed Handoff、Recall 与 self Intent 保持后端既有优先级；

@@ -10,6 +10,12 @@
 > 关联设计：
 > [Meeting V2 Floor Decision 空等与 Action Finalization 硬超时修复设计](meeting-v2-floor-decision-and-action-finalization-timeout-fix-design.md)、
 > [主持人直接完成行动收口的后端修正方案](../meeting/fix/meeting-v2-direct-action-finalization-backend-plan.md)
+>
+> **后续取代说明（2026-08-08）：**本文对当时事故、Return-to-Board 与 Desktop 收敛的记录保持
+> 不变；为修复该代际而引入的物理槽/ACP Session continuity correctness 已由
+> [逻辑主持人 ACK 与同步简化实现设计](../meeting/fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)
+> 取代。current v4 runtime 不再创建 exact binding 或新的 `affinity_lost`，但仍保留 canonical
+> fence、单执行 Turn、停止屏障及历史记录读取。
 
 ## 1. 结论
 

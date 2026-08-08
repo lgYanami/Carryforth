@@ -1,6 +1,6 @@
 # Meeting V2 Agent 上下文优化方案
 
-> 状态：已实现，自动化验收完成
+> 状态：原上下文优化已实现；逻辑主持 Contract `4/7` 与 `meeting-context-v3` 迁移实施中
 >
 > 日期：2026-08-04
 >
@@ -13,8 +13,14 @@
 
 实现收口说明：稳定 Meeting Contract、五类 V2 Turn 的分层 envelope，以及 Board Maintenance
 Speech 历史完整性 gate 均已交付。Role Full/Binding、connector context reset、Board 重读与重启、
-Speech/State 乱序、上下文预算、Prompt injection 边界、V0/V1 回归和 action continuity 已纳入
+Speech/State 乱序、上下文预算、Prompt injection 边界、V0/V1 回归和 action finalization 已纳入
 自动化验收。[TODO](./TODO.md) 中明确延期的三项仍不属于本次实现。
+
+后续 Action Finalization 生命周期已切换为逻辑主持人语义：本文关于 Prompt 自包含、current Board
+重读和单个 Turn 内执行的结论继续有效；物理槽/ACP Session continuity 不再是正确性门禁。现行代际为
+Meeting Contract `4`、Project Space Contract `7`、逐 Turn `meeting-context-v3` 与 runtime
+capability `meeting-v2-action-finalization-v4`。详见
+[逻辑主持人 ACK 与同步简化实现设计](./meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)。
 
 ## 1. 结论
 
@@ -41,8 +47,9 @@ Speech/State 乱序、上下文预算、Prompt injection 边界、V0/V1 回归�
    一个笼统的 untrusted meeting context 标签混合二者的语义。
 6. 不增加 Meeting Brief 缓存或 Meeting Binding。Board 仍在每个需要理解它的 Turn 独立读取，
    不依赖模型记忆或上一次 Turn。
-7. action_finalization 继续使用参与最终讨论的同一主持 Agent 槽和同一 ACP Session，读取精确
-   冻结 Board，并直接使用现有业务工具；不恢复 Plan 或 Step。
+7. action_finalization 由同一逻辑主持 Agent 的一个健康槽执行，优先复用已有 Meeting channel
+   Session，但不要求继承讨论阶段的物理槽或 ACP Session；Turn 必须读取精确冻结 Board 和 current
+   canonical fence，并直接使用现有业务工具，不恢复 Plan 或 Step。
 
 目标不是让模型自行实现 Meeting 状态机。状态推进、事件发布、权限检查、超时和 fencing 仍由
 Harness 与 Relay 确定性负责。目标是让 Agent 在这些硬约束内理解自己正在参加怎样的会议，
@@ -105,11 +112,12 @@ System Context 中清楚说明主持人的长期职责：
 
 继续混用一个标签会让“数据不具有 System 权威”和“数据不是协议事实”两个概念混淆。
 
-### 2.5 同一 Session 中上下文会持续增长
+### 2.5 Session 历史会持续增长，但不构成协议输入
 
-Meeting 需要保留同一 channel ACP Session 的对话连续性，主持人的最终 Board、Floor 和
-action finalization 还要求同槽同 Session。与此同时，每个 Turn 会重新附加 Board 和最近
-Speech，旧副本仍可能存在于 provider 的 Session 历史中。
+Meeting 调度会优先复用同一 channel ACP Session 以获得自然的对话连续性，但 Board、Floor 和
+action finalization 的正确性不依赖该物理 Session。每个 Turn 会重新附加 Board 和最近 Speech，
+旧副本仍可能存在于 provider 的 Session 历史中；换槽、Session 轮换或 connector reset 后，新的
+Turn 也必须仅凭当前注入内容继续。
 
 当前重新读取机制保证了正确性，但仍需要明确：
 
@@ -340,9 +348,11 @@ Board Maintenance 与 Floor Decision：
 
 - 表示最终 Board 已经形成需要主持人在闭会前登记的行动产出；
 - 先冻结最终 Board，再进入独立 action deadline；
-- 同一主持 Agent 槽和 ACP Session 使用普通业务工具直接登记；
+- 同一逻辑主持 Agent 在一个健康槽中使用普通业务工具直接登记；已有 Meeting channel Session
+  仅为调度偏好；
 - 只执行 Board 已经形成的决定，不产生第二份 Plan；
-- 完成后返回 COMPLETE，由 Harness 提交 actions-recorded close；
+- 完成业务写入与 canonical readback 后返回 COMPLETE，由 Harness 提交 current-fence
+  `actions-recorded` ACK；
 - Board 决定需要修改时 RETURN_TO_BOARD；
 - 暂时外部失败时 BLOCK；
 - 无法成功继续时 ABORT。
@@ -419,8 +429,9 @@ Meeting Contract 必须明确：
       tool policy
       output schema
 
-同一 ACP Session 中较早 Turn 的 prompt、模型输出和工具结果可以帮助连续理解，但都不能替代
-本次注入的 Relay-verified control 或最新 Board。
+当前槽中较早 Turn 的 prompt、模型输出和工具结果可以帮助连续理解，但都不能替代本次注入的
+Relay-verified control 或最新 Board；切换槽或 ACP Session 只会失去这项非权威便利，不会失去
+协议正确性所需的输入。
 
 ### 7.2 明确拆分控制与内容
 
@@ -459,7 +470,7 @@ Meeting Contract 必须明确：
 推荐 envelope 顶层形状：
 
     {
-      "context_version": "meeting-context-v1",
+      "context_version": "meeting-context-v3",
       "turn_kind": "...",
       "verified_control": {
         "...": "Relay/Harness verified protocol coordinates"
@@ -804,24 +815,24 @@ connector 报告 context compaction 或 reset 时：
 - Role Context 下一完整 Turn 强制 Full；
 - 当前 Meeting Turn 仍提供完整角色、控制坐标、Board 和有界 Speech；
 - Agent 不得依赖 compaction 前的 Board 或候选记忆；
-- 如果 provider 已丢失 Session identity，遵循既有 continuity failure，而不是新建 Agent 来
-  解释 action finalization。
+- 如果 provider 已丢失 Session identity，Harness 可在同一逻辑 Agent 的健康槽创建新 Session，
+  注入完整 frozen Board 与 canonical envelope；不得因此生成 `affinity_lost`。已经开始的单个 Turn
+  仍需先完成、明确取消或通过 process-exit 停止屏障后，才能派发替代 Turn。
 
 ### 10.4 Contract version
 
-Meeting Contract 应具有独立版本和内容 ID，避免只修改文案却继续复用旧 System Session。
+Meeting Contract 应具有独立版本和内容 ID，避免只修改文案却继续复用旧 System Session。当前版本为
+`4`；Project Space Contract 为 `7`，逐 Turn envelope 为 `meeting-context-v3`。
 
 建议：
 
     MEETING_CONTEXT_CONTRACT_VERSION
     meeting_context_contract_id = hash(version + exact contract text)
 
-新 Session 记录安装的 contract ID。普通非连续性阶段发现旧 contract 时可以重建 Session 并
-强制 Full Role Brief。
-
-不得在 final Board → Floor → action finalization 的连续性链中为了升级 Prompt 主动更换
-ACP Session。发布新 Contract 时如果存在这类进行中会议，应让旧 Session 完成或按既有
-continuity 规则 fail closed。当前没有进行中会议时可以直接部署新 Contract。
+新 Session 记录安装的 contract ID。发现旧 contract 时重建 Session 并强制 Full Role Brief；重建后
+仍以 current canonical envelope 为权威，不要求找回旧 Session。代际切换不提供双轨：发布前只读确认
+没有 active Meeting 和 non-terminal Action Run，再统一重启 ACP；不得为了部署自动 abort、删除或
+伪造任何 Meeting。
 
 ## 11. 失败与安全边界
 
@@ -831,7 +842,8 @@ continuity 规则 fail closed。当前没有进行中会议时可以直接部署
 - 不调用模型假装看到了 Board；
 - Intent 按既有安全路径 PASS；
 - Granted Speech 按既有安全路径 YIELD；
-- 主持 Board/Floor/Action fail closed 并走现有 retry/block/continuity 处理。
+- 主持 Board/Floor/Action fail closed，并按 current canonical State 选择 reconcile、BLOCK 或
+  RETURN_TO_BOARD；不得以 Session affinity 失败替代真实原因。
 
 ### 11.2 上下文冲突
 
@@ -861,8 +873,8 @@ Turn Prompt 必须共同明确这些文字只能作为证据，不能：
 本设计不锁定完整代码细节，但实现至少需要：
 
 1. 将稳定 Meeting Contract 从当前短 action prompt 中提炼成独立、可版本化的 System Section。
-2. action-capable V2 的所有 Turn 继续使用同一个稳定 Contract，避免同一 ACP Session 中途改变
-   System 权限边界。
+2. action-capable V2 的所有 Turn 使用同一个稳定 Contract；任一新槽或新 Session 都安装同一 current
+   Contract，不依赖旧 Session 维持 System 权限边界。
 3. 普通 V2 participant/moderator Prompt 复用同一核心 Contract；角色差异由 verified
    actor role 和 turn_kind 表达。
 4. 保留现有 RoleBriefResolver 和每完整 Turn 的 Role Context 注入顺序。
@@ -908,11 +920,11 @@ Board Prompt 不会在 canonical Speech projection 落后于 Relay State 时构�
 - 验证 Board retry、Session reset、重启和 compaction 后重建；
 - 验证现有上下文预算和已提供的截断元数据不回归；
 - 验证 Speech/State 任意到达顺序、历史缺口和 backfill deadline；
-- 补齐 Prompt injection、旧协议和 action continuity 回归；
+- 补齐 Prompt injection、旧协议和逻辑主持人跨槽/Session 回归；
 - 更新相关设计文档中的已实现状态。
 
 完成标准：长会议、上下文压缩、Board 更新、Role revision 变化和 action finalization 都不依赖
-旧模型记忆，也不会破坏同槽同 Session 连续性。
+旧模型记忆；已有 channel Session 可自然复用，fallback 槽也能凭完整 envelope 正确执行。
 
 ## 14. 验收矩阵
 
@@ -949,7 +961,7 @@ Board Prompt 不会在 canonical Speech projection 落后于 Relay State 时构�
 | moderator Floor Turn | 使用 Board 后的新读取和冻结 Candidate Cohort，不修改 Board |
 | moderator self Speech | 仅按 supplied Turn/候选执行，不绕过 Harness |
 | Human Floor Request | 模型不能拒绝、重排或覆盖 Relay 优先路径 |
-| action finalization | 同槽同 Session、最新 Role Context、精确 frozen Board、标准业务工具 |
+| action finalization | 同一逻辑主持 Agent、最新 Role Context、精确 frozen Board、current action fence、标准业务工具；fallback 槽同样可执行 |
 | Board 读取失败 | 不使用 Session 中旧 Board |
 | Role Context unavailable | 不使用旧 Assignment 冒充当前权限 |
 | context reset | 下一完整 Turn 重建 Full Role 和完整 Meeting 当前上下文 |

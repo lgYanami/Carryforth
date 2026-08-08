@@ -195,6 +195,13 @@ mod tests {
             classify_capability_document(r#"{"meeting":{"capabilities":[]}}"#),
             MeetingCapabilityProbe::Unsupported,
         );
+        assert_eq!(
+            classify_capability_document(&format!(
+                r#"{{"meeting":{{"capabilities":["{}"]}}}}"#,
+                buzz_sdk_pkg::MEETING_V2_ACTIONS_V3_CAPABILITY
+            )),
+            MeetingCapabilityProbe::Unsupported,
+        );
         assert!(matches!(
             classify_capability_document(r#"{"meeting":{}}"#),
             MeetingCapabilityProbe::Unknown(_)

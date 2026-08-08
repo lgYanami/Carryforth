@@ -12,6 +12,12 @@
 > [主持人乐观决策设计](../meeting/v1/meeting-v1-moderator-optimistic-decision-design.md)、
 > [主持人直接完成行动收口的后端修正方案](../meeting/fix/meeting-v2-direct-action-finalization-backend-plan.md)、
 > [现场验收后续：Board→Action 连续性、Return-to-Board 投影与 Desktop 终态收敛修复设计](meeting-v2-board-action-continuity-return-to-board-and-directory-convergence-fix-design.md)
+>
+> **后续取代说明（2026-08-08）：**本文保留 Floor 解析、renewable lease 与当时 continuity
+> 事故的历史事实；其中 exact slot/ACP Session affinity 被视为 Action correctness 的条款已由
+> [逻辑主持人 ACK 与同步简化实现设计](../meeting/fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)
+> 取代。现行完成权威是 frozen moderator 提交的 current-fence `actions-recorded` ACK；lease
+> 仅表达逻辑主持 Harness 的活性。
 
 ## 1. 结论
 

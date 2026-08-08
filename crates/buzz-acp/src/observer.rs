@@ -254,8 +254,6 @@ fn acceptance_safe_kind(kind: &str) -> bool {
             | "meeting_v2_action_format_retry"
             | "meeting_v2_action_turn_queued"
             | "meeting_v2_direct_action_turn_completed"
-            | "meeting_v2_continuity_bound"
-            | "meeting_v2_continuity_lost"
             | "meeting_v2_floor_turn_completed"
             | "meeting_v2_floor_turn_queued"
             | "meeting_v2_host_turn_discarded"

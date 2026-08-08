@@ -51,8 +51,9 @@ live fan-out、Meeting directory、Board/Speech point read 与 Desktop 都必须
 - Meeting 归档后坐标与既有 Edge 保留，并继续执行当前 Community membership 读取授权；
 - 不把 Board revision、单条 Speech 或 Nostr event ID 设计成独立坐标；
 - Relay 不因 Action Finalization、Meeting End 或 Project View 物化自动推断、创建或扩展 Edge；
-- 主持 Human 或 Agent 在 Action Finalization 同一 Turn / ACP Session 中，先物化并回读业务坐标，再显式
-  写入 Context Document、attach 当前 Meeting 与物化坐标并回读 canonical Edge；
+- 主持 Human 或 Agent 在同一 Action Finalization Turn / 逻辑主持身份下，先物化并回读业务坐标，再显式
+  写入 Context Document、attach 当前 Meeting 与物化坐标并回读 canonical Edge；该 Turn 不要求继承
+  讨论阶段的物理槽或 ACP Session；
 - 没有真实物化坐标或解释关系时，不伪造 Context Document / Edge。
 
 ### 历史过渡方案（已结束）
@@ -88,5 +89,6 @@ Project Context Edge v1 没有原地扩展 closed union；当前版本已完整�
 Meeting Coordinate。Meeting 使用追加 family rank `0x02`，既有 Project View / Document-only
 Edge key 保持不变。Project Document 继续承接经过整理的会议结论和来源说明，Meeting 则作为可跳转、
 按需读取的来源证据坐标。新 attach 的资格是 verified terminal 或 verified `finalizing_actions`；后者使
-主持人在上下文最完整的同一工作槽内完成业务物化、关系解释和 canonical 回读，同时保持 Relay 不自动
-推断 Context 的边界。
+主持人在一个自包含的 Action Finalization Turn 内完成业务物化、关系解释和 canonical 回读；Harness
+优先复用已有 Meeting channel Session，但 fallback 健康槽同样合法，同时保持 Relay 不自动推断 Context
+的边界。
