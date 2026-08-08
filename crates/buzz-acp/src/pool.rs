@@ -5586,7 +5586,7 @@ mod tests {
     #[test]
     fn complete_meeting_turn_places_current_role_context_before_the_envelope() {
         let prompt_sections = vec![
-            "MEETING TURN ENVELOPE:\n{\"context_version\":\"meeting-context-v1\"}\n\nCURRENT MEETING BOARD:\n{\"current_board\":{}}"
+            "MEETING TURN ENVELOPE:\n{\"context_version\":\"meeting-context-v2\"}\n\nCURRENT MEETING BOARD:\n{\"current_board\":{}}"
                 .to_string(),
         ];
         for role_context in [
