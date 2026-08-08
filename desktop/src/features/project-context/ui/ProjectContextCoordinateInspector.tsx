@@ -362,7 +362,8 @@ export function ProjectContextCoordinateInspector({
           identity={projectContextDocumentIdentity(result)}
           onOpenDocument={onOpenDocument}
         />
-      ) : detail.state === "terminal" && coordinate.type === "meeting" ? (
+      ) : (detail.state === "terminal" || detail.state === "active") &&
+        coordinate.type === "meeting" ? (
         <ProjectContextMeetingContent
           fallback={detail.meeting}
           meetingId={coordinate.meetingId}

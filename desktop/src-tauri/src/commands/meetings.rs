@@ -19,9 +19,10 @@ pub use host::submit_meeting_host_action;
 mod context;
 pub use context::get_meeting_context_detail;
 pub(crate) use context::{
-    read_meetings_for_project_context_at, MeetingContextActionSummary, MeetingContextParticipant,
-    MeetingContextRead, MeetingContextRecord,
+    read_meetings_for_project_context_at, MeetingContextRead, MeetingContextRecord,
 };
+#[cfg(test)]
+pub(crate) use context::{MeetingContextActionSummary, MeetingContextParticipant};
 mod directory;
 use directory::list_item_from_load;
 mod model;

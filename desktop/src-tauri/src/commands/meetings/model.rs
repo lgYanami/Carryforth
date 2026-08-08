@@ -166,7 +166,7 @@ pub struct MeetingSnapshot {
     pub(super) authoritative_updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeetingLifecycle {
     Initializing,
@@ -219,7 +219,7 @@ pub struct MeetingListItem {
     pub(super) compatibility: MeetingListCompatibility,
 }
 
-/// Body-free terminal Meeting metadata used by Project Context inspection.
+/// Body-free verified Meeting metadata used by Project Context inspection.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingContextInspectorDetail {
@@ -228,9 +228,10 @@ pub struct MeetingContextInspectorDetail {
     pub(super) description: Option<String>,
     pub(super) host_pubkey: String,
     pub(super) participants: Vec<MeetingParticipant>,
-    pub(super) terminal_outcome: String,
+    pub(super) lifecycle: MeetingLifecycle,
+    pub(super) terminal_outcome: Option<String>,
     pub(super) created_at: u64,
-    pub(super) ended_at: u64,
+    pub(super) ended_at: Option<u64>,
     pub(super) action_finalization: Option<MeetingContextInspectorActionSummary>,
 }
 
@@ -250,7 +251,7 @@ pub enum MeetingContextInspectorLoadResult {
     UnsupportedRelay,
     Forbidden,
     NotFound,
-    NotTerminal,
+    NotAttachable,
     UnsupportedProtocol,
     Ready {
         detail: Box<MeetingContextInspectorDetail>,

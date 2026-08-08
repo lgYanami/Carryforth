@@ -1,4 +1,4 @@
-# Project Context V0 领域规范
+# Project Context V2 领域规范
 
 > 状态：首版概念规范
 > 本文只定义 Project Context 的最小领域语义、关系、生命周期与查询语义，不定义事件
@@ -48,6 +48,9 @@ CoordinateRef =
   | ProjectDocumentCoordinate {
       document_id
     }
+  | MeetingCoordinate {
+      meeting_id
+    }
 ```
 
 其中：
@@ -60,12 +63,13 @@ CoordinateRef =
 
 ## 3. 坐标
 
-### 3.1 首版坐标类型
+### 3.1 当前坐标类型
 
-首版只允许两类坐标：
+当前只允许三类坐标：
 
 1. Project View 对象；
-2. Project Document。
+2. Project Document；
+3. Meeting。
 
 Project View 对象坐标复用现有对象类型与稳定 `object_id`。这包括 Project Profile、Goal、
 Role、Plan、Stage、Requirement、Issue、Work 和 Resource 等现有 Project View 对象，
@@ -73,6 +77,11 @@ Role、Plan、Stage、Requirement、Issue、Work 和 Resource 等现有 Project 
 
 Project Document 坐标复用稳定 `document_id`，不使用标题、当前 Revision 或某一次 Nostr
 event ID 作为身份。
+
+Meeting 坐标复用稳定 `meeting_id`，不把 Board、Speech、Action Run 或 Nostr event ID 设计成独立
+坐标。新建关联时，Relay 只接受 verified terminal Meeting，或 formal discussion 与 Board 已冻结且
+存在 current Action Run 的 verified `finalizing_actions` Meeting。其他 active Meeting 仍可被 Community
+成员读取，也可在既有 Edge 中保留，但不能新建 binding。
 
 ### 3.2 坐标身份
 
@@ -228,10 +237,15 @@ Human / Agent 在工作中：
 - 自动产生 Gap；
 - 根据对象变化自动改写 Context Document；
 - 从聊天、工作状态或文档正文中推断新 Edge；
+- 因 Meeting End、Board 内容或 Action Finalization 物化结果自动推断新 Edge；
 - 指定哪个 Role 永久拥有某条 Edge。
 
 只有 Human / Agent 通过实际工作发现并明确写回后，这些语义变化才成为项目上下文的一
 部分。
+
+主持 Human / Agent 可以在 Action Finalization 中显式维护 Context：先按冻结 Board 完成业务物化并回读，
+再创建或修订普通 Context Document，attach 当前 Meeting 与真实物化坐标并回读 canonical Edge。这里的
+“显式维护”不是 Relay 自动推断；没有真实物化坐标或解释关系时不得伪造 Document / Edge。
 
 ## 7. 生命周期
 

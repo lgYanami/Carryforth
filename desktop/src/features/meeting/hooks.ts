@@ -211,7 +211,7 @@ export function useMeetingSnapshot(meetingId: string) {
   return query;
 }
 
-/** Read body-free terminal metadata for Project Context inspection. */
+/** Read body-free verified Meeting metadata for Project Context inspection. */
 export function useMeetingContextDetail(meetingId: string) {
   const { activeCommunity } = useCommunities();
   return useQuery({
@@ -398,6 +398,15 @@ export function useMeetingLiveSync(
         invalidations.push(
           queryClient.invalidateQueries({
             queryKey: meetingActivitiesQueryKey(communityId, meetingId),
+          }),
+          queryClient.invalidateQueries({
+            queryKey: meetingContextDetailQueryKey(communityId, meetingId),
+          }),
+          queryClient.invalidateQueries({
+            predicate: (candidate) =>
+              candidate.queryKey[0] === "project-context" &&
+              typeof candidate.queryKey[1] === "string" &&
+              candidate.queryKey[1].startsWith(`${communityId ?? "none"}-`),
           }),
         );
       }

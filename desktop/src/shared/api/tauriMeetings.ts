@@ -297,9 +297,10 @@ export type MeetingContextInspectorDetail = {
   description: string | null;
   hostPubkey: string;
   participants: MeetingParticipant[];
-  terminalOutcome: string;
+  lifecycle: MeetingLifecycle;
+  terminalOutcome: string | null;
   createdAt: number;
-  endedAt: number;
+  endedAt: number | null;
   actionFinalization: {
     condition: string;
     terminalStatus: string | null;
@@ -311,7 +312,7 @@ export type MeetingContextInspectorLoadResult =
   | { status: "unsupported_relay" }
   | { status: "forbidden" }
   | { status: "not_found" }
-  | { status: "not_terminal" }
+  | { status: "not_attachable" }
   | { status: "unsupported_protocol" }
   | { status: "ready"; detail: MeetingContextInspectorDetail };
 

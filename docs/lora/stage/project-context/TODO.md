@@ -4,11 +4,11 @@
 >
 > 日期：2026-08-07
 
-## 1. 将终态 Meeting 作为 Project Context 坐标（已完成）
+## 1. 将 Meeting 作为 Project Context 坐标（已完成）
 
 ### 背景
 
-Meeting 的正式 Speech、最终 Board、终态和 Action Finalization 记录具有长期上下文价值。
+Meeting 的正式 Speech、冻结 Board、终态和 Action Finalization 记录具有长期上下文价值。
 会议物化产生的 Goal、Plan、Stage、Requirement、Issue、Work、Role、Resource 和 Document
 已经可以作为 Project Context 坐标，但当前无法直接表达“这些项目对象来源于哪场会议、为何在
 该会议中共同形成”。
@@ -41,20 +41,23 @@ Meeting 与 Project View、Project Document 一样，是 Community / Project 范
 live fan-out、Meeting directory、Board/Speech point read 与 Desktop 都必须一起迁移；frozen roster 写入
 校验保持不变。
 
-### 建议的首版边界
+### 当前边界
 
-- 仅允许 `closed` 或 `aborted` 的终态 Meeting 建立新的 Context 关联；
+- 允许 `closed` / `aborted` 终态 Meeting，以及 Relay 已验证处于 `finalizing_actions`、拥有 current
+  Action Run 与 frozen Board 的 Meeting 建立新的 Context 关联；其他 active Meeting 仍拒绝；
 - 坐标身份只使用稳定、Project-scoped `meeting_id`；
 - hydration 默认只返回有界轻量元数据，例如标题、终态、主持人、participant count / preview 与结束时间；
 - 最终 Board 与正式 Speech 按需从 Meeting 领域读取，不自动注入 Agent Turn；
 - Meeting 归档后坐标与既有 Edge 保留，并继续执行当前 Community membership 读取授权；
 - 不把 Board revision、单条 Speech 或 Nostr event ID 设计成独立坐标；
-- 不因 Action Finalization 或 Project View 物化自动推断、创建或扩展 Edge；
-- Human 或 Agent 必须显式确认准确坐标集合并写回 Context Document。
+- Relay 不因 Action Finalization、Meeting End 或 Project View 物化自动推断、创建或扩展 Edge；
+- 主持 Human 或 Agent 在 Action Finalization 同一 Turn / ACP Session 中，先物化并回读业务坐标，再显式
+  写入 Context Document、attach 当前 Meeting 与物化坐标并回读 canonical Edge；
+- 没有真实物化坐标或解释关系时，不伪造 Context Document / Edge。
 
-### 当前可行的过渡方案
+### 历史过渡方案（已结束）
 
-在 Meeting Coordinate 落地前，Action Finalization 可以显式创建或更新一份适合 Community
+在 Meeting Coordinate 落地前，Action Finalization 曾可显式创建或更新一份适合 Community
 范围共享的 Project Document，记录：
 
 - Meeting deep link；
@@ -62,9 +65,9 @@ live fan-out、Meeting directory、Board/Speech point read 与 Desktop 都必须
 - 关键分歧、采用方案及适用边界；
 - 受影响或新产生的 Project View / Resource / Document 坐标。
 
-随后以物化出的项目对象作为 Edge 坐标，以该 Document 作为 Context Document。Meeting Community-read
-迁移完成前，不得把按旧合同产生的 legacy Speech 全文直接复制到 Community-wide Document；写入者必须
-先整理出适合目标可见范围的内容。
+随后以物化出的项目对象作为 Edge 坐标，以该 Document 作为 Context Document。该方案现已由正式
+Meeting Coordinate 与同 Turn attach 流程取代，仅保留为历史决策记录；legacy Speech 仍不得未经整理
+直接复制到 Community-wide Document。
 
 ### 已完成的交付条件
 
@@ -76,10 +79,14 @@ live fan-out、Meeting directory、Board/Speech point read 与 Desktop 都必须
 6. 验证普通非 roster Community member 可读但不可执行会议行动、owner/admin 应急 End 边界不扩大，
    非 member 无侧信道；
 7. 验证现有 Project View / Document 坐标、Edge key、Context Revision 和三类集合查询语义不变。
+8. 验证同一 Action Finalization Turn 可将 current Meeting 与物化坐标显式 attach，其他 active phase
+   仍被拒绝，且既有 Edge 在 RETURN_TO_BOARD 后继续保留。
 
 ### 最终决定
 
 Project Context Edge v1 没有原地扩展 closed union；当前版本已完整升级到 schema/capability v2，并加入
-终态 Meeting Coordinate。Meeting 使用追加 family rank `0x02`，既有 Project View / Document-only
+Meeting Coordinate。Meeting 使用追加 family rank `0x02`，既有 Project View / Document-only
 Edge key 保持不变。Project Document 继续承接经过整理的会议结论和来源说明，Meeting 则作为可跳转、
-按需读取的来源证据坐标。
+按需读取的来源证据坐标。新 attach 的资格是 verified terminal 或 verified `finalizing_actions`；后者使
+主持人在上下文最完整的同一工作槽内完成业务物化、关系解释和 canonical 回读，同时保持 Relay 不自动
+推断 Context 的边界。

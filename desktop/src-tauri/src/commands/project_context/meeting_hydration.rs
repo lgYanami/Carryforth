@@ -77,13 +77,13 @@ fn meeting_detail(
     ProjectContextMeetingObservation,
 ) {
     match read {
-        MeetingContextRead::Terminal(record) => terminal_detail(coordinate, meeting_id, record)
+        MeetingContextRead::Observed(record) => observed_detail(coordinate, meeting_id, *record)
             .unwrap_or_else(|| failed_detail(coordinate, meeting_id, "invalid_meeting_timestamp")),
-        MeetingContextRead::Active => failed_or_unavailable_detail(
+        MeetingContextRead::NotAttachable => failed_or_unavailable_detail(
             coordinate,
             meeting_id,
             required_by_edge,
-            "meeting_not_terminal",
+            "meeting_not_attachable",
         ),
         MeetingContextRead::NotFound => failed_or_unavailable_detail(
             coordinate,
@@ -100,7 +100,7 @@ fn meeting_detail(
     }
 }
 
-fn terminal_detail(
+fn observed_detail(
     coordinate: &ProjectContextCoordinate,
     meeting_id: Uuid,
     record: MeetingContextRecord,
@@ -109,7 +109,10 @@ fn terminal_detail(
     ProjectContextMeetingObservation,
 )> {
     let created_at = timestamp(record.created_at)?;
-    let ended_at = timestamp(record.ended_at)?;
+    let ended_at = match record.ended_at {
+        Some(ended_at) => Some(timestamp(ended_at)?),
+        None => None,
+    };
     let updated_at = timestamp(record.updated_at)?;
     let observation = ProjectContextMeetingObservation {
         meeting_id,
@@ -117,19 +120,24 @@ fn terminal_detail(
         state_revision: Some(record.state_revision),
         create_event_id: Some(record.create_event_id),
         state_event_id: Some(record.state_event_id),
-        end_event_id: Some(record.end_event_id),
+        end_event_id: record.end_event_id,
         updated_at: Some(updated_at),
     };
     let detail = ProjectContextCoordinateDetail {
         coordinate_key: coordinate_key(coordinate),
         coordinate: coordinate_dto(coordinate),
-        state: ProjectContextDetailState::Terminal,
+        state: if record.terminal_outcome.is_some() {
+            ProjectContextDetailState::Terminal
+        } else {
+            ProjectContextDetailState::Active
+        },
         title: Some(record.title),
-        status: Some(json!(record.terminal_outcome)),
+        status: Some(json!(record.lifecycle)),
         object_revision: None,
         document_revision: None,
         meeting: Some(ProjectContextMeetingDetail {
             discussion_goal: record.discussion_goal,
+            lifecycle: record.lifecycle.to_string(),
             terminal_outcome: record.terminal_outcome,
             host_pubkey: record.host_pubkey,
             participant_count: record.participant_count,
@@ -252,7 +260,8 @@ mod tests {
         MeetingContextRecord {
             title: "Memory boundary review".to_string(),
             discussion_goal: Some("Agree the first durable memory slice".to_string()),
-            terminal_outcome: "closed".to_string(),
+            lifecycle: "closed",
+            terminal_outcome: Some("closed".to_string()),
             host_pubkey: "a".repeat(64),
             participant_count: 4,
             participant_preview: vec![MeetingContextParticipant {
@@ -260,7 +269,7 @@ mod tests {
                 participant_type: "agent",
             }],
             created_at: 1_786_054_800,
-            ended_at: 1_786_055_400,
+            ended_at: Some(1_786_055_400),
             action_finalization: Some(ReadActionSummary {
                 condition: "recorded".to_string(),
                 terminal_status: Some("completed_closed".to_string()),
@@ -269,7 +278,7 @@ mod tests {
             state_revision: 64,
             create_event_id: "c".repeat(64),
             state_event_id: "d".repeat(64),
-            end_event_id: "e".repeat(64),
+            end_event_id: Some("e".repeat(64)),
             updated_at: 1_786_055_400,
         }
     }
@@ -281,7 +290,7 @@ mod tests {
         let (detail, observation) = meeting_detail(
             &coordinate(meeting_id),
             meeting_id,
-            MeetingContextRead::Terminal(terminal_record()),
+            MeetingContextRead::Observed(Box::new(terminal_record())),
             true,
         );
 
@@ -290,7 +299,8 @@ mod tests {
         let meeting = detail.meeting.expect("terminal detail must be present");
         assert_eq!(meeting.participant_count, 4);
         assert_eq!(meeting.participant_preview.len(), 1);
-        assert_eq!(meeting.terminal_outcome, "closed");
+        assert_eq!(meeting.lifecycle, "closed");
+        assert_eq!(meeting.terminal_outcome.as_deref(), Some("closed"));
         assert_eq!(
             observation.state,
             ProjectContextMeetingObservationState::Observed
@@ -306,16 +316,58 @@ mod tests {
         let (detail, observation) = meeting_detail(
             &coordinate(meeting_id),
             meeting_id,
-            MeetingContextRead::Active,
+            MeetingContextRead::NotAttachable,
             true,
         );
 
         assert_eq!(detail.state, ProjectContextDetailState::Unavailable);
-        assert_eq!(detail.unavailable_reason, Some("meeting_not_terminal"));
+        assert_eq!(detail.unavailable_reason, Some("meeting_not_attachable"));
         assert_eq!(
             observation.state,
             ProjectContextMeetingObservationState::VerificationFailed
         );
+    }
+
+    #[test]
+    fn finalizing_meeting_emits_active_detail_with_frozen_action_metadata() {
+        let meeting_id = Uuid::parse_str("60000000-0000-4000-8000-000000000002")
+            .expect("fixture UUID must be valid");
+        let mut record = terminal_record();
+        record.lifecycle = "finalizing_actions";
+        record.terminal_outcome = None;
+        record.ended_at = None;
+        record.end_event_id = None;
+        record.action_finalization = Some(ReadActionSummary {
+            condition: "runnable".to_string(),
+            terminal_status: None,
+            actions_attested: false,
+        });
+
+        let (detail, observation) = meeting_detail(
+            &coordinate(meeting_id),
+            meeting_id,
+            MeetingContextRead::Observed(Box::new(record)),
+            true,
+        );
+
+        assert_eq!(detail.state, ProjectContextDetailState::Active);
+        assert_eq!(detail.status, Some(json!("finalizing_actions")));
+        let meeting = detail.meeting.expect("finalizing detail must be present");
+        assert_eq!(meeting.lifecycle, "finalizing_actions");
+        assert!(meeting.terminal_outcome.is_none());
+        assert!(meeting.ended_at.is_none());
+        assert_eq!(
+            meeting
+                .action_finalization
+                .expect("action summary")
+                .condition,
+            "runnable"
+        );
+        assert_eq!(
+            observation.state,
+            ProjectContextMeetingObservationState::Observed
+        );
+        assert!(observation.end_event_id.is_none());
     }
 
     #[test]

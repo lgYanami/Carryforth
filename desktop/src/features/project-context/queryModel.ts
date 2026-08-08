@@ -195,6 +195,23 @@ function shortId(value: string): string {
   return value.length > 12 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value;
 }
 
+function meetingLifecycleLabel(
+  lifecycle: MeetingListItem["lifecycle"],
+): string {
+  switch (lifecycle) {
+    case "finalizing_actions":
+      return "Finalizing actions";
+    case "closed":
+      return "Closed";
+    case "aborted":
+      return "Aborted";
+    case "initializing":
+      return "Initializing";
+    default:
+      return "In progress";
+  }
+}
+
 function optionFromVisibleDetail(
   detail: ProjectContextCoordinateDetail,
 ): ProjectContextCoordinateOption {
@@ -224,7 +241,9 @@ function optionFromVisibleDetail(
     title: detail.title?.trim() || `${typeLabel} ${shortId(stableId)}`,
     typeLabel,
     description: detail.meeting?.discussionGoal ?? detail.unavailableReason,
-    status: detail.meeting?.terminalOutcome,
+    status: detail.meeting
+      ? meetingLifecycleLabel(detail.meeting.lifecycle)
+      : undefined,
     searchTerms: detail.meeting
       ? [
           detail.meeting.hostPubkey,
@@ -303,7 +322,9 @@ export function buildProjectContextCoordinateOptions(input: {
   for (const meeting of input.meetings ?? []) {
     if (
       meeting.compatibility !== "ready" ||
-      (meeting.lifecycle !== "closed" && meeting.lifecycle !== "aborted")
+      (meeting.lifecycle !== "finalizing_actions" &&
+        meeting.lifecycle !== "closed" &&
+        meeting.lifecycle !== "aborted")
     ) {
       continue;
     }
@@ -332,7 +353,7 @@ export function buildProjectContextCoordinateOptions(input: {
       coordinate,
       coordinateKey: projectContextCoordinateKey(coordinate),
       group: "meetings",
-      state: "terminal",
+      state: meeting.lifecycle === "finalizing_actions" ? "active" : "terminal",
       title: meeting.title,
       typeLabel: "Meeting",
       description:
@@ -340,7 +361,7 @@ export function buildProjectContextCoordinateOptions(input: {
         (participantSummary
           ? `Participants: ${participantSummary}`
           : undefined),
-      status: `${meeting.lifecycle === "closed" ? "Closed" : "Aborted"}${
+      status: `${meetingLifecycleLabel(meeting.lifecycle)}${
         meeting.endedAt
           ? ` · ${new Date(meeting.endedAt * 1_000).toLocaleString()}`
           : ""

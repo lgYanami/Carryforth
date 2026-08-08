@@ -146,7 +146,7 @@ pub enum ProjectContextCoordinateDto {
     },
     /// Stable Project Document identity.
     Document { document_id: Uuid },
-    /// Stable terminal Meeting identity.
+    /// Stable Meeting identity.
     Meeting { meeting_id: Uuid },
 }
 
@@ -239,12 +239,13 @@ pub struct ProjectContextMeetingActionSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectContextMeetingDetail {
     pub(super) discussion_goal: Option<String>,
-    pub(super) terminal_outcome: String,
+    pub(super) lifecycle: String,
+    pub(super) terminal_outcome: Option<String>,
     pub(super) host_pubkey: String,
     pub(super) participant_count: usize,
     pub(super) participant_preview: Vec<ProjectContextMeetingParticipant>,
     pub(super) created_at: DateTime<Utc>,
-    pub(super) ended_at: DateTime<Utc>,
+    pub(super) ended_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) action_finalization: Option<ProjectContextMeetingActionSummary>,
 }

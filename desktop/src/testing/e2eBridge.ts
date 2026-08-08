@@ -11977,13 +11977,14 @@ export function maybeInstallE2eTauriMocks() {
             : { status: result.status };
         }
         const { snapshot } = result;
-        if (
-          snapshot.lifecycle !== "closed" &&
-          snapshot.lifecycle !== "aborted"
-        ) {
-          return { status: "not_terminal" };
+        if (snapshot.lifecycle === "initializing") {
+          return { status: "not_attachable" };
         }
-        if (!snapshot.end) return { status: "unsupported_protocol" };
+        const terminal =
+          snapshot.lifecycle === "closed" || snapshot.lifecycle === "aborted";
+        if (terminal !== Boolean(snapshot.end)) {
+          return { status: "unsupported_protocol" };
+        }
         return {
           status: "ready",
           detail: {
@@ -11992,14 +11993,15 @@ export function maybeInstallE2eTauriMocks() {
             description: snapshot.description,
             hostPubkey: snapshot.hostPubkey,
             participants: structuredClone(snapshot.participants),
-            terminalOutcome: snapshot.end.outcome,
+            lifecycle: snapshot.lifecycle,
+            terminalOutcome: snapshot.end?.outcome ?? null,
             createdAt: snapshot.createdAt,
-            endedAt: snapshot.end.endedAt,
+            endedAt: snapshot.end?.endedAt ?? null,
             actionFinalization: snapshot.action
               ? {
                   condition: snapshot.action.condition,
                   terminalStatus: snapshot.action.terminalStatus,
-                  actionsAttested: snapshot.end.actionsAttested,
+                  actionsAttested: snapshot.end?.actionsAttested ?? false,
                 }
               : null,
           },

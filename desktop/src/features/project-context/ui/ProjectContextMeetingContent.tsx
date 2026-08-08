@@ -72,6 +72,18 @@ export function ProjectContextMeetingContent({
     truncatePubkey(pubkey);
   const terminalOutcome =
     verified?.terminalOutcome ?? fallback?.terminalOutcome;
+  const lifecycle =
+    verified?.lifecycle ??
+    fallback?.lifecycle ??
+    (terminalOutcome === "aborted" ? "aborted" : "closed");
+  const finalizing = lifecycle === "finalizing_actions";
+  const lifecycleLabel = finalizing
+    ? "Finalizing actions"
+    : lifecycle === "aborted"
+      ? "Aborted"
+      : lifecycle === "closed"
+        ? "Closed"
+        : "In progress";
   const action = verified?.actionFinalization;
   const actionSummary = action
     ? action.terminalStatus || action.condition
@@ -87,9 +99,11 @@ export function ProjectContextMeetingContent({
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="outline">Meeting</Badge>
           <Badge
-            variant={terminalOutcome === "aborted" ? "warning" : "success"}
+            variant={
+              finalizing || lifecycle === "aborted" ? "warning" : "success"
+            }
           >
-            {terminalOutcome === "aborted" ? "Aborted" : "Closed"}
+            {lifecycleLabel}
           </Badge>
         </div>
         <h3 className="mt-2 text-lg font-semibold leading-tight">
@@ -100,6 +114,12 @@ export function ProjectContextMeetingContent({
             fallback?.discussionGoal ??
             "No discussion goal was recorded."}
         </p>
+        {finalizing ? (
+          <p className="mt-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-muted-foreground">
+            Formal discussion and the Board are frozen; Meeting closure is
+            pending.
+          </p>
+        ) : null}
         <Button
           className="mt-3"
           data-testid="project-context-open-meeting"
@@ -126,12 +146,14 @@ export function ProjectContextMeetingContent({
         </div>
         <div>
           <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Ended
+            {finalizing ? "Lifecycle" : "Ended"}
           </div>
           <div className="mt-1 text-sm">
-            {verified
-              ? unixDateTime(verified.endedAt)
-              : isoDateTime(fallback?.endedAt)}
+            {finalizing
+              ? "Pending closure"
+              : verified
+                ? unixDateTime(verified.endedAt ?? undefined)
+                : isoDateTime(fallback?.endedAt ?? undefined)}
           </div>
         </div>
         <div className="col-span-2">

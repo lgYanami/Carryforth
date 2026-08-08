@@ -396,7 +396,7 @@ heads 返回结果。
 `project_view_object | document | meeting` 三个显式分支，并对未知 type `RAISE`；否则未来错误类型可能
 计算出一个貌似合法的 Edge key。
 
-### 7.2 Meeting identity 与终态外键
+### 7.2 Meeting identity 与可 attach 状态证据
 
 不建议从 Context coordinate 表直接建立会阻碍历史保留的硬级联外键。`meeting_sessions` 是运行期权威
 resolver，Context Edge 需要像 tombstoned Project View / Document 坐标一样保留稳定身份。
@@ -413,13 +413,26 @@ MeetingCoordinateResolution =
     state_event_id,
     end_event_id
   }
+  | FinalizingActions {
+    meeting_id,
+    state_revision,
+    state_event_id,
+    board_event_id,
+    action_run_id,
+    control_epoch,
+    board_window
+  }
   | Active
   | OrdinaryChannel
   | MissingOrForeign
   | InvalidTerminal
 ```
 
-只有调用者先通过 Community write authorization 后，attach 才可以把 `Active`、`OrdinaryChannel` 和
+`FinalizingActions` 必须同时验证 schema / policy、Relay-signed current State、`runtime_phase =
+finalizing_actions`、current non-terminal Action Run、frozen current Board，以及 control epoch / board window
+一致性。不能只信任一个 lifecycle 字段。
+
+只有调用者先通过 Community write authorization 后，attach 才可以把普通 `Active`、`OrdinaryChannel` 和
 `InvalidTerminal` 映射为精确诊断。`MissingOrForeign` 始终合并不存在与跨 Community，避免利用写接口枚举
 其他 Community。读取入口继续使用无侧信道的统一 not-found 语义。
 
@@ -431,7 +444,7 @@ MeetingCoordinateResolution =
 - normalization 结果及其证据 ID 纳入 legacy visibility audit，不改写历史 Nostr event。
 
 attach 使用固定锁顺序：先锁当前 Community 的 Project Context state / Edge mutation scope，再以同一
-Community 锁定目标 Meeting session/state，重新执行 terminal resolver，最后写 binding 与 projection。
+Community 锁定目标 Meeting session/state，重新执行 attachability resolver，最后写 binding 与 projection。
 Meeting 终态不可 reopen，Meeting End 路径不反向获取 Context lock，因此不会形成锁环。若未来允许 reopen，
 必须重新设计该事务边界，不能沿用本约束。
 
@@ -557,17 +570,24 @@ Community owner/admin 不是当然主持人；Community-wide observer 不能借�
 
 ## 9. Meeting Coordinate 生命周期
 
-### 9.1 只有终态 Meeting 可以新 attach
+### 9.1 终态或冻结的 Action Finalization Meeting 可以新 attach
 
-首版 attach resolver 只接受：
+attach resolver 接受两类 verified 状态：
 
 ```text
 status = ended
 terminal_outcome IN (closed, aborted)
+
+或：
+
+status = active
+runtime_phase = finalizing_actions
+current non-terminal Action Run + frozen current Board + Relay-signed current State
+control_epoch / board_window 一致
 ```
 
-活动 Meeting 对所有 member 可读，但不出现在 Context Coordinate picker 中，也不能建立新的 binding。
-原因不是权限，而是 Meeting 尚未形成稳定的最终记录。
+其他活动 Meeting 对所有 member 可读，但不出现在 Context Coordinate picker 中，也不能建立新的 binding。
+Action Finalization 是唯一例外，因为 formal discussion 与 Board 已冻结，主持人正处于同一业务物化 Turn。
 
 这里的 `status` / `terminal_outcome` 指第 7.2 节 resolver 从 verified Create → State → End 链得到的
 normalized terminal，不是客户端字段或单条 event 的自述。旧 Meeting 无法证明终态时保持可读但不可
@@ -583,6 +603,11 @@ attach，直到 operator 修复或补齐可验证投影；系统不得把它猜�
 - 某个 Action Run
 
 建模为独立坐标。Inspector 可以把这些作为 Meeting 状态摘要显示。
+
+Action Finalization 允许主持 Human / Agent 显式维护 Context，但 Relay 不从 Board、Meeting End 或物化结果
+自动推断 Edge。主持人应在同一 Turn / ACP Session 内按顺序完成业务写入与回读、Context Document 写入、
+Meeting + 物化坐标 attach 和 canonical Edge 回读；没有真实关系时不得伪造 Edge。若 Meeting 后续
+RETURN_TO_BOARD，已经提交的 Edge 不自动删除，hydration 显示其真实 active lifecycle。
 
 ### 9.3 归档、不可用和 detach
 
@@ -675,7 +700,7 @@ Community membership。Context 查询无需因 Meeting 再建立 roster 权限�
 - 所有坐标属于同一 host-derived Project；
 - Context Document 属于同一 Project；
 - caller 是当前 Community member；
-- attach 时 Meeting 已终态；
+- attach 时 Meeting 已 verified terminal，或处于 verified `finalizing_actions`；
 - 完整 legacy visibility approval 与 Meeting Community-read gate 已通过。
 
 ## 11. CLI 与 ACP
@@ -703,10 +728,11 @@ coordinate 和轻量 metadata；非法 UUID、跨 Community Meeting、普通 Cha
 
 - Meeting 是 Community-visible 的项目会议记录；
 - frozen roster 控制参与和行动，不控制读取；
-- 终态 Meeting 可以作为 Project Context 坐标；
+- verified terminal 或 `finalizing_actions` Meeting 可以作为 Project Context 坐标；
 - Context Edge 仍需普通 Project Document 解释；
 - 需要 Board / Speech 时按需执行 Meeting read，不把全部历史注入每个 Agent Turn；
-- 工作影响 Meeting、View、Resource、Document 或 Context 时显式写回，不自动推断 Edge。
+- Action Finalization 中物化出长期坐标时，在同一 Turn 显式写回 Context Document 与 Edge；Relay
+  不自动推断 Edge。
 
 Role Brief 不应默认携带所有 Meeting。只有通过现有 Project Context / Role provenance 发现相关坐标后，Agent
 才按需读取 Meeting。
@@ -737,23 +763,23 @@ Speech 和 End 的 live invalidation 也要从 roster-only recipients 扩大到�
 
 Project Context Query Bar 增加 `Meetings` 分组：
 
-- 只列终态 `closed` / `aborted` Meeting；
+- 只列 verified `finalizing_actions`、`closed` 或 `aborted` Meeting；
 - 支持按标题、讨论目标、主持人和 participant 名称搜索；
-- 选项显示标题、终态、结束时间与简短 participant 摘要；
+- 选项显示标题、真实 lifecycle、结束时间（若有）与简短 participant 摘要；
 - 使用稳定 `meeting:<uuid>` key；
 - Incident、Exact、Contains all 复用现有安全 draft transition；
-- active Meeting 不显示为可 attach 候选。
+- 其他 active Meeting 不显示为可 attach 候选。
 
 ### 12.3 Graph node 与 Inspector
 
 Meeting Coordinate 使用独立图标和标签，不伪装成 Project View object。Inspector 至少显示：
 
 - Meeting 标题；
-- `closed` / `aborted`；
+- `finalizing_actions` / `closed` / `aborted`；
 - Discussion goal；
 - Host；
 - participant 名称、类型和 roster 数量；
-- 创建和结束时间；
+- 创建时间及可选结束时间；
 - Action Finalization 摘要；
 - `Open Meeting`。
 
@@ -802,7 +828,7 @@ Project Context Inspector 不内嵌完整 Board / Speech timeline。点击 `Open
 | caller 不是当前 Community member | `restricted:community:membership_required`，不泄漏 Meeting |
 | Meeting UUID 不存在或属于其他 Community | `invalid:project_context:meeting_not_found`，写入路径不区分跨 Community |
 | UUID 指向普通 Channel | `invalid:project_context:not_a_meeting` |
-| attach active Meeting | `invalid:project_context:meeting_not_terminal` |
+| attach 普通 active Meeting 或 Action Finalization 证据不完整 | `invalid:project_context:meeting_not_attachable` |
 | Meeting 存在但无法验证有效终态链 | `invalid:project_context:meeting_terminal_invalid` |
 | private source 创建 Community-wide Meeting | `restricted:meeting:source_not_community_readable` |
 | Relay 尚未完成 v2 reprojection | `unavailable:project_context:not_ready` |
@@ -916,14 +942,15 @@ schema migration、数据删除或隐式 source 修改。
 
 ### 16.4 attach、detach 与 lifecycle
 
-- active Meeting attach 拒绝；
+- ordinary active Meeting attach 拒绝；
+- verified `finalizing_actions` + current Action Run + frozen Board attach 成功；
 - closed / aborted Meeting attach 成功；
 - legacy Meeting 只有 verified End 可以 normalize；证据不完整时可读但 attach 拒绝；
 - 跨 Community / 普通 Channel 拒绝；
 - Meeting unavailable 后 Edge 仍查询得到；
 - unavailable / tombstoned 状态仍可 detach；
-- attach 在固定锁顺序内重验终态，detach 不调用 live Meeting resolver；
-- Meeting 结束和 Action Finalization 不自动创建 Edge；
+- attach 在固定锁顺序内重验 attachability，detach 不调用 live Meeting resolver；
+- Meeting 结束和 Action Finalization 不由 Relay 自动创建 Edge；Action Finalization 主持人可以显式维护；
 - Context Revision 只随 attach/detach 推进；
 - Meeting metadata 更新不推进 Context Revision。
 
@@ -931,7 +958,7 @@ schema migration、数据删除或隐式 source 修改。
 
 - 三类 query 支持 Meeting token；
 - Agent 按需读取 Meeting，不向每 turn 注入完整历史；
-- picker 只列终态 Meeting；
+- picker 只列 verified finalizing / terminal Meeting；
 - Meeting node、首屏有界 metadata、Inspector 分页 roster enrichment；
 - `Open Meeting` 跳转并可返回原 Context selection；
 - observer 页面只读且无瞬时写控件；
@@ -972,7 +999,7 @@ schema migration、数据删除或隐式 source 修改。
 ### 阶段 2：Project Context v2 协议与数据库
 
 > 交付状态：已完成。实现审查确认 v1 Edge key domain 与既有 key 不变；v1 只保留在显式迁移
-> verifier 中，普通 runtime 仅接受 v2；Meeting attach 需要可验证终态，detach 不依赖当前 Meeting
+> verifier 中，普通 runtime 仅接受 v2；Meeting attach 需要可验证终态或冻结的 Action Finalization，detach 不依赖当前 Meeting
 > 水合状态。Meeting resolver 与 End 使用一致的 `Session → Channel → State` 锁顺序，并有独立数据库
 > 并发回归测试。迁移只扩展约束和投影，不删除业务行或重置 Context Revision。
 
@@ -1003,7 +1030,7 @@ schema migration、数据删除或隐式 source 修改。
 
 > 交付状态：已完成。Desktop Meeting directory 以 Community 可读集合为输入，并把 viewer 明确标记为
 > Host、Participant 或 Observer；observer 不进入 unread、attention 与 Agent Activity 提示，也不会获得
-> frozen-roster 写控件。Project Context Query Bar 只列 verified terminal Meeting，graph 使用独立 Meeting
+> frozen-roster 写控件。Project Context Query Bar 只列 verified finalizing / terminal Meeting，graph 使用独立 Meeting
 > node，Inspector 通过独立的 body-free Tauri read 按需补全最多 12 人的冻结 roster 与 Action 摘要，不把
 > Board 或 Speech 放入 Context result/cache。`Open Meeting` 复用现有 Channel route，浏览器返回可恢复原
 > query 与 selection。实现审查确认 Community query key 隔离仍覆盖 Meeting directory/detail，未引入新的
@@ -1066,13 +1093,13 @@ Context 的 29 条 E2E 均通过，其中 Meeting metadata-first inspector、详
 3. 普通 member 非 roster observer 无法执行 Meeting 行动；owner/admin 只保留既有 administrative End；
 4. frozen roster、participant type、主持与 Action Finalization 行为没有回退；
 5. 新 Meeting 不接受比 Community 更窄的 source；
-6. 只有 closed / aborted Meeting 可以新建 Context binding；
+6. 只有 verified finalizing_actions / closed / aborted Meeting 可以新建 Context binding；
 7. `MeetingCoordinate { meeting_id }` 在协议、DB、CLI、ACP 和 Desktop 中语义一致；
 8. 旧 Project View / Document-only Edge key、Context Revision 和 Document binding 全部保持；
 9. Exact、Incident、Contains all 查询语义不变；
 10. Project Context Inspector 显示轻量会议信息，并可跳转现有 Meeting 详情；
 11. Board / Speech 不复制到 Edge，也不默认注入 Agent Turn；
-12. Meeting 结束或物化不会自动推断 Context Edge；
+12. Relay 不因 Meeting 结束或物化自动推断 Context Edge；Action Finalization 可以显式维护；
 13. capability 只在 Meeting Community read、schema 2 和 projection 全部 ready 后公告；
 14. 迁移不删除、重置或重建任何现有业务数据；
 15. unit、property、DB、Relay E2E、CLI、ACP、Desktop E2E 与真实验收全部通过。
@@ -1096,7 +1123,7 @@ Context 的 29 条 E2E 均通过，其中 Meeting metadata-first inspector、详
 1. Meeting 与 Project View / Document 同为 Community-visible 项目资产；
 2. Community membership 控制读取，frozen roster 控制参与和行动；
 3. Meeting Coordinate 只使用稳定 `meeting_id`；
-4. Project Context 只在终态 Meeting 上允许新 attach；
+4. Project Context 只在 verified terminal 或 frozen Action Finalization Meeting 上允许新 attach；
 5. Inspector metadata-first，完整记录跳转 Meeting 详情读取；
 6. Context Document 继续承载解释性语义；
 7. 新 Meeting source 必须 Community-readable；

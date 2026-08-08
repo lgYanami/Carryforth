@@ -250,6 +250,26 @@ function terminalMeetingSnapshot(): MeetingSnapshot {
   };
 }
 
+function finalizingMeetingSnapshot(): MeetingSnapshot {
+  const terminal = terminalMeetingSnapshot();
+  return {
+    ...terminal,
+    lifecycle: "finalizing_actions",
+    phase: "moderator_idle",
+    stateRevision: 63,
+    action: terminal.action
+      ? {
+          ...terminal.action,
+          condition: "runnable",
+          terminalStatus: null,
+          completionEventId: null,
+          lastProgressStage: "tool_result",
+        }
+      : null,
+    end: null,
+  };
+}
+
 function meetingContextResult(): ProjectContextQueryResult {
   const base = contextResult();
   return {
@@ -294,6 +314,7 @@ function meetingContextResult(): ProjectContextQueryResult {
         status: "closed",
         meeting: {
           discussionGoal: "Agree the first durable Agent memory slice.",
+          lifecycle: "closed",
           terminalOutcome: "closed",
           hostPubkey: TEST_IDENTITIES.alice.pubkey,
           participantCount: 2,
@@ -317,6 +338,40 @@ function meetingContextResult(): ProjectContextQueryResult {
         },
       },
     ],
+  };
+}
+
+function finalizingMeetingContextResult(): ProjectContextQueryResult {
+  const result = meetingContextResult();
+  return {
+    ...result,
+    meetingObservations: result.meetingObservations.map((observation) => ({
+      ...observation,
+      stateRevision: 63,
+      endEventId: undefined,
+    })),
+    coordinateDetails: result.coordinateDetails.map((detail) =>
+      detail.coordinate.type === "meeting"
+        ? {
+            ...detail,
+            state: "active",
+            status: "finalizing_actions",
+            meeting: detail.meeting
+              ? {
+                  ...detail.meeting,
+                  lifecycle: "finalizing_actions",
+                  terminalOutcome: null,
+                  endedAt: null,
+                  actionFinalization: {
+                    condition: "runnable",
+                    terminalStatus: undefined,
+                    actionsAttested: false,
+                  },
+                }
+              : undefined,
+          }
+        : detail,
+    ),
   };
 }
 
@@ -1020,6 +1075,37 @@ test("Meeting Coordinate stays metadata-first and opens the Community-readable M
   await page.goBack();
   await expect(page.getByTestId("project-context-inspector")).toBeVisible();
   await expect(page).toHaveURL(/selected=coordinate/);
+});
+
+test("finalizing Meeting Coordinate shows its frozen pending-closure lifecycle", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetings: [
+      {
+        id: MEETING_ID,
+        title: "Memory boundary review",
+        result: { status: "ready", snapshot: finalizingMeetingSnapshot() },
+        speeches: [],
+        activities: [],
+      },
+    ],
+    projectContext: finalizingMeetingContextResult(),
+  });
+  await openProjectContext(page);
+
+  await page
+    .getByTestId(`project-context-coordinate-meeting:${MEETING_ID}`)
+    .click();
+  const meeting = page
+    .getByTestId("project-context-inspector")
+    .getByTestId("project-context-meeting-detail");
+  await expect(meeting).toContainText("Finalizing actions");
+  await expect(meeting).toContainText(
+    "Formal discussion and the Board are frozen; Meeting closure is pending.",
+  );
+  await expect(meeting).toContainText("Pending closure");
+  await expect(meeting).toContainText("runnable");
 });
 
 test("Document Coordinate lazily reads current Markdown and returns from Documents", async ({

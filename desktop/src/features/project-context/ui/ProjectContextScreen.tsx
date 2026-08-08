@@ -12,7 +12,10 @@ import {
   useProjectDocuments,
 } from "@/features/project-documents/hooks";
 import { useChannelsQuery } from "@/features/channels/hooks";
-import { useMeetingDirectory } from "@/features/meeting/hooks";
+import {
+  useMeetingDirectory,
+  useMeetingLiveSync,
+} from "@/features/meeting/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import {
   buildProjectContextCoordinateOptions,
@@ -253,6 +256,7 @@ function ValidProjectContextScreen({
     [channelsQuery.data],
   );
   const meetingDirectoryQuery = useMeetingDirectory(meetingIds);
+  useMeetingLiveSync(meetingIds, meetingDirectoryQuery.data);
   const meetingProfilePubkeys = React.useMemo(
     () =>
       [

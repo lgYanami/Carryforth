@@ -33,22 +33,23 @@ pub(crate) struct MeetingContextActionSummary {
     pub(crate) actions_attested: bool,
 }
 
-/// Verified, body-free terminal Meeting metadata for a Context coordinate.
+/// Verified, body-free Meeting metadata for a Context coordinate.
 #[derive(Debug, Clone)]
 pub(crate) struct MeetingContextRecord {
     pub(crate) title: String,
     pub(crate) discussion_goal: Option<String>,
-    pub(crate) terminal_outcome: String,
+    pub(crate) lifecycle: &'static str,
+    pub(crate) terminal_outcome: Option<String>,
     pub(crate) host_pubkey: String,
     pub(crate) participant_count: usize,
     pub(crate) participant_preview: Vec<MeetingContextParticipant>,
     pub(crate) created_at: u64,
-    pub(crate) ended_at: u64,
+    pub(crate) ended_at: Option<u64>,
     pub(crate) action_finalization: Option<MeetingContextActionSummary>,
     pub(crate) state_revision: u64,
     pub(crate) create_event_id: String,
     pub(crate) state_event_id: String,
-    pub(crate) end_event_id: String,
+    pub(crate) end_event_id: Option<String>,
     pub(crate) updated_at: u64,
 }
 
@@ -56,8 +57,8 @@ pub(crate) struct MeetingContextRecord {
 /// not erase otherwise verified Edge topology.
 #[derive(Debug, Clone)]
 pub(crate) enum MeetingContextRead {
-    Terminal(MeetingContextRecord),
-    Active,
+    Observed(Box<MeetingContextRecord>),
+    NotAttachable,
     NotFound,
     Unavailable,
     VerificationFailed,
@@ -140,15 +141,17 @@ fn context_read_from_load(
             };
         }
     };
-    if !matches!(
+    if snapshot.lifecycle == MeetingLifecycle::Initializing {
+        return MeetingContextRead::NotAttachable;
+    }
+    let terminal = matches!(
         snapshot.lifecycle,
         MeetingLifecycle::Closed | MeetingLifecycle::Aborted
-    ) {
-        return MeetingContextRead::Active;
-    }
-    let Some(end) = snapshot.end.as_ref() else {
+    );
+    let end = snapshot.end.as_ref();
+    if terminal != end.is_some() {
         return MeetingContextRead::VerificationFailed;
-    };
+    }
     let state_event_id = snapshot
         .floor
         .as_ref()
@@ -168,7 +171,7 @@ fn context_read_from_load(
         .map(|action| MeetingContextActionSummary {
             condition: action.condition.clone(),
             terminal_status: action.terminal_status.clone(),
-            actions_attested: end.actions_attested,
+            actions_attested: end.is_some_and(|end| end.actions_attested),
         });
     let participant_preview = snapshot
         .participants
@@ -183,22 +186,23 @@ fn context_read_from_load(
             },
         })
         .collect();
-    MeetingContextRead::Terminal(MeetingContextRecord {
+    MeetingContextRead::Observed(Box::new(MeetingContextRecord {
         title: snapshot.title.clone(),
         discussion_goal: snapshot.description.clone(),
-        terminal_outcome: end.outcome.clone(),
+        lifecycle: meeting_lifecycle_label(snapshot.lifecycle),
+        terminal_outcome: end.map(|end| end.outcome.clone()),
         host_pubkey: snapshot.host_pubkey.clone(),
         participant_count: snapshot.participants.len(),
         participant_preview,
         created_at: snapshot.created_at,
-        ended_at: end.ended_at,
+        ended_at: end.map(|end| end.ended_at),
         action_finalization,
         state_revision: snapshot.state_revision,
         create_event_id: snapshot.create_event_id.clone(),
         state_event_id,
-        end_event_id: end.event_id.clone(),
+        end_event_id: end.map(|end| end.event_id.clone()),
         updated_at: snapshot.authoritative_updated_at,
-    })
+    }))
 }
 
 fn transient_meeting_read_error(message: &str) -> bool {
@@ -208,7 +212,17 @@ fn transient_meeting_read_error(message: &str) -> bool {
         || message.starts_with("relay returned 5")
 }
 
-/// Load verified terminal Meeting metadata without exposing Board or Speech.
+fn meeting_lifecycle_label(lifecycle: MeetingLifecycle) -> &'static str {
+    match lifecycle {
+        MeetingLifecycle::Initializing => "initializing",
+        MeetingLifecycle::Active => "active",
+        MeetingLifecycle::FinalizingActions => "finalizing_actions",
+        MeetingLifecycle::Closed => "closed",
+        MeetingLifecycle::Aborted => "aborted",
+    }
+}
+
+/// Load verified Meeting metadata without exposing Board or Speech.
 #[tauri::command]
 pub async fn get_meeting_context_detail(
     meeting_id: String,
@@ -238,15 +252,17 @@ pub async fn get_meeting_context_detail(
             return Ok(MeetingContextInspectorLoadResult::UnsupportedProtocol);
         }
     };
-    if !matches!(
+    if snapshot.lifecycle == MeetingLifecycle::Initializing {
+        return Ok(MeetingContextInspectorLoadResult::NotAttachable);
+    }
+    let terminal = matches!(
         snapshot.lifecycle,
         MeetingLifecycle::Closed | MeetingLifecycle::Aborted
-    ) {
-        return Ok(MeetingContextInspectorLoadResult::NotTerminal);
-    }
-    let Some(end) = snapshot.end.as_ref() else {
+    );
+    let end = snapshot.end.as_ref();
+    if terminal != end.is_some() {
         return Ok(MeetingContextInspectorLoadResult::UnsupportedProtocol);
-    };
+    }
     let action_finalization =
         snapshot
             .action
@@ -254,7 +270,7 @@ pub async fn get_meeting_context_detail(
             .map(|action| MeetingContextInspectorActionSummary {
                 condition: action.condition.clone(),
                 terminal_status: action.terminal_status.clone(),
-                actions_attested: end.actions_attested,
+                actions_attested: end.is_some_and(|end| end.actions_attested),
             });
     Ok(MeetingContextInspectorLoadResult::Ready {
         detail: Box::new(MeetingContextInspectorDetail {
@@ -263,9 +279,10 @@ pub async fn get_meeting_context_detail(
             description: snapshot.description.clone(),
             host_pubkey: snapshot.host_pubkey.clone(),
             participants: snapshot.participants.clone(),
-            terminal_outcome: end.outcome.clone(),
+            lifecycle: snapshot.lifecycle,
+            terminal_outcome: end.map(|end| end.outcome.clone()),
             created_at: snapshot.created_at,
-            ended_at: end.ended_at,
+            ended_at: end.map(|end| end.ended_at),
             action_finalization,
         }),
     })

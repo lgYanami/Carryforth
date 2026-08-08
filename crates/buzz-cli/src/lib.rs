@@ -699,6 +699,9 @@ pub enum ProjectContextCmd {
         coordinates: Vec<String>,
     },
     /// Attach one existing Project Document to an exact coordinate set
+    ///
+    /// Meeting coordinates are accepted when Relay-verified terminal or in a
+    /// frozen Action Finalization window; other active Meetings are rejected.
     Attach {
         /// Existing active Project Document carrying the explanatory context.
         #[arg(long = "context-document")]

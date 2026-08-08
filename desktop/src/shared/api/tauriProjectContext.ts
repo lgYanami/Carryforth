@@ -1,5 +1,6 @@
 import { invokeTauri, TauriInvokeError } from "@/shared/api/tauri";
 import type { ProjectViewObjectType } from "@/shared/api/tauriProjectView";
+import type { MeetingLifecycle } from "@/shared/api/tauriMeetings";
 
 export type ProjectContextCoordinate =
   | {
@@ -45,12 +46,13 @@ export type ProjectContextMeetingActionSummary = {
 
 export type ProjectContextMeetingDetail = {
   discussionGoal: string | null;
-  terminalOutcome: "closed" | "aborted" | string;
+  lifecycle: MeetingLifecycle;
+  terminalOutcome: "closed" | "aborted" | string | null;
   hostPubkey: string;
   participantCount: number;
   participantPreview: ProjectContextMeetingParticipant[];
   createdAt: string;
-  endedAt: string;
+  endedAt: string | null;
   actionFinalization?: ProjectContextMeetingActionSummary;
 };
 

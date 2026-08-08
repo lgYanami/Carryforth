@@ -184,7 +184,7 @@ test("picker groups active catalogs and retains visible lifecycle Coordinates", 
   assert.equal(options[2].description, "Shared rationale");
 });
 
-test("picker exposes only terminal Meetings with searchable participant presentation", () => {
+test("picker exposes finalizing and terminal Meetings but excludes ordinary active Meetings", () => {
   const options = buildProjectContextCoordinateOptions({
     meetings: [
       {
@@ -221,6 +221,28 @@ test("picker exposes only terminal Meetings with searchable participant presenta
         compatibility: "ready",
       },
       {
+        meetingId: "60000000-0000-4000-8000-000000000002",
+        title: "Finalizing delivery",
+        description: "Record the frozen Board outputs",
+        lifecycle: "finalizing_actions",
+        phase: "moderator_idle",
+        currentSpeakerPubkey: null,
+        currentOfferPubkey: null,
+        needsAttention: true,
+        attentionReason: "host_action",
+        moderatorPubkey: "a".repeat(64),
+        hostPubkey: "a".repeat(64),
+        participantCount: 2,
+        participantPreview: [],
+        viewerRole: "observer",
+        policy: "moderated-board-actions-v3",
+        createdAt: 1_786_055_450,
+        updatedAt: 1_786_055_500,
+        endedAt: null,
+        latestSpeechAt: 1_786_055_490,
+        compatibility: "ready",
+      },
+      {
         meetingId: "70000000-0000-4000-8000-000000000001",
         title: "Still running",
         description: null,
@@ -249,15 +271,23 @@ test("picker exposes only terminal Meetings with searchable participant presenta
     },
   });
 
-  assert.equal(options.length, 1);
-  assert.deepEqual(options[0].coordinate, {
+  assert.equal(options.length, 2);
+  const terminal = options.find(
+    (option) => option.coordinateKey === `meeting:${MEETING_ID}`,
+  );
+  const finalizing = options.find(
+    (option) =>
+      option.coordinateKey === "meeting:60000000-0000-4000-8000-000000000002",
+  );
+  assert.deepEqual(terminal.coordinate, {
     type: "meeting",
     meetingId: MEETING_ID,
   });
-  assert.equal(options[0].coordinateKey, `meeting:${MEETING_ID}`);
-  assert.equal(options[0].group, "meetings");
-  assert.equal(options[0].state, "terminal");
-  assert.match(options[0].status, /^Closed/);
-  assert.match(options[0].searchTerms, /Ada/);
-  assert.match(options[0].searchTerms, /Bumble/);
+  assert.equal(terminal.group, "meetings");
+  assert.equal(terminal.state, "terminal");
+  assert.match(terminal.status, /^Closed/);
+  assert.match(terminal.searchTerms, /Ada/);
+  assert.match(terminal.searchTerms, /Bumble/);
+  assert.equal(finalizing.state, "active");
+  assert.match(finalizing.status, /^Finalizing actions/);
 });
