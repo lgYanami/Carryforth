@@ -1,10 +1,10 @@
 # Desktop Project Context 有机网状图布局实现设计
 
-> 状态：待实现
+> 状态：已实现
 >
 > 日期：2026-08-09
 >
-> 代码基线：`feat/project-view-summary` @ `2acf99fea`
+> 设计基线：`feat/project-view-summary` @ `2acf99fea`
 >
 > 范围：Buzz Desktop 的 Project Context 图布局、连线端口、Island 外观及对应测试
 >
@@ -772,3 +772,21 @@ tombstone 或 unavailable 表现。
 11. 没有新增协议、DTO、持久化位置或通用图引擎依赖；
 12. metadata-only 更新不运行 solver，text zoom 与 live refresh 不无条件重置 viewport；
 13. Desktop 静态检查、单元测试和 Project Context E2E 全部通过。
+
+## 13. 实施结果
+
+本设计已在 Desktop 前端完成实现：
+
+- 新增纯函数、确定性的离线径向布局求解器；
+- All Context 与 Focused Query 均改为有机网状布局，并保留旧分层算法作为确定性回退；
+- 高扇出节点使用多物理环带，避免单环半径随节点数线性膨胀；
+- 布局在 React Flow 首次渲染前完成并冻结，不存在持续 simulation；
+- geometry 按 topology descriptor 复用，title、summary、状态与 Context Document membership 更新不会
+  重跑求解器，展示事实仍从当前 graph 重新水合；
+- text scale 只缩放 canonical geometry，并保持当前选中节点或 viewport 中心的屏幕位置；
+- 初次查询按完整 layout bounds 自动适配，后续 metadata 与 text scale 更新不再无条件重置 viewport；
+- Coordinate、Hub、Spoke、Island、selection、Inspector 与无向关系语义均保持不变；
+- 未修改 Tauri、Relay、数据库、CLI、Nostr 协议或 Project Context 领域模型。
+
+交付验证包括 Desktop 静态检查、TypeScript 类型检查、完整单元测试、E2E 构建，以及
+Project Context Desktop E2E。视觉截图作为本次实现的人工 review 证据，不改写历史阶段验收记录。

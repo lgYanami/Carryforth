@@ -62,6 +62,52 @@ function largeResult(edgeCount) {
   };
 }
 
+function oneConnectedIslandResult(edgeCount) {
+  const sharedKey = "requirement:shared";
+  const edges = [];
+  const coordinateDetails = [
+    {
+      coordinateKey: sharedKey,
+      coordinate: {
+        type: "project_view_object",
+        objectType: "requirement",
+        objectId: "shared",
+      },
+      state: "active",
+      title: "Shared requirement",
+    },
+  ];
+  for (let index = 0; index < edgeCount; index += 1) {
+    const suffix = String(index).padStart(6, "0");
+    const workKey = `work:work-${suffix}`;
+    edges.push({
+      edgeKey: `edge-connected-${suffix}`,
+      coordinateKeys: [sharedKey, workKey],
+      contextDocumentIds: [],
+    });
+    coordinateDetails.push({
+      coordinateKey: workKey,
+      coordinate: {
+        type: "project_view_object",
+        objectType: "work",
+        objectId: `work-${suffix}`,
+      },
+      state: "active",
+      title: `Work ${suffix}`,
+    });
+  }
+  return {
+    ...largeResult(0),
+    context: {
+      ...largeResult(0).context,
+      activeEdgeCount: edgeCount,
+      boundDocumentCount: 0,
+    },
+    edges,
+    coordinateDetails,
+  };
+}
+
 for (const edgeCount of [100, 500, 1_000]) {
   test(`${edgeCount} Edge result remains complete through graph, layout, and presentation`, () => {
     const graph = buildProjectContextGraph(largeResult(edgeCount));
@@ -97,4 +143,21 @@ test("selection discovery stays complete in a 1000 Edge result", () => {
     selected.edges.filter((edge) => edge.data?.emphasis === "active").length,
     2,
   );
+});
+
+test("1000 Edges sharing one Coordinate stay finite in one organic Island", () => {
+  const graph = buildProjectContextGraph(oneConnectedIslandResult(1_000));
+  const layout = layoutProjectContextGraph(graph);
+
+  assert.equal(graph.islands.length, 1);
+  assert.equal(layout.islands.length, 1);
+  assert.equal(layout.nodes.length, 2_001);
+  assert.equal(layout.spokes.length, 2_000);
+  assert.equal(
+    layout.nodes.every(
+      (node) => Number.isFinite(node.x) && Number.isFinite(node.y),
+    ),
+    true,
+  );
+  assert.deepEqual(layoutProjectContextGraph(graph), layout);
 });

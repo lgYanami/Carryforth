@@ -1794,6 +1794,30 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
   ).toHaveCount(3);
   await expect(page.locator(".project-context-spoke")).toHaveCount(7);
   await expect(page.locator(".project-context-coordinate")).toHaveCount(5);
+  await expect(
+    page.getByText(
+      "Pan · Scroll to zoom · Undirected · placement carries no rank or causality",
+    ),
+  ).toBeVisible();
+
+  await waitForAnimations(page);
+  const frozenPositions = async () =>
+    page.locator(".react-flow__node").evaluateAll((nodes) =>
+      nodes
+        .map((node) => ({
+          id: node.getAttribute("data-id"),
+          transform: (node as HTMLElement).style.transform,
+        }))
+        .sort((left, right) => (left.id ?? "").localeCompare(right.id ?? "")),
+    );
+  const firstPositions = await frozenPositions();
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
+  expect(await frozenPositions()).toEqual(firstPositions);
 
   await expect(
     page.getByTestId(`project-context-coordinate-resource:${RESOURCE_ID}`),
