@@ -20,7 +20,7 @@ use buzz_project_view::v3::{
 use buzz_project_view::ProjectionPlan;
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Args, Subcommand};
-use nostr::{Keys, PublicKey};
+use nostr::{EventId, Keys, PublicKey};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -290,6 +290,28 @@ pub(crate) enum ProjectViewMaintenanceCommand {
         community: String,
         #[arg(long)]
         epoch: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        operator_pubkey: Option<String>,
+        #[arg(long)]
+        relay_key_file: Option<PathBuf>,
+        #[arg(long)]
+        expected_pubkey: String,
+    },
+    /// Restore the exact v3 membership snapshot after a semantically equal
+    /// local bootstrap replacement retired the referenced canonical event.
+    RestoreMembershipSnapshot {
+        #[arg(long)]
+        community: String,
+        #[arg(long)]
+        expected_project_revision: u64,
+        #[arg(long)]
+        expected_projection_generation: u64,
+        #[arg(long)]
+        expected_old_membership_event_id: String,
+        #[arg(long)]
+        candidate_current_membership_event_id: String,
         #[arg(long)]
         idempotency_key: String,
         #[arg(long)]
@@ -901,6 +923,50 @@ async fn run_maintenance(db: &Db, command: ProjectViewMaintenanceCommand) -> Res
             publish_recovery_events(&pubsub, &status, &outcome.events, "reproject").await?;
             println!("{}", serde_json::to_string_pretty(&outcome.receipt)?);
         }
+        ProjectViewMaintenanceCommand::RestoreMembershipSnapshot {
+            community,
+            expected_project_revision,
+            expected_projection_generation,
+            expected_old_membership_event_id,
+            candidate_current_membership_event_id,
+            idempotency_key,
+            operator_pubkey,
+            relay_key_file,
+            expected_pubkey,
+        } => {
+            let status = required_status(db, &community).await?;
+            let operator = resolve_operator_pubkey(operator_pubkey.as_deref())?;
+            let keys = load_relay_keys(relay_key_file.as_deref())?;
+            let expected = parse_pubkey_argument(&expected_pubkey, "--expected-pubkey")?;
+            if keys.public_key() != expected {
+                bail!(
+                    "relay signer mismatch: expected {}, supplied key resolves to {}",
+                    expected.to_hex(),
+                    keys.public_key().to_hex()
+                );
+            }
+            let old_event_id = parse_event_id_argument(
+                &expected_old_membership_event_id,
+                "--expected-old-membership-event-id",
+            )?;
+            let candidate_event_id = parse_event_id_argument(
+                &candidate_current_membership_event_id,
+                "--candidate-current-membership-event-id",
+            )?;
+            let receipt = db
+                .restore_project_view_v3_membership_snapshot(
+                    status.community_id,
+                    operator,
+                    &idempotency_key,
+                    expected_project_revision,
+                    expected_projection_generation,
+                    old_event_id,
+                    candidate_event_id,
+                    &keys,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
         ProjectViewMaintenanceCommand::Resume {
             community,
             epoch,
@@ -946,6 +1012,10 @@ fn resolve_operator_pubkey(value: Option<&str>) -> Result<PublicKey> {
 
 fn parse_pubkey_argument(value: &str, argument: &str) -> Result<PublicKey> {
     PublicKey::parse(value).map_err(|error| anyhow::anyhow!("invalid {argument}: {error}"))
+}
+
+fn parse_event_id_argument(value: &str, argument: &str) -> Result<EventId> {
+    EventId::from_hex(value).map_err(|error| anyhow::anyhow!("invalid {argument}: {error}"))
 }
 
 #[allow(clippy::too_many_arguments)]

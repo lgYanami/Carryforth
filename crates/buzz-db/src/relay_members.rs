@@ -103,6 +103,31 @@ fn membership_coordinator_unavailable() -> DbError {
     DbError::AccessDenied("unavailable:project_view:membership_coordinator".to_owned())
 }
 
+/// Result of the loopback-only local Desktop owner claim.
+///
+/// The result is intentionally explicit so the Relay never infers a
+/// membership mutation from a generic idempotent `Ok(())` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalOwnerBootstrapOutcome {
+    /// The first Human owner row was created in the exact greenfield-v3 state.
+    Created,
+    /// The same Human identity was already the sole owner; nothing changed.
+    AlreadyOwner,
+    /// The greenfield claim path is permanently closed for this Community.
+    Closed,
+}
+
+/// Result of inspecting the generic Relay-authored NIP-43 snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nip43MembershipSnapshotReconciliation {
+    /// No initialized v3 root exists and the snapshot must be published.
+    Needed,
+    /// No initialized v3 root exists and the current snapshot already matches.
+    Current,
+    /// An initialized v3 root owns the snapshot coordinate; generic publish is forbidden.
+    GovernedV3,
+}
+
 fn greenfield_v3_owner_bootstrap_allowed(
     schema_version: i16,
     project_view_enabled: bool,
@@ -946,6 +971,66 @@ pub async fn bootstrap_owner(
     Ok(())
 }
 
+/// Claim the first Human owner for the loopback-only local Desktop Community.
+///
+/// Unlike [`bootstrap_owner`], this API never performs legacy owner rotation
+/// and reports whether the transaction actually inserted an owner. The
+/// greenfield check and insert share the Community lock, so two Desktop
+/// identities cannot both claim ownership. Once any membership, preparation,
+/// or canonical Project View state exists, the claim path returns
+/// [`LocalOwnerBootstrapOutcome::Closed`] without changing membership.
+pub async fn claim_local_owner(
+    pool: &PgPool,
+    community: CommunityId,
+    owner_pubkey: &str,
+) -> Result<LocalOwnerBootstrapOutcome> {
+    let pubkey = owner_pubkey.to_ascii_lowercase();
+    let mut tx = begin_membership_write(pool, community).await?;
+    if project_view_schema_version_in_tx(&mut tx, community).await? != 3 {
+        tx.rollback().await?;
+        return Ok(LocalOwnerBootstrapOutcome::Closed);
+    }
+    if known_managed_agent_in_tx(&mut tx, community, &pubkey).await? {
+        return Err(DbError::AccessDenied(
+            "forbidden:managed_agent:owner_ineligible".to_owned(),
+        ));
+    }
+
+    let current_owners: Vec<String> = sqlx::query_scalar(
+        "SELECT pubkey FROM relay_members \
+         WHERE community_id = $1 AND role = 'owner' FOR UPDATE",
+    )
+    .bind(community.as_uuid())
+    .fetch_all(&mut *tx)
+    .await?;
+    if current_owners.as_slice() == [pubkey.as_str()] {
+        tx.rollback().await?;
+        return Ok(LocalOwnerBootstrapOutcome::AlreadyOwner);
+    }
+    if !greenfield_v3_owner_bootstrap_allowed_in_tx(&mut tx, community, current_owners.len())
+        .await?
+    {
+        tx.rollback().await?;
+        return Ok(LocalOwnerBootstrapOutcome::Closed);
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+         VALUES ($1, $2, 'owner', NULL) ON CONFLICT DO NOTHING",
+    )
+    .bind(community.as_uuid())
+    .bind(&pubkey)
+    .execute(&mut *tx)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(DbError::InvalidData(
+            "local owner claim did not insert the greenfield owner".to_owned(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(LocalOwnerBootstrapOutcome::Created)
+}
+
 /// The result of a transfer-ownership attempt.
 #[derive(Debug, PartialEq)]
 pub enum TransferResult {
@@ -1338,6 +1423,77 @@ mod tests {
             .await
             .expect("failed ownerless mutation must not poison owner bootstrap");
         assert_role(&pool, anomalous, &anomalous_owner, "owner").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn local_owner_claim_reports_created_idempotent_and_closed_without_rotation() {
+        let pool = setup_pool().await;
+        let community = make_test_v3_community(&pool).await;
+        let owner = test_pubkey();
+        let other = test_pubkey();
+
+        assert_eq!(
+            claim_local_owner(&pool, community, &owner)
+                .await
+                .expect("claim first local owner"),
+            LocalOwnerBootstrapOutcome::Created
+        );
+        assert_eq!(
+            claim_local_owner(&pool, community, &owner)
+                .await
+                .expect("repeat local owner claim"),
+            LocalOwnerBootstrapOutcome::AlreadyOwner
+        );
+        assert_eq!(
+            claim_local_owner(&pool, community, &other)
+                .await
+                .expect("closed claim must be a non-mutating result"),
+            LocalOwnerBootstrapOutcome::Closed
+        );
+        assert_role(&pool, community, &owner, "owner").await;
+        assert!(get_relay_member(&pool, community, &other)
+            .await
+            .expect("read rejected local owner")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres"]
+    async fn initialized_v3_rejects_generic_membership_snapshot_publication_inside_lock() {
+        let pool = setup_pool().await;
+        let community = make_test_v3_community(&pool).await;
+        let marker = vec![0x42_u8; 32];
+        let mut fixture = pool.begin().await.expect("begin v3 root fixture");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *fixture)
+            .await
+            .expect("suspend aggregate fixture triggers");
+        sqlx::query(
+            "INSERT INTO project_view_state \
+                (community_id, project_revision, active_object_count, \
+                 initialized_at, updated_at, last_event_id, last_actor_pubkey, \
+                 meta_projection_event_id, projection_pubkey, \
+                 projection_generation, schema_version, last_change_id, \
+                 membership_snapshot_event_id) \
+             VALUES ($1, 1, 0, now(), now(), $2, $2, $2, $2, 1, 3, $2, $2)",
+        )
+        .bind(community.as_uuid())
+        .bind(&marker)
+        .execute(&mut *fixture)
+        .await
+        .expect("insert initialized v3 root fixture");
+        fixture.commit().await.expect("commit v3 root fixture");
+
+        let error = crate::Db::from_pool(pool)
+            .publish_nip43_membership_locked(community, &nostr::Keys::generate())
+            .await
+            .expect_err("generic publisher must not replace an initialized v3 coordinate");
+        assert!(matches!(
+            error,
+            DbError::AccessDenied(message)
+                if message == "unavailable:project_view:membership_coordinator"
+        ));
     }
 
     #[tokio::test]

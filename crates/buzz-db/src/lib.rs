@@ -3235,6 +3235,16 @@ impl Db {
         relay_members::bootstrap_owner(&self.pool, community, owner_pubkey).await
     }
 
+    /// Claim the first Human owner for the exact loopback local Desktop
+    /// Community without enabling legacy owner rotation.
+    pub async fn claim_local_owner(
+        &self,
+        community: CommunityId,
+        owner_pubkey: &str,
+    ) -> Result<relay_members::LocalOwnerBootstrapOutcome> {
+        relay_members::claim_local_owner(&self.pool, community, owner_pubkey).await
+    }
+
     /// Atomically transfers ownership of a legacy schema-v1 `community` to
     /// `new_owner_pubkey`, demoting previous owners to `member`. A Project
     /// View-governed Community fails closed until its source/audit/projection
@@ -3688,19 +3698,39 @@ impl Db {
         ))
     }
 
-    /// Returns whether the relay-authored NIP-43 snapshot is absent or differs
-    /// from the canonical membership rows for `community_id`.
+    /// Inspect whether the relay-authored NIP-43 snapshot is current, needs a
+    /// greenfield publication, or is governed by an initialized v3 root.
     ///
     /// Snapshot and canonical rows are compared directly rather than by
     /// timestamp: relay membership events use whole-second Nostr timestamps,
     /// and multiple mutations within one second must still be repaired.
-    pub async fn nip43_membership_snapshot_needs_reconciliation(
+    ///
+    /// Once a schema-v3 Project View root exists, this generic reconciliation
+    /// path is deliberately disabled. Its membership Event ID is part of the
+    /// signed canonical coordinate and may only advance through the Project
+    /// View membership coordinator or an explicit bounded recovery.
+    pub async fn nip43_membership_snapshot_reconciliation_status(
         &self,
         community_id: CommunityId,
         relay_pubkey: &nostr::PublicKey,
-    ) -> Result<bool> {
+    ) -> Result<relay_members::Nip43MembershipSnapshotReconciliation> {
         let mut tx = self.pool.begin().await?;
         crate::community_lock::acquire(&mut tx, community_id, true).await?;
+
+        let governed_v3: bool = sqlx::query_scalar(
+            "SELECT community.project_view_schema_version = 3 \
+                    AND EXISTS (SELECT 1 FROM project_view_state state \
+                                WHERE state.community_id = community.id) \
+             FROM communities community WHERE community.id = $1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("community {community_id}")))?;
+        if governed_v3 {
+            tx.rollback().await?;
+            return Ok(relay_members::Nip43MembershipSnapshotReconciliation::GovernedV3);
+        }
 
         let snapshot_tags: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT tags FROM events \
@@ -3724,7 +3754,7 @@ impl Db {
 
         let Some(snapshot_tags) = snapshot_tags else {
             tx.rollback().await?;
-            return Ok(true);
+            return Ok(relay_members::Nip43MembershipSnapshotReconciliation::Needed);
         };
         let mut snapshot_members = snapshot_tags
             .as_array()
@@ -3755,7 +3785,24 @@ impl Db {
 
         let needs_reconciliation = snapshot_members != canonical_members;
         tx.rollback().await?;
-        Ok(needs_reconciliation)
+        Ok(if needs_reconciliation {
+            relay_members::Nip43MembershipSnapshotReconciliation::Needed
+        } else {
+            relay_members::Nip43MembershipSnapshotReconciliation::Current
+        })
+    }
+
+    /// Return whether generic NIP-43 publication is both required and safe.
+    pub async fn nip43_membership_snapshot_needs_reconciliation(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &nostr::PublicKey,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.nip43_membership_snapshot_reconciliation_status(community_id, relay_pubkey,)
+                .await?,
+            relay_members::Nip43MembershipSnapshotReconciliation::Needed
+        ))
     }
 
     /// Atomically publish a NIP-43 membership snapshot under a single
@@ -3787,6 +3834,24 @@ impl Db {
         // This makes a snapshot read from the same serialized membership state
         // that role-continuity transactions protect.
         crate::community_lock::acquire(&mut tx, community_id, false).await?;
+
+        // An initialized schema-v3 Project View owns this Event ID as part of
+        // its signed canonical coordinate. Keep this check inside the same
+        // Community-locked transaction as publication: a preflight-only check
+        // would leave a race where v3 initialization commits between the
+        // preflight and this replacement write.
+        let governed_v3: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM project_view_state \
+             WHERE community_id = $1 AND schema_version = 3)",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if governed_v3 {
+            return Err(DbError::AccessDenied(
+                "unavailable:project_view:membership_coordinator".to_owned(),
+            ));
+        }
 
         // Acquire the per-community snapshot lock BEFORE reading members.
         // This serializes the entire read-build-write cycle: a concurrent

@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 54);
+        assert_eq!(migrations.len(), 55);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1320,6 +1320,34 @@ mod tests {
             assert!(
                 !project_context_finalizing_meeting.contains(destructive),
                 "migration 0054 must not contain destructive statement {destructive}"
+            );
+        }
+
+        assert_eq!(migrations[54].version, 55);
+        let local_membership_recovery = migrations[54].sql.as_str();
+        for required in [
+            "project_view_v3_membership_snapshot_recoveries",
+            "canonical_request_hash",
+            "restored_membership_event_id",
+            "retired_membership_event_id",
+            "project_view_v3_reject_ledger_mutation",
+        ] {
+            assert!(
+                local_membership_recovery.contains(required),
+                "migration 0055 must contain {required}"
+            );
+        }
+        for destructive in [
+            "DELETE FROM",
+            "TRUNCATE",
+            "DROP TABLE",
+            "DROP COLUMN",
+            "UPDATE events",
+            "UPDATE project_view_state",
+        ] {
+            assert!(
+                !local_membership_recovery.contains(destructive),
+                "migration 0055 must not contain destructive statement {destructive}"
             );
         }
     }

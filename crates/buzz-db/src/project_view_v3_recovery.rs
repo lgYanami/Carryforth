@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::kind::{KIND_PROJECT_VIEW_META, KIND_PROJECT_VIEW_OBJECT};
-use buzz_core::{CommunityId, EventId, PublicKey};
+use buzz_core::{CommunityId, EventId, PublicKey, StoredEvent};
 use buzz_project_view::v2::{ChangeSource, RoleLevel};
 use buzz_project_view::v3::{
     maintenance_repair_plan_digest, CanonicalMaintenanceRepairPlanV1,
@@ -23,7 +23,7 @@ use buzz_sdk::project_view_v3::{
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, Keys};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
@@ -40,6 +40,8 @@ use crate::Db;
 
 const REPAIR_REQUEST_DOMAIN: &[u8] = b"buzz-pv3-maintenance-repair-request-v1\0";
 const REPROJECT_REQUEST_DOMAIN: &[u8] = b"buzz-pv3-maintenance-reproject-request-v1\0";
+const MEMBERSHIP_SNAPSHOT_RESTORE_REQUEST_DOMAIN: &[u8] =
+    b"carryforth-pv3-membership-snapshot-restore-request-v1\0";
 const BUSINESS_BODY_DIGEST_DOMAIN: &[u8] = b"buzz-pv3-business-body-v1\0";
 const SOURCE_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"buzz-pv3-source-evidence-v1\0";
 
@@ -51,6 +53,27 @@ pub struct ProjectViewV3RecoveryOutcome {
     pub receipt: ProjectViewMaintenanceReceipt,
     /// Newly committed Relay events; empty for exact replay.
     pub events: Vec<Event>,
+}
+
+/// Durable receipt for the bounded local membership-snapshot restoration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectViewV3MembershipSnapshotRecoveryReceipt {
+    /// Community whose canonical snapshot coordinate was restored.
+    #[serde(serialize_with = "serialize_recovery_community_id")]
+    pub community_id: CommunityId,
+    /// Stable recovery operation spelling.
+    pub operation: String,
+    /// Whether this response is an exact durable idempotency replay.
+    pub replayed: bool,
+    /// Complete stored result body.
+    pub result: Value,
+}
+
+fn serialize_recovery_community_id<S>(value: &CommunityId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
 }
 
 #[derive(Debug)]
@@ -383,6 +406,311 @@ impl Db {
                 result,
             },
             events,
+        })
+    }
+
+    /// Restore the exact canonical NIP-43 snapshot already referenced by an
+    /// initialized schema-v3 Project View after a semantically equal generic
+    /// publisher incorrectly replaced it.
+    ///
+    /// This recovery is intentionally narrower than reprojection: it does not
+    /// change Project/object revisions, projection generation, projection
+    /// pointers, or business rows. The current replacement is accepted only
+    /// as evidence that membership did not change; the previously referenced
+    /// snapshot must still pass the full canonical v3 wire verifier before it
+    /// can be made current again.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn restore_project_view_v3_membership_snapshot(
+        &self,
+        community_id: CommunityId,
+        requested_by: PublicKey,
+        idempotency_key: &str,
+        expected_project_revision: u64,
+        expected_projection_generation: u64,
+        expected_old_membership_event_id: EventId,
+        candidate_current_membership_event_id: EventId,
+        relay_keys: &Keys,
+    ) -> ProjectViewMaintenanceResult<ProjectViewV3MembershipSnapshotRecoveryReceipt> {
+        if expected_old_membership_event_id == candidate_current_membership_event_id {
+            return Err(ProjectViewMaintenanceError::Invalid(
+                "old and candidate membership snapshot IDs must differ".to_owned(),
+            ));
+        }
+        let idempotency_key_hash = idempotency_hash(idempotency_key)?;
+        let request_hash = membership_snapshot_restore_request_hash(
+            community_id,
+            requested_by,
+            expected_project_revision,
+            expected_projection_generation,
+            expected_old_membership_event_id,
+            candidate_current_membership_event_id,
+            &relay_keys.public_key(),
+        );
+        let mut tx = self.pool.begin().await?;
+        crate::community_lock::acquire(&mut tx, community_id, false).await?;
+        require_human_operator_in_tx(&mut tx, community_id, requested_by).await?;
+
+        if let Some(receipt) = replay_membership_snapshot_restore_in_tx(
+            &mut tx,
+            community_id,
+            &idempotency_key_hash,
+            &request_hash,
+        )
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(receipt);
+        }
+
+        let row = sqlx::query(
+            "SELECT community.project_view_schema_version, \
+                    community.project_view_enabled, community.archived_at, \
+                    state.schema_version, state.project_revision, \
+                    state.projection_generation, state.projection_pubkey, \
+                    state.meta_projection_event_id, \
+                    state.membership_snapshot_event_id, \
+                    maintenance.state AS maintenance_state, \
+                    maintenance.current_epoch \
+             FROM communities community \
+             JOIN project_view_state state ON state.community_id = community.id \
+             JOIN project_view_maintenance maintenance \
+               ON maintenance.community_id = community.id \
+             WHERE community.id = $1 FOR UPDATE OF community, state, maintenance",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ProjectViewMaintenanceError::Conflict(
+                "initialized Project View v3 coordinate is missing".to_owned(),
+            )
+        })?;
+        let stored_signer = public_key(
+            &row.try_get::<Vec<u8>, _>("projection_pubkey")?,
+            "projection_pubkey",
+        )?;
+        let project_revision = revision_u64(row.try_get("project_revision")?, "project_revision")?;
+        let projection_generation = revision_u64(
+            row.try_get("projection_generation")?,
+            "projection_generation",
+        )?;
+        let state_membership_event_id = event_id(
+            bytes32(
+                row.try_get::<Vec<u8>, _>("membership_snapshot_event_id")?,
+                "membership_snapshot_event_id",
+            )?,
+            "membership_snapshot_event_id",
+        )?;
+        if row.try_get::<i16, _>("project_view_schema_version")? != 3
+            || row.try_get::<i16, _>("schema_version")? != 3
+            || !row.try_get::<bool, _>("project_view_enabled")?
+            || row
+                .try_get::<Option<DateTime<Utc>>, _>("archived_at")?
+                .is_some()
+            || row.try_get::<String, _>("maintenance_state")? != "normal"
+            || row.try_get::<Option<i64>, _>("current_epoch")?.is_some()
+            || stored_signer != relay_keys.public_key()
+            || project_revision != expected_project_revision
+            || projection_generation != expected_projection_generation
+            || state_membership_event_id != expected_old_membership_event_id
+        {
+            return Err(ProjectViewMaintenanceError::Conflict(
+                "Project View coordinate differs from the exact membership recovery request"
+                    .to_owned(),
+            ));
+        }
+
+        let meta_event_id = bytes32(
+            row.try_get::<Vec<u8>, _>("meta_projection_event_id")?,
+            "meta_projection_event_id",
+        )?;
+        let (meta_event, meta_deleted) = load_membership_recovery_event_in_tx(
+            &mut tx,
+            community_id,
+            &meta_event_id,
+            "Project View metadata",
+        )
+        .await?;
+        if meta_deleted {
+            return Err(ProjectViewMaintenanceError::Conflict(
+                "current Project View metadata projection is retired".to_owned(),
+            ));
+        }
+        let parsed_meta = buzz_sdk::project_view_v3::parse_meta_projection(
+            &meta_event.event,
+            &relay_keys.public_key(),
+        )
+        .map_err(|error| ProjectViewMaintenanceError::Invalid(error.to_string()))?;
+        if parsed_meta.project_id != community_id
+            || parsed_meta.project_revision != project_revision
+            || parsed_meta.projection_generation != projection_generation
+            || parsed_meta.membership_snapshot_event_id != expected_old_membership_event_id
+        {
+            return Err(ProjectViewMaintenanceError::Conflict(
+                "current Project View metadata does not reference the expected old snapshot"
+                    .to_owned(),
+            ));
+        }
+
+        let members = crate::project_view_v2::load_membership(&mut tx, community_id)
+            .await
+            .map_err(|error| ProjectViewMaintenanceError::Invalid(error.to_string()))?;
+        let old_id = expected_old_membership_event_id.to_bytes();
+        let candidate_id = candidate_current_membership_event_id.to_bytes();
+        let (old_event, old_deleted) = load_membership_recovery_event_in_tx(
+            &mut tx,
+            community_id,
+            &old_id,
+            "referenced membership snapshot",
+        )
+        .await?;
+        let (candidate_event, candidate_deleted) = load_membership_recovery_event_in_tx(
+            &mut tx,
+            community_id,
+            &candidate_id,
+            "candidate membership snapshot",
+        )
+        .await?;
+        if !old_deleted || candidate_deleted {
+            return Err(ProjectViewMaintenanceError::Conflict(
+                "recovery requires one retired referenced snapshot and one current candidate"
+                    .to_owned(),
+            ));
+        }
+        verify_canonical_membership_snapshot(&old_event, &relay_keys.public_key(), &members)?;
+        verify_semantically_equal_membership_snapshot(
+            &candidate_event,
+            &relay_keys.public_key(),
+            &members,
+        )?;
+
+        let live_snapshot_ids: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id = $1 AND kind = $2 \
+               AND pubkey = $3 AND channel_id IS NULL AND deleted_at IS NULL \
+             ORDER BY id",
+        )
+        .bind(community_id.as_uuid())
+        .bind(
+            i32::try_from(buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST).map_err(|_| {
+                ProjectViewMaintenanceError::Invalid(
+                    "membership event kind exceeds database integer".to_owned(),
+                )
+            })?,
+        )
+        .bind(relay_keys.public_key().as_bytes())
+        .fetch_all(&mut *tx)
+        .await?;
+        if live_snapshot_ids.len() != 1
+            || live_snapshot_ids[0].as_slice() != candidate_id.as_slice()
+        {
+            return Err(ProjectViewMaintenanceError::Conflict(
+                "candidate is not the unique current Relay membership snapshot".to_owned(),
+            ));
+        }
+
+        let requested_by_bytes = requested_by.to_bytes();
+        let audit = buzz_audit::append_in_transaction(
+            &mut tx,
+            NewAuditEntry {
+                community_id,
+                action: AuditAction::ProjectViewMaintenance,
+                actor_pubkey: Some(requested_by_bytes.to_vec()),
+                object_id: Some(expected_old_membership_event_id.to_hex()),
+                detail: json!({
+                    "operation": "restore_membership_snapshot",
+                    "project_revision": project_revision,
+                    "projection_generation": projection_generation,
+                    "restored_membership_event_id": expected_old_membership_event_id.to_hex(),
+                    "retired_membership_event_id": candidate_current_membership_event_id.to_hex(),
+                    "idempotency_key_hash": hex::encode(idempotency_key_hash),
+                }),
+            },
+        )
+        .await?;
+
+        let retired = sqlx::query(
+            "UPDATE events SET deleted_at = clock_timestamp() \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(candidate_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        let restored = sqlx::query(
+            "UPDATE events SET deleted_at = NULL \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NOT NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(old_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        if retired.rows_affected() != 1 || restored.rows_affected() != 1 {
+            return Err(ProjectViewMaintenanceError::Conflict(
+                "membership snapshot current-head state changed during recovery".to_owned(),
+            ));
+        }
+
+        sqlx::query("SELECT project_view_v3_validate_community($1)")
+            .bind(community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        if !crate::project_view_v3::strict_v3_projection_wires_ready_in_tx(
+            &mut tx,
+            community_id,
+            &relay_keys.public_key(),
+        )
+        .await?
+        {
+            return Err(ProjectViewMaintenanceError::Invalid(
+                "restored Project View v3 projection wires are not strictly ready".to_owned(),
+            ));
+        }
+
+        let result = json!({
+            "operation": "restore_membership_snapshot",
+            "community_id": community_id.to_string(),
+            "project_revision": project_revision,
+            "projection_generation": projection_generation,
+            "restored_membership_event_id": expected_old_membership_event_id.to_hex(),
+            "retired_membership_event_id": candidate_current_membership_event_id.to_hex(),
+            "state": "normal",
+            "strict_ready": true,
+        });
+        sqlx::query(
+            "INSERT INTO project_view_v3_membership_snapshot_recoveries \
+                (community_id, recovery_id, idempotency_key_hash, \
+                 canonical_request_hash, requested_by, audit_seq, \
+                 expected_project_revision, expected_projection_generation, \
+                 restored_membership_event_id, retired_membership_event_id, \
+                 result_receipt, accepted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,clock_timestamp())",
+        )
+        .bind(community_id.as_uuid())
+        .bind(Uuid::new_v4())
+        .bind(idempotency_key_hash.as_slice())
+        .bind(request_hash.as_slice())
+        .bind(requested_by_bytes.as_slice())
+        .bind(audit.seq)
+        .bind(revision_i64(project_revision, "project_revision")?)
+        .bind(revision_i64(
+            projection_generation,
+            "projection_generation",
+        )?)
+        .bind(old_id.as_slice())
+        .bind(candidate_id.as_slice())
+        .bind(&result)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(ProjectViewV3MembershipSnapshotRecoveryReceipt {
+            community_id,
+            operation: "restore_membership_snapshot".to_owned(),
+            replayed: false,
+            result,
         })
     }
 
@@ -1739,6 +2067,170 @@ fn recovery_request_hash(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn membership_snapshot_restore_request_hash(
+    community_id: CommunityId,
+    requested_by: PublicKey,
+    expected_project_revision: u64,
+    expected_projection_generation: u64,
+    old_membership_event_id: EventId,
+    candidate_membership_event_id: EventId,
+    relay_pubkey: &PublicKey,
+) -> [u8; 32] {
+    hash_parts(
+        MEMBERSHIP_SNAPSHOT_RESTORE_REQUEST_DOMAIN,
+        &[
+            community_id.as_uuid().as_bytes(),
+            requested_by.as_bytes(),
+            &expected_project_revision.to_be_bytes(),
+            &expected_projection_generation.to_be_bytes(),
+            old_membership_event_id.as_bytes(),
+            candidate_membership_event_id.as_bytes(),
+            relay_pubkey.as_bytes(),
+        ],
+    )
+}
+
+async fn replay_membership_snapshot_restore_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    idempotency_key_hash: &[u8; 32],
+    request_hash: &[u8; 32],
+) -> ProjectViewMaintenanceResult<Option<ProjectViewV3MembershipSnapshotRecoveryReceipt>> {
+    let row = sqlx::query(
+        "SELECT canonical_request_hash, result_receipt \
+         FROM project_view_v3_membership_snapshot_recoveries \
+         WHERE community_id = $1 AND idempotency_key_hash = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(idempotency_key_hash.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if bytes32(
+        row.try_get("canonical_request_hash")?,
+        "canonical_request_hash",
+    )? != *request_hash
+    {
+        return Err(ProjectViewMaintenanceError::Conflict(
+            "membership recovery idempotency key was reused for another request".to_owned(),
+        ));
+    }
+    Ok(Some(ProjectViewV3MembershipSnapshotRecoveryReceipt {
+        community_id,
+        operation: "restore_membership_snapshot".to_owned(),
+        replayed: true,
+        result: row.try_get("result_receipt")?,
+    }))
+}
+
+async fn load_membership_recovery_event_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event_id: &[u8; 32],
+    label: &str,
+) -> ProjectViewMaintenanceResult<(StoredEvent, bool)> {
+    let row = sqlx::query(
+        "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, \
+                channel_id, deleted_at \
+         FROM events WHERE community_id = $1 AND id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event_id.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| ProjectViewMaintenanceError::Conflict(format!("{label} is missing")))?;
+    let deleted = row
+        .try_get::<Option<DateTime<Utc>>, _>("deleted_at")?
+        .is_some();
+    let event = crate::event::row_to_stored_event(row)?
+        .ok_or_else(|| ProjectViewMaintenanceError::Invalid(format!("{label} is malformed")))?;
+    if event.channel_id.is_some() {
+        return Err(ProjectViewMaintenanceError::Invalid(format!(
+            "{label} is unexpectedly channel-scoped"
+        )));
+    }
+    Ok((event, deleted))
+}
+
+fn verify_canonical_membership_snapshot(
+    event: &StoredEvent,
+    relay_pubkey: &PublicKey,
+    members: &[crate::project_view_v2::V2MembershipEntry],
+) -> ProjectViewMaintenanceResult<()> {
+    let timestamp = i64::try_from(event.event.created_at.as_secs())
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .ok_or_else(|| {
+            ProjectViewMaintenanceError::Invalid(
+                "referenced membership snapshot timestamp is invalid".to_owned(),
+            )
+        })?;
+    crate::project_view_v2::verify_membership_projection(
+        &event.event,
+        *relay_pubkey,
+        members,
+        timestamp,
+    )
+    .map_err(|error| ProjectViewMaintenanceError::Invalid(error.to_string()))
+}
+
+fn verify_semantically_equal_membership_snapshot(
+    event: &StoredEvent,
+    relay_pubkey: &PublicKey,
+    members: &[crate::project_view_v2::V2MembershipEntry],
+) -> ProjectViewMaintenanceResult<()> {
+    event.event.verify().map_err(|error| {
+        ProjectViewMaintenanceError::Invalid(format!(
+            "candidate membership snapshot signature is invalid: {error}"
+        ))
+    })?;
+    if event.event.pubkey != *relay_pubkey
+        || event.event.kind.as_u16() as u32 != buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST
+        || !event.event.content.is_empty()
+    {
+        return Err(ProjectViewMaintenanceError::Invalid(
+            "candidate membership signer, kind, or content is invalid".to_owned(),
+        ));
+    }
+    let tags = event
+        .event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .collect::<Vec<_>>();
+    if !tags
+        .first()
+        .is_some_and(|tag| tag.len() == 1 && tag[0] == "-")
+    {
+        return Err(ProjectViewMaintenanceError::Invalid(
+            "candidate membership snapshot lacks the leading protected tag".to_owned(),
+        ));
+    }
+    let mut candidate = Vec::with_capacity(tags.len().saturating_sub(1));
+    for tag in tags.iter().skip(1) {
+        if tag.len() != 3 || tag.first().map(String::as_str) != Some("member") {
+            return Err(ProjectViewMaintenanceError::Invalid(
+                "candidate membership snapshot contains a noncanonical tag".to_owned(),
+            ));
+        }
+        candidate.push((tag[1].to_ascii_lowercase(), tag[2].clone()));
+    }
+    candidate.sort_unstable();
+    let expected = members
+        .iter()
+        .map(|member| (member.pubkey.to_ascii_lowercase(), member.role.clone()))
+        .collect::<Vec<_>>();
+    if candidate != expected {
+        return Err(ProjectViewMaintenanceError::Conflict(
+            "candidate membership snapshot differs from canonical Relay Members".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn hash_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain);
@@ -1923,6 +2415,7 @@ fn event_id(value: [u8; 32], field: &str) -> ProjectViewMaintenanceResult<EventI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, Kind, Tag};
 
     #[test]
     fn recovery_request_hash_binds_epoch_payload_and_signer() {
@@ -1944,6 +2437,71 @@ mod tests {
         assert_ne!(
             first,
             recovery_request_hash(REPAIR_REQUEST_DOMAIN, community, 7, &[2; 32], &signer,)
+        );
+    }
+
+    #[test]
+    fn membership_restore_hash_binds_every_exact_coordinate() {
+        let community = CommunityId::from_uuid(
+            Uuid::parse_str("0f85e5f0-c7d5-4c30-a0f2-c18478d21001").expect("UUID"),
+        );
+        let requester = Keys::generate().public_key();
+        let relay = Keys::generate().public_key();
+        let old = EventId::from_byte_array([1; 32]);
+        let candidate = EventId::from_byte_array([2; 32]);
+        let first = membership_snapshot_restore_request_hash(
+            community, requester, 69, 7, old, candidate, &relay,
+        );
+        assert_eq!(
+            first,
+            membership_snapshot_restore_request_hash(
+                community, requester, 69, 7, old, candidate, &relay,
+            )
+        );
+        assert_ne!(
+            first,
+            membership_snapshot_restore_request_hash(
+                community, requester, 70, 7, old, candidate, &relay,
+            )
+        );
+        assert_ne!(
+            first,
+            membership_snapshot_restore_request_hash(
+                community, requester, 69, 7, candidate, old, &relay,
+            )
+        );
+    }
+
+    #[test]
+    fn candidate_membership_may_be_semantically_equal_but_not_canonical_order() {
+        let relay = Keys::generate();
+        let members = vec![
+            crate::project_view_v2::V2MembershipEntry {
+                pubkey: "11".repeat(32),
+                role: "member".to_owned(),
+            },
+            crate::project_view_v2::V2MembershipEntry {
+                pubkey: "22".repeat(32),
+                role: "owner".to_owned(),
+            },
+        ];
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as u16),
+            "",
+        )
+        .tags([
+            Tag::parse(["-"]).expect("protected tag"),
+            Tag::parse(["member", members[1].pubkey.as_str(), "owner"]).expect("owner tag"),
+            Tag::parse(["member", members[0].pubkey.as_str(), "member"]).expect("member tag"),
+        ])
+        .sign_with_keys(&relay)
+        .expect("sign membership");
+        let stored = StoredEvent::new(event, None);
+
+        verify_semantically_equal_membership_snapshot(&stored, &relay.public_key(), &members)
+            .expect("unordered replacement is semantically equal evidence");
+        assert!(
+            verify_canonical_membership_snapshot(&stored, &relay.public_key(), &members).is_err()
         );
     }
 }

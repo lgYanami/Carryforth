@@ -17,6 +17,8 @@ use axum::{
 use serde_json::Value;
 use tracing::{info, warn};
 
+use buzz_db::relay_members::{LocalOwnerBootstrapOutcome, Nip43MembershipSnapshotReconciliation};
+
 use crate::state::AppState;
 
 use super::{api_error, bridge, internal_error};
@@ -80,10 +82,11 @@ pub async fn claim_initial_owner(
     bridge::check_nip98_replay(&state, &tenant, event_id).await?;
 
     let pubkey_hex = pubkey.to_hex();
-    let bootstrap_result = state
+    let bootstrap_outcome = state
         .db
-        .bootstrap_owner(tenant.community(), &pubkey_hex)
-        .await;
+        .claim_local_owner(tenant.community(), &pubkey_hex)
+        .await
+        .map_err(|error| internal_error(&format!("claim local owner: {error}")))?;
     let members = state
         .db
         .list_relay_members(tenant.community())
@@ -95,21 +98,88 @@ pub async fn claim_initial_owner(
         .map(|member| member.role.as_str());
     let owner_exists = members.iter().any(|member| member.role == "owner");
 
-    if bootstrap_result.is_ok() && caller_role == Some("owner") {
+    if matches!(
+        bootstrap_outcome,
+        LocalOwnerBootstrapOutcome::Created | LocalOwnerBootstrapOutcome::AlreadyOwner
+    ) && caller_role == Some("owner")
+    {
+        let snapshot_status = state
+            .db
+            .nip43_membership_snapshot_reconciliation_status(
+                tenant.community(),
+                &state.relay_keypair.public_key(),
+            )
+            .await
+            .map_err(|error| {
+                warn!(
+                    community = %tenant.community(),
+                    pubkey = %pubkey_hex,
+                    outcome = ?bootstrap_outcome,
+                    snapshot_action = "failed",
+                    error = %error,
+                    "local Desktop membership snapshot inspection failed"
+                );
+                internal_error(&format!("inspect local membership snapshot: {error}"))
+            })?;
+        let snapshot_action = match snapshot_status {
+            Nip43MembershipSnapshotReconciliation::Needed => {
+                crate::handlers::side_effects::publish_nip43_membership_list(&tenant, &state)
+                    .await
+                    .map_err(|error| {
+                        warn!(
+                            community = %tenant.community(),
+                            pubkey = %pubkey_hex,
+                            outcome = ?bootstrap_outcome,
+                            snapshot_action = "failed",
+                            error = %error,
+                            "local Desktop membership snapshot reconciliation failed"
+                        );
+                        internal_error(&format!("reconcile local membership snapshot: {error}"))
+                    })?;
+                if matches!(
+                    state
+                        .db
+                        .nip43_membership_snapshot_reconciliation_status(
+                            tenant.community(),
+                            &state.relay_keypair.public_key(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            warn!(
+                                community = %tenant.community(),
+                                pubkey = %pubkey_hex,
+                                outcome = ?bootstrap_outcome,
+                                snapshot_action = "failed",
+                                error = %error,
+                                "local Desktop membership snapshot verification failed"
+                            );
+                            internal_error(&format!("verify local membership snapshot: {error}"))
+                        })?,
+                    Nip43MembershipSnapshotReconciliation::Needed
+                ) {
+                    warn!(
+                        community = %tenant.community(),
+                        pubkey = %pubkey_hex,
+                        outcome = ?bootstrap_outcome,
+                        snapshot_action = "failed",
+                        "local Desktop membership snapshot remained inconsistent"
+                    );
+                    return Err(internal_error(
+                        "local membership snapshot remained inconsistent after reconciliation",
+                    ));
+                }
+                "published"
+            }
+            Nip43MembershipSnapshotReconciliation::Current => "already_current",
+            Nip43MembershipSnapshotReconciliation::GovernedV3 => "governed_noop",
+        };
         info!(
             community = %tenant.community(),
             pubkey = %pubkey_hex,
+            outcome = ?bootstrap_outcome,
+            snapshot_action,
             "local Desktop owner bootstrap ready"
         );
-        if let Err(error) =
-            crate::handlers::side_effects::publish_nip43_membership_list(&tenant, &state).await
-        {
-            warn!(
-                community = %tenant.community(),
-                error = %error,
-                "local owner persisted but membership snapshot publication failed"
-            );
-        }
         return Ok(Json(serde_json::json!({
             "status": "ready",
             "role": "owner",
@@ -125,14 +195,9 @@ pub async fn claim_initial_owner(
         })));
     }
 
-    let Some(error) = bootstrap_result.err() else {
-        return Err(internal_error(
-            "local owner bootstrap completed without an owner row",
-        ));
-    };
-    Err(internal_error(&format!(
-        "local owner bootstrap failed: {error}"
-    )))
+    Err(internal_error(
+        "local owner claim returned a writable outcome without an owner row",
+    ))
 }
 
 #[cfg(test)]
