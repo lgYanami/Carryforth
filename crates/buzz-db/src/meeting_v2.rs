@@ -529,6 +529,82 @@ pub(crate) async fn open_board_window_tx(
     })
 }
 
+/// Converge moderator control onto exactly one maintainable Board window.
+///
+/// A pending Board is reused in place so Offer/Grant recovery can commit its
+/// terminal transition without trying to open a second window. Advancing the
+/// control epoch fences commands prepared before control returned to the
+/// moderator, while preserving the existing Board window and deadline.
+pub(crate) async fn ensure_board_pending_for_moderator_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    control_epoch: i64,
+    now: DateTime<Utc>,
+) -> Result<RuntimeRow> {
+    if control_epoch <= 0 {
+        return Err(DbError::InvalidData(
+            "Meeting V2 control epoch must be positive".to_string(),
+        ));
+    }
+    let runtime = load_runtime_tx(tx, community_id, session_id, true).await?;
+    match runtime.phase {
+        RuntimePhase::BoardPending if runtime.control_epoch == control_epoch => Ok(runtime),
+        RuntimePhase::BoardPending if runtime.control_epoch < control_epoch => {
+            let row = sqlx::query(
+                "UPDATE meeting_v2_bootstrap_state \
+                 SET control_epoch = $5, updated_at = $6 \
+                 WHERE community_id = $1 AND session_id = $2 \
+                   AND runtime_phase = 'board_pending' \
+                   AND control_epoch = $3 AND board_window = $4 \
+                 RETURNING runtime_phase, control_epoch, board_window, board_started_at, \
+                           board_deadline_at, board_completed_at, board_outcome, \
+                           terminal_outcome, terminal_reason_code, terminal_at",
+            )
+            .bind(community_id.as_uuid())
+            .bind(session_id)
+            .bind(runtime.control_epoch)
+            .bind(runtime.board_window)
+            .bind(control_epoch)
+            .bind(now)
+            .fetch_optional(tx.as_mut())
+            .await?
+            .ok_or_else(|| {
+                DbError::InvalidData(format!(
+                    "Meeting V2 {session_id} Board window changed while returning moderator control"
+                ))
+            })?;
+            Ok(RuntimeRow {
+                phase: RuntimePhase::parse(row.try_get("runtime_phase")?)?,
+                control_epoch: row.try_get("control_epoch")?,
+                board_window: row.try_get("board_window")?,
+                board_started_at: row.try_get("board_started_at")?,
+                board_deadline_at: row.try_get("board_deadline_at")?,
+                board_completed_at: row.try_get("board_completed_at")?,
+                board_outcome: row.try_get("board_outcome")?,
+                terminal_outcome: row.try_get("terminal_outcome")?,
+                terminal_reason_code: row.try_get("terminal_reason_code")?,
+                terminal_at: row.try_get("terminal_at")?,
+            })
+        }
+        RuntimePhase::FloorReady => {
+            open_board_window_tx(tx, community_id, session_id, control_epoch, now).await
+        }
+        RuntimePhase::BoardPending => Err(DbError::InvalidData(format!(
+            "Meeting V2 {session_id} Board control epoch is ahead of moderator control"
+        ))),
+        RuntimePhase::BootstrapLocked => Err(DbError::InvalidData(format!(
+            "Meeting V2 {session_id} moderator recovery reached an uninitialized runtime"
+        ))),
+        RuntimePhase::FinalizingActions => Err(DbError::InvalidData(format!(
+            "Meeting V2 {session_id} cannot recover moderator control while finalizing actions"
+        ))),
+        RuntimePhase::Ended => Err(DbError::InvalidData(format!(
+            "Meeting V2 {session_id} cannot recover moderator control after it ended"
+        ))),
+    }
+}
+
 pub(crate) async fn ensure_runtime_initialized_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,

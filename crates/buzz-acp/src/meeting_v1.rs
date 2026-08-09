@@ -50,7 +50,9 @@ use crate::meeting_v2::{
     PARTICIPANT_BOARD_PROMPT_BODY_BYTES,
 };
 use crate::observer::{self, ObserverHandle};
-use crate::relay::{BuzzEvent, ProtocolSubmitOutcome, ProtocolSubmitRejected, RestClient};
+use crate::relay::{
+    BuzzEvent, ProtocolSubmitAccepted, ProtocolSubmitOutcome, ProtocolSubmitRejected, RestClient,
+};
 
 const LEDGER_VERSION: u32 = 7;
 const PREVIOUS_LEDGER_VERSION: u32 = 6;
@@ -903,7 +905,7 @@ struct ProgressTaskResult {
     event_id: String,
     progress_seq: u64,
     stage: MeetingV1ProgressStage,
-    result: std::result::Result<Value, ProtocolSubmitFailure>,
+    result: std::result::Result<ProtocolSubmitAccepted, ProtocolSubmitFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1026,7 +1028,7 @@ struct ProtocolTaskResult {
     event_id: String,
     request_started_at: tokio::time::Instant,
     context: ProtocolSubmissionContext,
-    result: std::result::Result<Value, ProtocolSubmitFailure>,
+    result: std::result::Result<ProtocolSubmitAccepted, ProtocolSubmitFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1060,6 +1062,31 @@ impl ActionRunKey {
             action_window_epoch: action.action_window_epoch,
             board_event_id: action.board_event_id.clone(),
         }
+    }
+}
+
+/// Process-local adoption of one exact signed Action Begin.
+///
+/// The HTTP receipt and Relay State can arrive in either order. Keeping both
+/// halves under the Begin event ID prevents a live first window from being
+/// confused with a runnable Action discovered after a cold restart.
+#[derive(Debug, Clone)]
+struct ActionBeginAdoption {
+    session_id: Uuid,
+    session_epoch: u64,
+    board_event_id: String,
+    receipt_key: Option<ActionRunKey>,
+    canonical_key: Option<ActionRunKey>,
+}
+
+impl ActionBeginAdoption {
+    fn observes(&self, key: &ActionRunKey) -> bool {
+        self.receipt_key.as_ref() == Some(key) || self.canonical_key.as_ref() == Some(key)
+    }
+
+    fn ready_key(&self) -> Option<&ActionRunKey> {
+        let receipt = self.receipt_key.as_ref()?;
+        (self.canonical_key.as_ref() == Some(receipt)).then_some(receipt)
     }
 }
 
@@ -1117,17 +1144,9 @@ pub(super) struct MeetingV1Coordinator {
     /// Process-local proof that this Runtime observed Action Begin commit (or
     /// an explicit Relay retry window) and may dispatch semantic work.
     action_dispatch_permits: BTreeSet<ActionRunKey>,
-    /// Process-local proof that the exact Begin command created the canonical
-    /// Action Run. This is deliberately separate from lease timing: Relay
-    /// State and the HTTP receipt may arrive in either order.
-    action_begin_ownership_ready: BTreeSet<ActionRunKey>,
-    /// Verified monotonic lease timing for the exact process-local Begin.
-    /// Semantic Action work is dispatchable only after ownership and timing
-    /// are both ready for the same ActionRunKey.
-    action_begin_timing_ready: BTreeSet<ActionRunKey>,
-    /// Begin events prepared by this process. Durable prepared events alone do
-    /// not prove ownership after a restart.
-    process_action_begin_events: BTreeMap<String, Uuid>,
+    /// Live Begin commands submitted by this process. Durable prepared events
+    /// alone do not recreate this adoption after a restart.
+    action_begin_adoptions: BTreeMap<String, ActionBeginAdoption>,
     /// Canonical blocked windows observed by this process. Only a subsequent
     /// Relay-advanced window from one of these observations is a safe retry.
     process_blocked_action_windows: BTreeSet<ActionRunKey>,
@@ -1210,9 +1229,7 @@ impl MeetingV1Coordinator {
             action_deadline_senders: HashMap::new(),
             action_deadline_hints: HashMap::new(),
             action_dispatch_permits: BTreeSet::new(),
-            action_begin_ownership_ready: BTreeSet::new(),
-            action_begin_timing_ready: BTreeSet::new(),
-            process_action_begin_events: BTreeMap::new(),
+            action_begin_adoptions: BTreeMap::new(),
             process_blocked_action_windows: BTreeSet::new(),
             #[cfg(feature = "meeting-acceptance")]
             acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
@@ -1608,14 +1625,10 @@ impl MeetingV1Coordinator {
         self.action_deadline_hints.remove(&session_id);
         self.action_dispatch_permits
             .retain(|key| key.session_id != session_id);
-        self.action_begin_ownership_ready
-            .retain(|key| key.session_id != session_id);
-        self.action_begin_timing_ready
-            .retain(|key| key.session_id != session_id);
+        self.action_begin_adoptions
+            .retain(|_, adoption| adoption.session_id != session_id);
         self.process_blocked_action_windows
             .retain(|key| key.session_id != session_id);
-        self.process_action_begin_events
-            .retain(|_, meeting_id| *meeting_id != session_id);
         self.meetings.remove(&session_id);
         if let Some(ledger) = self.ledger_for_mut(session_id) {
             // Membership/subscription removal tears down only ephemeral runtime
@@ -1673,14 +1686,10 @@ impl MeetingV1Coordinator {
         self.action_deadline_hints.remove(&session_id);
         self.action_dispatch_permits
             .retain(|key| key.session_id != session_id);
-        self.action_begin_ownership_ready
-            .retain(|key| key.session_id != session_id);
-        self.action_begin_timing_ready
-            .retain(|key| key.session_id != session_id);
+        self.action_begin_adoptions
+            .retain(|_, adoption| adoption.session_id != session_id);
         self.process_blocked_action_windows
             .retain(|key| key.session_id != session_id);
-        self.process_action_begin_events
-            .retain(|_, meeting_id| *meeting_id != session_id);
         self.external_reclaimable_turns.remove(&session_id);
         if let Some(pending) = deferred_turn_result {
             self.discard_deferred_turn_result(pending, Some("meeting_ended"));
@@ -1802,18 +1811,37 @@ impl MeetingV1Coordinator {
                 let session_id = Uuid::parse_str(&ledger.session_id).ok()?;
                 let record = ledger.v2_action_finalization.as_ref()?;
                 let view = self.meetings.get(&session_id)?.view.as_ref()?;
-                let board = view.baton.board_control.as_ref()?;
-                let action = board.action.as_ref()?;
+                let key = ActionRunKey {
+                    session_id,
+                    action_run_id: record.action_run_id,
+                    action_window_epoch: record.action_window_epoch,
+                    board_event_id: record.board_event_id.clone(),
+                };
+                let canonical_runnable = view
+                    .baton
+                    .board_control
+                    .as_ref()
+                    .filter(|board| board.phase == "finalizing_actions")
+                    .and_then(|board| board.action.as_ref())
+                    .is_some_and(|action| {
+                        action.condition == "runnable"
+                            && action.terminal_status.is_none()
+                            && ActionRunKey::from_view(session_id, action) == key
+                    });
+                let adopting_runnable = record.state == "adopting"
+                    && self.action_begin_adoptions.values().any(|adoption| {
+                        adoption.session_id == session_id
+                            && self
+                                .meetings
+                                .get(&session_id)
+                                .is_some_and(|runtime| runtime.epoch == adoption.session_epoch)
+                            && adoption.receipt_key.as_ref() == Some(&key)
+                    });
                 (view.protocol == MeetingBatonProtocol::V2Actions
                     && view.baton.moderator_pubkey == self.agent_pubkey
-                    && board.phase == "finalizing_actions"
                     && record.state != "orphaned"
                     && record.next_renewal_at_ms <= now
-                    && action.condition == "runnable"
-                    && action.terminal_status.is_none()
-                    && action.action_run_id == record.action_run_id
-                    && action.action_window_epoch == record.action_window_epoch
-                    && action.board_event_id == record.board_event_id)
+                    && (canonical_runnable || adopting_runnable))
                     .then_some((session_id, record.clone()))
             })
             .collect();
@@ -1905,14 +1933,31 @@ impl MeetingV1Coordinator {
         }
     }
 
-    fn promote_process_local_action_begin(&mut self, permit: &ActionRunKey) -> bool {
-        if !self.action_begin_ownership_ready.contains(permit)
-            || !self.action_begin_timing_ready.contains(permit)
-        {
+    fn action_begin_adoption_observes(&self, permit: &ActionRunKey) -> bool {
+        self.action_begin_adoptions.values().any(|adoption| {
+            adoption.session_id == permit.session_id
+                && self
+                    .meetings
+                    .get(&permit.session_id)
+                    .is_some_and(|runtime| runtime.epoch == adoption.session_epoch)
+                && adoption.observes(permit)
+        })
+    }
+
+    fn promote_process_local_action_begin(&mut self, event_id: &str) -> bool {
+        let Some(permit) = self
+            .action_begin_adoptions
+            .get(event_id)
+            .filter(|adoption| {
+                self.meetings
+                    .get(&adoption.session_id)
+                    .is_some_and(|runtime| runtime.epoch == adoption.session_epoch)
+            })
+            .and_then(ActionBeginAdoption::ready_key)
+            .cloned()
+        else {
             return false;
-        }
-        self.action_begin_ownership_ready.remove(permit);
-        self.action_begin_timing_ready.remove(permit);
+        };
         self.action_dispatch_permits.insert(permit.clone());
         if let Some(record) = self
             .ledger_for_mut(permit.session_id)
@@ -1921,15 +1966,16 @@ impl MeetingV1Coordinator {
                 record.action_run_id == permit.action_run_id
                     && record.action_window_epoch == permit.action_window_epoch
                     && record.board_event_id == permit.board_event_id
-                    && matches!(record.state.as_str(), "orphaned" | "awaiting_begin_timing")
+                    && matches!(record.state.as_str(), "orphaned" | "adopting")
             })
         {
             record.state = "pending".to_string();
         }
+        self.complete_process_local_action_begin_correlation(event_id, &permit);
         true
     }
 
-    fn mark_process_local_action_begin_pending(&mut self, permit: &ActionRunKey) {
+    fn mark_process_local_action_begin_adopting(&mut self, permit: &ActionRunKey) {
         if let Some(record) = self
             .ledger_for_mut(permit.session_id)
             .and_then(|ledger| ledger.v2_action_finalization.as_mut())
@@ -1937,10 +1983,59 @@ impl MeetingV1Coordinator {
                 record.action_run_id == permit.action_run_id
                     && record.action_window_epoch == permit.action_window_epoch
                     && record.board_event_id == permit.board_event_id
-                    && record.state == "orphaned"
+                    && matches!(record.state.as_str(), "orphaned" | "adopting")
             })
         {
-            record.state = "awaiting_begin_timing".to_string();
+            record.state = "adopting".to_string();
+        }
+    }
+
+    fn seed_process_local_action_begin_record(
+        &mut self,
+        permit: &ActionRunKey,
+        local_deadline: tokio::time::Instant,
+    ) {
+        let remaining_ms = local_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let hard_deadline_unix_ms = now_ms().saturating_add(remaining_ms);
+        let Some(ledger) = self.ledger_for_mut(permit.session_id) else {
+            return;
+        };
+        match ledger.v2_action_finalization.as_mut() {
+            Some(record)
+                if record.action_run_id == permit.action_run_id
+                    && record.action_window_epoch == permit.action_window_epoch
+                    && record.board_event_id == permit.board_event_id =>
+            {
+                record.hard_deadline_unix_ms =
+                    record.hard_deadline_unix_ms.max(hard_deadline_unix_ms);
+                if record.state == "orphaned" {
+                    record.state = "adopting".to_string();
+                }
+            }
+            Some(_) => {}
+            None => {
+                ledger.v2_action_finalization = Some(V2ActionFinalizationRecord {
+                    action_run_id: permit.action_run_id,
+                    board_event_id: permit.board_event_id.clone(),
+                    action_window_epoch: permit.action_window_epoch,
+                    hard_deadline_unix_ms,
+                    progress_seq: 0,
+                    last_progress_stage: None,
+                    next_renewal_at_ms: now_ms()
+                        .saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64),
+                    prepared_renewal_event: None,
+                    prepared_renewal_event_id: None,
+                    prepared_renewal_seq: None,
+                    state: "adopting".to_string(),
+                    turn_id: None,
+                    format_attempts: 0,
+                    prepared_end_event: None,
+                    prepared_end_event_id: None,
+                });
+            }
         }
     }
 
@@ -1949,7 +2044,7 @@ impl MeetingV1Coordinator {
         event_id: &str,
         permit: &ActionRunKey,
     ) {
-        self.process_action_begin_events.remove(event_id);
+        self.action_begin_adoptions.remove(event_id);
         if let Some(ledger) = self.ledger_for_mut(permit.session_id) {
             if ledger
                 .prepared_moderator_action
@@ -1968,13 +2063,45 @@ impl MeetingV1Coordinator {
         event_id: &str,
         permit: ActionRunKey,
     ) -> bool {
-        if self.process_action_begin_events.get(event_id) != Some(&permit.session_id) {
+        let current_epoch = self
+            .meetings
+            .get(&permit.session_id)
+            .map(|runtime| runtime.epoch);
+        let Some(adoption) = self.action_begin_adoptions.get_mut(event_id) else {
+            return false;
+        };
+        if adoption.session_id != permit.session_id
+            || Some(adoption.session_epoch) != current_epoch
+            || adoption.board_event_id != permit.board_event_id
+        {
             return false;
         }
-        self.action_begin_timing_ready.insert(permit.clone());
-        self.mark_process_local_action_begin_pending(&permit);
-        if self.promote_process_local_action_begin(&permit) {
-            self.complete_process_local_action_begin_correlation(event_id, &permit);
+        adoption.receipt_key = Some(permit.clone());
+        self.mark_process_local_action_begin_adopting(&permit);
+        let ready = self.promote_process_local_action_begin(event_id);
+        self.emit(
+            "meeting_v2_action_begin_http_accepted",
+            permit.session_id,
+            None,
+            json!({
+                "begin_event_id": event_id,
+                "action_run_id": permit.action_run_id,
+                "action_window_epoch": permit.action_window_epoch,
+                "board_event_id": permit.board_event_id.clone(),
+            }),
+        );
+        if ready {
+            self.emit(
+                "meeting_v2_action_begin_adoption_ready",
+                permit.session_id,
+                None,
+                json!({
+                    "begin_event_id": event_id,
+                    "action_run_id": permit.action_run_id,
+                    "action_window_epoch": permit.action_window_epoch,
+                    "board_event_id": permit.board_event_id,
+                }),
+            );
         }
         true
     }
@@ -1984,13 +2111,45 @@ impl MeetingV1Coordinator {
         event_id: &str,
         permit: ActionRunKey,
     ) -> bool {
-        if self.process_action_begin_events.get(event_id) != Some(&permit.session_id) {
+        let current_epoch = self
+            .meetings
+            .get(&permit.session_id)
+            .map(|runtime| runtime.epoch);
+        let Some(adoption) = self.action_begin_adoptions.get_mut(event_id) else {
+            return false;
+        };
+        if adoption.session_id != permit.session_id
+            || Some(adoption.session_epoch) != current_epoch
+            || adoption.board_event_id != permit.board_event_id
+        {
             return false;
         }
-        self.action_begin_ownership_ready.insert(permit.clone());
-        self.mark_process_local_action_begin_pending(&permit);
-        if self.promote_process_local_action_begin(&permit) {
-            self.complete_process_local_action_begin_correlation(event_id, &permit);
+        adoption.canonical_key = Some(permit.clone());
+        self.mark_process_local_action_begin_adopting(&permit);
+        let ready = self.promote_process_local_action_begin(event_id);
+        self.emit(
+            "meeting_v2_action_begin_state_observed",
+            permit.session_id,
+            None,
+            json!({
+                "begin_event_id": event_id,
+                "action_run_id": permit.action_run_id,
+                "action_window_epoch": permit.action_window_epoch,
+                "board_event_id": permit.board_event_id.clone(),
+            }),
+        );
+        if ready {
+            self.emit(
+                "meeting_v2_action_begin_adoption_ready",
+                permit.session_id,
+                None,
+                json!({
+                    "begin_event_id": event_id,
+                    "action_run_id": permit.action_run_id,
+                    "action_window_epoch": permit.action_window_epoch,
+                    "board_event_id": permit.board_event_id,
+                }),
+            );
         }
         true
     }
@@ -3295,9 +3454,9 @@ impl MeetingV1Coordinator {
                     });
                 if event_matches {
                     match &completed.result {
-                        Ok(response) => {
+                        Ok(accepted) => {
                             let timing = action_timing_receipt(
-                                response,
+                                &accepted.response,
                                 action_run_id,
                                 action_window_epoch,
                                 progress_seq,
@@ -3430,8 +3589,8 @@ impl MeetingV1Coordinator {
                 let mut retry_action_begin_for_timing = false;
                 if action_kind == "action_begin" && !meeting_ended {
                     match &completed.result {
-                        Ok(response) => match action_begin_timing_receipt(
-                            response,
+                        Ok(accepted) => match action_begin_timing_receipt(
+                            accepted,
                             &completed.event_id,
                             session_id,
                             &object_id,
@@ -3443,15 +3602,22 @@ impl MeetingV1Coordinator {
                                     action_window_epoch: verified.action_window_epoch,
                                     board_event_id: object_id.clone(),
                                 };
+                                let local_deadline = action_local_deadline(
+                                    completed.request_started_at,
+                                    &verified.timing,
+                                );
+                                if let Some(local_deadline) = local_deadline {
+                                    self.seed_process_local_action_begin_record(
+                                        &permit,
+                                        local_deadline,
+                                    );
+                                }
                                 let correlated = self.record_process_local_action_begin_timing(
                                     &completed.event_id,
                                     permit,
                                 );
                                 if correlated {
-                                    if let Some(local_deadline) = action_local_deadline(
-                                        completed.request_started_at,
-                                        &verified.timing,
-                                    ) {
+                                    if let Some(local_deadline) = local_deadline {
                                         self.action_deadline_hints.insert(
                                             session_id,
                                             ActionDeadlineHint {
@@ -3474,8 +3640,10 @@ impl MeetingV1Coordinator {
                             }
                             Err(error) => {
                                 retry_action_begin_for_timing = event_matches
-                                    && self.process_action_begin_events.get(&completed.event_id)
-                                        == Some(&session_id);
+                                    && self
+                                        .action_begin_adoptions
+                                        .get(&completed.event_id)
+                                        .is_some_and(|adoption| adoption.session_id == session_id);
                                 tracing::warn!(
                                     meeting = %session_id,
                                         event_id = %completed.event_id,
@@ -3485,15 +3653,9 @@ impl MeetingV1Coordinator {
                             }
                         },
                         Err(ProtocolSubmitFailure::Rejected(_)) => {
-                            if self.process_action_begin_events.get(&completed.event_id)
-                                == Some(&session_id)
-                            {
-                                self.process_action_begin_events.remove(&completed.event_id);
-                                self.action_begin_ownership_ready
-                                    .retain(|key| key.session_id != session_id);
-                                self.action_begin_timing_ready
-                                    .retain(|key| key.session_id != session_id);
-                            }
+                            self.action_begin_adoptions.retain(|event_id, adoption| {
+                                event_id != &completed.event_id || adoption.session_id != session_id
+                            });
                         }
                         Err(ProtocolSubmitFailure::Uncertain(_)) => {}
                     }
@@ -3627,7 +3789,7 @@ impl MeetingV1Coordinator {
         action_kind: &str,
         object_id: &str,
         event_id: &str,
-        result: &std::result::Result<Value, ProtocolSubmitFailure>,
+        result: &std::result::Result<ProtocolSubmitAccepted, ProtocolSubmitFailure>,
     ) {
         if matches!(
             action_kind,
@@ -4541,6 +4703,15 @@ impl MeetingV1Coordinator {
             })
             .filter(|_| view.baton.moderator_pubkey == agent_pubkey)
             .filter(|attempt| previous_attempt_id.as_deref() != Some(attempt.attempt_id.as_str()));
+        let projected_action_key = view
+            .baton
+            .board_control
+            .as_ref()
+            .and_then(|board| board.action.as_ref())
+            .map(|action| ActionRunKey::from_view(view.session_id, action));
+        let projected_action_adopting = projected_action_key
+            .as_ref()
+            .is_some_and(|permit| self.action_begin_adoption_observes(permit));
         let Some(ledger) = self.ledger.meetings.get_mut(&key) else {
             return;
         };
@@ -4730,7 +4901,9 @@ impl MeetingV1Coordinator {
                                     record.action_run_id == action.action_run_id
                                         && record.board_event_id == action.board_event_id
                                 });
-                        let current_action_key = ActionRunKey::from_view(view.session_id, action);
+                        let current_action_key = projected_action_key
+                            .clone()
+                            .unwrap_or_else(|| ActionRunKey::from_view(view.session_id, action));
                         if action.condition == "blocked" {
                             self.process_blocked_action_windows
                                 .insert(current_action_key.clone());
@@ -4738,10 +4911,6 @@ impl MeetingV1Coordinator {
                         if !same_run {
                             let dispatch_permitted =
                                 self.action_dispatch_permits.contains(&current_action_key);
-                            let begin_correlation_pending = self
-                                .action_begin_ownership_ready
-                                .contains(&current_action_key)
-                                || self.action_begin_timing_ready.contains(&current_action_key);
                             ledger.v2_action_finalization = Some(V2ActionFinalizationRecord {
                                 action_run_id: action.action_run_id,
                                 board_event_id: action.board_event_id.clone(),
@@ -4758,8 +4927,8 @@ impl MeetingV1Coordinator {
                                     "blocked"
                                 } else if dispatch_permitted {
                                     "pending"
-                                } else if begin_correlation_pending {
-                                    "awaiting_begin_timing"
+                                } else if projected_action_adopting {
+                                    "adopting"
                                 } else {
                                     "orphaned"
                                 }
@@ -4791,18 +4960,8 @@ impl MeetingV1Coordinator {
                                         || key.action_run_id != action.action_run_id
                                         || key.action_window_epoch >= action.action_window_epoch
                                 });
-                                self.action_begin_ownership_ready.retain(|key| {
-                                    key.session_id != view.session_id
-                                        || key.action_run_id != action.action_run_id
-                                        || key.action_window_epoch >= action.action_window_epoch
-                                });
-                                self.action_begin_timing_ready.retain(|key| {
-                                    key.session_id != view.session_id
-                                        || key.action_run_id != action.action_run_id
-                                        || key.action_window_epoch >= action.action_window_epoch
-                                });
-                                self.process_action_begin_events
-                                    .retain(|_, session_id| *session_id != view.session_id);
+                                self.action_begin_adoptions
+                                    .retain(|_, adoption| adoption.session_id != view.session_id);
                             }
                             record.hard_deadline_unix_ms = reconcile_action_deadline(
                                 record.action_window_epoch,
@@ -5224,7 +5383,10 @@ impl MeetingV1Coordinator {
 
         if action_kind == "action_begin"
             && transition.primary_type == "action_finalization_began"
-            && self.process_action_begin_events.get(&matched_event_id) == Some(&view.session_id)
+            && self
+                .action_begin_adoptions
+                .get(&matched_event_id)
+                .is_some_and(|adoption| adoption.session_id == view.session_id)
         {
             if let Some(action) = view
                 .baton
@@ -5250,14 +5412,10 @@ impl MeetingV1Coordinator {
         if transition.primary_type == "action_returned_to_board" {
             self.action_dispatch_permits
                 .retain(|key| key.session_id != view.session_id);
-            self.action_begin_ownership_ready
-                .retain(|key| key.session_id != view.session_id);
-            self.action_begin_timing_ready
-                .retain(|key| key.session_id != view.session_id);
+            self.action_begin_adoptions
+                .retain(|_, adoption| adoption.session_id != view.session_id);
             self.process_blocked_action_windows
                 .retain(|key| key.session_id != view.session_id);
-            self.process_action_begin_events
-                .retain(|_, session_id| *session_id != view.session_id);
         }
 
         let confirmed = ConfirmedModeratorTransition {
@@ -6289,8 +6447,23 @@ impl MeetingV1Coordinator {
                     return false;
                 }
             };
-        self.process_action_begin_events
-            .insert(event.id.to_hex(), session_id);
+        let Some(session_epoch) = self.meetings.get(&session_id).map(|runtime| runtime.epoch)
+        else {
+            return false;
+        };
+        self.action_begin_adoptions
+            .retain(|_, adoption| adoption.session_id != session_id);
+        let begin_event_id = event.id.to_hex();
+        self.action_begin_adoptions.insert(
+            begin_event_id.clone(),
+            ActionBeginAdoption {
+                session_id,
+                session_epoch,
+                board_event_id: board_event_id.to_string(),
+                receipt_key: None,
+                canonical_key: None,
+            },
+        );
         self.prepare_and_submit_moderator_event(
             session_id,
             "action_begin".to_string(),
@@ -6298,6 +6471,16 @@ impl MeetingV1Coordinator {
             decision_attempt_id.map(str::to_string),
             hard_deadline_unix_ms,
             event,
+        );
+        self.emit(
+            "meeting_v2_action_begin_submitted",
+            session_id,
+            Some(turn_id.to_string()),
+            json!({
+                "begin_event_id": begin_event_id,
+                "board_event_id": board_event_id,
+                "session_epoch": session_epoch,
+            }),
         );
         if let Some(ledger) = self.ledger_for_mut(session_id) {
             if let Some(record) = ledger.v2_floor_decision.as_mut() {
@@ -9810,7 +9993,7 @@ fn moderator_observer_snapshot(attempt: &ActiveDecisionAttemptView, view: &Meeti
 async fn submit_protocol_event(
     rest: &RestClient,
     event: &Event,
-) -> std::result::Result<Value, ProtocolSubmitFailure> {
+) -> std::result::Result<ProtocolSubmitAccepted, ProtocolSubmitFailure> {
     let response =
         tokio::time::timeout(PROTOCOL_SUBMIT_TIMEOUT, rest.submit_event_outcome(event)).await;
     match response {
@@ -9818,7 +10001,7 @@ async fn submit_protocol_event(
             "submission exceeded {}ms",
             PROTOCOL_SUBMIT_TIMEOUT.as_millis()
         ))),
-        Ok(ProtocolSubmitOutcome::Accepted(accepted)) => Ok(accepted.response),
+        Ok(ProtocolSubmitOutcome::Accepted(accepted)) => Ok(accepted),
         Ok(ProtocolSubmitOutcome::Rejected(rejected)) => {
             Err(ProtocolSubmitFailure::Rejected(rejected))
         }
@@ -9854,7 +10037,6 @@ fn action_timing_receipt(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionBeginReceiptError {
     EnvelopeMissing,
-    EventIdMissing,
     EventIdMismatch,
     MeetingIdMissing,
     MeetingIdMismatch,
@@ -9872,7 +10054,6 @@ impl ActionBeginReceiptError {
     const fn code(self) -> &'static str {
         match self {
             Self::EnvelopeMissing => "envelope_missing",
-            Self::EventIdMissing => "event_id_missing",
             Self::EventIdMismatch => "event_id_mismatch",
             Self::MeetingIdMissing => "meeting_id_missing",
             Self::MeetingIdMismatch => "meeting_id_mismatch",
@@ -9896,19 +10077,16 @@ struct VerifiedActionBeginTiming {
 }
 
 fn action_begin_timing_receipt(
-    response: &Value,
+    accepted: &ProtocolSubmitAccepted,
     expected_event_id: &str,
     expected_meeting_id: Uuid,
     expected_board_event_id: &str,
 ) -> std::result::Result<VerifiedActionBeginTiming, ActionBeginReceiptError> {
-    let Some(response_event_id) = response.get("event_id").and_then(Value::as_str) else {
-        return Err(ActionBeginReceiptError::EventIdMissing);
-    };
-    if !response_event_id.eq_ignore_ascii_case(expected_event_id) {
+    if !accepted.event_id.eq_ignore_ascii_case(expected_event_id) {
         return Err(ActionBeginReceiptError::EventIdMismatch);
     }
-    let timing =
-        action_timing_envelope(response).ok_or(ActionBeginReceiptError::EnvelopeMissing)?;
+    let timing = action_timing_envelope(&accepted.response)
+        .ok_or(ActionBeginReceiptError::EnvelopeMissing)?;
     let meeting_id = timing
         .get("meeting_id")
         .and_then(Value::as_str)
@@ -13868,6 +14046,10 @@ mod tests {
             directory.path().join("meeting-v2-targeted-preemption.json"),
             None,
         );
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
         coordinator.ensure_meeting_ledger(session_id);
         let mut view =
             meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
@@ -14163,9 +14345,7 @@ mod tests {
             action_deadline_senders: HashMap::new(),
             action_deadline_hints: HashMap::new(),
             action_dispatch_permits: BTreeSet::new(),
-            action_begin_ownership_ready: BTreeSet::new(),
-            action_begin_timing_ready: BTreeSet::new(),
-            process_action_begin_events: BTreeMap::new(),
+            action_begin_adoptions: BTreeMap::new(),
             process_blocked_action_windows: BTreeSet::new(),
             #[cfg(feature = "meeting-acceptance")]
             acceptance_barrier: PreSubmitAcceptanceBarrier::from_env(),
@@ -14224,9 +14404,16 @@ mod tests {
             created_at_ms: now_ms(),
             hard_deadline_unix_ms: now_ms().saturating_add(180_000),
         });
-        coordinator
-            .process_action_begin_events
-            .insert(event_id.clone(), session_id);
+        coordinator.action_begin_adoptions.insert(
+            event_id.clone(),
+            ActionBeginAdoption {
+                session_id,
+                session_epoch: 1,
+                board_event_id: board_event_id.to_string(),
+                receipt_key: None,
+                canonical_key: None,
+            },
+        );
         let key = ProtocolSubmissionKey::Moderator {
             session_id,
             event_id: event_id.clone(),
@@ -14247,11 +14434,13 @@ mod tests {
         session_id: Uuid,
         action_run_id: Uuid,
         board_event_id: &str,
-    ) -> Value {
-        json!({
-            "event_id": event_id,
-            "accepted": true,
-            "message": format!("response:{}", json!({
+    ) -> ProtocolSubmitAccepted {
+        ProtocolSubmitAccepted {
+            event_id: event_id.to_string(),
+            canonical_object_id: Some(action_run_id.to_string()),
+            response: json!({
+                "accepted": true,
+                "message": format!("response:{}", json!({
                 "meeting_id": session_id,
                 "accepted": true,
                 "outcome": "action_finalization_began",
@@ -14262,8 +14451,17 @@ mod tests {
                 "lease_ttl_ms": 90_000,
                 "operator_hard_remaining_ms": 3_600_000,
                 "details": { "board_event_id": board_event_id },
-            })),
-        })
+                })),
+            }),
+        }
+    }
+
+    fn test_protocol_accepted(event_id: &str, response: Value) -> ProtocolSubmitAccepted {
+        ProtocolSubmitAccepted {
+            event_id: event_id.to_string(),
+            canonical_object_id: None,
+            response,
+        }
     }
 
     fn test_grant_record(grant: &GrantView) -> GrantRecord {
@@ -16170,7 +16368,10 @@ mod tests {
                     turn_role: "participant".to_string(),
                     created_at_ms: now_ms(),
                 },
-                result: Ok(json!({ "accepted": true })),
+                result: Ok(test_protocol_accepted(
+                    &current.event_id,
+                    json!({ "accepted": true }),
+                )),
             })
             .await;
         assert_eq!(
@@ -16821,7 +17022,10 @@ mod tests {
             event_id: current_event_id.clone(),
             progress_seq: 2,
             stage: MeetingV1ProgressStage::Generating,
-            result: Ok(json!({ "accepted": true })),
+            result: Ok(test_protocol_accepted(
+                &current_event_id,
+                json!({ "accepted": true }),
+            )),
         });
         let in_flight = coordinator
             .progress_in_flight
@@ -16838,7 +17042,10 @@ mod tests {
             event_id: old_event.id.to_hex(),
             progress_seq: 2,
             stage: MeetingV1ProgressStage::Generating,
-            result: Ok(json!({ "accepted": true })),
+            result: Ok(test_protocol_accepted(
+                &old_event.id.to_hex(),
+                json!({ "accepted": true }),
+            )),
         });
         let in_flight = coordinator
             .progress_in_flight
@@ -16865,10 +17072,13 @@ mod tests {
             session_epoch: 0,
             grant_id: grant_id.clone(),
             submission_id: 22,
-            event_id: current_event_id,
+            event_id: current_event_id.clone(),
             progress_seq: 2,
             stage: MeetingV1ProgressStage::Generating,
-            result: Ok(json!({ "accepted": true })),
+            result: Ok(test_protocol_accepted(
+                &current_event_id,
+                json!({ "accepted": true }),
+            )),
         });
         assert!(!coordinator.progress_in_flight.contains_key(&in_flight_key));
         assert_eq!(
@@ -17430,6 +17640,12 @@ mod tests {
         let accepted = submit_protocol_event(&accepted_rest, &event).await;
         accepted_server.await.expect("join accepted HTTP server");
         assert_eq!(protocol_submission_label(&accepted), "accepted");
+        let accepted = accepted.expect("accepted protocol submission");
+        assert_eq!(accepted.event_id, event.id.to_hex());
+        assert!(
+            accepted.response.get("event_id").is_none(),
+            "typed event identity must not depend on a duplicated JSON field"
+        );
 
         const PRIVATE_REJECTION: &str = "PRIVATE_REJECTION_REASON_MUST_NOT_REACH_TELEMETRY";
         let rejected_body = json!({ "accepted": false, "message": PRIVATE_REJECTION }).to_string();
@@ -18723,7 +18939,10 @@ mod tests {
                         #[cfg(feature = "meeting-acceptance")]
                         barrier: None,
                     },
-                    result: Ok(json!({ "accepted": true })),
+                    result: Ok(test_protocol_accepted(
+                        &event_id,
+                        json!({ "accepted": true }),
+                    )),
                 })
                 .await;
 
@@ -20318,19 +20537,21 @@ mod tests {
         let meeting_id = Uuid::new_v4();
         let begin_event_id = pubkey(85);
         let board_event_id = pubkey(86);
-        let begin = json!({
-            "event_id": begin_event_id,
-            "meeting_id": meeting_id,
-            "accepted": true,
-            "outcome": "action_finalization_began",
-            "action_run_id": action_run_id,
-            "action_window_epoch": 1,
-            "server_now_ms": 1_000,
-            "lease_expires_at_ms": 91_000,
-            "lease_ttl_ms": 90_000,
-            "operator_hard_remaining_ms": 3_600_000,
-            "details": { "board_event_id": board_event_id },
-        });
+        let begin = test_protocol_accepted(
+            &begin_event_id,
+            json!({
+                "meeting_id": meeting_id,
+                "accepted": true,
+                "outcome": "action_finalization_began",
+                "action_run_id": action_run_id,
+                "action_window_epoch": 1,
+                "server_now_ms": 1_000,
+                "lease_expires_at_ms": 91_000,
+                "lease_ttl_ms": 90_000,
+                "operator_hard_remaining_ms": 3_600_000,
+                "details": { "board_event_id": board_event_id },
+            }),
+        );
         let verified =
             action_begin_timing_receipt(&begin, &begin_event_id, meeting_id, &board_event_id)
                 .expect("valid flattened Begin receipt");
@@ -20345,22 +20566,24 @@ mod tests {
             "the safety margin is deducted from the request-started TTL"
         );
 
-        let message_envelope = json!({
-            "event_id": begin_event_id,
-            "accepted": true,
-            "message": format!("response:{}", json!({
-                "meeting_id": meeting_id,
+        let message_envelope = test_protocol_accepted(
+            &begin_event_id,
+            json!({
                 "accepted": true,
-                "outcome": "action_finalization_began",
-                "action_run_id": action_run_id,
-                "action_window_epoch": 1,
-                "server_now_ms": 1_000,
-                "lease_expires_at_ms": 91_000,
-                "lease_ttl_ms": 90_000,
-                "operator_hard_remaining_ms": null,
-                "details": { "board_event_id": board_event_id },
-            })),
-        });
+                "message": format!("response:{}", json!({
+                    "meeting_id": meeting_id,
+                    "accepted": true,
+                    "outcome": "action_finalization_began",
+                    "action_run_id": action_run_id,
+                    "action_window_epoch": 1,
+                    "server_now_ms": 1_000,
+                    "lease_expires_at_ms": 91_000,
+                    "lease_ttl_ms": 90_000,
+                    "operator_hard_remaining_ms": null,
+                    "details": { "board_event_id": board_event_id },
+                })),
+            }),
+        );
         assert!(action_begin_timing_receipt(
             &message_envelope,
             &begin_event_id,
@@ -20370,7 +20593,7 @@ mod tests {
         .is_ok());
 
         let mut wrong_event = begin.clone();
-        wrong_event["event_id"] = json!(pubkey(87));
+        wrong_event.event_id = pubkey(87);
         assert_eq!(
             action_begin_timing_receipt(
                 &wrong_event,
@@ -20383,7 +20606,7 @@ mod tests {
         );
 
         let mut invalid_timing = begin;
-        invalid_timing["lease_ttl_ms"] = json!(90_001);
+        invalid_timing.response["lease_ttl_ms"] = json!(90_001);
         assert_eq!(
             action_begin_timing_receipt(
                 &invalid_timing,
@@ -20482,12 +20705,39 @@ mod tests {
             });
 
             if response_first {
+                let mut pre_begin_view = view.clone();
+                if let Some(board) = pre_begin_view.baton.board_control.as_mut() {
+                    board.phase = "floor_ready".to_string();
+                    board.action = None;
+                }
+                pre_begin_view.baton.transition = None;
+                coordinator
+                    .meetings
+                    .get_mut(&session_id)
+                    .expect("Meeting runtime")
+                    .view = Some(pre_begin_view);
                 coordinator.handle_protocol_result(result).await;
                 assert!(coordinator.action_dispatch_permits.is_empty());
                 assert!(coordinator
-                    .action_begin_timing_ready
-                    .iter()
-                    .any(|key| key.action_run_id == action_run_id));
+                    .action_begin_adoptions
+                    .get(&begin_event_id)
+                    .and_then(|adoption| adoption.receipt_key.as_ref())
+                    .is_some_and(|key| key.action_run_id == action_run_id));
+                if let Some(record) = coordinator
+                    .ledger_for_mut(session_id)
+                    .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+                {
+                    record.next_renewal_at_ms = 0;
+                }
+                coordinator.maintain_action_lease_renewals();
+                assert!(coordinator.protocol_in_flight.keys().any(|key| matches!(
+                    key,
+                    ProtocolSubmissionKey::ActionRenew {
+                        session_id: current_session,
+                        action_run_id: current_run,
+                        action_window_epoch: 1,
+                    } if *current_session == session_id && *current_run == action_run_id
+                )));
                 coordinator.apply_view_to_ledger(&view);
             } else {
                 coordinator.apply_view_to_ledger(&view);
@@ -20497,7 +20747,22 @@ mod tests {
                         .ledger_for(session_id)
                         .and_then(|ledger| ledger.v2_action_finalization.as_ref())
                         .map(|record| record.state.as_str()),
-                    Some("awaiting_begin_timing")
+                    Some("adopting")
+                );
+                if let Some(prepared) = coordinator
+                    .ledger_for_mut(session_id)
+                    .and_then(|ledger| ledger.prepared_moderator_action.as_mut())
+                {
+                    prepared.state = "sent".to_string();
+                }
+                coordinator.reconcile(session_id).await;
+                assert_eq!(
+                    coordinator
+                        .ledger_for(session_id)
+                        .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                        .map(|record| record.state.as_str()),
+                    Some("adopting"),
+                    "a live Begin awaiting its receipt must not be blocked as provider failure"
                 );
                 coordinator.handle_protocol_result(result).await;
             }
@@ -20511,7 +20776,7 @@ mod tests {
                 Some("pending")
             );
             assert!(!coordinator
-                .process_action_begin_events
+                .action_begin_adoptions
                 .contains_key(&begin_event_id));
             assert!(coordinator
                 .ledger_for(session_id)
@@ -21243,6 +21508,10 @@ mod tests {
             directory.path().join("meeting-v2-replayed-begin.json"),
             None,
         );
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
         coordinator.ensure_meeting_ledger(session_id);
         coordinator
             .ledger_for_mut(session_id)
@@ -21279,9 +21548,16 @@ mod tests {
             Some("orphaned")
         );
 
-        coordinator
-            .process_action_begin_events
-            .insert(event_id.clone(), session_id);
+        coordinator.action_begin_adoptions.insert(
+            event_id.clone(),
+            ActionBeginAdoption {
+                session_id,
+                session_epoch: 1,
+                board_event_id: permit.board_event_id.clone(),
+                receipt_key: None,
+                canonical_key: None,
+            },
+        );
         assert!(coordinator.record_process_local_action_begin_timing(&event_id, permit.clone()));
         assert!(coordinator.action_dispatch_permits.is_empty());
         assert_eq!(
@@ -21289,13 +21565,11 @@ mod tests {
                 .ledger_for(session_id)
                 .and_then(|ledger| ledger.v2_action_finalization.as_ref())
                 .map(|record| record.state.as_str()),
-            Some("awaiting_begin_timing")
+            Some("adopting")
         );
         assert!(coordinator.record_process_local_action_begin_ownership(&event_id, permit));
         assert_eq!(coordinator.action_dispatch_permits.len(), 1);
-        assert!(!coordinator
-            .process_action_begin_events
-            .contains_key(&event_id));
+        assert!(!coordinator.action_begin_adoptions.contains_key(&event_id));
         assert_eq!(
             coordinator
                 .ledger_for(session_id)
@@ -21332,9 +21606,16 @@ mod tests {
             prepared_end_event: None,
             prepared_end_event_id: None,
         });
-        coordinator
-            .process_action_begin_events
-            .insert(second_event_id.clone(), session_id);
+        coordinator.action_begin_adoptions.insert(
+            second_event_id.clone(),
+            ActionBeginAdoption {
+                session_id,
+                session_epoch: 1,
+                board_event_id: second_permit.board_event_id.clone(),
+                receipt_key: None,
+                canonical_key: None,
+            },
+        );
         assert!(coordinator
             .record_process_local_action_begin_ownership(&second_event_id, second_permit.clone(),));
         assert!(!coordinator.action_dispatch_permits.contains(&second_permit));

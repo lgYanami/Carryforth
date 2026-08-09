@@ -1,6 +1,9 @@
 # Meeting Action Finalization Context Attach 与首次调度 Permit 修复设计
 
-> 状态：代码实现完成；自动化回归已通过，真实 Provider Meeting 现场验收待完成
+> 状态：Project Context resolver 部分已完成现场验收；首次 Action dispatch permit 在连续两次真实
+> Provider Meeting 中 2/2 回归失败；其后续代码修复与自动化回归现已完成，真实 Provider 3/3 验收由
+> [Action 首 Epoch 接管与首次 Progress 回归修复设计](meeting-action-initial-epoch-adoption-regression-fix-design.md)
+> 接管
 >
 > 日期：2026-08-08
 >
@@ -13,6 +16,12 @@
 > [Meeting 作为 Project Context 坐标与 Community 可见性实现设计](../../project-context/meeting-coordinate-implementation-design.md)
 
 ## 1. 结论
+
+> 2026-08-09 现场复验更新：本文的 Project Context resolver 修复已经通过真实 Meeting attach、三域物化、
+> terminal hydration 与正常关闭验收；但“首次 Action dispatch permit”没有闭环。两场独立 Meeting 的
+> epoch 1 均为 `progress_seq=0` 且无 renewal，分别表现为 `action_lease_expired` 与 170ms 内
+> `provider_failure`，epoch 2 Retry 才成功。本文保留原事故与实现记录，新的接管模型和修复门禁见上方后续
+> 设计，不应再用本文“代码实现完成”的旧状态宣称首次调度已通过。
 
 “Agent Memory：恢复安全阶段启动与证据契约评审”现场验收没有端到端通过。新逻辑主持人路径已经证明：
 

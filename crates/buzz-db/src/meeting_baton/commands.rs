@@ -3285,7 +3285,7 @@ async fn return_control_to_moderator_tx(
         target.moderator_decision_started_at = None;
         target.moderator_decision_deadline = None;
         target.next_action_at = None;
-        crate::meeting_v2::open_board_window_tx(
+        crate::meeting_v2::ensure_board_pending_for_moderator_tx(
             tx,
             community_id,
             session_id,
@@ -3357,6 +3357,23 @@ async fn return_control_to_moderator_tx(
         target,
         unblocked_handoff_ids,
     })
+}
+
+async fn moderator_floor_is_ready_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    state: &StateRow,
+) -> Result<bool> {
+    if !load_baton_protocol_tx(tx, community_id, session_id)
+        .await?
+        .is_v2()
+    {
+        return Ok(true);
+    }
+    let runtime = crate::meeting_v2::load_runtime_tx(tx, community_id, session_id, true).await?;
+    Ok(runtime.phase == crate::meeting_v2::RuntimePhase::FloorReady
+        && runtime.control_epoch == state.control_epoch)
 }
 
 async fn ensure_moderator_window_tx(
@@ -6068,6 +6085,12 @@ async fn apply_moderator_attempt_start_tx(
             canonical_object_id: Some(state.state_event_id.clone()),
         });
     }
+    if !moderator_floor_is_ready_tx(tx, community_id, session_id, state).await? {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_floor_not_ready",
+            canonical_object_id: Some(state.state_event_id.clone()),
+        });
+    }
 
     let config = load_config_tx(tx, community_id, session_id).await?;
     let mut decision_epoch = state.decision_epoch;
@@ -7169,6 +7192,12 @@ async fn apply_moderator_select_tx(
         return Ok(ApplyResult::Rejected {
             code: "human_request_has_priority",
             canonical_object_id: None,
+        });
+    }
+    if !moderator_floor_is_ready_tx(tx, community_id, session_id, state).await? {
+        return Ok(ApplyResult::Rejected {
+            code: "moderator_floor_not_ready",
+            canonical_object_id: Some(state.state_event_id.clone()),
         });
     }
 
@@ -9632,6 +9661,127 @@ mod tests {
             human,
             human_two,
         }
+    }
+
+    async fn create_agent_moderated_test_meeting_v2() -> TestMeeting {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool.clone());
+        let community_id = seed_community(&pool).await;
+        let relay = Keys::generate();
+        let human = Keys::generate();
+        let moderator = Keys::generate();
+        let agent = Keys::generate();
+        let human_two = Keys::generate();
+        let owner_pubkey = human.public_key().to_bytes().to_vec();
+        let moderator_pubkey = moderator.public_key().to_bytes().to_vec();
+        seed_identity(&pool, community_id, &human, "owner", None).await;
+        seed_identity(
+            &pool,
+            community_id,
+            &moderator,
+            "member",
+            Some(&owner_pubkey),
+        )
+        .await;
+        seed_identity(&pool, community_id, &agent, "member", Some(&owner_pubkey)).await;
+        seed_identity(&pool, community_id, &human_two, "member", None).await;
+
+        let session_id = Uuid::new_v4();
+        let moderator_hex = moderator.public_key().to_hex();
+        let participant_hex = agent.public_key().to_hex();
+        let observer_hex = human_two.public_key().to_hex();
+        let create_event = buzz_sdk::build_meeting_v2_create(buzz_sdk::MeetingV2CreateParams {
+            session_id,
+            title: "Offer timeout convergence",
+            description: None,
+            source_channel_id: None,
+            author_pubkey: &moderator_hex,
+            participant_pubkeys: &[participant_hex.as_str(), observer_hex.as_str()],
+            initial_board: "# Goal\nVerify Offer timeout convergence.",
+        })
+        .expect("build Meeting V2 Create")
+        .sign_with_keys(&moderator)
+        .expect("sign Meeting V2 Create");
+        let board = buzz_sdk::parse_meeting_v2_board_content(&create_event.content)
+            .expect("parse Meeting V2 Board");
+        let roster = vec![
+            moderator_pubkey.clone(),
+            agent.public_key().to_bytes().to_vec(),
+            human_two.public_key().to_bytes().to_vec(),
+        ];
+        let mut tx = pool.begin().await.expect("begin Meeting V2 create");
+        persist_existing_event_tx(&mut tx, community_id, session_id, &create_event).await;
+        crate::meeting_v2::create_meeting_v2_tx(
+            &mut tx,
+            crate::meeting_v2::CreateMeetingV2Params {
+                community_id,
+                session_id,
+                policy: crate::meeting_v2::MeetingV2Policy::Board,
+                title: "Offer timeout convergence",
+                description: None,
+                source_channel_id: None,
+                host_pubkey: &moderator_pubkey,
+                create_event_id: create_event.id.as_bytes(),
+                participant_pubkeys: &roster,
+                initial_board: &board,
+                relay_keys: &relay,
+                baton_config: BatonConfig::default(),
+                board_maintenance_ms: 60_000,
+            },
+        )
+        .await
+        .expect("create Agent-moderated Meeting V2");
+        tx.commit().await.expect("commit Meeting V2 create");
+        TestMeeting {
+            db,
+            community_id,
+            session_id,
+            relay,
+            moderator,
+            agent,
+            human,
+            human_two,
+        }
+    }
+
+    async fn complete_test_v2_board_window(meeting: &TestMeeting) -> BatonTransitionResult {
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&meeting.db.pool)
+            .await
+            .expect("read test database time");
+        let mut tx = meeting
+            .db
+            .pool
+            .begin()
+            .await
+            .expect("begin Board completion");
+        let board_window: i64 = sqlx::query_scalar(
+            "UPDATE meeting_v2_bootstrap_state \
+             SET runtime_phase = 'floor_ready', board_deadline_at = NULL, \
+                 board_completed_at = $3, board_outcome = 'updated', updated_at = $3 \
+             WHERE community_id = $1 AND session_id = $2 \
+             RETURNING board_window",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(now)
+        .fetch_one(tx.as_mut())
+        .await
+        .expect("complete test Board runtime");
+        let transition = complete_v2_board_window_state_tx(
+            &mut tx,
+            meeting.community_id,
+            meeting.session_id,
+            &meeting.relay,
+            "board_updated",
+            None,
+            board_window,
+            now,
+        )
+        .await
+        .expect("complete test Board Baton state");
+        tx.commit().await.expect("commit Board completion");
+        transition
     }
 
     fn accepted_id(result: &BatonCommitResult) -> Vec<u8> {
@@ -13721,6 +13871,168 @@ mod tests {
         .await
         .expect("count canonical ACK/Human commands");
         assert_eq!(persisted_commands, if ack_won { 2 } else { 1 });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn v2_offer_timeout_reuses_pending_board_and_floor_commands_fail_closed() {
+        let meeting = create_agent_moderated_test_meeting_v2().await;
+        let (intent_event, submitted) =
+            submit_intent(&meeting, &meeting.agent, "Offer timeout candidate").await;
+
+        let (_, attempt_while_board_pending) =
+            start_agent_moderator_attempt(&meeting, &submitted.snapshot, None).await;
+        assert!(matches!(
+            attempt_while_board_pending.command_outcome,
+            BatonCommandOutcome::RejectedTerminal { ref code, .. }
+                if code == "moderator_floor_not_ready"
+        ));
+
+        complete_test_v2_board_window(&meeting).await;
+        let floor_ready = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("read floor-ready snapshot");
+        let (_, started) = start_agent_moderator_attempt(&meeting, &floor_ready, None).await;
+        let attempt_id = accepted_id(&started);
+
+        sqlx::query(
+            "UPDATE meeting_v2_bootstrap_state \
+             SET runtime_phase = 'board_pending', board_window = board_window + 1, \
+                 board_started_at = clock_timestamp(), \
+                 board_deadline_at = clock_timestamp() + interval '1 minute', \
+                 board_completed_at = NULL, board_outcome = NULL \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("inject Board takeover before Select");
+        let (_, selection_while_board_pending) = agent_moderator_select_intent(
+            &meeting,
+            &started.snapshot,
+            accepted_id(&submitted),
+            Some(attempt_id.clone()),
+            Some(intent_event.id.as_bytes().to_vec()),
+        )
+        .await;
+        assert!(matches!(
+            selection_while_board_pending.command_outcome,
+            BatonCommandOutcome::RejectedTerminal { ref code, .. }
+                if code == "moderator_floor_not_ready"
+        ));
+
+        sqlx::query(
+            "UPDATE meeting_v2_bootstrap_state \
+             SET runtime_phase = 'floor_ready', board_deadline_at = NULL, \
+                 board_completed_at = clock_timestamp(), board_outcome = 'updated' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("restore floor-ready test runtime");
+        let (_, selected) = agent_moderator_select_intent(
+            &meeting,
+            &started.snapshot,
+            accepted_id(&submitted),
+            Some(attempt_id),
+            Some(intent_event.id.as_bytes().to_vec()),
+        )
+        .await;
+        let offer_id = accepted_id(&selected);
+
+        let pending_before: (i64, DateTime<Utc>) = sqlx::query_as(
+            "UPDATE meeting_v2_bootstrap_state \
+             SET runtime_phase = 'board_pending', board_started_at = clock_timestamp(), \
+                 board_deadline_at = clock_timestamp() + interval '1 minute', \
+                 board_completed_at = NULL, board_outcome = NULL \
+             WHERE community_id = $1 AND session_id = $2 \
+             RETURNING board_window, board_deadline_at",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("inject offered plus Board-pending state");
+        sqlx::query(
+            "UPDATE meeting_baton_offers \
+             SET ack_deadline = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(&offer_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force Offer deadline");
+        sqlx::query(
+            "UPDATE meeting_baton_state \
+             SET next_action_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .execute(&meeting.db.pool)
+        .await
+        .expect("force due state hint");
+
+        let transitions = recover_meeting_v1(
+            &meeting.db,
+            meeting.community_id,
+            meeting.session_id,
+            &meeting.relay,
+        )
+        .await
+        .expect("recover expired Offer with a pending Board");
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|transition| transition.primary_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["offer_timed_out"]
+        );
+        let snapshot = get_baton_snapshot(&meeting.db, meeting.community_id, meeting.session_id)
+            .await
+            .expect("read recovered Meeting state");
+        assert_eq!(snapshot.phase, BatonPhase::ModeratorIdle);
+        assert!(snapshot.active_offer_id.is_none());
+        let offer_state: String = sqlx::query_scalar(
+            "SELECT state FROM meeting_baton_offers \
+             WHERE community_id = $1 AND session_id = $2 AND offer_id = $3",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .bind(offer_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("read timed-out Offer");
+        assert_eq!(offer_state, "timed_out");
+        let pending_after: (String, i64, i64, DateTime<Utc>) = sqlx::query_as(
+            "SELECT runtime_phase, control_epoch, board_window, board_deadline_at \
+             FROM meeting_v2_bootstrap_state \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(meeting.community_id.as_uuid())
+        .bind(meeting.session_id)
+        .fetch_one(&meeting.db.pool)
+        .await
+        .expect("read converged Board runtime");
+        assert_eq!(pending_after.0, "board_pending");
+        assert_eq!(pending_after.1, snapshot.control_epoch);
+        assert_eq!(pending_after.2, pending_before.0);
+        assert_eq!(pending_after.3, pending_before.1);
+
+        let replay = recover_meeting_v1(
+            &meeting.db,
+            meeting.community_id,
+            meeting.session_id,
+            &meeting.relay,
+        )
+        .await
+        .expect("repeat Offer recovery");
+        assert!(replay.is_empty());
     }
 
     #[tokio::test]
