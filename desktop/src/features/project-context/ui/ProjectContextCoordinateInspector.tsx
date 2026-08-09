@@ -36,6 +36,7 @@ import type {
 } from "@/shared/api/tauriProjectContext";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import { Markdown } from "@/shared/ui/markdown";
 
 const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -143,6 +144,10 @@ function ProjectViewContent({
     projectViewResult.view,
     object,
   );
+  const description =
+    object.objectType === "resource"
+      ? formatProjectViewTerm(object.data.resourceKind)
+      : projectViewObjectDescription(object);
   return (
     <div
       className="space-y-5"
@@ -164,12 +169,22 @@ function ProjectViewContent({
           {projectViewObjectTitle(object)}
         </h3>
         <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-          {projectViewObjectDescription(object)}
+          {description}
         </p>
         {object.data.summary ? (
-          <div className="mt-3 rounded-lg border border-border/70 bg-muted/20 p-3">
-            <Detail label="Retrieval summary">{object.data.summary}</Detail>
-          </div>
+          <section
+            className="mt-3 rounded-lg border border-border/70 bg-muted/20 p-3"
+            data-testid="project-context-project-view-summary"
+          >
+            <h4 className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Summary
+            </h4>
+            <Markdown
+              className="mt-2 text-sm leading-6"
+              content={object.data.summary}
+              interactive={false}
+            />
+          </section>
         ) : null}
         <Button
           className="mt-3"
@@ -370,7 +385,6 @@ export function ProjectContextCoordinateInspector({
           fallback={detail.meeting}
           meetingId={coordinate.meetingId}
           onOpenMeeting={onOpenMeeting}
-          summary={detail.summary}
           title={detail.title}
         />
       ) : detail.state === "active" ? (

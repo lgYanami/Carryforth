@@ -14,6 +14,7 @@ import type { MeetingParticipant } from "@/shared/api/tauriMeetings";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import { Markdown } from "@/shared/ui/markdown";
 
 const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -43,13 +44,11 @@ export function ProjectContextMeetingContent({
   fallback,
   meetingId,
   onOpenMeeting,
-  summary,
   title,
 }: {
   fallback?: ProjectContextMeetingDetail;
   meetingId: string;
   onOpenMeeting: (meetingId: string) => void;
-  summary?: string;
   title?: string;
 }) {
   const detailQuery = useMeetingContextDetail(meetingId);
@@ -94,7 +93,7 @@ export function ProjectContextMeetingContent({
   const actionsAttested =
     verified?.actionFinalization?.actionsAttested ??
     fallback?.actionFinalization?.actionsAttested;
-  const retrievalSummary = verified?.summary ?? summary;
+  const retrievalSummary = verified?.summary;
 
   return (
     <div className="space-y-5" data-testid="project-context-meeting-detail">
@@ -123,11 +122,13 @@ export function ProjectContextMeetingContent({
             data-testid="project-context-meeting-summary"
           >
             <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Retrieval summary
+              Summary
             </p>
-            <p className="mt-1 whitespace-pre-wrap text-sm">
-              {retrievalSummary}
-            </p>
+            <Markdown
+              className="mt-2 text-sm leading-6"
+              content={retrievalSummary}
+              interactive={false}
+            />
           </div>
         ) : null}
         {finalizing ? (

@@ -185,7 +185,7 @@ function terminalMeetingSnapshot(): MeetingSnapshot {
     title: "Memory boundary review",
     description: "Agree the first durable Agent memory slice.",
     summary:
-      "Defines the durable Agent-memory boundary and the resulting Project Context relationship.",
+      "Defines the **durable Agent-memory boundary** and the resulting Project Context relationship.",
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",
@@ -417,6 +417,8 @@ const inspectorRequirement = {
       title: "Keep Context relationships verifiable",
       description:
         "Every visible relationship must come from one complete verified Edge.",
+      summary:
+        "Loads the **verified Edge provenance** and the requirement it protects.",
       status: "ready",
       priority: "high",
     },
@@ -537,7 +539,7 @@ function inspectorDocumentState(): MockProjectDocumentState {
       documentId: CONTEXT_DOCUMENT_A_ID,
       eventDigit: "1",
       revision: 8,
-      summary: "Current summary for the architecture rationale.",
+      summary: "Current **summary** for the architecture rationale.",
       title: "Current architecture rationale",
     }),
     contextDocumentSnapshot({
@@ -546,7 +548,7 @@ function inspectorDocumentState(): MockProjectDocumentState {
       documentId: CONTEXT_DOCUMENT_B_ID,
       eventDigit: "2",
       revision: 2,
-      summary: "Current summary for the operational rationale.",
+      summary: "Current **summary** for the operational rationale.",
       title: "Current operational rationale",
     }),
     contextDocumentSnapshot({
@@ -555,7 +557,7 @@ function inspectorDocumentState(): MockProjectDocumentState {
       documentId: CONTEXT_DOCUMENT_C_ID,
       eventDigit: "3",
       revision: 1,
-      summary: "Current summary for the ownership rationale.",
+      summary: "Current **summary** for the ownership rationale.",
       title: "Current ownership rationale",
     }),
   ];
@@ -683,7 +685,7 @@ function inspectorResult(): ProjectContextQueryResult {
         documentId: CONTEXT_DOCUMENT_A_ID,
         state: "active",
         title: "Context binding A",
-        summary: "Observed summary for the first binding.",
+        summary: "Observed **summary** for the first binding.",
         documentRevision: 8,
         updatedAt: "2026-08-06T08:00:00Z",
         updatedBy: ACTOR,
@@ -692,7 +694,7 @@ function inspectorResult(): ProjectContextQueryResult {
         documentId: CONTEXT_DOCUMENT_B_ID,
         state: "active",
         title: "Context binding B",
-        summary: "Observed summary for the second binding.",
+        summary: "Observed **summary** for the second binding.",
         documentRevision: 2,
         updatedAt: "2026-08-06T08:00:00Z",
         updatedBy: ACTOR,
@@ -701,7 +703,7 @@ function inspectorResult(): ProjectContextQueryResult {
         documentId: CONTEXT_DOCUMENT_C_ID,
         state: "active",
         title: "Context binding C",
-        summary: "Observed summary for the independent Edge binding.",
+        summary: "Observed **summary** for the independent Edge binding.",
         documentRevision: 1,
         updatedAt: "2026-08-06T08:00:00Z",
         updatedBy: ACTOR,
@@ -979,6 +981,15 @@ test("Project View Coordinate Inspector is read-only, responsive, and restores g
   await expect(inspector).toContainText(
     "Every visible relationship must come from one complete verified Edge.",
   );
+  const projectViewSummary = inspector.getByTestId(
+    "project-context-project-view-summary",
+  );
+  await expect(projectViewSummary).toContainText(
+    "Loads the verified Edge provenance and the requirement it protects.",
+  );
+  await expect(projectViewSummary.locator("strong")).toHaveText(
+    "verified Edge provenance",
+  );
   await expect(inspector).toContainText("Ready");
   await expect(inspector).toContainText("High");
   await expect(inspector).toContainText("Project Context contract");
@@ -1065,6 +1076,9 @@ test("Meeting Coordinate stays metadata-first and opens the Community-readable M
   await expect(
     meeting.getByTestId("project-context-meeting-summary"),
   ).toContainText("Defines the durable Agent-memory boundary");
+  await expect(
+    meeting.getByTestId("project-context-meeting-summary").locator("strong"),
+  ).toHaveText("durable Agent-memory boundary");
   await expect(meeting).toContainText("completed_closed");
   await expect(meeting).not.toContainText("Private to the Meeting route");
   await expect(page).toHaveURL(/selected=coordinate/);
@@ -1132,6 +1146,13 @@ test("Document Coordinate lazily reads current Markdown and returns from Documen
   const inspector = page.getByTestId("project-context-inspector");
   await expect(inspector).toBeVisible();
   await expect(inspector).toContainText("Current architecture rationale");
+  const documentSummary = inspector.getByTestId(
+    "project-context-document-summary",
+  );
+  await expect(documentSummary).toContainText(
+    "Current summary for the architecture rationale.",
+  );
+  await expect(documentSummary.locator("strong")).toHaveText("summary");
   await expect(
     inspector.getByTestId(
       `project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`,
@@ -1162,7 +1183,7 @@ test("Document Coordinate lazily reads current Markdown and returns from Documen
   expect(bodyCalls).toHaveLength(1);
 });
 
-test("a Spoke opens the complete Edge and multi-Document bodies stay independent", async ({
+test("a Spoke opens the complete Edge and Context Document summaries expand independently", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1201,32 +1222,40 @@ test("a Spoke opens the complete Edge and multi-Document bodies stay independent
   await expect(
     edgeInspector.getByTestId("project-context-edge-key"),
   ).toHaveText(firstEdgeKey);
-  await expect(
-    edgeInspector.getByTestId(
-      `project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`,
-    ),
-  ).toContainText("Only the first Context body is rendered.");
+  const firstDocument = edgeInspector.getByTestId(
+    `project-context-edge-document-${CONTEXT_DOCUMENT_A_ID}`,
+  );
+  const secondDocument = edgeInspector.getByTestId(
+    `project-context-edge-document-${CONTEXT_DOCUMENT_B_ID}`,
+  );
+  await expect(firstDocument).not.toHaveAttribute("open", "");
+  await expect(secondDocument).not.toHaveAttribute("open", "");
+  expect(await documentBodyCalls(page)).toHaveLength(0);
 
-  await edgeInspector
-    .getByTestId(`project-context-edge-document-${CONTEXT_DOCUMENT_B_ID}`)
-    .click();
+  await firstDocument.locator("summary").click();
+  await expect(firstDocument).toHaveAttribute("open", "");
   await expect(
     edgeInspector.getByTestId(
-      `project-context-document-body-${CONTEXT_DOCUMENT_B_ID}`,
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
     ),
-  ).toContainText("fetched only after switching Documents");
+  ).toContainText("Observed summary for the first binding.");
+  await expect(
+    edgeInspector
+      .getByTestId(
+        `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
+      )
+      .locator("strong"),
+  ).toHaveText("summary");
+  expect(await documentBodyCalls(page)).toHaveLength(0);
+
+  await secondDocument.locator("summary").click();
+  await expect(secondDocument).toHaveAttribute("open", "");
   await expect(
     edgeInspector.getByTestId(
-      `project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`,
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_B_ID}`,
     ),
-  ).toHaveCount(0);
-  let bodyCalls = await documentBodyCalls(page);
-  expect(
-    bodyCalls?.map(
-      (call) =>
-        (call.payload as { input?: { documentId?: string } }).input?.documentId,
-    ),
-  ).toEqual([CONTEXT_DOCUMENT_A_ID, CONTEXT_DOCUMENT_B_ID]);
+  ).toContainText("Observed summary for the second binding.");
+  expect(await documentBodyCalls(page)).toHaveLength(0);
   await waitForAnimations(page);
   await edgeInspector.screenshot({
     path: "test-results/project-context/project-context-edge-inspector-multi-document.png",
@@ -1269,11 +1298,16 @@ test("a Spoke opens the complete Edge and multi-Document bodies stay independent
       `project-context-edge-document-${CONTEXT_DOCUMENT_C_ID}`,
     ),
   ).toBeVisible();
+  const independentDocument = secondEdgeInspector.getByTestId(
+    `project-context-edge-document-${CONTEXT_DOCUMENT_C_ID}`,
+  );
+  await expect(independentDocument).not.toHaveAttribute("open", "");
+  await independentDocument.locator("summary").click();
   await expect(
     secondEdgeInspector.getByTestId(
-      `project-context-document-body-${CONTEXT_DOCUMENT_C_ID}`,
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_C_ID}`,
     ),
-  ).toContainText("second Edge owns this Context Document");
+  ).toContainText("Observed summary for the independent Edge binding.");
 
   await secondEdgeInspector
     .getByTestId(
@@ -1286,8 +1320,14 @@ test("a Spoke opens the complete Edge and multi-Document bodies stay independent
   await expect(
     page.getByTestId(`project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`),
   ).toContainText("Only the first Context body is rendered.");
-  bodyCalls = await documentBodyCalls(page);
-  expect(bodyCalls).toHaveLength(3);
+  const bodyCalls = await documentBodyCalls(page);
+  expect(
+    bodyCalls?.some(
+      (call) =>
+        (call.payload as { input?: { documentId?: string } }).input
+          ?.documentId === CONTEXT_DOCUMENT_C_ID,
+    ),
+  ).toBe(false);
 });
 
 test("tombstoned and unavailable Coordinates remain distinct Edge members", async ({
@@ -1331,7 +1371,7 @@ test("tombstoned and unavailable Coordinates remain distinct Edge members", asyn
   });
 });
 
-test("an unavailable Document observation never issues an identity-free body read", async ({
+test("Edge Context Document summaries do not require a readable Document source", async ({
   page,
 }) => {
   const result = inspectorResult();
@@ -1347,16 +1387,22 @@ test("an unavailable Document observation never issues an identity-free body rea
   await openProjectContext(page);
   expect(await documentBodyCalls(page)).toHaveLength(0);
   await page.getByTestId(`project-context-edge-${"1".repeat(64)}`).click();
+  const edgeDocumentDisclosure = page.getByTestId(
+    `project-context-edge-document-${CONTEXT_DOCUMENT_A_ID}`,
+  );
+  await edgeDocumentDisclosure.locator("summary").click();
   await expect(
-    page.getByTestId("project-context-document-source-unavailable"),
-  ).toBeVisible();
+    page.getByTestId(
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Observed summary for the first binding.");
   await expect(
     page.getByTestId("project-context-edge-inspector"),
   ).toBeVisible();
   expect(await documentBodyCalls(page)).toHaveLength(0);
 });
 
-test("a current Document body error does not hide the verified Edge", async ({
+test("a current Document body error is irrelevant to Edge summary expansion", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1373,21 +1419,22 @@ test("a current Document body error does not hide the verified Edge", async ({
   await expect(
     edgeInspector.locator('[data-testid^="project-context-edge-coordinate-"]'),
   ).toHaveCount(3);
+  await edgeInspector
+    .getByTestId(`project-context-edge-document-${CONTEXT_DOCUMENT_A_ID}`)
+    .locator("summary")
+    .click();
+  await expect(
+    edgeInspector.getByTestId(
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Observed summary for the first binding.");
   await expect(
     edgeInspector.getByTestId("project-context-document-error"),
-  ).toContainText("Current Document verification failed.");
+  ).toHaveCount(0);
   await expect(
     edgeInspector.getByTestId("project-context-edge-key"),
   ).toHaveText("1".repeat(64));
-  const bodyCalls = await documentBodyCalls(page);
-  expect(bodyCalls?.length).toBeGreaterThan(0);
-  expect(
-    bodyCalls?.every(
-      (call) =>
-        (call.payload as { input?: { documentId?: string } }).input
-          ?.documentId === CONTEXT_DOCUMENT_A_ID,
-    ),
-  ).toBe(true);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
 });
 
 test("Query Bar keeps a draft until Run and URL history restores query and selection", async ({
@@ -1986,7 +2033,7 @@ test("live Project View hints refresh Coordinate title and detail through verifi
   ).toHaveAttribute("data-edge-count", "2");
 });
 
-test("live Document hints refresh the selected current body without changing topology", async ({
+test("live Document hints refresh an expanded Edge summary without changing topology", async ({
   page,
 }) => {
   const initialContext = inspectorResult();
@@ -1999,9 +2046,16 @@ test("live Document hints refresh the selected current body without changing top
   await openProjectContext(page);
   await waitForProjectContextLive(page);
   await page.getByTestId(`project-context-edge-${"1".repeat(64)}`).click();
+  const edgeDocumentDisclosure = page.getByTestId(
+    `project-context-edge-document-${CONTEXT_DOCUMENT_A_ID}`,
+  );
+  await edgeDocumentDisclosure.locator("summary").click();
   await expect(
-    page.getByTestId(`project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`),
-  ).toContainText("Only the first Context body is rendered.");
+    page.getByTestId(
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Observed summary for the first binding.");
+  expect(await documentBodyCalls(page)).toHaveLength(0);
 
   const nextDocuments = structuredClone(initialDocuments);
   const nextBody = contextDocumentSnapshot({
@@ -2010,7 +2064,7 @@ test("live Document hints refresh the selected current body without changing top
     documentId: CONTEXT_DOCUMENT_A_ID,
     eventDigit: "9",
     revision: 9,
-    summary: "Live verified summary for the architecture rationale.",
+    summary: "Live **verified summary** for the architecture rationale.",
     title: "Live architecture rationale",
   });
   nextDocuments.meta = {
@@ -2050,7 +2104,7 @@ test("live Document hints refresh the selected current body without changing top
   if (!contextDocument) throw new Error("Expected Context Document detail");
   contextDocument.title = "Live architecture rationale";
   contextDocument.summary =
-    "Live verified summary for the architecture rationale.";
+    "Live **verified summary** for the architecture rationale.";
   contextDocument.documentRevision = 9;
   contextDocument.updatedAt = "2026-08-06T08:01:00Z";
 
@@ -2068,8 +2122,17 @@ test("live Document hints refresh the selected current body without changing top
   );
 
   await expect(
-    page.getByTestId(`project-context-document-body-${CONTEXT_DOCUMENT_A_ID}`),
-  ).toContainText("The current body changed without changing Edge membership.");
+    page.getByTestId(
+      `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
+    ),
+  ).toContainText("Live verified summary for the architecture rationale.");
+  await expect(
+    page
+      .getByTestId(
+        `project-context-edge-document-summary-${CONTEXT_DOCUMENT_A_ID}`,
+      )
+      .locator("strong"),
+  ).toHaveText("verified summary");
   await expect(
     page.getByTestId("project-context-edge-inspector"),
   ).toContainText("Live architecture rationale");
@@ -2081,6 +2144,7 @@ test("live Document hints refresh the selected current body without changing top
       .getByTestId("project-context-edge-inspector")
       .locator('[data-testid^="project-context-edge-coordinate-"]'),
   ).toHaveCount(3);
+  expect(await documentBodyCalls(page)).toHaveLength(0);
 });
 
 test("offline Context stays visible as stale and reconnect replaces the whole trusted snapshot", async ({
