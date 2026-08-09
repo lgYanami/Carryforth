@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{Db, DbError, Result};
-use buzz_core::CommunityId;
+use buzz_core::{CommunityId, PublicKey};
 
 /// Maximum number of identities in a Meeting roster.
 pub const MAX_MEETING_PARTICIPANTS: usize = 12;
@@ -169,6 +169,7 @@ pub async fn resolve_meeting_coordinate_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     meeting_id: Uuid,
+    expected_projection_pubkey: &PublicKey,
 ) -> Result<MeetingCoordinateResolution> {
     // Meeting mutations lock Session before Channel. Keep the same order here
     // so a concurrent End and Project Context attach cannot deadlock.
@@ -237,6 +238,7 @@ pub async fn resolve_meeting_coordinate_tx(
                 meeting_id,
                 &create_event_id,
                 &host_pubkey,
+                expected_projection_pubkey,
             )
             .await?
             {
@@ -378,6 +380,7 @@ async fn resolve_finalizing_meeting_coordinate_tx(
     meeting_id: Uuid,
     create_event_id: &[u8],
     host_pubkey: &[u8],
+    expected_projection_pubkey: &PublicKey,
 ) -> Result<Option<MeetingCoordinateResolution>> {
     if create_event_id.len() != 32
         || host_pubkey.len() != 32
@@ -439,13 +442,13 @@ async fn resolve_finalizing_meeting_coordinate_tx(
         || runtime_control_epoch != run_control_epoch
         || runtime_board_window != run_board_window
         || !matches!(action_condition.as_str(), "runnable" | "blocked")
-        || !meeting_coordinate_event_exists_tx(
+        || !crate::meeting_v2_actions::accepted_action_begin_receipt_matches_tx(
             tx,
             community_id,
             meeting_id,
             &begin_event_id,
-            buzz_core::kind::KIND_MEETING_ACTION_COMMAND,
-            Some(host_pubkey),
+            host_pubkey,
+            action_run_id,
         )
         .await?
     {
@@ -467,7 +470,7 @@ async fn resolve_finalizing_meeting_coordinate_tx(
             meeting_id,
             &board_event_id,
             buzz_core::kind::KIND_MEETING_BOARD,
-            Some(host_pubkey),
+            Some(expected_projection_pubkey.as_bytes()),
         )
         .await?
     {
@@ -543,6 +546,7 @@ async fn resolve_finalizing_meeting_coordinate_tx(
             &action_condition,
             &transition_primary_type,
             &transition_effects,
+            expected_projection_pubkey,
         )
         .await?
     {
@@ -574,16 +578,18 @@ async fn meeting_action_state_event_matches_tx(
     action_condition: &str,
     transition_primary_type: &str,
     transition_effects: &serde_json::Value,
+    expected_projection_pubkey: &PublicKey,
 ) -> Result<bool> {
     let content: Option<String> = sqlx::query_scalar(
         "SELECT content FROM events \
          WHERE community_id = $1 AND channel_id = $2 AND id = $3 AND kind = $4 \
-           AND deleted_at IS NULL",
+           AND pubkey = $5 AND deleted_at IS NULL",
     )
     .bind(community_id.as_uuid())
     .bind(meeting_id)
     .bind(state_event_id)
     .bind(buzz_core::kind::KIND_MEETING_STATE as i32)
+    .bind(expected_projection_pubkey.as_bytes())
     .fetch_optional(tx.as_mut())
     .await?;
     let Some(content) = content else {

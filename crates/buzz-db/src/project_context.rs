@@ -1661,6 +1661,7 @@ impl ProjectContextWriteTx {
                     &mut self.tx,
                     self.community_id,
                     *meeting_id,
+                    &self.expected_projection_pubkey,
                 )
                 .await?
                 {
@@ -1679,7 +1680,15 @@ impl ProjectContextWriteTx {
                         return Err(ProjectContextWriteError::MeetingTerminalInvalid);
                     }
                 },
-                _ => coordinate_active_in_tx(&mut self.tx, self.community_id, coordinate).await?,
+                _ => {
+                    coordinate_active_in_tx(
+                        &mut self.tx,
+                        self.community_id,
+                        coordinate,
+                        &self.expected_projection_pubkey,
+                    )
+                    .await?
+                }
             };
             all_coordinates_active &= active;
         }
@@ -1994,6 +2003,7 @@ async fn coordinate_active_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     coordinate: &ProjectContextCoordinate,
+    expected_projection_pubkey: &PublicKey,
 ) -> ProjectContextWriteResult<bool> {
     match coordinate {
         ProjectContextCoordinate::ProjectViewObject {
@@ -2020,7 +2030,13 @@ async fn coordinate_active_in_tx(
         .await?
         .unwrap_or(false)),
         ProjectContextCoordinate::Meeting { meeting_id } => Ok(matches!(
-            crate::meeting::resolve_meeting_coordinate_tx(tx, community_id, *meeting_id).await?,
+            crate::meeting::resolve_meeting_coordinate_tx(
+                tx,
+                community_id,
+                *meeting_id,
+                expected_projection_pubkey,
+            )
+            .await?,
             crate::meeting::MeetingCoordinateResolution::Terminal { .. }
                 | crate::meeting::MeetingCoordinateResolution::FinalizingActions { .. }
         )),
@@ -3225,7 +3241,7 @@ mod tests {
             "# Frozen Board",
         )
         .tags([meeting_tag.clone()])
-        .sign_with_keys(host)
+        .sign_with_keys(relay)
         .expect("sign Meeting Board fixture");
         let action_begin = EventBuilder::new(
             Kind::Custom(buzz_core::kind::KIND_MEETING_ACTION_COMMAND as u16),
@@ -3299,7 +3315,7 @@ mod tests {
         .expect("insert Meeting Channel fixture");
         let mut evidence = vec![&create, &state];
         if matches!(lifecycle, MeetingFixtureLifecycle::FinalizingActions) {
-            evidence.extend([&board, &action_begin]);
+            evidence.push(&board);
         }
         for event in evidence {
             let (_, inserted) =
@@ -3443,6 +3459,31 @@ mod tests {
             .execute(&mut *tx)
             .await
             .expect("insert current Meeting action run fixture");
+            sqlx::query(
+                "INSERT INTO meeting_v2_action_command_receipts \
+                     (community_id, session_id, command_event_id, author_pubkey, action, \
+                      action_run_id, action_window_epoch, accepted, outcome_code, response_json) \
+                 VALUES ($1, $2, $3, $4, 'begin', $5, 1, true, \
+                         'action_finalization_began', $6)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(meeting_id)
+            .bind(action_begin.id.as_bytes().as_slice())
+            .bind(host.public_key().as_bytes())
+            .bind(action_run_id)
+            .bind(serde_json::json!({
+                "meeting_id": meeting_id,
+                "accepted": true,
+                "outcome": "action_finalization_began",
+                "action_run_id": action_run_id,
+                "action_window_epoch": 1,
+                "details": {
+                    "board_event_id": board.id.to_hex(),
+                },
+            }))
+            .execute(&mut *tx)
+            .await
+            .expect("insert private Meeting action Begin receipt fixture");
         }
         tx.commit()
             .await
@@ -4986,11 +5027,36 @@ mod tests {
             MeetingFixtureLifecycle::FinalizingActions,
         )
         .await;
+        let relay_pubkey = relay.public_key();
+        let public_begin_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(finalizing_meeting)
+        .bind(buzz_core::kind::KIND_MEETING_ACTION_COMMAND as i32)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("count ordinary Action Begin events");
+        assert_eq!(public_begin_count, 0);
+        let board_signer: Vec<u8> = sqlx::query_scalar(
+            "SELECT event.pubkey FROM meeting_current_boards board \
+             JOIN events event ON event.community_id = board.community_id \
+                              AND event.id = board.board_event_id \
+             WHERE board.community_id = $1 AND board.session_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(finalizing_meeting)
+        .fetch_one(&scratch.pool)
+        .await
+        .expect("read canonical Meeting Board signer");
+        assert_eq!(board_signer, relay_pubkey.as_bytes());
         assert!(matches!(
             crate::meeting::resolve_meeting_coordinate_tx(
                 &mut scratch.pool.begin().await.expect("begin closed resolver"),
                 community_id,
                 closed_meeting,
+                &relay_pubkey,
             )
             .await
             .expect("resolve closed Meeting"),
@@ -5008,6 +5074,7 @@ mod tests {
                     .expect("begin finalizing resolver"),
                 community_id,
                 finalizing_meeting,
+                &relay_pubkey,
             )
             .await
             .expect("resolve finalizing Meeting"),
@@ -5023,6 +5090,7 @@ mod tests {
                 &mut scratch.pool.begin().await.expect("begin aborted resolver"),
                 community_id,
                 aborted_meeting,
+                &relay_pubkey,
             )
             .await
             .expect("resolve aborted Meeting"),
@@ -5163,6 +5231,40 @@ mod tests {
         .execute(&scratch.pool)
         .await
         .expect("drift finalizing Meeting action fence fixture");
+        let rejected_begin_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::FinalizingActions,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE meeting_v2_action_command_receipts SET accepted = false \
+             WHERE community_id = $1 AND session_id = $2 AND action = 'begin'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(rejected_begin_meeting)
+        .execute(&scratch.pool)
+        .await
+        .expect("reject private Begin receipt fixture");
+        let wrong_begin_window_meeting = seed_meeting_coordinate_fixture(
+            &scratch.pool,
+            community_id,
+            &actor,
+            &relay,
+            MeetingFixtureLifecycle::FinalizingActions,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE meeting_v2_action_command_receipts SET action_window_epoch = 2 \
+             WHERE community_id = $1 AND session_id = $2 AND action = 'begin'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(wrong_begin_window_meeting)
+        .execute(&scratch.pool)
+        .await
+        .expect("drift private Begin receipt initial window fixture");
         let invalid_meeting = seed_meeting_coordinate_fixture(
             &scratch.pool,
             community_id,
@@ -5197,6 +5299,8 @@ mod tests {
         for (meeting_id, expected) in [
             (active_meeting, "active"),
             (drifted_finalizing_meeting, "active"),
+            (rejected_begin_meeting, "active"),
+            (wrong_begin_window_meeting, "active"),
             (invalid_meeting, "invalid"),
             (ordinary_channel, "ordinary"),
             (Uuid::new_v4(), "missing"),
@@ -5295,14 +5399,19 @@ mod tests {
         .expect("hold Meeting Session lock");
 
         let resolver_pool = scratch.pool.clone();
+        let resolver_projection_pubkey = relay.public_key();
         let mut resolver = tokio::spawn(async move {
             let mut tx = resolver_pool
                 .begin()
                 .await
                 .expect("begin coordinate resolver");
-            let result =
-                crate::meeting::resolve_meeting_coordinate_tx(&mut tx, community_id, meeting_id)
-                    .await;
+            let result = crate::meeting::resolve_meeting_coordinate_tx(
+                &mut tx,
+                community_id,
+                meeting_id,
+                &resolver_projection_pubkey,
+            )
+            .await;
             tx.rollback().await.expect("rollback coordinate resolver");
             result
         });

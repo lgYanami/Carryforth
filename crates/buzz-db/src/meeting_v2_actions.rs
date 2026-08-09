@@ -1249,6 +1249,39 @@ async fn load_receipt_tx(
     .transpose()
 }
 
+/// Verify the private accepted receipt that created one current action run.
+///
+/// Action commands intentionally do not enter the ordinary Event store. This
+/// verifier is used by Project Context while holding the Meeting lifecycle
+/// locks, so a finalizing Meeting can prove its Begin command without exposing
+/// that private control event to public subscriptions.
+pub(crate) async fn accepted_action_begin_receipt_matches_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    session_id: Uuid,
+    command_event_id: &[u8],
+    host_pubkey: &[u8],
+    action_run_id: Uuid,
+) -> Result<bool> {
+    if command_event_id.len() != 32 || host_pubkey.len() != 32 || action_run_id.is_nil() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM meeting_v2_action_command_receipts \
+         WHERE community_id = $1 AND session_id = $2 AND command_event_id = $3 \
+           AND author_pubkey = $4 AND action = 'begin' AND action_run_id = $5 \
+           AND action_window_epoch = 1 AND accepted \
+           AND outcome_code = 'action_finalization_began')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(session_id)
+    .bind(command_event_id)
+    .bind(host_pubkey)
+    .bind(action_run_id)
+    .fetch_one(tx.as_mut())
+    .await?)
+}
+
 async fn insert_receipt_tx(
     tx: &mut Transaction<'_, Postgres>,
     params: &ActionCommandTxParams<'_>,

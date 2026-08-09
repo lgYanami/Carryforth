@@ -3025,6 +3025,40 @@ mod tests {
         .await
         .expect("begin first action run");
         assert!(began_one.accepted);
+        let public_begin_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(session_id)
+        .bind(buzz_core::kind::KIND_MEETING_ACTION_COMMAND as i32)
+        .fetch_one(&pool)
+        .await
+        .expect("count private Action Begin in ordinary Event store");
+        assert_eq!(public_begin_count, 0);
+        let relay_pubkey = relay_keys.public_key();
+        let mut resolver_tx = pool.begin().await.expect("begin finalizing resolver");
+        let resolution = crate::meeting::resolve_meeting_coordinate_tx(
+            &mut resolver_tx,
+            community_id,
+            session_id,
+            &relay_pubkey,
+        )
+        .await
+        .expect("resolve production finalizing Meeting");
+        resolver_tx
+            .rollback()
+            .await
+            .expect("rollback production finalizing resolver");
+        assert!(matches!(
+            resolution,
+            crate::meeting::MeetingCoordinateResolution::FinalizingActions {
+                meeting_id,
+                control_epoch: 1,
+                board_window: 1,
+                ..
+            } if meeting_id == session_id
+        ));
         let consumed_attempt: (String, Option<String>) = sqlx::query_as(
             "SELECT state, terminal_reason FROM meeting_moderator_decision_attempts \
              WHERE community_id = $1 AND session_id = $2 AND attempt_id = $3",
@@ -3355,6 +3389,28 @@ mod tests {
             retried_one.response["details"]["retry_reason"],
             "action_lease_expired"
         );
+        let mut retried_resolver_tx = pool.begin().await.expect("begin retried resolver");
+        let retried_resolution = crate::meeting::resolve_meeting_coordinate_tx(
+            &mut retried_resolver_tx,
+            community_id,
+            session_id,
+            &relay_pubkey,
+        )
+        .await
+        .expect("resolve retried finalizing Meeting");
+        retried_resolver_tx
+            .rollback()
+            .await
+            .expect("rollback retried resolver");
+        assert!(matches!(
+            retried_resolution,
+            crate::meeting::MeetingCoordinateResolution::FinalizingActions {
+                meeting_id,
+                control_epoch: 1,
+                board_window: 1,
+                ..
+            } if meeting_id == session_id
+        ));
         let old_window_renewal = buzz_sdk::build_meeting_v2_action_lease_renew(
             buzz_sdk::MeetingV2ActionLeaseRenewParams {
                 session_id,

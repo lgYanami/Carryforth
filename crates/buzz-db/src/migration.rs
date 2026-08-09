@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 53);
+        assert_eq!(migrations.len(), 54);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1294,6 +1294,34 @@ mod tests {
                 "migration 0053 must not contain destructive statement {destructive}"
             );
         }
+
+        assert_eq!(migrations[53].version, 54);
+        let project_context_finalizing_meeting = migrations[53].sql.as_str();
+        for required in [
+            "project_context_meeting_is_attachable",
+            "meeting_v2_action_command_receipts",
+            "action_window_epoch = 1",
+            "action_finalization_began",
+            "board_projection.pubkey = context_state.projection_pubkey",
+            "state_projection.pubkey = context_state.projection_pubkey",
+        ] {
+            assert!(
+                project_context_finalizing_meeting.contains(required),
+                "migration 0054 must contain {required}"
+            );
+        }
+        for destructive in [
+            "DELETE FROM",
+            "TRUNCATE",
+            "DROP TABLE",
+            "DROP COLUMN",
+            "UPDATE ",
+        ] {
+            assert!(
+                !project_context_finalizing_meeting.contains(destructive),
+                "migration 0054 must not contain destructive statement {destructive}"
+            );
+        }
     }
 
     #[test]
@@ -1312,6 +1340,7 @@ mod tests {
             "project_context_validate_community",
             "project_context_validate_new_change",
             "project_context_meeting_is_terminal",
+            "project_context_meeting_is_attachable",
             "coordinate_type = 'meeting'",
             "schema_version IN (1, 2)",
             "context_state.schema_version = 2",

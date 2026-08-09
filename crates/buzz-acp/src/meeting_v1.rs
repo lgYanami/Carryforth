@@ -1117,6 +1117,14 @@ pub(super) struct MeetingV1Coordinator {
     /// Process-local proof that this Runtime observed Action Begin commit (or
     /// an explicit Relay retry window) and may dispatch semantic work.
     action_dispatch_permits: BTreeSet<ActionRunKey>,
+    /// Process-local proof that the exact Begin command created the canonical
+    /// Action Run. This is deliberately separate from lease timing: Relay
+    /// State and the HTTP receipt may arrive in either order.
+    action_begin_ownership_ready: BTreeSet<ActionRunKey>,
+    /// Verified monotonic lease timing for the exact process-local Begin.
+    /// Semantic Action work is dispatchable only after ownership and timing
+    /// are both ready for the same ActionRunKey.
+    action_begin_timing_ready: BTreeSet<ActionRunKey>,
     /// Begin events prepared by this process. Durable prepared events alone do
     /// not prove ownership after a restart.
     process_action_begin_events: BTreeMap<String, Uuid>,
@@ -1202,6 +1210,8 @@ impl MeetingV1Coordinator {
             action_deadline_senders: HashMap::new(),
             action_deadline_hints: HashMap::new(),
             action_dispatch_permits: BTreeSet::new(),
+            action_begin_ownership_ready: BTreeSet::new(),
+            action_begin_timing_ready: BTreeSet::new(),
             process_action_begin_events: BTreeMap::new(),
             process_blocked_action_windows: BTreeSet::new(),
             #[cfg(feature = "meeting-acceptance")]
@@ -1598,6 +1608,10 @@ impl MeetingV1Coordinator {
         self.action_deadline_hints.remove(&session_id);
         self.action_dispatch_permits
             .retain(|key| key.session_id != session_id);
+        self.action_begin_ownership_ready
+            .retain(|key| key.session_id != session_id);
+        self.action_begin_timing_ready
+            .retain(|key| key.session_id != session_id);
         self.process_blocked_action_windows
             .retain(|key| key.session_id != session_id);
         self.process_action_begin_events
@@ -1658,6 +1672,10 @@ impl MeetingV1Coordinator {
             .retain(|(meeting_id, _), _| *meeting_id != session_id);
         self.action_deadline_hints.remove(&session_id);
         self.action_dispatch_permits
+            .retain(|key| key.session_id != session_id);
+        self.action_begin_ownership_ready
+            .retain(|key| key.session_id != session_id);
+        self.action_begin_timing_ready
             .retain(|key| key.session_id != session_id);
         self.process_blocked_action_windows
             .retain(|key| key.session_id != session_id);
@@ -1887,15 +1905,31 @@ impl MeetingV1Coordinator {
         }
     }
 
-    fn record_process_local_action_begin_receipt(
-        &mut self,
-        event_id: &str,
-        permit: ActionRunKey,
-    ) -> bool {
-        if self.process_action_begin_events.get(event_id) != Some(&permit.session_id) {
+    fn promote_process_local_action_begin(&mut self, permit: &ActionRunKey) -> bool {
+        if !self.action_begin_ownership_ready.contains(permit)
+            || !self.action_begin_timing_ready.contains(permit)
+        {
             return false;
         }
+        self.action_begin_ownership_ready.remove(permit);
+        self.action_begin_timing_ready.remove(permit);
         self.action_dispatch_permits.insert(permit.clone());
+        if let Some(record) = self
+            .ledger_for_mut(permit.session_id)
+            .and_then(|ledger| ledger.v2_action_finalization.as_mut())
+            .filter(|record| {
+                record.action_run_id == permit.action_run_id
+                    && record.action_window_epoch == permit.action_window_epoch
+                    && record.board_event_id == permit.board_event_id
+                    && matches!(record.state.as_str(), "orphaned" | "awaiting_begin_timing")
+            })
+        {
+            record.state = "pending".to_string();
+        }
+        true
+    }
+
+    fn mark_process_local_action_begin_pending(&mut self, permit: &ActionRunKey) {
         if let Some(record) = self
             .ledger_for_mut(permit.session_id)
             .and_then(|ledger| ledger.v2_action_finalization.as_mut())
@@ -1906,7 +1940,57 @@ impl MeetingV1Coordinator {
                     && record.state == "orphaned"
             })
         {
-            record.state = "pending".to_string();
+            record.state = "awaiting_begin_timing".to_string();
+        }
+    }
+
+    fn complete_process_local_action_begin_correlation(
+        &mut self,
+        event_id: &str,
+        permit: &ActionRunKey,
+    ) {
+        self.process_action_begin_events.remove(event_id);
+        if let Some(ledger) = self.ledger_for_mut(permit.session_id) {
+            if ledger
+                .prepared_moderator_action
+                .as_ref()
+                .is_some_and(|prepared| {
+                    prepared.action_kind == "action_begin" && prepared.event_id == event_id
+                })
+            {
+                ledger.prepared_moderator_action = None;
+            }
+        }
+    }
+
+    fn record_process_local_action_begin_timing(
+        &mut self,
+        event_id: &str,
+        permit: ActionRunKey,
+    ) -> bool {
+        if self.process_action_begin_events.get(event_id) != Some(&permit.session_id) {
+            return false;
+        }
+        self.action_begin_timing_ready.insert(permit.clone());
+        self.mark_process_local_action_begin_pending(&permit);
+        if self.promote_process_local_action_begin(&permit) {
+            self.complete_process_local_action_begin_correlation(event_id, &permit);
+        }
+        true
+    }
+
+    fn record_process_local_action_begin_ownership(
+        &mut self,
+        event_id: &str,
+        permit: ActionRunKey,
+    ) -> bool {
+        if self.process_action_begin_events.get(event_id) != Some(&permit.session_id) {
+            return false;
+        }
+        self.action_begin_ownership_ready.insert(permit.clone());
+        self.mark_process_local_action_begin_pending(&permit);
+        if self.promote_process_local_action_begin(&permit) {
+            self.complete_process_local_action_begin_correlation(event_id, &permit);
         }
         true
     }
@@ -3343,43 +3427,75 @@ impl MeetingV1Coordinator {
                     .ledger_for(session_id)
                     .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
                     .is_some_and(|prepared| prepared.event_id == completed.event_id);
+                let mut retry_action_begin_for_timing = false;
                 if action_kind == "action_begin" && !meeting_ended {
-                    if let Ok(response) = &completed.result {
-                        if let Some((action_run_id, action_window_epoch, timing)) =
-                            action_begin_timing_receipt(response, &object_id)
-                        {
-                            let permit = ActionRunKey {
-                                session_id,
-                                action_run_id,
-                                action_window_epoch,
-                                board_event_id: object_id.clone(),
-                            };
-                            self.record_process_local_action_begin_receipt(
-                                &completed.event_id,
-                                permit,
-                            );
-                            if let Some(local_deadline) =
-                                action_local_deadline(completed.request_started_at, &timing)
-                            {
-                                self.action_deadline_hints.insert(
+                    match &completed.result {
+                        Ok(response) => match action_begin_timing_receipt(
+                            response,
+                            &completed.event_id,
+                            session_id,
+                            &object_id,
+                        ) {
+                            Ok(verified) => {
+                                let permit = ActionRunKey {
                                     session_id,
-                                    ActionDeadlineHint {
-                                        action_run_id,
-                                        action_window_epoch,
-                                        board_event_id: object_id.clone(),
-                                        local_deadline,
-                                    },
+                                    action_run_id: verified.action_run_id,
+                                    action_window_epoch: verified.action_window_epoch,
+                                    board_event_id: object_id.clone(),
+                                };
+                                let correlated = self.record_process_local_action_begin_timing(
+                                    &completed.event_id,
+                                    permit,
+                                );
+                                if correlated {
+                                    if let Some(local_deadline) = action_local_deadline(
+                                        completed.request_started_at,
+                                        &verified.timing,
+                                    ) {
+                                        self.action_deadline_hints.insert(
+                                            session_id,
+                                            ActionDeadlineHint {
+                                                action_run_id: verified.action_run_id,
+                                                action_window_epoch: verified.action_window_epoch,
+                                                board_event_id: object_id.clone(),
+                                                local_deadline,
+                                            },
+                                        );
+                                    }
+                                }
+                                if !correlated {
+                                    tracing::warn!(
+                                        meeting = %session_id,
+                                        event_id = %completed.event_id,
+                                        reason = "process_correlation_missing",
+                                        "Action Begin timing receipt did not match a process-local Begin"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                retry_action_begin_for_timing = event_matches
+                                    && self.process_action_begin_events.get(&completed.event_id)
+                                        == Some(&session_id);
+                                tracing::warn!(
+                                    meeting = %session_id,
+                                        event_id = %completed.event_id,
+                                        reason = error.code(),
+                                        "Action Begin response did not contain a verifiable lease timing receipt"
                                 );
                             }
-                        } else {
-                            tracing::warn!(
-                                meeting = %session_id,
-                                "Action Begin response did not contain a verifiable lease timing receipt"
-                            );
+                        },
+                        Err(ProtocolSubmitFailure::Rejected(_)) => {
+                            if self.process_action_begin_events.get(&completed.event_id)
+                                == Some(&session_id)
+                            {
+                                self.process_action_begin_events.remove(&completed.event_id);
+                                self.action_begin_ownership_ready
+                                    .retain(|key| key.session_id != session_id);
+                                self.action_begin_timing_ready
+                                    .retain(|key| key.session_id != session_id);
+                            }
                         }
-                    }
-                    if !matches!(&completed.result, Err(ProtocolSubmitFailure::Uncertain(_))) {
-                        self.process_action_begin_events.remove(&completed.event_id);
+                        Err(ProtocolSubmitFailure::Uncertain(_)) => {}
                     }
                 }
                 if event_matches && !meeting_ended {
@@ -3390,6 +3506,23 @@ impl MeetingV1Coordinator {
                         &completed.event_id,
                         &completed.result,
                     );
+                    if retry_action_begin_for_timing {
+                        if let Some(prepared) = self
+                            .ledger_for_mut(session_id)
+                            .and_then(|ledger| ledger.prepared_moderator_action.as_mut())
+                            .filter(|prepared| {
+                                prepared.action_kind == "action_begin"
+                                    && prepared.event_id == completed.event_id
+                            })
+                        {
+                            // The Relay accepted the exact signed Begin, but this
+                            // response did not provide a trustworthy monotonic
+                            // deadline. Preserve and idempotently replay that same
+                            // event after canonical backfill; never sign a second
+                            // Begin and never misclassify this as Provider failure.
+                            prepared.state = "prepared".to_string();
+                        }
+                    }
                 } else if event_matches {
                     // A terminal Meeting cannot continue or replay a prepared
                     // moderator action. Keep its immutable observer snapshot
@@ -4605,6 +4738,10 @@ impl MeetingV1Coordinator {
                         if !same_run {
                             let dispatch_permitted =
                                 self.action_dispatch_permits.contains(&current_action_key);
+                            let begin_correlation_pending = self
+                                .action_begin_ownership_ready
+                                .contains(&current_action_key)
+                                || self.action_begin_timing_ready.contains(&current_action_key);
                             ledger.v2_action_finalization = Some(V2ActionFinalizationRecord {
                                 action_run_id: action.action_run_id,
                                 board_event_id: action.board_event_id.clone(),
@@ -4621,6 +4758,8 @@ impl MeetingV1Coordinator {
                                     "blocked"
                                 } else if dispatch_permitted {
                                     "pending"
+                                } else if begin_correlation_pending {
+                                    "awaiting_begin_timing"
                                 } else {
                                     "orphaned"
                                 }
@@ -4652,6 +4791,18 @@ impl MeetingV1Coordinator {
                                         || key.action_run_id != action.action_run_id
                                         || key.action_window_epoch >= action.action_window_epoch
                                 });
+                                self.action_begin_ownership_ready.retain(|key| {
+                                    key.session_id != view.session_id
+                                        || key.action_run_id != action.action_run_id
+                                        || key.action_window_epoch >= action.action_window_epoch
+                                });
+                                self.action_begin_timing_ready.retain(|key| {
+                                    key.session_id != view.session_id
+                                        || key.action_run_id != action.action_run_id
+                                        || key.action_window_epoch >= action.action_window_epoch
+                                });
+                                self.process_action_begin_events
+                                    .retain(|_, session_id| *session_id != view.session_id);
                             }
                             record.hard_deadline_unix_ms = reconcile_action_deadline(
                                 record.action_window_epoch,
@@ -4693,10 +4844,11 @@ impl MeetingV1Coordinator {
                                     .saturating_add(ACTION_LEASE_RENEW_CADENCE.as_millis() as i64);
                             }
                         }
-                        if ledger
-                            .prepared_moderator_action
-                            .as_ref()
-                            .is_some_and(|prepared| prepared.action_kind == "action_begin")
+                        if self.action_dispatch_permits.contains(&current_action_key)
+                            && ledger
+                                .prepared_moderator_action
+                                .as_ref()
+                                .is_some_and(|prepared| prepared.action_kind == "action_begin")
                         {
                             ledger.prepared_moderator_action = None;
                         }
@@ -5071,20 +5223,36 @@ impl MeetingV1Coordinator {
         };
 
         if action_kind == "action_begin"
-            && self.process_action_begin_events.remove(&matched_event_id) == Some(view.session_id)
+            && transition.primary_type == "action_finalization_began"
+            && self.process_action_begin_events.get(&matched_event_id) == Some(&view.session_id)
         {
             if let Some(action) = view
                 .baton
                 .board_control
                 .as_ref()
                 .and_then(|board| board.action.as_ref())
+                .filter(|action| {
+                    action.action_window_epoch == 1
+                        && action.board_event_id
+                            == self
+                                .ledger_for(view.session_id)
+                                .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
+                                .map(|prepared| prepared.object_id.as_str())
+                                .unwrap_or_default()
+                })
             {
-                self.action_dispatch_permits
-                    .insert(ActionRunKey::from_view(view.session_id, action));
+                self.record_process_local_action_begin_ownership(
+                    &matched_event_id,
+                    ActionRunKey::from_view(view.session_id, action),
+                );
             }
         }
         if transition.primary_type == "action_returned_to_board" {
             self.action_dispatch_permits
+                .retain(|key| key.session_id != view.session_id);
+            self.action_begin_ownership_ready
+                .retain(|key| key.session_id != view.session_id);
+            self.action_begin_timing_ready
                 .retain(|key| key.session_id != view.session_id);
             self.process_blocked_action_windows
                 .retain(|key| key.session_id != view.session_id);
@@ -6672,7 +6840,8 @@ impl MeetingV1Coordinator {
             }
             "action_begin" => {
                 view.baton.moderator_pubkey == self.agent_pubkey
-                    && prepared_action_begin_matches_view(&prepared, view)
+                    && (prepared_action_begin_matches_view(&prepared, view)
+                        || prepared_action_begin_matches_finalizing_view(&prepared, view))
                     && now_ms() < prepared.hard_deadline_unix_ms
             }
             "action_block" => view
@@ -9682,25 +9851,122 @@ fn action_timing_receipt(
     .then_some(timing)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionBeginReceiptError {
+    EnvelopeMissing,
+    EventIdMissing,
+    EventIdMismatch,
+    MeetingIdMissing,
+    MeetingIdMismatch,
+    AcceptedMismatch,
+    OutcomeMismatch,
+    ActionRunIdInvalid,
+    ActionWindowInvalid,
+    BoardEventIdMismatch,
+    LeaseTimingMissing,
+    LeaseTimingInvalid,
+    OperatorDeadlineInvalid,
+}
+
+impl ActionBeginReceiptError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::EnvelopeMissing => "envelope_missing",
+            Self::EventIdMissing => "event_id_missing",
+            Self::EventIdMismatch => "event_id_mismatch",
+            Self::MeetingIdMissing => "meeting_id_missing",
+            Self::MeetingIdMismatch => "meeting_id_mismatch",
+            Self::AcceptedMismatch => "accepted_mismatch",
+            Self::OutcomeMismatch => "outcome_mismatch",
+            Self::ActionRunIdInvalid => "action_run_id_invalid",
+            Self::ActionWindowInvalid => "action_window_invalid",
+            Self::BoardEventIdMismatch => "board_event_id_mismatch",
+            Self::LeaseTimingMissing => "lease_timing_missing",
+            Self::LeaseTimingInvalid => "lease_timing_invalid",
+            Self::OperatorDeadlineInvalid => "operator_deadline_invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedActionBeginTiming {
+    action_run_id: Uuid,
+    action_window_epoch: u64,
+    timing: Value,
+}
+
 fn action_begin_timing_receipt(
     response: &Value,
+    expected_event_id: &str,
+    expected_meeting_id: Uuid,
     expected_board_event_id: &str,
-) -> Option<(Uuid, u64, Value)> {
-    let timing = action_timing_envelope(response)?;
+) -> std::result::Result<VerifiedActionBeginTiming, ActionBeginReceiptError> {
+    let Some(response_event_id) = response.get("event_id").and_then(Value::as_str) else {
+        return Err(ActionBeginReceiptError::EventIdMissing);
+    };
+    if !response_event_id.eq_ignore_ascii_case(expected_event_id) {
+        return Err(ActionBeginReceiptError::EventIdMismatch);
+    }
+    let timing =
+        action_timing_envelope(response).ok_or(ActionBeginReceiptError::EnvelopeMissing)?;
+    let meeting_id = timing
+        .get("meeting_id")
+        .and_then(Value::as_str)
+        .ok_or(ActionBeginReceiptError::MeetingIdMissing)?;
+    if meeting_id != expected_meeting_id.to_string() {
+        return Err(ActionBeginReceiptError::MeetingIdMismatch);
+    }
+    if timing.get("accepted").and_then(Value::as_bool) != Some(true) {
+        return Err(ActionBeginReceiptError::AcceptedMismatch);
+    }
+    if timing.get("outcome").and_then(Value::as_str) != Some("action_finalization_began") {
+        return Err(ActionBeginReceiptError::OutcomeMismatch);
+    }
     let action_run_id = timing
         .get("action_run_id")
         .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())?;
-    let action_window_epoch = timing.get("action_window_epoch").and_then(Value::as_u64)?;
-    (timing.get("accepted").and_then(Value::as_bool) == Some(true)
-        && timing.get("outcome").and_then(Value::as_str) == Some("action_finalization_began")
-        && timing
-            .get("details")
-            .and_then(|details| details.get("board_event_id"))
-            .and_then(Value::as_str)
-            == Some(expected_board_event_id)
-        && action_timing_fields_are_valid(&timing))
-    .then_some((action_run_id, action_window_epoch, timing))
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(ActionBeginReceiptError::ActionRunIdInvalid)?;
+    let action_window_epoch = timing
+        .get("action_window_epoch")
+        .and_then(Value::as_u64)
+        .filter(|window| *window == 1)
+        .ok_or(ActionBeginReceiptError::ActionWindowInvalid)?;
+    if timing
+        .get("details")
+        .and_then(|details| details.get("board_event_id"))
+        .and_then(Value::as_str)
+        != Some(expected_board_event_id)
+    {
+        return Err(ActionBeginReceiptError::BoardEventIdMismatch);
+    }
+    let Some(server_now_ms) = timing.get("server_now_ms").and_then(Value::as_i64) else {
+        return Err(ActionBeginReceiptError::LeaseTimingMissing);
+    };
+    let Some(lease_expires_at_ms) = timing.get("lease_expires_at_ms").and_then(Value::as_i64)
+    else {
+        return Err(ActionBeginReceiptError::LeaseTimingMissing);
+    };
+    let Some(lease_ttl_ms) = timing.get("lease_ttl_ms").and_then(Value::as_i64) else {
+        return Err(ActionBeginReceiptError::LeaseTimingMissing);
+    };
+    if lease_ttl_ms <= 0
+        || lease_expires_at_ms <= server_now_ms
+        || lease_ttl_ms > lease_expires_at_ms.saturating_sub(server_now_ms)
+    {
+        return Err(ActionBeginReceiptError::LeaseTimingInvalid);
+    }
+    if !timing
+        .get("operator_hard_remaining_ms")
+        .is_none_or(|value| value.is_null() || value.as_i64().is_some_and(|value| value >= 0))
+    {
+        return Err(ActionBeginReceiptError::OperatorDeadlineInvalid);
+    }
+    Ok(VerifiedActionBeginTiming {
+        action_run_id,
+        action_window_epoch,
+        timing,
+    })
 }
 
 fn action_timing_envelope(response: &Value) -> Option<Value> {
@@ -10862,6 +11128,35 @@ fn prepared_action_begin_matches_view(
             == Some(board.board_window)
         && tag_value(&event, "expected-state") == Some(view.baton.state_event_id.as_str())
         && tag_value(&event, "board") == Some(prepared.object_id.as_str())
+}
+
+fn prepared_action_begin_matches_finalizing_view(
+    prepared: &PreparedModeratorAction,
+    view: &MeetingView,
+) -> bool {
+    let Ok(event) = serde_json::from_value::<Event>(prepared.event.clone()) else {
+        return false;
+    };
+    let Some(board) = view.baton.board_control.as_ref() else {
+        return false;
+    };
+    let Some(action) = board.action.as_ref() else {
+        return false;
+    };
+    let transition_matches = view.baton.transition.as_ref().is_some_and(|transition| {
+        transition.outcome == "accepted"
+            && transition.primary_type == "action_finalization_began"
+            && transition.caused_by_event_id.as_deref() == Some(prepared.event_id.as_str())
+    });
+    view.protocol.has_action_finalization()
+        && !view.ended
+        && event.pubkey.to_hex() == view.baton.moderator_pubkey
+        && board.phase == "finalizing_actions"
+        && action.action_window_epoch == 1
+        && action.condition == "runnable"
+        && action.terminal_status.is_none()
+        && action.board_event_id == prepared.object_id
+        && transition_matches
 }
 
 fn prepared_action_end_matches_view(
@@ -13868,6 +14163,8 @@ mod tests {
             action_deadline_senders: HashMap::new(),
             action_deadline_hints: HashMap::new(),
             action_dispatch_permits: BTreeSet::new(),
+            action_begin_ownership_ready: BTreeSet::new(),
+            action_begin_timing_ready: BTreeSet::new(),
             process_action_begin_events: BTreeMap::new(),
             process_blocked_action_windows: BTreeSet::new(),
             #[cfg(feature = "meeting-acceptance")]
@@ -13892,6 +14189,81 @@ mod tests {
             hard_deadline_ms: now_ms() + 300_000,
             progress_seq: 0,
         }
+    }
+
+    fn prime_process_local_action_begin(
+        coordinator: &mut MeetingV1Coordinator,
+        session_id: Uuid,
+        board_event_id: &str,
+    ) -> Event {
+        coordinator.meetings.insert(
+            session_id,
+            MeetingRuntime::new(1, MeetingBatonProtocol::V2Actions),
+        );
+        coordinator.ensure_meeting_ledger(session_id);
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_MEETING_ACTION_COMMAND as u16),
+            "",
+        )
+        .tags([Tag::parse(["h", session_id.to_string().as_str()]).expect("Meeting h tag")])
+        .sign_with_keys(&coordinator.keys)
+        .expect("sign test Action Begin");
+        let event_id = event.id.to_hex();
+        coordinator
+            .ledger_for_mut(session_id)
+            .expect("Meeting ledger")
+            .prepared_moderator_action = Some(PreparedModeratorAction {
+            action_kind: "action_begin".to_string(),
+            object_id: board_event_id.to_string(),
+            attempt_id: None,
+            observer_snapshot: None,
+            turn_id: Some("test-floor-turn".to_string()),
+            event: serde_json::to_value(&event).expect("Action Begin JSON"),
+            event_id: event_id.clone(),
+            state: "prepared".to_string(),
+            created_at_ms: now_ms(),
+            hard_deadline_unix_ms: now_ms().saturating_add(180_000),
+        });
+        coordinator
+            .process_action_begin_events
+            .insert(event_id.clone(), session_id);
+        let key = ProtocolSubmissionKey::Moderator {
+            session_id,
+            event_id: event_id.clone(),
+        };
+        coordinator.protocol_in_flight.insert(
+            key,
+            ProtocolInFlight {
+                session_epoch: 1,
+                submission_id: 1,
+                event_id,
+            },
+        );
+        event
+    }
+
+    fn test_action_begin_response(
+        event_id: &str,
+        session_id: Uuid,
+        action_run_id: Uuid,
+        board_event_id: &str,
+    ) -> Value {
+        json!({
+            "event_id": event_id,
+            "accepted": true,
+            "message": format!("response:{}", json!({
+                "meeting_id": session_id,
+                "accepted": true,
+                "outcome": "action_finalization_began",
+                "action_run_id": action_run_id,
+                "action_window_epoch": 1,
+                "server_now_ms": 1_000,
+                "lease_expires_at_ms": 91_000,
+                "lease_ttl_ms": 90_000,
+                "operator_hard_remaining_ms": 3_600_000,
+                "details": { "board_event_id": board_event_id },
+            })),
+        })
     }
 
     fn test_grant_record(grant: &GrantView) -> GrantRecord {
@@ -19943,8 +20315,12 @@ mod tests {
     #[test]
     fn action_timing_receipts_use_request_start_and_reject_incomplete_envelopes() {
         let action_run_id = Uuid::new_v4();
+        let meeting_id = Uuid::new_v4();
+        let begin_event_id = pubkey(85);
         let board_event_id = pubkey(86);
         let begin = json!({
+            "event_id": begin_event_id,
+            "meeting_id": meeting_id,
             "accepted": true,
             "outcome": "action_finalization_began",
             "action_run_id": action_run_id,
@@ -19955,17 +20331,68 @@ mod tests {
             "operator_hard_remaining_ms": 3_600_000,
             "details": { "board_event_id": board_event_id },
         });
-        let (parsed_run, parsed_window, timing) =
-            action_begin_timing_receipt(&begin, &board_event_id).expect("valid Begin receipt");
-        assert_eq!(parsed_run, action_run_id);
-        assert_eq!(parsed_window, 1);
+        let verified =
+            action_begin_timing_receipt(&begin, &begin_event_id, meeting_id, &board_event_id)
+                .expect("valid flattened Begin receipt");
+        assert_eq!(verified.action_run_id, action_run_id);
+        assert_eq!(verified.action_window_epoch, 1);
         let request_started_at = tokio::time::Instant::now();
-        let deadline =
-            action_local_deadline(request_started_at, &timing).expect("monotonic local deadline");
+        let deadline = action_local_deadline(request_started_at, &verified.timing)
+            .expect("monotonic local deadline");
         assert_eq!(
             deadline.duration_since(request_started_at),
             Duration::from_secs(75),
             "the safety margin is deducted from the request-started TTL"
+        );
+
+        let message_envelope = json!({
+            "event_id": begin_event_id,
+            "accepted": true,
+            "message": format!("response:{}", json!({
+                "meeting_id": meeting_id,
+                "accepted": true,
+                "outcome": "action_finalization_began",
+                "action_run_id": action_run_id,
+                "action_window_epoch": 1,
+                "server_now_ms": 1_000,
+                "lease_expires_at_ms": 91_000,
+                "lease_ttl_ms": 90_000,
+                "operator_hard_remaining_ms": null,
+                "details": { "board_event_id": board_event_id },
+            })),
+        });
+        assert!(action_begin_timing_receipt(
+            &message_envelope,
+            &begin_event_id,
+            meeting_id,
+            &board_event_id,
+        )
+        .is_ok());
+
+        let mut wrong_event = begin.clone();
+        wrong_event["event_id"] = json!(pubkey(87));
+        assert_eq!(
+            action_begin_timing_receipt(
+                &wrong_event,
+                &begin_event_id,
+                meeting_id,
+                &board_event_id,
+            )
+            .expect_err("wrong event must fail"),
+            ActionBeginReceiptError::EventIdMismatch
+        );
+
+        let mut invalid_timing = begin;
+        invalid_timing["lease_ttl_ms"] = json!(90_001);
+        assert_eq!(
+            action_begin_timing_receipt(
+                &invalid_timing,
+                &begin_event_id,
+                meeting_id,
+                &board_event_id,
+            )
+            .expect_err("inconsistent lease timing must fail"),
+            ActionBeginReceiptError::LeaseTimingInvalid
         );
 
         let renewal = json!({
@@ -19987,6 +20414,110 @@ mod tests {
             .expect("renewal object")
             .remove("server_now_ms");
         assert!(action_timing_receipt(&incomplete, action_run_id, 1, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn action_begin_response_and_state_orderings_grant_one_dispatch_permit() {
+        for response_first in [true, false] {
+            let directory = tempfile::tempdir().expect("temporary ledger directory");
+            let moderator = Keys::generate();
+            let moderator_pubkey = moderator.public_key().to_hex();
+            let participant_pubkey = Keys::generate().public_key().to_hex();
+            let relay = Keys::generate();
+            let session_id = Uuid::new_v4();
+            let action_run_id = Uuid::new_v4();
+            let board_event_id = pubkey(if response_first { 121 } else { 122 });
+            let mut coordinator = test_coordinator(
+                moderator,
+                directory.path().join(if response_first {
+                    "meeting-v2-response-first.json"
+                } else {
+                    "meeting-v2-state-first.json"
+                }),
+                None,
+            );
+            let begin_event =
+                prime_process_local_action_begin(&mut coordinator, session_id, &board_event_id);
+            let begin_event_id = begin_event.id.to_hex();
+            let result = ProtocolTaskResult {
+                key: ProtocolSubmissionKey::Moderator {
+                    session_id,
+                    event_id: begin_event_id.clone(),
+                },
+                session_epoch: 1,
+                submission_id: 1,
+                event_id: begin_event_id.clone(),
+                request_started_at: tokio::time::Instant::now(),
+                context: ProtocolSubmissionContext::Moderator {
+                    action_kind: "action_begin".to_string(),
+                    object_id: board_event_id.clone(),
+                    attempt_id: None,
+                    observer_snapshot: None,
+                    turn_id: Some("test-floor-turn".to_string()),
+                    queued_at_ms: Some(now_ms()),
+                    #[cfg(feature = "meeting-acceptance")]
+                    barrier: None,
+                },
+                result: Ok(test_action_begin_response(
+                    &begin_event_id,
+                    session_id,
+                    action_run_id,
+                    &board_event_id,
+                )),
+            };
+            let mut view =
+                meeting_v2_actions_view(session_id, &moderator_pubkey, &participant_pubkey, &relay);
+            make_v2_local_moderator(&mut view, &moderator_pubkey);
+            set_v2_direct_action(
+                &mut view,
+                action_run_id,
+                board_event_id.clone(),
+                now_ms().saturating_add(90_000),
+            );
+            view.baton.state_event_id = pubkey(if response_first { 123 } else { 124 });
+            view.baton.transition = Some(CanonicalTransitionView {
+                primary_type: "action_finalization_began".to_string(),
+                outcome: "accepted".to_string(),
+                caused_by_event_id: Some(begin_event_id.clone()),
+            });
+
+            if response_first {
+                coordinator.handle_protocol_result(result).await;
+                assert!(coordinator.action_dispatch_permits.is_empty());
+                assert!(coordinator
+                    .action_begin_timing_ready
+                    .iter()
+                    .any(|key| key.action_run_id == action_run_id));
+                coordinator.apply_view_to_ledger(&view);
+            } else {
+                coordinator.apply_view_to_ledger(&view);
+                assert!(coordinator.action_dispatch_permits.is_empty());
+                assert_eq!(
+                    coordinator
+                        .ledger_for(session_id)
+                        .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                        .map(|record| record.state.as_str()),
+                    Some("awaiting_begin_timing")
+                );
+                coordinator.handle_protocol_result(result).await;
+            }
+
+            assert_eq!(coordinator.action_dispatch_permits.len(), 1);
+            assert_eq!(
+                coordinator
+                    .ledger_for(session_id)
+                    .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                    .map(|record| record.state.as_str()),
+                Some("pending")
+            );
+            assert!(!coordinator
+                .process_action_begin_events
+                .contains_key(&begin_event_id));
+            assert!(coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.prepared_moderator_action.as_ref())
+                .is_none());
+        }
     }
 
     #[test]
@@ -20700,7 +21231,7 @@ mod tests {
     }
 
     #[test]
-    fn replayed_begin_receipt_after_restart_cannot_grant_dispatch() {
+    fn process_local_begin_requires_timing_and_canonical_ownership() {
         let directory = tempfile::tempdir().expect("temporary ledger directory");
         let moderator = Keys::generate();
         let session_id = Uuid::new_v4();
@@ -20739,7 +21270,7 @@ mod tests {
             action_window_epoch: 1,
             board_event_id,
         };
-        assert!(!coordinator.record_process_local_action_begin_receipt(&event_id, permit.clone()));
+        assert!(!coordinator.record_process_local_action_begin_timing(&event_id, permit.clone()));
         assert_eq!(
             coordinator
                 .ledger_for(session_id)
@@ -20751,7 +21282,20 @@ mod tests {
         coordinator
             .process_action_begin_events
             .insert(event_id.clone(), session_id);
-        assert!(coordinator.record_process_local_action_begin_receipt(&event_id, permit));
+        assert!(coordinator.record_process_local_action_begin_timing(&event_id, permit.clone()));
+        assert!(coordinator.action_dispatch_permits.is_empty());
+        assert_eq!(
+            coordinator
+                .ledger_for(session_id)
+                .and_then(|ledger| ledger.v2_action_finalization.as_ref())
+                .map(|record| record.state.as_str()),
+            Some("awaiting_begin_timing")
+        );
+        assert!(coordinator.record_process_local_action_begin_ownership(&event_id, permit));
+        assert_eq!(coordinator.action_dispatch_permits.len(), 1);
+        assert!(!coordinator
+            .process_action_begin_events
+            .contains_key(&event_id));
         assert_eq!(
             coordinator
                 .ledger_for(session_id)
@@ -20759,6 +21303,44 @@ mod tests {
                 .map(|record| record.state.as_str()),
             Some("pending")
         );
+
+        let second_run_id = Uuid::new_v4();
+        let second_event_id = pubkey(96);
+        let second_permit = ActionRunKey {
+            session_id,
+            action_run_id: second_run_id,
+            action_window_epoch: 1,
+            board_event_id: pubkey(97),
+        };
+        coordinator
+            .ledger_for_mut(session_id)
+            .expect("Meeting ledger")
+            .v2_action_finalization = Some(V2ActionFinalizationRecord {
+            action_run_id: second_run_id,
+            board_event_id: second_permit.board_event_id.clone(),
+            action_window_epoch: 1,
+            hard_deadline_unix_ms: now_ms().saturating_add(60_000),
+            progress_seq: 0,
+            last_progress_stage: None,
+            next_renewal_at_ms: 0,
+            prepared_renewal_event: None,
+            prepared_renewal_event_id: None,
+            prepared_renewal_seq: None,
+            state: "orphaned".to_string(),
+            turn_id: None,
+            format_attempts: 0,
+            prepared_end_event: None,
+            prepared_end_event_id: None,
+        });
+        coordinator
+            .process_action_begin_events
+            .insert(second_event_id.clone(), session_id);
+        assert!(coordinator
+            .record_process_local_action_begin_ownership(&second_event_id, second_permit.clone(),));
+        assert!(!coordinator.action_dispatch_permits.contains(&second_permit));
+        assert!(coordinator
+            .record_process_local_action_begin_timing(&second_event_id, second_permit.clone(),));
+        assert!(coordinator.action_dispatch_permits.contains(&second_permit));
     }
 
     #[test]

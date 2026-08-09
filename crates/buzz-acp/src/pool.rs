@@ -7198,7 +7198,8 @@ mod tests {
     /// provider timeout, and ACP transport/protocol failure.
     #[tokio::test]
     async fn meeting_replacement_prompt_result_waits_for_shutdown_confirmation() {
-        let cases: [(&str, fn() -> PromptOutcome); 3] = [
+        type OutcomeFactory = fn() -> PromptOutcome;
+        let cases: [(&str, OutcomeFactory); 3] = [
             ("canonical_cancel_timeout", || {
                 PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE)
             }),
