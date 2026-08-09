@@ -149,6 +149,7 @@ mod tests {
                     responsibilities: Vec::new(),
                     boundaries: Vec::new(),
                     active,
+                    summary: None,
                 }),
                 relations: ProjectViewRelations::default(),
                 context_references: Vec::new(),

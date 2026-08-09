@@ -51,10 +51,12 @@ export function MeetingTerminalSummary({
   actionStarted,
   end,
   profiles,
+  summary,
 }: {
   actionStarted: boolean;
   end: MeetingEndState;
   profiles: Record<string, UserProfileSummary>;
+  summary: string | null;
 }) {
   const closed = end.outcome === "closed";
   const normalCloseDescription =
@@ -115,6 +117,18 @@ export function MeetingTerminalSummary({
             <p className="rounded-md bg-muted/50 px-2.5 py-2 text-xs">
               {end.reason}
             </p>
+          ) : null}
+
+          {summary ? (
+            <div
+              className="rounded-md border bg-muted/30 px-2.5 py-2"
+              data-testid="meeting-terminal-retrieval-summary"
+            >
+              <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Retrieval summary
+              </p>
+              <p className="mt-1 whitespace-pre-wrap text-sm">{summary}</p>
+            </div>
           ) : null}
 
           {!closed && actionStarted ? (

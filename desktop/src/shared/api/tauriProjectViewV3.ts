@@ -90,6 +90,7 @@ export function normalizeProjectViewObjectV3(
         objectType: raw.object_type,
         data: {
           title: raw.data.data.title,
+          summary: raw.data.data.summary,
           desiredOutcome: raw.data.data.desired_outcome,
           directions: raw.data.data.directions,
         },

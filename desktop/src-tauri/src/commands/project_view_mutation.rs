@@ -6,7 +6,7 @@ use buzz_project_view_pkg::v3::{
     CreateProjectObjectV3, DeleteProjectObjectV3, NewProjectViewObjectV3, ProjectContextReference,
     ProjectObjectCommandV3, ProjectObjectRequestV3, UpdateProjectObjectV3,
 };
-use buzz_project_view_pkg::ProjectViewObjectType;
+use buzz_project_view_pkg::{Patch, ProjectViewObjectType};
 use buzz_sdk_pkg::project_view::object_projection_coordinate;
 use buzz_sdk_pkg::project_view_v3::{
     build_project_object_command, entity_projection_coordinate, parse_entity_projection,
@@ -112,6 +112,11 @@ pub enum ProjectViewMutationResult {
         /// Whether the changed object is now a tombstone.
         #[serde(skip_serializing_if = "Option::is_none")]
         deleted: Option<bool>,
+        /// Whether the committed value is still the current object head.
+        confirmation: ProjectViewMutationConfirmation,
+        /// Newer object revision observed when the committed value was superseded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_object_revision: Option<u64>,
     },
     /// The Human's baseline is stale. The mutation was not applied.
     Conflict {
@@ -125,11 +130,39 @@ pub enum ProjectViewMutationResult {
     },
 }
 
+/// Readback state for an accepted Project View mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectViewMutationConfirmation {
+    /// The exact committed object revision and summary were verified as current.
+    CurrentVerified,
+    /// A later mutation was already current when readback completed.
+    Superseded,
+}
+
 #[derive(Debug)]
 struct PreparedMutation {
     builder: EventBuilder,
     expected_project_revision: u64,
     target: MutationTarget,
+    summary_expectation: SummaryWriteExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SummaryWriteExpectation {
+    Unchanged,
+    Set(String),
+    Clear,
+}
+
+impl SummaryWriteExpectation {
+    fn from_patch(patch: &Patch<String>) -> Self {
+        match patch {
+            Patch::Unchanged => Self::Unchanged,
+            Patch::Set(value) => Self::Set(value.clone()),
+            Patch::Clear => Self::Clear,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +186,7 @@ struct MutationObjectProjection {
     project_revision: u64,
     projection_generation: u64,
     deleted: bool,
+    summary: Option<String>,
 }
 
 /// Validate, sign, submit, and confirm one typed Project View mutation.
@@ -211,7 +245,15 @@ async fn execute_mutation(
         };
 
     let receipt = validate_receipt(parse_receipt(&response, &event)?, prepared.target)?;
-    confirm_projection(state, &context, &event, &receipt, prepared.target).await?;
+    let (confirmation, current_object_revision) = confirm_projection(
+        state,
+        &context,
+        &event,
+        &receipt,
+        prepared.target,
+        &prepared.summary_expectation,
+    )
+    .await?;
 
     Ok(ProjectViewMutationResult::Applied {
         event_id: event.id.to_hex(),
@@ -219,111 +261,128 @@ async fn execute_mutation(
         object_id: receipt.object_id,
         object_revision: receipt.object_revision,
         deleted: receipt.deleted,
+        confirmation,
+        current_object_revision,
     })
 }
 
 fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutation, String> {
-    let (expected_project_revision, target, request, acting_assignment_id, initial_role_level) =
-        match input {
-            ProjectViewMutationInput::Create {
+    let (
+        expected_project_revision,
+        target,
+        request,
+        acting_assignment_id,
+        initial_role_level,
+        summary_expectation,
+    ) = match input {
+        ProjectViewMutationInput::Create {
+            expected_project_revision,
+            object_type,
+            data,
+            initial_role_level,
+            acting_assignment_id,
+        } => {
+            if object_type == ProjectViewObjectType::ProjectProfile {
+                return Err("the Project Profile can only be created by initialization".to_owned());
+            }
+            let object_id = Uuid::new_v4();
+            let object = create_input_v3(object_type, object_id, data)?;
+            let summary_expectation = object
+                .summary()
+                .map_or(SummaryWriteExpectation::Unchanged, |summary| {
+                    SummaryWriteExpectation::Set(summary.to_owned())
+                });
+            let initial_role_level =
+                role_create_level(object_type, initial_role_level, acting_assignment_id)?;
+            (
                 expected_project_revision,
-                object_type,
-                data,
+                MutationTarget {
+                    operation: "create",
+                    object_type,
+                    object_id,
+                    deleted: false,
+                },
+                ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
+                acting_assignment_id,
                 initial_role_level,
-                acting_assignment_id,
-            } => {
-                if object_type == ProjectViewObjectType::ProjectProfile {
-                    return Err(
-                        "the Project Profile can only be created by initialization".to_owned()
-                    );
-                }
-                let object_id = Uuid::new_v4();
-                let object = create_input_v3(object_type, object_id, data)?;
-                let initial_role_level =
-                    role_create_level(object_type, initial_role_level, acting_assignment_id)?;
-                (
-                    expected_project_revision,
-                    MutationTarget {
-                        operation: "create",
-                        object_type,
-                        object_id,
-                        deleted: false,
-                    },
-                    ProjectObjectRequestV3::Create(CreateProjectObjectV3 { object }),
-                    acting_assignment_id,
-                    initial_role_level,
-                )
-            }
-            ProjectViewMutationInput::Update {
+                summary_expectation,
+            )
+        }
+        ProjectViewMutationInput::Update {
+            expected_project_revision,
+            object_type,
+            object_id,
+            patch,
+            acting_assignment_id,
+        } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
+            let update = update_input_v3(object_type, object_id, patch)?;
+            let summary_expectation = SummaryWriteExpectation::from_patch(update.summary_patch());
+            (
                 expected_project_revision,
-                object_type,
-                object_id,
-                patch,
+                MutationTarget {
+                    operation: "update",
+                    object_type,
+                    object_id,
+                    deleted: false,
+                },
+                ProjectObjectRequestV3::Update(update),
                 acting_assignment_id,
-            } => {
-                validate_role_actor_field(object_type, acting_assignment_id)?;
-                (
-                    expected_project_revision,
-                    MutationTarget {
-                        operation: "update",
-                        object_type,
-                        object_id,
-                        deleted: false,
-                    },
-                    ProjectObjectRequestV3::Update(update_input_v3(object_type, object_id, patch)?),
-                    acting_assignment_id,
-                    None,
-                )
-            }
-            ProjectViewMutationInput::Delete {
+                None,
+                summary_expectation,
+            )
+        }
+        ProjectViewMutationInput::Delete {
+            expected_project_revision,
+            object_type,
+            object_id,
+            acting_assignment_id,
+        } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
+            (
                 expected_project_revision,
-                object_type,
-                object_id,
+                MutationTarget {
+                    operation: "delete",
+                    object_type,
+                    object_id,
+                    deleted: true,
+                },
+                ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
+                    object_type,
+                    object_id,
+                }),
                 acting_assignment_id,
-            } => {
-                validate_role_actor_field(object_type, acting_assignment_id)?;
-                (
-                    expected_project_revision,
-                    MutationTarget {
-                        operation: "delete",
-                        object_type,
-                        object_id,
-                        deleted: true,
-                    },
-                    ProjectObjectRequestV3::Delete(DeleteProjectObjectV3 {
-                        object_type,
-                        object_id,
-                    }),
-                    acting_assignment_id,
-                    None,
-                )
-            }
-            ProjectViewMutationInput::Context {
+                None,
+                SummaryWriteExpectation::Unchanged,
+            )
+        }
+        ProjectViewMutationInput::Context {
+            expected_project_revision,
+            object_type,
+            object_id,
+            context_references,
+            acting_assignment_id,
+        } => {
+            validate_role_actor_field(object_type, acting_assignment_id)?;
+            (
                 expected_project_revision,
-                object_type,
-                object_id,
-                context_references,
+                MutationTarget {
+                    operation: "update",
+                    object_type,
+                    object_id,
+                    deleted: false,
+                },
+                ProjectObjectRequestV3::Update(update_input_v3(
+                    object_type,
+                    object_id,
+                    json!({ "context_references": context_references }),
+                )?),
                 acting_assignment_id,
-            } => {
-                validate_role_actor_field(object_type, acting_assignment_id)?;
-                (
-                    expected_project_revision,
-                    MutationTarget {
-                        operation: "update",
-                        object_type,
-                        object_id,
-                        deleted: false,
-                    },
-                    ProjectObjectRequestV3::Update(update_input_v3(
-                        object_type,
-                        object_id,
-                        json!({ "context_references": context_references }),
-                    )?),
-                    acting_assignment_id,
-                    None,
-                )
-            }
-        };
+                None,
+                SummaryWriteExpectation::Unchanged,
+            )
+        }
+    };
     let mut command =
         ProjectObjectCommandV3::new(expected_project_revision, acting_assignment_id, request);
     command.initial_role_level = initial_role_level;
@@ -333,6 +392,7 @@ fn prepare_v3_mutation(input: ProjectViewMutationInput) -> Result<PreparedMutati
         builder,
         expected_project_revision,
         target,
+        summary_expectation,
     })
 }
 
@@ -405,7 +465,8 @@ async fn confirm_projection(
     event: &Event,
     receipt: &ProjectViewReceipt,
     target: MutationTarget,
-) -> Result<(), String> {
+    summary_expectation: &SummaryWriteExpectation,
+) -> Result<(ProjectViewMutationConfirmation, Option<u64>), String> {
     let meta = read_meta(state, context).await?.ok_or_else(|| {
         "Project View integrity error: successful mutation has no metadata".to_owned()
     })?;
@@ -438,11 +499,24 @@ async fn confirm_projection(
         );
     }
     if projection.project_revision == receipt.project_revision {
-        return if projection.deleted == target.deleted {
-            Ok(())
+        if projection.deleted != target.deleted {
+            return Err(
+                "Project View integrity error: confirmed projection has the wrong deletion state"
+                    .to_owned(),
+            );
+        }
+        let summary_matches = match summary_expectation {
+            SummaryWriteExpectation::Unchanged => true,
+            SummaryWriteExpectation::Set(expected) => {
+                projection.summary.as_deref() == Some(expected.as_str())
+            }
+            SummaryWriteExpectation::Clear => projection.summary.is_none(),
+        };
+        return if summary_matches {
+            Ok((ProjectViewMutationConfirmation::CurrentVerified, None))
         } else {
             Err(
-                "Project View integrity error: confirmed projection has the wrong deletion state"
+                "Project View integrity error: confirmed projection has the wrong summary"
                     .to_owned(),
             )
         };
@@ -453,7 +527,10 @@ async fn confirm_projection(
                 .to_owned(),
         );
     }
-    Ok(())
+    Ok((
+        ProjectViewMutationConfirmation::Superseded,
+        Some(projection.object_revision),
+    ))
 }
 
 async fn read_meta(
@@ -587,6 +664,7 @@ fn parse_confirmed_object(
                 project_revision: projection.project_revision,
                 projection_generation: projection.projection_generation,
                 deleted: false,
+                summary: role.summary,
             })
         }
         "object" => {
@@ -596,17 +674,23 @@ fn parse_confirmed_object(
                 meta.project_id,
             )
             .map_err(|error| format!("Project View integrity error: {error}"))?;
-            let (object_id, object_type, object_revision, deleted) = match projection.object {
-                V3ProjectedObject::Active(object) => {
-                    (object.id, object.object_type, object.object_revision, false)
-                }
-                V3ProjectedObject::Tombstone(tombstone) => (
-                    tombstone.id,
-                    tombstone.object_type,
-                    tombstone.object_revision,
-                    true,
-                ),
-            };
+            let (object_id, object_type, object_revision, deleted, summary) =
+                match projection.object {
+                    V3ProjectedObject::Active(object) => (
+                        object.id,
+                        object.object_type,
+                        object.object_revision,
+                        false,
+                        object.data.summary().map(ToOwned::to_owned),
+                    ),
+                    V3ProjectedObject::Tombstone(tombstone) => (
+                        tombstone.id,
+                        tombstone.object_type,
+                        tombstone.object_revision,
+                        true,
+                        None,
+                    ),
+                };
             Ok(MutationObjectProjection {
                 object_id,
                 object_type,
@@ -614,6 +698,7 @@ fn parse_confirmed_object(
                 project_revision: projection.project_revision,
                 projection_generation: projection.projection_generation,
                 deleted,
+                summary,
             })
         }
         _ => Err("Project View integrity error: unsupported v3 object projection type".to_owned()),

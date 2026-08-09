@@ -34,6 +34,7 @@ function snapshot(input: {
     meetingId: input.id,
     title: input.title,
     description: "Sidebar attention acceptance fixture",
+    summary: null,
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",

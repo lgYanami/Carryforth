@@ -1,19 +1,21 @@
-import { Archive, ArrowRight, CloudOff, FileText, Network } from "lucide-react";
-import * as React from "react";
-
 import {
-  firstReadableProjectContextDocumentId,
-  projectContextDocumentIdentity,
-  projectContextInspectedEdge,
-} from "@/features/project-context/inspectorModel";
-import { ProjectContextDocumentContent } from "@/features/project-context/ui/ProjectContextDocumentContent";
+  Archive,
+  ArrowRight,
+  ArrowUpRight,
+  CloudOff,
+  FileText,
+  Network,
+} from "lucide-react";
+
+import { projectContextInspectedEdge } from "@/features/project-context/inspectorModel";
 import { projectViewObjectTypeLabel } from "@/features/project-view/model";
 import type {
   ProjectContextCoordinateDetail,
   ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
 import { Badge } from "@/shared/ui/badge";
-import { cn } from "@/shared/lib/cn";
+import { Button } from "@/shared/ui/button";
+import { Markdown } from "@/shared/ui/markdown";
 
 function coordinateType(detail: ProjectContextCoordinateDetail) {
   if (detail.coordinate.type === "document") return "Document";
@@ -37,22 +39,31 @@ function CoordinateRow({
     >
       <Network className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
-        <span className="flex flex-wrap items-center gap-1.5">
-          <span className="truncate text-sm font-medium">
-            {detail.title?.trim() || coordinateType(detail)}
+        <span className="flex items-start gap-1.5">
+          <span className="min-w-0 flex-1 text-sm font-medium">
+            <span className="block truncate">
+              {detail.title?.trim() || coordinateType(detail)}
+            </span>
+            {detail.summary ? (
+              <span className="mt-1 block line-clamp-2 text-xs font-normal text-muted-foreground">
+                {detail.summary}
+              </span>
+            ) : null}
           </span>
-          <Badge variant="outline">{coordinateType(detail)}</Badge>
-          {detail.state === "tombstoned" ? (
-            <Badge variant="secondary">
-              <Archive className="mr-1 h-3 w-3" />
-              Tombstoned
-            </Badge>
-          ) : detail.state === "unavailable" ? (
-            <Badge variant="warning">
-              <CloudOff className="mr-1 h-3 w-3" />
-              Unavailable
-            </Badge>
-          ) : null}
+          <span className="flex shrink-0 flex-wrap items-center gap-1.5">
+            <Badge variant="outline">{coordinateType(detail)}</Badge>
+            {detail.state === "tombstoned" ? (
+              <Badge variant="secondary">
+                <Archive className="mr-1 h-3 w-3" />
+                Tombstoned
+              </Badge>
+            ) : detail.state === "unavailable" ? (
+              <Badge variant="warning">
+                <CloudOff className="mr-1 h-3 w-3" />
+                Unavailable
+              </Badge>
+            ) : null}
+          </span>
         </span>
         <span className="mt-1 block truncate font-mono text-2xs text-muted-foreground">
           {detail.coordinateKey}
@@ -76,17 +87,6 @@ export function ProjectContextEdgeInspector({
   result: ProjectContextQueryResult;
 }) {
   const inspected = projectContextInspectedEdge(result, edgeKey);
-  const identity = projectContextDocumentIdentity(result);
-  const defaultDocumentId = inspected
-    ? (firstReadableProjectContextDocumentId(inspected.documents, identity) ??
-      inspected.documents[0]?.documentId)
-    : undefined;
-  const [selectedDocumentId, setSelectedDocumentId] =
-    React.useState(defaultDocumentId);
-
-  React.useEffect(() => {
-    setSelectedDocumentId(defaultDocumentId);
-  }, [defaultDocumentId]);
 
   if (!inspected) {
     return (
@@ -95,9 +95,6 @@ export function ProjectContextEdgeInspector({
       </div>
     );
   }
-  const selectedDocument = inspected.documents.find(
-    (document) => document.documentId === selectedDocumentId,
-  );
 
   return (
     <div className="space-y-5 p-4" data-testid="project-context-edge-inspector">
@@ -149,52 +146,74 @@ export function ProjectContextEdgeInspector({
           </h3>
         </div>
         {inspected.documents.length > 0 ? (
-          <div
-            aria-label="Context Documents"
-            className="space-y-1.5"
-            role="listbox"
-          >
-            {inspected.documents.map((document) => {
-              const selected = document.documentId === selectedDocumentId;
-              return (
-                <button
-                  aria-selected={selected}
-                  className={cn(
-                    "flex w-full items-start gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    selected
-                      ? "border-primary/45 bg-primary/10"
-                      : "border-border/70 bg-muted/20 hover:bg-muted/50",
-                  )}
+          <ul aria-label="Context Documents" className="space-y-1.5">
+            {inspected.documents.map((document) => (
+              <li key={document.documentId}>
+                <details
+                  className="group rounded-lg border border-border/70 bg-muted/20 open:bg-background"
                   data-testid={`project-context-edge-document-${document.documentId}`}
-                  key={document.documentId}
-                  onClick={() => setSelectedDocumentId(document.documentId)}
-                  role="option"
-                  type="button"
                 >
-                  <span className="min-w-0 flex-1">
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="truncate text-sm font-medium">
-                        {document.title?.trim() || "Context Document"}
+                  <summary className="cursor-pointer list-none px-3 py-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+                    <span className="flex min-w-0 items-start gap-2">
+                      <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-center gap-1.5">
+                          <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                            {document.title?.trim() || "Context Document"}
+                          </span>
+                          {document.state === "tombstoned" ? (
+                            <Badge variant="secondary">
+                              <Archive className="mr-1 h-3 w-3" />
+                              Tombstoned
+                            </Badge>
+                          ) : document.state === "unavailable" ? (
+                            <Badge variant="warning">
+                              <CloudOff className="mr-1 h-3 w-3" />
+                              Unavailable
+                            </Badge>
+                          ) : null}
+                        </span>
+                        <span className="mt-0.5 block truncate font-mono text-2xs text-muted-foreground">
+                          {document.documentId}
+                        </span>
                       </span>
-                      {document.state === "tombstoned" ? (
-                        <Archive className="h-3.5 w-3.5 text-muted-foreground" />
-                      ) : document.state === "unavailable" ? (
-                        <CloudOff className="h-3.5 w-3.5 text-muted-foreground" />
-                      ) : null}
                     </span>
+                  </summary>
+                  <div
+                    className="space-y-3 border-t border-border/70 px-3 py-3"
+                    data-testid={`project-context-edge-document-panel-${document.documentId}`}
+                  >
                     {document.summary ? (
-                      <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                        {document.summary}
-                      </span>
+                      <section
+                        data-testid={`project-context-edge-document-summary-${document.documentId}`}
+                      >
+                        <h4 className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                          Summary
+                        </h4>
+                        <Markdown
+                          className="mt-2 text-sm leading-6"
+                          content={document.summary}
+                          interactive={false}
+                        />
+                      </section>
                     ) : null}
-                    <span className="mt-0.5 block truncate font-mono text-2xs text-muted-foreground">
-                      {document.documentId}
-                    </span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
+                    {document.state === "active" ? (
+                      <Button
+                        data-testid={`project-context-open-document-${document.documentId}`}
+                        onClick={() => onOpenDocument(document.documentId)}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        Open in Documents
+                        <ArrowUpRight />
+                      </Button>
+                    ) : null}
+                  </div>
+                </details>
+              </li>
+            ))}
+          </ul>
         ) : (
           <p
             className="rounded-lg border border-dashed border-border/70 p-3 text-sm text-muted-foreground"
@@ -204,16 +223,6 @@ export function ProjectContextEdgeInspector({
           </p>
         )}
       </section>
-
-      {selectedDocument ? (
-        <section className="border-t border-border/70 pt-5">
-          <ProjectContextDocumentContent
-            detail={selectedDocument}
-            identity={identity}
-            onOpenDocument={onOpenDocument}
-          />
-        </section>
-      ) : null}
     </div>
   );
 }

@@ -19,7 +19,12 @@ import {
 
 import { buildProjectContextGraph } from "@/features/project-context/graph";
 import { focusProjectContextGraphTarget } from "@/features/project-context/focus";
-import { layoutProjectContextGraph } from "@/features/project-context/layout";
+import {
+  buildProjectContextLayoutTopology,
+  layoutProjectContextGeometry,
+  type layoutProjectContextGraph,
+  materializeProjectContextLayout,
+} from "@/features/project-context/layout";
 import {
   buildProjectContextFlowElements,
   type ProjectContextFlowEdge,
@@ -140,7 +145,9 @@ type ProjectContextGraphInnerProps = {
   focusSelectionRequest: number;
   graph: ReturnType<typeof buildProjectContextGraph>;
   layout: ReturnType<typeof layoutProjectContextGraph>;
+  queryIdentity: string;
   selection: ProjectContextGraphTarget | null;
+  textScale: number;
   onSelectionChange: (selection: ProjectContextGraphTarget | null) => void;
 };
 
@@ -150,16 +157,16 @@ function ProjectContextGraphInner({
   graph,
   layout,
   onSelectionChange,
+  queryIdentity,
   selection,
+  textScale,
 }: ProjectContextGraphInnerProps) {
   const shouldReduceMotion = useReducedMotion();
   const nodesInitialized = useNodesInitialized();
   const handledFocusSelectionRequest = React.useRef(0);
   const graphRootRef = React.useRef<HTMLElement>(null);
-  const { fitBounds, fitView, zoomIn, zoomOut } = useReactFlow<
-    ProjectContextFlowNode,
-    ProjectContextFlowEdge
-  >();
+  const { fitBounds, fitView, getViewport, setViewport, zoomIn, zoomOut } =
+    useReactFlow<ProjectContextFlowNode, ProjectContextFlowEdge>();
   const duration = shouldReduceMotion ? 0 : 220;
   const layoutKey = React.useMemo(
     () =>
@@ -173,11 +180,83 @@ function ProjectContextGraphInner({
   );
   const hoverResetKey = `${layoutKey}:${selection?.kind ?? "none"}:${selection?.key ?? "none"}`;
   const previousHoverResetKey = React.useRef<string | null>(null);
+  const fittedQueryIdentity = React.useRef<string | null>(null);
+  const previousLayout = React.useRef({ layout, queryIdentity, textScale });
+
+  React.useLayoutEffect(() => {
+    const previous = previousLayout.current;
+    previousLayout.current = { layout, queryIdentity, textScale };
+    if (
+      !nodesInitialized ||
+      previous.queryIdentity !== queryIdentity ||
+      previous.textScale === textScale ||
+      previous.textScale <= 0
+    ) {
+      return;
+    }
+    const viewport = getViewport();
+    const selectedId = selection
+      ? selection.kind === "coordinate"
+        ? `coordinate:${selection.key}`
+        : `edge-hub:${selection.key}`
+      : undefined;
+    const previousNode = selectedId
+      ? previous.layout.nodes.find((node) => node.id === selectedId)
+      : undefined;
+    const nextNode = selectedId
+      ? layout.nodes.find((node) => node.id === selectedId)
+      : undefined;
+    if (previousNode && nextNode) {
+      const previousCenterX = previousNode.x + previousNode.width / 2;
+      const previousCenterY = previousNode.y + previousNode.height / 2;
+      const nextCenterX = nextNode.x + nextNode.width / 2;
+      const nextCenterY = nextNode.y + nextNode.height / 2;
+      void setViewport(
+        {
+          x: viewport.x + (previousCenterX - nextCenterX) * viewport.zoom,
+          y: viewport.y + (previousCenterY - nextCenterY) * viewport.zoom,
+          zoom: viewport.zoom,
+        },
+        { duration: 0 },
+      );
+      return;
+    }
+    const root = graphRootRef.current;
+    if (!root) return;
+    const focusX = root.clientWidth / 2;
+    const focusY = root.clientHeight / 2;
+    const ratio = textScale / previous.textScale;
+    const graphX = (focusX - viewport.x) / viewport.zoom;
+    const graphY = (focusY - viewport.y) / viewport.zoom;
+    void setViewport(
+      {
+        x: focusX - graphX * ratio * viewport.zoom,
+        y: focusY - graphY * ratio * viewport.zoom,
+        zoom: viewport.zoom,
+      },
+      { duration: 0 },
+    );
+  }, [
+    getViewport,
+    layout,
+    nodesInitialized,
+    queryIdentity,
+    selection,
+    setViewport,
+    textScale,
+  ]);
 
   React.useEffect(() => {
-    if (!nodesInitialized || layoutKey.length === 0) return;
-    void fitView({ padding: 0.08, duration: 0, maxZoom: 1.15 });
-  }, [fitView, layoutKey, nodesInitialized]);
+    if (
+      !nodesInitialized ||
+      layoutKey.length === 0 ||
+      fittedQueryIdentity.current === queryIdentity
+    ) {
+      return;
+    }
+    fittedQueryIdentity.current = queryIdentity;
+    void fitBounds(layout.bounds, { padding: 0.08, duration: 0 });
+  }, [fitBounds, layout.bounds, layoutKey, nodesInitialized, queryIdentity]);
 
   React.useEffect(() => {
     if (previousHoverResetKey.current === hoverResetKey) return;
@@ -416,11 +495,12 @@ function ProjectContextGraphInner({
       </ReactFlow>
       <span className="sr-only" id="project-context-graph-description">
         This is an undirected incidence graph. Node placement does not express
-        source, target, order, importance, or causality.
+        source, target, order, importance, causality, or semantic similarity.
       </span>
       <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
         <span className="rounded-full bg-background/75 px-2.5 py-1 text-2xs text-muted-foreground shadow-sm backdrop-blur">
-          Pan to explore · Scroll to zoom · Undirected relationships
+          Pan · Scroll to zoom · Undirected · placement carries no rank or
+          causality
         </span>
       </div>
       {selection ? (
@@ -449,9 +529,22 @@ export function ProjectContextGraph({
 }) {
   const textScale = useProjectContextTextScale();
   const graph = React.useMemo(() => buildProjectContextGraph(result), [result]);
+  const nextTopology = React.useMemo(
+    () => buildProjectContextLayoutTopology(graph),
+    [graph],
+  );
+  const topologyCache = React.useRef(nextTopology);
+  if (topologyCache.current.descriptor !== nextTopology.descriptor) {
+    topologyCache.current = nextTopology;
+  }
+  const topology = topologyCache.current;
+  const geometry = React.useMemo(
+    () => layoutProjectContextGeometry(topology),
+    [topology],
+  );
   const layout = React.useMemo(
-    () => layoutProjectContextGraph(graph, textScale),
-    [graph, textScale],
+    () => materializeProjectContextLayout(geometry, graph, textScale),
+    [geometry, graph, textScale],
   );
   const elements = React.useMemo(
     () => buildProjectContextFlowElements(graph, layout, selection),
@@ -525,7 +618,9 @@ export function ProjectContextGraph({
           graph={graph}
           layout={layout}
           onSelectionChange={onSelectionChange}
+          queryIdentity={topology.queryIdentity}
           selection={selection}
+          textScale={textScale}
         />
       </section>
     </ReactFlowProvider>

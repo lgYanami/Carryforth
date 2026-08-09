@@ -28,12 +28,14 @@ use directory::list_item_from_load;
 mod model;
 use model::*;
 mod pending;
+mod summary;
+pub use summary::update_meeting_summary;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_core_pkg::kind::{
     KIND_MEETING_BOARD, KIND_MEETING_CREATE, KIND_MEETING_END, KIND_MEETING_STATE,
-    KIND_STREAM_MESSAGE,
+    KIND_NIP29_GROUP_METADATA, KIND_STREAM_MESSAGE,
 };
 use nostr::{Event, PublicKey};
 use serde::{Deserialize, Serialize};
@@ -52,6 +54,7 @@ const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
 const MEETING_V2_CREATE_EXTENSION: &str = "buzz-meeting-v2-create";
 const MEETING_V2_DIRECT_ACTIONS_EXTENSION: &str = "buzz-meeting-v2-direct-actions";
 const MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION: &str = "buzz-meeting-v2-direct-actions-create";
+const MEETING_SUMMARY_EXTENSION: &str = "buzz-meeting-summary-v1";
 const SNAPSHOT_STATE_LIMIT: usize = 200;
 const SNAPSHOT_EVENT_LIMIT: usize = 20;
 const MAX_LIST_MEETINGS: usize = 64;
@@ -80,6 +83,7 @@ pub struct MeetingCapability {
     relay_pubkey: Option<String>,
     supports_direct_actions: bool,
     can_create_direct_actions: bool,
+    supports_summary: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -107,6 +111,7 @@ pub async fn get_meeting_capability(
             relay_pubkey: None,
             supports_direct_actions: false,
             can_create_direct_actions: false,
+            supports_summary: false,
         },
         |identity| identity.capability,
     ))
@@ -320,6 +325,7 @@ async fn read_meeting_identity_at(
     let supports_direct_actions = has_extension(&info, MEETING_V2_DIRECT_ACTIONS_EXTENSION);
     let can_create_direct_actions =
         has_extension(&info, MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION);
+    let supports_summary = has_extension(&info, MEETING_SUMMARY_EXTENSION);
     Ok(Some(MeetingIdentity {
         relay_pubkey,
         capability: MeetingCapability {
@@ -331,6 +337,7 @@ async fn read_meeting_identity_at(
             relay_pubkey: Some(relay_self.to_string()),
             supports_direct_actions,
             can_create_direct_actions,
+            supports_summary,
         },
     }))
 }
@@ -382,6 +389,12 @@ async fn load_meeting_snapshot_at(
         json!({
             "kinds": [KIND_STREAM_MESSAGE],
             "#h": [meeting_id],
+            "limit": SNAPSHOT_EVENT_LIMIT,
+        }),
+        json!({
+            "kinds": [KIND_NIP29_GROUP_METADATA],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "#d": [meeting_id],
             "limit": SNAPSHOT_EVENT_LIMIT,
         }),
     ];
@@ -446,6 +459,8 @@ async fn load_meeting_snapshot_at(
     let current_state = select_current_state(states, &create)?;
     let board = parse_current_board(&events, identity, &create)?;
     let end = parse_current_end(&events, identity, &create)?;
+    let (summary, metadata_updated_at) =
+        parse_current_meeting_metadata(&events, identity, meeting_id)?;
 
     let (participants, phase, revisions, current_speaker, current_offer, floor, host, action) =
         if let Some(state) = &current_state {
@@ -559,6 +574,7 @@ async fn load_meeting_snapshot_at(
         .chain([create.created_at, board.updated_at])
         .chain(end.as_ref().map(|end| end.ended_at))
         .chain(latest_speech_at)
+        .chain(metadata_updated_at)
         .max()
         .unwrap_or(create.created_at);
 
@@ -567,6 +583,7 @@ async fn load_meeting_snapshot_at(
             meeting_id: create.meeting_id,
             title: create.title,
             description: create.description,
+            summary,
             source_channel_id: create.source_channel_id,
             schema_version: 3,
             policy: create.policy,
@@ -820,6 +837,36 @@ fn map_meeting_query_error(message: String) -> MeetingReadError {
     } else {
         MeetingReadError::Other(message)
     }
+}
+
+fn parse_current_meeting_metadata(
+    events: &[Event],
+    identity: &MeetingIdentity,
+    meeting_id: &str,
+) -> Result<(Option<String>, Option<u64>), MeetingReadError> {
+    let mut candidates = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_u16() as u32 == KIND_NIP29_GROUP_METADATA
+                && single_tag(event, "d") == Some(meeting_id)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let Some(event) = candidates.pop() else {
+        return Ok((None, None));
+    };
+    verify_relay_event(event, identity, "Meeting metadata")?;
+    if required_tag(event, "room_kind", "Meeting metadata")? != "meeting" {
+        return Err(MeetingReadError::Other(integrity_error(
+            "Meeting metadata has the wrong room kind",
+        )));
+    }
+    let summary = optional_tag(event, "summary", "Meeting metadata")?.map(str::to_string);
+    Ok((summary, Some(event.created_at.as_secs())))
 }
 
 fn canonical_meeting_id(value: &str) -> Result<String, String> {

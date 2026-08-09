@@ -44,12 +44,14 @@ fn initialize_mutation() -> Mutation {
                 purpose: "Coordinate humans and agents".to_owned(),
                 problem: "Project state is fragmented".to_owned(),
                 scope: "Project View v0".to_owned(),
+                summary: None,
             },
             goals: vec![InitializeGoal {
                 id: initial_goal_id(),
                 title: "Ship Project View".to_owned(),
                 desired_outcome: "Members share one current view".to_owned(),
                 directions: vec!["Build the domain first".to_owned()],
+                summary: None,
             }],
         }),
     )

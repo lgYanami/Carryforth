@@ -132,6 +132,7 @@ fn observed_detail(
             ProjectContextDetailState::Active
         },
         title: Some(record.title),
+        summary: record.summary,
         status: Some(json!(record.lifecycle)),
         object_revision: None,
         document_revision: None,
@@ -260,6 +261,7 @@ mod tests {
         MeetingContextRecord {
             title: "Memory boundary review".to_string(),
             discussion_goal: Some("Agree the first durable memory slice".to_string()),
+            summary: Some("Meeting decisions about the durable memory boundary.".to_string()),
             lifecycle: "closed",
             terminal_outcome: Some("closed".to_string()),
             host_pubkey: "a".repeat(64),

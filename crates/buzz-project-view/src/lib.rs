@@ -13,6 +13,7 @@ mod mutation;
 mod patch;
 mod projection;
 mod read_model;
+mod serde_helpers;
 mod state;
 /// Legacy v2 role-continuity primitives retained as wire-neutral domain types
 /// for v3 and explicit migration; not an ordinary runtime compatibility API.

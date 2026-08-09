@@ -740,6 +740,7 @@ pub fn run() {
             ensure_meeting_action_renewal,
             ensure_meeting_human_grant_renewal,
             submit_meeting_action_finalization,
+            update_meeting_summary,
             submit_meeting_floor_action,
             submit_meeting_host_action,
             create_channel,

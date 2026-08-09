@@ -137,6 +137,13 @@ pub struct InitializeGoal {
     pub desired_outcome: String,
     /// Strategic directions that guide work toward the goal.
     pub directions: Vec<String>,
+    /// Optional retrieval summary owned by this initial Goal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 impl InitializeGoal {
@@ -146,6 +153,7 @@ impl InitializeGoal {
             title: self.title,
             desired_outcome: self.desired_outcome,
             directions: self.directions,
+            summary: self.summary,
         }
     }
 }
@@ -319,6 +327,7 @@ impl NewProjectViewObject {
                     title,
                     desired_outcome,
                     directions,
+                    summary: None,
                 }),
                 ProjectViewRelations::default(),
             ),
@@ -337,6 +346,7 @@ impl NewProjectViewObject {
                     responsibilities,
                     boundaries,
                     active,
+                    summary: None,
                 }),
                 ProjectViewRelations::default(),
             ),
@@ -352,6 +362,7 @@ impl NewProjectViewObject {
                     title,
                     description,
                     status,
+                    summary: None,
                 }),
                 ProjectViewRelations {
                     under_goal_id,
@@ -370,6 +381,7 @@ impl NewProjectViewObject {
                     title,
                     description,
                     status,
+                    summary: None,
                 }),
                 ProjectViewRelations {
                     under_plan_id: Some(under_plan_id),
@@ -390,6 +402,7 @@ impl NewProjectViewObject {
                     description,
                     status,
                     priority,
+                    summary: None,
                 }),
                 ProjectViewRelations {
                     planned_in_stage_id,
@@ -411,6 +424,7 @@ impl NewProjectViewObject {
                     description,
                     status,
                     priority,
+                    summary: None,
                 }),
                 ProjectViewRelations {
                     planned_in_stage_id,
@@ -432,6 +446,7 @@ impl NewProjectViewObject {
                     description,
                     status,
                     priority,
+                    summary: None,
                 }),
                 ProjectViewRelations {
                     handles: Some(handles),

@@ -25,6 +25,39 @@ pub struct ActionRunFence {
     pub board_event_id: Vec<u8>,
 }
 
+/// Source-owned Meeting retrieval-summary mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeetingSummaryMutation {
+    /// Replace the current retrieval summary.
+    Set(String),
+    /// Remove the current retrieval summary.
+    Clear,
+}
+
+/// Inputs for changing a Meeting retrieval summary inside an existing command
+/// transaction.
+pub struct MeetingSummaryUpdateTxParams<'a> {
+    /// Community that owns the Meeting.
+    pub community_id: CommunityId,
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// Verified command author.
+    pub actor_pubkey: &'a [u8],
+    /// Exact current direct-action run/window/Board fence.
+    pub fence: ActionRunFence,
+    /// Requested source metadata mutation.
+    pub mutation: MeetingSummaryMutation,
+}
+
+/// Canonical result of a Meeting retrieval-summary mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummaryUpdate {
+    /// Current canonical summary after the mutation.
+    pub summary: Option<String>,
+    /// Whether the source field changed.
+    pub changed: bool,
+}
+
 /// Strict command payload produced by Relay wire parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionCommand {
@@ -160,6 +193,143 @@ struct ActionRunRow {
     progress_seq: i64,
     action_deadline_at: Option<DateTime<Utc>>,
     operator_hard_deadline: Option<DateTime<Utc>>,
+}
+
+/// Update the Meeting-owned retrieval summary without changing Meeting control
+/// state.
+///
+/// The caller owns the surrounding command-event transaction. This function
+/// locks and revalidates the current Action Finalization window so a delayed
+/// metadata command cannot write after Return-to-Board or Meeting closure.
+pub async fn update_meeting_summary_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    params: MeetingSummaryUpdateTxParams<'_>,
+) -> Result<MeetingSummaryUpdate> {
+    if params.session_id.is_nil() {
+        return Err(DbError::InvalidData(
+            "Meeting summary command has a nil session id".to_string(),
+        ));
+    }
+    if params.actor_pubkey.len() != 32 {
+        return Err(DbError::InvalidData(
+            "Meeting summary author pubkey must be 32 bytes".to_string(),
+        ));
+    }
+    let next_summary = match params.mutation {
+        MeetingSummaryMutation::Set(summary) => {
+            if summary.trim().is_empty() || summary.contains('\0') {
+                return Err(DbError::InvalidData(
+                    "Meeting summary SET requires non-blank text without NUL".to_string(),
+                ));
+            }
+            Some(summary)
+        }
+        MeetingSummaryMutation::Clear => None,
+    };
+
+    let session =
+        crate::meeting_baton::lock_baton_session_tx(tx, params.community_id, params.session_id)
+            .await?;
+    if session.protocol != crate::meeting_baton::BatonProtocol::V2Actions {
+        return Err(DbError::InvalidData(
+            "Meeting summary is only writable for the current action-finalization policy"
+                .to_string(),
+        ));
+    }
+    if session.status != "active" {
+        return Err(DbError::InvalidData(
+            "conflict: Meeting is no longer active".to_string(),
+        ));
+    }
+    if params.actor_pubkey != session.host_pubkey.as_slice() {
+        return Err(DbError::AccessDenied(
+            "only the immutable Meeting moderator can update its summary".to_string(),
+        ));
+    }
+    if crate::meeting_revocation::actor_durably_revoked_for_session_tx(
+        tx,
+        params.community_id,
+        params.session_id,
+        params.actor_pubkey,
+    )
+    .await?
+    {
+        return Err(DbError::AccessDenied(
+            "Meeting summary author was durably revoked from this Session".to_string(),
+        ));
+    }
+    if !crate::meeting::actor_security_active_tx(tx, params.community_id, params.actor_pubkey)
+        .await?
+    {
+        return Err(DbError::AccessDenied(
+            "Meeting summary author is no longer an active writable principal".to_string(),
+        ));
+    }
+
+    let runtime =
+        crate::meeting_v2::load_runtime_tx(tx, params.community_id, params.session_id, true)
+            .await?;
+    if runtime.phase != RuntimePhase::FinalizingActions {
+        return Err(DbError::InvalidData(
+            "conflict: Meeting is not in Action Finalization".to_string(),
+        ));
+    }
+    let run = load_active_run_tx(tx, params.community_id, params.session_id, true)
+        .await?
+        .ok_or_else(|| {
+            DbError::InvalidData("conflict: Meeting has no active action run".to_string())
+        })?;
+    if let Some(reason) = validate_run_fence(&run, &params.fence) {
+        return Err(DbError::InvalidData(format!("conflict: {reason}")));
+    }
+    if run.action_condition != "runnable" {
+        return Err(DbError::InvalidData(
+            "conflict: Meeting action run is not runnable".to_string(),
+        ));
+    }
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(tx.as_mut())
+        .await?;
+    if run
+        .action_deadline_at
+        .is_none_or(|deadline| deadline <= now)
+        || run
+            .operator_hard_deadline
+            .is_some_and(|deadline| deadline <= now)
+    {
+        return Err(DbError::InvalidData(
+            "conflict: Meeting action window has expired".to_string(),
+        ));
+    }
+
+    let current_summary: Option<String> = sqlx::query_scalar(
+        "SELECT summary FROM meeting_sessions \
+         WHERE community_id = $1 AND session_id = $2",
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.session_id)
+    .fetch_one(tx.as_mut())
+    .await?;
+    let changed = current_summary != next_summary;
+    if changed {
+        let updated = sqlx::query(
+            "UPDATE meeting_sessions SET summary = $3 \
+             WHERE community_id = $1 AND session_id = $2",
+        )
+        .bind(params.community_id.as_uuid())
+        .bind(params.session_id)
+        .bind(&next_summary)
+        .execute(tx.as_mut())
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::NotFound(format!("meeting {}", params.session_id)));
+        }
+    }
+
+    Ok(MeetingSummaryUpdate {
+        summary: next_summary,
+        changed,
+    })
 }
 
 /// Block one action window whose independent database deadline has elapsed.

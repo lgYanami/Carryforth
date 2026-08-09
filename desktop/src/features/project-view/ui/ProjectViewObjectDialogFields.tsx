@@ -180,12 +180,6 @@ export function ProjectViewObjectTextFields({
             value={form.resourceKind}
           />
         </ProjectViewField>
-        <ProjectViewField label="Summary">
-          <Textarea
-            onChange={(event) => set("summary", event.target.value)}
-            value={form.summary}
-          />
-        </ProjectViewField>
         <ProjectViewSelect
           label="Guide"
           onChange={(value) => set("guideDocumentId", value)}
@@ -245,6 +239,24 @@ export function ProjectViewObjectTextFields({
         />
       </ProjectViewField>
     </>
+  );
+}
+
+export function ProjectViewObjectSummaryField({
+  form,
+  set,
+}: {
+  form: ProjectViewObjectFormState;
+  set: SetFormField;
+}) {
+  return (
+    <ProjectViewField label="Retrieval summary">
+      <Textarea
+        onChange={(event) => set("summary", event.target.value)}
+        placeholder="What this object covers and when it is worth loading"
+        value={form.summary}
+      />
+    </ProjectViewField>
   );
 }
 

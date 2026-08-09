@@ -585,6 +585,7 @@ mod tests {
                     status,
                     relay_pubkey: Some(relay.public_key().to_hex()),
                     supports_direct_actions,
+                    supports_summary: false,
                     can_create_direct_actions,
                 },
             };

@@ -9,7 +9,7 @@ use super::{
     ProjectViewStateV3, UpdateProjectObjectV3, V3ContractError, V3ProjectObjectError,
 };
 use crate::{
-    DomainError, GoalPatch, IssuePatch, MutationRequest, PlanPatch, ProfilePatch,
+    DomainError, GoalPatch, IssuePatch, MutationRequest, Patch, PlanPatch, ProfilePatch,
     ProjectViewObjectData, ProjectViewObjectType, RequirementPatch, RolePatch, StagePatch,
     UpdateMutation, WorkPatch, MAX_SAFE_REVISION,
 };
@@ -35,6 +35,10 @@ pub(super) fn validate_relation_shape(
 /// Validate a v3 update's local body patch rules.
 pub(super) fn validate_update(update: &UpdateProjectObjectV3) -> Result<(), V3ProjectObjectError> {
     let context_changed = update.context_references().is_some();
+    let summary_changed = !update.summary_patch().is_unchanged();
+    if let Patch::Set(summary) = update.summary_patch() {
+        crate::validation::validate_summary(&Some(summary.clone()))?;
+    }
     let legacy_update = match update {
         UpdateProjectObjectV3::ProjectProfile { object_id, patch } => {
             UpdateMutation::ProjectProfile {
@@ -120,7 +124,7 @@ pub(super) fn validate_update(update: &UpdateProjectObjectV3) -> Result<(), V3Pr
         }
     };
     match crate::validation::validate_mutation_input(&MutationRequest::Update(legacy_update)) {
-        Err(DomainError::NoChanges) if context_changed => Ok(()),
+        Err(DomainError::NoChanges) if context_changed || summary_changed => Ok(()),
         result => result.map_err(Into::into),
     }
 }

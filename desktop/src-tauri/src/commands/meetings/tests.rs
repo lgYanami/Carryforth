@@ -161,6 +161,7 @@ fn test_identity(relay: &Keys) -> MeetingIdentity {
             status: MeetingCapabilityStatus::Readable,
             relay_pubkey: Some(relay_pubkey.to_hex()),
             supports_direct_actions: true,
+            supports_summary: false,
             can_create_direct_actions: false,
         },
     }

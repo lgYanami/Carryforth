@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Variant};
 
 use super::PROJECT_VIEW_V3_SCHEMA_VERSION;
+use crate::serde_helpers::deserialize_optional_non_null;
 use crate::v2::RoleLevel;
 use crate::{
     InitializeGoal, ProjectProfile, ProjectViewObjectData, MAX_INITIAL_GOALS, MAX_SAFE_REVISION,
@@ -23,7 +24,6 @@ pub const MAX_CONTEXT_REFERENCES: usize = 64;
 
 const MAX_RESOURCE_NAME_BYTES: usize = 256;
 const MAX_RESOURCE_KIND_BYTES: usize = 64;
-const MAX_RESOURCE_SUMMARY_BYTES: usize = 4_096;
 
 /// Fail-closed Project View v3 contract error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -79,14 +79,8 @@ impl ProjectResourceV3 {
             V3ContractError::InvalidResource,
         )?;
         validate_resource_kind(&self.resource_kind)?;
-        if let Some(summary) = &self.summary {
-            validate_optional_text(
-                "summary",
-                summary,
-                MAX_RESOURCE_SUMMARY_BYTES,
-                V3ContractError::InvalidResource,
-            )?;
-        }
+        crate::validation::validate_summary(&self.summary)
+            .map_err(|error| V3ContractError::InvalidResource(error.to_string()))?;
         require_uuid_v4(self.guide_document_id, "guide_document_id")
             .map_err(V3ContractError::InvalidResource)
     }
@@ -211,6 +205,13 @@ pub struct RoleDefinitionV3 {
     pub level: RoleLevel,
     /// Whether the Role can receive an Assignment.
     pub active: bool,
+    /// Optional retrieval summary owned by this Role.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
     /// Canonical Context Reference set.
     pub context_references: Vec<ProjectContextReference>,
     /// Canonical object revision.
@@ -240,6 +241,8 @@ impl RoleDefinitionV3 {
         )?;
         validate_string_list("responsibilities", &self.responsibilities)?;
         validate_string_list("boundaries", &self.boundaries)?;
+        crate::validation::validate_summary(&self.summary)
+            .map_err(|error| V3ContractError::InvalidWire(error.to_string()))?;
         validate_positive_safe(self.object_revision, "object_revision")?;
         validate_positive_safe(self.project_revision, "project_revision")?;
         if self.updated_at < self.created_at {
@@ -269,6 +272,13 @@ pub struct InitialRoleDefinitionV3 {
     pub level: RoleLevel,
     /// Initial active state; greenfield governance roles must be active.
     pub active: bool,
+    /// Optional retrieval summary owned by this initial Role.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
     /// Must be the canonical empty set while Context is not advertised.
     pub context_references: Vec<ProjectContextReference>,
 }
@@ -593,6 +603,8 @@ fn validate_initial_role(role: &InitialRoleDefinitionV3) -> Result<(), V3Contrac
     )?;
     validate_string_list("responsibilities", &role.responsibilities)?;
     validate_string_list("boundaries", &role.boundaries)?;
+    crate::validation::validate_summary(&role.summary)
+        .map_err(|error| V3ContractError::InvalidInitialization(error.to_string()))?;
     if role.level != RoleLevel::Admin || !role.active || !role.context_references.is_empty() {
         return Err(V3ContractError::InvalidInitialization(
             "initial governance Roles must be active admin Roles with empty Context".to_owned(),
@@ -651,20 +663,6 @@ fn validate_nonempty_text(
     Ok(())
 }
 
-fn validate_optional_text(
-    field: &str,
-    value: &str,
-    max: usize,
-    error: fn(String) -> V3ContractError,
-) -> Result<(), V3ContractError> {
-    if value.is_empty() || value.contains('\0') || value.len() > max {
-        return Err(error(format!(
-            "{field} must be omitted or contain 1..={max} UTF-8 bytes without NUL"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_positive_safe(value: u64, field: &str) -> Result<(), V3ContractError> {
     if !(1..=MAX_SAFE_REVISION).contains(&value) {
         return Err(V3ContractError::InvalidWire(format!(
@@ -700,12 +698,4 @@ fn context_key(reference: &ProjectContextReference) -> (u8, [u8; 16], u8, u64) {
             document_revision.unwrap_or(0),
         ),
     }
-}
-
-fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
 }

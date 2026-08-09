@@ -24,6 +24,7 @@ function meetingSeed(
     meetingId,
     title: "Agent activity review",
     description: "Observe Meeting-scoped ACP work without changing state.",
+    summary: null,
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",

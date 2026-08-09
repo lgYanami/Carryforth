@@ -240,7 +240,10 @@ function optionFromVisibleDetail(
     state: detail.state,
     title: detail.title?.trim() || `${typeLabel} ${shortId(stableId)}`,
     typeLabel,
-    description: detail.meeting?.discussionGoal ?? detail.unavailableReason,
+    description:
+      detail.summary ??
+      detail.meeting?.discussionGoal ??
+      detail.unavailableReason,
     status: detail.meeting
       ? meetingLifecycleLabel(detail.meeting.lifecycle)
       : undefined,
@@ -299,6 +302,7 @@ export function buildProjectContextCoordinateOptions(input: {
       state: "active",
       title: projectViewObjectTitle(object),
       typeLabel: projectViewObjectTypeLabel(object.objectType),
+      description: object.data.summary,
       status: status ? formatProjectViewTerm(status) : undefined,
     };
     options.set(option.coordinateKey, option);
@@ -357,6 +361,7 @@ export function buildProjectContextCoordinateOptions(input: {
       title: meeting.title,
       typeLabel: "Meeting",
       description:
+        meeting.summary ||
         meeting.description ||
         (participantSummary
           ? `Participants: ${participantSummary}`

@@ -3,8 +3,12 @@ import test from "node:test";
 
 import { buildProjectContextGraph } from "./graph.ts";
 import {
+  buildProjectContextLayoutTopology,
+  layoutProjectContextGeometry,
   layoutProjectContextGraph,
+  materializeProjectContextLayout,
   projectContextBoundsOverlap,
+  projectContextPortToward,
 } from "./layout.ts";
 
 function detail(coordinateKey) {
@@ -122,18 +126,36 @@ test("Coordinate and Hub rectangles have deterministic reading space", () => {
   }
 });
 
-test("every Spoke receives opposite boundary ports", () => {
-  const layout = layoutProjectContextGraph(graphFixture());
-  const opposite = {
-    top: "bottom",
-    right: "left",
-    bottom: "top",
-    left: "right",
-  };
+test("every Spoke chooses each endpoint Handle from its own rectangle", () => {
+  const graph = graphFixture();
+  const layout = layoutProjectContextGraph(graph);
+  const nodeById = new Map(layout.nodes.map((node) => [node.id, node]));
+  const graphSpokeById = new Map(
+    graph.spokes.map((spoke) => [spoke.id, spoke]),
+  );
   assert.equal(layout.spokes.length, 7);
   for (const spoke of layout.spokes) {
-    assert.equal(spoke.targetHandle, opposite[spoke.sourceHandle]);
+    const graphSpoke = graphSpokeById.get(spoke.id);
+    assert.ok(graphSpoke);
+    assert.equal(
+      spoke.sourceHandle,
+      projectContextPortToward(
+        nodeById.get(graphSpoke.sourceId),
+        nodeById.get(graphSpoke.targetId),
+      ),
+    );
+    assert.equal(
+      spoke.targetHandle,
+      projectContextPortToward(
+        nodeById.get(graphSpoke.targetId),
+        nodeById.get(graphSpoke.sourceId),
+      ),
+    );
   }
+  const square = { x: 0, y: 0, width: 76, height: 76 };
+  const wide = { x: 100, y: 90, width: 224, height: 120 };
+  assert.equal(projectContextPortToward(square, wide), "right");
+  assert.equal(projectContextPortToward(wide, square), "top");
 });
 
 test("text scale expands nodes, spacing, and Island bounds together", () => {
@@ -151,6 +173,53 @@ test("text scale expands nodes, spacing, and Island bounds together", () => {
   assert.equal(enlargedCoordinate.height, regularCoordinate.height * 1.5);
   assert.ok(enlarged.bounds.width > regular.bounds.width);
   assert.ok(enlarged.bounds.height > regular.bounds.height);
+});
+
+test("one connected Island fans into at least three quadrants", () => {
+  const layout = layoutProjectContextGraph(graphFixture());
+  const island = layout.islands.find(
+    (candidate) => candidate.edgeKeys.length === 2,
+  );
+  assert.ok(island);
+  const nodes = layout.nodes.filter(
+    (node) => node.islandKey === island.stableKey,
+  );
+  const center = nodes.find((node) => node.id === "edge-hub:edge-abc");
+  assert.ok(center);
+  const centerX = center.x + center.width / 2;
+  const centerY = center.y + center.height / 2;
+  const quadrants = new Set(
+    nodes
+      .filter((node) => node.id !== center.id)
+      .map((node) => {
+        const x = node.x + node.width / 2 >= centerX ? "right" : "left";
+        const y = node.y + node.height / 2 >= centerY ? "bottom" : "top";
+        return `${x}:${y}`;
+      }),
+  );
+  assert.ok(quadrants.size >= 3);
+});
+
+test("metadata changes reuse geometry while Island facts stay current", () => {
+  const graph = graphFixture();
+  const topology = buildProjectContextLayoutTopology(graph);
+  const geometry = layoutProjectContextGeometry(topology);
+  const changed = structuredClone(graph);
+  changed.coordinates[0].displayTitle = "Changed metadata only";
+  changed.coordinates[0].summary = "A newer summary";
+  changed.hubs[0].contextDocumentIds.push("new-context-document");
+  changed.islands[0].contextDocumentIds.push("new-context-document");
+  const changedTopology = buildProjectContextLayoutTopology(changed);
+
+  assert.equal(changedTopology.descriptor, topology.descriptor);
+  assert.deepEqual(layoutProjectContextGeometry(changedTopology), geometry);
+  const materialized = materializeProjectContextLayout(geometry, changed);
+  assert.equal(
+    materialized.islands.some((island) =>
+      island.contextDocumentIds.includes("new-context-document"),
+    ),
+    true,
+  );
 });
 
 test("empty graph has a closed zero layout", () => {
@@ -216,4 +285,73 @@ test("focused no-match lays out standalone Anchors without Island bounds", () =>
   assert.deepEqual(layout.islands, []);
   assert.ok(layout.bounds.width > 0);
   assert.ok(layout.bounds.height > 0);
+});
+
+test("focused exact centers its one matching Hub", () => {
+  const source = graphFixture();
+  const hub = source.hubs.find((candidate) => candidate.edgeKey === "edge-abc");
+  assert.ok(hub);
+  const coordinateKeySet = new Set(hub.coordinateKeys);
+  const graph = {
+    ...source,
+    anchorCoordinateKeys: [...hub.coordinateKeys],
+    coordinates: source.coordinates.filter((coordinate) =>
+      coordinateKeySet.has(coordinate.coordinateKey),
+    ),
+    hubs: [hub],
+    isAllContext: false,
+    queryMode: "exact",
+    spokes: source.spokes.filter((spoke) => spoke.edgeKey === hub.edgeKey),
+  };
+  const layout = layoutProjectContextGraph(graph);
+  const center = layout.nodes.find((node) => node.id === hub.id);
+  assert.ok(center);
+  const centerX = center.x + center.width / 2;
+  const centerY = center.y + center.height / 2;
+
+  for (const node of layout.nodes.filter((node) => node.id !== hub.id)) {
+    assert.ok(
+      Math.hypot(
+        node.x + node.width / 2 - centerX,
+        node.y + node.height / 2 - centerY,
+      ) > 100,
+    );
+  }
+  assert.deepEqual(layout.islands, []);
+});
+
+test("focused contains-all keeps multiple Anchors around a virtual center", () => {
+  const source = graphFixture();
+  const hub = source.hubs.find((candidate) => candidate.edgeKey === "edge-abc");
+  assert.ok(hub);
+  const graph = {
+    ...source,
+    anchorCoordinateKeys: ["requirement:a", "resource:b"],
+    coordinates: source.coordinates.filter((coordinate) =>
+      hub.coordinateKeys.includes(coordinate.coordinateKey),
+    ),
+    hubs: [hub],
+    isAllContext: false,
+    queryMode: "contains_all",
+    spokes: source.spokes.filter((spoke) => spoke.edgeKey === hub.edgeKey),
+  };
+  const layout = layoutProjectContextGraph(graph);
+  const anchors = graph.anchorCoordinateKeys.map((key) =>
+    layout.nodes.find((node) => node.id === `coordinate:${key}`),
+  );
+  assert.equal(anchors.every(Boolean), true);
+  const virtualX =
+    anchors.reduce((sum, node) => sum + node.x + node.width / 2, 0) /
+    anchors.length;
+  const virtualY =
+    anchors.reduce((sum, node) => sum + node.y + node.height / 2, 0) /
+    anchors.length;
+  const hubNode = layout.nodes.find((node) => node.id === hub.id);
+  assert.ok(hubNode);
+  assert.ok(
+    Math.hypot(
+      hubNode.x + hubNode.width / 2 - virtualX,
+      hubNode.y + hubNode.height / 2 - virtualY,
+    ) > 100,
+  );
 });

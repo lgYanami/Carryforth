@@ -322,38 +322,46 @@ pub(crate) fn validate_data(data: &ProjectViewObjectData) -> DomainResult<()> {
             validate_required_long("positioning", &profile.positioning)?;
             validate_required_long("purpose", &profile.purpose)?;
             validate_required_long("problem", &profile.problem)?;
-            validate_required_long("scope", &profile.scope)
+            validate_required_long("scope", &profile.scope)?;
+            validate_summary(&profile.summary)
         }
         ProjectViewObjectData::Goal(goal) => {
             validate_required_short("title", &goal.title)?;
             validate_required_long("desired_outcome", &goal.desired_outcome)?;
-            validate_string_list("directions", &goal.directions)
+            validate_string_list("directions", &goal.directions)?;
+            validate_summary(&goal.summary)
         }
         ProjectViewObjectData::Role(role) => {
             validate_required_short("name", &role.name)?;
             validate_required_long("purpose", &role.purpose)?;
             validate_string_list("responsibilities", &role.responsibilities)?;
-            validate_string_list("boundaries", &role.boundaries)
+            validate_string_list("boundaries", &role.boundaries)?;
+            validate_summary(&role.summary)
         }
         ProjectViewObjectData::Plan(plan) => {
             validate_required_short("title", &plan.title)?;
-            validate_required_long("description", &plan.description)
+            validate_required_long("description", &plan.description)?;
+            validate_summary(&plan.summary)
         }
         ProjectViewObjectData::Stage(stage) => {
             validate_required_short("title", &stage.title)?;
-            validate_required_long("description", &stage.description)
+            validate_required_long("description", &stage.description)?;
+            validate_summary(&stage.summary)
         }
         ProjectViewObjectData::Requirement(requirement) => {
             validate_required_short("title", &requirement.title)?;
-            validate_required_long("description", &requirement.description)
+            validate_required_long("description", &requirement.description)?;
+            validate_summary(&requirement.summary)
         }
         ProjectViewObjectData::Issue(issue) => {
             validate_required_short("title", &issue.title)?;
-            validate_required_long("description", &issue.description)
+            validate_required_long("description", &issue.description)?;
+            validate_summary(&issue.summary)
         }
         ProjectViewObjectData::Work(work) => {
             validate_required_short("title", &work.title)?;
-            validate_required_long("description", &work.description)
+            validate_required_long("description", &work.description)?;
+            validate_summary(&work.summary)
         }
         ProjectViewObjectData::Resource(resource) => {
             validate_required_short("name", &resource.name)?;
@@ -361,6 +369,29 @@ pub(crate) fn validate_data(data: &ProjectViewObjectData) -> DomainResult<()> {
             validate_required_long("description", &resource.description)
         }
     }
+}
+
+/// Validate one optional Project View retrieval summary.
+///
+/// Summaries deliberately have no field-specific length limit. Ordinary
+/// mutation and event envelopes retain their existing aggregate limits.
+pub(crate) fn validate_summary(summary: &Option<String>) -> DomainResult<()> {
+    let Some(summary) = summary else {
+        return Ok(());
+    };
+    if summary.is_empty() {
+        return Err(DomainError::InvalidField {
+            field: "summary",
+            reason: "must be omitted or contain non-empty text".to_owned(),
+        });
+    }
+    if summary.contains('\0') {
+        return Err(DomainError::InvalidField {
+            field: "summary",
+            reason: "must not contain NUL".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_state(state: &ProjectViewState) -> DomainResult<()> {

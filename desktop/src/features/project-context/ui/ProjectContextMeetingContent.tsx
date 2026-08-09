@@ -14,6 +14,7 @@ import type { MeetingParticipant } from "@/shared/api/tauriMeetings";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import { Markdown } from "@/shared/ui/markdown";
 
 const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -92,6 +93,7 @@ export function ProjectContextMeetingContent({
   const actionsAttested =
     verified?.actionFinalization?.actionsAttested ??
     fallback?.actionFinalization?.actionsAttested;
+  const retrievalSummary = verified?.summary;
 
   return (
     <div className="space-y-5" data-testid="project-context-meeting-detail">
@@ -114,6 +116,21 @@ export function ProjectContextMeetingContent({
             fallback?.discussionGoal ??
             "No discussion goal was recorded."}
         </p>
+        {retrievalSummary ? (
+          <div
+            className="mt-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-2"
+            data-testid="project-context-meeting-summary"
+          >
+            <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Summary
+            </p>
+            <Markdown
+              className="mt-2 text-sm leading-6"
+              content={retrievalSummary}
+              interactive={false}
+            />
+          </div>
+        ) : null}
         {finalizing ? (
           <p className="mt-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-muted-foreground">
             Formal discussion and the Board are frozen; Meeting closure is

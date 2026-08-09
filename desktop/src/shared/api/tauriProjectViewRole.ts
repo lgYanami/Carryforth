@@ -66,6 +66,7 @@ export type ProjectCommunityMemberRole = "owner" | "admin" | "member";
 type RawProjectRoleDefinition = {
   role_id: string;
   name: string;
+  summary?: string;
   purpose: string;
   responsibilities: string[];
   boundaries: string[];
@@ -232,6 +233,7 @@ export type RawProjectViewRoleContinuity = {
 export type ProjectRoleDefinition = {
   roleId: string;
   name: string;
+  summary?: string;
   purpose: string;
   responsibilities: string[];
   boundaries: string[];
@@ -597,6 +599,7 @@ export function normalizeRoleContinuity(
   const roles = raw.roles.map<ProjectRoleDefinition>((role) => ({
     roleId: role.role_id,
     name: role.name,
+    summary: role.summary,
     purpose: role.purpose,
     responsibilities: role.responsibilities,
     boundaries: role.boundaries,

@@ -7,10 +7,17 @@ import {
   ExternalLink,
   Loader2,
   RefreshCw,
+  RotateCcw,
+  Save,
+  Trash2,
 } from "lucide-react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import type { MeetingActionFinalizationController } from "@/features/meeting/useMeetingActionFinalizationController";
+import {
+  useMeetingCapability,
+  useUpdateMeetingSummaryMutation,
+} from "@/features/meeting/hooks";
 import {
   meetingDeadlineLabel,
   useMeetingDeadline,
@@ -92,11 +99,77 @@ export function MeetingActionFinalizationCard({
   const [blockReasonCode, setBlockReasonCode] =
     React.useState<MeetingActionBlockReason>("external_operation_failed");
   const [blockReason, setBlockReason] = React.useState("");
+  const capabilityQuery = useMeetingCapability();
+  const {
+    isPending: summaryMutationPending,
+    mutateAsync: updateMeetingSummary,
+  } = useUpdateMeetingSummaryMutation(snapshot.meetingId);
+  const [summaryBaseline, setSummaryBaseline] = React.useState(
+    snapshot.summary ?? "",
+  );
+  const [summaryDraft, setSummaryDraft] = React.useState(
+    snapshot.summary ?? "",
+  );
+  const summaryBaselineRef = React.useRef(snapshot.summary ?? "");
+  const [summarySubmissionId, setSummarySubmissionId] = React.useState<
+    string | null
+  >(null);
+  const [summaryMessage, setSummaryMessage] = React.useState<string | null>(
+    null,
+  );
   const remainingMs = useMeetingDeadline(
     action?.condition === "runnable"
       ? (action.actionDeadlineAtMs ?? null)
       : null,
     onRefresh,
+  );
+
+  React.useEffect(() => {
+    const incoming = snapshot.summary ?? "";
+    const previous = summaryBaselineRef.current;
+    summaryBaselineRef.current = incoming;
+    setSummaryBaseline(incoming);
+    setSummaryDraft((current) => (current === previous ? incoming : current));
+  }, [snapshot.summary]);
+
+  const submitSummary = React.useCallback(
+    async (intended: string | null) => {
+      const submissionId = summarySubmissionId ?? crypto.randomUUID();
+      setSummarySubmissionId(submissionId);
+      setSummaryMessage(null);
+      try {
+        const result = await updateMeetingSummary({
+          submissionId,
+          meetingId: snapshot.meetingId,
+          expectedControlToken: snapshot.host?.controlToken ?? "",
+          mutation:
+            intended === null
+              ? { type: "clear" }
+              : { type: "set", summary: intended },
+        });
+        if (result.status === "indeterminate") {
+          setSummaryMessage(result.message);
+          return;
+        }
+        const canonical = result.summary ?? "";
+        summaryBaselineRef.current = canonical;
+        setSummaryBaseline(canonical);
+        setSummaryDraft(canonical);
+        setSummarySubmissionId(null);
+        setSummaryMessage("Summary saved and verified.");
+      } catch (error) {
+        setSummarySubmissionId(null);
+        setSummaryMessage(
+          error instanceof Error ? error.message : "Could not save summary.",
+        );
+      }
+    },
+    [
+      snapshot.host?.controlToken,
+      snapshot.meetingId,
+      summarySubmissionId,
+      updateMeetingSummary,
+    ],
   );
 
   if (!action) {
@@ -110,6 +183,9 @@ export function MeetingActionFinalizationCard({
   const runnable = action.condition === "runnable";
   const blocked = action.condition === "blocked";
   const deadlineExpired = runnable && remainingMs !== null && remainingMs <= 0;
+  const summaryDirty = summaryDraft !== summaryBaseline;
+  const summaryIndeterminate = summarySubmissionId !== null;
+  const summarySupported = capabilityQuery.data?.supportsSummary === true;
   const disabled =
     actionController.disabled || hostController.disabled || deadlineExpired;
 
@@ -211,6 +287,103 @@ export function MeetingActionFinalizationCard({
           ) : null}
         </div>
       </div>
+
+      {summarySupported ? (
+        <div
+          className="mt-4 rounded-lg border p-3"
+          data-testid="meeting-summary-editor"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <p className="text-sm font-medium">Meeting summary</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                A retrieval hint for future Project Context exploration. It does
+                not replace the final Board or formal Speech.
+              </p>
+            </div>
+            <Badge variant={summaryDirty ? "warning" : "outline"}>
+              {summaryDirty ? "Unsaved summary" : "Saved"}
+            </Badge>
+          </div>
+          <Textarea
+            aria-label="Meeting summary"
+            className="mt-3"
+            disabled={
+              !runnable ||
+              deadlineExpired ||
+              summaryMutationPending ||
+              summaryIndeterminate
+            }
+            onChange={(event) => {
+              setSummaryDraft(event.target.value);
+              setSummaryMessage(null);
+            }}
+            placeholder="What did this Meeting decide or materialize, and when is it worth loading?"
+            rows={4}
+            value={summaryDraft}
+          />
+          {summaryMessage ? (
+            <p
+              className="mt-2 text-xs text-muted-foreground"
+              data-testid="meeting-summary-status"
+            >
+              {summaryMessage}
+            </p>
+          ) : null}
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
+            <Button
+              data-testid="meeting-summary-reset"
+              disabled={
+                !summaryDirty || summaryMutationPending || summaryIndeterminate
+              }
+              onClick={() => {
+                setSummaryDraft(summaryBaseline);
+                setSummaryMessage(null);
+              }}
+              size="sm"
+              variant="ghost"
+            >
+              <RotateCcw className="size-4" />
+              Reset draft
+            </Button>
+            <Button
+              data-testid="meeting-summary-clear"
+              disabled={
+                !runnable ||
+                deadlineExpired ||
+                summaryMutationPending ||
+                summaryIndeterminate ||
+                (summaryBaseline.length === 0 && summaryDraft.length === 0)
+              }
+              onClick={() => void submitSummary(null)}
+              size="sm"
+              variant="outline"
+            >
+              <Trash2 className="size-4" />
+              Clear summary
+            </Button>
+            <Button
+              data-testid="meeting-summary-save"
+              disabled={
+                !runnable ||
+                deadlineExpired ||
+                summaryMutationPending ||
+                !summaryDirty ||
+                summaryDraft.trim().length === 0
+              }
+              onClick={() => void submitSummary(summaryDraft)}
+              size="sm"
+            >
+              {summaryMutationPending ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Save className="size-4" />
+              )}
+              {summaryIndeterminate ? "Retry exact save" : "Save summary"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       {blocked ? (
         <div
@@ -404,6 +577,11 @@ export function MeetingActionFinalizationCard({
               needed recording before normal close have been recorded, or that
               no new recording is required. This does not mean the resulting
               Work has been completed.
+              {summaryDirty
+                ? " The unsaved Meeting summary draft will not be included; continue only if you intend to discard it."
+                : summaryMutationPending || summaryIndeterminate
+                  ? " The Meeting summary write is not yet confirmed; closing remains independent and may leave the previous summary in place."
+                  : ""}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

@@ -1817,6 +1817,7 @@ fn project_object_from_role(role: &RoleDefinition) -> ProjectViewObject {
             responsibilities: role.responsibilities.clone(),
             boundaries: role.boundaries.clone(),
             active: role.active,
+            summary: None,
         }),
         relations: ProjectViewRelations::default(),
     }
@@ -2365,6 +2366,7 @@ mod tests {
             1,
             ProjectViewObjectData::ProjectProfile(ProjectProfile {
                 name: "Lora".to_owned(),
+                summary: None,
                 positioning: "Project-owned continuity".to_owned(),
                 purpose: "Keep project context available across runtimes".to_owned(),
                 problem: "Agent-local continuity disappears".to_owned(),
@@ -2380,6 +2382,7 @@ mod tests {
             1,
             ProjectViewObjectData::Goal(Goal {
                 title: "Continuous project work".to_owned(),
+                summary: None,
                 desired_outcome: "A successor resumes from verified state".to_owned(),
                 directions: vec!["Keep context project-owned".to_owned()],
             }),
@@ -2393,6 +2396,7 @@ mod tests {
             4,
             ProjectViewObjectData::Issue(ProjectIssue {
                 title: "Role context may drift".to_owned(),
+                summary: None,
                 description: "Refresh it before every turn".to_owned(),
                 status: IssueStatus::Open,
                 priority: Priority::High,
@@ -2413,6 +2417,7 @@ mod tests {
             4,
             ProjectViewObjectData::Work(ProjectWork {
                 title: "Refresh Role Brief".to_owned(),
+                summary: None,
                 description: "Resolve the active Assignment at turn start".to_owned(),
                 status: WorkStatus::InProgress,
                 priority: Priority::High,

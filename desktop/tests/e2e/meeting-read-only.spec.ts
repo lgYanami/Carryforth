@@ -178,6 +178,7 @@ function readyMeeting(input: {
     meetingId: input.id,
     title: input.title,
     description: "Review the Meeting Desktop lifecycle and safe room split.",
+    summary: null,
     sourceChannelId: "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9",
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",

@@ -15,6 +15,7 @@ const creatableCapability = {
   status: "creatable" as const,
   relayPubkey: "ab".repeat(32),
   supportsDirectActions: true,
+  supportsSummary: true,
   canCreateDirectActions: true,
 };
 

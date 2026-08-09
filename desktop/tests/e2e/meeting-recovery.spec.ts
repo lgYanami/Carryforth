@@ -34,6 +34,7 @@ function meetingSeed(
     meetingId: id,
     title,
     description: "Recovery boundary fixture",
+    summary: null,
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",

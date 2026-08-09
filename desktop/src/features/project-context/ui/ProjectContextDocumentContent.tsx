@@ -79,7 +79,7 @@ export function ProjectContextDocumentContent({
     currentDocument?.title?.trim() ||
     detail.title?.trim() ||
     "Context Document";
-  const summary = currentDocument?.summary ?? detail.summary;
+  const summary = currentDocument?.summary;
   const canOpenDocument =
     detail.state === "active" && document?.state !== "deleted";
 
@@ -108,9 +108,19 @@ export function ProjectContextDocumentContent({
         </div>
         <h3 className="mt-2 text-base font-semibold leading-tight">{title}</h3>
         {summary ? (
-          <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-            {summary}
-          </p>
+          <section
+            className="mt-3 rounded-lg border border-border/70 bg-muted/20 p-3"
+            data-testid="project-context-document-summary"
+          >
+            <h4 className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Summary
+            </h4>
+            <Markdown
+              className="mt-2 text-sm leading-6"
+              content={summary}
+              interactive={false}
+            />
+          </section>
         ) : null}
         <div className="mt-3 flex flex-wrap gap-2">
           {canOpenDocument ? (

@@ -5,6 +5,7 @@ export type MeetingCapability = {
   relayPubkey: string | null;
   supportsDirectActions: boolean;
   canCreateDirectActions: boolean;
+  supportsSummary: boolean;
 };
 
 export type CreateMeetingInput = {
@@ -224,6 +225,7 @@ export type MeetingSnapshot = {
   meetingId: string;
   title: string;
   description: string | null;
+  summary: string | null;
   sourceChannelId: string | null;
   schemaVersion: 3;
   policy:
@@ -267,6 +269,7 @@ export type MeetingListItem = {
   meetingId: string;
   title: string;
   description: string | null;
+  summary: string | null;
   lifecycle: MeetingLifecycle | null;
   phase: string | null;
   currentSpeakerPubkey: string | null;
@@ -295,6 +298,7 @@ export type MeetingContextInspectorDetail = {
   meetingId: string;
   title: string;
   description: string | null;
+  summary: string | null;
   hostPubkey: string;
   participants: MeetingParticipant[];
   lifecycle: MeetingLifecycle;
@@ -584,6 +588,28 @@ export type MeetingActionFinalizationResult =
       message: string;
     };
 
+export type UpdateMeetingSummaryInput = {
+  /** Stable UUID reused while an indeterminate signed command is retried. */
+  submissionId: string;
+  meetingId: string;
+  expectedControlToken: string;
+  mutation: { type: "set"; summary: string } | { type: "clear" };
+};
+
+export type UpdateMeetingSummaryResult =
+  | {
+      status: "accepted";
+      meetingId: string;
+      eventId: string;
+      summary: string | null;
+    }
+  | {
+      status: "indeterminate";
+      meetingId: string;
+      eventId: string;
+      message: string;
+    };
+
 export type EnsureMeetingActionRenewalInput = {
   meetingId: string;
   actionRunId: string;
@@ -637,6 +663,14 @@ export async function submitMeetingActionFinalization(
     "submit_meeting_action_finalization",
     { input },
   );
+}
+
+export async function updateMeetingSummary(
+  input: UpdateMeetingSummaryInput,
+): Promise<UpdateMeetingSummaryResult> {
+  return invokeTauri<UpdateMeetingSummaryResult>("update_meeting_summary", {
+    input,
+  });
 }
 
 export async function ensureMeetingActionRenewal(

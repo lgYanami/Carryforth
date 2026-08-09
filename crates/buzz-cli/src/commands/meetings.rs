@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use nostr::{Event, PublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::client::{
-    extract_d_tag, extract_p_tags, extract_tag_value, normalize_write_response,
-    print_create_response, BuzzClient,
+    extract_p_tags, extract_tag_value, normalize_write_response, print_create_response, BuzzClient,
 };
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_file_or_stdin, read_or_stdin, sdk_err, validate_hex64};
@@ -20,15 +20,25 @@ const KIND_MEETING_ROUND_STATE: u32 = 42103;
 const KIND_MEETING_FLOOR_SIGNAL: u32 = 42104;
 const KIND_MEETING_BOARD: u32 = buzz_sdk::kind::KIND_MEETING_BOARD;
 const MEETING_METADATA_CHUNK_SIZE: usize = 200;
+const MEETING_SUMMARY_EXTENSION: &str = "buzz-meeting-summary-v1";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct MeetingSummary {
     pub(crate) meeting_id: String,
     pub(crate) title: String,
     pub(crate) description: Option<String>,
+    pub(crate) summary: Option<String>,
     pub(crate) room_kind: String,
     pub(crate) status: &'static str,
     pub(crate) updated_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MeetingRelayInfo {
+    #[serde(default)]
+    supported_extensions: Vec<String>,
+    #[serde(rename = "self")]
+    relay_self: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -576,46 +586,114 @@ async fn require_uniform_v0(client: &BuzzClient, meeting_id: Uuid) -> Result<(),
     }
 }
 
-fn is_meeting_metadata(event: &serde_json::Value) -> bool {
-    extract_tag_value(event, "room_kind") == "meeting"
+async fn meeting_relay_identity(
+    client: &BuzzClient,
+    require_summary_write: bool,
+) -> Result<PublicKey, CliError> {
+    let raw = client.get_public("/info").await?;
+    let info: MeetingRelayInfo = serde_json::from_str(&raw)
+        .map_err(|error| CliError::Other(format!("invalid NIP-11 document: {error}")))?;
+    if require_summary_write
+        && !info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == MEETING_SUMMARY_EXTENSION)
+    {
+        return Err(CliError::Other(format!(
+            "unavailable: Relay does not advertise {MEETING_SUMMARY_EXTENSION}"
+        )));
+    }
+    let relay_self = info
+        .relay_self
+        .ok_or_else(|| CliError::Other("NIP-11 has no canonical Relay `self` key".into()))?;
+    let relay_pubkey = PublicKey::from_hex(&relay_self)
+        .map_err(|error| CliError::Other(format!("invalid NIP-11 Relay `self`: {error}")))?;
+    if relay_pubkey.to_hex() != relay_self {
+        return Err(CliError::Other(
+            "NIP-11 Relay `self` is not canonical lowercase hex".into(),
+        ));
+    }
+    Ok(relay_pubkey)
 }
 
-fn meeting_summary(event: &serde_json::Value) -> Option<MeetingSummary> {
-    if !is_meeting_metadata(event) {
-        return None;
+fn strict_metadata_tag(event: &Event, name: &str) -> Result<Option<String>, CliError> {
+    let values = event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.first().map(String::as_str) == Some(name)).then_some(parts)
+        })
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [parts] if parts.len() == 2 && !parts[1].is_empty() => Ok(Some(parts[1].clone())),
+        _ => Err(CliError::Other(format!(
+            "malformed Relay Meeting metadata {name} tag"
+        ))),
     }
-    let meeting_id = extract_d_tag(event);
-    let title = extract_tag_value(event, "name");
-    if meeting_id.is_empty() || title.is_empty() {
-        return None;
+}
+
+fn verified_meeting_summary(
+    value: serde_json::Value,
+    relay_pubkey: &PublicKey,
+) -> Result<Option<MeetingSummary>, CliError> {
+    let event: Event = serde_json::from_value(value)
+        .map_err(|error| CliError::Other(format!("invalid Meeting metadata event: {error}")))?;
+    event
+        .verify()
+        .map_err(|error| CliError::Other(format!("invalid Meeting metadata signature: {error}")))?;
+    if event.pubkey != *relay_pubkey || event.kind.as_u16() as u32 != KIND_GROUP_METADATA {
+        return Err(CliError::Other(
+            "Meeting metadata was not signed by the advertised Relay".into(),
+        ));
     }
-    let description = extract_tag_value(event, "about");
-    let archived = extract_tag_value(event, "archived") == "true";
-    Some(MeetingSummary {
+    if strict_metadata_tag(&event, "room_kind")?.as_deref() != Some("meeting") {
+        return Ok(None);
+    }
+    let meeting_id = strict_metadata_tag(&event, "d")?
+        .ok_or_else(|| CliError::Other("Meeting metadata has no identity".into()))?;
+    Uuid::parse_str(&meeting_id)
+        .map_err(|_| CliError::Other("Meeting metadata identity is not a UUID".into()))?;
+    let title = strict_metadata_tag(&event, "name")?
+        .ok_or_else(|| CliError::Other("Meeting metadata has no title".into()))?;
+    let description = strict_metadata_tag(&event, "about")?;
+    let summary = strict_metadata_tag(&event, "summary")?;
+    let archived = strict_metadata_tag(&event, "archived")?.as_deref() == Some("true");
+    Ok(Some(MeetingSummary {
         meeting_id,
         title,
-        description: (!description.is_empty()).then_some(description),
+        description,
+        summary,
         room_kind: "meeting".to_string(),
         status: if archived { "ended" } else { "active" },
-        updated_at: event
-            .get("created_at")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-    })
+        updated_at: event.created_at.as_secs(),
+    }))
 }
 
 async fn fetch_meeting_metadata(
     client: &BuzzClient,
     meeting_id: &str,
-) -> Result<Option<serde_json::Value>, CliError> {
+) -> Result<Option<MeetingSummary>, CliError> {
+    let relay_pubkey = meeting_relay_identity(client, false).await?;
     let filter = serde_json::json!({
         "kinds": [KIND_GROUP_METADATA],
+        "authors": [relay_pubkey.to_hex()],
         "#d": [meeting_id],
         "limit": 1,
     });
-    let response = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap_or_default();
-    Ok(events.into_iter().find(is_meeting_metadata))
+    for value in client.query_all(filter).await? {
+        let Some(metadata) = verified_meeting_summary(value, &relay_pubkey)? else {
+            continue;
+        };
+        if metadata.meeting_id != meeting_id {
+            return Err(CliError::Other(
+                "Meeting metadata response contained an unrequested identity".into(),
+            ));
+        }
+        return Ok(Some(metadata));
+    }
+    Ok(None)
 }
 
 /// Read bounded, metadata-only Meeting summaries for Project Context output.
@@ -626,23 +704,19 @@ pub(crate) async fn fetch_meeting_context_summaries(
     client: &BuzzClient,
     requested: &BTreeSet<Uuid>,
 ) -> Result<BTreeMap<Uuid, MeetingSummary>, CliError> {
+    let relay_pubkey = meeting_relay_identity(client, false).await?;
     let mut summaries = BTreeMap::new();
     let requested_ids = requested.iter().copied().collect::<Vec<_>>();
     for chunk in requested_ids.chunks(MEETING_METADATA_CHUNK_SIZE) {
         let ids = chunk.iter().map(Uuid::to_string).collect::<Vec<_>>();
         let filter = serde_json::json!({
             "kinds": [KIND_GROUP_METADATA],
+            "authors": [relay_pubkey.to_hex()],
             "#d": ids,
             "limit": chunk.len(),
         });
-        let response = client.query(&filter).await?;
-        let events: Vec<serde_json::Value> = serde_json::from_str(&response).map_err(|error| {
-            CliError::Other(format!(
-                "Meeting metadata response is not a JSON event array: {error}"
-            ))
-        })?;
-        for event in events {
-            let Some(summary) = meeting_summary(&event) else {
+        for event in client.query_all(filter).await? {
+            let Some(summary) = verified_meeting_summary(event, &relay_pubkey)? else {
                 continue;
             };
             let Ok(meeting_id) = Uuid::parse_str(&summary.meeting_id) else {
@@ -788,15 +862,20 @@ pub async fn cmd_list_meetings(
     limit: u32,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
+    let relay_pubkey = meeting_relay_identity(client, false).await?;
     let filter = serde_json::json!({
         "kinds": [KIND_GROUP_METADATA],
+        "authors": [relay_pubkey.to_hex()],
     });
     let events = client.query_paginated(filter, limit).await?;
-    let meetings: Vec<MeetingSummary> = events
-        .iter()
-        .filter_map(meeting_summary)
-        .filter(|meeting| include_ended || meeting.status == "active")
-        .collect();
+    let mut meetings = Vec::new();
+    for event in events {
+        if let Some(meeting) = verified_meeting_summary(event, &relay_pubkey)? {
+            if include_ended || meeting.status == "active" {
+                meetings.push(meeting);
+            }
+        }
+    }
 
     match format {
         OutputFormat::Json => println!(
@@ -810,6 +889,7 @@ pub async fn cmd_list_meetings(
                     serde_json::json!({
                         "meeting_id": meeting.meeting_id,
                         "title": meeting.title,
+                        "summary": meeting.summary,
                         "status": meeting.status,
                     })
                 })
@@ -825,9 +905,11 @@ pub async fn cmd_list_meetings(
 
 pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(), CliError> {
     let meeting_id = parse_uuid(meeting_id)?.to_string();
+    let relay_pubkey = meeting_relay_identity(client, false).await?;
     let filters = [
         serde_json::json!({
             "kinds": [KIND_GROUP_METADATA],
+            "authors": [relay_pubkey.to_hex()],
             "#d": [&meeting_id],
             "limit": 1,
         }),
@@ -847,14 +929,14 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
     ];
     let response = client.query_multi(&filters).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap_or_default();
-    let Some(metadata) = events
-        .iter()
-        .find(|event| {
-            event.get("kind").and_then(serde_json::Value::as_u64)
-                == Some(KIND_GROUP_METADATA as u64)
-                && is_meeting_metadata(event)
-        })
-        .and_then(meeting_summary)
+    let metadata_value = events.iter().find(|event| {
+        event.get("kind").and_then(serde_json::Value::as_u64) == Some(KIND_GROUP_METADATA as u64)
+    });
+    let Some(metadata) = metadata_value
+        .cloned()
+        .map(|value| verified_meeting_summary(value, &relay_pubkey))
+        .transpose()?
+        .flatten()
     else {
         println!("null");
         return Ok(());
@@ -905,6 +987,7 @@ pub async fn cmd_show_meeting(client: &BuzzClient, meeting_id: &str) -> Result<(
         "meeting_id": metadata.meeting_id,
         "title": metadata.title,
         "description": metadata.description,
+        "summary": metadata.summary,
         "room_kind": metadata.room_kind,
         "status": metadata.status,
         "host_pubkey": create
@@ -1368,6 +1451,94 @@ fn meeting_action_fence<'a>(
         action_window: action.action_window_epoch,
         board_event_id: &action.board_event_id,
     }
+}
+
+pub async fn cmd_update_meeting_summary(
+    client: &BuzzClient,
+    meeting_id: &str,
+    summary: Option<&str>,
+    clear_summary: bool,
+) -> Result<(), CliError> {
+    let meeting_id = parse_uuid(meeting_id)?;
+    let intended = match (summary, clear_summary) {
+        (Some(value), false) => {
+            let value = read_or_stdin(value)?;
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err(CliError::Usage(
+                    "--summary must contain non-blank text without NUL".into(),
+                ));
+            }
+            Some(value)
+        }
+        (None, true) => None,
+        _ => {
+            return Err(CliError::Usage(
+                "choose exactly one of --summary or --clear-summary".into(),
+            ));
+        }
+    };
+    meeting_relay_identity(client, true).await?;
+    let (_, action) = meeting_action_context(client, meeting_id).await?;
+    if action.condition != "runnable" {
+        return Err(CliError::Conflict(
+            "Meeting action run is not runnable".into(),
+        ));
+    }
+    let current = fetch_meeting_metadata(client, &meeting_id.to_string())
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("meeting not found: {meeting_id}")))?;
+    if current.summary == intended {
+        println!(
+            "{}",
+            serde_json::json!({
+                "meeting_id": meeting_id,
+                "accepted": true,
+                "changed": false,
+                "summary": intended,
+            })
+        );
+        return Ok(());
+    }
+
+    let mutation = match intended.as_deref() {
+        Some(value) => buzz_sdk::MeetingSummaryMutation::Set(value),
+        None => buzz_sdk::MeetingSummaryMutation::Clear,
+    };
+    let builder = buzz_sdk::build_meeting_summary_update(buzz_sdk::MeetingSummaryUpdateParams {
+        session_id: meeting_id,
+        mutation,
+        action_fence: meeting_action_fence(&action),
+    })
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let event_id = event.id.to_hex();
+    let response = submit_v1_event(client, meeting_id, event).await?;
+
+    for attempt in 0..3 {
+        let observed = fetch_meeting_metadata(client, &meeting_id.to_string()).await?;
+        if observed
+            .as_ref()
+            .and_then(|metadata| metadata.summary.as_ref())
+            == intended.as_ref()
+        {
+            let mut output = serde_json::from_str::<Value>(&normalize_write_response(&response))
+                .unwrap_or_else(|_| serde_json::json!({ "accepted": true }));
+            if let Some(object) = output.as_object_mut() {
+                object.insert("meeting_id".into(), serde_json::json!(meeting_id));
+                object.insert("event_id".into(), Value::String(event_id));
+                object.insert("summary".into(), serde_json::json!(intended));
+                object.insert("readback_verified".into(), Value::Bool(true));
+            }
+            println!("{output}");
+            return Ok(());
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(50_u64 << attempt)).await;
+        }
+    }
+    Err(CliError::Other(format!(
+        "Meeting summary command {event_id} was accepted but canonical metadata readback is not yet confirmed"
+    )))
 }
 
 async fn submit_meeting_action_builder(
@@ -3010,6 +3181,11 @@ pub async fn dispatch(
             limit,
         } => cmd_list_meetings(client, include_ended, limit, format).await,
         MeetingsCmd::Show { meeting } => cmd_show_meeting(client, &meeting).await,
+        MeetingsCmd::Update {
+            meeting,
+            summary,
+            clear_summary,
+        } => cmd_update_meeting_summary(client, &meeting, summary.as_deref(), clear_summary).await,
         MeetingsCmd::Board { command } => {
             use crate::MeetingBoardCmd;
             match command {
@@ -3465,6 +3641,38 @@ mod tests {
             "3",
             Some(buzz_sdk::MEETING_V1_POLICY)
         ))
+        .is_err());
+    }
+
+    #[test]
+    fn meeting_metadata_summary_requires_the_advertised_relay_signature() {
+        let meeting_id = Uuid::new_v4();
+        let relay = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_GROUP_METADATA as u16), "")
+            .tags([
+                Tag::parse(["d", &meeting_id.to_string()]).expect("d"),
+                Tag::parse(["name", "Summary review"]).expect("name"),
+                Tag::parse(["room_kind", "meeting"]).expect("room kind"),
+                Tag::parse(["summary", "Decision and verified outputs."]).expect("summary"),
+            ])
+            .sign_with_keys(&relay)
+            .expect("sign metadata");
+        let parsed = verified_meeting_summary(
+            serde_json::to_value(&event).expect("serialize metadata"),
+            &relay.public_key(),
+        )
+        .expect("verify metadata")
+        .expect("Meeting metadata");
+        assert_eq!(parsed.meeting_id, meeting_id.to_string());
+        assert_eq!(
+            parsed.summary.as_deref(),
+            Some("Decision and verified outputs.")
+        );
+
+        assert!(verified_meeting_summary(
+            serde_json::to_value(&event).expect("serialize metadata"),
+            &Keys::generate().public_key()
+        )
         .is_err());
     }
 

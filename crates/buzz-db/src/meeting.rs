@@ -77,6 +77,8 @@ pub struct MeetingRecord {
     pub floor_revision: i64,
     /// Persisted winner-selection policy version.
     pub floor_policy_version: String,
+    /// Optional Meeting-owned retrieval summary.
+    pub summary: Option<String>,
 }
 
 /// Persisted protocol discriminator used before policy-specific dispatch.
@@ -953,6 +955,7 @@ pub async fn create_meeting_tx(
             current_round: 1,
             floor_revision: 0,
             floor_policy_version: "uniform-v0".to_string(),
+            summary: None,
         },
         participants,
     ))
@@ -1363,7 +1366,8 @@ pub async fn get_meeting(
     let row = sqlx::query(
         "SELECT session_id, create_event_id, host_pubkey, source_channel_id, \
                 schema_version, status, created_at, ended_at, ended_by, end_event_id, \
-                current_round, floor_revision, floor_policy_version \
+                current_round, floor_revision, floor_policy_version, \
+                to_jsonb(meeting_sessions)->>'summary' AS summary \
          FROM meeting_sessions \
          WHERE community_id = $1 AND session_id = $2",
     )
@@ -1387,6 +1391,7 @@ pub async fn get_meeting(
         current_round: row.try_get("current_round")?,
         floor_revision: row.try_get("floor_revision")?,
         floor_policy_version: row.try_get("floor_policy_version")?,
+        summary: row.try_get("summary")?,
     })
 }
 

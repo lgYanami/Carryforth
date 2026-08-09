@@ -7,9 +7,10 @@
 use buzz_core::kind::{KIND_MEETING_BOARD, KIND_MEETING_END, KIND_MEETING_STATE};
 use buzz_core::CommunityId;
 use buzz_sdk::{
-    MeetingV2ActionBeginParams, MeetingV2ActionBlockParams, MeetingV2ActionCommandParams,
-    MeetingV2ActionRunFence, MeetingV2ActionsEndFence, MeetingV2ActionsEndParams,
-    MeetingV2BoardActionParams, MeetingV2CreateParams, MeetingV2EndOutcome,
+    MeetingSummaryMutation, MeetingSummaryUpdateParams, MeetingV2ActionBeginParams,
+    MeetingV2ActionBlockParams, MeetingV2ActionCommandParams, MeetingV2ActionRunFence,
+    MeetingV2ActionsEndFence, MeetingV2ActionsEndParams, MeetingV2BoardActionParams,
+    MeetingV2CreateParams, MeetingV2EndOutcome,
 };
 use nostr::{Event, EventBuilder, Keys, Kind, Tag};
 use serde_json::{json, Value};
@@ -470,6 +471,65 @@ async fn eight_agents_complete_one_direct_action_lifecycle() {
         Some(2)
     );
 
+    let retrieval_summary =
+        "Records the accepted direct-action result and when its final Board is worth loading.";
+    let stale_summary = buzz_sdk::build_meeting_summary_update(MeetingSummaryUpdateParams {
+        session_id: meeting_id,
+        mutation: MeetingSummaryMutation::Set(retrieval_summary),
+        action_fence: MeetingV2ActionRunFence {
+            action_run_id,
+            action_window: 1,
+            board_event_id: &board_event_id,
+        },
+    })
+    .expect("build stale-window Meeting summary")
+    .sign_with_keys(&moderator)
+    .expect("sign stale-window Meeting summary");
+    let (status, body) = post_event(&moderator, &stale_summary).await;
+    assert_rejected(status, &body);
+
+    let participant_summary = buzz_sdk::build_meeting_summary_update(MeetingSummaryUpdateParams {
+        session_id: meeting_id,
+        mutation: MeetingSummaryMutation::Set(retrieval_summary),
+        action_fence: MeetingV2ActionRunFence {
+            action_run_id,
+            action_window: 2,
+            board_event_id: &board_event_id,
+        },
+    })
+    .expect("build participant Meeting summary")
+    .sign_with_keys(&participant_a)
+    .expect("sign participant Meeting summary");
+    let (status, body) = post_event(&participant_a, &participant_summary).await;
+    assert_rejected(status, &body);
+
+    let summary = buzz_sdk::build_meeting_summary_update(MeetingSummaryUpdateParams {
+        session_id: meeting_id,
+        mutation: MeetingSummaryMutation::Set(retrieval_summary),
+        action_fence: MeetingV2ActionRunFence {
+            action_run_id,
+            action_window: 2,
+            board_event_id: &board_event_id,
+        },
+    })
+    .expect("build Meeting summary")
+    .sign_with_keys(&moderator)
+    .expect("sign Meeting summary");
+    let (status, body) = post_event(&moderator, &summary).await;
+    assert_accepted(status, &body);
+    let (status, body) = post_event(&moderator, &summary).await;
+    assert_accepted(status, &body);
+    let stored_summary: Option<String> = sqlx::query_scalar(
+        "SELECT summary FROM meeting_sessions \
+         WHERE community_id = $1 AND session_id = $2",
+    )
+    .bind(community.as_uuid())
+    .bind(meeting_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read Meeting retrieval summary");
+    assert_eq!(stored_summary.as_deref(), Some(retrieval_summary));
+
     let end = buzz_sdk::build_meeting_v2_actions_end(MeetingV2ActionsEndParams {
         session_id: meeting_id,
         create_event_id: &create.id.to_hex(),
@@ -493,11 +553,12 @@ async fn eight_agents_complete_one_direct_action_lifecycle() {
     let terminal: (
         String,
         Option<String>,
+        Option<String>,
         String,
         Option<String>,
         Option<Vec<u8>>,
     ) = sqlx::query_as(
-        "SELECT session.status, session.terminal_outcome, runtime.runtime_phase, \
+        "SELECT session.status, session.terminal_outcome, session.summary, runtime.runtime_phase, \
                     run.terminal_status, run.completion_event_id \
              FROM meeting_sessions session \
              JOIN meeting_v2_bootstrap_state runtime \
@@ -520,6 +581,7 @@ async fn eight_agents_complete_one_direct_action_lifecycle() {
         (
             "ended".to_owned(),
             Some("closed".to_owned()),
+            Some(retrieval_summary.to_owned()),
             "ended".to_owned(),
             Some("completed_closed".to_owned()),
             Some(end.id.as_bytes().to_vec()),

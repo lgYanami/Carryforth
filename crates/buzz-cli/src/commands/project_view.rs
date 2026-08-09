@@ -1,6 +1,7 @@
 //! `buzz project-view` — typed reads and optimistic-concurrency mutations.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use buzz_core::PublicKey;
 use buzz_project_view::v2::{CommunityMemberRole, RoleLevel};
@@ -10,7 +11,7 @@ use buzz_project_view::v3::{
     ProjectContextReference, ProjectObjectCommandV3, ProjectObjectRequestV3, ProjectViewEntryV3,
     ProjectViewInitializeV3, ProjectViewInitializeV3Request, UpdateProjectObjectV3,
 };
-use buzz_project_view::ProjectViewObjectType;
+use buzz_project_view::{Patch, ProjectViewObjectType};
 use buzz_sdk::project_view_v3::{
     build_initialize_command as build_initialize_v3,
     build_project_object_command as build_project_object_command_v3, PROJECT_VIEW_V3_EXTENSION,
@@ -29,6 +30,8 @@ use crate::commands::project_view_snapshot::{
 use crate::error::CliError;
 use crate::validate::{read_file_or_stdin, sdk_err};
 use crate::{OutputFormat, ProjectViewCmd, ProjectViewContextCmd, ProjectViewV3ClientCmd};
+
+const OBJECT_READBACK_ATTEMPTS: usize = 3;
 
 #[derive(Serialize)]
 struct ProjectViewV3Output<'a> {
@@ -89,6 +92,40 @@ struct ProjectViewObjectReceipt {
     object_id: Uuid,
     object_revision: u64,
     deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SummaryWriteExpectation {
+    Unchanged,
+    Set(String),
+    Clear,
+}
+
+impl SummaryWriteExpectation {
+    fn from_patch(patch: &Patch<String>) -> Self {
+        match patch {
+            Patch::Unchanged => Self::Unchanged,
+            Patch::Set(value) => Self::Set(value.clone()),
+            Patch::Clear => Self::Clear,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectReceiptConfirmation {
+    CurrentVerified,
+    Superseded { current_object_revision: u64 },
+}
+
+fn report_superseded_confirmation(confirmation: ObjectReceiptConfirmation) {
+    if let ObjectReceiptConfirmation::Superseded {
+        current_object_revision,
+    } = confirmation
+    {
+        eprintln!(
+            "Project View write was accepted, but object revision {current_object_revision} has already superseded the committed revision; reread current state before relying on its summary."
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,15 +361,17 @@ async fn submit_context_replacement(
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt =
         parse_object_receipt(&raw, &event, "update", object.object_type, object.id, false)?;
-    confirm_object_receipt(
+    let confirmation = confirm_object_receipt(
         client,
         identity,
         object.object_type,
         object.id,
         None,
+        &SummaryWriteExpectation::Unchanged,
         &receipt,
     )
     .await?;
+    report_superseded_confirmation(confirmation);
     println!("{}", normalize_write_response(&raw));
     Ok(())
 }
@@ -415,6 +454,11 @@ async fn cmd_create(
     }
     let data = read_json_value(data_path, "data")?;
     let object = create_input_v3(object_type, object_id, data)?;
+    let summary_expectation = object
+        .summary()
+        .map_or(SummaryWriteExpectation::Unchanged, |summary| {
+            SummaryWriteExpectation::Set(summary.to_owned())
+        });
     let mut command = ProjectObjectCommandV3::new(
         expected_project_revision,
         acting_assignment_id,
@@ -425,15 +469,17 @@ async fn cmd_create(
         client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?;
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, "create", object_type, object_id, false)?;
-    confirm_object_receipt(
+    let confirmation = confirm_object_receipt(
         client,
         identity,
         object_type,
         object_id,
         Some(&event),
+        &summary_expectation,
         &receipt,
     )
     .await?;
+    report_superseded_confirmation(confirmation);
     print_object_write_result(&event, &receipt)
 }
 
@@ -454,6 +500,7 @@ async fn cmd_update(
         None
     };
     let update = update_input_v3(object_type, object_id, patch)?;
+    let summary_expectation = SummaryWriteExpectation::from_patch(update.summary_patch());
     let command = ProjectObjectCommandV3::new(
         expected_project_revision,
         acting_assignment_id,
@@ -463,7 +510,17 @@ async fn cmd_update(
         client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?;
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, "update", object_type, object_id, false)?;
-    confirm_object_receipt(client, identity, object_type, object_id, None, &receipt).await?;
+    let confirmation = confirm_object_receipt(
+        client,
+        identity,
+        object_type,
+        object_id,
+        None,
+        &summary_expectation,
+        &receipt,
+    )
+    .await?;
+    report_superseded_confirmation(confirmation);
     println!("{}", normalize_write_response(&raw));
     Ok(())
 }
@@ -494,7 +551,17 @@ async fn cmd_delete(
         client.sign_event_exact(build_project_object_command_v3(command).map_err(sdk_err)?)?;
     let raw = submit_mutation(client, event.clone()).await?;
     let receipt = parse_object_receipt(&raw, &event, "delete", object_type, object_id, true)?;
-    confirm_object_receipt(client, identity, object_type, object_id, None, &receipt).await?;
+    let confirmation = confirm_object_receipt(
+        client,
+        identity,
+        object_type,
+        object_id,
+        None,
+        &SummaryWriteExpectation::Unchanged,
+        &receipt,
+    )
+    .await?;
+    report_superseded_confirmation(confirmation);
     println!("{}", normalize_write_response(&raw));
     Ok(())
 }
@@ -834,37 +901,74 @@ async fn confirm_object_receipt(
     object_type: ProjectViewObjectType,
     object_id: Uuid,
     expected_source: Option<&Event>,
+    summary_expectation: &SummaryWriteExpectation,
     receipt: &ProjectViewObjectReceipt,
-) -> Result<(), CliError> {
-    let snapshot = read_verified_v3_snapshot(client, identity).await?;
-    if snapshot.meta().project_revision < receipt.project_revision {
-        return Err(integrity_error(
-            "v3 metadata projection is older than the successful mutation receipt",
-        ));
-    }
-    let entry = snapshot
-        .entry(object_id)
-        .ok_or_else(|| integrity_error("successful v3 mutation has no object projection"))?;
-    if entry.object_type() != object_type
-        || entry.object_revision() < receipt.object_revision
-        || receipt.deleted != matches!(entry, ProjectViewEntryV3::Tombstone(_))
-    {
-        return Err(integrity_error(
-            "v3 object projection does not confirm the mutation receipt",
-        ));
-    }
-    if let Some(event) = expected_source {
-        let source = snapshot
-            .object_source(object_id)
-            .or_else(|| snapshot.role_source(object_id))
-            .ok_or_else(|| integrity_error("successful v3 mutation has no active object source"))?;
-        if source.change_id.to_hex() != event.id.to_hex() {
+) -> Result<ObjectReceiptConfirmation, CliError> {
+    for attempt in 0..OBJECT_READBACK_ATTEMPTS {
+        let snapshot = read_verified_v3_snapshot(client, identity).await?;
+        let entry = snapshot.entry(object_id);
+        let projection_is_behind = snapshot.meta().project_revision < receipt.project_revision
+            || entry.is_none_or(|entry| entry.object_revision() < receipt.object_revision);
+        if projection_is_behind {
+            if attempt + 1 < OBJECT_READBACK_ATTEMPTS {
+                let backoff_ms = 25_u64 << attempt;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
             return Err(integrity_error(
-                "v3 object projection source does not match the submitted event",
+                "v3 mutation readback remained older than the successful receipt after bounded retries; current summary is uncertain",
             ));
         }
+        let entry = entry.ok_or_else(|| {
+            integrity_error("successful v3 mutation has no object projection after readback")
+        })?;
+        if entry.object_type() != object_type {
+            return Err(integrity_error(
+                "v3 object projection does not confirm the mutation receipt",
+            ));
+        }
+        if entry.object_revision() > receipt.object_revision {
+            return Ok(ObjectReceiptConfirmation::Superseded {
+                current_object_revision: entry.object_revision(),
+            });
+        }
+        if receipt.deleted != matches!(entry, ProjectViewEntryV3::Tombstone(_)) {
+            return Err(integrity_error(
+                "v3 object projection does not confirm the mutation receipt",
+            ));
+        }
+        if let ProjectViewEntryV3::Active(object) = entry {
+            let summary_matches = match summary_expectation {
+                SummaryWriteExpectation::Unchanged => true,
+                SummaryWriteExpectation::Set(expected) => {
+                    object.data.summary() == Some(expected.as_str())
+                }
+                SummaryWriteExpectation::Clear => object.data.summary().is_none(),
+            };
+            if !summary_matches {
+                return Err(integrity_error(
+                    "v3 object projection summary does not match the successful mutation",
+                ));
+            }
+        }
+        if let Some(event) = expected_source {
+            let source = snapshot
+                .object_source(object_id)
+                .or_else(|| snapshot.role_source(object_id))
+                .ok_or_else(|| {
+                    integrity_error("successful v3 mutation has no active object source")
+                })?;
+            if source.change_id.to_hex() != event.id.to_hex() {
+                return Err(integrity_error(
+                    "v3 object projection source does not match the submitted event",
+                ));
+            }
+        }
+        return Ok(ObjectReceiptConfirmation::CurrentVerified);
     }
-    Ok(())
+    Err(integrity_error(
+        "v3 mutation readback exhausted without a confirmation result",
+    ))
 }
 
 fn print_object_write_result(
@@ -970,6 +1074,56 @@ mod tests {
         .expect("typed create input");
         assert_eq!(object.id(), id);
         assert_eq!(object.object_type(), ProjectViewObjectType::Goal);
+        assert_eq!(object.summary(), None);
+    }
+
+    #[test]
+    fn create_and_update_preserve_summary_wire_semantics() {
+        let id = Uuid::new_v4();
+        let object = create_input_v3(
+            ProjectViewObjectType::Goal,
+            id,
+            json!({
+                "title": "Ship",
+                "summary": "Explains when this Goal is worth loading",
+                "desired_outcome": "A working CLI",
+                "directions": []
+            }),
+        )
+        .expect("create summary");
+        assert_eq!(
+            object.summary(),
+            Some("Explains when this Goal is worth loading")
+        );
+
+        assert!(create_input_v3(
+            ProjectViewObjectType::Goal,
+            Uuid::new_v4(),
+            json!({
+                "title": "Ship",
+                "summary": null,
+                "desired_outcome": "A working CLI",
+                "directions": []
+            }),
+        )
+        .is_err());
+
+        let set = update_input_v3(
+            ProjectViewObjectType::Goal,
+            id,
+            json!({"summary": "New retrieval summary"}),
+        )
+        .expect("summary SET");
+        assert_eq!(
+            SummaryWriteExpectation::from_patch(set.summary_patch()),
+            SummaryWriteExpectation::Set("New retrieval summary".to_owned())
+        );
+        let clear = update_input_v3(ProjectViewObjectType::Goal, id, json!({"summary": null}))
+            .expect("summary CLEAR");
+        assert_eq!(
+            SummaryWriteExpectation::from_patch(clear.summary_patch()),
+            SummaryWriteExpectation::Clear
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ export type ProjectContextGraphCoordinate = {
   coordinateKey: string;
   coordinate?: ProjectContextCoordinate;
   displayTitle: string;
+  summary?: string;
   stableId: string;
   state: ProjectContextDetailState;
   typeLabel: string;
@@ -46,6 +47,7 @@ export type ProjectContextGraphModel = {
   coordinates: ProjectContextGraphCoordinate[];
   hubs: ProjectContextGraphHub[];
   isAllContext: boolean;
+  queryMode: ProjectContextQueryResult["query"]["type"];
   spokes: ProjectContextGraphSpoke[];
   islands: ProjectContextGraphIsland[];
 };
@@ -132,6 +134,7 @@ function coordinatePresentation(
     coordinate: detail?.coordinate,
     displayTitle:
       detail?.title?.trim() || `${typeLabel} ${shortStableId(stableId)}`,
+    summary: detail?.summary,
     stableId,
     state: detail?.state ?? "unavailable",
     typeLabel,
@@ -267,6 +270,7 @@ export function buildProjectContextGraph(
     isAllContext:
       result.query.type === "contains_all" &&
       result.query.coordinates.length === 0,
+    queryMode: result.query.type,
     spokes,
     islands: deriveIslands(hubs),
   };

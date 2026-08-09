@@ -8,7 +8,7 @@ import {
   projectContextSpokeId,
 } from "./graph.ts";
 
-function projectViewDetail(key, objectType, state = "active") {
+function projectViewDetail(key, objectType, state = "active", summary) {
   const objectId = key.slice(key.indexOf(":") + 1);
   return {
     coordinateKey: key,
@@ -19,6 +19,7 @@ function projectViewDetail(key, objectType, state = "active") {
     },
     state,
     title: `${objectType} ${objectId}`,
+    summary,
   };
 }
 
@@ -129,6 +130,35 @@ test("binary Edge becomes one Hub and two undirected presentation Spokes", () =>
   assert.equal(
     graph.coordinates.some((coordinate) => coordinate.stableId === "context-1"),
     false,
+  );
+});
+
+test("Project View source summary is preserved on the graph Coordinate", () => {
+  const graph = buildProjectContextGraph(
+    result(
+      [
+        {
+          edgeKey: "edge-ab",
+          coordinateKeys: [A, B],
+          contextDocumentIds: ["context-1"],
+        },
+      ],
+      [
+        projectViewDetail(
+          A,
+          "requirement",
+          "active",
+          "Relevant when choosing the progressive retrieval boundary",
+        ),
+        projectViewDetail(B, "resource"),
+      ],
+    ),
+  );
+
+  assert.equal(
+    graph.coordinates.find((coordinate) => coordinate.coordinateKey === A)
+      ?.summary,
+    "Relevant when choosing the progressive retrieval boundary",
   );
 });
 

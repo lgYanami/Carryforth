@@ -97,6 +97,11 @@ export function ProjectContextCoordinateNode({
               {data.coordinate.stableId}
             </span>
           </span>
+          {data.coordinate.summary ? (
+            <span className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+              {data.coordinate.summary}
+            </span>
+          ) : null}
           {isTombstoned || isUnavailable ? (
             <span className="mt-1.5 flex items-center gap-1 text-2xs font-medium">
               {isTombstoned ? (

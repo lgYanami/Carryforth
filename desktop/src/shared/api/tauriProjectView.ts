@@ -91,6 +91,7 @@ export type ProjectViewWorkStatus =
   | "cancelled";
 type RawProjectProfileData = {
   name: string;
+  summary?: string;
   positioning: string;
   purpose: string;
   problem: string;
@@ -99,12 +100,14 @@ type RawProjectProfileData = {
 
 type RawGoalData = {
   title: string;
+  summary?: string;
   desired_outcome: string;
   directions: string[];
 };
 
 type RawRoleData = {
   name: string;
+  summary?: string;
   purpose: string;
   responsibilities: string[];
   boundaries: string[];
@@ -113,18 +116,21 @@ type RawRoleData = {
 
 type RawPlanData = {
   title: string;
+  summary?: string;
   description: string;
   status: ProjectViewPlanStatus;
 };
 
 type RawStageData = {
   title: string;
+  summary?: string;
   description: string;
   status: ProjectViewStageStatus;
 };
 
 type RawRequirementData = {
   title: string;
+  summary?: string;
   description: string;
   status: ProjectViewRequirementStatus;
   priority: ProjectViewPriority;
@@ -132,6 +138,7 @@ type RawRequirementData = {
 
 type RawIssueData = {
   title: string;
+  summary?: string;
   description: string;
   status: ProjectViewIssueStatus;
   priority: ProjectViewPriority;
@@ -139,6 +146,7 @@ type RawIssueData = {
 
 type RawWorkData = {
   title: string;
+  summary?: string;
   description: string;
   status: ProjectViewWorkStatus;
   priority: ProjectViewPriority;
@@ -226,6 +234,7 @@ export type RawProjectViewLoadResult =
 export type ProjectProfileData = RawProjectProfileData;
 export type ProjectGoalData = {
   title: string;
+  summary?: string;
   desiredOutcome: string;
   directions: string[];
 };
@@ -394,6 +403,8 @@ export type ProjectViewMutationIntent =
       expectedProjectRevision: number;
       objectId: string;
       object: ProjectViewWritableObject;
+      /** Undefined keeps the current summary; string sets it; null clears it. */
+      summaryPatch?: string | null;
       actingAssignmentId?: string;
     }
   | {
@@ -420,6 +431,8 @@ export type RawProjectViewMutationResult =
       object_id?: string;
       object_revision?: number;
       deleted?: boolean;
+      confirmation?: "current_verified" | "superseded";
+      current_object_revision?: number;
     }
   | {
       status: "conflict";
@@ -436,6 +449,8 @@ export type ProjectViewMutationResult =
       objectId?: string;
       objectRevision?: number;
       deleted?: boolean;
+      confirmation: "current_verified" | "superseded";
+      currentObjectRevision?: number;
     }
   | {
       status: "conflict";

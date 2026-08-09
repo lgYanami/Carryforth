@@ -2,6 +2,7 @@ import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   KIND_MEETING_END,
+  KIND_MEETING_SUMMARY_COMMAND,
   KIND_MEETING_STATE,
   KIND_STREAM_MESSAGE,
 } from "@/shared/constants/kinds";
@@ -28,7 +29,12 @@ export function meetingLiveFilter(
   }
 
   return {
-    kinds: [KIND_STREAM_MESSAGE, KIND_MEETING_STATE, KIND_MEETING_END],
+    kinds: [
+      KIND_STREAM_MESSAGE,
+      KIND_MEETING_STATE,
+      KIND_MEETING_END,
+      KIND_MEETING_SUMMARY_COMMAND,
+    ],
     "#h": [normalizedMeetingId],
     limit: 256,
     since: Math.max(0, nowSeconds - MEETING_LIVE_LOOKBACK_SECONDS),

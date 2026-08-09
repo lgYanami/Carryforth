@@ -470,7 +470,7 @@ pub enum ProjectViewCmd {
         /// Explicit UUID v4; omitted to generate a fresh ID.
         #[arg(long)]
         id: Option<Uuid>,
-        /// JSON file containing the typed object body and relations, or `-`.
+        /// Typed body/relations JSON, or `-`; `summary` is optional retrieval metadata.
         #[arg(long)]
         data: String,
         /// Initial Role level. Valid only when object_type is `role`.
@@ -487,7 +487,7 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
-        /// JSON file containing the typed patch, or `-` for stdin.
+        /// Typed patch, or `-`; omit `summary` to keep, use text to set, or null to clear.
         #[arg(long)]
         patch: String,
     },
@@ -1722,6 +1722,22 @@ pub enum MeetingsCmd {
         /// Meeting UUID
         #[arg(long)]
         meeting: String,
+    },
+    /// Update the Meeting-owned retrieval summary in Action Finalization
+    Update {
+        /// Meeting UUID
+        #[arg(long)]
+        meeting: String,
+        /// Complete summary text, or `-` for stdin
+        #[arg(
+            long,
+            conflicts_with = "clear_summary",
+            required_unless_present = "clear_summary"
+        )]
+        summary: Option<String>,
+        /// Explicitly clear the current summary
+        #[arg(long, conflicts_with = "summary", required_unless_present = "summary")]
+        clear_summary: bool,
     },
     /// Read or maintain the current Meeting V2 board
     Board {
@@ -3675,6 +3691,51 @@ mod tests {
     }
 
     #[test]
+    fn meeting_summary_update_requires_exactly_one_mutation() {
+        let meeting = "00000000-0000-4000-8000-000000000001";
+        for args in [
+            vec![
+                "buzz",
+                "meetings",
+                "update",
+                "--meeting",
+                meeting,
+                "--summary",
+                "Decision and verified outputs.",
+            ],
+            vec![
+                "buzz",
+                "meetings",
+                "update",
+                "--meeting",
+                meeting,
+                "--clear-summary",
+            ],
+        ] {
+            Cli::try_parse_from(args).expect("parse Meeting summary mutation");
+        }
+
+        for args in [
+            vec!["buzz", "meetings", "update", "--meeting", meeting],
+            vec![
+                "buzz",
+                "meetings",
+                "update",
+                "--meeting",
+                meeting,
+                "--summary",
+                "Decision",
+                "--clear-summary",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "ambiguous Meeting summary mutation must fail"
+            );
+        }
+    }
+
+    #[test]
     fn meeting_v1_baton_command_surface_is_parseable() {
         let id = "aa".repeat(32);
         let participant = "bb".repeat(32);
@@ -4072,7 +4133,8 @@ mod tests {
                 "offer",
                 "participants",
                 "say",
-                "show"
+                "show",
+                "update"
             ]
         );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
@@ -4165,7 +4227,7 @@ mod tests {
             ("feed", 1),
             ("issues", 4),
             ("media", 1),
-            ("meetings", 16),
+            ("meetings", 17),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),

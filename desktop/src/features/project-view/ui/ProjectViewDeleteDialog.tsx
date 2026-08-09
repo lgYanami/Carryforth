@@ -118,7 +118,15 @@ export function ProjectViewDeleteDialog({
         void reviewLatest();
         return;
       }
-      toast.success(`${projectViewObjectTypeLabel(object.objectType)} deleted`);
+      if (result.confirmation === "superseded") {
+        toast.warning(
+          `${projectViewObjectTypeLabel(object.objectType)} changed again after deletion; review the current object.`,
+        );
+      } else {
+        toast.success(
+          `${projectViewObjectTypeLabel(object.objectType)} deleted`,
+        );
+      }
       onOpenChange(false);
       onDeleted();
     } catch (caught) {

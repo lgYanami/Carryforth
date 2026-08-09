@@ -142,9 +142,6 @@ function ObjectDetails({ object }: { object: ProjectViewObject }) {
     case "resource":
       return (
         <>
-          {object.data.summary ? (
-            <Detail label="Summary">{object.data.summary}</Detail>
-          ) : null}
           <Detail label="Resource kind">
             {formatProjectViewTerm(object.data.resourceKind)}
           </Detail>
@@ -351,6 +348,9 @@ function ProjectViewInspectorContent({
         ) : null}
 
         <div className="space-y-4">
+          {object.data.summary ? (
+            <Detail label="Retrieval summary">{object.data.summary}</Detail>
+          ) : null}
           <ObjectDetails object={object} />
         </div>
 

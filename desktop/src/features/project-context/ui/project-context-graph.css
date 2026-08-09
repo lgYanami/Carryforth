@@ -26,7 +26,7 @@
   border-radius: 2rem;
   background:
     radial-gradient(
-      circle at 18% 12%,
+      circle at 50% 50%,
       hsl(var(--project-context-island-hue) 76% 58% / 0.13),
       transparent 34%
     ),
@@ -44,7 +44,7 @@
   border-color: hsl(var(--project-context-island-hue) 78% 72% / 0.28);
   background:
     radial-gradient(
-      circle at 18% 12%,
+      circle at 50% 50%,
       hsl(var(--project-context-island-hue) 74% 70% / 0.12),
       transparent 34%
     ),

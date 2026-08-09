@@ -39,6 +39,9 @@ pub struct ProjectViewTombstone {
 }
 
 /// One occupied object ID in canonical Project View state.
+// Keep the established public legacy state shape; boxing this variant would be
+// a separate API migration unrelated to the additive summary field.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectViewEntry {
     /// An active object with its complete business data.
