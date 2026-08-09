@@ -38,6 +38,7 @@ pub(crate) struct MeetingContextActionSummary {
 pub(crate) struct MeetingContextRecord {
     pub(crate) title: String,
     pub(crate) discussion_goal: Option<String>,
+    pub(crate) summary: Option<String>,
     pub(crate) lifecycle: &'static str,
     pub(crate) terminal_outcome: Option<String>,
     pub(crate) host_pubkey: String,
@@ -189,6 +190,7 @@ fn context_read_from_load(
     MeetingContextRead::Observed(Box::new(MeetingContextRecord {
         title: snapshot.title.clone(),
         discussion_goal: snapshot.description.clone(),
+        summary: snapshot.summary.clone(),
         lifecycle: meeting_lifecycle_label(snapshot.lifecycle),
         terminal_outcome: end.map(|end| end.outcome.clone()),
         host_pubkey: snapshot.host_pubkey.clone(),
@@ -277,6 +279,7 @@ pub async fn get_meeting_context_detail(
             meeting_id: snapshot.meeting_id.clone(),
             title: snapshot.title.clone(),
             description: snapshot.description.clone(),
+            summary: snapshot.summary.clone(),
             host_pubkey: snapshot.host_pubkey.clone(),
             participants: snapshot.participants.clone(),
             lifecycle: snapshot.lifecycle,

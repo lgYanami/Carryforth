@@ -84,6 +84,7 @@ function meetingSeed(
     meetingId: MEETING_ID,
     title: "Human Floor lifecycle",
     description: "Exercise the verified Desktop Floor boundary.",
+    summary: null,
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",

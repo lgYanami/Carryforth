@@ -184,6 +184,8 @@ function terminalMeetingSnapshot(): MeetingSnapshot {
     meetingId: MEETING_ID,
     title: "Memory boundary review",
     description: "Agree the first durable Agent memory slice.",
+    summary:
+      "Defines the durable Agent-memory boundary and the resulting Project Context relationship.",
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",
@@ -311,6 +313,8 @@ function meetingContextResult(): ProjectContextQueryResult {
         coordinate: { type: "meeting", meetingId: MEETING_ID },
         state: "terminal",
         title: "Memory boundary review",
+        summary:
+          "Defines the durable Agent-memory boundary and the resulting Project Context relationship.",
         status: "closed",
         meeting: {
           discussionGoal: "Agree the first durable Agent memory slice.",
@@ -1058,6 +1062,9 @@ test("Meeting Coordinate stays metadata-first and opens the Community-readable M
   await expect(meeting).toContainText(
     "Agree the first durable Agent memory slice.",
   );
+  await expect(
+    meeting.getByTestId("project-context-meeting-summary"),
+  ).toContainText("Defines the durable Agent-memory boundary");
   await expect(meeting).toContainText("completed_closed");
   await expect(meeting).not.toContainText("Private to the Meeting route");
   await expect(page).toHaveURL(/selected=coordinate/);

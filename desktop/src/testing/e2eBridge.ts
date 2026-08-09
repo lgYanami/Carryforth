@@ -90,6 +90,8 @@ import type {
   MeetingLoadResult,
   MeetingSnapshot,
   MeetingSpeech,
+  UpdateMeetingSummaryInput,
+  UpdateMeetingSummaryResult,
 } from "@/shared/api/tauriMeetings";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
@@ -381,6 +383,10 @@ type E2eConfig = {
     /** Process then lose this many Human host command receipts. */
     meetingHostIndeterminateResponses?: number;
     meetingHostActionDelayMs?: number;
+    /** Definitive failures for successive Meeting summary submissions. */
+    meetingSummaryErrors?: Array<string | null>;
+    /** Process then lose this many Meeting summary receipts. */
+    meetingSummaryIndeterminateResponses?: number;
     /** Verified Project View command result returned to the View screen. */
     projectView?: RawProjectViewLoadResult;
     /** Community-isolated Project View results keyed by applied Relay URL. */
@@ -2563,6 +2569,10 @@ const mockMeetingActionSubmissions = new Map<
   string,
   MeetingActionFinalizationResult
 >();
+const mockMeetingSummarySubmissions = new Map<
+  string,
+  UpdateMeetingSummaryResult
+>();
 
 function nextMeetingStateEventId(revision: number): string {
   return revision.toString(16).padStart(64, "0");
@@ -3238,6 +3248,71 @@ async function handleMeetingActionFinalization(
   return accepted;
 }
 
+async function handleMeetingSummaryUpdate(
+  args: { input: UpdateMeetingSummaryInput },
+  config?: E2eConfig,
+): Promise<UpdateMeetingSummaryResult> {
+  const input = args.input;
+  const configuredError = config?.mock?.meetingSummaryErrors?.shift();
+  if (configuredError) throw new Error(configuredError);
+
+  const prior = mockMeetingSummarySubmissions.get(input.submissionId);
+  if (prior?.status === "accepted") return prior;
+
+  const seed = getMockMeetingSeed(input.meetingId, config);
+  if (seed?.result.status !== "ready") {
+    throw new Error("Meeting summary is unavailable");
+  }
+  const snapshot = seed.result.snapshot;
+  const actor = getMockMemberPubkey(config).toLowerCase();
+  const actorParticipant = snapshot.participants.find(
+    (participant) => participant.pubkey === actor,
+  );
+  if (
+    snapshot.lifecycle !== "finalizing_actions" ||
+    snapshot.action?.condition !== "runnable" ||
+    snapshot.action.terminalStatus !== null ||
+    actor !== snapshot.moderatorPubkey ||
+    actorParticipant?.participantType !== "human"
+  ) {
+    throw new Error(
+      "only the frozen Human moderator can update the summary during action finalization",
+    );
+  }
+  if (snapshot.host?.controlToken !== input.expectedControlToken) {
+    throw new Error(
+      "Meeting action-finalization control changed; refresh before submitting",
+    );
+  }
+  const intended =
+    input.mutation.type === "set" ? input.mutation.summary : null;
+  if (intended !== null && intended.trim().length === 0) {
+    throw new Error("Meeting summary must not be blank");
+  }
+  snapshot.summary = intended;
+  const eventId = input.submissionId.replaceAll("-", "").padEnd(64, "0");
+  const accepted: UpdateMeetingSummaryResult = {
+    status: "accepted",
+    meetingId: input.meetingId,
+    eventId,
+    summary: intended,
+  };
+  mockMeetingSummarySubmissions.set(input.submissionId, accepted);
+  if ((config?.mock?.meetingSummaryIndeterminateResponses ?? 0) > 0) {
+    if (config?.mock) {
+      config.mock.meetingSummaryIndeterminateResponses =
+        (config.mock.meetingSummaryIndeterminateResponses ?? 1) - 1;
+    }
+    return {
+      status: "indeterminate",
+      meetingId: input.meetingId,
+      eventId,
+      message: "relay unreachable: response was lost after submission",
+    };
+  }
+  return accepted;
+}
+
 async function handleMeetingFloorAction(
   args: { input: MeetingFloorActionInput },
   config?: E2eConfig,
@@ -3584,6 +3659,7 @@ function mockMeetingListItem(
       meetingId: seed.id,
       title: seed.title,
       description: snapshot.description,
+      summary: snapshot.summary,
       lifecycle: snapshot.lifecycle,
       phase: snapshot.phase,
       currentSpeakerPubkey: snapshot.currentSpeakerPubkey,
@@ -3620,6 +3696,7 @@ function mockMeetingListItem(
     meetingId: seed.id,
     title: seed.title,
     description: null,
+    summary: null,
     lifecycle: null,
     phase: null,
     currentSpeakerPubkey: null,
@@ -3686,6 +3763,7 @@ async function handleCreateMeeting(
     meetingId,
     title,
     description: input.description ?? null,
+    summary: null,
     sourceChannelId: input.sourceChannelId ?? null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",
@@ -11902,6 +11980,7 @@ export function maybeInstallE2eTauriMocks() {
             status: "readable",
             relayPubkey: activeConfig?.mock?.relaySelf ?? "ab".repeat(32),
             supportsDirectActions: true,
+            supportsSummary: true,
             canCreateDirectActions: false,
           }
         );
@@ -11923,6 +12002,11 @@ export function maybeInstallE2eTauriMocks() {
       case "submit_meeting_action_finalization":
         return handleMeetingActionFinalization(
           payload as { input: MeetingActionFinalizationInput },
+          activeConfig,
+        );
+      case "update_meeting_summary":
+        return handleMeetingSummaryUpdate(
+          payload as { input: UpdateMeetingSummaryInput },
           activeConfig,
         );
       case "ensure_meeting_action_renewal":
@@ -11991,6 +12075,7 @@ export function maybeInstallE2eTauriMocks() {
             meetingId: snapshot.meetingId,
             title: snapshot.title,
             description: snapshot.description,
+            summary: snapshot.summary,
             hostPubkey: snapshot.hostPubkey,
             participants: structuredClone(snapshot.participants),
             lifecycle: snapshot.lifecycle,

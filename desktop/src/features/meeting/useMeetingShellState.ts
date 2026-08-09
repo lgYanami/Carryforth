@@ -39,6 +39,7 @@ export function useMeetingRoomPartition(channels: Channel[]) {
         meetingId: room.id,
         title: room.name,
         description: null,
+        summary: null,
         lifecycle: "initializing",
         phase: "initializing",
         currentSpeakerPubkey: null,

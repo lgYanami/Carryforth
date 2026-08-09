@@ -1009,6 +1009,13 @@ pub async fn emit_group_discovery_events(
 ) -> anyhow::Result<()> {
     let channel = state.db.get_channel(tenant.community(), channel_id).await?;
     let members = state.db.get_members(tenant.community(), channel_id).await?;
+    let meeting_summary = if channel.room_kind == "meeting" {
+        buzz_db::meeting::get_meeting(state.db.writer(), tenant.community(), channel_id)
+            .await?
+            .summary
+    } else {
+        None
+    };
 
     let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
     let group_id = channel_id.to_string();
@@ -1020,6 +1027,9 @@ pub async fn emit_group_discovery_events(
             if !desc.is_empty() {
                 tags.push(Tag::parse(["about", desc])?);
             }
+        }
+        if let Some(ref summary) = meeting_summary {
+            tags.push(Tag::parse(["summary", summary])?);
         }
         if channel.visibility == "private" {
             tags.push(Tag::parse(["private"])?);
@@ -3000,12 +3010,15 @@ pub async fn publish_nip43_member_removed(
     publish_nip43_delta(tenant, state, 8001, target_pubkey_hex, "member-removed").await
 }
 
-/// Reconcile channels missing any relay-authored NIP-29 discovery projection.
+/// Reconcile missing relay-authored NIP-29 discovery projections and stale
+/// Meeting summary metadata.
 ///
 /// This handles the case where channels were created via direct SQL inserts
 /// (e.g. test seed scripts), or where the relay committed a channel and
 /// stopped between post-commit discovery emissions. Emits a fresh complete
-/// kind:39000/39001/39002 set whenever any member of the set is absent.
+/// kind:39000/39001/39002 set whenever any member of the set is absent. For a
+/// Meeting, it also re-emits the set when the current kind:39000 summary does
+/// not match the Meeting-owned source field.
 ///
 /// This startup scan is the durable recovery path for Meeting V0 discovery;
 /// membership notifications are useful wake-ups, never the sole source of
@@ -3054,7 +3067,50 @@ pub async fn reconcile_channel_events(
         let discovery_complete = [39000, 39001, 39002]
             .iter()
             .all(|kind| existing_kinds.contains(kind));
-        if !discovery_complete {
+        let meeting_summary_current = if channel.room_kind == "meeting" {
+            let expected = match buzz_db::meeting::get_meeting(
+                state.db.writer(),
+                tenant.community(),
+                channel.id,
+            )
+            .await
+            {
+                Ok(meeting) => meeting.summary,
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id = %channel.id,
+                        error = %error,
+                        "reconcile: failed to load Meeting summary"
+                    );
+                    continue;
+                }
+            };
+            let observed = existing
+                .iter()
+                .find(|stored| stored.event.kind.as_u16() as u32 == 39000)
+                .and_then(|stored| {
+                    let values = stored
+                        .event
+                        .tags
+                        .iter()
+                        .filter_map(|tag| {
+                            let parts = tag.as_slice();
+                            (parts.first().map(String::as_str) == Some("summary")).then_some(parts)
+                        })
+                        .collect::<Vec<_>>();
+                    match values.as_slice() {
+                        [] => Some(None),
+                        [parts] if parts.len() == 2 && !parts[1].is_empty() => {
+                            Some(Some(parts[1].clone()))
+                        }
+                        _ => None,
+                    }
+                });
+            observed == Some(expected)
+        } else {
+            true
+        };
+        if !discovery_complete || !meeting_summary_current {
             if let Err(e) = emit_group_discovery_events(tenant, state, channel.id).await {
                 tracing::warn!(
                     channel_id = %channel.id,

@@ -166,6 +166,9 @@ pub async fn handle_command(
         KIND_MEETING_ACTION_COMMAND => {
             super::meeting_baton::handle_action_command(tenant, state, &event, &auth).await
         }
+        KIND_MEETING_SUMMARY_COMMAND => {
+            handle_meeting_summary_update(tenant, state, &event, &auth).await
+        }
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
@@ -173,6 +176,144 @@ pub async fn handle_command(
         _ => Err(IngestError::Rejected(format!(
             "unknown command kind: {kind}"
         ))),
+    }
+}
+
+async fn handle_meeting_summary_update(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let session_id = parse_single_uuid_tag(event, "h", "meeting session id")?;
+    if auth
+        .channel_ids()
+        .is_some_and(|ids| !ids.contains(&session_id))
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: token not authorized for this meeting".into(),
+        ));
+    }
+    validate_meeting_tag_schema(
+        event,
+        &[
+            "h",
+            "v",
+            "policy",
+            "action",
+            "action-run",
+            "action-window",
+            "board",
+        ],
+        &[],
+        &[],
+    )?;
+    if require_single_tag(event, "v")? != buzz_sdk::MEETING_V2_SCHEMA_VERSION {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting summary command must use schema version 3".into(),
+        ));
+    }
+    if require_single_tag(event, "policy")? != buzz_sdk::MEETING_V2_ACTIONS_POLICY {
+        return Err(IngestError::Rejected(format!(
+            "invalid: Meeting summary command policy must be {}",
+            buzz_sdk::MEETING_V2_ACTIONS_POLICY
+        )));
+    }
+    let action_run_id = parse_single_uuid_tag(event, "action-run", "Meeting action run id")?;
+    let action_window_epoch = require_single_tag(event, "action-window")?
+        .parse::<i64>()
+        .map_err(|_| {
+            IngestError::Rejected("invalid: Meeting action window must be an integer".into())
+        })?;
+    if action_window_epoch <= 0 {
+        return Err(IngestError::Rejected(
+            "invalid: Meeting action window must be positive".into(),
+        ));
+    }
+    let board_event_id = decode_event_id(
+        &require_single_tag(event, "board")?,
+        "Meeting final Board event id",
+    )?;
+    let mutation = match require_single_tag(event, "action")?.as_str() {
+        "set" => {
+            if event.content.trim().is_empty() || event.content.contains('\0') {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting summary SET requires non-blank text without NUL".into(),
+                ));
+            }
+            buzz_db::meeting_v2_actions::MeetingSummaryMutation::Set(event.content.clone())
+        }
+        "clear" => {
+            if !event.content.is_empty() {
+                return Err(IngestError::Rejected(
+                    "invalid: Meeting summary CLEAR content must be empty".into(),
+                ));
+            }
+            buzz_db::meeting_v2_actions::MeetingSummaryMutation::Clear
+        }
+        other => {
+            return Err(IngestError::Rejected(format!(
+                "invalid: unsupported Meeting summary action {other}"
+            )));
+        }
+    };
+
+    let mut tx = match persist_command_event(state, tenant, event, Some(session_id)).await? {
+        PersistResult::Duplicate => {
+            if let Err(error) = emit_group_discovery_events(tenant, state, session_id).await {
+                warn!(meeting = %session_id, "Meeting summary duplicate discovery repair failed: {error}");
+            }
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+    let update = buzz_db::meeting_v2_actions::update_meeting_summary_tx(
+        &mut tx,
+        buzz_db::meeting_v2_actions::MeetingSummaryUpdateTxParams {
+            community_id: tenant.community(),
+            session_id,
+            actor_pubkey: event.pubkey.as_bytes(),
+            fence: buzz_db::meeting_v2_actions::ActionRunFence {
+                action_run_id,
+                action_window_epoch,
+                board_event_id,
+            },
+            mutation,
+        },
+    )
+    .await
+    .map_err(map_meeting_summary_db_error)?;
+    tx.commit().await.map_err(|error| {
+        IngestError::Internal(format!("error: commit Meeting summary update: {error}"))
+    })?;
+
+    if let Err(error) = emit_group_discovery_events(tenant, state, session_id).await {
+        warn!(meeting = %session_id, "Meeting summary discovery emission failed: {error}");
+    }
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "meeting_id": session_id,
+                "changed": update.changed,
+                "summary": update.summary,
+            })
+        ),
+    })
+}
+
+fn map_meeting_summary_db_error(error: DbError) -> IngestError {
+    match error {
+        DbError::InvalidData(message) if message.starts_with("conflict:") => {
+            IngestError::Rejected(message)
+        }
+        other => map_meeting_db_error(other),
     }
 }
 

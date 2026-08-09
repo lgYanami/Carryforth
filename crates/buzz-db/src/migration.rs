@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 54);
+        assert_eq!(migrations.len(), 55);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1322,6 +1322,31 @@ mod tests {
                 "migration 0054 must not contain destructive statement {destructive}"
             );
         }
+
+        assert_eq!(migrations[54].version, 55);
+        let meeting_summary = migrations[54].sql.as_str();
+        for required in [
+            "ADD COLUMN summary TEXT",
+            "chk_meeting_summary_non_empty",
+            "summary IS NULL OR BTRIM(summary) <> ''",
+        ] {
+            assert!(
+                meeting_summary.contains(required),
+                "migration 0055 must contain {required}"
+            );
+        }
+        for destructive in [
+            "DELETE FROM",
+            "TRUNCATE",
+            "DROP TABLE",
+            "DROP COLUMN",
+            "UPDATE ",
+        ] {
+            assert!(
+                !meeting_summary.contains(destructive),
+                "migration 0055 must not contain destructive statement {destructive}"
+            );
+        }
     }
 
     #[test]
@@ -1329,6 +1354,8 @@ mod tests {
         let schema = include_str!("../../../schema/schema.sql");
 
         for required in [
+            "summary            TEXT",
+            "chk_meeting_summary_non_empty",
             "project_context_edge_enabled BOOLEAN NOT NULL DEFAULT FALSE",
             "CREATE TABLE project_context_edge_state",
             "CREATE TABLE project_context_edges",

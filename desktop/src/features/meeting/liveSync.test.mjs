@@ -10,6 +10,7 @@ import {
 const STATE_KIND = 42103;
 const END_KIND = 42101;
 const SPEECH_KIND = 9;
+const SUMMARY_KIND = 42113;
 
 async function flushPromises() {
   await Promise.resolve();
@@ -47,7 +48,7 @@ function relayEvent(kind) {
 
 test("Meeting live filters always carry exactly one channel scope", () => {
   assert.deepEqual(meetingLiveFilter(" meeting-a ", 100), {
-    kinds: [SPEECH_KIND, STATE_KIND, END_KIND],
+    kinds: [SPEECH_KIND, STATE_KIND, END_KIND, SUMMARY_KIND],
     "#h": ["meeting-a"],
     limit: 256,
     since: 95,

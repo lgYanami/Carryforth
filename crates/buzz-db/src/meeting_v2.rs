@@ -1631,6 +1631,20 @@ pub async fn create_meeting_v2_tx(
 }
 
 impl Db {
+    /// Return whether the Meeting source-summary column is available.
+    pub async fn meeting_summary_schema_ready(&self) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_attribute \
+                WHERE attrelid = to_regclass('meeting_sessions') \
+                  AND attname = 'summary' AND NOT attisdropped \
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Return whether the complete Meeting V2 runtime catalog is present.
     ///
     /// This is a deployment probe, not a per-Session authorization check. It

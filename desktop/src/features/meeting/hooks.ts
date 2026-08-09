@@ -23,15 +23,18 @@ import {
   submitMeetingActionFinalization,
   submitMeetingFloorAction,
   submitMeetingHostAction,
+  updateMeetingSummary,
   type MeetingActionFinalizationInput,
   type MeetingFloorActionInput,
   type MeetingHostActionInput,
   type MeetingListItem,
   type MeetingSpeechCursor,
+  type UpdateMeetingSummaryInput,
 } from "@/shared/api/tauriMeetings";
 import type { Channel } from "@/shared/api/types";
 import {
   KIND_MEETING_END,
+  KIND_MEETING_SUMMARY_COMMAND,
   KIND_MEETING_STATE,
   KIND_STREAM_MESSAGE,
 } from "@/shared/constants/kinds";
@@ -321,6 +324,46 @@ export function useMeetingActionFinalizationMutation(meetingId: string) {
   });
 }
 
+export function useUpdateMeetingSummaryMutation(meetingId: string) {
+  const { activeCommunity } = useCommunities();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: UpdateMeetingSummaryInput) =>
+      updateMeetingSummary(input),
+    onSuccess: async (result) => {
+      if (result.status !== "accepted") return;
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: [...meetingQueryRoot(activeCommunity?.id), "directory"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: meetingContextDetailQueryKey(
+            activeCommunity?.id,
+            meetingId,
+          ),
+        }),
+        queryClient.invalidateQueries({
+          predicate: (candidate) =>
+            candidate.queryKey[0] === "project-context" &&
+            typeof candidate.queryKey[1] === "string" &&
+            candidate.queryKey[1].startsWith(
+              `${activeCommunity?.id ?? "none"}-`,
+            ),
+        }),
+      ]);
+    },
+    onError: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: meetingSnapshotQueryKey(activeCommunity?.id, meetingId),
+      });
+    },
+  });
+}
+
 export function useMeetingSpeeches(input: {
   meetingId: string;
   enabled: boolean;
@@ -394,7 +437,11 @@ export function useMeetingLiveSync(
           }),
         );
       }
-      if (signals.has(KIND_MEETING_STATE) || signals.has(KIND_MEETING_END)) {
+      if (
+        signals.has(KIND_MEETING_STATE) ||
+        signals.has(KIND_MEETING_END) ||
+        signals.has(KIND_MEETING_SUMMARY_COMMAND)
+      ) {
         invalidations.push(
           queryClient.invalidateQueries({
             queryKey: meetingActivitiesQueryKey(communityId, meetingId),

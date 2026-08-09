@@ -513,6 +513,8 @@ pub const KIND_MEETING_BOARD: u32 = 42110;
 pub const KIND_MEETING_BOARD_COMMAND: u32 = 42111;
 /// Moderator-signed Meeting V2 action-finalization command.
 pub const KIND_MEETING_ACTION_COMMAND: u32 = 42112;
+/// Moderator-signed Meeting retrieval-summary metadata command.
+pub const KIND_MEETING_SUMMARY_COMMAND: u32 = 42113;
 
 // Agent job protocol (43000–43999)
 // Not using NIP-90 kinds (5000–6999) — Buzz requires auth chains (depth ≤ 3, breadth ≤ 10).
@@ -734,6 +736,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEETING_BOARD,
     KIND_MEETING_BOARD_COMMAND,
     KIND_MEETING_ACTION_COMMAND,
+    KIND_MEETING_SUMMARY_COMMAND,
     KIND_JOB_REQUEST,
     KIND_JOB_ACCEPTED,
     KIND_JOB_PROGRESS,
@@ -939,6 +942,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_MEETING_GRANT_SIGNAL
             | KIND_MEETING_BOARD_COMMAND
             | KIND_MEETING_ACTION_COMMAND
+            | KIND_MEETING_SUMMARY_COMMAND
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
@@ -1119,6 +1123,8 @@ mod tests {
         assert!(!is_relay_only_kind(KIND_MEETING_BOARD_COMMAND));
         assert!(is_command_kind(KIND_MEETING_ACTION_COMMAND));
         assert!(!is_relay_only_kind(KIND_MEETING_ACTION_COMMAND));
+        assert!(is_command_kind(KIND_MEETING_SUMMARY_COMMAND));
+        assert!(!is_relay_only_kind(KIND_MEETING_SUMMARY_COMMAND));
         for kind in [
             KIND_MEETING_SPEECH_INTENT,
             KIND_MEETING_MODERATOR_COMMAND,

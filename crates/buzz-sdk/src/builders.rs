@@ -14,9 +14,9 @@ use buzz_core::{
         KIND_MEETING_END, KIND_MEETING_FLOOR_CLAIM, KIND_MEETING_FLOOR_SIGNAL,
         KIND_MEETING_GRANT_SIGNAL, KIND_MEETING_HUMAN_FLOOR_REQUEST,
         KIND_MEETING_MODERATOR_COMMAND, KIND_MEETING_OFFER_RESPONSE, KIND_MEETING_SPEECH_INTENT,
-        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
-        KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_MEETING_SUMMARY_COMMAND, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+        KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT,
+        KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -141,6 +141,25 @@ pub struct MeetingV2ActionRunFence<'a> {
     pub action_window: u64,
     /// Exact frozen final Board event for this action run.
     pub board_event_id: &'a str,
+}
+
+/// Source-owned Meeting retrieval-summary mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingSummaryMutation<'a> {
+    /// Replace the current retrieval summary with the exact supplied text.
+    Set(&'a str),
+    /// Clear the current retrieval summary.
+    Clear,
+}
+
+/// Inputs for updating Meeting retrieval metadata in an active Action window.
+pub struct MeetingSummaryUpdateParams<'a> {
+    /// Stable Meeting UUID.
+    pub session_id: Uuid,
+    /// SET or CLEAR mutation.
+    pub mutation: MeetingSummaryMutation<'a>,
+    /// Current action-run fences.
+    pub action_fence: MeetingV2ActionRunFence<'a>,
 }
 
 /// Inputs for entering Meeting V2 action finalization.
@@ -2835,6 +2854,30 @@ fn meeting_v2_action_run_tags(
     ])
 }
 
+/// Build a fenced Meeting retrieval-summary metadata command (kind 42113).
+pub fn build_meeting_summary_update(
+    params: MeetingSummaryUpdateParams<'_>,
+) -> Result<EventBuilder, SdkError> {
+    let (action, content) = match params.mutation {
+        MeetingSummaryMutation::Set(summary) => {
+            if summary.trim().is_empty() {
+                return Err(SdkError::InvalidInput(
+                    "Meeting summary must not be empty".into(),
+                ));
+            }
+            if summary.contains('\0') {
+                return Err(SdkError::InvalidInput(
+                    "Meeting summary must not contain NUL".into(),
+                ));
+            }
+            ("set", summary)
+        }
+        MeetingSummaryMutation::Clear => ("clear", ""),
+    };
+    let tags = meeting_v2_action_run_tags(params.session_id, action, params.action_fence)?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_MEETING_SUMMARY_COMMAND as u16), content).tags(tags))
+}
+
 /// Build the `FINALIZE_ACTIONS`/`begin` command for an action-capable Meeting V2.
 pub fn build_meeting_v2_action_begin(
     params: MeetingV2ActionBeginParams<'_>,
@@ -5331,6 +5374,57 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag.as_slice()[0] == "action-plan"));
+    }
+
+    #[test]
+    fn meeting_summary_update_is_fenced_metadata_not_control() {
+        let session_id = uuid();
+        let action_run_id = uuid();
+        let board_event_id = "bb".repeat(32);
+        let fence = MeetingV2ActionRunFence {
+            action_run_id,
+            action_window: 2,
+            board_event_id: &board_event_id,
+        };
+        let set = sign(
+            build_meeting_summary_update(MeetingSummaryUpdateParams {
+                session_id,
+                mutation: MeetingSummaryMutation::Set("Decision and materialized outputs."),
+                action_fence: fence,
+            })
+            .unwrap(),
+        );
+        assert_eq!(set.kind.as_u16() as u32, KIND_MEETING_SUMMARY_COMMAND);
+        assert_eq!(set.content, "Decision and materialized outputs.");
+        assert!(has_tag(&set, "h", &session_id.to_string()));
+        assert!(has_tag(&set, "policy", MEETING_V2_ACTIONS_POLICY));
+        assert!(has_tag(&set, "action", "set"));
+        assert!(has_tag(&set, "action-run", &action_run_id.to_string()));
+        assert!(has_tag(&set, "action-window", "2"));
+        assert!(has_tag(&set, "board", &board_event_id));
+
+        let clear = sign(
+            build_meeting_summary_update(MeetingSummaryUpdateParams {
+                session_id,
+                mutation: MeetingSummaryMutation::Clear,
+                action_fence: fence,
+            })
+            .unwrap(),
+        );
+        assert!(has_tag(&clear, "action", "clear"));
+        assert!(clear.content.is_empty());
+        assert!(build_meeting_summary_update(MeetingSummaryUpdateParams {
+            session_id,
+            mutation: MeetingSummaryMutation::Set(" \n "),
+            action_fence: fence,
+        })
+        .is_err());
+        assert!(build_meeting_summary_update(MeetingSummaryUpdateParams {
+            session_id,
+            mutation: MeetingSummaryMutation::Set("bad\0summary"),
+            action_fence: fence,
+        })
+        .is_err());
     }
 
     #[test]

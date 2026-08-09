@@ -780,6 +780,7 @@ export function MeetingScreen({ meetingId }: { meetingId: string }) {
             actionStarted={readySnapshot.action !== null}
             end={readySnapshot.end}
             profiles={profiles}
+            summary={readySnapshot.summary}
           />
         </div>
       ) : null}

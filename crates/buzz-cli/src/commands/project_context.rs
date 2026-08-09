@@ -1008,10 +1008,14 @@ fn meeting_coordinate_output(
     };
     CoordinateOutput {
         coordinate: ProjectContextCoordinate::Meeting { meeting_id },
-        state: "terminal",
+        state: if summary.status == "ended" {
+            "terminal"
+        } else {
+            "active"
+        },
         title: Some(summary.title.clone()),
         description: summary.description.clone(),
-        summary: None,
+        summary: summary.summary.clone(),
         status: Some(json!(summary.status)),
         object_revision: None,
         document_revision: None,
@@ -1020,9 +1024,11 @@ fn meeting_coordinate_output(
             .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0)),
         updated_by: None,
         meeting_fetch: Some(MeetingFetchCommands {
-            metadata: format!("buzz meetings show {meeting_id}"),
-            board: format!("buzz meetings board get {meeting_id}"),
-            speech: format!("buzz --format compact meetings history {meeting_id} --limit 200"),
+            metadata: format!("buzz meetings show --meeting {meeting_id}"),
+            board: format!("buzz meetings board get --meeting {meeting_id}"),
+            speech: format!(
+                "buzz --format compact meetings history --meeting {meeting_id} --limit 200"
+            ),
         }),
         unavailable_reason: None,
     }
@@ -1720,6 +1726,7 @@ mod tests {
                 meeting_id: meeting_id.to_string(),
                 title: "Architecture review".to_owned(),
                 description: Some("Set the first delivery boundary".to_owned()),
+                summary: Some("Decision and materialized architecture context.".to_owned()),
                 room_kind: "meeting".to_owned(),
                 status: "ended",
                 updated_at: 1_800_000_000,
@@ -1730,14 +1737,18 @@ mod tests {
         assert_eq!(value["coordinate"]["meeting_id"], meeting_id.to_string());
         assert_eq!(value["state"], "terminal");
         assert_eq!(value["title"], "Architecture review");
+        assert_eq!(
+            value["summary"],
+            "Decision and materialized architecture context."
+        );
         assert_eq!(value["status"], "ended");
         assert_eq!(
             value["meeting_fetch"]["metadata"],
-            format!("buzz meetings show {meeting_id}")
+            format!("buzz meetings show --meeting {meeting_id}")
         );
         assert_eq!(
             value["meeting_fetch"]["board"],
-            format!("buzz meetings board get {meeting_id}")
+            format!("buzz meetings board get --meeting {meeting_id}")
         );
         assert!(value.get("content").is_none());
         assert!(value.get("board").is_none());

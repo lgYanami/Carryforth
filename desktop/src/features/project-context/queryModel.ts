@@ -361,6 +361,7 @@ export function buildProjectContextCoordinateOptions(input: {
       title: meeting.title,
       typeLabel: "Meeting",
       description:
+        meeting.summary ||
         meeting.description ||
         (participantSummary
           ? `Participants: ${participantSummary}`

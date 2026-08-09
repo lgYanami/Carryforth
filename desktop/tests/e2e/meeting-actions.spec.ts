@@ -21,6 +21,7 @@ const IDS = {
   agentHost: "50000000-0000-4000-8000-000000000007",
   abort: "50000000-0000-4000-8000-000000000008",
   discussionControl: "50000000-0000-4000-8000-000000000009",
+  summaryFailure: "50000000-0000-4000-8000-000000000010",
 } as const;
 
 function meetingSeed(input: {
@@ -90,6 +91,7 @@ function meetingSeed(input: {
     meetingId: input.id,
     title: input.title,
     description: "Record the final Board actions without a Meeting Plan.",
+    summary: null,
     sourceChannelId: null,
     schemaVersion: 3,
     policy: "moderated-board-actions-v3",
@@ -186,6 +188,14 @@ test("Human host enters action finalization, visits Project View, and atomically
   await expect(
     page.getByTestId("meeting-action-finalization-card"),
   ).toBeVisible();
+
+  const summary =
+    "Records the final action-output decision and its verified Project View materialization.";
+  await page.getByLabel("Meeting summary").fill(summary);
+  await page.getByTestId("meeting-summary-save").click();
+  await expect(page.getByTestId("meeting-summary-status")).toContainText(
+    "saved and verified",
+  );
   await expect(page.getByTestId("meeting-floor-request")).toHaveCount(0);
 
   await page.getByTestId("meeting-action-open-view").click();
@@ -207,13 +217,20 @@ test("Human host enters action finalization, visits Project View, and atomically
   await expect(page.getByTestId("meeting-terminal-summary")).toContainText(
     "Action output confirmed",
   );
+  await expect(
+    page.getByTestId("meeting-terminal-retrieval-summary"),
+  ).toContainText(summary);
 
-  const actions = await page.evaluate(() =>
-    (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
-      .filter((entry) => entry.command === "submit_meeting_action_finalization")
-      .map((entry) => entry.payload.input.action.type),
-  );
+  const log = await page.evaluate(() => window.__BUZZ_E2E_COMMAND_LOG__ ?? []);
+  const actions = log
+    .filter((entry) => entry.command === "submit_meeting_action_finalization")
+    .map((entry) => entry.payload.input.action.type);
   expect(actions).toEqual(["begin", "confirm"]);
+  expect(
+    log
+      .filter((entry) => entry.command === "update_meeting_summary")
+      .map((entry) => entry.payload.input.mutation),
+  ).toEqual([{ type: "set", summary }]);
 });
 
 test("action begin waits for the idle Human-host decision point", async ({
@@ -232,6 +249,40 @@ test("action begin waits for the idle Human-host decision point", async ({
 
   await expect(page.getByTestId("meeting-host-close")).toBeVisible();
   await expect(page.getByTestId("meeting-host-begin-actions")).toHaveCount(0);
+});
+
+test("Meeting summary failure does not change the Human Confirm flow", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    meetingSummaryErrors: ["mock summary write failed"],
+    meetings: [
+      meetingSeed({
+        id: IDS.summaryFailure,
+        title: "Optional retrieval summary",
+        lifecycle: "finalizing_actions",
+      }),
+    ],
+  });
+  await openMeeting(page, IDS.summaryFailure);
+
+  await page
+    .getByLabel("Meeting summary")
+    .fill("A summary that fails to save.");
+  await page.getByTestId("meeting-summary-save").click();
+  await expect(page.getByTestId("meeting-summary-status")).toContainText(
+    "mock summary write failed",
+  );
+  await expect(page.getByTestId("meeting-action-confirm")).toBeEnabled();
+  await page.getByTestId("meeting-action-confirm").click();
+  await expect(page.getByTestId("meeting-action-confirm-dialog")).toContainText(
+    "unsaved Meeting summary draft",
+  );
+  await page.getByTestId("meeting-action-confirm-submit").click();
+  await expect(page.getByTestId("meeting-screen")).toHaveAttribute(
+    "data-meeting-lifecycle",
+    "closed",
+  );
 });
 
 test("blocked action recording retries into a fresh runnable window before close", async ({

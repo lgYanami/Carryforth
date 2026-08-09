@@ -370,6 +370,7 @@ export function ProjectContextCoordinateInspector({
           fallback={detail.meeting}
           meetingId={coordinate.meetingId}
           onOpenMeeting={onOpenMeeting}
+          summary={detail.summary}
           title={detail.title}
         />
       ) : detail.state === "active" ? (

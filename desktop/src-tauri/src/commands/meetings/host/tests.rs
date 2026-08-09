@@ -19,6 +19,7 @@ fn snapshot(host: &Keys, participant: &Keys) -> MeetingSnapshot {
         meeting_id: MEETING_ID.to_string(),
         title: "Design review".to_string(),
         description: None,
+        summary: None,
         source_channel_id: None,
         schema_version: 3,
         policy: buzz_sdk_pkg::MEETING_V2_ACTIONS_POLICY.to_string(),

@@ -43,11 +43,13 @@ export function ProjectContextMeetingContent({
   fallback,
   meetingId,
   onOpenMeeting,
+  summary,
   title,
 }: {
   fallback?: ProjectContextMeetingDetail;
   meetingId: string;
   onOpenMeeting: (meetingId: string) => void;
+  summary?: string;
   title?: string;
 }) {
   const detailQuery = useMeetingContextDetail(meetingId);
@@ -92,6 +94,7 @@ export function ProjectContextMeetingContent({
   const actionsAttested =
     verified?.actionFinalization?.actionsAttested ??
     fallback?.actionFinalization?.actionsAttested;
+  const retrievalSummary = verified?.summary ?? summary;
 
   return (
     <div className="space-y-5" data-testid="project-context-meeting-detail">
@@ -114,6 +117,19 @@ export function ProjectContextMeetingContent({
             fallback?.discussionGoal ??
             "No discussion goal was recorded."}
         </p>
+        {retrievalSummary ? (
+          <div
+            className="mt-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-2"
+            data-testid="project-context-meeting-summary"
+          >
+            <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Retrieval summary
+            </p>
+            <p className="mt-1 whitespace-pre-wrap text-sm">
+              {retrievalSummary}
+            </p>
+          </div>
+        ) : null}
         {finalizing ? (
           <p className="mt-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-muted-foreground">
             Formal discussion and the Board are frozen; Meeting closure is

@@ -37,6 +37,7 @@ abstract final class EventKind {
   static const meetingHumanFloorRequest = 42107;
   static const meetingOfferResponse = 42108;
   static const meetingGrantSignal = 42109;
+  static const meetingSummaryCommand = 42113;
   static const jobRequest = 43001;
   static const jobAccepted = 43002;
   static const jobProgress = 43003;

@@ -332,6 +332,7 @@ CREATE TABLE meeting_sessions (
     current_round     BIGINT NOT NULL DEFAULT 1,
     floor_revision    BIGINT NOT NULL DEFAULT 0,
     floor_policy_version TEXT NOT NULL DEFAULT 'uniform-v0',
+    summary            TEXT,
     moderator_pubkey  BYTEA,
     terminal_outcome TEXT,
     terminal_reason_code TEXT,
@@ -353,6 +354,8 @@ CREATE TABLE meeting_sessions (
         CHECK (moderator_pubkey IS NULL OR LENGTH(moderator_pubkey) = 32),
     CONSTRAINT chk_meeting_current_round_positive CHECK (current_round > 0),
     CONSTRAINT chk_meeting_floor_revision_nonnegative CHECK (floor_revision >= 0),
+    CONSTRAINT chk_meeting_summary_non_empty
+        CHECK (summary IS NULL OR BTRIM(summary) <> ''),
     CONSTRAINT chk_meeting_floor_policy
         CHECK (floor_policy_version IN (
             'uniform-v0',
