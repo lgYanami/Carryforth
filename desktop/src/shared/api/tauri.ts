@@ -361,8 +361,18 @@ export function getDefaultRelayUrl(): Promise<string> {
   return invokeTauri<string>("get_default_relay_url");
 }
 
-export function autoConnectDefaultRelayEnabled(): Promise<boolean> {
-  return invokeTauri<boolean>("auto_connect_default_relay_enabled");
+export function getDesktopNetworkMode(): Promise<string> {
+  return invokeTauri<string>("get_desktop_network_mode");
+}
+
+export type LocalOwnerClaim = {
+  status: "ready" | "already_initialized";
+  role: "owner" | "admin" | "member" | null;
+  pubkey: string;
+};
+
+export function claimLocalOwner(): Promise<LocalOwnerClaim> {
+  return invokeTauri<LocalOwnerClaim>("claim_local_owner");
 }
 
 export function isSharedIdentity(): Promise<boolean> {

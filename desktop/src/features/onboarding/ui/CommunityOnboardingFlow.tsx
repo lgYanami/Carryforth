@@ -363,15 +363,6 @@ export function CommunityOnboardingFlow({
         {isCommunityChangeOpen ? (
           <CommunityChangeOverlay
             onClose={() => setIsCommunityChangeOpen(false)}
-            onUpdated={(communityName, updatedRelayUrl) => {
-              update({
-                communityName,
-                relayUrl: updatedRelayUrl,
-                stage: "connecting",
-                error: undefined,
-              });
-              setIsMembershipDenied(false);
-            }}
           />
         ) : null}
       </>

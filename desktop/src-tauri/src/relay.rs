@@ -12,49 +12,50 @@ use crate::app_state::AppState;
 mod managed_agent_profile;
 pub use managed_agent_profile::sync_managed_agent_capabilities;
 
-const DEFAULT_RELAY_WS_URL: &str = "ws://localhost:3000";
+pub(crate) const LOCAL_RELAY_WS_URL: &str = "ws://localhost:3000";
+pub(crate) const LOCAL_ONLY_UNAVAILABLE: &str = "unavailable:desktop:local_only";
 
 // A reached-but-malformed 2xx body is NOT a connectivity failure, so this
 // message must never carry the "relay unreachable:" prefix the frontend
 // classifier keys on. Extracted to a const so a test can pin that contract.
 const MALFORMED_RESPONSE_MESSAGE: &str = "relay returned malformed response: not valid JSON";
 
-fn configured_env_var(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+/// Return the stable failure used by inherited hosted-community commands.
+///
+/// Carryforth Desktop has no remote-community mode or enabling switch. The
+/// inherited implementations remain compiled only so callers receive one
+/// explicit local-only error before any network or browser side effect.
+pub(crate) fn reject_remote_community_operation() -> Result<(), String> {
+    Err(LOCAL_ONLY_UNAVAILABLE.to_owned())
+}
+
+fn validate_workspace_relay_url_value(relay_url: &str) -> Result<String, String> {
+    if relay_url == LOCAL_RELAY_WS_URL {
+        Ok(relay_url.to_owned())
+    } else {
+        Err(LOCAL_ONLY_UNAVAILABLE.to_owned())
+    }
+}
+
+/// Validate a relay chosen by the Desktop workspace surface. Local-only
+/// binaries accept exactly the canonical local relay spelling; aliases,
+/// alternate ports, trailing slashes, and remote hosts are rejected.
+pub(crate) fn validate_workspace_relay_url(relay_url: &str) -> Result<String, String> {
+    validate_workspace_relay_url_value(relay_url)
 }
 
 pub fn relay_ws_url() -> String {
-    configured_env_var("BUZZ_RELAY_URL")
-        .or_else(|| option_env!("BUZZ_DESKTOP_BUILD_RELAY_URL").map(str::to_string))
-        .unwrap_or_else(|| DEFAULT_RELAY_WS_URL.to_string())
+    LOCAL_RELAY_WS_URL.to_owned()
 }
 
-/// Read the workspace relay URL override, if set. Returns `None` when no
-/// override is active or when the mutex is poisoned (best-effort).
-fn workspace_relay_override(state: &AppState) -> Option<String> {
-    state
-        .relay_url_override
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
+/// Return the only Relay coordinate supported by Carryforth Desktop.
+pub fn relay_ws_url_with_override(_state: &AppState) -> String {
+    LOCAL_RELAY_WS_URL.to_owned()
 }
 
-/// Returns the relay WebSocket URL, checking the workspace override first.
-/// Precedence: workspace override > env vars > build-time vars > default.
-pub fn relay_ws_url_with_override(state: &AppState) -> String {
-    workspace_relay_override(state).unwrap_or_else(relay_ws_url)
-}
-
-/// Returns the relay HTTP API base URL, checking the workspace override first.
-/// Precedence: workspace override > env vars > build-time vars > default.
-pub fn relay_api_base_url_with_override(state: &AppState) -> String {
-    match workspace_relay_override(state) {
-        Some(url) => relay_http_base_url(&url),
-        None => relay_api_base_url(),
-    }
+/// Return the HTTP origin corresponding to the fixed local Relay.
+pub fn relay_api_base_url_with_override(_state: &AppState) -> String {
+    relay_http_base_url(LOCAL_RELAY_WS_URL)
 }
 
 /// Selects the relay a managed agent should use for a relay operation.
@@ -88,15 +89,7 @@ pub fn relay_http_base_url(relay_url: &str) -> String {
 }
 
 pub fn relay_api_base_url() -> String {
-    if let Some(base) = configured_env_var("BUZZ_RELAY_HTTP") {
-        return base.trim_end_matches('/').to_string();
-    }
-
-    if let Some(base) = option_env!("BUZZ_DESKTOP_BUILD_RELAY_HTTP") {
-        return base.trim().trim_end_matches('/').to_string();
-    }
-
-    relay_http_base_url(&relay_ws_url())
+    relay_http_base_url(LOCAL_RELAY_WS_URL)
 }
 
 // ── NIP-98 HTTP auth ────────────────────────────────────────────────────────
@@ -684,9 +677,31 @@ mod tests {
     use super::{
         build_profile_event, classify_intercepted_response, effective_agent_relay_url,
         extract_retry_in_hint, parse_command_response, relay_http_base_url,
+        validate_workspace_relay_url, LOCAL_ONLY_UNAVAILABLE, LOCAL_RELAY_WS_URL,
         MALFORMED_RESPONSE_MESSAGE,
     };
     use serde::Deserialize;
+
+    #[test]
+    fn local_only_workspace_accepts_only_canonical_local_relay() {
+        assert_eq!(
+            validate_workspace_relay_url(LOCAL_RELAY_WS_URL).unwrap(),
+            LOCAL_RELAY_WS_URL
+        );
+        for candidate in [
+            "ws://localhost:3000/",
+            "ws://127.0.0.1:3000",
+            "ws://localhost:3001",
+            "wss://localhost:3000",
+            "wss://relay.example.com",
+            " ws://localhost:3000",
+        ] {
+            assert_eq!(
+                validate_workspace_relay_url(candidate).unwrap_err(),
+                LOCAL_ONLY_UNAVAILABLE
+            );
+        }
+    }
 
     // ── extract_retry_in_hint ────────────────────────────────────────────────
 

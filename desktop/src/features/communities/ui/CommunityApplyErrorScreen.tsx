@@ -4,13 +4,11 @@ import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 
 type CommunityApplyErrorScreenProps = {
   error: string;
-  onChangeCommunity: () => void;
   onRetry: () => void;
 };
 
 export function CommunityApplyErrorScreen({
   error,
-  onChangeCommunity,
   onRetry,
 }: CommunityApplyErrorScreenProps) {
   const systemColorScheme = useSystemColorScheme();
@@ -35,14 +33,6 @@ export function CommunityApplyErrorScreen({
             type="button"
           >
             Retry
-          </Button>
-          <Button
-            className="h-10 w-full"
-            onClick={onChangeCommunity}
-            type="button"
-            variant="secondary"
-          >
-            Change community
           </Button>
         </div>
       </div>

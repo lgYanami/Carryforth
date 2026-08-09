@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -10,9 +11,9 @@ import type { ReactNode } from "react";
 
 import type { Community } from "./types";
 import {
-  clearCommunityStorage,
   loadActiveCommunityId,
   loadCommunities,
+  projectConnectableCommunities,
   saveActiveCommunityId,
   saveCommunities,
 } from "./communityStorage";
@@ -20,10 +21,7 @@ import { removeSelfProfileCachesForRelay } from "@/features/profile/lib/selfProf
 import { removeChannelSnapshotForRelay } from "@/features/channels/channelSnapshot";
 import { removeMessageSnapshotsForRelay } from "@/features/messages/lib/messageSnapshot";
 import { clearSavedCommunitySnapshot } from "@/features/agents/activeAgentTurnsStore";
-import {
-  clearCommunityDestinations,
-  removeCommunityDestination,
-} from "./communityNavigationStorage";
+import { removeCommunityDestination } from "./communityNavigationStorage";
 
 export type UpdateCommunityResult =
   | { kind: "updated"; requiresReinit: boolean }
@@ -154,53 +152,46 @@ export function useCommunities(): UseCommunitiesReturn {
 }
 
 function useCommunitiesInternal(): UseCommunitiesReturn {
-  const [communities, setCommunitiesState] =
+  const [storedCommunities, setStoredCommunitiesState] =
     useState<Community[]>(loadCommunities);
   const [activeId, setActiveId] = useState<string | null>(
     loadActiveCommunityId,
   );
   const [reinitKey, setReinitKey] = useState(0);
-  const communitiesRef = useRef(communities);
-  communitiesRef.current = communities;
+  const storedCommunitiesRef = useRef(storedCommunities);
+  storedCommunitiesRef.current = storedCommunities;
+  const communities = useMemo(
+    () => projectConnectableCommunities(storedCommunities),
+    [storedCommunities],
+  );
 
   const activeCommunity = useMemo(
     () => communities.find((w) => w.id === activeId) ?? communities[0] ?? null,
     [communities, activeId],
   );
 
+  // Bootstrap already activates Local Dev before this provider mounts. Keep a
+  // fail-safe here for quota-recovery or tests that construct the provider
+  // directly with a previously active remote community.
+  useEffect(() => {
+    if (!activeCommunity || activeCommunity.id === activeId) {
+      return;
+    }
+    saveActiveCommunityId(activeCommunity.id);
+    setActiveId(activeCommunity.id);
+  }, [activeCommunity, activeId]);
+
   const addCommunity = useCallback((community: Community): string => {
-    const existing = communitiesRef.current.find(
-      (w) => w.relayUrl === community.relayUrl,
+    // Carryforth owns exactly one local Community. Stale inherited callbacks
+    // cannot add or activate a remote Relay coordinate.
+    return (
+      projectConnectableCommunities(storedCommunitiesRef.current)[0]?.id ??
+      community.id
     );
-    const resolvedId = existing?.id ?? community.id;
-    setCommunitiesState((prev) => {
-      const dup = prev.find((w) => w.relayUrl === community.relayUrl);
-      let next: Community[];
-      if (dup) {
-        next = prev.map((w) =>
-          w.id === dup.id
-            ? {
-                ...w,
-                name: community.name || w.name,
-                token: community.token ?? w.token,
-                pubkey: community.pubkey ?? w.pubkey,
-              }
-            : w,
-        );
-      } else {
-        next = [...prev, community];
-      }
-      saveCommunities(next);
-      return next;
-    });
-    return resolvedId;
   }, []);
 
   const clearCommunities = useCallback(() => {
-    clearCommunityStorage();
-    clearCommunityDestinations();
-    setCommunitiesState([]);
-    setActiveId(null);
+    // The canonical local Community is part of Carryforth's runtime policy.
   }, []);
 
   const removeCommunity = useCallback(
@@ -220,9 +211,10 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
         }
       }
 
-      setCommunitiesState((prev) => {
-        // Never allow removing the last community
-        if (prev.length <= 1) {
+      setStoredCommunitiesState((prev) => {
+        // Never allow removing the last connectable community. Hidden remote
+        // records do not make Local Dev removable in local-only mode.
+        if (projectConnectableCommunities(prev).length <= 1) {
           return prev;
         }
         const next = prev.filter((w) => w.id !== id);
@@ -242,11 +234,16 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
 
   const switchCommunity = useCallback(
     (id: string) => {
-      if (id === activeId) return;
+      if (
+        id === activeCommunity?.id ||
+        !communities.some((community) => community.id === id)
+      ) {
+        return;
+      }
       saveActiveCommunityId(id);
       setActiveId(id);
     },
-    [activeId],
+    [activeCommunity?.id, communities],
   );
 
   const reconnectCommunity = useCallback(() => {
@@ -261,14 +258,21 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
       >,
     ): UpdateCommunityResult => {
       const result = resolveCommunityUpdateResult(
-        communitiesRef.current,
-        activeId,
+        storedCommunitiesRef.current,
+        activeCommunity?.id ?? null,
         id,
         updates,
       );
 
+      if (
+        !communities.some((community) => community.id === id) ||
+        updates.relayUrl !== undefined
+      ) {
+        return { kind: "unchanged" };
+      }
+
       if (result.kind === "updated") {
-        setCommunitiesState((prev) => {
+        setStoredCommunitiesState((prev) => {
           const next = prev.map((w) =>
             w.id === id ? { ...w, ...updates } : w,
           );
@@ -283,11 +287,11 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
 
       return result;
     },
-    [activeId],
+    [activeCommunity?.id, communities],
   );
 
   const reorderCommunities = useCallback((orderedIds: string[]) => {
-    setCommunitiesState((prev) => {
+    setStoredCommunitiesState((prev) => {
       const next = applyCommunitiesOrder(prev, orderedIds);
       saveCommunities(next);
       return next;

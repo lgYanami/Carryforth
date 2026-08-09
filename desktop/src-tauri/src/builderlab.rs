@@ -228,6 +228,7 @@ async fn authenticated_user(
     client: &reqwest::Client,
     credential: &str,
 ) -> Result<AuthMeResponse, String> {
+    crate::relay::reject_remote_community_operation()?;
     let response = client
         .get(api_url("/v1/auth/me")?)
         .header(BB_SESSION_CREDENTIAL_HEADER, credential)
@@ -254,6 +255,9 @@ pub(crate) async fn start_builderlab_login(
     session: tauri::State<'_, BuilderlabSession>,
     login: tauri::State<'_, BuilderlabLogin>,
 ) -> Result<BuilderlabAuthInfo, String> {
+    // This guard intentionally precedes listener creation and browser launch:
+    // a local-only build must not even begin the remote authentication flow.
+    crate::relay::reject_remote_community_operation()?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| format!("could not start local authentication callback: {error}"))?;
@@ -369,6 +373,7 @@ pub(crate) async fn get_builderlab_auth(
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
 ) -> Result<Option<BuilderlabAuthInfo>, String> {
+    crate::relay::reject_remote_community_operation()?;
     let stored = session
         .0
         .lock()
@@ -428,6 +433,7 @@ async fn authenticated_json(
     path: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    crate::relay::reject_remote_community_operation()?;
     let credential = session
         .0
         .lock()
@@ -683,5 +689,13 @@ mod tests {
             Some("http://127.0.0.1:1234/callback/nonce")
         );
         assert!(!query.contains_key("screen_hint"));
+    }
+
+    #[test]
+    fn hosted_community_guard_is_permanently_local_only() {
+        assert_eq!(
+            crate::relay::reject_remote_community_operation().unwrap_err(),
+            crate::relay::LOCAL_ONLY_UNAVAILABLE
+        );
     }
 }

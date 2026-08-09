@@ -877,13 +877,15 @@ pub async fn update_relay_member_role(
 ///
 /// Runs in a single transaction. Safe to call at every startup — idempotent.
 ///
-/// **Deployment-root authority exception:** This function is called only by
-/// startup initialization and operator provisioning
-/// (`community_provisioning.rs`). It is NOT an end-user path and does NOT
-/// enforce the per-owner community limit (`MAX_COMMUNITIES_PER_OWNER`) or
-/// acquire the per-recipient advisory lock. The per-owner limit is an
-/// end-user invariant enforced by `create_community_with_owner` and
-/// `transfer_ownership`; deployment-root operations may exceed it by design.
+/// **Bootstrap authority exception:** This function is called by startup
+/// initialization, operator provisioning (`community_provisioning.rs`), and
+/// the loopback-only Carryforth Desktop bootstrap endpoint. The Desktop path
+/// is restricted to the exact local Community and uses the same greenfield
+/// transaction fence: it cannot rotate or replace an existing owner. This
+/// function does not enforce the per-owner community limit
+/// (`MAX_COMMUNITIES_PER_OWNER`) or acquire the per-recipient advisory lock.
+/// Those remain end-user invariants of `create_community_with_owner` and
+/// `transfer_ownership`.
 pub async fn bootstrap_owner(
     pool: &PgPool,
     community: CommunityId,

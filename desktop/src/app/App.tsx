@@ -23,7 +23,6 @@ import { KnownAgentPubkeysProvider } from "@/features/agents/useKnownAgentPubkey
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { useMachineOnboardingState } from "@/features/onboarding/machineOnboarding";
 import {
-  type FirstCommunityPage,
   useCommunityOnboarding,
   markCommunityOnboardingComplete,
   resolveProfileCheckAction,
@@ -35,7 +34,6 @@ import {
   type MachineOnboardingPage,
 } from "@/features/onboarding/ui/MachineOnboardingFlow";
 import { OnboardingFlow } from "@/features/onboarding/ui/OnboardingFlow";
-import { PendingInviteGate } from "@/features/onboarding/ui/PendingInviteGate";
 import { KeyringLockedScreen } from "@/features/onboarding/ui/KeyringLockedScreen";
 import { RelaunchRequiredScreen } from "@/features/onboarding/ui/RelaunchRequiredScreen";
 import { ResetFailedScreen } from "@/features/onboarding/ui/ResetFailedScreen";
@@ -48,21 +46,14 @@ import {
   markPendingCommunityRestore,
   saveCommunityDestination,
 } from "@/features/communities/communityNavigationStorage";
-import {
-  onAddCommunityPrefillAvailable,
-  requestAddCommunityPrefill,
-} from "@/features/communities/addCommunityPrefill";
-import { WelcomeSetup } from "@/features/communities/ui/WelcomeSetup";
 import { CommunityApplyErrorScreen } from "@/features/communities/ui/CommunityApplyErrorScreen";
-import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
 import { setAvatarProfileSyncQueryClient } from "@/features/profile/avatarProfileSync";
 import { createBuzzQueryClient } from "@/shared/api/queryClient";
-import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
-import { getProfile } from "@/shared/api/tauriProfiles";
 import {
-  type AddCommunityDeepLinkPayload,
-  listenForDeepLinks,
-} from "@/shared/deep-link";
+  claimLocalOwner,
+  isSharedIdentity as isSharedIdentityCmd,
+} from "@/shared/api/tauri";
+import { getProfile } from "@/shared/api/tauriProfiles";
 import { cn } from "@/shared/lib/cn";
 import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 import { FlappingBee } from "@/shared/ui/buzz-logo/FlappingBee";
@@ -278,11 +269,9 @@ function AppReady({
 
 function CommunityApp({
   currentPubkey,
-  onBackToMachineConfig,
   sharedIdentity,
 }: {
   currentPubkey: string | null;
-  onBackToMachineConfig: () => void;
   sharedIdentity: boolean;
 }) {
   const {
@@ -305,9 +294,6 @@ function CommunityApp({
   // an atomic check of both ID and stage before mutating state.
   const transactionRef = useRef(communityOnboarding.transaction);
   transactionRef.current = communityOnboarding.transaction;
-  const [isCommunityChangeOpen, setIsCommunityChangeOpen] = useState(false);
-  const [resumeFirstCommunityPage, setResumeFirstCommunityPage] =
-    useState<FirstCommunityPage | null>(null);
 
   // Surface nest-related backend events (repos-dir errors, legacy migration)
   // as toasts. Mounted before useCommunityInit so the listeners are registered
@@ -414,9 +400,6 @@ function CommunityApp({
       return;
     }
     if (communities.length === 1) {
-      if (transaction.source === "first-community") {
-        setResumeFirstCommunityPage(transaction.firstCommunityPage ?? "join");
-      }
       clearCommunities();
       return;
     }
@@ -498,28 +481,18 @@ function CommunityApp({
   let appContent: ReactNode = null;
   if (!transaction) {
     if (community.needsSetup) {
-      // Show welcome setup for first-run users with no communities
       appContent = (
-        <WelcomeSetup
-          initialPage={resumeFirstCommunityPage ?? undefined}
-          onBack={onBackToMachineConfig}
+        <CommunityApplyErrorScreen
+          error="Carryforth could not persist the fixed Local Dev community. Free local application storage and retry."
+          onRetry={reconnectCommunity}
         />
       );
     } else if ("error" in community && community.error) {
-      // Surface apply failures so the user can retry or change community.
       appContent = (
-        <>
-          <CommunityApplyErrorScreen
-            error={community.error}
-            onChangeCommunity={() => setIsCommunityChangeOpen(true)}
-            onRetry={reconnectCommunity}
-          />
-          {isCommunityChangeOpen ? (
-            <CommunityChangeOverlay
-              onClose={() => setIsCommunityChangeOpen(false)}
-            />
-          ) : null}
-        </>
+        <CommunityApplyErrorScreen
+          error={community.error}
+          onRetry={reconnectCommunity}
+        />
       );
     }
   }
@@ -585,7 +558,6 @@ function CommunityApp({
 
 function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   const { activeCommunity } = useCommunities();
-  const communityOnboarding = useCommunityOnboarding();
   const machine = useMachineOnboardingState({
     activeCommunityPubkey: activeCommunity
       ? (activeCommunity.pubkey ?? null)
@@ -595,11 +567,6 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   const [machineInitialPage, setMachineInitialPage] =
     useState<MachineOnboardingPage>();
 
-  const reopenMachineConfig = useCallback(() => {
-    setMachineInitialPage("config");
-    machine.reopen();
-  }, [machine.reopen]);
-
   const completeMachineOnboarding = useCallback(
     (pubkey?: string) => {
       setMachineInitialPage(undefined);
@@ -608,69 +575,95 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
     [machine.complete],
   );
 
-  const openAddCommunity = useCallback(
-    (payload: AddCommunityDeepLinkPayload & { requestId: string }) =>
-      activeCommunity
-        ? requestAddCommunityPrefill(payload)
-        : communityOnboarding.start({
-            source: "add-community",
-            relayUrl: payload.relayUrl,
-            communityName: payload.name,
-          }),
-    [activeCommunity, communityOnboarding.start],
-  );
-
-  // Deep links are captured here — above the machine-onboarding gate — not in
-  // CommunityApp. The Rust side queues them; draining into the persisted
-  // community-onboarding transaction immediately means an invite opened on a
-  // fresh install is acknowledged on screen while the identity steps are
-  // still pending, and survives a relaunch in between.
-  useEffect(() => {
-    const unlisten = listenForDeepLinks({
-      startCommunityOnboarding: communityOnboarding.start,
-      openAddCommunity,
-      onAddCommunityAvailable: onAddCommunityPrefillAvailable,
-    });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
-  }, [communityOnboarding.start, openAddCommunity]);
-
   if (machine.stage === "reset-failed") return <ResetFailedScreen />;
   if (machine.stage === "keyring-locked") return <KeyringLockedScreen />;
   if (machine.stage === "relaunch-required") return <RelaunchRequiredScreen />;
   if (machine.stage === "blocking") return <AppLoadingGate />;
   if (machine.stage === "ready") {
     return (
-      <CommunityApp
-        currentPubkey={machine.currentPubkey}
-        onBackToMachineConfig={reopenMachineConfig}
-        sharedIdentity={sharedIdentity}
-      />
+      <LocalOwnerBootstrap currentPubkey={machine.currentPubkey}>
+        <CommunityApp
+          currentPubkey={machine.currentPubkey}
+          sharedIdentity={sharedIdentity}
+        />
+      </LocalOwnerBootstrap>
     );
   }
 
-  // A community deep link that arrived before machine onboarding finished is
-  // persisted immediately and acknowledged here. Invite claiming waits until
-  // setup completes so it is signed only by the user's final identity.
-  const transaction = communityOnboarding.transaction;
-  const isDeepLink =
-    transaction?.source === "deep-link-join" ||
-    transaction?.source === "deep-link-connect";
-  const shouldAcknowledgeDeepLink = isDeepLink && !transaction.acknowledged;
-
   return (
-    <>
-      <MachineOnboardingFlow
-        complete={completeMachineOnboarding}
-        continueWithIdentity={machine.continueWithIdentity}
-        identityLost={machine.identityLost}
-        initialPage={machineInitialPage}
-        queryClient={machine.queryClient}
-      />
-      {shouldAcknowledgeDeepLink ? <PendingInviteGate /> : null}
-    </>
+    <MachineOnboardingFlow
+      complete={completeMachineOnboarding}
+      continueWithIdentity={machine.continueWithIdentity}
+      identityLost={machine.identityLost}
+      initialPage={machineInitialPage}
+      queryClient={machine.queryClient}
+    />
   );
+}
+
+function LocalOwnerBootstrap({
+  children,
+  currentPubkey,
+}: {
+  children: ReactNode;
+  currentPubkey: string | null;
+}) {
+  const { activeCommunity, updateCommunity } = useCommunities();
+  const [attempt, setAttempt] = useState(0);
+  const [state, setState] = useState<
+    { kind: "loading" } | { kind: "ready" } | { kind: "error"; message: string }
+  >({ kind: "loading" });
+
+  useEffect(() => {
+    // Reading the retry generation makes an explicit Retry a fresh bootstrap
+    // attempt even when the identity and Community coordinates are unchanged.
+    void attempt;
+    if (!currentPubkey || !activeCommunity) {
+      setState({
+        kind: "error",
+        message: "The final local Desktop identity is not available yet.",
+      });
+      return;
+    }
+
+    if (activeCommunity.pubkey !== currentPubkey) {
+      updateCommunity(activeCommunity.id, { pubkey: currentPubkey });
+      setState({ kind: "loading" });
+      return;
+    }
+
+    let cancelled = false;
+    setState({ kind: "loading" });
+    void claimLocalOwner()
+      .then(() => {
+        if (!cancelled) setState({ kind: "ready" });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setState({
+          kind: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "The local Relay is not ready for owner initialization.",
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCommunity, attempt, currentPubkey, updateCommunity]);
+
+  if (state.kind === "loading") return <AppLoadingGate />;
+  if (state.kind === "error") {
+    return (
+      <CommunityApplyErrorScreen
+        error={state.message}
+        onRetry={() => setAttempt((value) => value + 1)}
+      />
+    );
+  }
+  return children;
 }
 
 export function App() {

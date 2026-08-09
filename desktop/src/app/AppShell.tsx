@@ -77,11 +77,9 @@ import { RemindMeLaterProvider } from "@/features/reminders/ui/RemindMeLaterProv
 import { useReminderNotifications } from "@/features/reminders/useReminderNotifications";
 import { AppSidebar } from "@/features/sidebar/ui/AppSidebar";
 import { requestFocusedThreadClose } from "@/features/channels/focusedThreadCloseRequest";
-import { CommunityRail } from "@/features/sidebar/ui/CommunityRail";
 import { useChannelMutes } from "@/features/sidebar/lib/useChannelMutes";
 import { useChannelStars } from "@/features/sidebar/lib/useChannelStars";
 import { useCommunities } from "@/features/communities/useCommunities";
-import { useAddCommunityDialogState } from "@/features/communities/addCommunityPrefill";
 import { useApplyTemplate } from "@/features/channel-templates/useApplyTemplate";
 import { relayClient } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -106,8 +104,6 @@ export function AppShell() {
   useWebviewScrollBoundaryLock();
 
   const communitiesHook = useCommunities();
-  const hasCommunityRail = communitiesHook.communities.length > 1;
-  const addCommunityDialog = useAddCommunityDialogState();
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
     React.useState(false);
   const [managedChannelId, setManagedChannelId] = React.useState<string | null>(
@@ -142,11 +138,7 @@ export function AppShell() {
     () => deriveShellRoute(location.pathname),
     [location.pathname],
   );
-  const {
-    openCommunityOverview,
-    removeCommunity: handleRemoveCommunity,
-    switchCommunity: handleSwitchCommunity,
-  } = useCommunityNavigationTransitions({
+  const { openCommunityOverview } = useCommunityNavigationTransitions({
     communities: communitiesHook,
     goCommunity,
     goHome,
@@ -725,25 +717,11 @@ export function AppShell() {
                   )}
                 >
                   <BuzzTheme.GradientLayer />
-                  {hasCommunityRail ? (
-                    <CommunityRail
-                      activeCommunityId={
-                        communitiesHook.activeCommunity?.id ?? null
-                      }
-                      onAddCommunity={addCommunityDialog.openDialog}
-                      onRemoveCommunity={(id) => void handleRemoveCommunity(id)}
-                      onReorderCommunities={communitiesHook.reorderCommunities}
-                      onSwitchCommunity={handleSwitchCommunity}
-                      onUpdateCommunity={communitiesHook.updateCommunity}
-                      communities={communitiesHook.communities}
-                    />
-                  ) : null}
                   <SidebarProvider className="min-h-0 flex-1 flex-col overflow-hidden">
                     {!settingsOpen ? (
                       <AppTopChrome
                         canGoBack={canGoBack}
                         canGoForward={canGoForward}
-                        hasCommunityRail={hasCommunityRail}
                         onGoBack={goBack}
                         onGoForward={goForward}
                       />
@@ -800,38 +778,18 @@ export function AppShell() {
                           errorMessage={channelsErrorMessage}
                           fallbackDisplayName={identityQuery.data?.displayName}
                           homeBadgeCount={homeBadgeCount + dueReminderBadge}
-                          addCommunityPrefill={addCommunityDialog.prefill}
-                          isAddCommunityOpen={addCommunityDialog.open}
                           relayConnectionCard={relayConnectionCard}
                           isCreatingChannel={createChannelMutation.isPending}
                           isCreatingForum={createForumMutation.isPending}
                           isLoading={channelsQuery.isLoading}
                           isCreateChannelOpen={isCreateChannelOpen}
                           isPresencePending={presenceSession.isPending}
-                          onAddCommunity={(community) => {
-                            const id = communitiesHook.addCommunity({
-                              ...community,
-                              pubkey:
-                                community.pubkey ?? identityQuery.data?.pubkey,
-                            });
-                            handleSwitchCommunity(id);
-                          }}
-                          onAddCommunityOpenChange={
-                            addCommunityDialog.onOpenChange
-                          }
                           onNewMessage={handleOpenNewDm}
                           onBackgroundClick={requestFocusedThreadClose}
                           onCreateChannelOpenChange={setIsCreateChannelOpen}
-                          onOpenAddCommunity={addCommunityDialog.openDialog}
                           onSendFeedback={() => setIsSendFeedbackOpen(true)}
-                          onUpdateCommunity={communitiesHook.updateCommunity}
-                          onRemoveCommunity={(id) =>
-                            void handleRemoveCommunity(id)
-                          }
-                          onSwitchCommunity={handleSwitchCommunity}
                           onCreateAgent={() => requestOpenCreateAgent()}
                           selfPresenceStatus={presenceSession.currentStatus}
-                          communities={communitiesHook.communities}
                           onCreateChannel={handleCreateChannel}
                           onCreateForum={handleCreateForum}
                           onHideDm={handleHideDm}
@@ -909,7 +867,6 @@ export function AppShell() {
                         <RelayConnectionOverlay
                           card={relayConnectionCard}
                           errorMessage={channelsErrorMessage}
-                          hasCommunityRail={hasCommunityRail}
                           isHuddleDrawerOpen={isHuddleDrawerOpen}
                         />
                       </div>

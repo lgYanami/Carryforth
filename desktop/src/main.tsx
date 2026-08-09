@@ -1,18 +1,23 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
-import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
 import "@fontsource-variable/inter/wght.css";
 import "@/shared/styles/globals.css";
 import { UpdaterProvider } from "@/features/settings/hooks/UpdaterProvider";
 import { migrateLegacyCommunityStorageBeforeRender } from "@/features/communities/legacyCommunityStorage";
+import { ensureLocalOnlyCommunityStorage } from "@/features/communities/communityStorage";
+import { purgeRemovedCommunityClientState } from "@/features/communities/localCommunityCleanup";
 import { CommunitiesProvider } from "@/features/communities/useCommunities";
-import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
+import {
+  clearCommunityOnboardingTransaction,
+  CommunityOnboardingProvider,
+} from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
 import { EmojiBurstProvider } from "@/shared/ui/EmojiBurstProvider";
 import { PoofBurstProvider } from "@/shared/ui/PoofBurstProvider";
 import { Toaster } from "@/shared/ui/sonner";
 import { TooltipProvider } from "@/shared/ui/tooltip";
+import { bootstrapDesktopNetworkMode } from "@/shared/runtime/desktopNetworkMode";
 
 type E2eWindow = Window & {
   __BUZZ_E2E__?: unknown;
@@ -80,7 +85,6 @@ function renderApp() {
                 <PoofBurstProvider>
                   <UpdaterProvider>
                     <App />
-                    <NostrBindConsentDialog />
                   </UpdaterProvider>
                   <Toaster />
                 </PoofBurstProvider>
@@ -111,7 +115,17 @@ async function bootstrap() {
   resetDevWebviewStateFromUrl();
   configureDevE2eBridgeFromUrl();
   await installE2eBridgeIfConfigured();
+  await bootstrapDesktopNetworkMode();
   await migrateLegacyCommunityStorageBeforeRender();
+  clearCommunityOnboardingTransaction(window.localStorage);
+  // Do not stamp or claim with the ephemeral identity created at process
+  // startup. Machine onboarding may still replace it with an imported key.
+  // The final identity is persisted and claimed by LocalOwnerBootstrap after
+  // machine onboarding reaches `ready`.
+  const localBootstrap = ensureLocalOnlyCommunityStorage(window.localStorage);
+  if (localBootstrap) {
+    purgeRemovedCommunityClientState(localBootstrap.removedCommunities);
+  }
   renderApp();
 }
 

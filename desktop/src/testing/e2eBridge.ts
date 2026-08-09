@@ -571,7 +571,6 @@ type E2eConfig = {
   };
   relayHttpUrl?: string;
   relayWsUrl?: string;
-  autoConnectDefaultRelay?: boolean;
   identity?: TestIdentity;
 };
 
@@ -11842,8 +11841,14 @@ export function maybeInstallE2eTauriMocks() {
         return getRelayWsUrl(activeConfig);
       case "get_default_relay_url":
         return getRelayWsUrl(activeConfig);
-      case "auto_connect_default_relay_enabled":
-        return activeConfig?.autoConnectDefaultRelay ?? false;
+      case "get_desktop_network_mode":
+        return "localOnly";
+      case "claim_local_owner":
+        return {
+          status: "ready",
+          role: "owner",
+          pubkey: identity?.pubkey ?? DEFAULT_MOCK_IDENTITY.pubkey,
+        };
       case "get_legacy_workspace_storage":
         return {
           workspaces: null,

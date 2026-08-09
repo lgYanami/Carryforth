@@ -104,6 +104,13 @@ fn activate_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn deep_link_action_enabled(action: Option<&str>) -> bool {
+    !matches!(
+        action,
+        Some("connect" | "join" | "add-community" | "nostr-bind")
+    )
+}
+
 /// Parse the query string of a `buzz://message?…` URL into the JSON
 /// payload emitted on `deep-link-message`. Returns `None` when a required
 /// param (`channel`, `id`) is missing or empty — mirroring the validation
@@ -309,6 +316,14 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
         return;
     }
 
+    if !deep_link_action_enabled(url.host_str()) {
+        eprintln!(
+            "buzz-desktop: ignoring remote-community deep link in local-only mode: {}",
+            url.host_str().unwrap_or_default()
+        );
+        return;
+    }
+
     match url.host_str() {
         Some("connect") => {
             let Some(relay_url) = parse_websocket_relay_param(&url) else {
@@ -389,9 +404,20 @@ mod tests {
     use url::Url;
 
     use super::{
-        parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
-        parse_nostr_bind_deep_link, PendingCommunityDeepLink, PendingCommunityDeepLinks,
+        deep_link_action_enabled, parse_add_community_deep_link, parse_join_deep_link,
+        parse_message_deep_link, parse_nostr_bind_deep_link, PendingCommunityDeepLink,
+        PendingCommunityDeepLinks,
     };
+
+    #[test]
+    fn local_only_suppresses_remote_community_and_identity_bind_links() {
+        for action in ["connect", "join", "add-community", "nostr-bind"] {
+            assert!(!deep_link_action_enabled(Some(action)));
+        }
+        assert!(deep_link_action_enabled(Some("message")));
+        assert!(deep_link_action_enabled(Some("unknown")));
+        assert!(deep_link_action_enabled(None));
+    }
 
     fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {
         PendingCommunityDeepLink {

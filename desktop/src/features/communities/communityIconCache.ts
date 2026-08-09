@@ -39,3 +39,15 @@ export function saveCachedCommunityIcon(
     // Quota exceeded — the icon still renders from the in-memory query.
   }
 }
+
+/** Remove a persisted icon for a Community coordinate that is no longer used. */
+export function removeCachedCommunityIcon(relayUrl: string): void {
+  const cache = loadCache();
+  if (!(relayUrl in cache)) return;
+  delete cache[relayUrl];
+  try {
+    localStorage.setItem(ICON_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // Storage access failures are non-fatal.
+  }
+}

@@ -20,42 +20,29 @@ import { cn } from "@/shared/lib/cn";
 type SidebarProfileCardProps = {
   activeCommunity: Community | null;
   isPresencePending?: boolean;
-  onOpenAddCommunity: () => void;
   onOpenSettings: (section?: SettingsSection) => void;
-  onRemoveCommunity: (id: string) => void;
   onSendFeedback?: () => void;
   onSetPresenceStatus?: (status: PresenceStatus) => void;
   onSetUserStatus: (text: string, emoji: string) => void;
   onClearUserStatus: () => void;
-  onSwitchCommunity: (id: string) => void;
-  onUpdateCommunity: (
-    id: string,
-    updates: Partial<Pick<Community, "name" | "relayUrl" | "token">>,
-  ) => void;
   profile?: Profile;
   resolvedDisplayName: string;
   selfPresenceStatus: PresenceStatus;
   selfUserStatus?: UserStatus;
-  communities: Community[];
 };
 
 export function SidebarProfileCard({
   activeCommunity,
   isPresencePending,
-  onOpenAddCommunity,
   onOpenSettings,
   onSendFeedback,
-  onRemoveCommunity,
   onSetPresenceStatus,
   onSetUserStatus,
   onClearUserStatus,
-  onSwitchCommunity,
-  onUpdateCommunity,
   profile,
   resolvedDisplayName,
   selfPresenceStatus,
   selfUserStatus,
-  communities,
 }: SidebarProfileCardProps) {
   const selfProfileCache = useSelfProfileCache();
   const myMembershipQuery = useMyRelayMembershipLookupQuery();
@@ -165,19 +152,11 @@ export function SidebarProfileCard({
               <CommunitySwitcher
                 activeCommunity={activeCommunity}
                 canInvite={canInvite}
-                onAddCommunity={() => {
-                  setProfilePopoverOpen(false);
-                  onOpenAddCommunity();
-                }}
                 onInvite={() => {
                   setProfilePopoverOpen(false);
                   onOpenSettings("community-members");
                 }}
-                onRemoveCommunity={onRemoveCommunity}
-                onSwitchCommunity={onSwitchCommunity}
-                onUpdateCommunity={onUpdateCommunity}
                 variant="profile-menu"
-                communities={communities}
               />
             }
           >

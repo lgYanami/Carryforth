@@ -1,4 +1,3 @@
-import { invokeTauri } from "@/shared/api/tauri";
 import { migrateLegacyCommunityStorage } from "./communityStorage";
 
 const BUZZ_COMMUNITIES_KEY = "buzz-communities";
@@ -116,26 +115,8 @@ export async function migrateLegacyCommunityStorageBeforeRender(): Promise<void>
   }
 
   migrateLegacyCommunityStorage(window.localStorage);
-  const currentCommunitiesRaw =
-    window.localStorage.getItem(BUZZ_COMMUNITIES_KEY);
-  const hasCurrentActiveCommunity = window.localStorage.getItem(
-    BUZZ_ACTIVE_COMMUNITY_KEY,
-  );
-  if (
-    currentCommunitiesRaw &&
-    hasCurrentActiveCommunity &&
-    !hasOnlyLocalDevCommunity(currentCommunitiesRaw)
-  ) {
-    return;
-  }
-
-  try {
-    applyLegacyCommunityStorage(
-      await invokeTauri<LegacyCommunityStorageSnapshot>(
-        "get_legacy_workspace_storage",
-      ),
-    );
-  } catch (error) {
-    console.warn("Failed to read legacy Sprout community storage.", error);
-  }
+  // Carryforth never imports the previous Sprout/Buzz native WebKit snapshot:
+  // it may contain hosted Community coordinates. The same-origin key rename
+  // above is retained only so the local cleanup step can reuse an older local
+  // record before deleting the legacy keys.
 }

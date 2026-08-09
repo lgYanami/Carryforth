@@ -1,11 +1,7 @@
 import {
-  Check,
   ChevronDown,
   ChevronRight,
   Link2,
-  MoreHorizontal,
-  Plus,
-  Settings2,
   Ticket,
   WifiOff,
 } from "lucide-react";
@@ -16,7 +12,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import {
@@ -34,7 +29,6 @@ import {
 } from "@/shared/api/useRelayConnection";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { useActiveCommunityIcon } from "@/features/communities/useCommunityIcons";
-import { EditCommunityDialog } from "./EditCommunityDialog";
 
 const CONNECTION_STATE_LABEL: Record<ConnectionState, string> = {
   idle: "Not connected",
@@ -47,17 +41,9 @@ const CONNECTION_STATE_LABEL: Record<ConnectionState, string> = {
 
 type CommunitySwitcherProps = {
   activeCommunity: Community | null;
-  communities: Community[];
   variant?: "sidebar" | "profile" | "profile-menu";
   canInvite?: boolean;
   onInvite?: () => void;
-  onSwitchCommunity: (id: string) => void;
-  onAddCommunity: () => void;
-  onUpdateCommunity: (
-    id: string,
-    updates: Partial<Pick<Community, "name" | "relayUrl" | "token">>,
-  ) => void;
-  onRemoveCommunity: (id: string) => void;
 };
 
 export function CommunityEmojiIcon({
@@ -91,17 +77,10 @@ export function CommunityEmojiIcon({
 
 export function CommunitySwitcher({
   activeCommunity,
-  communities,
   variant = "sidebar",
   canInvite = false,
   onInvite,
-  onSwitchCommunity,
-  onAddCommunity,
-  onUpdateCommunity,
-  onRemoveCommunity,
 }: CommunitySwitcherProps) {
-  const [editingCommunity, setEditingCommunity] =
-    React.useState<Community | null>(null);
   const [dropdownOpen, setDropdownOpen] = React.useState(false);
   const profileMenuHoverTimer = React.useRef<number | null>(null);
   const connectionState = useRelayConnection();
@@ -250,7 +229,7 @@ export function CommunitySwitcher({
                   type="button"
                 >
                   <Link2 className="h-4 w-4" />
-                  <span>Copy community URL</span>
+                  <span>Copy local Relay URL</span>
                 </button>
                 {canInvite && onInvite ? (
                   <button
@@ -266,33 +245,8 @@ export function CommunitySwitcher({
                     <span>Invite to community</span>
                   </button>
                 ) : null}
-                <button
-                  className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
-                  onClick={() => {
-                    setDropdownOpen(false);
-                    setEditingCommunity(activeCommunity);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Settings2 className="h-4 w-4" />
-                  <span>Community settings</span>
-                </button>
-                <hr className="-mx-1 my-1 h-px border-0 bg-muted" />
               </>
             ) : null}
-            <button
-              className="flex min-h-9 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:outline-none focus-visible:bg-muted/50 focus-visible:outline-none"
-              onClick={() => {
-                setDropdownOpen(false);
-                onAddCommunity();
-              }}
-              role="menuitem"
-              type="button"
-            >
-              <Plus className="h-4 w-4" />
-              <span>Add a community</span>
-            </button>
           </div>
         </PopoverContent>
       </Popover>
@@ -310,7 +264,7 @@ export function CommunitySwitcher({
             aria-label={
               degraded
                 ? `${activeCommunity?.name ?? "Community"} — ${connectionLabel}`
-                : "Switch community"
+                : "Local community actions"
             }
             className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md py-0.5 text-left text-xs text-sidebar-foreground/50 outline-hidden transition-colors hover:text-sidebar-foreground focus:outline-none focus-visible:outline-none data-[state=open]:text-sidebar-foreground"
             data-testid="community-switcher"
@@ -340,67 +294,31 @@ export function CommunitySwitcher({
         side={variant === "profile" ? "top" : "bottom"}
         sideOffset={4}
       >
-        {communities.map((community) => (
+        {activeCommunity ? (
           <DropdownMenuItem
-            key={community.id}
-            className="group flex items-center gap-2 pr-1"
-            onSelect={() => {
-              onSwitchCommunity(community.id);
-            }}
+            onSelect={() => void writeTextToClipboard(activeCommunity.relayUrl)}
           >
-            <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-              {activeCommunity?.id === community.id ? (
-                <Check className="h-4 w-4 text-primary" />
-              ) : null}
-            </span>
-            <span className="min-w-0 flex-1 truncate">{community.name}</span>
-            <button
-              aria-label={`Edit ${community.name}`}
-              className="flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-0 hover:bg-accent group-hover:opacity-100 group-focus:opacity-100"
-              onClick={(e) => {
-                e.stopPropagation();
-                e.preventDefault();
-                setDropdownOpen(false);
-                setEditingCommunity(community);
-              }}
-              type="button"
-            >
-              <MoreHorizontal className="h-4 w-4" />
-            </button>
+            <Link2 className="h-4 w-4" />
+            <span>Copy local Relay URL</span>
           </DropdownMenuItem>
-        ))}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={onAddCommunity}>
-          <Plus className="h-4 w-4" />
-          <span>Add a community</span>
-        </DropdownMenuItem>
+        ) : null}
+        {canInvite && onInvite ? (
+          <DropdownMenuItem onSelect={onInvite}>
+            <Ticket className="h-4 w-4" />
+            <span>Invite to local community</span>
+          </DropdownMenuItem>
+        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   );
 
-  return (
-    <>
-      {variant === "profile" ? (
-        switcherDropdown
-      ) : variant === "profile-menu" ? (
-        profileMenuPopover
-      ) : (
-        <SidebarMenu>
-          <SidebarMenuItem>{switcherDropdown}</SidebarMenuItem>
-        </SidebarMenu>
-      )}
-
-      <EditCommunityDialog
-        canRemove={communities.length > 1}
-        onOpenChange={(open) => {
-          if (!open) setEditingCommunity(null);
-        }}
-        onRemove={onRemoveCommunity}
-        onSave={onUpdateCommunity}
-        open={editingCommunity !== null}
-        community={editingCommunity}
-        showIconEditor={editingCommunity?.id === activeCommunity?.id}
-      />
-    </>
+  return variant === "profile" ? (
+    switcherDropdown
+  ) : variant === "profile-menu" ? (
+    profileMenuPopover
+  ) : (
+    <SidebarMenu>
+      <SidebarMenuItem>{switcherDropdown}</SidebarMenuItem>
+    </SidebarMenu>
   );
 }

@@ -92,6 +92,7 @@ fn observer_lifecycle_key(
     outer_pubkey: &str,
     payload: &super::ManagedAgentRuntimeLifecycleObserverPayload,
 ) -> Result<ManagedAgentRuntimeKey, String> {
+    let relay_url = crate::relay::validate_workspace_relay_url(&payload.relay_url)?;
     if !outer_pubkey.eq_ignore_ascii_case(&payload.pubkey) {
         return Err("observer signer does not match lifecycle payload pubkey".into());
     }
@@ -107,17 +108,18 @@ fn observer_lifecycle_key(
     if payload.lifecycle != ManagedAgentRuntimeLifecycle::Failed && payload.error.is_some() {
         return Err("lifecycle error is only valid for failed".into());
     }
-    ManagedAgentRuntimeKey::new(payload.pubkey.clone(), &payload.relay_url)
+    ManagedAgentRuntimeKey::new(payload.pubkey.clone(), &relay_url)
 }
 
 fn observer_supervision_key(
     outer_pubkey: &str,
     payload: &super::ManagedAgentRuntimeSupervisionObserverPayload,
 ) -> Result<ManagedAgentRuntimeKey, String> {
+    let relay_url = crate::relay::validate_workspace_relay_url(&payload.relay_url)?;
     if !outer_pubkey.eq_ignore_ascii_case(&payload.pubkey) {
         return Err("observer signer does not match supervision payload pubkey".to_owned());
     }
-    ManagedAgentRuntimeKey::new(payload.pubkey.clone(), &payload.relay_url)
+    ManagedAgentRuntimeKey::new(payload.pubkey.clone(), &relay_url)
 }
 
 #[tauri::command]
@@ -349,6 +351,7 @@ fn start_pair(
     expected_updated_at: Option<&str>,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
+    let relay_url = crate::relay::validate_workspace_relay_url(&relay_url)?;
     let state = app.state::<AppState>();
     let _transition = state
         .managed_agent_runtime_transition
@@ -421,6 +424,7 @@ pub fn stop_managed_agent_runtime(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
+    let relay_url = crate::relay::validate_workspace_relay_url(&relay_url)?;
     let state = app.state::<AppState>();
     let _transition = state
         .managed_agent_runtime_transition
@@ -506,6 +510,7 @@ async fn probe_agent_relay_access(
     record: super::ManagedAgentRecord,
     requested_relay_url: String,
 ) -> Result<(super::ManagedAgentRecord, ManagedAgentRuntimeKey, String), String> {
+    let requested_relay_url = crate::relay::validate_workspace_relay_url(&requested_relay_url)?;
     let key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), &requested_relay_url)?;
     let keys = nostr::Keys::parse(record.private_key_nsec.trim())
         .map_err(|error| format!("invalid managed-agent key: {error}"))?;
@@ -573,6 +578,7 @@ pub async fn reconcile_managed_agent_runtimes(
     let records = load_managed_agents(&app)?;
     let mut jobs = Vec::new();
     for community in communities {
+        let relay_url = crate::relay::validate_workspace_relay_url(&community.relay_url)?;
         for record in records
             .iter()
             .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
@@ -580,7 +586,7 @@ pub async fn reconcile_managed_agent_runtimes(
         // `effective_agent_relay_url`. Every local auto-start agent fans out
         // to every configured community.
         {
-            jobs.push((record.clone(), community.relay_url.clone()));
+            jobs.push((record.clone(), relay_url.clone()));
         }
     }
     let probes: Vec<_> = stream::iter(jobs)
@@ -769,35 +775,35 @@ mod tests {
     }
 
     #[test]
-    fn observer_lifecycle_key_preserves_exact_canonical_pair() {
+    fn observer_lifecycle_accepts_only_the_local_workspace_pair() {
         let first = payload(
-            "WSS://Relay.Example:443/",
+            "ws://localhost:3000",
             ManagedAgentRuntimeLifecycle::Ready,
             None,
         );
         let key = observer_lifecycle_key(&first.pubkey, &first).unwrap();
         assert_eq!(key.pubkey, first.pubkey);
-        assert_eq!(key.relay_url, "wss://relay.example");
+        assert_eq!(key.relay_url, "ws://127.0.0.1:3000");
 
         let other = payload(
             "wss://other.example",
             ManagedAgentRuntimeLifecycle::Ready,
             None,
         );
-        assert_ne!(key, observer_lifecycle_key(&other.pubkey, &other).unwrap());
+        assert!(observer_lifecycle_key(&other.pubkey, &other).is_err());
     }
 
     #[test]
     fn observer_lifecycle_rejects_cross_agent_and_desktop_states() {
         let ready = payload(
-            "wss://relay.example",
+            "ws://localhost:3000",
             ManagedAgentRuntimeLifecycle::Ready,
             None,
         );
         assert!(observer_lifecycle_key(&"bb".repeat(32), &ready).is_err());
 
         let stopped = payload(
-            "wss://relay.example",
+            "ws://localhost:3000",
             ManagedAgentRuntimeLifecycle::Stopped,
             None,
         );
@@ -807,14 +813,14 @@ mod tests {
     #[test]
     fn observer_lifecycle_enforces_failed_error_contract() {
         let failed = payload(
-            "wss://relay.example",
+            "ws://localhost:3000",
             ManagedAgentRuntimeLifecycle::Failed,
             None,
         );
         assert!(observer_lifecycle_key(&failed.pubkey, &failed).is_err());
 
         let ready_with_error = payload(
-            "wss://relay.example",
+            "ws://localhost:3000",
             ManagedAgentRuntimeLifecycle::Ready,
             Some("unexpected"),
         );

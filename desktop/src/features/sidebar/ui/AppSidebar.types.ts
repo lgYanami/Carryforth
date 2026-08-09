@@ -1,4 +1,3 @@
-import type { AddCommunityPrefillRequest } from "@/features/communities/addCommunityPrefill";
 import type { Community } from "@/features/communities/types";
 import type { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import type { SettingsSection } from "@/features/settings/ui/SettingsPanels";
@@ -14,14 +13,12 @@ import type {
 } from "@/shared/api/types";
 
 export type AppSidebarProps = {
-  addCommunityPrefill?: AddCommunityPrefillRequest | null;
   activeCommunity: Community | null;
   channels: Channel[];
   meetingItems: MeetingListItem[];
   currentPubkey?: string;
   fallbackDisplayName?: string;
   homeBadgeCount: number;
-  isAddCommunityOpen?: boolean;
   isLoading: boolean;
   isCreatingChannel: boolean;
   isCreatingForum: boolean;
@@ -34,9 +31,6 @@ export type AppSidebarProps = {
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
   unreadMeetingIds: ReadonlySet<string>;
-  communities: Community[];
-  onAddCommunity: (community: Community) => void;
-  onAddCommunityOpenChange?: (open: boolean) => void;
   onCreateChannel: (input: {
     name: string;
     description?: string;
@@ -51,7 +45,6 @@ export type AppSidebarProps = {
     ttlSeconds?: number;
     templateId?: string;
   }) => Promise<void>;
-  onOpenAddCommunity: () => void;
   onSendFeedback?: () => void;
   onHideDm: (channelId: string) => void;
   onMarkChannelUnread: (channelId: string) => void;
@@ -62,11 +55,6 @@ export type AppSidebarProps = {
   onMarkAllChannelsRead: () => void;
   onBrowseChannels?: (onCreated?: (channelId: string) => void) => void;
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
-  onUpdateCommunity: (
-    id: string,
-    updates: Partial<Pick<Community, "name" | "relayUrl" | "token">>,
-  ) => void;
-  onRemoveCommunity: (id: string) => void;
   onCreateAgent: () => void;
   onSelectAgents: () => void;
   onSelectCommunity: () => void;
@@ -89,7 +77,6 @@ export type AppSidebarProps = {
   onSetPresenceStatus?: (status: "online" | "away" | "offline") => void;
   onSetUserStatus: (text: string, emoji: string) => void;
   onClearUserStatus: () => void;
-  onSwitchCommunity: (id: string) => void;
   selfUserStatus?: UserStatus;
   isPresencePending?: boolean;
   onNewMessage: () => void;

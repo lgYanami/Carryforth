@@ -5,7 +5,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 
-import { loadCommunities } from "@/features/communities/communityStorage";
+import { loadConnectableCommunities } from "@/features/communities/communityStorage";
 import {
   listManagedAgentRuntimes,
   reconcileManagedAgentRuntimes,
@@ -78,7 +78,7 @@ export function bootstrapManagedAgentRuntimePairs(
   const baseline = queryClient.getQueryData<ManagedAgentRuntimeStatus[]>(
     managedAgentRuntimesQueryKey,
   );
-  const communities = loadCommunities().map((community) => ({
+  const communities = loadConnectableCommunities().map((community) => ({
     relayUrl: community.relayUrl,
   }));
   void reconcileManagedAgentRuntimes(communities)

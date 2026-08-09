@@ -13,6 +13,7 @@ import {
   type JoinPolicy,
 } from "@/shared/api/invites";
 import { normalizeRelayUrl } from "@/features/communities/relayProbe";
+import { isDesktopRelayUrlAllowed } from "@/shared/runtime/desktopNetworkMode";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
@@ -113,7 +114,12 @@ export function InviteRedeemForm({
         : parsedInvite
           ? bareCodeRelayUrl.trim()
           : "";
-    if (!relayWsUrl || !isJoinPolicyDiscoveryCandidate(relayWsUrl)) return;
+    if (
+      !relayWsUrl ||
+      !isDesktopRelayUrlAllowed(relayWsUrl) ||
+      !isJoinPolicyDiscoveryCandidate(relayWsUrl)
+    )
+      return;
 
     const code = parsedInvite?.code;
     let cancelled = false;
@@ -141,9 +147,11 @@ export function InviteRedeemForm({
 
   const canSubmit =
     (parsedInvite !== null &&
-      ("relayWsUrl" in parsedInvite ||
-        (isBareCode && bareCodeRelayUrl.trim().length > 0))) ||
-    normalizedRelayUrl !== null;
+      (hasInviteRelay(parsedInvite)
+        ? isDesktopRelayUrlAllowed(parsedInvite.relayWsUrl)
+        : isBareCode && isDesktopRelayUrlAllowed(bareCodeRelayUrl))) ||
+    (normalizedRelayUrl !== null &&
+      isDesktopRelayUrlAllowed(normalizedRelayUrl));
   const isOnboardingSpotlight = variant === "onboarding-spotlight";
   const isAddCommunity = variant === "add-community";
   const showInvalidInviteTip =
@@ -153,6 +161,12 @@ export function InviteRedeemForm({
     async (event: React.FormEvent) => {
       event.preventDefault();
       if (normalizedRelayUrl) {
+        if (!isDesktopRelayUrlAllowed(normalizedRelayUrl)) {
+          setPolicyError(
+            "Carryforth accepts invites only for the local Relay.",
+          );
+          return;
+        }
         setPolicyError(null);
         setIsLoadingPolicy(true);
         try {
@@ -201,6 +215,10 @@ export function InviteRedeemForm({
         ? parsedInvite.relayWsUrl
         : bareCodeRelayUrl.trim();
       if (!relayWsUrl) return;
+      if (!isDesktopRelayUrlAllowed(relayWsUrl)) {
+        setPolicyError("Carryforth accepts invites only for the local Relay.");
+        return;
+      }
 
       setPolicyError(null);
       setIsLoadingPolicy(true);

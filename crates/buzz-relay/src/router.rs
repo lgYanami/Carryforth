@@ -72,6 +72,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/query", post(api::bridge::query_events))
         .route("/count", post(api::bridge::count_events))
         .route(
+            "/api/local/owner",
+            post(api::local_desktop::claim_initial_owner),
+        )
+        .route(
             "/operator/communities",
             get(api::operator::list_owned_communities).post(api::operator::provision_community),
         )

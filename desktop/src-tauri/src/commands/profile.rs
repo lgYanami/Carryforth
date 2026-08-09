@@ -106,6 +106,7 @@ pub async fn update_profile_at_relay(
     avatar_url: String,
     state: State<'_, AppState>,
 ) -> Result<ProfileInfo, String> {
+    let relay_url = crate::relay::validate_workspace_relay_url(&relay_url)?;
     let signer = capture_expected_signer(&state, &expected_pubkey)?;
 
     let api_base_url = relay_http_base_url(&relay_url);

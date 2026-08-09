@@ -11,6 +11,16 @@ use crate::{
     relay::{self, relay_api_base_url_with_override, relay_ws_url_with_override},
 };
 
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct LocalOwnerClaimResponse {
+    /// Stable initialization outcome.
+    status: String,
+    /// Current Community role for this Desktop identity, when present.
+    role: Option<String>,
+    /// Hex public key of the local Desktop identity.
+    pubkey: String,
+}
+
 /// Encode `pubkey` as npub bech32 and truncate it for display: first 10 chars
 /// + "…" + last 4 chars. Returns the full bech32 when it is 16 chars or fewer.
 fn truncated_display_name(pubkey: &PublicKey) -> Result<String, String> {
@@ -55,24 +65,32 @@ pub fn get_default_relay_url() -> String {
 }
 
 #[tauri::command]
-pub fn auto_connect_default_relay_enabled() -> bool {
-    option_env!("BUZZ_DESKTOP_BUILD_AUTO_CONNECT_DEFAULT_RELAY").is_some()
+pub fn get_desktop_network_mode() -> &'static str {
+    "localOnly"
 }
 
-#[cfg(test)]
-mod auto_connect_default_relay_tests {
-    use super::auto_connect_default_relay_enabled;
-
-    #[test]
-    #[ignore]
-    fn compiled_flag_matches_expected() {
-        let expected = std::env::var("BUZZ_TEST_EXPECTED_AUTO_CONNECT_DEFAULT_RELAY")
-            .expect("compiled-flag test requires an expected value");
-        assert_eq!(
-            auto_connect_default_relay_enabled(),
-            expected == "true" || expected == "1"
-        );
+/// Ask the exact loopback Relay to atomically initialize this Desktop identity
+/// as the first owner. Existing ownership is never replaced.
+#[tauri::command]
+pub async fn claim_local_owner(
+    state: State<'_, AppState>,
+) -> Result<LocalOwnerClaimResponse, String> {
+    let url = format!("{}/api/local/owner", relay::relay_api_base_url());
+    let body = b"{}";
+    let auth = relay::build_nip98_auth_header(&reqwest::Method::POST, &url, body, &state)?;
+    let response = state
+        .http_client
+        .post(&url)
+        .header("Authorization", auth)
+        .header("Content-Type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|error| relay::classify_request_error(&error))?;
+    if !response.status().is_success() {
+        return Err(relay::relay_error_message(response).await);
     }
+    relay::parse_json_response(response).await
 }
 
 #[tauri::command]
@@ -449,6 +467,7 @@ pub async fn create_auth_event(
     relay_url: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let relay_url = relay::validate_workspace_relay_url(&relay_url)?;
     let keys = state.signing_keys()?;
 
     tauri::async_runtime::spawn_blocking(move || {

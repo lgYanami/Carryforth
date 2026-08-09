@@ -5,6 +5,8 @@ pub mod bridge;
 pub mod events;
 pub mod git;
 pub mod invites;
+/// Loopback-only Carryforth Desktop bootstrap operations.
+pub mod local_desktop;
 pub mod media;
 pub mod mesh_demo;
 pub mod nip05;

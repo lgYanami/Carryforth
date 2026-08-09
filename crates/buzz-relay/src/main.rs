@@ -212,11 +212,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // NIP-43: if membership enforcement is on, a valid owner pubkey is required.
-    // config.rs already strips invalid values with a warning; catch the resulting
-    // None here so we fail fast with a clear message rather than starting a relay
-    // that no one can administer.
-    if config.require_relay_membership && config.relay_owner_pubkey.is_none() {
+    let is_local_desktop_deployment =
+        buzz_relay::api::local_desktop::is_local_desktop_relay_url(&config.relay_url);
+
+    // Hosted deployments still require a configured owner when membership is
+    // enforced. The exact Carryforth loopback deployment is the sole exception:
+    // its finalized Desktop identity claims a greenfield owner through the
+    // signed local bootstrap endpoint after machine onboarding completes.
+    if config.require_relay_membership
+        && config.relay_owner_pubkey.is_none()
+        && !is_local_desktop_deployment
+    {
         error!(
             "BUZZ_REQUIRE_RELAY_MEMBERSHIP=true but RELAY_OWNER_PUBKEY is not set or invalid. \
              Set RELAY_OWNER_PUBKEY to a valid 64-char hex pubkey."
@@ -306,7 +312,13 @@ async fn main() -> anyhow::Result<()> {
 
     // NIP-43: ensure the configured relay owner always holds the owner role
     // within the deployment community.
-    if let (Some(community), Some(owner_pubkey)) =
+    if is_local_desktop_deployment {
+        if config.relay_owner_pubkey.is_some() {
+            info!(
+                "Ignoring RELAY_OWNER_PUBKEY for the local Carryforth deployment; the first signed Desktop identity claims the greenfield owner"
+            );
+        }
+    } else if let (Some(community), Some(owner_pubkey)) =
         (deployment_community, config.relay_owner_pubkey.as_ref())
     {
         match db.bootstrap_owner(community, owner_pubkey).await {

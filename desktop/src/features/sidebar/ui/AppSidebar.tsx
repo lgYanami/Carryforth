@@ -3,7 +3,6 @@ import * as React from "react";
 import { FeatureGate } from "@/shared/features";
 import { SidebarDndContext } from "@/features/sidebar/ui/SidebarDnd";
 
-import { AddCommunityDialog } from "@/features/communities/ui/AddCommunityDialog";
 import { useIsMobile } from "@/shared/hooks/use-mobile";
 import { useDeferredLoad } from "@/shared/hooks/useDeferredStartup";
 import {
@@ -74,7 +73,6 @@ type CollapsibleSidebarGroup =
 type CreateChannelKind = "stream" | "forum";
 
 export function AppSidebar({
-  addCommunityPrefill,
   activeCommunity,
   channels,
   meetingItems,
@@ -82,7 +80,6 @@ export function AppSidebar({
   fallbackDisplayName,
   homeBadgeCount,
   onBackgroundClick,
-  isAddCommunityOpen,
   isLoading,
   isCreatingChannel,
   isCreatingForum,
@@ -95,12 +92,8 @@ export function AppSidebar({
   unreadChannelCounts,
   unreadChannelIds,
   unreadMeetingIds,
-  communities,
-  onAddCommunity,
-  onAddCommunityOpenChange,
   onCreateChannel,
   onCreateForum,
-  onOpenAddCommunity,
   onSendFeedback,
   onHideDm,
   onMarkChannelUnread,
@@ -108,8 +101,6 @@ export function AppSidebar({
   onMarkAllChannelsRead,
   onBrowseChannels,
   onOpenDm,
-  onUpdateCommunity,
-  onRemoveCommunity,
   onCreateAgent,
   onSelectAgents,
   onSelectCommunity,
@@ -127,7 +118,6 @@ export function AppSidebar({
   onSetPresenceStatus,
   onSetUserStatus,
   onClearUserStatus,
-  onSwitchCommunity,
   selfUserStatus,
   isPresencePending,
   onNewMessage,
@@ -810,20 +800,15 @@ export function AppSidebar({
                 <SidebarProfileCard
                   activeCommunity={activeCommunity}
                   isPresencePending={isPresencePending}
-                  onOpenAddCommunity={onOpenAddCommunity}
                   onOpenSettings={onSelectSettings}
                   onSendFeedback={onSendFeedback}
-                  onRemoveCommunity={onRemoveCommunity}
                   onSetPresenceStatus={onSetPresenceStatus}
                   onSetUserStatus={onSetUserStatus}
                   onClearUserStatus={onClearUserStatus}
-                  onSwitchCommunity={onSwitchCommunity}
-                  onUpdateCommunity={onUpdateCommunity}
                   profile={profile}
                   resolvedDisplayName={resolvedDisplayName}
                   selfPresenceStatus={selfPresenceStatus}
                   selfUserStatus={selfUserStatus}
-                  communities={communities}
                 />
               </SidebarMenuItem>
             </SidebarMenu>
@@ -845,13 +830,6 @@ export function AppSidebar({
           }
         }}
         onCreate={handleCreateFromDialog}
-      />
-
-      <AddCommunityDialog
-        prefill={addCommunityPrefill}
-        onOpenChange={onAddCommunityOpenChange ?? (() => {})}
-        onSubmit={onAddCommunity}
-        open={isAddCommunityOpen ?? false}
       />
 
       <CreateSectionDialog

@@ -5,8 +5,6 @@ include!("src/commands/reconnect_hook_config.rs");
 use base64::Engine as _;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
-    println!("cargo:rerun-if-env-changed=BUZZ_RELAY_HTTP");
     println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_PUBLIC_KEY");
     println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_ENDPOINT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_BUZZ_AGENT_PROVIDER");
@@ -15,16 +13,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_RELAY_RECONNECT_CMD");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_OBSERVER_ARCHIVE_DEFAULT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT");
-    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY");
     println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
-
-    if let Ok(relay_url) = std::env::var("BUZZ_RELAY_URL") {
-        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_RELAY_URL={relay_url}");
-    }
-
-    if let Ok(relay_http) = std::env::var("BUZZ_RELAY_HTTP") {
-        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_RELAY_HTTP={relay_http}");
-    }
 
     if let Ok(provider) = std::env::var("BUZZ_BUILD_BUZZ_AGENT_PROVIDER") {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_BUZZ_AGENT_PROVIDER={provider}");
@@ -88,13 +77,6 @@ fn main() {
     // leave this unset → default OFF.
     if std::env::var("BUZZ_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT").is_ok() {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT=1");
-    }
-
-    // Presence-only release capability: internal desktop builds opt into
-    // auto-connecting their configured default relay on first run. OSS builds
-    // leave this unset and retain explicit community selection.
-    if std::env::var("BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY").is_ok() {
-        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_AUTO_CONNECT_DEFAULT_RELAY=1");
     }
 
     let updater_public_key = std::env::var("BUZZ_UPDATER_PUBLIC_KEY")

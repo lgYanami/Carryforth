@@ -329,7 +329,8 @@ fn resolve_identity(app: &AppHandle, relay_url: &str) -> Result<IdentityResoluti
 }
 
 fn identity_scope(app: &AppHandle, relay_url: &str) -> Result<SupervisorIdentityScope, String> {
-    let (relay_url, coordinate) = identity_coordinate(relay_url)?;
+    let relay_url = crate::relay::validate_workspace_relay_url(relay_url)?;
+    let (relay_url, coordinate) = identity_coordinate(&relay_url)?;
     let directory = super::managed_agents_base_dir(app)?
         .join("runtime-supervision")
         .join("identities");

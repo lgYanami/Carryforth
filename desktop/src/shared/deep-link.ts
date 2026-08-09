@@ -1,5 +1,4 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
 import type { StartCommunityOnboardingInput } from "@/features/onboarding/communityOnboarding";
 
 export type AddCommunityDeepLinkPayload = {
@@ -40,61 +39,6 @@ export type NostrBindDeepLinkPayload = {
 };
 
 /**
- * Payload emitted by the Rust deep-link handler for `buzz://join?…` —
- * a relay invite from the web landing page (`/invite/<code>`).
- */
-export type JoinDeepLinkPayload = {
-  relayUrl: string;
-  code: string;
-  policyReceipt: string | null;
-};
-
-type PendingCommunityDeepLink = {
-  id: string;
-  kind: "connect" | "join" | "add-community";
-  relayUrl: string;
-  code: string | null;
-  name: string | null;
-  policyReceipt: string | null;
-};
-
-function acceptPendingCommunityDeepLink(
-  pending: PendingCommunityDeepLink,
-  deps: DeepLinkDeps,
-) {
-  const accepted =
-    pending.kind === "add-community"
-      ? deps.openAddCommunity({
-          requestId: pending.id,
-          relayUrl: pending.relayUrl,
-          name: pending.name ?? undefined,
-        })
-      : deps.startCommunityOnboarding({
-          source:
-            pending.kind === "join" ? "deep-link-join" : "deep-link-connect",
-          relayUrl: pending.relayUrl,
-          inviteCode: pending.code ?? undefined,
-          policyReceipt: pending.policyReceipt ?? undefined,
-        });
-  return accepted
-    ? invoke<boolean>("acknowledge_pending_community_deep_link", {
-        id: pending.id,
-      })
-    : Promise.resolve(false);
-}
-
-async function drainPendingCommunityDeepLinks(deps: DeepLinkDeps) {
-  while (true) {
-    const pending = await invoke<PendingCommunityDeepLink | null>(
-      "take_pending_community_deep_link",
-    );
-    if (!pending) return;
-    if (!(await acceptPendingCommunityDeepLink(pending, deps))) return;
-    if (pending.kind === "add-community") return;
-  }
-}
-
-/**
  * Register listeners for deep-link events emitted by the Rust backend.
  *
  * When a `buzz://connect?relay=<url>` link is opened, the handler
@@ -113,43 +57,10 @@ async function drainPendingCommunityDeepLinks(deps: DeepLinkDeps) {
 export async function listenForDeepLinks(
   deps: DeepLinkDeps,
 ): Promise<UnlistenFn> {
-  let drainRunning = false;
-  let drainRequested = false;
-  const drain = () => {
-    drainRequested = true;
-    if (drainRunning) return;
-    drainRunning = true;
-    void (async () => {
-      try {
-        while (drainRequested) {
-          drainRequested = false;
-          await drainPendingCommunityDeepLinks(deps);
-        }
-      } catch (error: unknown) {
-        console.warn("Failed to drain pending community deep links", error);
-      } finally {
-        drainRunning = false;
-        if (drainRequested) drain();
-      }
-    })();
-  };
-  const stopAvailabilityListener = deps.onAddCommunityAvailable(drain);
-  const connectPromise = listen<string>("deep-link-connect", drain);
-  const joinPromise = listen<JoinDeepLinkPayload>("deep-link-join", drain);
-  const addCommunityPromise = listen<AddCommunityDeepLinkPayload>(
-    "deep-link-add-community",
-    drain,
-  );
-  const unlistens = await Promise.all([
-    connectPromise,
-    joinPromise,
-    addCommunityPromise,
-  ]);
-  drain();
-  return () => {
-    stopAvailabilityListener();
-    for (const unlisten of unlistens) unlisten();
-  };
+  // Community deep links are a remote-community entry point. Carryforth does
+  // not consume Rust's pending queue or register any of those listeners.
+  void deps;
+  return () => {};
 }
 
 /**
@@ -168,7 +79,8 @@ export function listenForMessageDeepLinks(
 export function listenForNostrBindDeepLinks(
   onOpen: (payload: NostrBindDeepLinkPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<NostrBindDeepLinkPayload>("deep-link-nostr-bind", (event) => {
-    onOpen(event.payload);
-  });
+  // Nostr binding is the browser/Builderlab account hand-off. A local-only
+  // Desktop must not surface or sign that remote binding request.
+  void onOpen;
+  return Promise.resolve(() => {});
 }
