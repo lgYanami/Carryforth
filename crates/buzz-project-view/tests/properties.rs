@@ -97,6 +97,7 @@ fn baseline_state() -> ProjectViewState {
                 purpose: "Coordinate human and agent work".to_owned(),
                 problem: "Project state is otherwise fragmented".to_owned(),
                 scope: "Deterministic domain model".to_owned(),
+                summary: None,
             },
             goals: vec![
                 InitializeGoal {
@@ -104,12 +105,14 @@ fn baseline_state() -> ProjectViewState {
                     title: "Goal one".to_owned(),
                     desired_outcome: "First outcome".to_owned(),
                     directions: vec!["Direction one".to_owned()],
+                    summary: None,
                 },
                 InitializeGoal {
                     id: object_id(GOAL_TWO),
                     title: "Goal two".to_owned(),
                     desired_outcome: "Second outcome".to_owned(),
                     directions: vec![],
+                    summary: None,
                 },
             ],
         }),

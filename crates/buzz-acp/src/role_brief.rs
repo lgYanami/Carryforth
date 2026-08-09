@@ -2021,6 +2021,7 @@ mod tests {
             updated_by: member,
             data: ProjectViewObjectDataV3::ProjectProfile(ProjectProfile {
                 name: project_name.to_owned(),
+                summary: None,
                 positioning: "Project-owned continuity".to_owned(),
                 purpose: "Keep project context available across runtimes".to_owned(),
                 problem: "Runtime-local context is discontinuous".to_owned(),
@@ -2048,6 +2049,7 @@ mod tests {
             updated_by: member,
             data: ProjectViewObjectDataV3::Goal(Goal {
                 title: "Continuous project work".to_owned(),
+                summary: None,
                 desired_outcome: "A successor resumes from verified state".to_owned(),
                 directions: vec!["Keep context project-owned".to_owned()],
             }),

@@ -470,7 +470,7 @@ pub enum ProjectViewCmd {
         /// Explicit UUID v4; omitted to generate a fresh ID.
         #[arg(long)]
         id: Option<Uuid>,
-        /// JSON file containing the typed object body and relations, or `-`.
+        /// Typed body/relations JSON, or `-`; `summary` is optional retrieval metadata.
         #[arg(long)]
         data: String,
         /// Initial Role level. Valid only when object_type is `role`.
@@ -487,7 +487,7 @@ pub enum ProjectViewCmd {
         /// Project revision on which this intent was based.
         #[arg(long)]
         expected_project_revision: u64,
-        /// JSON file containing the typed patch, or `-` for stdin.
+        /// Typed patch, or `-`; omit `summary` to keep, use text to set, or null to clear.
         #[arg(long)]
         patch: String,
     },

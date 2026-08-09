@@ -41,7 +41,7 @@ export type ProjectContextLayout = {
 };
 
 const BASE_COORDINATE_WIDTH = 224;
-const BASE_COORDINATE_HEIGHT = 88;
+const BASE_COORDINATE_HEIGHT = 120;
 const BASE_HUB_SIZE = 76;
 const BASE_LAYER_GAP = 116;
 const BASE_ROW_GAP = 52;

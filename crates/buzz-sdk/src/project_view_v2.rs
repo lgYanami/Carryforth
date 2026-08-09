@@ -1533,6 +1533,7 @@ mod tests {
             updated_by: actor,
             data: ProjectViewObjectData::Work(ProjectWork {
                 title: "Project Role continuity".to_owned(),
+                summary: None,
                 description: "Keep responsibility stable across runtimes".to_owned(),
                 status: WorkStatus::InProgress,
                 priority: Priority::High,

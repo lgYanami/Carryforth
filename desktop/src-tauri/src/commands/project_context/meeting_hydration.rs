@@ -132,6 +132,7 @@ fn observed_detail(
             ProjectContextDetailState::Active
         },
         title: Some(record.title),
+        summary: None,
         status: Some(json!(record.lifecycle)),
         object_revision: None,
         document_revision: None,

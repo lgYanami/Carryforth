@@ -1011,6 +1011,7 @@ mod tests {
             MutationRequest::Initialize(InitializeMutation {
                 profile: ProjectProfile {
                     name: "SDK test".to_owned(),
+                    summary: None,
                     positioning: "Canonical current state".to_owned(),
                     purpose: "Verify projection wire format".to_owned(),
                     problem: "Wire drift".to_owned(),
@@ -1019,6 +1020,7 @@ mod tests {
                 goals: vec![InitializeGoal {
                     id: Uuid::new_v4(),
                     title: "Ship".to_owned(),
+                    summary: None,
                     desired_outcome: "Projection is verifiable".to_owned(),
                     directions: Vec::new(),
                 }],
@@ -1148,6 +1150,7 @@ mod tests {
         let initialize = build_initialize(
             ProjectProfile {
                 name: "SDK command".to_owned(),
+                summary: None,
                 positioning: "Typed".to_owned(),
                 purpose: "Avoid hand-written events".to_owned(),
                 problem: "Protocol drift".to_owned(),
@@ -1156,6 +1159,7 @@ mod tests {
             vec![InitializeGoal {
                 id: goal_id,
                 title: "Ship".to_owned(),
+                summary: None,
                 desired_outcome: "CLI works".to_owned(),
                 directions: Vec::new(),
             }],

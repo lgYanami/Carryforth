@@ -1560,6 +1560,7 @@ impl Db {
                     responsibilities: role.responsibilities.clone(),
                     boundaries: role.boundaries.clone(),
                     active: role.active,
+                    summary: role.summary.clone(),
                 }),
                 relations: ProjectViewRelations::default(),
                 context_references: role.context_references.clone(),
@@ -4994,6 +4995,7 @@ mod tests {
         let entity = buzz_sdk::project_view_v3::V3EntityChange::Role(RoleDefinitionV3 {
             role_id: Uuid::new_v4(),
             name: "Runtime owner".to_owned(),
+            summary: None,
             purpose: "Exercise trusted system projection wire format".to_owned(),
             responsibilities: vec!["Supervise".to_owned()],
             boundaries: vec!["No legacy fallback".to_owned()],
@@ -5224,6 +5226,7 @@ mod tests {
             updated_by: actor,
             data: ProjectViewObjectDataV3::ProjectProfile(buzz_project_view::ProjectProfile {
                 name: "Project".to_owned(),
+                summary: None,
                 positioning: "Local".to_owned(),
                 purpose: "Verify strict readiness".to_owned(),
                 problem: "Projection drift".to_owned(),
@@ -5299,6 +5302,7 @@ mod tests {
         let role = RoleDefinitionV3 {
             role_id,
             name: "Maintainer".to_owned(),
+            summary: None,
             purpose: "Maintain".to_owned(),
             responsibilities: vec!["Review".to_owned()],
             boundaries: vec!["No bypass".to_owned()],

@@ -4207,6 +4207,7 @@ mod tests {
             MutationRequest::Initialize(InitializeMutation {
                 profile: ProjectProfile {
                     name: "Project View".to_owned(),
+                    summary: None,
                     positioning: "Canonical project state".to_owned(),
                     purpose: "Coordinate humans and agents".to_owned(),
                     problem: "Project context is fragmented".to_owned(),
@@ -4215,6 +4216,7 @@ mod tests {
                 goals: vec![InitializeGoal {
                     id: Uuid::new_v4(),
                     title: "Ship the backend".to_owned(),
+                    summary: None,
                     desired_outcome: "A transactionally consistent view".to_owned(),
                     directions: vec!["Preserve atomicity".to_owned()],
                 }],
@@ -8801,6 +8803,7 @@ mod tests {
     fn canonical_body_storage_round_trips_every_active_variant_shape() {
         let data = ProjectViewObjectData::Goal(Goal {
             title: "Goal".to_owned(),
+            summary: None,
             desired_outcome: "Outcome".to_owned(),
             directions: vec!["Direction".to_owned()],
         });

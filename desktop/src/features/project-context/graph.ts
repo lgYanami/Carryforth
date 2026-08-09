@@ -11,6 +11,7 @@ export type ProjectContextGraphCoordinate = {
   coordinateKey: string;
   coordinate?: ProjectContextCoordinate;
   displayTitle: string;
+  summary?: string;
   stableId: string;
   state: ProjectContextDetailState;
   typeLabel: string;
@@ -132,6 +133,7 @@ function coordinatePresentation(
     coordinate: detail?.coordinate,
     displayTitle:
       detail?.title?.trim() || `${typeLabel} ${shortStableId(stableId)}`,
+    summary: detail?.summary,
     stableId,
     state: detail?.state ?? "unavailable",
     typeLabel,

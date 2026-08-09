@@ -249,6 +249,13 @@ pub struct ProjectProfile {
     pub problem: String,
     /// The project's declared boundary.
     pub scope: String,
+    /// Optional retrieval summary owned by this Project Profile.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// A desired outcome of the project.
@@ -261,6 +268,13 @@ pub struct Goal {
     pub desired_outcome: String,
     /// Explicit directions that guide pursuit of the goal.
     pub directions: Vec<String>,
+    /// Optional retrieval summary owned by this Goal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// A stable semantic responsibility position within the project.
@@ -279,6 +293,13 @@ pub struct ProjectRole {
     pub boundaries: Vec<String>,
     /// Whether the semantic role is currently active.
     pub active: bool,
+    /// Optional retrieval summary owned by this Role.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// Planning logic used to advance the project.
@@ -291,6 +312,13 @@ pub struct ProjectPlan {
     pub description: String,
     /// Explicit plan status.
     pub status: PlanStatus,
+    /// Optional retrieval summary owned by this Plan.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// A stable segment within one project plan.
@@ -303,6 +331,13 @@ pub struct ProjectStage {
     pub description: String,
     /// Explicit stage status.
     pub status: StageStatus,
+    /// Optional retrieval summary owned by this Stage.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// Something the project intends to implement, change, or satisfy.
@@ -317,6 +352,13 @@ pub struct Requirement {
     pub status: RequirementStatus,
     /// Explicit requirement priority.
     pub priority: Priority,
+    /// Optional retrieval summary owned by this Requirement.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// A discovered project problem, gap, exception, or feedback item.
@@ -331,6 +373,13 @@ pub struct ProjectIssue {
     pub status: IssueStatus,
     /// Explicit issue priority.
     pub priority: Priority,
+    /// Optional retrieval summary owned by this Issue.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// A unit of execution that handles exactly one requirement or issue.
@@ -345,6 +394,13 @@ pub struct ProjectWork {
     pub status: WorkStatus,
     /// Explicit work priority.
     pub priority: Priority,
+    /// Optional retrieval summary owned by this Work.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_non_null"
+    )]
+    pub summary: Option<String>,
 }
 
 /// A stable entry point to a project-related asset.

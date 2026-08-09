@@ -15,6 +15,7 @@ use super::{
     ProjectViewTombstoneV3, ReferenceTargetProof, V3ContractError, V3ReferenceError,
     PROJECT_VIEW_V3_SCHEMA_VERSION,
 };
+use crate::serde_helpers::deserialize_optional_non_null;
 use crate::v2::{RoleLevel, RuntimeFence};
 use crate::{
     DomainError, Goal, IssueStatus, ObjectRef, Patch, PlanStatus, Priority, ProjectIssue,
@@ -302,6 +303,13 @@ pub enum NewProjectViewObjectV3 {
         desired_outcome: String,
         /// Strategic directions.
         directions: Vec<String>,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Initial canonical Context set.
         #[serde(default)]
         context_references: Vec<ProjectContextReference>,
@@ -320,6 +328,13 @@ pub enum NewProjectViewObjectV3 {
         boundaries: Vec<String>,
         /// Whether this Role may receive Assignments.
         active: bool,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Initial canonical Context set.
         #[serde(default)]
         context_references: Vec<ProjectContextReference>,
@@ -334,6 +349,13 @@ pub enum NewProjectViewObjectV3 {
         description: String,
         /// Plan status.
         status: PlanStatus,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Optional owning Goal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         under_goal_id: Option<Uuid>,
@@ -351,6 +373,13 @@ pub enum NewProjectViewObjectV3 {
         description: String,
         /// Stage status.
         status: StageStatus,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Required parent Plan.
         under_plan_id: Uuid,
         /// Initial canonical Context set.
@@ -369,6 +398,13 @@ pub enum NewProjectViewObjectV3 {
         status: RequirementStatus,
         /// Requirement priority.
         priority: Priority,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Optional planning Stage.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         planned_in_stage_id: Option<Uuid>,
@@ -388,6 +424,13 @@ pub enum NewProjectViewObjectV3 {
         status: IssueStatus,
         /// Issue priority.
         priority: Priority,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Optional planning Stage.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         planned_in_stage_id: Option<Uuid>,
@@ -410,6 +453,13 @@ pub enum NewProjectViewObjectV3 {
         status: WorkStatus,
         /// Work priority.
         priority: Priority,
+        /// Optional retrieval summary.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
+        summary: Option<String>,
         /// Requirement or Issue handled by this Work.
         handles: ObjectRef,
         /// Initial canonical Context set.
@@ -425,7 +475,11 @@ pub enum NewProjectViewObjectV3 {
         /// Open canonical kind token.
         resource_kind: String,
         /// Optional summary.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
         summary: Option<String>,
         /// Required active Guide Document.
         guide_document_id: Uuid,
@@ -463,6 +517,21 @@ impl NewProjectViewObjectV3 {
             Self::Issue { .. } => ProjectViewObjectType::Issue,
             Self::Work { .. } => ProjectViewObjectType::Work,
             Self::Resource { .. } => ProjectViewObjectType::Resource,
+        }
+    }
+
+    /// Retrieval summary supplied with this create payload.
+    #[must_use]
+    pub fn summary(&self) -> Option<&str> {
+        match self {
+            Self::Goal { summary, .. }
+            | Self::Role { summary, .. }
+            | Self::Plan { summary, .. }
+            | Self::Stage { summary, .. }
+            | Self::Requirement { summary, .. }
+            | Self::Issue { summary, .. }
+            | Self::Work { summary, .. }
+            | Self::Resource { summary, .. } => summary.as_deref(),
         }
     }
 
@@ -511,6 +580,7 @@ impl NewProjectViewObjectV3 {
                 title,
                 desired_outcome,
                 directions,
+                summary,
                 context_references,
             } => (
                 id,
@@ -518,6 +588,7 @@ impl NewProjectViewObjectV3 {
                     title,
                     desired_outcome,
                     directions,
+                    summary,
                 }),
                 ProjectViewRelations::default(),
                 context_references,
@@ -529,6 +600,7 @@ impl NewProjectViewObjectV3 {
                 responsibilities,
                 boundaries,
                 active,
+                summary,
                 context_references,
             } => (
                 id,
@@ -538,6 +610,7 @@ impl NewProjectViewObjectV3 {
                     responsibilities,
                     boundaries,
                     active,
+                    summary,
                 }),
                 ProjectViewRelations::default(),
                 context_references,
@@ -547,6 +620,7 @@ impl NewProjectViewObjectV3 {
                 title,
                 description,
                 status,
+                summary,
                 under_goal_id,
                 context_references,
             } => (
@@ -555,6 +629,7 @@ impl NewProjectViewObjectV3 {
                     title,
                     description,
                     status,
+                    summary,
                 }),
                 ProjectViewRelations {
                     under_goal_id,
@@ -567,6 +642,7 @@ impl NewProjectViewObjectV3 {
                 title,
                 description,
                 status,
+                summary,
                 under_plan_id,
                 context_references,
             } => (
@@ -575,6 +651,7 @@ impl NewProjectViewObjectV3 {
                     title,
                     description,
                     status,
+                    summary,
                 }),
                 ProjectViewRelations {
                     under_plan_id: Some(under_plan_id),
@@ -588,6 +665,7 @@ impl NewProjectViewObjectV3 {
                 description,
                 status,
                 priority,
+                summary,
                 planned_in_stage_id,
                 context_references,
             } => (
@@ -597,6 +675,7 @@ impl NewProjectViewObjectV3 {
                     description,
                     status,
                     priority,
+                    summary,
                 }),
                 ProjectViewRelations {
                     planned_in_stage_id,
@@ -610,6 +689,7 @@ impl NewProjectViewObjectV3 {
                 description,
                 status,
                 priority,
+                summary,
                 planned_in_stage_id,
                 about,
                 context_references,
@@ -620,6 +700,7 @@ impl NewProjectViewObjectV3 {
                     description,
                     status,
                     priority,
+                    summary,
                 }),
                 ProjectViewRelations {
                     planned_in_stage_id,
@@ -634,6 +715,7 @@ impl NewProjectViewObjectV3 {
                 description,
                 status,
                 priority,
+                summary,
                 handles,
                 context_references,
             } => (
@@ -643,6 +725,7 @@ impl NewProjectViewObjectV3 {
                     description,
                     status,
                     priority,
+                    summary,
                 }),
                 ProjectViewRelations {
                     handles: Some(handles),
@@ -691,6 +774,10 @@ macro_rules! v3_patch {
                 #[serde(default, skip_serializing_if = "Patch::is_unchanged")]
                 pub $field: Patch<$field_type>,
             )*
+            /// Optional retrieval summary. Omission preserves the current
+            /// value; a string sets it and JSON `null` clears it.
+            #[serde(default, skip_serializing_if = "Patch::is_unchanged")]
+            pub summary: Patch<String>,
             /// Complete replacement Context set. Absence preserves the current
             /// canonical set; explicit JSON `null` is rejected.
             #[serde(
@@ -832,8 +919,6 @@ v3_patch! {
         name: String,
         /// Open kind token.
         resource_kind: String,
-        /// Optional summary; clear removes it.
-        summary: String,
         /// Required Guide Document identity.
         guide_document_id: Uuid,
     }
@@ -954,6 +1039,22 @@ impl UpdateProjectObjectV3 {
             Self::Issue { patch, .. } => patch.context_references.as_deref(),
             Self::Work { patch, .. } => patch.context_references.as_deref(),
             Self::Resource { patch, .. } => patch.context_references.as_deref(),
+        }
+    }
+
+    /// Retrieval summary patch carried by this update.
+    #[must_use]
+    pub const fn summary_patch(&self) -> &Patch<String> {
+        match self {
+            Self::ProjectProfile { patch, .. } => &patch.summary,
+            Self::Goal { patch, .. } => &patch.summary,
+            Self::Role { patch, .. } => &patch.summary,
+            Self::Plan { patch, .. } => &patch.summary,
+            Self::Stage { patch, .. } => &patch.summary,
+            Self::Requirement { patch, .. } => &patch.summary,
+            Self::Issue { patch, .. } => &patch.summary,
+            Self::Work { patch, .. } => &patch.summary,
+            Self::Resource { patch, .. } => &patch.summary,
         }
     }
 
@@ -1512,6 +1613,7 @@ fn apply_update(
             apply_required(&mut profile.purpose, &patch.purpose, "purpose")?;
             apply_required(&mut profile.problem, &patch.problem, "problem")?;
             apply_required(&mut profile.scope, &patch.scope, "scope")?;
+            apply_optional(&mut profile.summary, &patch.summary);
         }
         (UpdateProjectObjectV3::Goal { patch, .. }, ProjectViewObjectDataV3::Goal(goal)) => {
             apply_required(&mut goal.title, &patch.title, "title")?;
@@ -1521,6 +1623,7 @@ fn apply_update(
                 "desired_outcome",
             )?;
             apply_required(&mut goal.directions, &patch.directions, "directions")?;
+            apply_optional(&mut goal.summary, &patch.summary);
         }
         (UpdateProjectObjectV3::Role { patch, .. }, ProjectViewObjectDataV3::Role(role)) => {
             apply_required(&mut role.name, &patch.name, "name")?;
@@ -1532,17 +1635,20 @@ fn apply_update(
             )?;
             apply_required(&mut role.boundaries, &patch.boundaries, "boundaries")?;
             apply_required(&mut role.active, &patch.active, "active")?;
+            apply_optional(&mut role.summary, &patch.summary);
         }
         (UpdateProjectObjectV3::Plan { patch, .. }, ProjectViewObjectDataV3::Plan(plan)) => {
             apply_required(&mut plan.title, &patch.title, "title")?;
             apply_required(&mut plan.description, &patch.description, "description")?;
             apply_required(&mut plan.status, &patch.status, "status")?;
+            apply_optional(&mut plan.summary, &patch.summary);
             apply_optional(&mut object.relations.under_goal_id, &patch.under_goal_id);
         }
         (UpdateProjectObjectV3::Stage { patch, .. }, ProjectViewObjectDataV3::Stage(stage)) => {
             apply_required(&mut stage.title, &patch.title, "title")?;
             apply_required(&mut stage.description, &patch.description, "description")?;
             apply_required(&mut stage.status, &patch.status, "status")?;
+            apply_optional(&mut stage.summary, &patch.summary);
             apply_required_relation(
                 &mut object.relations.under_plan_id,
                 &patch.under_plan_id,
@@ -1561,6 +1667,7 @@ fn apply_update(
             )?;
             apply_required(&mut requirement.status, &patch.status, "status")?;
             apply_required(&mut requirement.priority, &patch.priority, "priority")?;
+            apply_optional(&mut requirement.summary, &patch.summary);
             apply_optional(
                 &mut object.relations.planned_in_stage_id,
                 &patch.planned_in_stage_id,
@@ -1571,6 +1678,7 @@ fn apply_update(
             apply_required(&mut issue.description, &patch.description, "description")?;
             apply_required(&mut issue.status, &patch.status, "status")?;
             apply_required(&mut issue.priority, &patch.priority, "priority")?;
+            apply_optional(&mut issue.summary, &patch.summary);
             apply_optional(
                 &mut object.relations.planned_in_stage_id,
                 &patch.planned_in_stage_id,
@@ -1582,6 +1690,7 @@ fn apply_update(
             apply_required(&mut work.description, &patch.description, "description")?;
             apply_required(&mut work.status, &patch.status, "status")?;
             apply_required(&mut work.priority, &patch.priority, "priority")?;
+            apply_optional(&mut work.summary, &patch.summary);
             apply_required_relation(&mut object.relations.handles, &patch.handles, "handles")?;
         }
         (
@@ -1686,19 +1795,12 @@ fn json_depth(value: &Value) -> usize {
     }
 }
 
-fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::{DocumentCoordinate, DocumentTargetState};
     use super::*;
     use crate::ProjectProfile;
+    use serde_json::json;
 
     fn actor() -> PublicKey {
         PublicKey::from_hex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
@@ -1722,6 +1824,7 @@ mod tests {
                 purpose: "Purpose".to_owned(),
                 problem: "Problem".to_owned(),
                 scope: "Scope".to_owned(),
+                summary: None,
             }),
             relations: ProjectViewRelations::default(),
             context_references: Vec::new(),
@@ -1774,6 +1877,7 @@ mod tests {
                     responsibilities: Vec::new(),
                     boundaries: Vec::new(),
                     active: true,
+                    summary: None,
                     context_references: Vec::new(),
                 },
             }),
@@ -1804,6 +1908,7 @@ mod tests {
                     title: "Goal".to_owned(),
                     desired_outcome: "Outcome".to_owned(),
                     directions: Vec::new(),
+                    summary: None,
                     context_references: Vec::new(),
                 },
             }),
@@ -1817,6 +1922,141 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn create_summary_is_optional_but_explicit_null_is_rejected() {
+        let object_id = Uuid::new_v4();
+        let without_summary: NewProjectViewObjectV3 = serde_json::from_value(json!({
+            "object_type": "goal",
+            "id": object_id,
+            "title": "Progressive retrieval",
+            "desired_outcome": "Agents load only relevant context",
+            "directions": []
+        }))
+        .expect("missing summary remains compatible");
+        assert_eq!(without_summary.summary(), None);
+
+        let with_null = serde_json::from_value::<NewProjectViewObjectV3>(json!({
+            "object_type": "goal",
+            "id": object_id,
+            "title": "Progressive retrieval",
+            "desired_outcome": "Agents load only relevant context",
+            "directions": [],
+            "summary": null
+        }));
+        assert!(with_null.is_err(), "create null must not mean CLEAR");
+    }
+
+    #[test]
+    fn goal_summary_supports_keep_set_clear_and_has_no_summary_specific_cap() {
+        let now = Utc::now();
+        let state = initialized_state(now);
+        let goal_id = Uuid::new_v4();
+        let long_summary = "context".repeat(1_024);
+        let create = ProjectObjectCommandV3::new(
+            1,
+            None,
+            ProjectObjectRequestV3::Create(CreateProjectObjectV3 {
+                object: NewProjectViewObjectV3::Goal {
+                    id: goal_id,
+                    title: "Progressive retrieval".to_owned(),
+                    desired_outcome: "Agents load only relevant context".to_owned(),
+                    directions: Vec::new(),
+                    summary: Some(long_summary.clone()),
+                    context_references: Vec::new(),
+                },
+            }),
+        );
+        let (state, _) = state
+            .reduce(
+                &create,
+                actor(),
+                now,
+                V3ReducerCapabilities::stage4(false),
+                &ReferenceTargetProof::new(),
+            )
+            .expect("create with summary larger than the former Resource cap");
+        let ProjectViewEntryV3::Active(goal) = state.entry(goal_id).expect("created Goal") else {
+            panic!("Goal must be active");
+        };
+        assert_eq!(goal.data.summary(), Some(long_summary.as_str()));
+
+        let keep = ProjectObjectCommandV3::new(
+            2,
+            None,
+            ProjectObjectRequestV3::Update(UpdateProjectObjectV3::Goal {
+                object_id: goal_id,
+                patch: GoalPatchV3 {
+                    title: Patch::Set("Progressive context retrieval".to_owned()),
+                    ..GoalPatchV3::default()
+                },
+            }),
+        );
+        let (state, _) = state
+            .reduce(
+                &keep,
+                actor(),
+                now,
+                V3ReducerCapabilities::stage4(false),
+                &ReferenceTargetProof::new(),
+            )
+            .expect("omitted summary keeps current value");
+        let ProjectViewEntryV3::Active(goal) = state.entry(goal_id).expect("updated Goal") else {
+            panic!("Goal must be active");
+        };
+        assert_eq!(goal.data.summary(), Some(long_summary.as_str()));
+
+        let set = ProjectObjectCommandV3::new(
+            3,
+            None,
+            ProjectObjectRequestV3::Update(UpdateProjectObjectV3::Goal {
+                object_id: goal_id,
+                patch: GoalPatchV3 {
+                    summary: Patch::Set("Explains when to load graph traversal context".to_owned()),
+                    ..GoalPatchV3::default()
+                },
+            }),
+        );
+        let (state, outcome) = state
+            .reduce(
+                &set,
+                actor(),
+                now,
+                V3ReducerCapabilities::stage4(false),
+                &ReferenceTargetProof::new(),
+            )
+            .expect("summary-only SET is a real object update");
+        assert_eq!(outcome.project_revision, 4);
+        let ProjectViewEntryV3::Active(goal) = state.entry(goal_id).expect("updated Goal") else {
+            panic!("Goal must be active");
+        };
+        assert_eq!(goal.object_revision, 3);
+
+        let clear = ProjectObjectCommandV3::new(
+            4,
+            None,
+            ProjectObjectRequestV3::Update(UpdateProjectObjectV3::Goal {
+                object_id: goal_id,
+                patch: GoalPatchV3 {
+                    summary: Patch::Clear,
+                    ..GoalPatchV3::default()
+                },
+            }),
+        );
+        let (state, _) = state
+            .reduce(
+                &clear,
+                actor(),
+                now,
+                V3ReducerCapabilities::stage4(false),
+                &ReferenceTargetProof::new(),
+            )
+            .expect("summary CLEAR");
+        let ProjectViewEntryV3::Active(goal) = state.entry(goal_id).expect("updated Goal") else {
+            panic!("Goal must be active");
+        };
+        assert_eq!(goal.data.summary(), None);
     }
 
     #[test]

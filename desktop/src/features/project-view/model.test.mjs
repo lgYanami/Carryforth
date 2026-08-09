@@ -297,10 +297,45 @@ test("v3 assembly preserves unknown Resource kinds and Guide-only writes", () =>
       patch: {
         name: "Release console",
         resource_kind: "internal-release-console-v7",
-        summary: "Coordinates release operations",
         guide_document_id: "guide-document",
       },
     },
   );
   assert.equal(JSON.stringify(view.resources[0]).includes("locator"), false);
+});
+
+test("Project View update summary uses explicit KEEP, SET, and CLEAR wire", () => {
+  const object = {
+    objectType: "issue",
+    data: {
+      title: "Retry ambiguity",
+      description: "An accepted write may have an uncertain response",
+      status: "open",
+      priority: "high",
+      summary: "Relevant when investigating duplicate writes",
+    },
+  };
+  const base = {
+    operation: "update",
+    expectedProjectRevision: 12,
+    objectId: "issue",
+    object,
+  };
+
+  assert.equal(
+    Object.hasOwn(serializeProjectViewMutationIntent(base).patch, "summary"),
+    false,
+  );
+  assert.equal(
+    serializeProjectViewMutationIntent({
+      ...base,
+      summaryPatch: "Relevant to idempotency and uncertain write recovery",
+    }).patch.summary,
+    "Relevant to idempotency and uncertain write recovery",
+  );
+  assert.equal(
+    serializeProjectViewMutationIntent({ ...base, summaryPatch: null }).patch
+      .summary,
+    null,
+  );
 });

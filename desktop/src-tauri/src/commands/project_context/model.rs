@@ -329,6 +329,9 @@ pub struct ProjectContextCoordinateDetail {
     pub(super) state: ProjectContextDetailState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) title: Option<String>,
+    /// Source-owned retrieval summary. Project Context only hydrates this value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) status: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

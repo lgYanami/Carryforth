@@ -2041,6 +2041,7 @@ fn object_from_role(role: &RoleDefinitionV3) -> ProjectViewObjectV3 {
             responsibilities: role.responsibilities.clone(),
             boundaries: role.boundaries.clone(),
             active: role.active,
+            summary: role.summary.clone(),
         }),
         relations: ProjectViewRelations::default(),
         context_references: role.context_references.clone(),
@@ -2231,6 +2232,7 @@ mod tests {
             updated_by: member,
             data: ProjectViewObjectDataV3::ProjectProfile(ProjectProfile {
                 name: "Project".to_owned(),
+                summary: None,
                 positioning: "Position".to_owned(),
                 purpose: "Purpose".to_owned(),
                 problem: "Problem".to_owned(),

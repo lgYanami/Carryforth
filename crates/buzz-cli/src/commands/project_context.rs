@@ -99,6 +99,8 @@ struct CoordinateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     object_revision: Option<u64>,
@@ -678,6 +680,7 @@ fn project_view_coordinate_output(
                 state: "active",
                 title: Some(title),
                 description: None,
+                summary: object.data.summary().map(ToOwned::to_owned),
                 status,
                 object_revision: Some(object.object_revision),
                 document_revision: None,
@@ -692,6 +695,7 @@ fn project_view_coordinate_output(
             state: "tombstoned",
             title: None,
             description: None,
+            summary: None,
             status: None,
             object_revision: Some(tombstone.object_revision),
             document_revision: None,
@@ -918,6 +922,7 @@ fn document_coordinate_output(
             state: "active",
             title: Some(title.clone()),
             description: None,
+            summary: None,
             status: None,
             object_revision: None,
             document_revision: Some(*document_revision),
@@ -935,6 +940,7 @@ fn document_coordinate_output(
             state: "tombstoned",
             title: None,
             description: None,
+            summary: None,
             status: None,
             object_revision: None,
             document_revision: Some(*document_revision),
@@ -1005,6 +1011,7 @@ fn meeting_coordinate_output(
         state: "terminal",
         title: Some(summary.title.clone()),
         description: summary.description.clone(),
+        summary: None,
         status: Some(json!(summary.status)),
         object_revision: None,
         document_revision: None,
@@ -1067,6 +1074,7 @@ fn unavailable_coordinate(coordinate: ProjectContextCoordinate) -> CoordinateOut
         state: "unavailable",
         title: None,
         description: None,
+        summary: None,
         status: None,
         object_revision: None,
         document_revision: None,
@@ -1659,6 +1667,48 @@ mod tests {
         let json = serde_json::to_value(output).expect("serialize metadata-only output");
         assert!(json.get("content_markdown").is_none());
         assert!(json.get("fetch_command").is_some());
+    }
+
+    #[test]
+    fn project_view_coordinate_output_hydrates_the_source_owned_summary() {
+        let object_id = Uuid::new_v4();
+        let actor = Keys::generate().public_key();
+        let now = Utc::now();
+        let coordinate = ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Requirement,
+            object_id,
+        };
+        let entry =
+            ProjectViewEntryV3::Active(Box::new(buzz_project_view::v3::ProjectViewObjectV3 {
+                id: object_id,
+                object_type: ProjectViewObjectType::Requirement,
+                object_revision: 2,
+                project_revision: 7,
+                created_at: now,
+                updated_at: now,
+                created_by: actor,
+                updated_by: actor,
+                data: ProjectViewObjectDataV3::Requirement(buzz_project_view::Requirement {
+                    title: "Progressive retrieval".to_owned(),
+                    description: "Expose source metadata before full content.".to_owned(),
+                    status: buzz_project_view::RequirementStatus::Ready,
+                    priority: buzz_project_view::Priority::High,
+                    summary: Some(
+                        "Relevant when deciding how graph coordinates are loaded.".to_owned(),
+                    ),
+                }),
+                relations: buzz_project_view::ProjectViewRelations::default(),
+                context_references: Vec::new(),
+            }));
+
+        let output = project_view_coordinate_output(&coordinate, &entry);
+        let value = serde_json::to_value(output).expect("serialize Coordinate preview");
+        assert_eq!(
+            value["summary"],
+            "Relevant when deciding how graph coordinates are loaded."
+        );
+        assert_eq!(value["object_revision"], 2);
+        assert!(value.get("content").is_none());
     }
 
     #[test]

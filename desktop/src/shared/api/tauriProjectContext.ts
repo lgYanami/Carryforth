@@ -103,6 +103,7 @@ export type ProjectContextCoordinateDetail = {
   coordinate: ProjectContextCoordinate;
   state: ProjectContextDetailState;
   title?: string;
+  summary?: string;
   status?: unknown;
   objectRevision?: number;
   documentRevision?: number;

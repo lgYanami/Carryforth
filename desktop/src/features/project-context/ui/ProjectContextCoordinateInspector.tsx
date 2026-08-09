@@ -109,9 +109,6 @@ function ProjectViewBody({ object }: { object: ProjectViewObject }) {
     case "resource":
       return (
         <>
-          {object.data.summary ? (
-            <Detail label="Summary">{object.data.summary}</Detail>
-          ) : null}
           <Detail label="Resource kind">
             {formatProjectViewTerm(object.data.resourceKind)}
           </Detail>
@@ -169,6 +166,11 @@ function ProjectViewContent({
         <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
           {projectViewObjectDescription(object)}
         </p>
+        {object.data.summary ? (
+          <div className="mt-3 rounded-lg border border-border/70 bg-muted/20 p-3">
+            <Detail label="Retrieval summary">{object.data.summary}</Detail>
+          </div>
+        ) : null}
         <Button
           className="mt-3"
           data-testid="project-context-open-project-view"

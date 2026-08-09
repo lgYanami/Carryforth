@@ -29,51 +29,63 @@ function rawContextReference(reference: ProjectViewContextReference) {
       };
 }
 
+function withOptionalSummary(
+  data: Record<string, unknown> & { summary?: string },
+): Record<string, unknown> {
+  const { summary, ...rest } = data;
+  return summary === undefined ? rest : { ...rest, summary };
+}
+
 function serializeWritableObject(
   object: ProjectViewWritableObject,
 ): Record<string, unknown> {
   switch (object.objectType) {
     case "project_profile":
-      return object.data;
+      return withOptionalSummary(object.data);
     case "goal":
       return {
         title: object.data.title,
+        ...(object.data.summary === undefined
+          ? {}
+          : { summary: object.data.summary }),
         desired_outcome: object.data.desiredOutcome,
         directions: object.data.directions,
       };
     case "role":
-      return object.data;
+      return withOptionalSummary(object.data);
     case "plan":
       return {
-        ...object.data,
+        ...withOptionalSummary(object.data),
         under_goal_id: object.underGoalId ?? null,
       };
     case "stage":
       return {
-        ...object.data,
+        ...withOptionalSummary(object.data),
         under_plan_id: object.underPlanId,
       };
     case "requirement":
       return {
-        ...object.data,
+        ...withOptionalSummary(object.data),
         planned_in_stage_id: object.plannedInStageId ?? null,
       };
     case "issue":
       return {
-        ...object.data,
+        ...withOptionalSummary(object.data),
         planned_in_stage_id: object.plannedInStageId ?? null,
         about: object.about ? rawReference(object.about) : null,
       };
     case "work":
       return {
-        ...object.data,
+        ...withOptionalSummary(object.data),
         handles: rawReference(object.handles),
       };
     case "resource":
       return {
         name: object.data.name,
         resource_kind: object.data.resourceKind,
-        summary: object.data.summary,
+        ...(object.data.summary === undefined
+          ? {}
+          : { summary: object.data.summary }),
         guide_document_id: object.data.guideDocumentId,
       };
   }
@@ -96,17 +108,24 @@ export function serializeProjectViewMutationIntent(
           ? { acting_assignment_id: intent.actingAssignmentId }
           : {}),
       };
-    case "update":
+    case "update": {
+      const patch = serializeWritableObject(intent.object);
+      if (intent.summaryPatch === undefined) {
+        delete patch.summary;
+      } else {
+        patch.summary = intent.summaryPatch;
+      }
       return {
         operation: intent.operation,
         expected_project_revision: intent.expectedProjectRevision,
         object_type: intent.object.objectType,
         object_id: intent.objectId,
-        patch: serializeWritableObject(intent.object),
+        patch,
         ...(intent.actingAssignmentId
           ? { acting_assignment_id: intent.actingAssignmentId }
           : {}),
       };
+    }
     case "delete":
       return {
         operation: intent.operation,
@@ -145,6 +164,8 @@ function normalizeMutationResult(
         objectId: raw.object_id,
         objectRevision: raw.object_revision,
         deleted: raw.deleted,
+        confirmation: raw.confirmation ?? "current_verified",
+        currentObjectRevision: raw.current_object_revision,
       };
     case "conflict":
       return {

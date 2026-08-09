@@ -65,6 +65,22 @@ impl ProjectViewObjectDataV3 {
             Self::Resource(_) => ProjectViewObjectType::Resource,
         }
     }
+
+    /// Return the source-owned retrieval summary, when present.
+    #[must_use]
+    pub fn summary(&self) -> Option<&str> {
+        match self {
+            Self::ProjectProfile(value) => value.summary.as_deref(),
+            Self::Goal(value) => value.summary.as_deref(),
+            Self::Role(value) => value.summary.as_deref(),
+            Self::Plan(value) => value.summary.as_deref(),
+            Self::Stage(value) => value.summary.as_deref(),
+            Self::Requirement(value) => value.summary.as_deref(),
+            Self::Issue(value) => value.summary.as_deref(),
+            Self::Work(value) => value.summary.as_deref(),
+            Self::Resource(value) => value.summary.as_deref(),
+        }
+    }
 }
 
 /// One active canonical Project View v3 object.
@@ -111,6 +127,7 @@ impl ProjectViewObjectV3 {
             boundaries: role.boundaries.clone(),
             level,
             active: role.active,
+            summary: role.summary.clone(),
             context_references: self.context_references.clone(),
             object_revision: self.object_revision,
             project_revision: self.project_revision,

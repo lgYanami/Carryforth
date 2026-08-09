@@ -408,6 +408,7 @@ fn detail_mapping_distinguishes_active_tombstone_and_unavailable() {
         data: ProjectViewObjectDataV3::Requirement(Requirement {
             title: "Desktop Context graph".to_owned(),
             description: "Read-only graph".to_owned(),
+            summary: Some("Explains the read-only Project Context graph surface.".to_owned()),
             status: RequirementStatus::Ready,
             priority: Priority::High,
         }),
@@ -419,6 +420,10 @@ fn detail_mapping_distinguishes_active_tombstone_and_unavailable() {
     assert_eq!(
         active_detail.title.as_deref(),
         Some("Desktop Context graph")
+    );
+    assert_eq!(
+        active_detail.summary.as_deref(),
+        Some("Explains the read-only Project Context graph surface.")
     );
     assert_eq!(active_detail.object_revision, Some(3));
 

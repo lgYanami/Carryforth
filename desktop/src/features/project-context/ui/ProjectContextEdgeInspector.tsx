@@ -37,22 +37,31 @@ function CoordinateRow({
     >
       <Network className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
-        <span className="flex flex-wrap items-center gap-1.5">
-          <span className="truncate text-sm font-medium">
-            {detail.title?.trim() || coordinateType(detail)}
+        <span className="flex items-start gap-1.5">
+          <span className="min-w-0 flex-1 text-sm font-medium">
+            <span className="block truncate">
+              {detail.title?.trim() || coordinateType(detail)}
+            </span>
+            {detail.summary ? (
+              <span className="mt-1 block line-clamp-2 text-xs font-normal text-muted-foreground">
+                {detail.summary}
+              </span>
+            ) : null}
           </span>
-          <Badge variant="outline">{coordinateType(detail)}</Badge>
-          {detail.state === "tombstoned" ? (
-            <Badge variant="secondary">
-              <Archive className="mr-1 h-3 w-3" />
-              Tombstoned
-            </Badge>
-          ) : detail.state === "unavailable" ? (
-            <Badge variant="warning">
-              <CloudOff className="mr-1 h-3 w-3" />
-              Unavailable
-            </Badge>
-          ) : null}
+          <span className="flex shrink-0 flex-wrap items-center gap-1.5">
+            <Badge variant="outline">{coordinateType(detail)}</Badge>
+            {detail.state === "tombstoned" ? (
+              <Badge variant="secondary">
+                <Archive className="mr-1 h-3 w-3" />
+                Tombstoned
+              </Badge>
+            ) : detail.state === "unavailable" ? (
+              <Badge variant="warning">
+                <CloudOff className="mr-1 h-3 w-3" />
+                Unavailable
+              </Badge>
+            ) : null}
+          </span>
         </span>
         <span className="mt-1 block truncate font-mono text-2xs text-muted-foreground">
           {detail.coordinateKey}

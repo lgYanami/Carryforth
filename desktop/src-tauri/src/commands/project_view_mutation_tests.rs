@@ -179,6 +179,10 @@ fn v3_resource_is_guide_only_and_rejects_the_legacy_locator_shape() {
         }),
     })
     .expect("prepare v3 Resource");
+    assert_eq!(
+        prepared.summary_expectation,
+        SummaryWriteExpectation::Set("Coordinates releases".to_owned())
+    );
     let event = prepared
         .builder
         .sign_with_keys(&Keys::generate())
@@ -199,6 +203,32 @@ fn v3_resource_is_guide_only_and_rejects_the_legacy_locator_shape() {
     })
     .expect_err("legacy Resource must fail closed");
     assert!(error.contains("invalid typed Project View v3 create data"));
+}
+
+#[test]
+fn update_summary_wire_preserves_keep_set_and_clear() {
+    let object_id = Uuid::new_v4();
+    for (patch, expected) in [
+        (
+            json!({"status": "resolved"}),
+            SummaryWriteExpectation::Unchanged,
+        ),
+        (
+            json!({"summary": "Relevant when diagnosing release failures"}),
+            SummaryWriteExpectation::Set("Relevant when diagnosing release failures".to_owned()),
+        ),
+        (json!({"summary": null}), SummaryWriteExpectation::Clear),
+    ] {
+        let prepared = prepare_v3_mutation(ProjectViewMutationInput::Update {
+            expected_project_revision: 5,
+            object_type: ProjectViewObjectType::Issue,
+            object_id,
+            acting_assignment_id: None,
+            patch,
+        })
+        .expect("prepare summary update");
+        assert_eq!(prepared.summary_expectation, expected);
+    }
 }
 
 #[test]

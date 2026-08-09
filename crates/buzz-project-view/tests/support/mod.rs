@@ -53,6 +53,7 @@ pub fn initialize_request(goal_ids: impl IntoIterator<Item = Uuid>) -> MutationR
             purpose: "Exercise Project View invariants".to_owned(),
             problem: "Relationship regressions need precise failures".to_owned(),
             scope: "Pure in-memory domain behavior".to_owned(),
+            summary: None,
         },
         goals: goal_ids
             .into_iter()
@@ -62,6 +63,7 @@ pub fn initialize_request(goal_ids: impl IntoIterator<Item = Uuid>) -> MutationR
                 title: format!("Initial goal {index}"),
                 desired_outcome: format!("Outcome {index} is observable"),
                 directions: vec![format!("Direction {index}")],
+                summary: None,
             })
             .collect(),
     })

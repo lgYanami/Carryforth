@@ -24,6 +24,7 @@ import { ProjectViewObjectConflict } from "@/features/project-view/ui/ProjectVie
 import {
   ProjectViewObjectLifecycleFields,
   ProjectViewObjectRelationFields,
+  ProjectViewObjectSummaryField,
   ProjectViewObjectTextFields,
 } from "@/features/project-view/ui/ProjectViewObjectDialogFields";
 import { CREATE_TYPES } from "@/features/project-view/ui/projectViewObjectFormOptions";
@@ -120,11 +121,12 @@ function formFromObject(object: ProjectViewObject): FormState {
   const form = emptyForm(object.objectType);
   switch (object.objectType) {
     case "project_profile":
-      return { ...form, ...object.data };
+      return { ...form, ...object.data, summary: object.data.summary ?? "" };
     case "goal":
       return {
         ...form,
         title: object.data.title,
+        summary: object.data.summary ?? "",
         desiredOutcome: object.data.desiredOutcome,
         directions: object.data.directions.join("\n"),
       };
@@ -132,6 +134,7 @@ function formFromObject(object: ProjectViewObject): FormState {
       return {
         ...form,
         name: object.data.name,
+        summary: object.data.summary ?? "",
         purpose: object.data.purpose,
         responsibilities: object.data.responsibilities.join("\n"),
         boundaries: object.data.boundaries.join("\n"),
@@ -141,6 +144,7 @@ function formFromObject(object: ProjectViewObject): FormState {
       return {
         ...form,
         title: object.data.title,
+        summary: object.data.summary ?? "",
         description: object.data.description,
         status: object.data.status,
         underGoalId: object.relations.underGoalId ?? "",
@@ -149,6 +153,7 @@ function formFromObject(object: ProjectViewObject): FormState {
       return {
         ...form,
         title: object.data.title,
+        summary: object.data.summary ?? "",
         description: object.data.description,
         status: object.data.status,
         underPlanId: object.relations.underPlanId ?? "",
@@ -157,6 +162,7 @@ function formFromObject(object: ProjectViewObject): FormState {
       return {
         ...form,
         title: object.data.title,
+        summary: object.data.summary ?? "",
         description: object.data.description,
         status: object.data.status,
         priority: object.data.priority,
@@ -166,6 +172,7 @@ function formFromObject(object: ProjectViewObject): FormState {
       return {
         ...form,
         title: object.data.title,
+        summary: object.data.summary ?? "",
         description: object.data.description,
         status: object.data.status,
         priority: object.data.priority,
@@ -176,6 +183,7 @@ function formFromObject(object: ProjectViewObject): FormState {
       return {
         ...form,
         title: object.data.title,
+        summary: object.data.summary ?? "",
         description: object.data.description,
         status: object.data.status,
         priority: object.data.priority,
@@ -227,6 +235,7 @@ function writableFromForm(
         objectType: type,
         data: {
           name: required(form.name, "Project name"),
+          summary: form.summary.trim() || undefined,
           positioning: required(form.positioning, "Positioning"),
           purpose: required(form.purpose, "Purpose"),
           problem: required(form.problem, "Problem"),
@@ -238,6 +247,7 @@ function writableFromForm(
         objectType: type,
         data: {
           title: required(form.title, "Title"),
+          summary: form.summary.trim() || undefined,
           desiredOutcome: required(form.desiredOutcome, "Desired outcome"),
           directions: lines(form.directions),
         },
@@ -247,6 +257,7 @@ function writableFromForm(
         objectType: type,
         data: {
           name: required(form.name, "Name"),
+          summary: form.summary.trim() || undefined,
           purpose: required(form.purpose, "Purpose"),
           responsibilities: lines(form.responsibilities),
           boundaries: lines(form.boundaries),
@@ -258,6 +269,7 @@ function writableFromForm(
         objectType: type,
         data: {
           title: required(form.title, "Title"),
+          summary: form.summary.trim() || undefined,
           description: required(form.description, "Description"),
           status: form.status as ProjectViewPlanStatus,
         },
@@ -268,6 +280,7 @@ function writableFromForm(
         objectType: type,
         data: {
           title: required(form.title, "Title"),
+          summary: form.summary.trim() || undefined,
           description: required(form.description, "Description"),
           status: form.status as ProjectViewStageStatus,
         },
@@ -278,6 +291,7 @@ function writableFromForm(
         objectType: type,
         data: {
           title: required(form.title, "Title"),
+          summary: form.summary.trim() || undefined,
           description: required(form.description, "Description"),
           status: form.status as ProjectViewRequirementStatus,
           priority: form.priority,
@@ -289,6 +303,7 @@ function writableFromForm(
         objectType: type,
         data: {
           title: required(form.title, "Title"),
+          summary: form.summary.trim() || undefined,
           description: required(form.description, "Description"),
           status: form.status as ProjectViewIssueStatus,
           priority: form.priority,
@@ -303,6 +318,7 @@ function writableFromForm(
         objectType: type,
         data: {
           title: required(form.title, "Title"),
+          summary: form.summary.trim() || undefined,
           description: required(form.description, "Description"),
           status: form.status as ProjectViewWorkStatus,
           priority: form.priority,
@@ -385,6 +401,7 @@ export function ProjectViewObjectDialog({
     object ? formFromObject(object) : emptyForm(initialObjectType, context),
   );
   const [baseRevision, setBaseRevision] = React.useState(projectRevision);
+  const [summaryDirty, setSummaryDirty] = React.useState(false);
   const [error, setError] = React.useState<string>();
   const [rebasedRevision, setRebasedRevision] = React.useState<number>();
   const [reviewingLatest, setReviewingLatest] = React.useState(false);
@@ -439,6 +456,7 @@ export function ProjectViewObjectDialog({
       setObjectType(type);
       setForm(object ? formFromObject(object) : emptyForm(type, context));
       setBaseRevision(projectRevision);
+      setSummaryDirty(false);
       setError(undefined);
       setRebasedRevision(undefined);
       setReviewingLatest(false);
@@ -460,14 +478,17 @@ export function ProjectViewObjectDialog({
   ]);
 
   const set = React.useCallback(
-    <K extends keyof FormState>(field: K, value: FormState[K]) =>
-      setForm((current) => ({ ...current, [field]: value })),
+    <K extends keyof FormState>(field: K, value: FormState[K]) => {
+      if (field === "summary") setSummaryDirty(true);
+      setForm((current) => ({ ...current, [field]: value }));
+    },
     [],
   );
 
   const changeType = (type: CreatableObjectType) => {
     setObjectType(type);
     setForm(emptyForm(type));
+    setSummaryDirty(false);
     setError(undefined);
   };
 
@@ -581,6 +602,9 @@ export function ProjectViewObjectDialog({
               expectedProjectRevision: baseRevision,
               objectId: object.id,
               object: writable,
+              summaryPatch: summaryDirty
+                ? form.summary.trim() || null
+                : undefined,
               actingAssignmentId:
                 objectType === "role" ? roleActingAssignmentId : undefined,
             }
@@ -607,11 +631,17 @@ export function ProjectViewObjectDialog({
         void reviewLatest();
         return;
       }
-      toast.success(
-        mode === "edit"
-          ? `${projectViewObjectTypeLabel(objectType)} updated`
-          : `${projectViewObjectTypeLabel(objectType)} created`,
-      );
+      if (result.confirmation === "superseded") {
+        toast.warning(
+          `${projectViewObjectTypeLabel(objectType)} changed again after this write; review the current object.`,
+        );
+      } else {
+        toast.success(
+          mode === "edit"
+            ? `${projectViewObjectTypeLabel(objectType)} updated`
+            : `${projectViewObjectTypeLabel(objectType)} created`,
+        );
+      }
       onOpenChange(false);
       onApplied(result.objectId);
     } catch (caught) {
@@ -712,6 +742,7 @@ export function ProjectViewObjectDialog({
               set={set}
               type={objectType}
             />
+            <ProjectViewObjectSummaryField form={form} set={set} />
             <ProjectViewObjectLifecycleFields
               form={form}
               set={set}

@@ -1349,6 +1349,10 @@ mod tests {
         let role = RoleDefinitionV3 {
             role_id: Uuid::new_v4(),
             name: "Maintainer".to_owned(),
+            summary: Some(
+                "Covers release safety and is relevant when reviewing privileged changes."
+                    .to_owned(),
+            ),
             purpose: "Keep releases safe".to_owned(),
             responsibilities: vec!["Review".to_owned()],
             boundaries: vec!["No bypass".to_owned()],
@@ -1393,6 +1397,10 @@ mod tests {
             updated_by: actor,
             data: ProjectViewObjectDataV3::Role(ProjectRole {
                 name: "Maintainer".to_owned(),
+                summary: Some(
+                    "Covers release safety and is relevant when reviewing privileged changes."
+                        .to_owned(),
+                ),
                 purpose: "Keep releases safe".to_owned(),
                 responsibilities: Vec::new(),
                 boundaries: Vec::new(),
