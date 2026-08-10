@@ -4918,6 +4918,16 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("when actual work discovers, creates, or corrects"));
         assert!(prompt.contains("write it explicitly through Project Documents"));
         assert!(prompt.contains("using `attach` or `detach` only to change the relationship"));
+        assert!(prompt.contains("Ordinary Project Context writes use Community membership"));
+        assert!(prompt.contains(
+            "omit `--acting-assignment`, `--runtime-id`, and `--runtime-epoch` together"
+        ));
+        assert!(prompt.contains(
+            "A current Role or Assignment does not make an ordinary Document or Context Edge"
+        ));
+        assert!(prompt.contains("Use all three supervised-attribution options only when"));
+        assert!(prompt.contains("remove all three options, and retry once"));
+        assert!(prompt.contains("do not apply that correction to Relay, auth, conflict"));
     }
 }
 

@@ -1,6 +1,6 @@
 # `cf` Action Finalization Context 归因误用与 Help 敏感值暴露修复设计
 
-> 状态：方案确认，待实现
+> 状态：代码与自动化完成，待全新 Meeting 现场验收
 >
 > 日期：2026-08-10
 >
@@ -473,5 +473,37 @@ cf <invalid invocation>
 
 ## 12. 实施记录
 
-待代码实现、自动化与全新 Meeting 现场验收完成后补充。不得仅凭 prompt 字符串测试或手工省略
-`--acting-assignment` 将本文标记为完成。
+2026-08-11 已完成代码与自动化交付：
+
+1. `cf` 的 Relay、private key 与 auth tag 参数均启用 `hide_env_values`；实际重建后的
+   `target/debug/cf --help` 已用三个独立 sentinel 验证只显示环境变量名称、不显示当前值；
+2. Project Context 三项 supervised attribution 参数不再由 Clap 输出缺少参数的泛化错误，而是在任何
+   网络读取和 Event 签名前由语义层执行 all-or-nothing 校验；
+3. 普通 Community 写入、完整 supervised 写入及六种 partial tuple 均有单元测试；partial error 同时说明
+   “普通写入全部省略”和“supervised 写入全部提供”两条合法路径；
+4. Action Finalization trusted `project_context_policy` 已声明 Community authority、普通写入省略归因和
+   supervised all-or-nothing；Action 系统提示与 Board 后置 guard 均禁止不可信 Board 强制 Runtime attribution；
+5. 通用 ACP base prompt 已同步普通 Context 写入边界与仅限本地、无副作用 partial-attribution 错误的一次
+   安全纠正规则；Relay/auth/conflict/network/unknown-delivery 仍禁止按该规则重试；
+6. `external_operation_failed`、canonical Edge readback、COMPLETE/ACK 门槛、Relay/DB ACL、Meeting lease
+   和状态机均未修改。
+
+已通过：
+
+```text
+cargo test -p carryforth-cli
+  307 passed
+
+cargo test -p buzz-acp
+  835 passed；pool lifecycle 9 passed
+
+cargo clippy -p carryforth-cli -p buzz-acp --all-targets -- -D warnings
+./scripts/check-cf-cli-cutover.sh
+cargo fmt --all
+git diff --check
+实际 target/debug/cf help sentinel smoke
+```
+
+未执行数据库迁移、数据清理、Meeting 恢复或 localhost 主数据写入。本文仍需用全新、创建后 DM 零干预的
+Meeting 完成 Project View、Document、无 attribution 的 Context Edge、canonical readback、COMPLETE 与
+`ended / closed` 现场验收；在此之前不标记为“全部验收完成”。

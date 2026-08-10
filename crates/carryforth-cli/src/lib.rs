@@ -81,16 +81,17 @@ struct Cli {
     #[arg(
         long,
         env = "CARRYFORTH_RELAY_URL",
+        hide_env_values = true,
         default_value = "http://localhost:3000"
     )]
     relay: String,
 
     /// Nostr private key (hex or nsec). This is the CLI's identity.
-    #[arg(long, env = "CARRYFORTH_PRIVATE_KEY")]
+    #[arg(long, env = "CARRYFORTH_PRIVATE_KEY", hide_env_values = true)]
     private_key: Option<String>,
 
     /// NIP-OA auth tag JSON (owner attestation). Injected into every signed event.
-    #[arg(long, env = "CARRYFORTH_AUTH_TAG")]
+    #[arg(long, env = "CARRYFORTH_AUTH_TAG", hide_env_values = true)]
     auth_tag: Option<String>,
 
     /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
@@ -732,23 +733,14 @@ pub enum ProjectContextCmd {
 /// Optional explicit managed-Agent attribution for a Context write.
 #[derive(clap::Args)]
 pub struct ProjectContextAttributionArgs {
-    /// Active Assignment to which the write is explicitly attributed.
-    #[arg(
-        long = "acting-assignment",
-        requires_all = ["runtime_id", "runtime_epoch"]
-    )]
+    /// Optional supervised attribution; omit for an ordinary Community Context write.
+    #[arg(long = "acting-assignment")]
     acting_assignment_id: Option<Uuid>,
-    /// Stable supervised Runtime UUID paired with the Assignment.
-    #[arg(
-        long = "runtime-id",
-        requires_all = ["acting_assignment_id", "runtime_epoch"]
-    )]
+    /// Supervised Runtime UUID; requires Assignment and Runtime epoch when used.
+    #[arg(long = "runtime-id")]
     runtime_id: Option<Uuid>,
-    /// Current supervised Runtime epoch paired with the Assignment.
-    #[arg(
-        long = "runtime-epoch",
-        requires_all = ["acting_assignment_id", "runtime_id"]
-    )]
+    /// Supervised Runtime epoch; requires Assignment and Runtime UUID when used.
+    #[arg(long = "runtime-epoch")]
     runtime_epoch: Option<u64>,
 }
 
@@ -3381,6 +3373,34 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static CLI_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     /// Smoke test: CLI definition is valid and parseable.
     #[test]
@@ -3435,6 +3455,17 @@ mod tests {
             vec![
                 "cf",
                 "project-context",
+                "attach",
+                "--context-document",
+                document,
+                "--coordinate",
+                requirement_a,
+                "--coordinate",
+                requirement_b,
+            ],
+            vec![
+                "cf",
+                "project-context",
                 "detach",
                 "--context-document",
                 document,
@@ -3449,8 +3480,8 @@ mod tests {
     }
 
     #[test]
-    fn project_context_explicit_attribution_must_be_complete() {
-        let result = Cli::try_parse_from([
+    fn project_context_partial_attribution_reaches_actionable_semantic_validation() {
+        let cli = Cli::try_parse_from([
             "cf",
             "project-context",
             "attach",
@@ -3462,14 +3493,75 @@ mod tests {
             "requirement:10000000-0000-4000-8000-000000000002",
             "--acting-assignment",
             "30000000-0000-4000-8000-000000000001",
-        ]);
-        let Err(error) = result else {
-            panic!("partial attribution must be rejected by clap");
+        ])
+        .expect("Clap must preserve a partial tuple for the actionable semantic validator");
+        let Cmd::ProjectContext(ProjectContextCmd::Attach { attribution, .. }) = cli.command else {
+            panic!("expected Project Context Attach");
         };
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
+        assert!(attribution.acting_assignment_id.is_some());
+        assert!(attribution.runtime_id.is_none());
+        assert!(attribution.runtime_epoch.is_none());
+    }
+
+    #[test]
+    fn cli_help_never_renders_current_auth_environment_values() {
+        let _lock = CLI_ENV_LOCK.lock().expect("CLI env test lock");
+        const RELAY_ENV: &str = "CARRYFORTH_RELAY_URL";
+        const PRIVATE_KEY_ENV: &str = "CARRYFORTH_PRIVATE_KEY";
+        const AUTH_TAG_ENV: &str = "CARRYFORTH_AUTH_TAG";
+        const RELAY_SENTINEL: &str = "https://cf-help-relay-secret.invalid/unique";
+        const PRIVATE_KEY_SENTINEL: &str = "cf_help_private_secret_8f305ada";
+        const AUTH_TAG_SENTINEL: &str = "cf_help_auth_tag_secret_73b7769b";
+        let _restore = EnvRestore::capture(&[RELAY_ENV, PRIVATE_KEY_ENV, AUTH_TAG_ENV]);
+        std::env::set_var(RELAY_ENV, RELAY_SENTINEL);
+        std::env::set_var(PRIVATE_KEY_ENV, PRIVATE_KEY_SENTINEL);
+        std::env::set_var(
+            AUTH_TAG_ENV,
+            format!(r#"{{"secret":"{AUTH_TAG_SENTINEL}"}}"#),
         );
+
+        let mut root = Cli::command();
+        let root_help = root.render_long_help().to_string();
+
+        let mut project_context_command = Cli::command();
+        let project_context_help = project_context_command
+            .find_subcommand_mut("project-context")
+            .expect("Project Context subcommand")
+            .render_long_help()
+            .to_string();
+
+        let mut attach_command = Cli::command();
+        let attach_help = attach_command
+            .find_subcommand_mut("project-context")
+            .expect("Project Context subcommand")
+            .find_subcommand_mut("attach")
+            .expect("Project Context Attach subcommand")
+            .render_long_help()
+            .to_string();
+
+        let invalid_invocation = match Cli::try_parse_from(["cf", "project-context", "attach"]) {
+            Ok(_) => panic!("incomplete invocation must fail"),
+            Err(error) => error.to_string(),
+        };
+        let rendered = [
+            root_help.as_str(),
+            project_context_help.as_str(),
+            attach_help.as_str(),
+            invalid_invocation.as_str(),
+        ]
+        .join("\n");
+
+        for env_name in [RELAY_ENV, PRIVATE_KEY_ENV, AUTH_TAG_ENV] {
+            assert!(root_help.contains(env_name), "root help omitted {env_name}");
+        }
+        for secret in [RELAY_SENTINEL, PRIVATE_KEY_SENTINEL, AUTH_TAG_SENTINEL] {
+            assert!(
+                !rendered.contains(secret),
+                "CLI help or usage output exposed sentinel {secret}"
+            );
+        }
+        assert!(attach_help.contains("ordinary Community Context write"));
+        assert!(attach_help.contains("requires Assignment and Runtime epoch"));
     }
 
     #[test]

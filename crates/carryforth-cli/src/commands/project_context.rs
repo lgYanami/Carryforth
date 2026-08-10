@@ -1107,6 +1107,10 @@ async fn run_write(
     coordinates: Vec<ProjectContextCoordinate>,
     attribution: ProjectContextAttributionArgs,
 ) -> Result<(), CliError> {
+    // Validate the optional attribution tuple before any network request or Event signing. An
+    // ordinary Community write omits the tuple; an explicit supervised write must prove all of
+    // it. Keeping this local makes a partial tuple safe to correct without an ambiguous delivery.
+    let (assignment_id, runtime_fence) = attribution.into_runtime_fence()?;
     let identity = require_identity(client).await?;
     if operation == ProjectContextOperation::Attach && !identity.context_edge_enabled {
         return Err(CliError::Other(
@@ -1120,7 +1124,6 @@ async fn run_write(
             .validate_for_project(project_id)
             .map_err(|error| CliError::Usage(error.to_string()))?;
     }
-    let (assignment_id, runtime_fence) = attribution.into_runtime_fence()?;
     let mut command = ProjectContextCommand::new(
         meta.projection.context_revision,
         operation,
@@ -1262,7 +1265,7 @@ impl ProjectContextAttributionArgs {
                 Ok((Some(assignment_id), Some(fence)))
             }
             _ => Err(CliError::Usage(
-                "--acting-assignment, --runtime-id, and --runtime-epoch must be supplied together"
+                "ordinary Community Context writes: omit --acting-assignment, --runtime-id, and --runtime-epoch; supervised attribution requires all three options together"
                     .to_owned(),
             )),
         }
@@ -1410,6 +1413,84 @@ mod tests {
     };
     use nostr::{EventBuilder, Keys, Kind, Timestamp};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn attribution_accepts_ordinary_and_complete_supervised_writes() {
+        let ordinary = ProjectContextAttributionArgs {
+            acting_assignment_id: None,
+            runtime_id: None,
+            runtime_epoch: None,
+        }
+        .into_runtime_fence()
+        .expect("ordinary Community attribution");
+        assert_eq!(ordinary, (None, None));
+
+        let assignment_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let supervised = ProjectContextAttributionArgs {
+            acting_assignment_id: Some(assignment_id),
+            runtime_id: Some(runtime_id),
+            runtime_epoch: Some(7),
+        }
+        .into_runtime_fence()
+        .expect("complete supervised attribution");
+        assert_eq!(supervised.0, Some(assignment_id));
+        assert_eq!(
+            supervised.1,
+            Some(RuntimeFence {
+                runtime_id,
+                runtime_epoch: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn partial_attribution_fails_locally_with_both_legal_corrections() {
+        let assignment_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        for attribution in [
+            ProjectContextAttributionArgs {
+                acting_assignment_id: Some(assignment_id),
+                runtime_id: None,
+                runtime_epoch: None,
+            },
+            ProjectContextAttributionArgs {
+                acting_assignment_id: None,
+                runtime_id: Some(runtime_id),
+                runtime_epoch: None,
+            },
+            ProjectContextAttributionArgs {
+                acting_assignment_id: None,
+                runtime_id: None,
+                runtime_epoch: Some(7),
+            },
+            ProjectContextAttributionArgs {
+                acting_assignment_id: Some(assignment_id),
+                runtime_id: Some(runtime_id),
+                runtime_epoch: None,
+            },
+            ProjectContextAttributionArgs {
+                acting_assignment_id: Some(assignment_id),
+                runtime_id: None,
+                runtime_epoch: Some(7),
+            },
+            ProjectContextAttributionArgs {
+                acting_assignment_id: None,
+                runtime_id: Some(runtime_id),
+                runtime_epoch: Some(7),
+            },
+        ] {
+            let error = attribution
+                .into_runtime_fence()
+                .expect_err("partial attribution must fail before Event signing");
+            let CliError::Usage(message) = error else {
+                panic!("partial attribution must be a user error");
+            };
+            assert!(message.contains("ordinary Community Context writes"));
+            assert!(message.contains("omit --acting-assignment"));
+            assert!(message.contains("supervised attribution requires all three"));
+        }
+    }
 
     #[derive(Clone)]
     struct QueryServerState {
