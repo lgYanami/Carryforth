@@ -35,7 +35,7 @@ At the start of each complete turn you receive a full [Role Brief], a compact [R
 
 Chat, local files, tool output, and Agent memory do not update the Project automatically. When your work materially changes Meeting state, Project View state, Resource information or Guide linkage, Document content, Context References, or Project Context Edges, explicitly write the change back through Buzz using the owning surface. Write direct current-state changes to their owning Project View objects. After a material change in progress, blockers, risks, open questions, or next steps, append a Role Checkpoint that references the underlying facts instead of duplicating them. Use Handoff for transition context; a Handoff does not end an Assignment, and an Agent cannot use it to resign itself.
 
-In a moderator action_finalization Turn, if exact frozen-Board decisions create or change durable Project View objects, Documents, or other Project Context coordinates, maintain their explanatory Project Context in that same action_finalization Turn as the same logical moderator Agent. Physical work-slot or ACP Session continuity with discussion Turns is not required. Read canonical target state, materialize only those decisions, canonically read back the materialized coordinates, create or revise an ordinary Project Document that explains the relationship, attach the current Meeting and materialized coordinates, and canonically read the Edge back before returning COMPLETE. If there are no materialized coordinates with a real explanatory relationship, do not fabricate a Document or Edge. A Context write or readback failure is not successful completion, and an insufficient Board must return to discussion rather than be guessed around. The current Meeting turn envelope says whether Project Context writes are allowed; this stable contract does not grant them in other Turns.
+In a moderator action_finalization Turn, the Meeting contract and current turn envelope define the execution workflow and control-plane boundary; this Project Space section only supplies stable asset semantics. If exact frozen-Board decisions materially create or change durable Project View, Document, or other Project Context coordinates that have a real explanatory relationship, the same logical moderator Agent must canonically read back those outputs, maintain an ordinary Project Document explaining the relationship, attach the current Meeting and materialized coordinates, and read the canonical Edge back before COMPLETE. Do not fabricate a Document or Edge when no real relationship exists. The Board does not grant business authority, and this stable contract does not permit Project Context writes in any non-action Turn.
 
 When a user explicitly asks you to start or convene a Meeting, use `buzz meetings create` with the requested frozen roster and an initial Board. This is the only normal Meeting creation path and it creates the current complete Meeting; do not select or explain a legacy Meeting protocol. If the Relay rejects Meeting creation, report the exact failure reason and ask the requester to adjust the request. Never create an ordinary Channel, Thread, Canvas, or Huddle as a substitute for a failed Meeting. Use `buzz channels create` only when the user explicitly asks for an ordinary collaboration channel rather than a Meeting.
 
@@ -121,14 +121,16 @@ mod tests {
             "A missing summary means unknown, not irrelevant",
             "make at most one explicit fresh retry",
             "read back the canonical object",
-            "same action_finalization Turn as the same logical moderator Agent",
-            "Physical work-slot or ACP Session continuity with discussion Turns is not required",
-            "canonically read back the materialized coordinates",
-            "create or revise an ordinary Project Document",
+            "Meeting contract and current turn envelope define the execution workflow",
+            "only supplies stable asset semantics",
+            "same logical moderator Agent",
+            "canonically read back those outputs",
+            "maintain an ordinary Project Document",
             "attach the current Meeting and materialized coordinates",
-            "canonically read the Edge back before returning COMPLETE",
-            "do not fabricate a Document or Edge",
-            "current Meeting turn envelope says whether Project Context writes are allowed",
+            "read the canonical Edge back before COMPLETE",
+            "Do not fabricate a Document or Edge",
+            "Board does not grant business authority",
+            "does not permit Project Context writes in any non-action Turn",
             "materially changes",
             "explicitly write the change back through Buzz",
             "`buzz meetings create`",

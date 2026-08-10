@@ -1,6 +1,6 @@
 # Meeting Action 首 Epoch 接管与首次 Progress 回归修复设计
 
-> 状态：代码实现完成；自动化回归已通过，真实 Provider Meeting 3/3 验收待完成
+> 状态：代码实现与 ACP 自动化完成；简单 Floor 与 Candidate-Cohort 均已收口，真实 Provider 3/3 待验收
 >
 > 日期：2026-08-09
 >
@@ -9,7 +9,14 @@
 >
 > 关联设计：
 > [Action Context Attach 与首次调度 Permit 修复设计](meeting-action-context-attach-and-initial-dispatch-permit-fix-design.md)、
-> [逻辑主持人 ACK 与同步简化实现设计](../fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)
+> [逻辑主持人 ACK 与同步简化实现设计](../fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)、
+> [Candidate-Cohort Action Begin Board 关联与首 Epoch 接管修复设计](meeting-candidate-cohort-action-begin-board-correlation-adoption-fix-design.md)
+
+> 2026-08-10 现场更正：本文 2026-08-09 的实施记录只覆盖了无候选人的简单 Floor Action Begin；当
+> Candidate-Cohort Decision Attempt 直接决定 `finalize_actions` 时，ACP 仍会混用
+> `decision_attempt_id` 与 `board_event_id`，并绕过 `ActionBeginAdoption` 初始化。该代码缺口现已由上面的
+> Candidate-Cohort 专项设计收口并通过 ACP 自动化；在专项设计完成真实 Provider 3/3 前，仍不能把本文
+> 解释为现场稳定性验收已经完成。
 
 ## 1. 结论
 
@@ -406,7 +413,7 @@ dispatch、冷启动 orphan、Retry 与既有 Action 生命周期回归。已通
 
 ```text
 cargo test -p buzz-acp --lib
-  828 passed
+  830 passed
 
 cargo test -p buzz-acp --lib action_begin -- --nocapture
 cargo test -p buzz-acp --lib \
@@ -421,3 +428,10 @@ cargo clippy -p buzz-db -p buzz-acp --all-targets -- -D warnings
 
 本轮未启动真实 Provider Meeting，也未完成第 7 项的 3/3 现场验证，因此文档保持“代码完成、现场待验收”，
 不把自动化结果扩大解释为生产验收。
+
+### 11.1 Candidate-Cohort 后续收口（2026-08-10）
+
+专项修复已把 Candidate-Cohort `finalize_actions` 路由到与简单 Floor 相同的 dedicated Begin 入口，分离
+Board/Attempt 坐标，并补齐 exact adoption、receipt/State 双时序及单一 Action Turn 回归。Meeting
+Coordinator 测试 118/118、buzz-acp 全库测试 830/830、Clippy 与格式门禁均通过。真实 Provider 3/3 与
+Summary/三域现场 readback 仍待后续重新构建后的独立验收。
