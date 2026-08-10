@@ -12,10 +12,10 @@ A minimal three-agent persona pack for Buzz.
 
 ```bash
 # Validate the pack
-buzz pack validate ./examples/meadow-core
+cf pack validate ./examples/meadow-core
 
 # Inspect resolved config
-buzz pack inspect ./examples/meadow-core
+cf pack inspect ./examples/meadow-core
 
 # Import into the desktop app
 # Use the "Install Pack" button and point to this directory

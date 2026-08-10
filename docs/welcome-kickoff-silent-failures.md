@@ -417,7 +417,7 @@ The unit test passes only because it attaches the `p` tag independently of
 content — a shape no product path can produce.
 
 Options: relax the matcher to accept a leading `@Name` before the command, or
-add a mention flag to `buzz messages send`. First confirm these were ever
+add a mention flag to `cf messages send`. First confirm these were ever
 intended for anything but hand-crafted/test use.
 
 Even fixed, `!cancel` cancels **one turn, one agent, one channel**, and the

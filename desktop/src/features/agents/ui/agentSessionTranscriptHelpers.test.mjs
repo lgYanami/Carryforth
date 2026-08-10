@@ -375,7 +375,7 @@ test("parseSystemPromptSections pins the full Base+System+Core+Canvas harness sh
     "[Channel Canvas]",
     "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     "Last modified: 2026-07-11T10:00:00Z",
-    "Fetch current content with: buzz canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
+    "Fetch current content with: cf canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
   ].join("\n");
   const sections = parseSystemPromptSections(framed);
   assert.deepEqual(sections, [
@@ -384,7 +384,7 @@ test("parseSystemPromptSections pins the full Base+System+Core+Canvas harness sh
     { title: "Core Memory", body: "I am Duncan." },
     {
       title: "Channel Canvas",
-      body: "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\nLast modified: 2026-07-11T10:00:00Z\nFetch current content with: buzz canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
+      body: "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\nLast modified: 2026-07-11T10:00:00Z\nFetch current content with: cf canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
     },
   ]);
 });
@@ -554,7 +554,7 @@ test("parseSystemPromptSections extracts Team Instructions with Core Memory and 
     "[Channel Canvas]",
     "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     "Last modified: 2026-07-11T10:00:00Z",
-    "Fetch current content with: buzz canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
+    "Fetch current content with: cf canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
   ].join("\n");
   const sections = parseSystemPromptSections(framed);
   assert.deepEqual(sections, [
@@ -573,7 +573,7 @@ test("parseSystemPromptSections extracts Team Instructions with Core Memory and 
     },
     {
       title: "Channel Canvas",
-      body: "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\nLast modified: 2026-07-11T10:00:00Z\nFetch current content with: buzz canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
+      body: "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\nLast modified: 2026-07-11T10:00:00Z\nFetch current content with: cf canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
     },
   ]);
 });
@@ -751,7 +751,7 @@ test("parseSystemPromptSections (modern) pins full 5-section shape: Base+System+
     "[Channel Canvas]",
     "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     "Last modified: 2026-07-11T10:00:00Z",
-    "Fetch current content with: buzz canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
+    "Fetch current content with: cf canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
   ].join("\n");
   const sections = parseSystemPromptSections(framed);
   assert.deepEqual(sections, [
@@ -770,7 +770,7 @@ test("parseSystemPromptSections (modern) pins full 5-section shape: Base+System+
     },
     {
       title: "Channel Canvas",
-      body: "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\nLast modified: 2026-07-11T10:00:00Z\nFetch current content with: buzz canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
+      body: "Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\nLast modified: 2026-07-11T10:00:00Z\nFetch current content with: cf canvas get --channel 94a444a4-c0a3-5966-ab05-530c6ddc2301",
     },
   ]);
 });

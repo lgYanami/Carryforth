@@ -1269,7 +1269,7 @@ pub(crate) fn render_role_directory(output: &mut String, directory: &RoleBriefRo
     if directory.omitted_active_roles > 0 {
         let _ = writeln!(
             output,
-            "Role Directory omitted: {} active Role(s). Run `buzz roles list` for the complete \
+            "Role Directory omitted: {} active Role(s). Run `cf roles list` for the complete \
              directory; omitted Roles still exist.",
             directory.omitted_active_roles
         );
@@ -2168,7 +2168,7 @@ mod tests {
         assert!(leader.purpose_summary.ends_with('…'));
         let markdown = render_role_brief_markdown(&assigned);
         assert!(markdown.contains("Role Directory omitted: 2 active Role(s)"));
-        assert!(markdown.contains("`buzz roles list`"));
+        assert!(markdown.contains("`cf roles list`"));
         assert!(markdown.contains("omitted Roles still exist"));
 
         let candidate = snapshot

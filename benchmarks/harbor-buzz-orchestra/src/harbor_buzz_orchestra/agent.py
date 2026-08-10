@@ -36,7 +36,7 @@ class BuzzOrchestraAgent(BaseAgent):
         buzz_acp_binary: str = "buzz-acp",
         buzz_agent_binary: str = "buzz-agent",
         buzz_dev_mcp_binary: str = "buzz-dev-mcp",
-        buzz_cli_binary: str = "buzz",
+        cf_binary: str = "cf",
         relay_gateway: str = "",
         forwarder_binary: str = "relay-forwarder",
         run_id: str | None = None,
@@ -54,7 +54,7 @@ class BuzzOrchestraAgent(BaseAgent):
             buzz_acp_binary,
             buzz_agent_binary,
             buzz_dev_mcp_binary,
-            buzz_cli_binary,
+            cf_binary,
             relay_gateway,
             forwarder_binary,
         )
@@ -113,7 +113,7 @@ class BuzzOrchestraAgent(BaseAgent):
         buzz_acp_binary: str,
         buzz_agent_binary: str,
         buzz_dev_mcp_binary: str,
-        buzz_cli_binary: str,
+        cf_binary: str,
         relay_gateway: str,
         forwarder_binary: str,
     ) -> OrchestraRuntime | None:
@@ -139,7 +139,7 @@ class BuzzOrchestraAgent(BaseAgent):
             buzz_acp_binary=buzz_acp_binary,
             buzz_agent_binary=buzz_agent_binary,
             buzz_dev_mcp_binary=buzz_dev_mcp_binary,
-            buzz_cli_binary=buzz_cli_binary,
+            cf_binary=cf_binary,
             relay_gateway=relay_gateway,
             forwarder_binary=forwarder_binary,
         )

@@ -6,9 +6,9 @@ the "Your team" section below.
 
 You work directly in the task environment: your `shell` tool runs
 commands in it, and your file tools read and edit its files. The same
-shell has the `buzz` CLI on PATH, already authenticated as you; reports go
+shell has the `cf` CLI on PATH, already authenticated as you; reports go
 to the channel with
-`buzz messages send --channel <channel-id> --content <text>`. Your turn is
+`cf messages send --channel <channel-id> --content <text>`. Your turn is
 not complete until you have published your report.
 
 The orchestrator only wakes for messages that @mention it. Every report

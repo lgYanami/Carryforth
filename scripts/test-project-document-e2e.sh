@@ -113,12 +113,12 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
 
 if [[ "${PROJECT_DOCUMENT_E2E_NO_BUILD:-0}" != "1" ]]; then
   if [[ "${profile}" == "dev" ]]; then
-    cargo build -p buzz-relay -p buzz-cli -p buzz-admin
+    cargo build -p buzz-relay -p carryforth-cli -p buzz-admin
   else
-    cargo build --profile "${profile}" -p buzz-relay -p buzz-cli -p buzz-admin
+    cargo build --profile "${profile}" -p buzz-relay -p carryforth-cli -p buzz-admin
   fi
 fi
-for binary in buzz-relay buzz buzz-admin; do
+for binary in buzz-relay cf buzz-admin; do
   if [[ ! -x "${bin_dir}/${binary}" ]]; then
     echo "Project Document E2E: missing executable ${bin_dir}/${binary}" >&2
     exit 1
@@ -195,18 +195,18 @@ run_e2e_binary() {
   fi
 }
 
-buzz_cli() {
+cf_cli() {
   env \
-    BUZZ_RELAY_URL="http://${test_host}" \
-    BUZZ_PRIVATE_KEY="${member_private_key}" \
-    "${bin_dir}/buzz" "$@"
+    CARRYFORTH_RELAY_URL="http://${test_host}" \
+    CARRYFORTH_PRIVATE_KEY="${member_private_key}" \
+    "${bin_dir}/cf" "$@"
 }
 
-buzz_owner_cli() {
+cf_owner_cli() {
   env \
-    BUZZ_RELAY_URL="http://${test_host}" \
-    BUZZ_PRIVATE_KEY="${owner_private_key}" \
-    "${bin_dir}/buzz" "$@"
+    CARRYFORTH_RELAY_URL="http://${test_host}" \
+    CARRYFORTH_PRIVATE_KEY="${owner_private_key}" \
+    "${bin_dir}/cf" "$@"
 }
 
 buzz_admin() {
@@ -244,7 +244,7 @@ jq -e '
 
 # Disabled remains an independently tested security state.
 start_relay
-buzz_cli channels list >/dev/null
+cf_cli channels list >/dev/null
 run_e2e_binary e2e_project_context_stage1
 if [[ "${PROJECT_CONTEXT_STAGE1_ONLY:-0}" == "1" ]]; then
   stop_relay
@@ -324,7 +324,7 @@ jq -e '
       or . == "buzz-project-view-v3-bootstrap"
     ))
 ' <<<"${pre_initialize_info}" >/dev/null
-initialize_json="$(buzz_owner_cli --format compact project-view init-v3 \
+initialize_json="$(cf_owner_cli --format compact project-view init-v3 \
   --command "${initialize_v3_file}")"
 jq -e '.accepted == true' <<<"${initialize_json}" >/dev/null
 initialized_disabled_info="$(curl -fsS "http://${test_host}/info")"
@@ -394,7 +394,7 @@ run_e2e_binary e2e_project_document_enabled
 
 # Real CLI CRUD, metadata-only list/history, pinned reads, exact patch, and
 # conflict exit-code behavior.
-create_json="$(buzz_cli documents create \
+create_json="$(cf_cli documents create \
   --title "Stage 2 CLI canary" \
   --summary "isolated metadata" \
   --content "# Stage 2 CLI canary")"
@@ -402,14 +402,14 @@ document_id="$(jq -er '.document_id' <<<"${create_json}")"
 jq -e '.accepted == true and .document_revision == 1 and .confirmation == "receipt_and_readback"' \
   <<<"${create_json}" >/dev/null
 
-list_json="$(buzz_cli documents list)"
+list_json="$(cf_cli documents list)"
 jq -e --arg id "${document_id}" '
   any(.[]; .document_id == $id)
   and all(.[]; has("content_markdown") | not)
 ' <<<"${list_json}" >/dev/null
-[[ "$(buzz_cli documents get "${document_id}" --content-only)" == "# Stage 2 CLI canary" ]]
+[[ "$(cf_cli documents get "${document_id}" --content-only)" == "# Stage 2 CLI canary" ]]
 
-buzz_cli documents update "${document_id}" \
+cf_cli documents update "${document_id}" \
   --expected-revision 1 \
   --title "Stage 2 CLI canary" \
   --clear-summary \
@@ -424,11 +424,11 @@ printf '%s\n' \
   ' line one' \
   '-line two' \
   '+line three' >"${patch_file}"
-buzz_cli documents patch "${document_id}" \
+cf_cli documents patch "${document_id}" \
   --expected-revision 2 \
   --patch-file "${patch_file}" >/dev/null
 
-history_json="$(buzz_cli documents history "${document_id}")"
+history_json="$(cf_cli documents history "${document_id}")"
 jq -e '
   length == 3
   and .[0].document_revision == 3
@@ -436,12 +436,12 @@ jq -e '
   and all(.[]; has("content_markdown") | not)
 ' <<<"${history_json}" >/dev/null
 jq -e '.document_revision == 1 and .content_markdown == "# Stage 2 CLI canary"' \
-  <<<"$(buzz_cli documents get "${document_id}" --revision 1)" >/dev/null
+  <<<"$(cf_cli documents get "${document_id}" --revision 1)" >/dev/null
 
 conflict_log="$(mktemp)"
 temporary_files+=("${conflict_log}")
 set +e
-buzz_cli documents update "${document_id}" \
+cf_cli documents update "${document_id}" \
   --expected-revision 2 \
   --title "stale update" \
   --clear-summary \
@@ -454,16 +454,16 @@ if [[ "${conflict_status}" != "5" ]]; then
   exit 1
 fi
 
-buzz_cli documents delete "${document_id}" --expected-revision 3 >/dev/null
+cf_cli documents delete "${document_id}" --expected-revision 3 >/dev/null
 jq -e 'length == 4 and .[0].state == "deleted"' \
-  <<<"$(buzz_cli documents history "${document_id}")" >/dev/null
+  <<<"$(cf_cli documents history "${document_id}")" >/dev/null
 jq -e '.document_revision == 1 and .content_markdown == "# Stage 2 CLI canary"' \
-  <<<"$(buzz_cli documents get "${document_id}" --revision 1)" >/dev/null
+  <<<"$(cf_cli documents get "${document_id}" --revision 1)" >/dev/null
 
 # Synthetic Secret incident drill: no credential value is created. Keep only
 # event/Document coordinates, disable, verify public fail-closed behavior,
 # simulate external rotation/assessment, then perform reviewed re-enable.
-incident_json="$(buzz_cli documents create \
+incident_json="$(cf_cli documents create \
   --title "Secret incident drill" \
   --content "Synthetic suspected-credential marker; no real secret value")"
 incident_document_id="$(jq -er '.document_id' <<<"${incident_json}")"
@@ -475,7 +475,7 @@ jq -e '
   (.supported_extensions // [])
   | all(. != "buzz-project-document-v1")
 ' <<<"${info_json}" >/dev/null
-if buzz_cli documents list >/dev/null 2>&1; then
+if cf_cli documents list >/dev/null 2>&1; then
   echo "Project Document E2E: disabled capability remained readable" >&2
   exit 1
 fi
@@ -497,8 +497,8 @@ buzz_admin enable \
   --community "${test_host}" \
   --expected-pubkey "${relay_signer_pubkey}" >/dev/null
 jq -e '.document_revision == 1 and .state == "active"' \
-  <<<"$(buzz_cli documents get "${incident_document_id}" --revision 1)" >/dev/null
-buzz_cli documents delete "${incident_document_id}" --expected-revision 1 >/dev/null
+  <<<"$(cf_cli documents get "${incident_document_id}" --revision 1)" >/dev/null
+cf_cli documents delete "${incident_document_id}" --expected-revision 1 >/dev/null
 
 # Final kill-switch proof: canonical history remains, ordinary capability is
 # unavailable, and the control sequence is audit-recorded.
@@ -616,7 +616,7 @@ if [[ "${PROJECT_DOCUMENT_STAGE7_RECOVERY:-0}" == "1" ]]; then
     --relay-key-file "${rotated_key_file}" \
     --expected-pubkey "${rotated_relay_pubkey}" >/dev/null
   jq -e 'length == 4 and .[0].state == "deleted"' \
-    <<<"$(buzz_cli documents history "${document_id}")" >/dev/null
+    <<<"$(cf_cli documents history "${document_id}")" >/dev/null
 
   # Bounded abuse burst: the normal shared HTTP admission limiter must reject
   # the fourth/following private Document history query. This exercises the

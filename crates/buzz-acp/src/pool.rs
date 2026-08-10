@@ -3463,7 +3463,7 @@ pub(crate) fn render_canvas_section(event_id: &str, timestamp: &str, channel_uui
         "[Channel Canvas]\n\
          Canvas revision (event ID): {event_id}\n\
          Last modified: {timestamp}\n\
-         Fetch current content with: buzz canvas get --channel {channel_uuid}"
+         Fetch current content with: cf canvas get --channel {channel_uuid}"
     )
 }
 
@@ -5366,7 +5366,7 @@ mod tests {
         assert!(composed.starts_with("[Project Space]\n"));
         assert!(composed.contains("versioned Project Documents"));
         assert!(composed.contains("referenced directly from Project View"));
-        assert!(composed.contains("explicitly write the change back through Buzz"));
+        assert!(composed.contains("explicitly write the change back through Carryforth"));
         assert!(composed.ends_with("\n\nhello channel"));
     }
 
@@ -5401,7 +5401,7 @@ mod tests {
     fn test_initial_message_legacy_agent_gets_canvas_prepended() {
         // Legacy agents (protocol_version < 2) receive the canvas section before
         // the initial-message body so it arrives before the first prompt.
-        let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00Z\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
+        let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00Z\nFetch current content with: cf canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
         let composed = prepend_canvas_for_legacy(1, Some(canvas), "do the thing");
         assert!(
             composed.starts_with("[Channel Canvas]"),
@@ -5554,9 +5554,9 @@ mod tests {
         assert!(framed.contains("Guide Document"));
         assert!(framed.contains("Context References"));
         assert!(framed.contains("Project Context Edges"));
-        assert!(framed.contains("`buzz project-context exact`"));
-        assert!(framed.contains("`buzz project-context incident`"));
-        assert!(framed.contains("`buzz project-context contains-all`"));
+        assert!(framed.contains("`cf project-context exact`"));
+        assert!(framed.contains("`cf project-context incident`"));
+        assert!(framed.contains("`cf project-context contains-all`"));
         assert!(framed.contains("does not automatically produce a Gap"));
         assert!(framed.contains("materially changes"));
     }
@@ -5653,7 +5653,7 @@ mod tests {
         );
         assert!(prompt.contains("referenced directly from Project View"));
         assert!(prompt.contains("read only the needed body on demand"));
-        assert!(prompt.contains("explicitly write the change back through Buzz"));
+        assert!(prompt.contains("explicitly write the change back through Carryforth"));
     }
 
     #[test]
@@ -7664,7 +7664,7 @@ mod tests {
             "[Channel Canvas]\n\
              Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n\
              Last modified: 2024-01-15T10:30:00+00:00\n\
-             Fetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae"
+             Fetch current content with: cf canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae"
         );
     }
 
@@ -7774,7 +7774,7 @@ mod tests {
         let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
         let section = result.expect("expected Some");
         assert!(section.contains(&id), "section must contain the event id");
-        assert!(section.contains("buzz canvas get --channel"));
+        assert!(section.contains("cf canvas get --channel"));
         assert!(section.contains(CHANNEL_UUID));
         assert!(section.starts_with("[Channel Canvas]"));
         // Timestamp must use Z suffix, not +00:00

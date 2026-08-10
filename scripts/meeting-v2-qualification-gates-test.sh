@@ -221,7 +221,7 @@ JSON
 {"supported_extensions":["buzz-meeting-v2"]}
 JSON
   cat >"${directory}/preflight/executable-sha256.txt" <<'TEXT'
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  target/release/buzz
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  target/release/cf
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  target/release/buzz-acp
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  target/release/buzz-relay
 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  @agentclientprotocol/codex-acp

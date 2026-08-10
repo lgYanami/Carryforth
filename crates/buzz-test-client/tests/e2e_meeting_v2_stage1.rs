@@ -163,28 +163,28 @@ fn tag_value<'a>(event: &'a Value, name: &str) -> Option<&'a str> {
         .as_str()
 }
 
-fn run_real_buzz(keys: &Keys, args: &[&str]) -> Value {
-    let buzz = std::env::var("MEETING_E2E_BUZZ_BIN")
-        .expect("MEETING_E2E_BUZZ_BIN must point at the real buzz CLI");
-    let output = Command::new(buzz)
+fn run_real_cf(keys: &Keys, args: &[&str]) -> Value {
+    let cf = std::env::var("MEETING_E2E_CF_BIN")
+        .expect("MEETING_E2E_CF_BIN must point at the real cf CLI");
+    let output = Command::new(cf)
         .args(["--format", "compact"])
         .args(args)
-        .env("BUZZ_RELAY_URL", relay_http_url())
+        .env("CARRYFORTH_RELAY_URL", relay_http_url())
         .env(
-            "BUZZ_PRIVATE_KEY",
+            "CARRYFORTH_PRIVATE_KEY",
             keys.secret_key().to_bech32().expect("encode E2E nsec"),
         )
-        .env_remove("BUZZ_AUTH_TAG")
+        .env_remove("CARRYFORTH_AUTH_TAG")
         .output()
-        .expect("run real buzz CLI");
+        .expect("run real cf CLI");
     assert!(
         output.status.success(),
-        "real buzz CLI failed (status={}): stdout={} stderr={}",
+        "real cf CLI failed (status={}): stdout={} stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("parse real buzz CLI JSON output")
+    serde_json::from_slice(&output.stdout).expect("parse real cf CLI JSON output")
 }
 
 fn response_payload(body: &str) -> Value {
@@ -1067,7 +1067,7 @@ async fn meeting_v2_operator_abort_is_distinct_from_normal_close() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Relay and MEETING_E2E_BUZZ_BIN"]
+#[ignore = "requires a disposable Relay and MEETING_E2E_CF_BIN"]
 async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
     let pool = test_pool().await;
     let community_id = ensure_community(&pool).await;
@@ -1078,7 +1078,7 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
     let host_hex = host.public_key().to_hex();
     let participant_hex = participant.public_key().to_hex();
 
-    let create = run_real_buzz(
+    let create = run_real_cf(
         &host,
         &[
             "meetings",
@@ -1098,7 +1098,7 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
         .expect("CLI Create meeting_id")
         .to_string();
 
-    let intent = run_real_buzz(
+    let intent = run_real_cf(
         &participant,
         &[
             "meetings",
@@ -1115,12 +1115,12 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
         .expect("CLI Intent id")
         .to_string();
 
-    let board_ready = run_real_buzz(
+    let board_ready = run_real_cf(
         &host,
         &["meetings", "board", "unchanged", "--meeting", &meeting_id],
     );
     assert_eq!(board_ready["accepted"], true);
-    let selected = run_real_buzz(
+    let selected = run_real_cf(
         &host,
         &[
             "meetings",
@@ -1133,12 +1133,12 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
         ],
     );
     assert_eq!(selected["accepted"], true);
-    let ack = run_real_buzz(
+    let ack = run_real_cf(
         &participant,
         &["meetings", "offer", "ack", "--meeting", &meeting_id],
     );
     assert_eq!(ack["accepted"], true);
-    let speech = run_real_buzz(
+    let speech = run_real_cf(
         &participant,
         &[
             "meetings",
@@ -1157,7 +1157,7 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
     );
     assert!(speech["speech_event_id"].as_str().is_some());
 
-    let handed_off = run_real_buzz(
+    let handed_off = run_real_cf(
         &participant,
         &["meetings", "floor", "status", "--meeting", &meeting_id],
     );
@@ -1169,12 +1169,12 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
     assert_eq!(handed_off["content"]["board_control"]["board_window"], 1);
     assert_eq!(handed_off["content"]["offer"]["target_pubkey"], host_hex);
 
-    let moderator_ack = run_real_buzz(
+    let moderator_ack = run_real_cf(
         &host,
         &["meetings", "offer", "ack", "--meeting", &meeting_id],
     );
     assert_eq!(moderator_ack["accepted"], true);
-    let moderator_speech = run_real_buzz(
+    let moderator_speech = run_real_cf(
         &host,
         &[
             "meetings",
@@ -1186,7 +1186,7 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
         ],
     );
     assert!(moderator_speech["speech_event_id"].as_str().is_some());
-    let board_pending = run_real_buzz(
+    let board_pending = run_real_cf(
         &host,
         &["meetings", "floor", "status", "--meeting", &meeting_id],
     );
@@ -1204,7 +1204,7 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
     ));
     std::fs::write(&board_path, board_body).expect("write CLI Board fixture");
     let board_path_text = board_path.to_string_lossy().into_owned();
-    let updated = run_real_buzz(
+    let updated = run_real_cf(
         &host,
         &[
             "meetings",
@@ -1218,23 +1218,23 @@ async fn meeting_v2_real_cli_completes_a_multi_identity_lifecycle() {
     );
     let _ = std::fs::remove_file(&board_path);
     assert_eq!(updated["accepted"], true);
-    let board = run_real_buzz(
+    let board = run_real_cf(
         &participant,
         &["meetings", "board", "get", "--meeting", &meeting_id],
     );
     assert_eq!(board["body"], board_body);
 
-    let closed = run_real_buzz(&host, &["meetings", "close", "--meeting", &meeting_id]);
+    let closed = run_real_cf(&host, &["meetings", "close", "--meeting", &meeting_id]);
     assert_eq!(closed["status"], "ended");
     assert_eq!(closed["terminal_outcome"], "closed");
-    let shown = run_real_buzz(
+    let shown = run_real_cf(
         &participant,
         &["meetings", "show", "--meeting", &meeting_id],
     );
     assert_eq!(shown["status"], "ended");
     assert_eq!(shown["terminal_outcome"], "closed");
     assert!(shown["terminal_reason_code"].is_null());
-    let terminal_board = run_real_buzz(
+    let terminal_board = run_real_cf(
         &participant,
         &["meetings", "board", "get", "--meeting", &meeting_id],
     );

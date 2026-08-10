@@ -103,7 +103,6 @@ pub(crate) struct ResetContext<'a> {
     pub nest_dir: Option<PathBuf>,
     pub keychain: &'a dyn ResetKeychain,
     pub home_dir: Option<PathBuf>,
-    pub is_dev: bool,
 }
 
 /// Entry point called from `lib.rs` setup (before migrations).
@@ -114,12 +113,6 @@ pub(crate) fn run_boot_reset(app_data_dir: &Path) -> ResetOutcome {
     if !check_sentinel(app_data_dir) {
         return ResetOutcome::default();
     }
-
-    let is_dev = app_data_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(crate::migration::is_dev_data_dir_name)
-        .unwrap_or(false);
 
     let store = crate::secret_store::SecretStore::keyring(crate::app_state::keyring_service());
     let home_dir = dirs::home_dir();
@@ -132,7 +125,6 @@ pub(crate) fn run_boot_reset(app_data_dir: &Path) -> ResetOutcome {
         nest_dir,
         keychain: &store,
         home_dir,
-        is_dev,
     };
 
     run_boot_reset_with_keychain(ctx)
@@ -211,15 +203,17 @@ pub(crate) fn run_boot_reset_with_keychain(ctx: ResetContext<'_>) -> ResetOutcom
         None
     };
 
-    // ── Step 3: remove nest, ~/.sprout, ~/.config/buzz-agent, CLI symlink ────
+    // ── Step 3: remove nest, ~/.sprout, and ~/.config/buzz-agent ────────────
     if let Some(ref nest) = ctx.nest_dir {
         let _ = std::fs::remove_dir_all(nest);
     }
     if let Some(ref home) = ctx.home_dir {
         let _ = std::fs::remove_dir_all(home.join(".sprout"));
         let _ = std::fs::remove_dir_all(home.join(".config").join("buzz-agent"));
-        let link_name = crate::managed_agents::cli_link_name(ctx.is_dev);
-        let _ = std::fs::remove_file(home.join(".local").join("bin").join(link_name));
+        // `cf` is not an app-owned namespace on every machine (for example,
+        // Cloud Foundry also installs it). The convenience link contains no
+        // identity state, so reset deliberately leaves it alone rather than
+        // risk deleting a third-party file or symlink.
     }
 
     // ── Step 4: keychain — LAST so we can read keys before deleting ──────────
@@ -396,18 +390,13 @@ mod tests {
         dir
     }
 
-    fn make_ctx<'a>(
-        app_data_dir: &'a Path,
-        keychain: &'a dyn ResetKeychain,
-        is_dev: bool,
-    ) -> ResetContext<'a> {
+    fn make_ctx<'a>(app_data_dir: &'a Path, keychain: &'a dyn ResetKeychain) -> ResetContext<'a> {
         ResetContext {
             app_data_dir,
             legacy_app_data_dir: None,
             nest_dir: None,
             keychain,
             home_dir: None, // skip nest/sprout/CLI ops in unit tests
-            is_dev,
         }
     }
 
@@ -450,7 +439,6 @@ mod tests {
             nest_dir: None,
             keychain: &kc,
             home_dir: None,
-            is_dev: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -471,7 +459,7 @@ mod tests {
         let app_data = make_app_data(&tmp);
         write_sentinel(&app_data).unwrap();
         let kc = FakeKeychain::fail("keychain unavailable");
-        let ctx = make_ctx(&app_data, &kc, false);
+        let ctx = make_ctx(&app_data, &kc);
 
         let outcome = run_boot_reset_with_keychain(ctx);
 
@@ -492,7 +480,7 @@ mod tests {
         write_sentinel(&app_data).unwrap();
         // Keychain delete "succeeds" but verify_fully_wiped still returns false.
         let kc = FakeKeychain::ok_but_not_wiped();
-        let ctx = make_ctx(&app_data, &kc, false);
+        let ctx = make_ctx(&app_data, &kc);
 
         let outcome = run_boot_reset_with_keychain(ctx);
 
@@ -511,7 +499,7 @@ mod tests {
 
         // First run — keychain fails (simulates a crash mid-wipe).
         let kc1 = FakeKeychain::fail("transient error");
-        let ctx1 = make_ctx(&app_data, &kc1, false);
+        let ctx1 = make_ctx(&app_data, &kc1);
         let first = run_boot_reset_with_keychain(ctx1);
         assert!(first.failed);
         assert!(
@@ -527,7 +515,7 @@ mod tests {
         std::fs::create_dir_all(&app_data).unwrap();
 
         let kc2 = FakeKeychain::ok();
-        let ctx2 = make_ctx(&app_data, &kc2, false);
+        let ctx2 = make_ctx(&app_data, &kc2);
         let second = run_boot_reset_with_keychain(ctx2);
         assert!(second.completed, "second attempt must complete");
         assert!(!second.failed);
@@ -563,7 +551,6 @@ mod tests {
             nest_dir: Some(dev_nest.clone()),
             keychain: &kc,
             home_dir: None,
-            is_dev: true,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -599,7 +586,6 @@ mod tests {
             nest_dir: Some(prod_nest.clone()),
             keychain: &kc,
             home_dir: None,
-            is_dev: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -632,7 +618,6 @@ mod tests {
             nest_dir: None,
             keychain: &kc,
             home_dir: None,
-            is_dev: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -650,7 +635,7 @@ mod tests {
         write_sentinel(&app_data).unwrap();
         // Simulates an unclassified/transient keychain error during delete.
         let kc = FakeKeychain::fail("unknown transient keychain error");
-        let ctx = make_ctx(&app_data, &kc, false);
+        let ctx = make_ctx(&app_data, &kc);
 
         let outcome = run_boot_reset_with_keychain(ctx);
 
@@ -673,7 +658,7 @@ mod tests {
         // keychain error (e.g. constructor failure, unclassified read error)
         // that cannot confirm absence. The sentinel must survive.
         let kc = FakeKeychain::ok_but_verify_fails();
-        let ctx = make_ctx(&app_data, &kc, false);
+        let ctx = make_ctx(&app_data, &kc);
 
         let outcome = run_boot_reset_with_keychain(ctx);
 
@@ -715,7 +700,6 @@ mod tests {
             nest_dir: Some(dev_nest.clone()),
             keychain: &kc,
             home_dir: None,
-            is_dev: true,
         };
         let outcome = run_boot_reset_with_keychain(ctx);
         assert!(outcome.completed, "reset must complete");
@@ -771,7 +755,7 @@ mod tests {
         std::fs::remove_dir_all(&app_data).unwrap();
 
         let kc = FakeKeychain::ok();
-        let ctx = make_ctx(&app_data, &kc, false);
+        let ctx = make_ctx(&app_data, &kc);
 
         let outcome = run_boot_reset_with_keychain(ctx);
         assert!(outcome.completed, "retry must complete");
@@ -809,7 +793,6 @@ mod tests {
             nest_dir: None,
             keychain: &kc1,
             home_dir: Some(tmp.path().to_path_buf()),
-            is_dev: false,
         };
         let first = run_boot_reset_with_keychain(ctx1);
         assert!(first.failed, "first attempt must fail");
@@ -832,7 +815,6 @@ mod tests {
             nest_dir: None,
             keychain: &kc2,
             home_dir: Some(tmp.path().to_path_buf()),
-            is_dev: false,
         };
         let second = run_boot_reset_with_keychain(ctx2);
         assert!(second.completed, "second attempt must complete");

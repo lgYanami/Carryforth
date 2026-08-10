@@ -142,7 +142,7 @@ run_unit_tests() {
     cargo test -p buzz-relay --lib project_view -- --nocapture
 
   run_test_step "Project View CLI tests" \
-    cargo test -p buzz-cli --lib project_view -- --nocapture
+    cargo test -p carryforth-cli --lib project_view -- --nocapture
 
   run_test_step "Project View ACP tests" \
     cargo test -p buzz-acp --lib project_view -- --nocapture
@@ -169,13 +169,13 @@ run_unit_tests() {
     cargo test -p buzz-relay --lib community_private -- --nocapture
 
   run_test_step "Project Document CLI boundary tests" \
-    cargo test -p buzz-cli --lib project_document -- --nocapture
+    cargo test -p carryforth-cli --lib project_document -- --nocapture
 
   run_test_step "Project Document CLI vertical tests" \
-    cargo test -p buzz-cli --lib documents -- --nocapture
+    cargo test -p carryforth-cli --lib documents -- --nocapture
 
   run_test_step "Project Document delivery policy tests" \
-    cargo test -p buzz-cli --lib project_command -- --nocapture
+    cargo test -p carryforth-cli --lib project_command -- --nocapture
 
   run_test_step "Project Document ACP boundary tests" \
     cargo test -p buzz-acp --lib project_document -- --nocapture

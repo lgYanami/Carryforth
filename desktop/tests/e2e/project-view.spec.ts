@@ -1940,7 +1940,7 @@ test("an uninitialized v3 View exposes only the operator and owner setup guide",
   await expect(
     page.getByText(/buzz-admin project-view prepare-v3/),
   ).toBeVisible();
-  await expect(page.getByText(/buzz project-view init-v3/)).toBeVisible();
+  await expect(page.getByText(/cf project-view init-v3/)).toBeVisible();
   await expect(page.getByLabel("Project name")).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Initialize View" }),

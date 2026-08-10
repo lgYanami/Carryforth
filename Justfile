@@ -104,7 +104,11 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+check: cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+
+# Keep the Agent-first CLI on its one-way Carryforth/cf cutover.
+cf-cli-cutover-check:
+    ./scripts/check-cf-cli-cutover.sh
 
 # Keep every ordinary Project View runtime surface on one schema-v3 contract.
 project-view-v3-runtime-check:
@@ -171,7 +175,7 @@ _ensure-sidecar-stubs:
     set -euo pipefail
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     mkdir -p desktop/src-tauri/binaries
-    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr cf; do
         touch "desktop/src-tauri/binaries/${bin}-${TARGET}"
     done
 
@@ -247,7 +251,7 @@ desktop-release-build target="aarch64-apple-darwin":
     touch "desktop/src-tauri/binaries/buzz-agent-$TARGET"
     touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
     touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
-    touch "desktop/src-tauri/binaries/buzz-$TARGET"
+    touch "desktop/src-tauri/binaries/cf-$TARGET"
     pnpm install
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
@@ -334,7 +338,7 @@ project-view-test-unit:
           -p buzz-core \
           -p buzz-sdk \
           -p buzz-relay \
-          -p buzz-cli \
+          -p carryforth-cli \
           -p buzz-acp \
           --lib \
           -E 'test(project_view)'
@@ -345,7 +349,7 @@ project-view-test-unit:
         cargo test -p buzz-core --lib project_view
         cargo test -p buzz-sdk --lib project_view
         cargo test -p buzz-relay --lib project_view
-        cargo test -p buzz-cli --lib project_view
+        cargo test -p carryforth-cli --lib project_view
         cargo test -p buzz-acp --lib project_view
         cargo test -p buzz-admin project_view
     fi
@@ -377,7 +381,7 @@ project-document-test-unit:
         cargo nextest run \
           -p buzz-core \
           -p buzz-relay \
-          -p buzz-cli \
+          -p carryforth-cli \
           -p buzz-acp \
           --lib \
           -E 'test(project_document) or test(project_command) or test(community_private) or test(documents) or test(bounded_file_reader)'
@@ -390,10 +394,10 @@ project-document-test-unit:
         cargo test -p buzz-core --lib project_document
         cargo test -p buzz-relay --lib project_document
         cargo test -p buzz-relay --lib community_private
-        cargo test -p buzz-cli --lib project_document
-        cargo test -p buzz-cli --lib documents
-        cargo test -p buzz-cli --lib project_command
-        cargo test -p buzz-cli --lib bounded_file_reader
+        cargo test -p carryforth-cli --lib project_document
+        cargo test -p carryforth-cli --lib documents
+        cargo test -p carryforth-cli --lib project_command
+        cargo test -p carryforth-cli --lib bounded_file_reader
         cargo test -p buzz-acp --lib project_document
         cargo test -p buzz-db --lib project_document
         cargo test -p buzz-admin project_document
@@ -425,7 +429,7 @@ project-context-test-unit:
           -E 'test(project_context)'
         cargo nextest run -p buzz-db --lib -E 'test(project_context)'
         cargo nextest run -p buzz-admin -E 'test(project_context)'
-        cargo nextest run -p buzz-cli -E 'test(project_context)'
+        cargo nextest run -p carryforth-cli -E 'test(project_context)'
     else
         cargo test -p buzz-project-context
         cargo test -p buzz-sdk --test project_context
@@ -434,7 +438,7 @@ project-context-test-unit:
         cargo test -p buzz-relay --lib project_context
         cargo test -p buzz-db --lib project_context
         cargo test -p buzz-admin project_context
-        cargo test -p buzz-cli project_context
+        cargo test -p carryforth-cli project_context
     fi
 
 # Run isolated PostgreSQL-backed Project Context canonical storage tests.
@@ -670,10 +674,10 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
             fi
         done
     fi
-    cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr -p buzz-relay
+    cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p carryforth-cli -p git-credential-nostr -p buzz-relay
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
-    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr cf; do
         src="${TARGET_DIR}/debug/${bin}"
         dest="desktop/src-tauri/binaries/${bin}-${TARGET}"
         if ! cmp -s "$src" "$dest"; then
@@ -728,10 +732,10 @@ desktop-standalone *ARGS: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
-    cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
+    cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p carryforth-cli -p git-credential-nostr
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
-    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+    for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr cf; do
         cp "${TARGET_DIR}/debug/${bin}" "desktop/src-tauri/binaries/${bin}-${TARGET}"
         chmod +x "desktop/src-tauri/binaries/${bin}-${TARGET}"
     done
@@ -980,7 +984,7 @@ _release-pr lane version:
             TAG_PREFIX="relay-v"
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
-            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/buzz-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
+            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/carryforth-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
             ARTIFACT="Buzz Relay" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"

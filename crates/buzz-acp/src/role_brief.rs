@@ -1205,7 +1205,7 @@ mod tests {
         assert!(resolution
             .markdown
             .contains("Context: not advertised; verified canonical Context is empty."));
-        assert!(resolution.markdown.contains("buzz resources guide"));
+        assert!(resolution.markdown.contains("cf resources guide"));
         assert!(!resolution.markdown.contains("locator"));
         assert_eq!(
             state.lock().expect("mock state").counts,
@@ -1263,13 +1263,13 @@ mod tests {
         assert_eq!(initial.mode, "full");
         assert!(initial.markdown.contains("Context: ready."));
         assert!(!initial.markdown.contains("Project Context Edge"));
-        assert!(!initial.markdown.contains("buzz project-context"));
+        assert!(!initial.markdown.contains("cf project-context"));
         assert!(initial.markdown.contains(&fixture.resource_id.to_string()));
         assert!(initial.markdown.contains("mandatory_guide_revision: 1"));
         assert!(initial.markdown.contains("current_revision: 1"));
         assert!(initial.markdown.contains("Current runbook [Role Brief v3]"));
         assert!(initial.markdown.contains(&format!(
-            "buzz documents get {} --revision 7 --content-only",
+            "cf documents get {} --revision 7 --content-only",
             fixture.pinned_document_id
         )));
         assert!(!initial.markdown.contains("SECRET_GUIDE_BODY"));
@@ -1285,7 +1285,7 @@ mod tests {
             .await;
         assert_eq!(compact.mode, "compact");
         assert!(!compact.markdown.contains("Project Context Edge"));
-        assert!(!compact.markdown.contains("buzz project-context"));
+        assert!(!compact.markdown.contains("cf project-context"));
         {
             let state = state.lock().expect("mock state");
             assert_eq!(state.document_meta_queries, 3);

@@ -36,9 +36,9 @@ Your text is read aloud via TTS, message by message, in the order sent.
 
 Latency matters most: reply IMMEDIATELY — do not compose your full reply
 before sending anything. The moment your first sentence is formed, send it
-as its own `buzz messages send` tool call: it is what breaks the silence.
+as its own `cf messages send` tool call: it is what breaks the silence.
 Then send each following sentence the same way — one sentence per separate
-`buzz messages send` call. Never hold a finished sentence back to bundle it
+`cf messages send` call. Never hold a finished sentence back to bundle it
 with the next one.
 
 - If not addressed or relevant: do nothing. Do not respond.

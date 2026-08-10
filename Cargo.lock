@@ -902,40 +902,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "buzz-cli"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64",
- "buzz-core",
- "buzz-persona",
- "buzz-project-context",
- "buzz-project-document",
- "buzz-project-view",
- "buzz-sdk",
- "buzz-ws-client",
- "bytes",
- "chrono",
- "clap",
- "diffy",
- "dirs",
- "hex",
- "infer",
- "nostr",
- "rand 0.10.1",
- "reqwest 0.13.4",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "buzz-conformance"
 version = "0.1.0"
 dependencies = [
@@ -995,8 +961,8 @@ name = "buzz-dev-mcp"
 version = "0.1.0"
 dependencies = [
  "base64",
- "buzz-cli",
  "buzz-core",
+ "carryforth-cli",
  "git-credential-nostr",
  "git-sign-nostr",
  "ignore",
@@ -1422,6 +1388,40 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "carryforth-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "buzz-core",
+ "buzz-persona",
+ "buzz-project-context",
+ "buzz-project-document",
+ "buzz-project-view",
+ "buzz-sdk",
+ "buzz-ws-client",
+ "bytes",
+ "chrono",
+ "clap",
+ "diffy",
+ "dirs",
+ "hex",
+ "infer",
+ "nostr",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "castaway"

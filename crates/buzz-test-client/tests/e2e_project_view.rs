@@ -133,6 +133,7 @@ fn create_goal_command(expected_revision: u64, title: &str) -> ProjectObjectComm
             object: NewProjectViewObjectV3::Goal {
                 id: Uuid::new_v4(),
                 title: title.to_owned(),
+                summary: None,
                 desired_outcome: format!("{title} is complete"),
                 directions: Vec::new(),
                 context_references: Vec::new(),
@@ -326,8 +327,8 @@ fn create_goal_with_real_cli(
     writer: &Keys,
     expected_project_revision: u64,
 ) -> Value {
-    let buzz = std::env::var("PROJECT_VIEW_E2E_BUZZ_BIN")
-        .expect("PROJECT_VIEW_E2E_BUZZ_BIN must point at the real buzz CLI");
+    let cf = std::env::var("PROJECT_VIEW_E2E_CF_BIN")
+        .expect("PROJECT_VIEW_E2E_CF_BIN must point at the real cf CLI");
     let input_path = std::env::temp_dir().join(format!(
         "buzz-project-view-cli-{}.json",
         Uuid::new_v4().simple()
@@ -335,7 +336,7 @@ fn create_goal_with_real_cli(
     std::fs::write(
         &input_path,
         serde_json::to_vec(&json!({
-            "title": "Created by the real buzz CLI",
+            "title": "Created by the real cf CLI",
             "desired_outcome": "The packaged agent surface exercises typed Project View writes",
             "directions": ["Do not hand-write kind or tags"]
         }))
@@ -344,7 +345,7 @@ fn create_goal_with_real_cli(
     .expect("write CLI fixture");
 
     let expected_revision = expected_project_revision.to_string();
-    let output = Command::new(buzz)
+    let output = Command::new(cf)
         .args([
             "--format",
             "compact",
@@ -356,26 +357,26 @@ fn create_goal_with_real_cli(
             "--data",
         ])
         .arg(&input_path)
-        .env("BUZZ_RELAY_URL", &context.http_url)
+        .env("CARRYFORTH_RELAY_URL", &context.http_url)
         .env(
-            "BUZZ_PRIVATE_KEY",
+            "CARRYFORTH_PRIVATE_KEY",
             writer
                 .secret_key()
                 .to_bech32()
                 .expect("encode E2E writer nsec"),
         )
-        .env_remove("BUZZ_AUTH_TAG")
+        .env_remove("CARRYFORTH_AUTH_TAG")
         .output()
-        .expect("run real buzz CLI");
+        .expect("run real cf CLI");
     let _ = std::fs::remove_file(&input_path);
     assert!(
         output.status.success(),
-        "real buzz CLI failed (status={}): stdout={} stderr={}",
+        "real cf CLI failed (status={}): stdout={} stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("parse real buzz CLI JSON output")
+    serde_json::from_slice(&output.stdout).expect("parse real cf CLI JSON output")
 }
 
 fn create_role_with_real_cli(
@@ -402,7 +403,7 @@ fn create_role_with_real_cli(
     .expect("write schema-v3 Role fixture");
     let path = input_path.to_string_lossy().into_owned();
     let expected_revision = expected_project_revision.to_string();
-    let created = run_real_buzz(
+    let created = run_real_cf(
         context,
         owner,
         &[
@@ -486,7 +487,7 @@ fn initialize_v3_with_real_cli(context: &TestContext, owner: &Keys) -> Value {
     )
     .expect("write schema-v3 initialization fixture");
     let path = input_path.to_string_lossy().into_owned();
-    let initialized = run_real_buzz(
+    let initialized = run_real_cf(
         context,
         owner,
         &["project-view", "init-v3", "--command", &path],
@@ -496,51 +497,51 @@ fn initialize_v3_with_real_cli(context: &TestContext, owner: &Keys) -> Value {
     initialized
 }
 
-fn run_real_buzz(context: &TestContext, keys: &Keys, args: &[&str]) -> Value {
-    let buzz = std::env::var("PROJECT_VIEW_E2E_BUZZ_BIN")
-        .expect("PROJECT_VIEW_E2E_BUZZ_BIN must point at the real buzz CLI");
-    let output = Command::new(buzz)
+fn run_real_cf(context: &TestContext, keys: &Keys, args: &[&str]) -> Value {
+    let cf = std::env::var("PROJECT_VIEW_E2E_CF_BIN")
+        .expect("PROJECT_VIEW_E2E_CF_BIN must point at the real cf CLI");
+    let output = Command::new(cf)
         .args(["--format", "compact"])
         .args(args)
-        .env("BUZZ_RELAY_URL", &context.http_url)
+        .env("CARRYFORTH_RELAY_URL", &context.http_url)
         .env(
-            "BUZZ_PRIVATE_KEY",
+            "CARRYFORTH_PRIVATE_KEY",
             keys.secret_key()
                 .to_bech32()
                 .expect("encode E2E command signer nsec"),
         )
-        .env_remove("BUZZ_AUTH_TAG")
+        .env_remove("CARRYFORTH_AUTH_TAG")
         .output()
-        .expect("run real buzz CLI");
+        .expect("run real cf CLI");
     assert!(
         output.status.success(),
-        "real buzz CLI failed (status={}): stdout={} stderr={}",
+        "real cf CLI failed (status={}): stdout={} stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("parse real buzz CLI JSON output")
+    serde_json::from_slice(&output.stdout).expect("parse real cf CLI JSON output")
 }
 
-fn run_real_buzz_rejected(context: &TestContext, keys: &Keys, args: &[&str]) -> String {
-    let buzz = std::env::var("PROJECT_VIEW_E2E_BUZZ_BIN")
-        .expect("PROJECT_VIEW_E2E_BUZZ_BIN must point at the real buzz CLI");
-    let output = Command::new(buzz)
+fn run_real_cf_rejected(context: &TestContext, keys: &Keys, args: &[&str]) -> String {
+    let cf = std::env::var("PROJECT_VIEW_E2E_CF_BIN")
+        .expect("PROJECT_VIEW_E2E_CF_BIN must point at the real cf CLI");
+    let output = Command::new(cf)
         .args(["--format", "compact"])
         .args(args)
-        .env("BUZZ_RELAY_URL", &context.http_url)
+        .env("CARRYFORTH_RELAY_URL", &context.http_url)
         .env(
-            "BUZZ_PRIVATE_KEY",
+            "CARRYFORTH_PRIVATE_KEY",
             keys.secret_key()
                 .to_bech32()
                 .expect("encode E2E command signer nsec"),
         )
-        .env_remove("BUZZ_AUTH_TAG")
+        .env_remove("CARRYFORTH_AUTH_TAG")
         .output()
-        .expect("run rejected real buzz CLI command");
+        .expect("run rejected real cf CLI command");
     assert!(
         !output.status.success(),
-        "expected real buzz CLI command to fail: stdout={} stderr={}",
+        "expected real cf CLI command to fail: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -685,7 +686,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         "only the current Project View capability must be advertised for {}: {info}",
         context.host
     );
-    let initial_view = run_real_buzz(&context, &writer, &["project-view", "get"]);
+    let initial_view = run_real_cf(&context, &writer, &["project-view", "get"]);
     assert_eq!(initial_view["project_view_schema_version"], 3);
     assert_eq!(initial_view["project_revision"], 1);
     assert_eq!(initial_view["projection_generation"], 1);
@@ -937,7 +938,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         .expect("schema-v3 Role ID")
         .to_owned();
     let agent_pubkey = agent.public_key().to_hex();
-    let offered = run_real_buzz(
+    let offered = run_real_cf(
         &context,
         &writer,
         &[
@@ -952,7 +953,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         ],
     );
     assert_eq!(offered["accepted"], true);
-    let proposals = run_real_buzz(
+    let proposals = run_real_cf(
         &context,
         &agent,
         &["roles", "proposals", "--status", "open"],
@@ -967,7 +968,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         .and_then(|proposal| proposal["proposal_id"].as_str())
         .expect("find open Role offer")
         .to_owned();
-    let accepted = run_real_buzz(
+    let accepted = run_real_cf(
         &context,
         &agent,
         &[
@@ -981,7 +982,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
     );
     assert_eq!(accepted["accepted"], true);
 
-    let current = run_real_buzz(&context, &agent, &["roles", "current"]);
+    let current = run_real_cf(&context, &agent, &["roles", "current"]);
     assert_eq!(current["project_view_schema_version"], 3);
     assert_eq!(current["project_revision"], 7);
     assert_eq!(current["assigned"], true);
@@ -990,7 +991,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         .as_str()
         .expect("first active Assignment ID")
         .to_owned();
-    let rejection = run_real_buzz_rejected(
+    let rejection = run_real_cf_rejected(
         &context,
         &agent,
         &[
@@ -1008,7 +1009,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
     );
 
     let successor_pubkey = successor.public_key().to_hex();
-    let offered = run_real_buzz(
+    let offered = run_real_cf(
         &context,
         &writer,
         &[
@@ -1023,7 +1024,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         ],
     );
     assert_eq!(offered["accepted"], true);
-    let proposals = run_real_buzz(
+    let proposals = run_real_cf(
         &context,
         &successor,
         &["roles", "proposals", "--status", "open"],
@@ -1038,7 +1039,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
         .and_then(|proposal| proposal["proposal_id"].as_str())
         .expect("find replacement Role offer")
         .to_owned();
-    let accepted = run_real_buzz(
+    let accepted = run_real_cf(
         &context,
         &successor,
         &[
@@ -1052,7 +1053,7 @@ async fn project_view_v3_greenfield_ws_http_cli_history_and_live_revocation() {
     );
     assert_eq!(accepted["accepted"], true);
 
-    let role = run_real_buzz(&context, &successor, &["roles", "get", &role_id_text]);
+    let role = run_real_cf(&context, &successor, &["roles", "get", &role_id_text]);
     assert_eq!(role["project_view_schema_version"], 3);
     assert_eq!(role["project_revision"], 9);
     assert_eq!(

@@ -338,18 +338,18 @@ def ensure_stack(state: dict[str, str]) -> None:
     raise SystemExit(f"benchmark schema apply failed: {last_error}")
 
 
-# -- buzz binaries -----------------------------------------------------------
+# -- Carryforth CLI ----------------------------------------------------------
 
 
 def ensure_binaries() -> dict[str, Path]:
-    """Find the host buzz CLI, building it once if missing."""
+    """Find the host cf CLI, building it once if missing."""
     try:
         return run_leaderboard.find_binaries(None)
     except SystemExit:
-        print("host buzz CLI missing — building (cargo build, first run only)...")
+        print("host cf CLI missing — building (cargo build, first run only)...")
     cargo = REPO_ROOT / "bin" / "cargo"
     subprocess.run(
-        [str(cargo), "build", "-p", "buzz-cli"],
+        [str(cargo), "build", "-p", "carryforth-cli"],
         cwd=REPO_ROOT,
         check=True,
     )
@@ -450,12 +450,12 @@ def launch_gui(state: dict[str, str]) -> subprocess.Popen:
     sidecar_dir = desktop_dir / "src-tauri" / "binaries"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
     binaries = ensure_binaries()
-    for name in ("buzz-acp", "buzz-agent", "buzz-dev-mcp", "git-credential-nostr", "buzz"):
+    for name in ("buzz-acp", "buzz-agent", "buzz-dev-mcp", "git-credential-nostr", "cf"):
         stub = sidecar_dir / f"{name}-{triple}"
         if not stub.exists():
             stub.touch()
-    real_cli = sidecar_dir / f"buzz-{triple}"
-    real_cli.write_bytes(binaries["buzz"].read_bytes())
+    real_cli = sidecar_dir / f"cf-{triple}"
+    real_cli.write_bytes(binaries["cf"].read_bytes())
     real_cli.chmod(0o755)
 
     print(

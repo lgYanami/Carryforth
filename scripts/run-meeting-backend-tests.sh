@@ -176,8 +176,8 @@ PGDATABASE="${MEETING_CONTRACT_DB}" \
   ./scripts/meeting-v2-schema-drift.sh
 
 echo "Building the real agent-facing CLI for Meeting V2 lifecycle coverage..."
-cargo build -p buzz-cli
-export MEETING_E2E_BUZZ_BIN="${REPO_ROOT}/target/debug/buzz"
+cargo build -p carryforth-cli
+export MEETING_E2E_CF_BIN="${REPO_ROOT}/target/debug/cf"
 
 export PGDATABASE="${MEETING_RELAY_DB}"
 export DATABASE_URL="postgres://buzz:buzz_dev@localhost:5432/${MEETING_RELAY_DB}"

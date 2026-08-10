@@ -114,23 +114,23 @@ fn ensure_nest_creates_skill_file() {
     ensure_nest_at(&root).unwrap();
 
     // Canonical location under .agents.
-    let skill = root.join(".agents/skills/buzz-cli/SKILL.md");
+    let skill = root.join(".agents/skills/carryforth-cli/SKILL.md");
     assert!(skill.exists(), "SKILL.md should exist at .agents path");
     let content = fs::read_to_string(&skill).unwrap();
-    assert_eq!(content, BUZZ_CLI_SKILL_MD);
+    assert_eq!(content, CARRYFORTH_CLI_SKILL_MD);
 
     // On unix, harness-specific symlinks should resolve to the canonical dir.
     #[cfg(unix)]
     {
         for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
-            let link = root.join(dir).join("buzz-cli");
+            let link = root.join(dir).join("carryforth-cli");
             assert!(
                 link.symlink_metadata().unwrap().file_type().is_symlink(),
-                "{dir}/buzz-cli should be a symlink"
+                "{dir}/carryforth-cli should be a symlink"
             );
             assert!(
                 link.join("SKILL.md").exists(),
-                "symlink at {dir}/buzz-cli should resolve to dir with SKILL.md"
+                "symlink at {dir}/carryforth-cli should resolve to dir with SKILL.md"
             );
         }
     }
@@ -142,7 +142,7 @@ fn ensure_nest_does_not_overwrite_skill_file() {
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
 
-    let skill = root.join(".agents/skills/buzz-cli/SKILL.md");
+    let skill = root.join(".agents/skills/carryforth-cli/SKILL.md");
     fs::write(&skill, "custom skill content").unwrap();
 
     ensure_nest_at(&root).unwrap();
@@ -157,11 +157,11 @@ fn ensure_nest_skill_dir_has_700_permissions() {
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
     // Canonical path and all provider parent dirs should be locked down.
-    // Symlinks (e.g. .goose/skills/buzz-cli) are skipped by the chmod loop.
+    // Symlinks (e.g. .goose/skills/carryforth-cli) are skipped by the chmod loop.
     for dir in [
         ".agents",
         ".agents/skills",
-        ".agents/skills/buzz-cli",
+        ".agents/skills/carryforth-cli",
         ".goose",
         ".goose/skills",
         ".claude",
@@ -206,42 +206,31 @@ fn ensure_nest_skips_permissions_on_symlinked_child() {
 
 #[cfg(unix)]
 #[test]
-fn ensure_nest_migrates_old_skill_dir() {
+fn ensure_nest_retires_app_owned_legacy_skill_assets() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
-
-    // Simulate a pre-migration install: real directory at old path.
-    // Create the nest first to get all dirs, then simulate old layout.
     ensure_nest_at(&root).unwrap();
 
-    // Remove the symlink and new skill dir, recreate old real dir.
-    let _ = fs::remove_file(root.join(".claude/skills/buzz-cli"));
-    let _ = fs::remove_dir_all(root.join(".agents/skills/buzz-cli"));
-    let old_skill_dir = root.join(".claude/skills/buzz-cli");
-    fs::create_dir_all(&old_skill_dir).unwrap();
-    fs::write(old_skill_dir.join("SKILL.md"), "user edited skill").unwrap();
+    let legacy_canonical = root.join(LEGACY_CANONICAL_SKILL_DIR);
+    fs::create_dir_all(&legacy_canonical).unwrap();
+    fs::write(legacy_canonical.join("SKILL.md"), "legacy managed skill").unwrap();
+    fs::write(legacy_canonical.join(".skill-version"), "4\n").unwrap();
+    for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
+        let legacy_link = root.join(dir).join("buzz-cli");
+        std::os::unix::fs::symlink("../../.agents/skills/buzz-cli", legacy_link).unwrap();
+    }
 
-    // Delete version file to force refresh.
-    let _ = fs::remove_file(root.join(".agents/skills/buzz-cli/.skill-version"));
-
-    // Re-run ensure_nest_at — should trigger migration in refresh_skill_md_if_stale.
     ensure_nest_at(&root).unwrap();
 
-    // New canonical location exists with user's content preserved.
-    let new_skill = root.join(".agents/skills/buzz-cli/SKILL.md");
+    let new_skill = root.join(".agents/skills/carryforth-cli/SKILL.md");
     assert!(new_skill.exists(), "SKILL.md should exist at new path");
-    assert_eq!(fs::read_to_string(&new_skill).unwrap(), "user edited skill");
-
-    // Old path is now a symlink, not a real directory.
-    let old_path = root.join(".claude/skills/buzz-cli");
-    assert!(
-        old_path
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "old path should now be a symlink"
-    );
+    assert!(fs::read_to_string(&new_skill)
+        .unwrap()
+        .contains("cf agents"));
+    assert!(!legacy_canonical.exists());
+    for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
+        assert!(root.join(dir).join("buzz-cli").symlink_metadata().is_err());
+    }
 }
 
 #[cfg(unix)]
@@ -254,52 +243,38 @@ fn ensure_skill_symlinks_are_idempotent() {
     ensure_nest_at(&root).unwrap();
     // All symlinks still valid and point to relative targets.
     for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
-        let link = root.join(dir).join("buzz-cli");
+        let link = root.join(dir).join("carryforth-cli");
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(
             link.join("SKILL.md").exists(),
-            "symlink at {dir}/buzz-cli should resolve to dir with SKILL.md"
+            "symlink at {dir}/carryforth-cli should resolve to dir with SKILL.md"
         );
         let target = fs::read_link(&link).unwrap();
         assert_eq!(
             target.to_str().unwrap(),
             format!("../../{CANONICAL_SKILL_DIR}"),
-            "symlink at {dir}/buzz-cli should use relative target"
+            "symlink at {dir}/carryforth-cli should use relative target"
         );
     }
 }
 
 #[cfg(unix)]
 #[test]
-fn ensure_skill_symlinks_skips_existing_path_during_initial_pass() {
-    // ensure_skill_symlinks skips any path where symlink_metadata succeeds.
-    // However, refresh_skill_md_if_stale (called after ensure_skill_symlinks)
-    // migrates pre-existing real directories at .claude/skills/buzz-cli to
-    // symlinks. This test verifies the end-to-end behavior: a pre-existing real
-    // dir at the claude path is migrated to a symlink.
+fn ensure_skill_symlinks_preserves_existing_real_provider_path() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
-    // Pre-create a real directory where a symlink would go.
-    let real_dir = root.join(".claude/skills/buzz-cli");
+    let real_dir = root.join(".claude/skills/carryforth-cli");
     fs::create_dir_all(&real_dir).unwrap();
-    // Place SKILL.md so migration preserves it.
     fs::write(real_dir.join("SKILL.md"), "custom skill content").unwrap();
 
     ensure_nest_at(&root).unwrap();
 
-    // Migration converts the real dir to a symlink; content is moved to canonical path.
     assert!(
-        real_dir
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        ".claude/skills/buzz-cli should be migrated to a symlink"
+        real_dir.symlink_metadata().unwrap().file_type().is_dir(),
+        "a user-owned provider skill directory must not be replaced"
     );
-    // The canonical path now holds the migrated content.
-    let canonical = root.join(".agents/skills/buzz-cli/SKILL.md");
     assert_eq!(
-        fs::read_to_string(&canonical).unwrap(),
+        fs::read_to_string(real_dir.join("SKILL.md")).unwrap(),
         "custom skill content"
     );
 }
@@ -312,7 +287,7 @@ fn ensure_skill_symlinks_skip_dangling_symlink() {
     // Pre-create a dangling symlink where the .codex link would go.
     let codex_skills = root.join(".codex/skills");
     fs::create_dir_all(&codex_skills).unwrap();
-    let dangling = codex_skills.join("buzz-cli");
+    let dangling = codex_skills.join("carryforth-cli");
     std::os::unix::fs::symlink("/nonexistent/target", &dangling).unwrap();
 
     ensure_nest_at(&root).unwrap();
@@ -330,13 +305,13 @@ fn ensure_skill_symlinks_skip_dangling_symlink() {
 }
 
 #[test]
-fn cli_link_name_prod_is_buzz() {
-    assert_eq!(cli_link_name(false), "buzz");
+fn cli_link_name_prod_is_cf() {
+    assert_eq!(cli_link_name(false), "cf");
 }
 
 #[test]
-fn cli_link_name_dev_is_buzz_dev() {
-    assert_eq!(cli_link_name(true), "buzz-dev");
+fn cli_link_name_dev_is_cf_dev() {
+    assert_eq!(cli_link_name(true), "cf-dev");
 }
 
 #[cfg(unix)]
@@ -345,16 +320,13 @@ fn ensure_cli_symlink_creates_symlink_prod() {
     let tmp = tempfile::tempdir().unwrap();
     let exe_parent = tmp.path().join("MacOS");
     fs::create_dir(&exe_parent).unwrap();
-    fs::write(exe_parent.join("buzz"), "binary").unwrap();
+    fs::write(exe_parent.join("cf"), "binary").unwrap();
 
     let local_bin = tmp.path().join("local_bin");
-    fs::create_dir_all(&local_bin).unwrap();
-
-    // Prod link name is "buzz"; simulate the symlink creation path.
+    ensure_cli_symlink_at(&exe_parent, &local_bin, false).unwrap();
     let link = local_bin.join(cli_link_name(false));
-    std::os::unix::fs::symlink(exe_parent.join("buzz"), &link).unwrap();
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-    assert_eq!(fs::read_link(&link).unwrap(), exe_parent.join("buzz"));
+    assert_eq!(fs::read_link(&link).unwrap(), exe_parent.join("cf"));
 }
 
 #[cfg(unix)]
@@ -363,32 +335,32 @@ fn ensure_cli_symlink_creates_symlink_dev() {
     let tmp = tempfile::tempdir().unwrap();
     let exe_parent = tmp.path().join("MacOS");
     fs::create_dir(&exe_parent).unwrap();
-    fs::write(exe_parent.join("buzz"), "binary").unwrap();
+    fs::write(exe_parent.join("cf"), "binary").unwrap();
 
     let local_bin = tmp.path().join("local_bin");
-    fs::create_dir_all(&local_bin).unwrap();
-
-    // Dev link must be "buzz-dev", never "buzz".
-    assert_eq!(cli_link_name(true), "buzz-dev");
-
+    ensure_cli_symlink_at(&exe_parent, &local_bin, true).unwrap();
+    assert_eq!(cli_link_name(true), "cf-dev");
     let link = local_bin.join(cli_link_name(true));
-    std::os::unix::fs::symlink(exe_parent.join("buzz"), &link).unwrap();
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-    assert_eq!(fs::read_link(&link).unwrap(), exe_parent.join("buzz"));
+    assert_eq!(fs::read_link(&link).unwrap(), exe_parent.join("cf"));
     // Prod link must not exist — the two builds don't touch each other.
-    assert!(!local_bin.join("buzz").exists());
+    assert!(!local_bin.join("cf").exists());
 }
 
 #[cfg(unix)]
 #[test]
 fn ensure_cli_symlink_does_not_clobber_regular_file_prod() {
     let tmp = tempfile::tempdir().unwrap();
+    let exe_parent = tmp.path().join("MacOS");
+    fs::create_dir(&exe_parent).unwrap();
+    fs::write(exe_parent.join("cf"), "binary").unwrap();
     let local_bin = tmp.path().join("local_bin");
     fs::create_dir_all(&local_bin).unwrap();
     let link = local_bin.join(cli_link_name(false));
     fs::write(&link, "user-installed binary").unwrap();
 
-    // Regular files are preserved — the Ok(_) branch skips them.
+    let result = ensure_cli_symlink_at(&exe_parent, &local_bin, false);
+    assert!(result.is_err());
     assert!(link.symlink_metadata().unwrap().file_type().is_file());
     assert_eq!(fs::read_to_string(&link).unwrap(), "user-installed binary");
 }
@@ -397,16 +369,69 @@ fn ensure_cli_symlink_does_not_clobber_regular_file_prod() {
 #[test]
 fn ensure_cli_symlink_does_not_clobber_regular_file_dev() {
     let tmp = tempfile::tempdir().unwrap();
+    let exe_parent = tmp.path().join("MacOS");
+    fs::create_dir(&exe_parent).unwrap();
+    fs::write(exe_parent.join("cf"), "binary").unwrap();
     let local_bin = tmp.path().join("local_bin");
     fs::create_dir_all(&local_bin).unwrap();
     let link = local_bin.join(cli_link_name(true));
-    fs::write(&link, "user-installed buzz-dev binary").unwrap();
+    fs::write(&link, "user-installed cf-dev binary").unwrap();
 
-    // Regular files at the dev path are also preserved.
+    let result = ensure_cli_symlink_at(&exe_parent, &local_bin, true);
+    assert!(result.is_err());
     assert!(link.symlink_metadata().unwrap().file_type().is_file());
     assert_eq!(
         fs::read_to_string(&link).unwrap(),
-        "user-installed buzz-dev binary"
+        "user-installed cf-dev binary"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_cli_symlink_removes_only_owned_legacy_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exe_parent = tmp.path().join("MacOS");
+    fs::create_dir(&exe_parent).unwrap();
+    fs::write(exe_parent.join("cf"), "binary").unwrap();
+
+    let local_bin = tmp.path().join("local_bin");
+    fs::create_dir_all(&local_bin).unwrap();
+    let owned = local_bin.join("buzz");
+    let unrelated = local_bin.join("buzz-dev");
+    std::os::unix::fs::symlink(exe_parent.join("buzz"), &owned).unwrap();
+    std::os::unix::fs::symlink("/opt/other/buzz", &unrelated).unwrap();
+
+    ensure_cli_symlink_at(&exe_parent, &local_bin, false).unwrap();
+
+    assert!(owned.symlink_metadata().is_err());
+    assert_eq!(
+        fs::read_link(&unrelated).unwrap(),
+        std::path::PathBuf::from("/opt/other/buzz")
+    );
+    assert_eq!(
+        fs::read_link(local_bin.join("cf")).unwrap(),
+        exe_parent.join("cf")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_cli_symlink_preserves_unrelated_cf_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exe_parent = tmp.path().join("MacOS");
+    fs::create_dir(&exe_parent).unwrap();
+    fs::write(exe_parent.join("cf"), "binary").unwrap();
+
+    let local_bin = tmp.path().join("local_bin");
+    fs::create_dir_all(&local_bin).unwrap();
+    let link = local_bin.join("cf");
+    std::os::unix::fs::symlink("/opt/cloud-foundry/cf", &link).unwrap();
+
+    let result = ensure_cli_symlink_at(&exe_parent, &local_bin, false);
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("/opt/cloud-foundry/cf")
     );
 }
 
@@ -828,7 +853,8 @@ fn refresh_skill_md_writes_version_file() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
-    let version = fs::read_to_string(root.join(".agents/skills/buzz-cli/.skill-version")).unwrap();
+    let version =
+        fs::read_to_string(root.join(".agents/skills/carryforth-cli/.skill-version")).unwrap();
     assert_eq!(version.trim(), NEST_SKILL_VERSION.to_string());
 }
 
@@ -893,17 +919,17 @@ fn refresh_skill_overwrites_on_version_bump() {
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
 
-    let skill_md = root.join(".agents/skills/buzz-cli/SKILL.md");
+    let skill_md = root.join(".agents/skills/carryforth-cli/SKILL.md");
     fs::write(&skill_md, "stale skill content").unwrap();
 
     // Remove version file to simulate upgrade.
-    let _ = fs::remove_file(root.join(".agents/skills/buzz-cli/.skill-version"));
+    let _ = fs::remove_file(root.join(".agents/skills/carryforth-cli/.skill-version"));
 
     ensure_nest_at(&root).unwrap();
 
     let content = fs::read_to_string(&skill_md).unwrap();
     assert_eq!(
-        content, BUZZ_CLI_SKILL_MD,
+        content, CARRYFORTH_CLI_SKILL_MD,
         "SKILL.md must be refreshed on version bump"
     );
 }

@@ -80,9 +80,9 @@ require_literal "ProjectDocumentCommand::Enable" crates/buzz-admin/src/project_d
 require_literal "ProjectDocumentCommand::Disable" crates/buzz-admin/src/project_document.rs
 require_literal "for_v3_cutover: bool" crates/buzz-admin/src/project_document.rs
 require_literal "Project View schema-2 Document input is migration-only; pass --for-v3-cutover" crates/buzz-admin/src/project_document.rs
-require_literal "enum DocumentsCmd" crates/buzz-cli/src/lib.rs
-require_literal "Cmd::Documents" crates/buzz-cli/src/lib.rs
-require_literal "Project Documents are not a Secret Store" crates/buzz-cli/src/commands/documents.rs
+require_literal "enum DocumentsCmd" crates/carryforth-cli/src/lib.rs
+require_literal "Cmd::Documents" crates/carryforth-cli/src/lib.rs
+require_literal "Project Documents are not a Secret Store" crates/carryforth-cli/src/commands/documents.rs
 require_literal "buzz-project-document-v1" crates/buzz-relay/src/nip11.rs
 require_literal "Synthetic Secret incident drill" scripts/test-project-document-e2e.sh
 require_literal "PROJECT_DOCUMENT_STAGE7_RECOVERY" scripts/test-project-document-e2e.sh
@@ -93,7 +93,7 @@ require_literal "project-document-capacity-fixture.sql" scripts/test-project-doc
 require_literal "PROJECT_DOCUMENT_E2E_SCRATCH_DATABASE=1" scripts/test-project-document-e2e.sh
 require_literal '[[ "${owner_pubkey}" != "${relay_signer_pubkey}" ]]' scripts/test-project-document-e2e.sh
 require_literal "buzz_project_view_admin prepare-v3" scripts/test-project-document-e2e.sh
-require_literal "buzz_owner_cli --format compact project-view init-v3" scripts/test-project-document-e2e.sh
+require_literal "cf_owner_cli --format compact project-view init-v3" scripts/test-project-document-e2e.sh
 require_literal "buzz_project_view_admin enable --community" scripts/test-project-document-e2e.sh
 require_literal "buzz-project-view-v3-bootstrap" scripts/test-project-document-e2e.sh
 require_literal "project_view_schema_version == 3" scripts/test-project-document-e2e.sh

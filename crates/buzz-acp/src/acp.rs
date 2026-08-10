@@ -564,7 +564,20 @@ impl AcpClient {
             .env_remove(crate::runtime_supervisor::SUPERVISION_STATE_PATH_ENV)
             .env_remove(crate::runtime_supervisor::RUNTIME_FENCE_PATH_ENV)
             .env_remove("BUZZ_RUNTIME_ID")
-            .env_remove("BUZZ_RUNTIME_EPOCH");
+            .env_remove("BUZZ_RUNTIME_EPOCH")
+            // Desktop still uses these names to configure the ACP harness.
+            // They are retired from the model-facing CLI contract and must not
+            // leak into an Agent process or any provider-owned shell child.
+            .env_remove(crate::RETIRED_BUZZ_RELAY_URL_ENV)
+            .env_remove(crate::RETIRED_BUZZ_PRIVATE_KEY_ENV)
+            .env_remove(crate::RETIRED_BUZZ_AUTH_TAG_ENV)
+            // Start from a clean public CLI environment. Harness-owned values
+            // from extra_env are applied below; a parent shell must not select
+            // a different Relay or identity, and an absent auth tag must stay
+            // absent instead of inheriting a stale value.
+            .env_remove(crate::CARRYFORTH_RELAY_URL_ENV)
+            .env_remove(crate::CARRYFORTH_PRIVATE_KEY_ENV)
+            .env_remove(crate::CARRYFORTH_AUTH_TAG_ENV);
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
@@ -600,15 +613,23 @@ impl AcpClient {
                 // ACP children must use the dynamic fence file exclusively.
                 continue;
             }
+            if crate::is_retired_buzz_cli_env(key) {
+                // Old public CLI variables remain blocked even if a stale
+                // persona or embedding attempts to add them back after the
+                // inherited environment was cleared above.
+                continue;
+            }
             if matches!(
                 key.as_str(),
                 MANAGED_AGENT_OWNER_ENV
                     | MANAGED_RUNTIME_MODE_ENV
                     | crate::runtime_supervisor::RUNTIME_FENCE_PATH_ENV
-            ) {
+            ) || crate::is_carryforth_cli_env(key)
+            {
                 // These are harness-owned security and fencing values. A
                 // parent-shell value must neither downgrade managed mode nor
-                // redirect the Agent to a different fence file.
+                // redirect the Agent to a different fence file or CLI
+                // identity.
                 cmd.env(key, value);
                 continue;
             }
@@ -619,6 +640,23 @@ impl AcpClient {
         if let Some(merged) = codex_config_value {
             cmd.env("CODEX_CONFIG", merged);
         }
+        let carryforth_relay_present = extra_env
+            .iter()
+            .any(|(name, _)| name == crate::CARRYFORTH_RELAY_URL_ENV);
+        let carryforth_key_present = extra_env
+            .iter()
+            .any(|(name, _)| name == crate::CARRYFORTH_PRIVATE_KEY_ENV);
+        let carryforth_auth_tag_present = extra_env
+            .iter()
+            .any(|(name, _)| name == crate::CARRYFORTH_AUTH_TAG_ENV);
+        tracing::debug!(
+            managed_cli_env_ready = carryforth_relay_present && carryforth_key_present,
+            relay_url_present = carryforth_relay_present,
+            private_key_present = carryforth_key_present,
+            auth_tag_present = carryforth_auth_tag_present,
+            legacy_cli_env_removed = true,
+            "managed Agent CLI environment prepared"
+        );
         let child_registry_token = uuid::Uuid::new_v4().simple().to_string();
         cmd.env(
             crate::child_registry::CHILD_REGISTRY_TOKEN_ENV,
@@ -2755,11 +2793,11 @@ mod tests {
             args: vec![],
             env: vec![
                 EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
+                    name: "CARRYFORTH_RELAY_URL".into(),
                     value: "ws://localhost:3000".into(),
                 },
                 EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
+                    name: "CARRYFORTH_PRIVATE_KEY".into(),
                     value: "nsec1abc".into(),
                 },
             ],
@@ -2776,7 +2814,7 @@ mod tests {
         assert_eq!(serialized["env"].as_array().unwrap().len(), 2);
         assert_eq!(
             serialized["env"][0]["name"].as_str(),
-            Some("BUZZ_RELAY_URL")
+            Some("CARRYFORTH_RELAY_URL")
         );
     }
 
@@ -3174,6 +3212,88 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    #[tokio::test]
+    async fn spawn_exposes_only_the_harness_owned_carryforth_cli_contract() {
+        let script = r#"
+            read -t 2 _REQ
+            status=env-ok
+            [ "${CARRYFORTH_RELAY_URL-}" = "ws://localhost:3000" ] || status=env-bad
+            [ "${CARRYFORTH_PRIVATE_KEY-}" = "managed-key" ] || status=env-bad
+            [ "${CARRYFORTH_AUTH_TAG-}" = "managed-auth" ] || status=env-bad
+            [ -z "${BUZZ_RELAY_URL+x}" ] || status=env-bad
+            [ -z "${BUZZ_PRIVATE_KEY+x}" ] || status=env-bad
+            [ -z "${BUZZ_AUTH_TAG+x}" ] || status=env-bad
+            printf '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"%s"}}}\n' "$status"
+            sleep 1
+        "#;
+        let extra_env = vec![
+            (
+                crate::CARRYFORTH_RELAY_URL_ENV.to_owned(),
+                "ws://localhost:3000".to_owned(),
+            ),
+            (
+                crate::CARRYFORTH_PRIVATE_KEY_ENV.to_owned(),
+                "managed-key".to_owned(),
+            ),
+            (
+                crate::CARRYFORTH_AUTH_TAG_ENV.to_owned(),
+                "managed-auth".to_owned(),
+            ),
+            (
+                crate::RETIRED_BUZZ_RELAY_URL_ENV.to_owned(),
+                "ws://retired.example".to_owned(),
+            ),
+            (
+                crate::RETIRED_BUZZ_PRIVATE_KEY_ENV.to_owned(),
+                "retired-key".to_owned(),
+            ),
+            (
+                crate::RETIRED_BUZZ_AUTH_TAG_ENV.to_owned(),
+                "retired-auth".to_owned(),
+            ),
+        ];
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &extra_env, false)
+            .await
+            .expect("spawn env probe");
+
+        let initialized = client.initialize().await.expect("initialize env probe");
+        assert_eq!(initialized["agentInfo"]["name"].as_str(), Some("env-ok"));
+        assert!(client.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn spawn_does_not_inherit_a_missing_carryforth_auth_tag() {
+        let script = r#"
+            read -t 2 _REQ
+            if [ -z "${CARRYFORTH_AUTH_TAG+x}" ]; then status=auth-absent; else status=auth-leaked; fi
+            printf '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"%s"}}}\n' "$status"
+            sleep 1
+        "#;
+        let extra_env = vec![
+            (
+                crate::CARRYFORTH_RELAY_URL_ENV.to_owned(),
+                "ws://localhost:3000".to_owned(),
+            ),
+            (
+                crate::CARRYFORTH_PRIVATE_KEY_ENV.to_owned(),
+                "managed-key".to_owned(),
+            ),
+        ];
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &extra_env, false)
+            .await
+            .expect("spawn auth-tag absence probe");
+
+        let initialized = client
+            .initialize()
+            .await
+            .expect("initialize auth-tag absence probe");
+        assert_eq!(
+            initialized["agentInfo"]["name"].as_str(),
+            Some("auth-absent")
+        );
+        assert!(client.shutdown().await);
     }
 
     #[tokio::test]

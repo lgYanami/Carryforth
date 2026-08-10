@@ -171,28 +171,28 @@ wait_for_current_runtime_status() {
   fail "Runtime ${runtime_id}:${runtime_epoch} did not become the only expected current lease"
 }
 
-buzz_as() {
+cf_as() {
   local private_key="$1"
   shift
   env \
-    BUZZ_RELAY_URL="http://${test_host}" \
-    BUZZ_PRIVATE_KEY="${private_key}" \
-    "${bin_dir}/buzz" "$@"
+    CARRYFORTH_RELAY_URL="http://${test_host}" \
+    CARRYFORTH_PRIVATE_KEY="${private_key}" \
+    "${bin_dir}/cf" "$@"
 }
 
-buzz_managed() {
+cf_managed() {
   local fence_path="$1"
   shift
   env \
-    BUZZ_RELAY_URL="http://${test_host}" \
-    BUZZ_PRIVATE_KEY="${agent_private_key}" \
+    CARRYFORTH_RELAY_URL="http://${test_host}" \
+    CARRYFORTH_PRIVATE_KEY="${agent_private_key}" \
     BUZZ_MANAGED_RUNTIME=1 \
     BUZZ_RUNTIME_FENCE_PATH="${fence_path}" \
-    "${bin_dir}/buzz" "$@"
+    "${bin_dir}/cf" "$@"
 }
 
 project_revision() {
-  buzz_as "${owner_private_key}" --format compact project-view get \
+  cf_as "${owner_private_key}" --format compact project-view get \
     | jq -er '.project_revision'
 }
 
@@ -304,12 +304,12 @@ psql_query "
 
 if [[ "${PROJECT_VIEW_STAGE6_NO_BUILD:-0}" != "1" ]]; then
   if [[ "${profile}" == "dev" ]]; then
-    cargo build -p buzz-relay -p buzz-cli -p buzz-admin -p buzz-acp
+    cargo build -p buzz-relay -p carryforth-cli -p buzz-admin -p buzz-acp
   else
-    cargo build --profile "${profile}" -p buzz-relay -p buzz-cli -p buzz-admin -p buzz-acp
+    cargo build --profile "${profile}" -p buzz-relay -p carryforth-cli -p buzz-admin -p buzz-acp
   fi
 fi
-for binary in buzz-relay buzz buzz-admin buzz-acp; do
+for binary in buzz-relay cf buzz-admin buzz-acp; do
   [[ -x "${bin_dir}/${binary}" ]] || fail "missing executable ${bin_dir}/${binary}"
 done
 
@@ -400,7 +400,7 @@ jq -n \
       }]
     }
   }' >"${initialize_file}"
-buzz_as "${owner_private_key}" --format compact project-view init-v3 \
+cf_as "${owner_private_key}" --format compact project-view init-v3 \
   --command "${initialize_file}" >"${artifact_dir}/project-view-init-v3.json"
 pv_admin enable --community "${test_host}" >"${artifact_dir}/project-view-enable-v3.json"
 info_for | tee "${artifact_dir}/info-project-view-v3.json" \
@@ -430,7 +430,7 @@ env DATABASE_URL="${database_url}" BUZZ_RELAY_PRIVATE_KEY="${relay_private_key}"
 guide_body="${temporary_dir}/resource-guide.md"
 printf '%s\n' '# Stage 6 Resource Guide' '' \
   'STAGE6_GUIDE_BODY_MUST_REQUIRE_EXPLICIT_FETCH' >"${guide_body}"
-buzz_as "${owner_private_key}" --format compact documents create \
+cf_as "${owner_private_key}" --format compact documents create \
   --document-id "${guide_id}" --title "Stage 6 Resource Guide" \
   --summary "Mandatory Guide for the isolated Resource" \
   --content-file "${guide_body}" >"${artifact_dir}/guide-create.json"
@@ -443,7 +443,7 @@ jq -n --arg guide "${guide_id}" '{
   guide_document_id: $guide,
   context_references: []
 }' >"${resource_file}"
-buzz_as "${owner_private_key}" --format compact project-view create resource \
+cf_as "${owner_private_key}" --format compact project-view create resource \
   --expected-project-revision "$(project_revision)" --id "${resource_id}" \
   --data "${resource_file}" >"${artifact_dir}/resource-create-v3.json"
 
@@ -456,16 +456,16 @@ jq -n '{
   active: true,
   context_references: []
 }' >"${role_file}"
-buzz_as "${owner_private_key}" --format compact project-view create role \
+cf_as "${owner_private_key}" --format compact project-view create role \
   --expected-project-revision "$(project_revision)" --id "${role_id}" \
   --role-level member --data "${role_file}" >"${artifact_dir}/role-create-v3.json"
 
-buzz_as "${owner_private_key}" --format compact roles offer \
+cf_as "${owner_private_key}" --format compact roles offer \
   --role "${role_id}" --member "${agent_pubkey}" \
   --expected-project-revision "$(project_revision)" \
   --reason "Assign the isolated Stage 6 Context Role" \
   >"${artifact_dir}/role-offer-v3.json"
-agent_proposals="$(buzz_as "${agent_private_key}" --format compact roles proposals \
+agent_proposals="$(cf_as "${agent_private_key}" --format compact roles proposals \
   --status open --limit 20 | tee "${artifact_dir}/agent-open-proposals-v3.json")"
 proposal_id="$(jq -er --arg role "${role_id}" --arg member "${agent_pubkey}" '
   [.proposals[]
@@ -474,7 +474,7 @@ proposal_id="$(jq -er --arg role "${role_id}" --arg member "${agent_pubkey}" '
   | if length == 1 then .[0].proposal_id else error("expected one open Stage 6 proposal") end
 ' <<<"${agent_proposals}")"
 proposal_revision="$(jq -er '.project_revision' <<<"${agent_proposals}")"
-buzz_as "${agent_private_key}" --format compact roles proposal accept "${proposal_id}" \
+cf_as "${agent_private_key}" --format compact roles proposal accept "${proposal_id}" \
   --expected-project-revision "${proposal_revision}" \
   >"${artifact_dir}/role-accept-v3.json"
 assignment_id="$(psql_query "
@@ -505,7 +505,7 @@ jq -e '
   and .advertised_ready == false
 ' <<<"${before_status}" >/dev/null
 set +e
-buzz_as "${owner_private_key}" project-view context add "${role_id}" \
+cf_as "${owner_private_key}" project-view context add "${role_id}" \
   --resource "${resource_id}" >"${artifact_dir}/context-add-disabled.stdout" \
   2>"${artifact_dir}/context-add-disabled.stderr"
 disabled_add_status=$?
@@ -533,7 +533,7 @@ echo "[3/6] Exercising managed-Agent Runtime and Assignment fences"
 document_body_v1="${temporary_dir}/supplemental-v1.md"
 printf '%s\n' '# Explicit Stage 6 task input' '' \
   'STAGE6_DOCUMENT_BODY_MUST_REQUIRE_EXPLICIT_FETCH_V1' >"${document_body_v1}"
-buzz_as "${owner_private_key}" --format compact documents create \
+cf_as "${owner_private_key}" --format compact documents create \
   --document-id "${supplemental_document_id}" \
   --title "Stage 6 current runbook" --summary "Explicit local task context" \
   --content-file "${document_body_v1}" >"${artifact_dir}/supplemental-create.json"
@@ -546,7 +546,7 @@ first_runtime_id="${current_runtime_id}"
 first_runtime_epoch="${current_runtime_epoch}"
 wait_for_current_runtime_status "${first_runtime_id}" "${first_runtime_epoch}" "" \
   "${artifact_dir}/runtime-status-generation-1.json"
-buzz_managed "${current_fence_path}" --format compact project-view context add \
+cf_managed "${current_fence_path}" --format compact project-view context add \
   "${role_id}" --resource "${resource_id}" >"${artifact_dir}/context-add-resource.json"
 
 stop_acp
@@ -558,14 +558,14 @@ wait_for_current_runtime_status "${second_runtime_id}" "${second_runtime_epoch}"
 # Context is governed by Community/Role authority, not by the operational
 # supervisor lease. The current fence stays in the harness environment, but
 # Context mutation authorization depends on the active Assignment below.
-buzz_managed "${current_fence_path}" --format compact project-view context add \
+cf_managed "${current_fence_path}" --format compact project-view context add \
   "${role_id}" --document "${supplemental_document_id}" \
   >"${artifact_dir}/context-add-live.json"
-buzz_managed "${current_fence_path}" --format compact project-view context add \
+cf_managed "${current_fence_path}" --format compact project-view context add \
   "${role_id}" --document "${supplemental_document_id}" --revision 1 \
   >"${artifact_dir}/context-add-pinned.json"
 
-context_before_assignment_change="$(buzz_managed "${current_fence_path}" --format compact \
+context_before_assignment_change="$(cf_managed "${current_fence_path}" --format compact \
   project-view context list "${role_id}" \
   | tee "${artifact_dir}/context-before-assignment-change.json")"
 jq -e --arg resource "${resource_id}" --arg document "${supplemental_document_id}" '
@@ -576,7 +576,7 @@ jq -e --arg resource "${resource_id}" --arg document "${supplemental_document_id
 ' <<<"${context_before_assignment_change}" >/dev/null
 
 echo "[4/6] Verifying Role closure, body-free metadata, and explicit Guide fetch"
-brief_v1="$(buzz_managed "${current_fence_path}" --format compact roles brief \
+brief_v1="$(cf_managed "${current_fence_path}" --format compact roles brief \
   | tee "${artifact_dir}/role-brief-context-v1.json")"
 jq -e --arg resource "${resource_id}" --arg guide "${guide_id}" \
   --arg document "${supplemental_document_id}" '
@@ -590,7 +590,7 @@ jq -e --arg resource "${resource_id}" --arg guide "${guide_id}" \
   and ((tostring | contains("STAGE6_DOCUMENT_BODY_MUST_REQUIRE_EXPLICIT_FETCH")) | not)
 ' <<<"${brief_v1}" >/dev/null
 
-buzz_managed "${current_fence_path}" resources guide "${resource_id}" --content-only \
+cf_managed "${current_fence_path}" resources guide "${resource_id}" --content-only \
   >"${artifact_dir}/agent-explicit-guide.md"
 cmp "${guide_body}" "${artifact_dir}/agent-explicit-guide.md"
 ! rg -q "STAGE6_DOCUMENT_BODY_MUST_REQUIRE_EXPLICIT_FETCH" \
@@ -600,14 +600,14 @@ pv_revision_before_document_edit="$(project_revision)"
 document_body_v2="${temporary_dir}/supplemental-v2.md"
 printf '%s\n' '# Updated explicit Stage 6 task input' '' \
   'STAGE6_DOCUMENT_BODY_MUST_REQUIRE_EXPLICIT_FETCH_V2' >"${document_body_v2}"
-buzz_as "${owner_private_key}" --format compact documents update \
+cf_as "${owner_private_key}" --format compact documents update \
   "${supplemental_document_id}" --expected-revision 1 \
   --title "Updated Stage 6 current runbook" --summary "Updated explicit local task context" \
   --content-file "${document_body_v2}" >"${artifact_dir}/supplemental-update.json"
 pv_revision_after_document_edit="$(project_revision)"
 [[ "${pv_revision_before_document_edit}" == "${pv_revision_after_document_edit}" ]] \
   || fail "Document edit advanced the Project View revision"
-brief_v2="$(buzz_managed "${current_fence_path}" --format compact roles brief \
+brief_v2="$(cf_managed "${current_fence_path}" --format compact roles brief \
   | tee "${artifact_dir}/role-brief-context-v2.json")"
 jq -e --arg document "${supplemental_document_id}" '
   any(.context.live_documents[]; .document_id == $document and .document_revision == 2 and .title == "Updated Stage 6 current runbook")
@@ -616,7 +616,7 @@ jq -e --arg document "${supplemental_document_id}" '
 ' <<<"${brief_v2}" >/dev/null
 
 set +e
-buzz_as "${owner_private_key}" documents delete "${supplemental_document_id}" \
+cf_as "${owner_private_key}" documents delete "${supplemental_document_id}" \
   --expected-revision 2 >"${artifact_dir}/live-delete-protected.stdout" \
   2>"${artifact_dir}/live-delete-protected.stderr"
 live_delete_status=$?
@@ -631,7 +631,7 @@ pv_admin context disable --community "${test_host}" \
   >"${artifact_dir}/context-disable.json"
 info_for | tee "${artifact_dir}/info-context-disabled.json" \
   | jq -e '((.supported_extensions // []) | index("buzz-project-context-v1")) == null' >/dev/null
-disabled_brief="$(buzz_as "${agent_private_key}" --format compact roles brief \
+disabled_brief="$(cf_as "${agent_private_key}" --format compact roles brief \
   | tee "${artifact_dir}/role-brief-context-disabled.json")"
 jq -e '
   .context.availability.state == "unavailable_preserved"
@@ -640,12 +640,12 @@ jq -e '
   and (.context.pinned_documents | length) == 0
   and .source_revisions.document_metadata.state == "not_required"
 ' <<<"${disabled_brief}" >/dev/null
-disabled_list="$(buzz_as "${agent_private_key}" --format compact project-view context list \
+disabled_list="$(cf_as "${agent_private_key}" --format compact project-view context list \
   "${role_id}" | tee "${artifact_dir}/context-disabled-preserved.json")"
 jq -e '(.context_references | length) == 3 and .context_capability == false' \
   <<<"${disabled_list}" >/dev/null
 set +e
-buzz_as "${owner_private_key}" project-view context add "${role_id}" \
+cf_as "${owner_private_key}" project-view context add "${role_id}" \
   --document "${guide_id}" >"${artifact_dir}/disabled-retarget.stdout" \
   2>"${artifact_dir}/disabled-retarget.stderr"
 disabled_retarget_status=$?
@@ -653,7 +653,7 @@ set -e
 [[ "${disabled_retarget_status}" != "0" ]] || fail "disabled Context accepted a new target"
 rg -q "unavailable:project_view:context_capability" \
   "${artifact_dir}/disabled-retarget.stderr"
-buzz_as "${owner_private_key}" --format compact project-view context remove \
+cf_as "${owner_private_key}" --format compact project-view context remove \
   "${role_id}" --document "${supplemental_document_id}" \
   >"${artifact_dir}/disabled-remove-live.json"
 
@@ -666,7 +666,7 @@ jq -e '
   .context_enabled == true and .advertised_ready == true
   and .resource_reference_count == 1 and .document_reference_count == 1
 ' <<<"${context_status_final}" >/dev/null
-reenabled_brief="$(buzz_managed "${current_fence_path}" --format compact roles brief \
+reenabled_brief="$(cf_managed "${current_fence_path}" --format compact roles brief \
   | tee "${artifact_dir}/role-brief-context-reenabled.json")"
 jq -e --arg document "${supplemental_document_id}" '
   .context.availability.state == "ready"
@@ -675,20 +675,20 @@ jq -e --arg document "${supplemental_document_id}" '
 ' <<<"${reenabled_brief}" >/dev/null
 
 echo "[6/6] Verifying delete protection, pinned history, and normalized cleanup"
-buzz_as "${owner_private_key}" --format compact documents delete \
+cf_as "${owner_private_key}" --format compact documents delete \
   "${supplemental_document_id}" --expected-revision 2 \
   >"${artifact_dir}/pinned-document-delete.json"
-buzz_as "${agent_private_key}" documents get "${supplemental_document_id}" \
+cf_as "${agent_private_key}" documents get "${supplemental_document_id}" \
   --revision 1 --content-only >"${artifact_dir}/pinned-document-v1.md"
 cmp "${document_body_v1}" "${artifact_dir}/pinned-document-v1.md"
-buzz_as "${agent_private_key}" --format compact project-view context list "${role_id}" \
+cf_as "${agent_private_key}" --format compact project-view context list "${role_id}" \
   >"${artifact_dir}/context-after-document-delete.json"
 jq -e --arg document "${supplemental_document_id}" '
   any(.context_references[]; .type == "document" and .document_id == $document and .mode == "pinned" and .document_revision == 1)
 ' "${artifact_dir}/context-after-document-delete.json" >/dev/null
 
 set +e
-buzz_as "${owner_private_key}" documents delete "${guide_id}" --expected-revision 1 \
+cf_as "${owner_private_key}" documents delete "${guide_id}" --expected-revision 1 \
   >"${artifact_dir}/guide-delete-protected.stdout" \
   2>"${artifact_dir}/guide-delete-protected.stderr"
 guide_delete_status=$?
@@ -697,11 +697,11 @@ set -e
 rg -qi "guide|referenc|conflict|protected" \
   "${artifact_dir}/guide-delete-protected.stdout" "${artifact_dir}/guide-delete-protected.stderr"
 
-resource_revision="$(buzz_as "${owner_private_key}" \
+resource_revision="$(cf_as "${owner_private_key}" \
   project-view get-object resource "${resource_id}" | jq -er '.object.object_revision')"
 revision="$(project_revision)"
 set +e
-buzz_as "${owner_private_key}" project-view delete resource "${resource_id}" \
+cf_as "${owner_private_key}" project-view delete resource "${resource_id}" \
   --expected-project-revision "${revision}" >"${artifact_dir}/resource-delete-protected.stdout" \
   2>"${artifact_dir}/resource-delete-protected.stderr"
 resource_delete_status=$?
@@ -710,12 +710,12 @@ set -e
 rg -qi "referenc|conflict|protected" \
   "${artifact_dir}/resource-delete-protected.stdout" "${artifact_dir}/resource-delete-protected.stderr"
 
-buzz_as "${owner_private_key}" --format compact project-view context remove \
+cf_as "${owner_private_key}" --format compact project-view context remove \
   "${role_id}" --resource "${resource_id}" >"${artifact_dir}/context-remove-resource.json"
-buzz_as "${owner_private_key}" --format compact project-view context remove \
+cf_as "${owner_private_key}" --format compact project-view context remove \
   "${role_id}" --document "${supplemental_document_id}" --revision 1 \
   >"${artifact_dir}/context-remove-pinned.json"
-final_context="$(buzz_as "${owner_private_key}" --format compact project-view context list \
+final_context="$(cf_as "${owner_private_key}" --format compact project-view context list \
   "${role_id}" | tee "${artifact_dir}/context-final-empty.json")"
 jq -e '.context_capability == true and (.context_references | length) == 0' \
   <<<"${final_context}" >/dev/null
@@ -750,7 +750,7 @@ env BUZZ_PRIVATE_KEY="${agent_private_key}" node \
   desktop/scripts/stage6-canary-sign-project-view-event.mjs \
   "${stale_assignment_command}" "${stale_assignment_event}"
 stop_acp
-buzz_as "${owner_private_key}" --format compact roles assignment end \
+cf_as "${owner_private_key}" --format compact roles assignment end \
   "${assignment_id}" --expected-project-revision "${revision}" \
   --reason "Stage 6 stale Assignment fence canary" \
   >"${artifact_dir}/old-assignment-end.json"
@@ -793,7 +793,7 @@ jq -n \
     execution: "real_local",
     fixture_origin: "greenfield_v3",
     project_view: {schema_version: 3, ordinary_runtime: "v3_only"},
-    services: ["PostgreSQL", "Redis", "Relay", "buzz-cli", "buzz-admin", "buzz-acp", "ACP child"],
+    services: ["PostgreSQL", "Redis", "Relay", "carryforth-cli", "buzz-admin", "buzz-acp", "ACP child"],
     context_control: {status: "passed", closure_protocol_version: 1, replay_first: true, audit_rows: 3},
     role_context: {
       status: "passed",

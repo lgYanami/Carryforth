@@ -2969,7 +2969,7 @@ pub fn build_meeting_v2_action_retry(
 
 /// Build an internal host `renew` command for a runnable Action window.
 ///
-/// This builder intentionally has no `buzz-cli` subcommand: a renewal is a
+/// This builder intentionally has no `carryforth-cli` subcommand: a renewal is a
 /// cooperative host-liveness signal, not a model-authored business action.
 pub fn build_meeting_v2_action_lease_renew(
     params: MeetingV2ActionLeaseRenewParams<'_>,
@@ -5977,7 +5977,7 @@ mod tests {
 
     #[test]
     fn git_patch_rejects_whitespace_only_content() {
-        // Regression: a failed `git format-patch | buzz patches send
+        // Regression: a failed `git format-patch | cf patches send
         // --patch-file -` must not silently publish a whitespace-only
         // (i.e. unappliable) patch.
         let repo = GitRepoCoord {

@@ -30,7 +30,7 @@ on:
       - "crates/buzz-acp/**"
       - "crates/buzz-agent/**"
       - "crates/buzz-dev-mcp/**"
-      - "crates/buzz-cli/**"
+      - "crates/carryforth-cli/**"
       - "crates/buzz-sdk/**"
       - "crates/buzz-project-view/**"
   workflow_dispatch:
@@ -152,7 +152,7 @@ jobs:
           set -euo pipefail
           TAG="sprig-latest"
           TITLE="Sprig (rolling)"
-          NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp + buzz CLI), tracking \`main\` (\`${SHA}\`)."
+          NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp + cf CLI), tracking \`main\` (\`${SHA}\`)."
 
           gh release edit "$TAG" \
             --prerelease \
@@ -195,5 +195,5 @@ jobs:
           set -euo pipefail
           gh release create "$TAG" \
             --title "Sprig v${VERSION}" \
-            --notes "Sprig v${VERSION} — Linux all-in-one builds of buzz-acp + buzz-agent + buzz-dev-mcp + buzz CLI." \
+            --notes "Sprig v${VERSION} — Linux all-in-one builds of buzz-acp + buzz-agent + buzz-dev-mcp + cf CLI." \
             dist/*

@@ -2,7 +2,7 @@
 # grab-emoji.sh — Register custom Slack emoji in Buzz
 #
 # Looks up each emoji name in your Slack workspace and registers it in Buzz
-# via `buzz emoji set`, making it available as :name: in the Buzz emoji picker.
+# via `cf emoji set`, making it available as :name: in the Buzz emoji picker.
 #
 # Usage:
 #   SLACK_TOKEN=xoxp-... ./scripts/grab-emoji.sh [--name <buzz-name>] <emoji-name> [emoji-name ...]
@@ -157,8 +157,8 @@ for emoji_name in "$@"; do
   }
 
   # Register in Buzz
-  set_output=$(buzz emoji set --shortcode "$buzz_shortcode" --url "$emoji_url" 2>&1) || {
-    echo "${emoji_name} → ERROR: buzz emoji set failed — ${set_output}"
+  set_output=$(cf emoji set --shortcode "$buzz_shortcode" --url "$emoji_url" 2>&1) || {
+    echo "${emoji_name} → ERROR: cf emoji set failed — ${set_output}"
     continue
   }
 

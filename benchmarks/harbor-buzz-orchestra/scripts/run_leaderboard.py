@@ -36,7 +36,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 AGENT_IMPORT = "harbor_buzz_orchestra:BuzzOrchestraAgent"
 PROVISIONER_FACTORY = "harbor_buzz_testbed:provisioner_from_dict"
 # Host-side: the harness speaks to the relay as the trial user via this CLI.
-BINARIES = ("buzz",)
+BINARIES = ("cf",)
 # Container-side: the production stack uploaded into each task container.
 # These must be Linux builds matching the task image architecture.
 AGENT_BINARIES = ("buzz-acp", "buzz-agent", "buzz-dev-mcp")
@@ -81,8 +81,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="JSON config for the Buzz relay/Postgres provisioner",
     )
     parser.add_argument(
-        "--buzz-bin-dir", type=Path, default=None,
-        help="Directory with the host buzz CLI (default: repo target/release, then target/debug)",
+        "--cf-bin-dir", type=Path, default=None,
+        help="Directory with the host cf CLI (default: repo target/release, then target/debug)",
     )
     parser.add_argument(
         "--agent-bin-dir", type=Path, required=True,
@@ -118,8 +118,8 @@ def find_binaries(bin_dir: Path | None) -> dict[str, Path]:
             return found
     searched = ", ".join(str(c) for c in candidates)
     raise SystemExit(
-        f"buzz binaries not found (need {', '.join(BINARIES)}; searched {searched}). "
-        "Build them with `cargo build` or pass --buzz-bin-dir."
+        f"Carryforth CLI not found (need {', '.join(BINARIES)}; searched {searched}). "
+        "Build it with `cargo build -p carryforth-cli` or pass --cf-bin-dir."
     )
 
 
@@ -172,7 +172,7 @@ def build_command(
         "buzz_acp_binary": agent_binaries["buzz-acp"],
         "buzz_agent_binary": agent_binaries["buzz-agent"],
         "buzz_dev_mcp_binary": agent_binaries["buzz-dev-mcp"],
-        "buzz_cli_binary": binaries["buzz"],
+        "cf_binary": binaries["cf"],
         "run_id": args.job_name,
     }
     if args.relay_gateway:

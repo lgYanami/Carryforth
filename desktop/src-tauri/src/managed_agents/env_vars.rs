@@ -5,7 +5,7 @@
 //! Precedence: desktop parent env < persona env < agent env (last wins on
 //! key collision). See `runtime::spawn_agent_child`.
 //!
-//! A small set of *reserved* keys — Buzz's identity and secrets — are
+//! A small set of *reserved* keys — Carryforth's identity and secrets — are
 //! rejected at save time and stripped at runtime so a typo or malicious
 //! value can't swap the agent's nsec. Behavior knobs (GOOSE_MODE, BUZZ_ACP_MODEL, BUZZ_ACP_SYSTEM_PROMPT, …) remain
 //! freely overridable — those have dedicated UI fields, but power users
@@ -43,7 +43,7 @@ pub(crate) fn is_derived_provider_model_key(key: &str) -> bool {
         .any(|k| k.eq_ignore_ascii_case(key))
 }
 
-/// Env var keys that Buzz sets itself and users must not override from
+/// Env var keys that Carryforth sets itself and users must not override from
 /// the persona/agent env_vars UI. Three categories:
 ///
 /// 1. **Identity / secrets** — overriding would swap the agent's nsec or
@@ -61,6 +61,8 @@ pub(crate) fn is_derived_provider_model_key(key: &str) -> bool {
 /// to bypass them.
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // Identity / secrets / server-issued runtime fences.
+    "CARRYFORTH_PRIVATE_KEY",
+    "CARRYFORTH_AUTH_TAG",
     "BUZZ_PRIVATE_KEY",
     "NOSTR_PRIVATE_KEY",
     "BUZZ_AUTH_TAG",
@@ -77,6 +79,7 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     MANAGED_AGENT_START_NONCE_ENV,
     // Relay URL: overriding would let a malicious config redirect the
     // agent to an attacker-controlled relay.
+    "CARRYFORTH_RELAY_URL",
     "BUZZ_RELAY_URL",
     // Code-execution surface: overriding would let the user run arbitrary
     // binaries/args as the agent process.

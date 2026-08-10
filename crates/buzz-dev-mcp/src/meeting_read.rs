@@ -1,6 +1,6 @@
 //! Bounded, read-only access to Relay-authoritative Meeting context.
 //!
-//! The tool deliberately maps a small enum to fixed `buzz` CLI arguments and
+//! The tool deliberately maps a small enum to fixed `cf` CLI arguments and
 //! starts the session shim directly. It never evaluates a shell command string
 //! and cannot reach write-capable Meeting subcommands.
 
@@ -76,13 +76,13 @@ enum WaitOutcome {
     Failed(String),
 }
 
-/// Execute one fixed Meeting read through the session-scoped Buzz CLI shim.
+/// Execute one fixed Meeting read through the session-scoped Carryforth CLI shim.
 pub async fn run(
     state: &SharedState,
     params: MeetingReadParams,
     cancellation: CancellationToken,
 ) -> Result<CallToolResult, ErrorData> {
-    let binary = state.shim.buzz_path();
+    let binary = state.shim.cf_path();
     run_with_binary(state, &binary, params, cancellation, COMMAND_TIMEOUT).await
 }
 
@@ -103,8 +103,8 @@ async fn run_with_binary(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // BUZZ_PRIVATE_KEY and BUZZ_RELAY_URL are intentionally inherited by the
-    // fixed Buzz CLI process. NOSTR_PRIVATE_KEY was removed during Shim setup.
+    // CARRYFORTH_PRIVATE_KEY and CARRYFORTH_RELAY_URL are intentionally inherited by the
+    // fixed Carryforth CLI process. NOSTR_PRIVATE_KEY was removed during Shim setup.
     for (key, value) in &state.shim.git_env {
         command.env(key, value);
     }
@@ -113,7 +113,9 @@ async fn run_with_binary(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return tool_error(format!("meeting_read failed to start Buzz CLI: {error}"));
+            return tool_error(format!(
+                "meeting_read failed to start Carryforth CLI: {error}"
+            ));
         }
     };
     let mut stdout_reader = spawn_reader(child.stdout.take(), MAX_STDOUT_BYTES);
@@ -144,7 +146,7 @@ async fn run_with_binary(
             timeout.as_secs_f64()
         )),
         WaitOutcome::Failed(error) => tool_error(format!(
-            "meeting_read failed while waiting for Buzz CLI: {error}"
+            "meeting_read failed while waiting for Carryforth CLI: {error}"
         )),
         WaitOutcome::Completed(status) => finish_completed(status, stdout, stderr),
     }
@@ -295,7 +297,7 @@ fn finish_completed(
             ""
         };
         return tool_error(format!(
-            "Buzz CLI exited with {}: {}{}",
+            "Carryforth CLI exited with {}: {}{}",
             status.code().unwrap_or(-1),
             diagnostic.trim(),
             suffix
@@ -494,7 +496,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempdir().expect("tempdir");
-        let binary = directory.path().join("fake-buzz");
+        let binary = directory.path().join("fake-cf");
         std::fs::write(&binary, script).expect("write fake binary");
         let mut permissions = std::fs::metadata(&binary)
             .expect("fake binary metadata")

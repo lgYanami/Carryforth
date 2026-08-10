@@ -13,7 +13,7 @@ import psycopg
 from harbor_buzz_orchestra.manifest import ExperimentManifest
 from harbor_buzz_orchestra.provisioning import AgentCredential, TrialHandle
 
-from .buzz_cli import BuzzCli
+from .cf_cli import CfCli
 from .keys import compute_auth_tag, generate_keypair, keypair_from_secret
 
 
@@ -220,8 +220,8 @@ class BuzzTrialProvisioner:
             llm_api_key="",
         )
 
-    def _cli_for(self, credential: AgentCredential) -> BuzzCli:
-        return BuzzCli(
+    def _cli_for(self, credential: AgentCredential) -> CfCli:
+        return CfCli(
             relay_url=self._config.relay_http_url,
             secret_key=credential.nostr_secret_key,
             auth_tag=credential.nostr_auth_tag,

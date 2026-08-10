@@ -70,7 +70,7 @@ export function ProjectViewV3SetupGuide({
                   Assignment, then signs and submits it with the Buzz CLI.
                 </p>
                 <code className="mt-3 block overflow-x-auto rounded-lg border border-border/70 bg-background px-3 py-2 text-xs">
-                  buzz project-view init-v3 --command
+                  cf project-view init-v3 --command
                   &lt;prepared-bootstrap.json&gt;
                 </code>
               </div>

@@ -14,7 +14,7 @@ import uuid
 
 import psycopg
 import pytest
-from harbor_buzz_testbed.buzz_cli import BuzzCli, BuzzCliError
+from harbor_buzz_testbed.cf_cli import CfCli, CfCliError
 from harbor_buzz_testbed.provisioner import (
     BuzzTrialProvisioner,
     ProvisioningError,
@@ -51,7 +51,7 @@ def provisioner() -> BuzzTrialProvisioner:
     )
 
 
-def cli_for(provisioner: BuzzTrialProvisioner, credential) -> BuzzCli:
+def cli_for(provisioner: BuzzTrialProvisioner, credential) -> CfCli:
     return provisioner._cli_for(credential)
 
 
@@ -94,7 +94,7 @@ def test_create_is_idempotent_and_isolated(provisioner, manifest):
             "messages", "get", "--channel", handle_a.channel_id, "--limit", "10"
         )
         assert foreign_read == [], "cross-trial read must return nothing"
-        with pytest.raises(BuzzCliError, match="private"):
+        with pytest.raises(CfCliError, match="private"):
             cli_b.run("channels", "join", "--channel", handle_a.channel_id)
 
         # Members can read their own channel.

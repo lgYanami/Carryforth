@@ -47,10 +47,10 @@ require_literal "/target/release/buzz-admin /usr/local/bin/buzz-admin" Dockerfil
 require_literal "- \"migrations/**\"" .github/workflows/docker.yml
 require_literal "- \"schema/**\"" .github/workflows/docker.yml
 
-# Managed agents receive the real `buzz` multicall entry and PRs exercise it.
-require_literal "COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp buzz)" scripts/build-sprig.sh
-require_literal "- \"crates/buzz-cli/**\"" .github/workflows/sprig.yml
-require_literal "target/ci/buzz" .github/workflows/ci.yml
+# Managed agents receive the real `cf` multicall entry and PRs exercise it.
+require_literal "COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp cf)" scripts/build-sprig.sh
+require_literal "- \"crates/carryforth-cli/**\"" .github/workflows/sprig.yml
+require_literal "target/ci/cf" .github/workflows/ci.yml
 require_literal "target/ci/buzz-admin" .github/workflows/ci.yml
 require_literal "--test e2e_project_view" .github/workflows/ci.yml
 require_literal "just test-migrations" .github/workflows/ci.yml
@@ -126,7 +126,7 @@ require_literal "forward-fix the current schema-v3 runtime" docs/project-view-op
 require_literal "BUZZ_AUTO_MIGRATE=false" docs/project-view-operations.md
 require_literal "buzz-project-view-v3-bootstrap" docs/project-view-operations.md
 require_literal "buzz-admin project-view prepare-v3" docs/project-view-operations.md
-require_literal "buzz --format compact project-view init-v3" docs/project-view-operations.md
+require_literal "cf --format compact project-view init-v3" docs/project-view-operations.md
 require_literal "test-project-view-legacy-v2-to-v3-migration-canary.sh" docs/project-view-operations.md
 require_literal "--for-v3-cutover" docs/project-view-operations.md
 

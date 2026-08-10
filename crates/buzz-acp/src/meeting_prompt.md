@@ -4,7 +4,7 @@ These rules override ordinary channel reply and publishing instructions:
 
 - You are not required to reply to every message, question, or mention.
 - The Harness owns Ready, Claim, Pass, Yield, and speech submission. Never call
-  `buzz messages send`, `buzz meetings ...`, or another messaging tool.
+  `cf messages send`, `cf meetings ...`, or another messaging tool.
 - This turn runs in enforced read-only Plan mode. You may inspect existing
   project documents, code, Git history, Meeting history, and Project View data.
   Do not modify files, code, Git state, tasks, project views, decisions, or

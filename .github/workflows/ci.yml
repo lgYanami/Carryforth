@@ -72,7 +72,7 @@ jobs:
               - 'crates/buzz-db/**'
               - 'crates/buzz-relay/**'
               - 'crates/buzz-sdk/**'
-              - 'crates/buzz-cli/**'
+              - 'crates/carryforth-cli/**'
               - 'crates/buzz-acp/**'
               - 'crates/buzz-admin/**'
               - 'crates/buzz-test-client/tests/e2e_project_view.rs'
@@ -102,7 +102,7 @@ jobs:
               - 'crates/buzz-db/**'
               - 'crates/buzz-relay/**'
               - 'crates/buzz-sdk/**'
-              - 'crates/buzz-cli/**'
+              - 'crates/carryforth-cli/**'
               - 'crates/buzz-acp/**'
               - 'crates/buzz-admin/**'
               - 'crates/buzz-test-client/tests/e2e_project_document_*.rs'
@@ -400,7 +400,7 @@ jobs:
         with:
           path: |
             target/ci/buzz-relay
-            target/ci/buzz
+            target/ci/cf
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
@@ -422,7 +422,7 @@ jobs:
       - name: Build relay artifacts
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
         run: |
-          cargo build --profile ci -p buzz-relay -p buzz-cli -p buzz-admin -p git-credential-nostr
+          cargo build --profile ci -p buzz-relay -p carryforth-cli -p buzz-admin -p git-credential-nostr
           cargo nextest archive \
             --cargo-profile ci \
             -p buzz-db \
@@ -447,7 +447,7 @@ jobs:
         with:
           path: |
             target/ci/buzz-relay
-            target/ci/buzz
+            target/ci/cf
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
@@ -458,7 +458,7 @@ jobs:
           name: desktop-e2e-relay
           path: |
             target/ci/buzz-relay
-            target/ci/buzz
+            target/ci/cf
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
@@ -976,7 +976,7 @@ jobs:
           name: desktop-e2e-relay
           path: target/ci
       - name: Make packaged binaries executable
-        run: chmod +x target/ci/buzz-relay target/ci/buzz target/ci/buzz-admin
+        run: chmod +x target/ci/buzz-relay target/ci/cf target/ci/buzz-admin
       - name: Project View database transactions
         env:
           PROJECT_VIEW_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
@@ -1013,7 +1013,7 @@ jobs:
           name: desktop-e2e-relay
           path: target/ci
       - name: Make packaged binaries executable
-        run: chmod +x target/ci/buzz-relay target/ci/buzz target/ci/buzz-admin
+        run: chmod +x target/ci/buzz-relay target/ci/cf target/ci/buzz-admin
       - name: Project Document database transactions and races
         env:
           PROJECT_DOCUMENT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
@@ -1054,7 +1054,7 @@ jobs:
           name: desktop-e2e-relay
           path: target/ci
       - name: Make packaged binaries executable
-        run: chmod +x target/ci/buzz-relay target/ci/buzz target/ci/buzz-admin
+        run: chmod +x target/ci/buzz-relay target/ci/cf target/ci/buzz-admin
       - name: Project Context direct-v3 protocol and lifecycle e2e
         env:
           PROJECT_CONTEXT_TEST_ARCHIVE: ${{ github.workspace }}/target/ci/backend-integration-tests.tar.zst
@@ -1373,7 +1373,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p desktop/src-tauri/binaries
-          for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+          for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr cf; do
             touch "desktop/src-tauri/binaries/${bin}-${TARGET}.exe"
           done
       - name: Clippy (workspace)
@@ -1449,7 +1449,7 @@ jobs:
           touch "desktop/src-tauri/binaries/buzz-agent-$TARGET"
           touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
           touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
-          touch "desktop/src-tauri/binaries/buzz-$TARGET"
+          touch "desktop/src-tauri/binaries/cf-$TARGET"
       # Mesh rev is derived from Cargo.lock so a dependency bump needs no
       # lockstep edit here; the cache key tracks it automatically.
       - name: Resolve mesh-llm rev

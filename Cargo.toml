@@ -17,7 +17,7 @@ members = [
     "crates/buzz-admin",
     "crates/buzz-workflow",
     "crates/buzz-media",
-    "crates/buzz-cli",
+    "crates/carryforth-cli",
     "crates/buzz-pairing-cli",
     "crates/buzz-sdk",
     "crates/buzz-project-context",

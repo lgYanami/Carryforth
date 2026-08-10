@@ -44,7 +44,7 @@ impl DevMcp {
 
     #[tool(
         name = "shell",
-        description = "Run a shell command (bash by default; set `BUZZ_SHELL` to use cmd, PowerShell, or another shell). Ephemeral process per call. Output tail-truncated to ~8KB for the LLM; full output (first 10MB) saved to artifact file. timeout_ms defaults to 120000 (2 min) if omitted; capped at 600000 (10 min). For long-running commands (git push with hooks, cargo build, test suites), use 300000+. On PATH: rg (prefer over grep; flags: -n -i -l -g <glob> -C <n> --files), tree (flags: -d <depth>; shows line counts), and buzz (Buzz relay CLI — run buzz --help for commands)."
+        description = "Run a shell command (bash by default; set `BUZZ_SHELL` to use cmd, PowerShell, or another shell). Ephemeral process per call. Output tail-truncated to ~8KB for the LLM; full output (first 10MB) saved to artifact file. timeout_ms defaults to 120000 (2 min) if omitted; capped at 600000 (10 min). For long-running commands (git push with hooks, cargo build, test suites), use 300000+. On PATH: rg (prefer over grep; flags: -n -i -l -g <glob> -C <n> --files), tree (flags: -d <depth>; shows line counts), and cf (Carryforth relay CLI — run cf --help for commands)."
     )]
     async fn shell(
         &self,
@@ -90,7 +90,7 @@ impl DevMcp {
 
     #[tool(
         name = "meeting_read",
-        description = "Read Relay-authoritative Meeting context through a fixed Buzz CLI allowlist. Operations: show, participants, history, intents, floor_status, floor_history. `meeting` must be a canonical UUID. `limit` is accepted only for history/floor_history (default 100, maximum 500). The command, runtime, and returned output are bounded; no shell or write-capable Buzz command is exposed."
+        description = "Read Relay-authoritative Meeting context through a fixed Carryforth CLI allowlist. Operations: show, participants, history, intents, floor_status, floor_history. `meeting` must be a canonical UUID. `limit` is accepted only for history/floor_history (default 100, maximum 500). The command, runtime, and returned output are bounded; no shell or write-capable Carryforth command is exposed."
     )]
     async fn meeting_read(
         &self,
@@ -219,9 +219,9 @@ async fn async_main(cmd: String) -> Result<(), Box<dyn std::error::Error>> {
     // repeated installation is harmless.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // buzz CLI needs tokio (async HTTP client).
-    if cmd == "buzz" {
-        std::process::exit(buzz_cli::run_from_args(std::env::args()).await);
+    // Carryforth CLI needs tokio (async HTTP client).
+    if cmd == "cf" {
+        std::process::exit(carryforth_cli::run_from_args(std::env::args()).await);
     }
 
     // MCP server mode — safe to init tracing now.

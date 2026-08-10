@@ -90,10 +90,12 @@ fn merged_env_strips_reserved_keys_from_persona() {
     // persona data (e.g. older record from before validation existed),
     // it must be stripped before reaching the child process.
     let persona = map(&[
+        ("CARRYFORTH_PRIVATE_KEY", "nsec1new-evil"),
         ("BUZZ_PRIVATE_KEY", "nsec1evil"),
         ("ANTHROPIC_API_KEY", "ok"),
     ]);
     let merged = merged_user_env(&persona, &BTreeMap::new());
+    assert!(!merged.contains_key("CARRYFORTH_PRIVATE_KEY"));
     assert!(!merged.contains_key("BUZZ_PRIVATE_KEY"));
     assert_eq!(
         merged.get("ANTHROPIC_API_KEY").map(String::as_str),
@@ -188,10 +190,28 @@ fn reserved_keys_include_code_execution_surface() {
 fn reserved_keys_include_relay_url() {
     // Overriding the relay URL could redirect the agent to an
     // attacker-controlled relay.
+    assert!(is_reserved_env_key("CARRYFORTH_RELAY_URL"));
     assert!(is_reserved_env_key("BUZZ_RELAY_URL"));
-    let agent = map(&[("BUZZ_RELAY_URL", "ws://attacker.example")]);
+    let agent = map(&[
+        ("CARRYFORTH_RELAY_URL", "ws://attacker.example"),
+        ("BUZZ_RELAY_URL", "ws://retired.example"),
+    ]);
     let merged = merged_user_env(&BTreeMap::new(), &agent);
     assert!(merged.is_empty());
+}
+
+#[test]
+fn reserved_keys_include_current_and_retired_cli_credentials() {
+    for key in [
+        "CARRYFORTH_PRIVATE_KEY",
+        "CARRYFORTH_AUTH_TAG",
+        "CARRYFORTH_RELAY_URL",
+        "BUZZ_PRIVATE_KEY",
+        "BUZZ_AUTH_TAG",
+        "BUZZ_RELAY_URL",
+    ] {
+        assert!(is_reserved_env_key(key), "{key} should be reserved");
+    }
 }
 
 // ── validate_user_env_keys ─────────────────────────────────────────

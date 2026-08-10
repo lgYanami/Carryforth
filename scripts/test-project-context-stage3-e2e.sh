@@ -174,12 +174,12 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
 
 if [[ "${PROJECT_CONTEXT_E2E_NO_BUILD:-0}" != "1" ]]; then
   if [[ "${profile}" == "dev" ]]; then
-    cargo build -p buzz-relay -p buzz-cli -p buzz-admin
+    cargo build -p buzz-relay -p carryforth-cli -p buzz-admin
   else
-    cargo build --profile "${profile}" -p buzz-relay -p buzz-cli -p buzz-admin
+    cargo build --profile "${profile}" -p buzz-relay -p carryforth-cli -p buzz-admin
   fi
 fi
-for binary in buzz-relay buzz buzz-admin; do
+for binary in buzz-relay cf buzz-admin; do
   if [[ ! -x "${bin_dir}/${binary}" ]]; then
     echo "Project Context Stage 3 E2E: missing executable ${bin_dir}/${binary}" >&2
     exit 1
@@ -270,11 +270,11 @@ desktop_context_probe() {
       --ignored --nocapture --test-threads=1
 }
 
-buzz_as_member() {
+cf_as_member() {
   env \
-    BUZZ_RELAY_URL="http://${test_host}" \
-    BUZZ_PRIVATE_KEY="${member_private_key}" \
-    "${bin_dir}/buzz" "$@"
+    CARRYFORTH_RELAY_URL="http://${test_host}" \
+    CARRYFORTH_PRIVATE_KEY="${member_private_key}" \
+    "${bin_dir}/cf" "$@"
 }
 
 project_view_admin() {
@@ -421,7 +421,7 @@ jq -n \
   }' >"${command_file}"
 
 start_relay
-init_v3="$(buzz_as_member --format compact project-view init-v3 --command "${command_file}")"
+init_v3="$(cf_as_member --format compact project-view init-v3 --command "${command_file}")"
 jq -e '.accepted == true' <<<"${init_v3}" >/dev/null
 stop_relay
 project_view_admin enable --community "${test_host}" >/dev/null
@@ -488,7 +488,7 @@ binary_body_marker="STAGE5_BINARY_CONTEXT_BODY_MUST_BE_FETCHED_EXPLICITLY"
 hyper_body_marker="STAGE5_HYPER_CONTEXT_BODY_MUST_BE_FETCHED_EXPLICITLY"
 corrected_hyper_body_marker="STAGE5_CORRECTED_HYPER_BODY_MUST_BE_FETCHED_EXPLICITLY"
 
-create_binary_document="$(buzz_as_member --format compact documents create \
+create_binary_document="$(cf_as_member --format compact documents create \
   --document-id "${binary_context_document}" \
   --title "Binary Context" \
   --summary "Explains the profile and lifecycle goal" \
@@ -499,7 +499,7 @@ jq -e --arg id "${binary_context_document}" '
   and .document_revision == 1
 ' <<<"${create_binary_document}" >/dev/null
 
-create_hyper_document="$(buzz_as_member --format compact documents create \
+create_hyper_document="$(cf_as_member --format compact documents create \
   --document-id "${hyper_context_document}" \
   --title "Hyper Context" \
   --summary "Explains the profile, goal, and supporting Document" \
@@ -510,7 +510,7 @@ jq -e --arg id "${hyper_context_document}" '
   and .document_revision == 1
 ' <<<"${create_hyper_document}" >/dev/null
 
-create_coordinate_document="$(buzz_as_member --format compact documents create \
+create_coordinate_document="$(cf_as_member --format compact documents create \
   --document-id "${coordinate_document}" \
   --title "Supporting Document coordinate" \
   --summary "A coordinate, not the explanatory Context Document" \
@@ -521,7 +521,7 @@ jq -e --arg id "${coordinate_document}" '
   and .document_revision == 1
 ' <<<"${create_coordinate_document}" >/dev/null
 
-attach_binary="$(buzz_as_member --format compact project-context attach \
+attach_binary="$(cf_as_member --format compact project-context attach \
   --context-document "${binary_context_document}" \
   --coordinate "${goal_coordinate}" \
   --coordinate "${profile_coordinate}")"
@@ -535,7 +535,7 @@ jq -e --arg id "${binary_context_document}" '
   and .receipt.context_document_id == $id
 ' <<<"${attach_binary}" >/dev/null
 
-attach_hyper="$(buzz_as_member --format compact project-context attach \
+attach_hyper="$(cf_as_member --format compact project-context attach \
   --context-document "${hyper_context_document}" \
   --coordinate "${document_coordinate}" \
   --coordinate "${profile_coordinate}" \
@@ -549,7 +549,7 @@ jq -e --arg id "${hyper_context_document}" '
   and .receipt.context_document_id == $id
 ' <<<"${attach_hyper}" >/dev/null
 
-exact_binary="$(buzz_as_member --format compact project-context exact \
+exact_binary="$(cf_as_member --format compact project-context exact \
   --coordinate "${goal_coordinate}" \
   --coordinate "${profile_coordinate}")"
 jq -e --arg id "${binary_context_document}" '
@@ -560,7 +560,7 @@ jq -e --arg id "${binary_context_document}" '
   and (.edges[0].context_documents | length) == 1
   and .edges[0].context_documents[0].document_id == $id
   and .edges[0].context_documents[0].document_revision == 1
-  and .edges[0].context_documents[0].fetch_command == ("buzz documents get " + $id + " --content-only")
+  and .edges[0].context_documents[0].fetch_command == ("cf documents get " + $id + " --content-only")
   and (.edges[0].context_documents[0] | has("content_markdown") | not)
 ' <<<"${exact_binary}" >/dev/null
 if grep -Fq "${binary_body_marker}" <<<"${exact_binary}"; then
@@ -568,7 +568,7 @@ if grep -Fq "${binary_body_marker}" <<<"${exact_binary}"; then
   exit 1
 fi
 
-incident_profile="$(buzz_as_member --format compact project-context incident \
+incident_profile="$(cf_as_member --format compact project-context incident \
   "${profile_coordinate}")"
 jq -e '
   .query.query_type == "incident"
@@ -576,7 +576,7 @@ jq -e '
   and ([.edges[].coordinates | length] | sort) == [2, 3]
 ' <<<"${incident_profile}" >/dev/null
 
-contains_pair="$(buzz_as_member --format compact project-context contains-all \
+contains_pair="$(cf_as_member --format compact project-context contains-all \
   --coordinate "${profile_coordinate}" \
   --coordinate "${goal_coordinate}")"
 jq -e '
@@ -585,14 +585,14 @@ jq -e '
   and ([.edges[].coordinates | length] | sort) == [2, 3]
 ' <<<"${contains_pair}" >/dev/null
 
-contains_everything="$(buzz_as_member --format compact project-context contains-all)"
+contains_everything="$(cf_as_member --format compact project-context contains-all)"
 jq -e '
   .query.query_type == "contains_all"
   and (.query.coordinates | length) == 0
   and (.edges | length) == 2
 ' <<<"${contains_everything}" >/dev/null
 
-incident_document="$(buzz_as_member --format compact project-context incident \
+incident_document="$(cf_as_member --format compact project-context incident \
   "${document_coordinate}")"
 jq -e --arg id "${hyper_context_document}" '
   (.edges | length) == 1
@@ -600,7 +600,7 @@ jq -e --arg id "${hyper_context_document}" '
   and .edges[0].context_documents[0].document_id == $id
 ' <<<"${incident_document}" >/dev/null
 
-update_hyper="$(buzz_as_member --format compact documents update \
+update_hyper="$(cf_as_member --format compact documents update \
   "${hyper_context_document}" \
   --expected-revision 1 \
   --title "Hyper Context corrected" \
@@ -612,7 +612,7 @@ jq -e --arg id "${hyper_context_document}" '
   and .document_revision == 2
 ' <<<"${update_hyper}" >/dev/null
 
-delete_coordinate="$(buzz_as_member --format compact documents delete \
+delete_coordinate="$(cf_as_member --format compact documents delete \
   "${coordinate_document}" --expected-revision 1)"
 jq -e --arg id "${coordinate_document}" '
   .accepted == true
@@ -620,7 +620,7 @@ jq -e --arg id "${coordinate_document}" '
   and .document_revision == 2
 ' <<<"${delete_coordinate}" >/dev/null
 
-tombstoned_hyper="$(buzz_as_member --format compact project-context incident \
+tombstoned_hyper="$(cf_as_member --format compact project-context incident \
   "${document_coordinate}")"
 jq -e --arg coordinate_id "${coordinate_document}" --arg context_id "${hyper_context_document}" '
   .context_revision == 12
@@ -639,19 +639,19 @@ if grep -Fq "${corrected_hyper_body_marker}" <<<"${tombstoned_hyper}"; then
   echo "Project Context Stage 5 E2E: hydrated Edge output leaked a Document body" >&2
   exit 1
 fi
-fetched_hyper_body="$(buzz_as_member documents get \
+fetched_hyper_body="$(cf_as_member documents get \
   "${hyper_context_document}" --content-only)"
 [[ "${fetched_hyper_body}" == "${corrected_hyper_body_marker}" ]]
 
 set +e
-protected_delete="$(buzz_as_member --format compact documents delete \
+protected_delete="$(cf_as_member --format compact documents delete \
   "${binary_context_document}" --expected-revision 1 2>&1)"
 protected_delete_status=$?
 set -e
 [[ "${protected_delete_status}" == "5" ]]
 grep -Fq "conflict:project_document:still_referenced" <<<"${protected_delete}"
 
-detach_hyper="$(buzz_as_member --format compact project-context detach \
+detach_hyper="$(cf_as_member --format compact project-context detach \
   --context-document "${hyper_context_document}" \
   --coordinate "${profile_coordinate}" \
   --coordinate "${goal_coordinate}" \
@@ -664,7 +664,7 @@ jq -e '
   and .receipt.edge_document_count == 0
 ' <<<"${detach_hyper}" >/dev/null
 
-post_detach_all="$(buzz_as_member --format compact project-context contains-all)"
+post_detach_all="$(cf_as_member --format compact project-context contains-all)"
 jq -e '
   .context_revision == 13
   and (.edges | length) == 1
@@ -720,7 +720,7 @@ jq -e '
 # reads or cleanup. The CLI must therefore read and detach the retained Edge,
 # while refusing a new attach before submission.
 start_relay
-disabled_exact="$(buzz_as_member --format compact project-context exact \
+disabled_exact="$(cf_as_member --format compact project-context exact \
   --coordinate "${profile_coordinate}" \
   --coordinate "${goal_coordinate}")"
 jq -e --arg id "${binary_context_document}" '
@@ -730,7 +730,7 @@ jq -e --arg id "${binary_context_document}" '
 ' <<<"${disabled_exact}" >/dev/null
 
 set +e
-disabled_attach="$(buzz_as_member --format compact project-context attach \
+disabled_attach="$(cf_as_member --format compact project-context attach \
   --context-document "${hyper_context_document}" \
   --coordinate "${profile_coordinate}" \
   --coordinate "${goal_coordinate}" 2>&1)"
@@ -739,7 +739,7 @@ set -e
 [[ "${disabled_attach_status}" == "4" ]]
 grep -Fq "unavailable:project_context:capability_disabled" <<<"${disabled_attach}"
 
-disabled_detach="$(buzz_as_member --format compact project-context detach \
+disabled_detach="$(cf_as_member --format compact project-context detach \
   --context-document "${binary_context_document}" \
   --coordinate "${goal_coordinate}" \
   --coordinate "${profile_coordinate}")"
@@ -751,7 +751,7 @@ jq -e '
   and .receipt.edge_document_count == 0
 ' <<<"${disabled_detach}" >/dev/null
 
-disabled_empty="$(buzz_as_member --format compact project-context contains-all)"
+disabled_empty="$(cf_as_member --format compact project-context contains-all)"
 jq -e '
   .context_revision == 14
   and (.edges | length) == 0
@@ -834,7 +834,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   project_context_admin enable \
     --community "${test_host}" --expected-pubkey "${relay_pubkey}" >/dev/null
   start_relay
-  recovered_empty="$(buzz_as_member --format compact project-context contains-all)"
+  recovered_empty="$(cf_as_member --format compact project-context contains-all)"
   jq -e '
     .context_revision == 14
     and .projection_generation == 2
@@ -853,7 +853,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   stage7_body_a="STAGE7_CONTEXT_BODY_A_MUST_STAY_OUT_OF_GRAPH_RESULTS"
   stage7_body_a_corrected="STAGE7_CONTEXT_BODY_A_CORRECTED_MUST_BE_LAZY"
 
-  create_stage7_a="$(buzz_as_member --format compact documents create \
+  create_stage7_a="$(cf_as_member --format compact documents create \
     --document-id "${stage7_context_a}" \
     --title "Stage 7 Context A" \
     --summary "Explains the profile and lifecycle goal island" \
@@ -862,7 +862,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     .accepted == true and .document_id == $id and .document_revision == 1
   ' <<<"${create_stage7_a}" >/dev/null
 
-  create_stage7_b="$(buzz_as_member --format compact documents create \
+  create_stage7_b="$(cf_as_member --format compact documents create \
     --document-id "${stage7_context_b}" \
     --title "Stage 7 Context B" \
     --summary "Explains the role and Document island" \
@@ -871,7 +871,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     .accepted == true and .document_id == $id and .document_revision == 1
   ' <<<"${create_stage7_b}" >/dev/null
 
-  create_stage7_bridge="$(buzz_as_member --format compact documents create \
+  create_stage7_bridge="$(cf_as_member --format compact documents create \
     --document-id "${stage7_context_bridge}" \
     --title "Stage 7 bridge Context" \
     --summary "Connects the two Context islands" \
@@ -880,7 +880,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     .accepted == true and .document_id == $id and .document_revision == 1
   ' <<<"${create_stage7_bridge}" >/dev/null
 
-  create_stage7_coordinate="$(buzz_as_member --format compact documents create \
+  create_stage7_coordinate="$(cf_as_member --format compact documents create \
     --document-id "${stage7_coordinate_document}" \
     --title "Stage 7 Coordinate Document" \
     --summary "Acts as a graph Coordinate, not a Context binding" \
@@ -889,7 +889,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     .accepted == true and .document_id == $id and .document_revision == 1
   ' <<<"${create_stage7_coordinate}" >/dev/null
 
-  stage7_attach_a="$(buzz_as_member --format compact project-context attach \
+  stage7_attach_a="$(cf_as_member --format compact project-context attach \
     --context-document "${stage7_context_a}" \
     --coordinate "${goal_coordinate}" \
     --coordinate "${profile_coordinate}")"
@@ -899,7 +899,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     and .receipt.edge_state == "active"
   ' <<<"${stage7_attach_a}" >/dev/null
 
-  stage7_attach_b="$(buzz_as_member --format compact project-context attach \
+  stage7_attach_b="$(cf_as_member --format compact project-context attach \
     --context-document "${stage7_context_b}" \
     --coordinate "${stage7_role_coordinate}" \
     --coordinate "${stage7_document_coordinate}")"
@@ -909,7 +909,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     and .receipt.edge_state == "active"
   ' <<<"${stage7_attach_b}" >/dev/null
 
-  stage7_all_split="$(buzz_as_member --format compact project-context contains-all)"
+  stage7_all_split="$(cf_as_member --format compact project-context contains-all)"
   jq -e --arg a "${stage7_context_a}" --arg b "${stage7_context_b}" '
     .context_revision == 16
     and .projection_generation == 2
@@ -921,7 +921,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     exit 1
   fi
 
-  stage7_exact="$(buzz_as_member --format compact project-context exact \
+  stage7_exact="$(cf_as_member --format compact project-context exact \
     --coordinate "${profile_coordinate}" \
     --coordinate "${goal_coordinate}")"
   jq -e --arg id "${stage7_context_a}" '
@@ -931,7 +931,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     and .edges[0].context_documents[0].document_id == $id
   ' <<<"${stage7_exact}" >/dev/null
 
-  stage7_incident="$(buzz_as_member --format compact project-context incident \
+  stage7_incident="$(cf_as_member --format compact project-context incident \
     "${goal_coordinate}")"
   jq -e --arg id "${stage7_context_a}" '
     .context_revision == 16
@@ -940,7 +940,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     and .edges[0].context_documents[0].document_id == $id
   ' <<<"${stage7_incident}" >/dev/null
 
-  stage7_contains="$(buzz_as_member --format compact project-context contains-all \
+  stage7_contains="$(cf_as_member --format compact project-context contains-all \
     --coordinate "${stage7_role_coordinate}")"
   jq -e --arg id "${stage7_context_b}" '
     .context_revision == 16
@@ -950,7 +950,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   ' <<<"${stage7_contains}" >/dev/null
   desktop_context_probe split 16
 
-  stage7_attach_bridge="$(buzz_as_member --format compact project-context attach \
+  stage7_attach_bridge="$(cf_as_member --format compact project-context attach \
     --context-document "${stage7_context_bridge}" \
     --coordinate "${goal_coordinate}" \
     --coordinate "${stage7_role_coordinate}")"
@@ -959,14 +959,14 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
     and .receipt.context_revision == 17
     and .receipt.edge_state == "active"
   ' <<<"${stage7_attach_bridge}" >/dev/null
-  stage7_all_merged="$(buzz_as_member --format compact project-context contains-all)"
+  stage7_all_merged="$(cf_as_member --format compact project-context contains-all)"
   jq -e '
     .context_revision == 17
     and (.edges | length) == 3
   ' <<<"${stage7_all_merged}" >/dev/null
   desktop_context_probe merged 17
 
-  stage7_update_a="$(buzz_as_member --format compact documents update \
+  stage7_update_a="$(cf_as_member --format compact documents update \
     "${stage7_context_a}" \
     --expected-revision 1 \
     --title "Stage 7 Context A corrected" \
@@ -975,7 +975,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   jq -e --arg id "${stage7_context_a}" '
     .accepted == true and .document_id == $id and .document_revision == 2
   ' <<<"${stage7_update_a}" >/dev/null
-  stage7_after_update="$(buzz_as_member --format compact project-context exact \
+  stage7_after_update="$(cf_as_member --format compact project-context exact \
     --coordinate "${profile_coordinate}" \
     --coordinate "${goal_coordinate}")"
   jq -e '
@@ -989,12 +989,12 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   fi
   desktop_context_probe updated 17
 
-  stage7_delete_coordinate="$(buzz_as_member --format compact documents delete \
+  stage7_delete_coordinate="$(cf_as_member --format compact documents delete \
     "${stage7_coordinate_document}" --expected-revision 1)"
   jq -e --arg id "${stage7_coordinate_document}" '
     .accepted == true and .document_id == $id and .document_revision == 2
   ' <<<"${stage7_delete_coordinate}" >/dev/null
-  stage7_tombstoned="$(buzz_as_member --format compact project-context incident \
+  stage7_tombstoned="$(cf_as_member --format compact project-context incident \
     "${stage7_document_coordinate}")"
   jq -e --arg id "${stage7_coordinate_document}" '
     .context_revision == 17
@@ -1008,7 +1008,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   desktop_context_probe tombstoned 17
 
   set +e
-  stage7_protected_delete="$(buzz_as_member --format compact documents delete \
+  stage7_protected_delete="$(cf_as_member --format compact documents delete \
     "${stage7_context_a}" --expected-revision 2 2>&1)"
   stage7_protected_delete_status=$?
   set -e
@@ -1018,7 +1018,7 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   stop_relay
   project_context_admin disable --community "${test_host}" >/dev/null
   start_relay
-  stage7_capability_off="$(buzz_as_member --format compact project-context contains-all)"
+  stage7_capability_off="$(cf_as_member --format compact project-context contains-all)"
   jq -e '
     .context_revision == 17
     and .projection_generation == 2
@@ -1026,25 +1026,25 @@ if [[ "${PROJECT_CONTEXT_E2E_STAGE7:-0}" == "1" ]]; then
   ' <<<"${stage7_capability_off}" >/dev/null
   desktop_context_probe capability_off 17
 
-  stage7_detach_bridge="$(buzz_as_member --format compact project-context detach \
+  stage7_detach_bridge="$(cf_as_member --format compact project-context detach \
     --context-document "${stage7_context_bridge}" \
     --coordinate "${goal_coordinate}" \
     --coordinate "${stage7_role_coordinate}")"
   jq -e '.accepted == true and .receipt.context_revision == 18' \
     <<<"${stage7_detach_bridge}" >/dev/null
-  stage7_detach_a="$(buzz_as_member --format compact project-context detach \
+  stage7_detach_a="$(cf_as_member --format compact project-context detach \
     --context-document "${stage7_context_a}" \
     --coordinate "${profile_coordinate}" \
     --coordinate "${goal_coordinate}")"
   jq -e '.accepted == true and .receipt.context_revision == 19' \
     <<<"${stage7_detach_a}" >/dev/null
-  stage7_detach_b="$(buzz_as_member --format compact project-context detach \
+  stage7_detach_b="$(cf_as_member --format compact project-context detach \
     --context-document "${stage7_context_b}" \
     --coordinate "${stage7_role_coordinate}" \
     --coordinate "${stage7_document_coordinate}")"
   jq -e '.accepted == true and .receipt.context_revision == 20' \
     <<<"${stage7_detach_b}" >/dev/null
-  stage7_clean="$(buzz_as_member --format compact project-context contains-all)"
+  stage7_clean="$(cf_as_member --format compact project-context contains-all)"
   jq -e '.context_revision == 20 and (.edges | length) == 0' \
     <<<"${stage7_clean}" >/dev/null
   stop_relay

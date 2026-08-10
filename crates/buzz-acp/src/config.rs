@@ -386,7 +386,7 @@ pub struct CliArgs {
     /// Memory injection is on by default. When enabled, the harness
     /// fetches the agent's per-session core engram and renders it as an
     /// `[Agent Memory — core]` prompt section (or renders the onboarding nudge
-    /// when the relay confirms no core engram exists). The `buzz mem` CLI
+    /// when the relay confirms no core engram exists). The `cf mem` CLI
     /// and the relay's acceptance of kind:30174 engrams are unaffected — this
     /// flag controls prompt-time injection in the ACP harness only.
     /// Pass `--no-memory` / `BUZZ_ACP_NO_MEMORY=true` to disable.
@@ -630,8 +630,8 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 /// Build the `CODEX_CONFIG` environment variable that enables full outbound
 /// network access in Codex's macOS Seatbelt sandbox.
 ///
-/// Codex sandboxes MCP subprocesses (including `buzz-cli`) behind a Seatbelt sandbox
-/// that blocks all outbound network by default. Without this env var, `buzz-cli`
+/// Codex sandboxes MCP subprocesses (including `carryforth-cli`) behind a Seatbelt sandbox
+/// that blocks all outbound network by default. Without this env var, `carryforth-cli`
 /// requests are blocked before they can reach the relay WebSocket.
 ///
 /// Returns `Some(("CODEX_CONFIG", "{\"sandbox_workspace_write\":{\"network_access\":true}}"))` for
@@ -950,7 +950,7 @@ impl Config {
         let model = args.model;
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
-        // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
+        // opens the Seatbelt network sandbox for carryforth-cli (an MCP subprocess). No-op
         // for non-Codex agents or unparseable relay URLs.
         let has_generated_codex_config =
             if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {

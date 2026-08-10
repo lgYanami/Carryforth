@@ -89,7 +89,7 @@ require_test_only_item() {
 # project_view_snapshot's explicitly named legacy helpers and
 # project_view_v3_approval remain available solely as read-only v2-to-v3
 # operator migration input.
-fail_before_tests crates/buzz-cli/src/commands/project_view.rs \
+fail_before_tests crates/carryforth-cli/src/commands/project_view.rs \
   'ProjectViewSchema::V1' \
   'ProjectViewSchema::V2' \
   'read_verified_v2_snapshot' \
@@ -99,7 +99,7 @@ fail_before_tests crates/buzz-cli/src/commands/project_view.rs \
   'buzz-project-view-v2' \
   'project_view_v2::'
 
-fail_if_present crates/buzz-cli/src/commands/roles.rs \
+fail_if_present crates/carryforth-cli/src/commands/roles.rs \
   'read_verified_v2_snapshot' \
   'read_legacy_v2_migration_snapshot' \
   'require_v2_identity' \
@@ -107,7 +107,7 @@ fail_if_present crates/buzz-cli/src/commands/roles.rs \
   'build_role_command(command)' \
   'ProjectViewSchema::V2'
 
-fail_if_present crates/buzz-cli/src/commands/project_view_v3_role_history.rs \
+fail_if_present crates/carryforth-cli/src/commands/project_view_v3_role_history.rs \
   'buzz-project-view-v2-entity' \
   'parse_v2_entity_projection' \
   '"scope": "role_history"'
@@ -238,13 +238,13 @@ fail_if_present scripts/meeting-v2-actions-live-acceptance.sh \
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
   'admin_project_view prepare-v3'
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
-  'buzz_as_supervisor project-view init-v3'
+  'cf_as_supervisor project-view init-v3'
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
   'admin_project_view enable --community "${relay_host}"'
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
-  'buzz_as_supervisor roles offer'
+  'cf_as_supervisor roles offer'
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
-  'buzz_as_moderator roles proposal accept'
+  'cf_as_moderator roles proposal accept'
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
   ".accepted_project_revision // empty"
 require_present scripts/meeting-v2-actions-live-acceptance.sh \
@@ -271,7 +271,7 @@ require_present scripts/test-project-document-e2e.sh \
 require_present scripts/test-project-document-e2e.sh \
   '  --operator-pubkey "${owner_pubkey}"'
 require_present scripts/test-project-document-e2e.sh \
-  'buzz_owner_cli --format compact project-view init-v3'
+  'cf_owner_cli --format compact project-view init-v3'
 require_present scripts/test-project-document-e2e.sh \
   'buzz_project_view_admin enable --community "${test_host}"'
 require_present scripts/test-project-document-e2e.sh \
@@ -355,7 +355,7 @@ fail_if_present scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh \
   'project-view init ' \
   'project-view create ' \
   'roles offer ' \
-  'buzz_as' \
+  'cf_as' \
   'buzz-relay' \
   'buzz-acp'
 require_present crates/buzz-db/src/project_view.rs \
@@ -408,19 +408,19 @@ fail_if_present docs/project-view-operations.md \
 require_present docs/project-view-operations.md \
   'buzz-project-view-v3-bootstrap'
 require_present docs/project-view-operations.md \
-  'buzz --format compact project-view init-v3'
+  'cf --format compact project-view init-v3'
 require_present docs/project-view-operations.md \
   'buzz-admin project-view enable'
 require_present docs/project-view-operations.md \
   'test-project-view-legacy-v2-to-v3-migration-canary.sh'
 require_present docs/project-view-operations.md \
   'Project Documents used as migration input remain capability-disabled'
-fail_if_present crates/buzz-cli/TESTING.md \
+fail_if_present crates/carryforth-cli/TESTING.md \
   'Project View v2/v3 Community' \
   'verified Project View v2 identity'
-require_present crates/buzz-cli/TESTING.md \
+require_present crates/carryforth-cli/TESTING.md \
   'strict-ready 的 Project View v3 Community'
-require_present crates/buzz-cli/TESTING.md \
+require_present crates/carryforth-cli/TESTING.md \
   '普通 Document CRUD 使用'
 
 # Project Document and Context are ordinary v3-governed runtime surfaces even
@@ -485,7 +485,7 @@ require_present crates/buzz-relay/src/handlers/event.rs \
   'project_view_projection_passes_final_fanout_gate('
 require_present crates/buzz-relay/src/handlers/event.rs \
   'configured_projection_signer.as_ref()'
-require_present crates/buzz-cli/src/commands/project_view_snapshot.rs \
+require_present crates/carryforth-cli/src/commands/project_view_snapshot.rs \
   '"#t": [PROJECT_VIEW_V3_META_TAG]'
 require_present crates/buzz-acp/src/role_brief.rs \
   '.custom_tags(t_tag, [PROJECT_VIEW_V3_META_TAG])'
@@ -688,21 +688,21 @@ require_present crates/buzz-db/src/project_view.rs \
   'project_view_v2_migration_current_entities_page'
 require_present crates/buzz-db/src/project_view.rs \
   'buzz_sdk::project_view_v2::parse_project_object_projection'
-require_present crates/buzz-cli/src/commands/project_view_snapshot.rs \
+require_present crates/carryforth-cli/src/commands/project_view_snapshot.rs \
   'read_legacy_v2_migration_objects'
-require_present crates/buzz-cli/src/commands/project_view_snapshot.rs \
+require_present crates/carryforth-cli/src/commands/project_view_snapshot.rs \
   'read_legacy_v2_migration_current_entities'
-require_present crates/buzz-cli/src/commands/project_view_snapshot.rs \
+require_present crates/carryforth-cli/src/commands/project_view_snapshot.rs \
   '"scope": "v2_migration_objects"'
-require_present crates/buzz-cli/src/commands/project_view_snapshot.rs \
+require_present crates/carryforth-cli/src/commands/project_view_snapshot.rs \
   '"scope": "v2_migration_current_entities"'
-fail_if_present crates/buzz-cli/src/commands/project_view_snapshot.rs \
+fail_if_present crates/carryforth-cli/src/commands/project_view_snapshot.rs \
   '"scope": "v2_current_entities"' \
   'V2_ENTITY_PAGE_SIZE'
 
 legacy_snapshot_reader=$(sed -n \
   '/pub(crate) async fn read_legacy_v2_migration_snapshot/,/^async fn read_legacy_v2_migration_current_entities/p' \
-  "$repo_root/crates/buzz-cli/src/commands/project_view_snapshot.rs")
+  "$repo_root/crates/carryforth-cli/src/commands/project_view_snapshot.rs")
 if rg -n --fixed-strings 'query_all' <<<"$legacy_snapshot_reader"; then
   echo "error: the closed v2 migration snapshot must not use ordinary query_all" >&2
   exit 1

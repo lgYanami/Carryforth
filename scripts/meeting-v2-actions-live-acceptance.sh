@@ -203,7 +203,7 @@ workspace_status_sha256="$(shasum -a 256 "${run_dir}/workspace-before.status" | 
 workspace_diff_sha256="$(shasum -a 256 "${secret_dir}/workspace-before.diff" | awk '{print $1}')"
 printf '%s\n' "${workspace_status_sha256}" >"${run_dir}/workspace-before.status.sha256"
 printf '%s\n' "${workspace_diff_sha256}" >"${run_dir}/workspace-before.diff.sha256"
-shasum -a 256 "$0" target/release/buzz target/release/buzz-acp \
+shasum -a 256 "$0" target/release/cf target/release/buzz-acp \
   target/release/buzz-admin target/release/buzz-relay "${codex_acp_bin}" \
   >"${run_dir}/preflight/executable-sha256.txt"
 
@@ -342,14 +342,14 @@ jq -e '
 ' "${run_dir}/preflight/relay-capabilities.json" >/dev/null \
   || fail "Relay did not advertise action runtime and Create capabilities"
 
-buzz_as_moderator() {
-  BUZZ_RELAY_URL="${relay_url}" BUZZ_PRIVATE_KEY="${moderator_private_key}" \
-    target/release/buzz --format compact "$@"
+cf_as_moderator() {
+  CARRYFORTH_RELAY_URL="${relay_url}" CARRYFORTH_PRIVATE_KEY="${moderator_private_key}" \
+    target/release/cf --format compact "$@"
 }
 
-buzz_as_supervisor() {
-  BUZZ_RELAY_URL="${relay_url}" BUZZ_PRIVATE_KEY="${supervisor_private_key}" \
-    target/release/buzz --format compact "$@"
+cf_as_supervisor() {
+  CARRYFORTH_RELAY_URL="${relay_url}" CARRYFORTH_PRIVATE_KEY="${supervisor_private_key}" \
+    target/release/cf --format compact "$@"
 }
 
 admin_project_view() {
@@ -428,15 +428,15 @@ jq -n \
       }]
     }
   }' >"${secret_dir}/initialize-v3.json"
-buzz_as_supervisor project-view init-v3 \
+cf_as_supervisor project-view init-v3 \
   --command "${secret_dir}/initialize-v3.json" \
   >"${run_dir}/logs/project-view-init-v3.json"
 admin_project_view enable --community "${relay_host}" \
   >"${run_dir}/logs/project-view-enable-v3.log"
-buzz_as_supervisor project-view get >"${run_dir}/logs/project-view-v3-initial.json"
+cf_as_supervisor project-view get >"${run_dir}/logs/project-view-v3-initial.json"
 
 log "creating and assigning the moderator Role through ordinary v3 governance"
-buzz_as_supervisor project-view create role \
+cf_as_supervisor project-view create role \
   --expected-project-revision 1 \
   --id "${role_id}" \
   --role-level member \
@@ -445,13 +445,13 @@ role_project_revision="$(jq -r '.accepted_project_revision // empty' \
   "${run_dir}/logs/project-view-role-v3.json")"
 [[ "${role_project_revision}" =~ ^[0-9]+$ ]] \
   || fail "Role create did not return a Project revision"
-buzz_as_supervisor roles offer \
+cf_as_supervisor roles offer \
   --role "${role_id}" \
   --member "${moderator_pubkey}" \
   --expected-project-revision "${role_project_revision}" \
   --reason "Bind the disposable Meeting action moderator" \
   >"${run_dir}/logs/project-view-role-offer-v3.json"
-buzz_as_moderator roles proposals --status open --limit 20 \
+cf_as_moderator roles proposals --status open --limit 20 \
   >"${run_dir}/logs/project-view-open-proposals-v3.json"
 proposal_id="$(jq -r --arg role_id "${role_id}" --arg member "${moderator_pubkey}" '
   [.proposals[]
@@ -465,10 +465,10 @@ proposal_project_revision="$(jq -r '.project_revision // empty' \
   || fail "could not resolve the moderator's unique open Role proposal"
 [[ "${proposal_project_revision}" =~ ^[0-9]+$ ]] \
   || fail "Role proposal read did not return a Project revision"
-buzz_as_moderator roles proposal accept "${proposal_id}" \
+cf_as_moderator roles proposal accept "${proposal_id}" \
   --expected-project-revision "${proposal_project_revision}" \
   >"${run_dir}/logs/project-view-role-accept-v3.json"
-buzz_as_moderator project-view get >"${run_dir}/logs/project-view-v3.json"
+cf_as_moderator project-view get >"${run_dir}/logs/project-view-v3.json"
 
 project_schema="$(docker exec -e PGPASSWORD=buzz_dev "${postgres_container}" \
   psql -U buzz -d "${database_name}" -qtA \
@@ -491,7 +491,7 @@ printf '%s\n' \
   'The accepted decision record must be represented by one Resource in this Community Project View.' \
   '' \
   '# Closing operation' \
-  'Use the ordinary buzz project-view CLI directly; do not generate a Meeting Plan or Step.' \
+  'Use the ordinary cf project-view CLI directly; do not generate a Meeting Plan or Step.' \
   'Create exactly one Resource named: Accepted Meeting decision record.' \
   'Resource type: document.' \
   'Locator type: url.' \
@@ -501,7 +501,7 @@ printf '%s\n' \
   >"${board_file}"
 
 log "creating one action-capable Meeting"
-buzz_as_moderator meetings create \
+cf_as_moderator meetings create \
   --policy moderated-board-actions-v3 \
   --title 'Meeting V2 action finalization real-provider acceptance' \
   --description 'One bounded backend acceptance using the ordinary Project View CLI.' \
@@ -517,7 +517,7 @@ team_instructions="$(printf '%s\n' \
   '当前看板已经明确记录 Goal reached、Effective conclusion，以及需要创建的一个 Resource。' \
   'Board Maintenance 必须保持这些事实；若无需修正则返回 UNCHANGED。' \
   '紧接着的 Floor Decision 必须选择 FINALIZE_ACTIONS，不能 CLOSE、IDLE 或 ABORT。' \
-  'Action Finalization 中必须直接使用普通 buzz project-view CLI：先读取权威视图和 revision，再严格按最终看板创建一个 Resource。' \
+  'Action Finalization 中必须直接使用普通 cf project-view CLI：先读取权威视图和 revision，再严格按最终看板创建一个 Resource。' \
   '不要生成 Plan、Step 或 Materialization Intent，不要自行发布 Meeting 协议事件，也不要修改源码或 Git。Resource 被 Relay 接受后返回 COMPLETE。')"
 
 log "starting exactly one real Codex ACP moderator runtime"

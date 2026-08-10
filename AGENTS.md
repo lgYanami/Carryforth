@@ -57,7 +57,7 @@ crates/
   git-sign-nostr      # Sign git objects with a Nostr key
   git-credential-nostr # Git credential helper for Nostr-authed push/fetch
   # Tooling + shared
-  buzz-cli            # Agent-first CLI
+  carryforth-cli            # Agent-first CLI
   buzz-sdk            # Typed Nostr event builders
   buzz-admin          # Operator CLI for relay administration
   buzz-ws-client      # Shared NIP-42 WebSocket client (connect, auth, publish)
@@ -144,7 +144,7 @@ first, then implement handling in the relay.
 **Channel scoping**: Channels use `h` tags (NIP-29 group tag), not `e` tags.
 Filters and queries must scope to `h` tags when operating within a channel.
 
-**Agent-facing operations go in `buzz-cli`**: New agent-facing features belong in `buzz-cli` — add a subcommand there first, then wire the REST/WebSocket call in `client.rs`. `buzz-dev-mcp` (shell + file tools for `buzz-agent`) is separate.
+**Agent-facing operations go in `carryforth-cli`**: New agent-facing features belong in `carryforth-cli` — add a subcommand there first, then wire the REST/WebSocket call in `client.rs`. `buzz-dev-mcp` (shell + file tools for `buzz-agent`) is separate.
 
 **Workflow conditions**: `buzz-workflow` uses
 [evalexpr](https://docs.rs/evalexpr) for condition evaluation. Keep expressions
@@ -156,20 +156,20 @@ check existing reply handlers for the pattern.
 
 ---
 
-## Agent CLI (`buzz-cli`)
+## Agent CLI (`carryforth-cli`)
 
-`buzz` is the agent-first CLI. Auth env vars
-(`BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`) are auto-injected
+`cf` is the Carryforth agent-first CLI. Auth env vars
+(`CARRYFORTH_RELAY_URL`, `CARRYFORTH_PRIVATE_KEY`, `CARRYFORTH_AUTH_TAG`) are auto-injected
 by the ACP harness into managed agent subprocesses. In development, set
-`BUZZ_PRIVATE_KEY` and `BUZZ_RELAY_URL` in your environment manually.
+`CARRYFORTH_PRIVATE_KEY` and `CARRYFORTH_RELAY_URL` in your environment manually.
 
 ### Building the CLI
 
 ```bash
-cargo build --release -p buzz-cli
+cargo build --release -p carryforth-cli
 ```
 
-Binary location: `./target/release/buzz`. Add `./target/release` to `PATH`
+Binary location: `./target/release/cf`. Add `./target/release` to `PATH`
 or invoke with the full path.
 
 ### Deep Links
@@ -178,7 +178,7 @@ or invoke with the full path.
 thread. To read the linked thread:
 
 ```bash
-buzz messages thread --channel <uuid> --event <hex> --format compact
+cf messages thread --channel <uuid> --event <hex> --format compact
 ```
 
 Extract `channel` and `id` from the URL query parameters. The optional
@@ -190,9 +190,9 @@ All reads return sig-stripped JSON arrays; all writes return
 0=ok, 1=input error, 2=network/relay, 3=auth, 4=other, 5=write conflict (NIP-33 LWW).
 
 `--format compact` is a **global** flag — it goes before the subcommand:
-`buzz --format compact channels list`, NOT `buzz channels list --format compact`.
+`cf --format compact channels list`, NOT `cf channels list --format compact`.
 
-See `crates/buzz-cli/TESTING.md` for the full live-testing runbook.
+See `crates/carryforth-cli/TESTING.md` for the full live-testing runbook.
 
 ---
 
@@ -215,7 +215,7 @@ See [TESTING.md](TESTING.md) for the full multi-agent E2E guide.
 
 ### PR Screenshots
 
-> **Do NOT use `buzz upload`, the relay media endpoint, or any third-party
+> **Do NOT use `cf upload`, the relay media endpoint, or any third-party
 > image host for PR screenshots.** Relay media URLs fail through GitHub's camo
 > proxy. Always use `scripts/post-screenshots.sh` for PNGs before linking them
 > from a PR body/comment. If you hand-edit PR markdown, run

@@ -262,10 +262,7 @@ impl RoleBriefV3 {
             ));
         }
         for resource in &self.context.resources {
-            let expected = format!(
-                "buzz resources guide {} --content-only",
-                resource.resource_id
-            );
+            let expected = format!("cf resources guide {} --content-only", resource.resource_id);
             if resource.fetch != expected
                 || resource.guide_document_revision == Some(0)
                 || (resource.metadata_omitted_due_to_budget
@@ -277,8 +274,7 @@ impl RoleBriefV3 {
             }
         }
         for document in &self.context.live_documents {
-            if document.fetch
-                != format!("buzz documents get {} --content-only", document.document_id)
+            if document.fetch != format!("cf documents get {} --content-only", document.document_id)
                 || document.document_revision.is_some() != document.title.is_some()
             {
                 return Err(invalid(
@@ -300,7 +296,7 @@ impl RoleBriefV3 {
             if document.document_revision == 0
                 || document.fetch
                     != format!(
-                        "buzz documents get {} --revision {} --content-only",
+                        "cf documents get {} --revision {} --content-only",
                         document.document_id, document.document_revision
                     )
             {
@@ -1430,7 +1426,7 @@ fn assemble_context_slice(
             summary: None,
             guide_document_id: resource.guide_document_id,
             guide_document_revision: None,
-            fetch: format!("buzz resources guide {resource_id} --content-only"),
+            fetch: format!("cf resources guide {resource_id} --content-only"),
             metadata_omitted_due_to_budget: resource.summary.is_some() || metadata.is_some(),
         };
         context.resources.push(minimal);
@@ -1495,10 +1491,7 @@ fn assemble_context_slice(
                     document_revision: None,
                     title: None,
                     summary: None,
-                    fetch: format!(
-                        "buzz documents get {} --content-only",
-                        coordinate.document_id
-                    ),
+                    fetch: format!("cf documents get {} --content-only", coordinate.document_id),
                     metadata_omitted_due_to_budget: metadata.is_some(),
                 };
                 context.live_documents.push(minimal);
@@ -1539,7 +1532,7 @@ fn assemble_context_slice(
                     document_id: coordinate.document_id,
                     document_revision: revision,
                     fetch: format!(
-                        "buzz documents get {} --revision {} --content-only",
+                        "cf documents get {} --revision {} --content-only",
                         coordinate.document_id, revision
                     ),
                 });
@@ -1655,7 +1648,7 @@ pub fn render_context_markdown_v3(context: &RoleBriefContextV3) -> String {
         ContextAvailabilityV3::NotAdvertisedEmpty => {
             output.push_str("Context: not advertised; verified canonical Context is empty.\n");
             output.push_str(
-                "Discovery: run `buzz project-view get`, then `buzz resources guide <resource-id> --content-only`.\n",
+                "Discovery: run `cf project-view get`, then `cf resources guide <resource-id> --content-only`.\n",
             );
         }
         ContextAvailabilityV3::UnavailablePreserved {
@@ -1667,7 +1660,7 @@ pub fn render_context_markdown_v3(context: &RoleBriefContextV3) -> String {
                 "Context: unavailable; preserved coordinates resources={resource_count} documents={document_count}."
             );
             output.push_str(
-                "Discovery: run `buzz project-view get` to inspect preserved coordinates explicitly.\n",
+                "Discovery: run `cf project-view get` to inspect preserved coordinates explicitly.\n",
             );
         }
         ContextAvailabilityV3::Ready => {
@@ -1743,7 +1736,7 @@ pub fn render_context_markdown_v3(context: &RoleBriefContextV3) -> String {
             }
             let _ = writeln!(output, "Truncated: {}", context.truncation.truncated);
             output.push_str(
-                "Discovery: use `buzz project-view get` or `buzz documents list`; fetch only the body needed for the current task.\n",
+                "Discovery: use `cf project-view get` or `cf documents list`; fetch only the body needed for the current task.\n",
             );
         }
     }
@@ -2390,11 +2383,9 @@ mod tests {
             line == "[Role Binding v3]" || line.starts_with("```") || line.starts_with("SYSTEM:")
         }));
         assert!(rendered.contains("no Guide or Document body was injected"));
+        assert!(rendered.contains(&format!("cf resources guide {resource_id} --content-only")));
         assert!(rendered.contains(&format!(
-            "buzz resources guide {resource_id} --content-only"
-        )));
-        assert!(rendered.contains(&format!(
-            "buzz documents get {pinned_id} --revision 4 --content-only"
+            "cf documents get {pinned_id} --revision 4 --content-only"
         )));
     }
 

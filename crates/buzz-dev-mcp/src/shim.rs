@@ -11,8 +11,8 @@ use zeroize::Zeroize;
 ///    builds ephemeral `GIT_CONFIG_*` env vars, then removes the env var
 /// 3. Prepends the shim dir to PATH
 ///
-/// Shell children receive `path_env`, `git_env`, and `BUZZ_PRIVATE_KEY` (for
-/// the buzz CLI). `NOSTR_PRIVATE_KEY` is removed from the process env after
+/// Shell children receive `path_env`, `git_env`, and `CARRYFORTH_PRIVATE_KEY` (for
+/// the cf CLI). `NOSTR_PRIVATE_KEY` is removed from the process env after
 /// the keyfile is written — git helpers read from the keyfile only.
 /// Cleaned up on drop (TempDir).
 pub struct Shim {
@@ -29,13 +29,7 @@ impl Shim {
         let self_exe = std::env::current_exe()?;
 
         // Multicall symlinks — all resolve back to this binary.
-        for name in [
-            "rg",
-            "tree",
-            "buzz",
-            "git-credential-nostr",
-            "git-sign-nostr",
-        ] {
+        for name in ["rg", "tree", "cf", "git-credential-nostr", "git-sign-nostr"] {
             symlink(&self_exe, &dir.path().join(name))?;
         }
 
@@ -74,12 +68,12 @@ impl Shim {
         })
     }
 
-    /// Absolute path to the session-scoped `buzz` multicall personality.
+    /// Absolute path to the session-scoped `cf` multicall personality.
     ///
     /// Read-only tools use this instead of PATH lookup so an untrusted tool
     /// argument can never select a different executable.
-    pub(crate) fn buzz_path(&self) -> PathBuf {
-        let path = self._dir.path().join("buzz");
+    pub(crate) fn cf_path(&self) -> PathBuf {
+        let path = self._dir.path().join("cf");
         #[cfg(windows)]
         let path = path.with_extension("exe");
         path
@@ -161,9 +155,9 @@ fn write_keyfile_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Derive a NIP-05-style email from the pubkey and relay URL.
 /// Format: `<hex_pubkey>@<relay_host>` (e.g., `ab12...cd@relay.buzz.dev`).
-/// Falls back to `<hex_pubkey>@buzz` if no relay URL is configured.
+/// Falls back to `<hex_pubkey>@carryforth` if no relay URL is configured.
 fn derive_git_email(pubkey_hex: &str) -> String {
-    let host = std::env::var("BUZZ_RELAY_URL")
+    let host = std::env::var("CARRYFORTH_RELAY_URL")
         .ok()
         .and_then(|url| {
             // Strip scheme, port, and trailing paths
@@ -178,7 +172,7 @@ fn derive_git_email(pubkey_hex: &str) -> String {
             Some(host_port.split(':').next().unwrap_or(host_port).to_owned())
         })
         .filter(|h| !h.is_empty() && !h.starts_with("localhost") && !h.starts_with("127."))
-        .unwrap_or_else(|| "buzz".to_owned());
+        .unwrap_or_else(|| "carryforth".to_owned());
     format!("{pubkey_hex}@{host}")
 }
 
@@ -192,11 +186,11 @@ fn build_git_env(info: &KeyInfo) -> Vec<(String, String)> {
         // Identity — npub as display name, NIP-05-style email
         ("user.name", info.npub.clone()),
         ("user.email", email),
-        // Nostr credential helper is additive — it silently declines non-Buzz
+        // Nostr credential helper is additive — it silently declines non-Carryforth
         // remotes (exits 0, no credential), so git falls through to system
         // helpers (osxkeychain, store, etc.) for GitHub/GitLab/etc.
         ("credential.helper", "nostr".into()),
-        // Required: Buzz relay verifies NIP-98 against the full repo-root URL.
+        // Required: Carryforth relay verifies NIP-98 against the full repo-root URL.
         // Without useHttpPath, git only passes the host and auth is rejected.
         ("credential.useHttpPath", "true".into()),
         ("nostr.keyfile", info.keyfile_path.clone()),

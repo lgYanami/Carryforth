@@ -41,7 +41,7 @@ const DEVELOPER_TOOL_BASES = new Set([
   "postcompact",
 ]);
 
-const BUZZ_CLI_GROUPS = new Set([
+const CARRYFORTH_CLI_GROUPS = new Set([
   "messages",
   "channels",
   "dms",
@@ -62,7 +62,7 @@ const BUZZ_CLI_GROUPS = new Set([
   "pack",
 ]);
 
-const BUZZ_CLI_ADMIN_VERBS = new Set([
+const CARRYFORTH_CLI_ADMIN_VERBS = new Set([
   "archive",
   "unarchive",
   "create",
@@ -73,7 +73,7 @@ const BUZZ_CLI_ADMIN_VERBS = new Set([
   "set-channel-add-policy",
 ]);
 
-const BUZZ_CLI_READ_VERBS = new Set([
+const CARRYFORTH_CLI_READ_VERBS = new Set([
   "get",
   "list",
   "thread",
@@ -85,7 +85,7 @@ const BUZZ_CLI_READ_VERBS = new Set([
 
 const TOOL_CLASS_LABELS: Record<AgentActivityRenderClass, string> = {
   message: "Message",
-  "relay-op": "Buzz relay op",
+  "relay-op": "Carryforth relay op",
   "file-edit": "File edit",
   "file-read": "File read",
   "skill-read": "Skill read",
@@ -173,9 +173,9 @@ function classifyDeveloperHarnessTool(
 
   if (kind === "shell") {
     const command = getToolString(input.args, ["command"]);
-    const buzzCli = command ? parseBuzzCliCommand(command) : null;
-    if (buzzCli) {
-      return buzzCli;
+    const carryforthCli = command ? parseCarryforthCliCommand(command) : null;
+    if (carryforthCli) {
+      return carryforthCli;
     }
     return {
       renderClass: "shell",
@@ -289,7 +289,7 @@ function classifyBuzzTool(
     renderClass: isBuzzMessageSend(operation) ? "message" : "relay-op",
     label,
     preview,
-    action: actionForBuzzOperation(operation, preview, info.tone),
+    action: actionForCarryforthOperation(operation, preview, info.tone),
     tone: info.tone,
     operation,
     object: preview,
@@ -353,11 +353,11 @@ function classifyDeveloperToolName(value: string | null | undefined) {
   return null;
 }
 
-export function parseBuzzCliCommand(
+export function parseCarryforthCliCommand(
   command: string,
 ): AgentActivityDescriptor | null {
   const tokens = tokenizeShellCommand(command);
-  const range = findBuzzCommand(tokens);
+  const range = findCarryforthCommand(tokens);
   if (!range) return null;
 
   const group = tokens[range.groupIndex];
@@ -365,23 +365,23 @@ export function parseBuzzCliCommand(
   const operation = `${group}.${verb}`;
   const isSend = group === "messages" && verb === "send";
   const preview = isSend
-    ? extractBuzzCliInlineContent(tokens, range)
-    : extractBuzzCliObjectPreview(tokens, range);
-  const tone = buzzCliTone(group, verb);
+    ? extractCarryforthCliInlineContent(tokens, range)
+    : extractCarryforthCliObjectPreview(tokens, range);
+  const tone = carryforthCliTone(group, verb);
   return {
     renderClass: isSend ? "message" : "relay-op",
-    label: titleForBuzzCli(group, verb),
+    label: titleForCarryforthCli(group, verb),
     preview,
-    action: actionForBuzzOperation(operation, preview, tone),
+    action: actionForCarryforthOperation(operation, preview, tone),
     tone,
     operation,
     object: preview,
     source: "shell",
-    groupKey: `buzz-cli:${operation}`,
+    groupKey: `carryforth-cli:${operation}`,
   };
 }
 
-function titleForBuzzCli(group: string, verb: string) {
+function titleForCarryforthCli(group: string, verb: string) {
   if (group === "messages" && verb === "send") return "Send Message";
   return [group, verb]
     .map((part) =>
@@ -395,26 +395,26 @@ function titleForBuzzCli(group: string, verb: string) {
     .join(" ");
 }
 
-function actionForBuzzOperation(
+function actionForCarryforthOperation(
   operation: string,
   object: string | null,
   tone: AgentActivityTone,
 ): AgentActivityAction {
-  const verb = buzzOperationVerbToken(operation);
+  const verb = carryforthOperationVerbToken(operation);
   return {
-    verb: buzzOperationVerb(verb, tone),
-    object: object ?? buzzOperationObject(operation),
+    verb: carryforthOperationVerb(verb, tone),
+    object: object ?? carryforthOperationObject(operation),
   };
 }
 
-function buzzOperationVerbToken(operation: string) {
+function carryforthOperationVerbToken(operation: string) {
   if (operation.includes(".")) {
     return operation.split(".")[1] ?? "run";
   }
   return operation.split("_")[0] ?? "run";
 }
 
-function buzzOperationVerb(verb: string, tone: AgentActivityTone) {
+function carryforthOperationVerb(verb: string, tone: AgentActivityTone) {
   if (verb === "add") return "Added";
   if (verb === "archive") return "Archived";
   if (verb === "create") return "Created";
@@ -430,29 +430,29 @@ function buzzOperationVerb(verb: string, tone: AgentActivityTone) {
   return "Updated";
 }
 
-function buzzOperationObject(operation: string) {
+function carryforthOperationObject(operation: string) {
   if (isBuzzMessageSend(operation)) return "message";
   if (operation.includes(".")) {
     const [group] = operation.split(".");
-    return group ? group.replace(/[-_]+/g, " ") : "Buzz";
+    return group ? group.replace(/[-_]+/g, " ") : "Carryforth";
   }
   const object = operation.replace(
     /^(add|approve|archive|create|delete|edit|get|hide|join|leave|list|open|publish|remove|search|send|set|trigger|unarchive|update|vote)_/,
     "",
   );
-  return object ? object.replace(/[-_]+/g, " ") : "Buzz";
+  return object ? object.replace(/[-_]+/g, " ") : "Carryforth";
 }
 
-function buzzCliTone(group: string, verb: string): AgentActivityTone {
-  if (BUZZ_CLI_ADMIN_VERBS.has(verb)) return "admin";
-  if (BUZZ_CLI_READ_VERBS.has(verb)) return "read";
+function carryforthCliTone(group: string, verb: string): AgentActivityTone {
+  if (CARRYFORTH_CLI_ADMIN_VERBS.has(verb)) return "admin";
+  if (CARRYFORTH_CLI_READ_VERBS.has(verb)) return "read";
   if (group === "feed" && verb === "get") return "read";
   return "write";
 }
 
-function extractBuzzCliInlineContent(
+function extractCarryforthCliInlineContent(
   tokens: string[],
-  range: BuzzCommandRange,
+  range: CarryforthCommandRange,
 ): string | null {
   const content = getFlagValue(tokens, range.verbIndex + 1, "--content");
   if (!content || content === "-") return null;
@@ -460,9 +460,9 @@ function extractBuzzCliInlineContent(
   return content;
 }
 
-function extractBuzzCliObjectPreview(
+function extractCarryforthCliObjectPreview(
   tokens: string[],
-  range: BuzzCommandRange,
+  range: CarryforthCommandRange,
 ): string | null {
   const flagPreview =
     getFlagValue(tokens, range.verbIndex + 1, "--channel") ??
@@ -478,15 +478,17 @@ function extractBuzzCliObjectPreview(
     : null;
 }
 
-type BuzzCommandRange = {
-  buzzIndex: number;
+type CarryforthCommandRange = {
+  cfIndex: number;
   groupIndex: number;
   verbIndex: number;
 };
 
-function findBuzzCommand(tokens: string[]): BuzzCommandRange | null {
+function findCarryforthCommand(
+  tokens: string[],
+): CarryforthCommandRange | null {
   for (let i = 0; i < tokens.length; i++) {
-    if (!isBuzzExecutable(tokens[i])) continue;
+    if (!isCfExecutable(tokens[i])) continue;
 
     for (let j = i + 1; j < tokens.length; j++) {
       if (isCommandSeparator(tokens[j])) break;
@@ -499,12 +501,12 @@ function findBuzzCommand(tokens: string[]): BuzzCommandRange | null {
         }
         continue;
       }
-      if (!BUZZ_CLI_GROUPS.has(tokens[j])) continue;
+      if (!CARRYFORTH_CLI_GROUPS.has(tokens[j])) continue;
       const verbIndex = j + 1;
       if (!tokens[verbIndex] || isCommandSeparator(tokens[verbIndex])) {
         return null;
       }
-      return { buzzIndex: i, groupIndex: j, verbIndex };
+      return { cfIndex: i, groupIndex: j, verbIndex };
     }
   }
   return null;
@@ -559,8 +561,8 @@ export function tokenizeShellCommand(command: string): string[] {
   return tokens;
 }
 
-function isBuzzExecutable(token: string) {
-  return token === "buzz" || token.split(/[\\/]/).pop() === "buzz";
+function isCfExecutable(token: string) {
+  return token === "cf" || token.split(/[\\/]/).pop() === "cf";
 }
 
 function isCommandSeparator(token: string) {

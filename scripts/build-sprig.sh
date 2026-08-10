@@ -6,8 +6,8 @@
 #   buzz-acp       link to sprig (ACP harness)
 #   buzz-agent     link to sprig (ACP-compliant agent)
 #   buzz-dev-mcp   link to sprig (developer MCP server; also dispatches
-#                    rg/tree/buzz/git-credential-nostr/git-sign-nostr)
-#   buzz           link to sprig (agent-first Buzz CLI)
+#                    rg/tree/cf/git-credential-nostr/git-sign-nostr)
+#   cf             link to sprig (agent-first Carryforth CLI)
 #
 # Usage:
 #   ./scripts/build-sprig.sh [version] [target]
@@ -36,7 +36,7 @@
 #   buzz-acp
 #   buzz-agent
 #   buzz-dev-mcp
-#   buzz
+#   cf
 #   README.md
 #   sprig.json        { version, git_sha, target, binaries: [{name, sha256, size}] }
 
@@ -61,7 +61,7 @@ else
 fi
 
 BUNDLE_BIN="sprig"
-COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp buzz)
+COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp cf)
 
 echo "==> Building Sprig v${VERSION} for ${TARGET}"
 echo "    git_sha=${GIT_SHA}"
@@ -135,7 +135,7 @@ JSON
 cat > "${STAGING}/README.md" <<'README'
 # Sprig
 
-Sprig is the all-in-one Buzz agent binary for deploy-anywhere environments.
+Sprig is the all-in-one Carryforth agent binary for deploy-anywhere environments.
 It exposes the ACP harness, ACP agent, and developer MCP command names as symlinks
 to one multicall binary so shared Rust runtime/TLS code is stored only once.
 
@@ -146,9 +146,9 @@ Commands:
   ACP-compliant agent over stdio.
 - `buzz-agent` — ACP-compliant agent (spawns MCP servers, calls LLMs).
 - `buzz-dev-mcp` — Developer MCP server (shell, str_replace, todo) and
-  multicall entrypoint for `rg`, `tree`, `buzz`, `git-credential-nostr`,
+  multicall entrypoint for `rg`, `tree`, `cf`, `git-credential-nostr`,
   `git-sign-nostr`.
-- `buzz` — Agent-first Relay CLI, including typed `project-view` commands.
+- `cf` — Agent-first Carryforth CLI, including typed `project-view` commands.
 
 See `sprig.json` for SHA-256s, sizes, target, and source git SHA.
 
@@ -167,10 +167,10 @@ export BUZZ_AGENT_PROVIDER=anthropic            # or openai
 export ANTHROPIC_API_KEY=sk-...
 export ANTHROPIC_MODEL=claude-sonnet-4-20250514
 
-# Nostr identity (shared by buzz-acp, git auth, signing, and buzz CLI)
+# Nostr identity (shared by buzz-acp, git auth, signing, and cf)
 export NOSTR_PRIVATE_KEY=nsec1...
-export BUZZ_PRIVATE_KEY="$NOSTR_PRIVATE_KEY"
-export BUZZ_RELAY_URL=https://your-relay.example.com
+export CARRYFORTH_PRIVATE_KEY="$NOSTR_PRIVATE_KEY"
+export CARRYFORTH_RELAY_URL=http://localhost:3000
 ```
 README
 

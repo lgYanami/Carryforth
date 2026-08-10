@@ -24,7 +24,7 @@ Buzz is a Rust monorepo, licensed Apache 2.0 under Block, Inc.
 ┌─────────────────────────────────────────────────────────────────────┐
 │                           CLIENTS                                    │
 │                                                                      │
-│  Human (Nostr app, web, mobile)    Agent (CLI tools via buzz-cli)    │
+│  Human (Nostr app, web, mobile)    Agent (CLI tools via carryforth-cli)    │
 │           │                                    │                     │
 │           └──────────── WebSocket ─────────────┘                    │
 └─────────────────────────────────────────────────────────────────────┘
@@ -87,9 +87,9 @@ buzz-core    (zero I/O — types, verification, filter matching, kind registry)
          └── buzz-relay       (ties everything together — the server)
 
 buzz-acp            (agent harness — bridges relay @mentions → AI agents via ACP/JSON-RPC)
-buzz-sdk            (typed Nostr event builders — used by buzz-acp and buzz-cli)
+buzz-sdk            (typed Nostr event builders — used by buzz-acp and carryforth-cli)
 buzz-media          (Blossom/S3 media storage)
-buzz-cli            (agent-first CLI)
+carryforth-cli            (agent-first CLI)
 buzz-admin          (operator CLI: relay membership + key generation)
 buzz-test-client    (integration test harness + manual CLI)
 ```

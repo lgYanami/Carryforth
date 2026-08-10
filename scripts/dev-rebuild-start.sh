@@ -35,7 +35,7 @@ cargo clean \
   -p buzz-acp \
   -p buzz-agent \
   -p buzz-dev-mcp \
-  -p buzz-cli \
+  -p carryforth-cli \
   -p git-credential-nostr
 cargo clean \
   --manifest-path "${REPO_ROOT}/desktop/src-tauri/Cargo.toml" \

@@ -186,7 +186,7 @@ for required in codex codex-acp curl docker jq npm pgrep ps rg shasum; do
 done
 
 for required_binary in \
-  target/release/buzz \
+  target/release/cf \
   target/release/buzz-acp \
   target/release/buzz-admin \
   target/release/buzz-relay \
@@ -206,7 +206,7 @@ git status --porcelain=v1 >"$run_dir/workspace-before.status"
 git diff --binary HEAD >"$run_dir/workspace-before.diff"
 shasum -a 256 \
   "$0" \
-  target/release/buzz \
+  target/release/cf \
   target/release/buzz-acp \
   target/release/buzz-admin \
   target/release/buzz-relay \
@@ -460,12 +460,12 @@ seeded_users="$(
 [[ "$seeded_users" -eq "$expected_identity_count" ]] ||
   fail "user seed mismatch: expected $expected_identity_count, found $seeded_users"
 
-buzz_as() {
+cf_as() {
   local role="$1"
   shift
-  BUZZ_RELAY_URL="$relay_url" \
-    BUZZ_PRIVATE_KEY="$(identity_private_key "$role")" \
-    target/release/buzz --format compact "$@"
+  CARRYFORTH_RELAY_URL="$relay_url" \
+    CARRYFORTH_PRIVATE_KEY="$(identity_private_key "$role")" \
+    target/release/cf --format compact "$@"
 }
 
 db_scalar() {
@@ -488,7 +488,7 @@ human_turn() {
   local -a say_args
 
   log "$artifact_prefix: Human Request"
-  buzz_as "$role" meetings floor request --meeting "$meeting_id" \
+  cf_as "$role" meetings floor request --meeting "$meeting_id" \
     >"$run_dir/meetings/$artifact_prefix-request.json"
   request_id="$(
     jq -r '.request_id // empty' "$run_dir/meetings/$artifact_prefix-request.json"
@@ -522,7 +522,7 @@ human_turn() {
     sleep 0.25
   done
 
-  buzz_as "$role" meetings offer ack --meeting "$meeting_id" --offer "$offer_id" \
+  cf_as "$role" meetings offer ack --meeting "$meeting_id" --offer "$offer_id" \
     >"$run_dir/meetings/$artifact_prefix-ack.json"
   jq -e '.accepted == true and .outcome == "accepted"' \
     "$run_dir/meetings/$artifact_prefix-ack.json" >/dev/null ||
@@ -536,7 +536,7 @@ human_turn() {
       --handoff-reason "$handoff_reason"
     )
   fi
-  buzz_as "$role" "${say_args[@]}" \
+  cf_as "$role" "${say_args[@]}" \
     >"$run_dir/meetings/$artifact_prefix-say.json"
   LAST_SPEECH_ID="$(
     jq -r '.speech_event_id // empty' "$run_dir/meetings/$artifact_prefix-say.json"
@@ -568,7 +568,7 @@ for agent_count in $meeting_agent_counts; do
     create_args+=(--participant "$(identity_public_key "m${meeting_index}-agent${agent_index}")")
     agent_index=$((agent_index + 1))
   done
-  buzz_as "$host_role" "${create_args[@]}" >"$create_path"
+  cf_as "$host_role" "${create_args[@]}" >"$create_path"
   meeting_id="$(jq -r '.meeting_id // empty' "$create_path")"
   [[ "$meeting_id" =~ ^[0-9a-f-]{36}$ ]] ||
     fail "Meeting $meeting_index create did not return a UUID"
@@ -625,7 +625,7 @@ submit_fixture_intent() {
       '{intent_id: $intent_id, reused_existing_pending: true}' >"$artifact"
   else
     set +e
-    buzz_as "$role" meetings intents submit \
+    cf_as "$role" meetings intents submit \
       --meeting "$meeting_id" \
       --summary "验收候选 ${role}：${focus}；该议题与其他候选互补而非重复，并将基于只读代码和权威 State 给出独立证据。" \
       >"$artifact" 2>&1
@@ -1266,14 +1266,14 @@ mutate_intent() {
   )"
   case "$mutation" in
     refresh)
-      buzz_as "$role" meetings intents refresh \
+      cf_as "$role" meetings intents refresh \
         --meeting "$meeting_id" \
         --intent "$intent_id" \
         --summary "Acceptance refresh ${label}：保留稳定 intent_id，但以新的权威 source version 提供同一独立证据。" \
         >"$run_dir/meetings/$label-refresh.json"
       ;;
     withdraw)
-      buzz_as "$role" meetings intents withdraw \
+      cf_as "$role" meetings intents withdraw \
         --meeting "$meeting_id" \
         --intent "$intent_id" \
         >"$run_dir/meetings/$label-withdraw.json"
@@ -1317,7 +1317,7 @@ submit_human_request_only() {
   local role="$1"
   local meeting_id="$2"
   local label="$3"
-  buzz_as "$role" meetings floor request --meeting "$meeting_id" \
+  cf_as "$role" meetings floor request --meeting "$meeting_id" \
     >"$run_dir/meetings/$label-request.json"
   LAST_REQUEST_ID="$(jq -r '.request_id // empty' "$run_dir/meetings/$label-request.json")"
   [[ "$LAST_REQUEST_ID" =~ ^[0-9a-f]{64}$ ]] ||
@@ -1355,9 +1355,9 @@ complete_human_request() {
     fi
     sleep 0.1
   done
-  buzz_as "$role" meetings offer ack --meeting "$meeting_id" --offer "$offer_id" \
+  cf_as "$role" meetings offer ack --meeting "$meeting_id" --offer "$offer_id" \
     >"$run_dir/meetings/$label-ack.json"
-  buzz_as "$role" meetings say \
+  cf_as "$role" meetings say \
     --meeting "$meeting_id" \
     --content "Human priority acceptance speech：旧主持判断不得形成 canonical action；控制权归还后才允许建立新快照。" \
     >"$run_dir/meetings/$label-say.json"
@@ -1647,7 +1647,7 @@ run_barrier_source_mutation() {
     [[ "$retry_ticket_id" =~ ^[0-9a-f]{64}$ &&
       "$failed_action_event_id" =~ ^[0-9a-f]{64}$ ]] ||
       fail "selected-source retry evidence is missing its authoritative ticket binding"
-    if buzz_as "m${meeting_index}-agent1" meetings moderator retry \
+    if cf_as "m${meeting_index}-agent1" meetings moderator retry \
       --meeting "$meeting_id" \
       --attempt "$retry_attempt_id" \
       --ticket "$retry_ticket_id" \
@@ -2040,11 +2040,11 @@ fi
 
 log "ending all Meetings through the canonical CLI path"
 while IFS=$'\t' read -r meeting_index meeting_id host_role observer_role agent_count; do
-  buzz_as "$host_role" meetings history --meeting "$meeting_id" \
+  cf_as "$host_role" meetings history --meeting "$meeting_id" \
     >"$run_dir/meetings/m${meeting_index}-history-pre-end.json"
-  buzz_as "$host_role" meetings floor status --meeting "$meeting_id" \
+  cf_as "$host_role" meetings floor status --meeting "$meeting_id" \
     >"$run_dir/meetings/m${meeting_index}-floor-pre-end.json"
-  buzz_as "$host_role" meetings end --meeting "$meeting_id" \
+  cf_as "$host_role" meetings end --meeting "$meeting_id" \
     >"$run_dir/meetings/m${meeting_index}-end.json"
 done <"$run_dir/meetings.tsv"
 
@@ -2203,11 +2203,11 @@ for ignored_attempt in $(seq 1 80); do
 done
 
 while IFS=$'\t' read -r meeting_index meeting_id host_role observer_role agent_count; do
-  buzz_as "$host_role" meetings show --meeting "$meeting_id" \
+  cf_as "$host_role" meetings show --meeting "$meeting_id" \
     >"$run_dir/meetings/m${meeting_index}-show-post-end.json"
-  buzz_as "$host_role" meetings history --meeting "$meeting_id" \
+  cf_as "$host_role" meetings history --meeting "$meeting_id" \
     >"$run_dir/meetings/m${meeting_index}-history-post-end.json"
-  buzz_as "$host_role" meetings floor status --meeting "$meeting_id" \
+  cf_as "$host_role" meetings floor status --meeting "$meeting_id" \
     >"$run_dir/meetings/m${meeting_index}-floor-post-end.json"
 done <"$run_dir/meetings.tsv"
 

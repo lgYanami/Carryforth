@@ -6,7 +6,7 @@ orchestrator and N workers coordinate over the production relay/Postgres.
 Each agent runs *inside* the Harbor task container as the same
 `buzz-acp` → `buzz-agent` → `buzz-dev-mcp` process tree the desktop app
 launches: the production MCP toolset (shell, file tools, todo) with the
-`buzz` CLI on the shell's PATH. No Harbor fork or patch is required.
+Carryforth `cf` CLI on the shell's PATH. No Harbor fork or patch is required.
 
 ## Define the team
 
@@ -43,13 +43,13 @@ one task (`-p`), a directory of tasks, or replace `-p` with Harbor's dataset and
 task selectors:
 
 ```bash
-uv run --project benchmarks/harbor-buzz-orchestra/testbed harbor run --yes -p <TASK_OR_DIRECTORY> --agent harbor_buzz_orchestra:BuzzOrchestraAgent --agent-kwarg manifest=<CONDITION.yaml> --agent-kwarg provisioner_factory=harbor_buzz_testbed:provisioner_from_dict --agent-kwarg provisioner_config=<PROVISIONER.json> --agent-kwarg endpoint_config=<ENDPOINTS.json> --agent-kwarg artifact_root=benchmarks/harbor-buzz-orchestra --agent-kwarg buzz_acp_binary=<LINUX_BIN>/buzz-acp --agent-kwarg buzz_agent_binary=<LINUX_BIN>/buzz-agent --agent-kwarg buzz_dev_mcp_binary=<LINUX_BIN>/buzz-dev-mcp --agent-kwarg buzz_cli_binary=target/debug/buzz --agent-kwarg run_id="bench-$(date -u +%Y%m%dT%H%M%SZ)" --agent-timeout-multiplier 15 --n-concurrent 1
+uv run --project benchmarks/harbor-buzz-orchestra/testbed harbor run --yes -p <TASK_OR_DIRECTORY> --agent harbor_buzz_orchestra:BuzzOrchestraAgent --agent-kwarg manifest=<CONDITION.yaml> --agent-kwarg provisioner_factory=harbor_buzz_testbed:provisioner_from_dict --agent-kwarg provisioner_config=<PROVISIONER.json> --agent-kwarg endpoint_config=<ENDPOINTS.json> --agent-kwarg artifact_root=benchmarks/harbor-buzz-orchestra --agent-kwarg buzz_acp_binary=<LINUX_BIN>/buzz-acp --agent-kwarg buzz_agent_binary=<LINUX_BIN>/buzz-agent --agent-kwarg buzz_dev_mcp_binary=<LINUX_BIN>/buzz-dev-mcp --agent-kwarg cf_binary=target/debug/cf --agent-kwarg run_id="bench-$(date -u +%Y%m%dT%H%M%SZ)" --agent-timeout-multiplier 15 --n-concurrent 1
 ```
 
 `buzz_acp_binary`/`buzz_agent_binary`/`buzz_dev_mcp_binary` must be **Linux**
 builds matching the task image architecture — they are uploaded into each task
 container (`just benchmark` cross-builds them automatically; musl-static, so
-any Linux base image works). `buzz_cli_binary` is the **host** CLI the harness
+any Linux base image works). `cf_binary` is the **host** CLI the harness
 uses to act as the trial user.
 
 `--n-concurrent 1` is the safe laptop setting for a serialized local model; it

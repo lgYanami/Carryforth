@@ -21,6 +21,11 @@ use crate::managed_agents::discovery::known_skill_dirs;
 #[cfg(unix)]
 use crate::util::create_symlink;
 
+mod cli;
+pub use cli::ensure_cli_symlink;
+#[cfg(test)]
+use cli::{cli_link_name, ensure_cli_symlink_at};
+
 /// Subdirectories created inside the nest.
 /// `REPOS` is intentionally absent: it is provisioned by
 /// [`super::repos::ensure_repos_symlink`], which makes it either a real directory (default)
@@ -39,9 +44,9 @@ const NEST_DIRS: &[&str] = &[
 /// Fully static — no runtime interpolation, no secrets, no user paths.
 pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
 
-/// Default SKILL.md content for the buzz-cli skill.
-/// Written to ~/.buzz/.agents/skills/buzz-cli/SKILL.md on first init.
-const BUZZ_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
+/// Default SKILL.md content for the carryforth-cli skill.
+/// Written to ~/.buzz/.agents/skills/carryforth-cli/SKILL.md on first init.
+const CARRYFORTH_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
 
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
@@ -50,13 +55,14 @@ const NEST_AGENTS_VERSION: u32 = 4;
 
 /// Template content version for SKILL.md.
 /// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
-const NEST_SKILL_VERSION: u32 = 4;
+const NEST_SKILL_VERSION: u32 = 5;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";
 
 /// Canonical skill directory path relative to the nest root.
-const CANONICAL_SKILL_DIR: &str = ".agents/skills/buzz-cli";
+const CANONICAL_SKILL_DIR: &str = ".agents/skills/carryforth-cli";
+const LEGACY_CANONICAL_SKILL_DIR: &str = ".agents/skills/buzz-cli";
 
 /// Nest directory name for production builds.
 const NEST_DIR_PROD: &str = ".buzz";
@@ -144,9 +150,9 @@ pub fn ensure_nest() -> Result<(), String> {
 ///
 /// - Creates the root directory and all subdirectories.
 /// - Writes `AGENTS.md` only if it doesn't already exist.
-/// - Writes `.agents/skills/buzz-cli/SKILL.md` only if it doesn't already exist.
+/// - Writes `.agents/skills/carryforth-cli/SKILL.md` only if it doesn't already exist.
 /// - Creates harness-specific symlinks pointing to the canonical
-///   `.agents/skills/buzz-cli` directory for each known provider.
+///   `.agents/skills/carryforth-cli` directory for each known provider.
 /// - Sets 700 permissions on the root, all subdirectories, and the skill
 ///   directory tree (Unix).
 ///
@@ -210,9 +216,7 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         }
     }
 
-    // Write buzz-cli skill to the harness-agnostic .agents path.
-    // The first-init write uses the new canonical path; migration from
-    // the old .claude path is handled in refresh_skill_md_if_stale.
+    // Write the Carryforth CLI skill to the harness-agnostic .agents path.
     let agents_skill_dir = root.join(CANONICAL_SKILL_DIR);
     fs::create_dir_all(&agents_skill_dir)
         .map_err(|e| format!("create {}: {e}", agents_skill_dir.display()))?;
@@ -225,7 +229,7 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
     {
         Ok(mut file) => {
             use std::io::Write;
-            file.write_all(BUZZ_CLI_SKILL_MD.as_bytes())
+            file.write_all(CARRYFORTH_CLI_SKILL_MD.as_bytes())
                 .map_err(|e| format!("write {}: {e}", skill_md.display()))?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -234,9 +238,12 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         }
     }
 
+    // Retire only legacy skill assets proven to be app-managed. Real provider
+    // directories and arbitrary links are user-owned and remain untouched.
+    retire_legacy_skill_assets(root)?;
+
     // Create harness-specific symlinks for all known providers.
-    // Migration of the old .claude/skills/buzz-cli real dir is handled in
-    // refresh_skill_md_if_stale; ensure_skill_symlinks skips paths that already exist.
+    // Existing real paths and arbitrary symlinks are never overwritten.
     ensure_skill_symlinks(root)?;
 
     // Refresh static content if the embedded template version is newer.
@@ -315,7 +322,7 @@ fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
     for skill_dir in known_skill_dirs() {
         let parent = root.join(skill_dir);
         fs::create_dir_all(&parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        let link = parent.join("buzz-cli");
+        let link = parent.join("carryforth-cli");
         if link.symlink_metadata().is_ok() {
             continue; // symlink or real path exists — skip
         }
@@ -328,76 +335,54 @@ fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn retire_legacy_skill_assets(root: &Path) -> Result<(), String> {
+    for skill_dir in known_skill_dirs() {
+        let legacy_link = root.join(skill_dir).join("buzz-cli");
+        let Ok(metadata) = legacy_link.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let depth = std::path::Path::new(skill_dir).components().count();
+        let expected_target = format!("{}{LEGACY_CANONICAL_SKILL_DIR}", "../".repeat(depth));
+        let actual_target = fs::read_link(&legacy_link)
+            .map_err(|e| format!("read symlink {}: {e}", legacy_link.display()))?;
+        if actual_target == Path::new(&expected_target) {
+            fs::remove_file(&legacy_link)
+                .map_err(|e| format!("remove legacy symlink {}: {e}", legacy_link.display()))?;
+        }
+    }
+
+    // The canonical legacy directory was entirely app-managed and carried a
+    // version marker. Remove it only when that marker proves ownership; an
+    // unmarked directory may contain user material and is left intact.
+    let legacy_canonical = root.join(LEGACY_CANONICAL_SKILL_DIR);
+    if legacy_canonical
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+        && read_version_file(&legacy_canonical.join(".skill-version")) > 0
+    {
+        fs::remove_dir_all(&legacy_canonical).map_err(|e| {
+            format!(
+                "remove legacy skill directory {}: {e}",
+                legacy_canonical.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn ensure_skill_symlinks(_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns the `~/.local/bin` link name for the bundled CLI.
-///
-/// Dev builds (`is_dev = true`) use `"buzz-dev"` so that a running DMG and a
-/// concurrent dev build each own a separate link and never clobber each other —
-/// the same isolation that separates `~/.buzz` (prod) from `~/.buzz-dev` (dev).
-pub fn cli_link_name(is_dev: bool) -> &'static str {
-    if is_dev {
-        "buzz-dev"
-    } else {
-        "buzz"
-    }
-}
-
-/// Ensures `~/.local/bin/buzz` (prod) or `~/.local/bin/buzz-dev` (dev) is a
-/// symlink to the bundled CLI binary.
-///
-/// The link name is split by `is_dev` so that an installed DMG and a
-/// concurrently running dev build each maintain their own symlink and never
-/// overwrite each other's target — the same isolation that separates the
-/// `~/.buzz` and `~/.buzz-dev` nests (see [`NEST_DIR_DEV`]).
-///
-/// On every boot: replaces any existing symlink unconditionally (the `buzz` /
-/// `buzz-dev` name is our namespace), creates a new one if absent, and leaves
-/// regular files alone to avoid clobbering a user-compiled binary.
-///
-/// Non-fatal: callers should ignore errors — the symlink is a convenience
-/// for human Terminal use; agents find the CLI via PATH augmentation.
-#[cfg(unix)]
-pub fn ensure_cli_symlink(exe_parent: &Path, is_dev: bool) -> Result<(), String> {
-    let buzz_bin = exe_parent.join("buzz");
-    if !buzz_bin.exists() {
-        return Ok(()); // CLI not bundled (e.g., dev builds without sidecars).
-    }
-
-    let local_bin = dirs::home_dir()
-        .ok_or("cannot resolve home directory")?
-        .join(".local")
-        .join("bin");
-    fs::create_dir_all(&local_bin).map_err(|e| format!("create {}: {e}", local_bin.display()))?;
-
-    let link = local_bin.join(cli_link_name(is_dev));
-    match link.symlink_metadata() {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let _ = fs::remove_file(&link);
-            create_symlink(&buzz_bin, &link)
-                .map_err(|e| format!("symlink {}: {e}", link.display()))?;
-        }
-        Ok(_) => {
-            // Regular file or directory — don't clobber.
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            create_symlink(&buzz_bin, &link)
-                .map_err(|e| format!("symlink {}: {e}", link.display()))?;
-        }
-        Err(e) => {
-            return Err(format!("stat {}: {e}", link.display()));
-        }
-    }
-
-    Ok(())
-}
-
-/// No-op on non-Unix platforms — symlink management is macOS/Linux only.
 #[cfg(not(unix))]
-pub fn ensure_cli_symlink(_exe_parent: &Path, _is_dev: bool) -> Result<(), String> {
+fn retire_legacy_skill_assets(_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -470,28 +455,11 @@ fn refresh_agents_md_if_stale(root: &Path) -> Result<(), String> {
 ///
 /// SKILL.md has no user-editable sections — it is fully overwritten on version bump.
 fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
-    let agents_skill_dir = root.join(".agents/skills/buzz-cli");
+    let agents_skill_dir = root.join(CANONICAL_SKILL_DIR);
     let version_path = agents_skill_dir.join(".skill-version");
     if read_version_file(&version_path) >= NEST_SKILL_VERSION {
         return Ok(());
     }
-
-    // Migration: if .claude/skills/buzz-cli exists as a real directory
-    // (pre-migration install), copy user's SKILL.md to the new location
-    // then remove the old directory so we can replace it with a symlink.
-    let old_skill_dir = root.join(".claude/skills/buzz-cli");
-    let old_is_real_dir = old_skill_dir
-        .symlink_metadata()
-        .map(|m| m.file_type().is_dir())
-        .unwrap_or(false);
-
-    let skill_content = if old_is_real_dir {
-        // Preserve user-edited content during migration.
-        fs::read_to_string(old_skill_dir.join("SKILL.md"))
-            .unwrap_or_else(|_| BUZZ_CLI_SKILL_MD.to_string())
-    } else {
-        BUZZ_CLI_SKILL_MD.to_string()
-    };
 
     // Ensure the canonical .agents skill directory exists.
     fs::create_dir_all(&agents_skill_dir)
@@ -503,40 +471,11 @@ fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("tempfile in {}: {e}", agents_skill_dir.display()))?;
     {
         use std::io::Write;
-        tmp.write_all(skill_content.as_bytes())
+        tmp.write_all(CARRYFORTH_CLI_SKILL_MD.as_bytes())
             .map_err(|e| format!("write tempfile: {e}"))?;
     }
     tmp.persist(&skill_md)
         .map_err(|e| format!("persist {}: {e}", skill_md.display()))?;
-
-    // Replace old real directory with a symlink.
-    if old_is_real_dir {
-        fs::remove_dir_all(&old_skill_dir)
-            .map_err(|e| format!("remove {}: {e}", old_skill_dir.display()))?;
-    }
-
-    // Create/replace the .claude/skills/buzz-cli symlink.
-    #[cfg(unix)]
-    {
-        let claude_skills_dir = root.join(".claude/skills");
-        fs::create_dir_all(&claude_skills_dir)
-            .map_err(|e| format!("create {}: {e}", claude_skills_dir.display()))?;
-        let symlink_path = root.join(".claude/skills/buzz-cli");
-        // Remove any stale symlink before (re)creating.
-        let symlink_exists = symlink_path
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if symlink_exists {
-            fs::remove_file(&symlink_path)
-                .map_err(|e| format!("remove symlink {}: {e}", symlink_path.display()))?;
-        }
-        create_symlink(
-            std::path::Path::new("../../.agents/skills/buzz-cli"),
-            &symlink_path,
-        )
-        .map_err(|e| format!("symlink {}: {e}", symlink_path.display()))?;
-    }
 
     fs::write(&version_path, format!("{NEST_SKILL_VERSION}\n"))
         .map_err(|e| format!("write {}: {e}", version_path.display()))?;

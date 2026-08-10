@@ -380,7 +380,7 @@ async def test_wait_for_done_requires_orchestrator_authorship(tmp_path, monkeypa
         observers.append(credential.agent_id)
         return next(rounds)
 
-    monkeypatch.setattr(rt, "_buzz_json", buzz_json)
+    monkeypatch.setattr(rt, "_cf_json", buzz_json)
     result = await rt._wait_for_done(Environment(), orch, trial, [])
     assert json.dumps(result).find("real") > 0
     # observation happens as the trial user, never as an agent identity

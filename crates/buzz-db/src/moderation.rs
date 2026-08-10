@@ -141,7 +141,7 @@ pub struct NewAction<'a> {
     pub matched_principal: Option<&'a str>,
 }
 
-/// An audit row as read back for `buzz moderation audit`.
+/// An audit row as read back for `cf moderation audit`.
 #[derive(Debug, Clone)]
 pub struct ActionRecord {
     /// Row id.
@@ -752,7 +752,7 @@ pub async fn insert_action(
     Ok(row.try_get("id")?)
 }
 
-/// List audit rows, newest first (`buzz moderation audit`).
+/// List audit rows, newest first (`cf moderation audit`).
 pub async fn list_actions(
     pool: &PgPool,
     community: CommunityId,

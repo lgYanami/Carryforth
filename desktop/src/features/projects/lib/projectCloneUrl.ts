@@ -5,7 +5,7 @@
  * Buzz relays serve their own git repositories at a canonical path —
  * `<relay-origin>/git/<owner-pubkey>/<repo-id>` — which is exactly the shape the
  * Rust `validate_clone_url` gate enforces. When an announcement carries no
- * `clone` tag (e.g. it was created via `buzz repos create` without `--clone`),
+ * `clone` tag (e.g. it was created via `cf repos create` without `--clone`),
  * the desktop would otherwise have no URL to fetch from, so the project detail
  * view comes up empty. Synthesizing the canonical relay-hosted URL lets those
  * repositories load while still deferring to any explicit clone URLs.

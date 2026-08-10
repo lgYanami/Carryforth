@@ -450,11 +450,11 @@ async fn test_long_form_malformed_e_plus_a_does_not_delete() {
 /// `notes set` re-publish preserves the original `published_at` while letting
 /// `created_at` advance. This is the contract that NIP-23 readers rely on to
 /// tell "when the author first wrote this" from "when they last updated it",
-/// and the carry-forward logic in `buzz-cli`'s `build_set_event` (unit-tested
+/// and the carry-forward logic in `carryforth-cli`'s `build_set_event` (unit-tested
 /// there) only works if the relay round-trips the tag faithfully.
 ///
 /// The carry rule is duplicated inline here (rather than reaching into
-/// `buzz-cli`) so this e2e crate stays free of CLI deps; the rule's
+/// `carryforth-cli`) so this e2e crate stays free of CLI deps; the rule's
 /// correctness is unit-tested in `commands::notes::tests`.
 #[tokio::test]
 #[ignore]

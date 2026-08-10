@@ -4587,7 +4587,7 @@ mod tests {
     /// L7 read-auth blocker (Wren, #1591 sweep): the CLI signs the *full*
     /// request URL — including `?limit=…&status=…` — but the relay used to
     /// reconstruct the expected URL from the bare path only, so
-    /// `buzz moderation reports` / `audit` 401'd on a NIP-98 URL mismatch in
+    /// `cf moderation reports` / `audit` 401'd on a NIP-98 URL mismatch in
     /// normal use. This pins that a query-bearing GET verifies iff the expected
     /// URL carries the same query verbatim. Bites if the query is ever dropped
     /// from `authorize_moderation_read`'s expected-URL reconstruction.

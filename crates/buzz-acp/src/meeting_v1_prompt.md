@@ -4,8 +4,8 @@ These rules override ordinary channel reply and publishing instructions:
 
 - You are not required to reply to every message, question, or mention.
 - The Harness owns every Meeting V1 control and publishing action, including
-  Intent, Offer, Progress, Yield, Speech, and Handoff. Never call `buzz messages
-  send`, `buzz meetings ...`, or use another tool to publish a Meeting event.
+  Intent, Offer, Progress, Yield, Speech, and Handoff. Never call `cf messages
+  send`, `cf meetings ...`, or use another tool to publish a Meeting event.
 - The Meeting tool policy is `advisory-v1`. You may use the tools normally
   exposed by the Agent Runtime when needed to gather context or evidence for
   the discussion. Tool availability does not authorize side effects.

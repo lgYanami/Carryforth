@@ -68,7 +68,7 @@ pub(crate) fn create_symlink(
 /// Returns `true` when `link` is a symlink whose stored target equals `target`.
 ///
 /// Compares the raw stored link value — no canonicalization — so relative
-/// targets (e.g. `../../.agents/skills/buzz-cli`) compare correctly against
+/// targets (e.g. `../../.agents/skills/carryforth-cli`) compare correctly against
 /// the literal string used to create them.
 pub(crate) fn symlink_points_to(link: &std::path::Path, target: &std::path::Path) -> bool {
     link.is_symlink()

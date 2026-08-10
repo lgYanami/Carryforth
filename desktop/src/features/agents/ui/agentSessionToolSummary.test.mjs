@@ -39,13 +39,13 @@ test("buildCompactToolSummary formats Buzz send_message preview", () => {
   assert.equal(summary.presentation, "message");
 });
 
-test("buildCompactToolSummary treats buzz messages send commands as messages", () => {
+test("buildCompactToolSummary treats cf messages send commands as messages", () => {
   const summary = buildCompactToolSummary(
     makeTool({
       toolName: "buzz-dev-mcp__shell",
       args: {
         command:
-          'buzz --format compact messages send --channel channel-1 --content "@Ned are you working"',
+          'cf --format compact messages send --channel channel-1 --content "@Ned are you working"',
       },
     }),
   );
@@ -62,7 +62,7 @@ test("buildCompactToolSummary returns null preview for piped stdin sends", () =>
       toolName: "shell",
       args: {
         command:
-          'echo "hello from stdin" | ./target/release/buzz messages send --channel channel-1 --content -',
+          'echo "hello from stdin" | ./target/release/cf messages send --channel channel-1 --content -',
       },
     }),
   );
@@ -197,7 +197,7 @@ test("buildCompactToolSummary promotes non-send buzz CLI commands to relay ops",
     makeTool({
       toolName: "shell",
       args: {
-        command: "buzz channels get --channel channel-1",
+        command: "cf channels get --channel channel-1",
       },
     }),
   );
@@ -207,12 +207,12 @@ test("buildCompactToolSummary promotes non-send buzz CLI commands to relay ops",
   assert.equal(summary.preview, "channel-1");
   assert.deepEqual(summary.action, { verb: "Read", object: "channel-1" });
   assert.equal(summary.presentation, "inline");
-  assert.equal(summary.shellContent, "buzz channels get --channel channel-1");
+  assert.equal(summary.shellContent, "cf channels get --channel channel-1");
 });
 
 test("buildCompactToolSummary exposes shellContent for shell-sourced buzz CLI reads", () => {
   const command =
-    "sleep 45; buzz messages thread --channel channel-uuid --event abc | tail -n 20";
+    "sleep 45; cf messages thread --channel channel-uuid --event abc | tail -n 20";
   const summary = buildCompactToolSummary(
     makeTool({
       toolName: "shell",

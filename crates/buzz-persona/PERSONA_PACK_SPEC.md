@@ -418,7 +418,7 @@ description: "Reviews code for security vulnerabilities using OWASP Top 10 and s
 ```
 
 Both `name:` and `description:` are **required**. A skill missing either field is silently skipped
-by the agent runtime. `buzz pack validate` warns on skill name mismatches but does not yet
+by the agent runtime. `cf pack validate` warns on skill name mismatches but does not yet
 enforce required metadata fields (see PF-5).
 
 ---
@@ -764,12 +764,12 @@ apply to both.
 | `triggers.keywords` | string[] | `[]` | Any strings | Respond when message contains any keyword (case-insensitive). |
 | `triggers.all_messages` | bool | `false` | `true` / `false` | Respond to every message in subscribed channels. |
 | `model` | string | none (agent runtime uses operator default) | `"provider:model-id"` format | Model to use. Split on first `:` for provider + model env vars. |
-| `temperature` | float | `0.7` | Provider-dependent (typically 0.0–2.0). buzz-acp passes through without range validation; `buzz pack validate` checks type only (must be a number), not range. | Passed as env var to agent runtime. |
+| `temperature` | float | `0.7` | Provider-dependent (typically 0.0–2.0). buzz-acp passes through without range validation; `cf pack validate` checks type only (must be a number), not range. | Passed as env var to agent runtime. |
 | `max_context_tokens` | int | none (provider default) | Positive integer | Passed as env var to agent runtime. |
 | `thread_replies` | bool | `true` | `true` / `false` | Reply in-thread when the triggering message is in a thread. |
 | `broadcast_replies` | bool | `false` | `true` / `false` | Also surface thread replies to the main channel. |
 
-**Unknown keys** in `defaults` (in `plugin.json`) are **validation warnings** in `buzz pack
+**Unknown keys** in `defaults` (in `plugin.json`) are **validation warnings** in `cf pack
 validate` — this catches typos like `temprature` at validate time. Unknown keys in persona
 frontmatter are **hard errors** (via `deny_unknown_fields` in the YAML parser). At deploy time,
 buzz-acp logs a `WARN` and ignores unknown manifest keys, remaining fail-soft:
@@ -849,8 +849,8 @@ All fields are consumed entirely by buzz-acp. None are passed to the agent runti
 A pack is distributed as a `.buzzpack` file (zip archive):
 
 ```bash
-buzz pack validate ./my-pack
-buzz pack ./my-pack --output my-pack-1.2.0.buzzpack
+cf pack validate ./my-pack
+cf pack ./my-pack --output my-pack-1.2.0.buzzpack
 buzz install ./my-pack-1.2.0.buzzpack
 buzz install https://example.com/releases/my-pack-1.2.0.buzzpack
 ```
@@ -1093,7 +1093,7 @@ Field mapping from flat JSON (`personas/lep.json`) to `.persona.md`:
 2. For each persona JSON → create `agents/<name>.persona.md` using the mapping above
 3. Move skills to `skills/<skill-name>/SKILL.md`; ensure each has `name:` and `description:` frontmatter
 4. Create `instructions.md` from any shared prompt content
-5. Run `buzz pack validate ./my-pack`
+5. Run `cf pack validate ./my-pack`
 
 ### Backward Compatibility
 
@@ -1127,7 +1127,7 @@ The V6 namespaced `buzz:` block format is not supported. Only the current flat t
 
 ### Future Work
 
-`buzz pack init` scaffolding; hot reload of skills/instructions; skill marketplace; pack dependencies; agent-to-agent handoff within a pack.
+`cf pack init` scaffolding; hot reload of skills/instructions; skill marketplace; pack dependencies; agent-to-agent handoff within a pack.
 
 ---
 
@@ -1138,7 +1138,7 @@ Features required by this spec but not yet implemented.
 | ID | What | Where |
 |----|------|-------|
 | PF-1 | True system prompt injection via the ACP protocol's `on_new_session()`. Current `[System]` prefix re-sends persona prompt on every turn; true injection fires once at session creation. | ACP server `on_new_session()` |
-| PF-2 | `buzz pack validate` CLI: **Implemented.** Schema-validates `plugin.json`; checks `.persona.md` required identity fields; validates behavioral config fields; warns on unknown keys and skill name mismatches. Remaining: verify `skills:` and `hooks:` paths exist; error on `SKILL.md` missing `name:` or `description:`. | `buzz-cli` / `buzz-admin` |
+| PF-2 | `cf pack validate` CLI: **Implemented.** Schema-validates `plugin.json`; checks `.persona.md` required identity fields; validates behavioral config fields; warns on unknown keys and skill name mismatches. Remaining: verify `skills:` and `hooks:` paths exist; error on `SKILL.md` missing `name:` or `description:`. | `carryforth-cli` / `buzz-admin` |
 | PF-3 | Skill collision warning: emit `WARN` when a pack skill is skipped because a skill with the same load key already exists in `.agents/skills/`. | buzz-acp skill copy logic |
 | PF-4 | `$AGENT_CWD` resolution: determine `NewSessionRequest.cwd` from (1) `AGENT_CWD` env var, (2) `std::env::current_dir()`, (3) error and refuse to start. | buzz-acp startup / session init |
 | PF-5 | Skill parse failure warning: emit `WARN` when `parse_skill_content` returns `None` (missing `name:`, missing `description:`, or malformed frontmatter). Currently the agent runtime silently skips. buzz-acp should pre-validate during skill copy. | buzz-acp skill copy logic |

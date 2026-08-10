@@ -137,7 +137,7 @@ if ss -ltn | awk '{print $4}' | rg -q ":${metrics_port}$"; then
 fi
 
 for required_binary in \
-  target/release/buzz \
+  target/release/cf \
   target/release/buzz-acp \
   target/release/buzz-admin \
   target/release/buzz-relay; do
@@ -207,7 +207,7 @@ printf '%s\n' "${workspace_status_sha256}" >"${run_dir}/workspace-before.status.
 printf '%s\n' "${workspace_diff_sha256}" >"${run_dir}/workspace-before.diff.sha256"
 shasum -a 256 \
   "$0" \
-  target/release/buzz \
+  target/release/cf \
   target/release/buzz-acp \
   target/release/buzz-admin \
   target/release/buzz-relay \
@@ -376,12 +376,12 @@ jq -e '
 ' "${run_dir}/preflight/relay-create-enabled.json" >/dev/null \
   || fail "create-enabled Relay did not advertise both V2 extensions"
 
-buzz_as() {
+cf_as() {
   local role="$1"
   shift
-  BUZZ_RELAY_URL="${relay_url}" \
-    BUZZ_PRIVATE_KEY="$(identity_private_key "${role}")" \
-    target/release/buzz --format compact "$@"
+  CARRYFORTH_RELAY_URL="${relay_url}" \
+    CARRYFORTH_PRIVATE_KEY="$(identity_private_key "${role}")" \
+    target/release/cf --format compact "$@"
 }
 
 db_scalar() {
@@ -458,7 +458,7 @@ create_meeting() {
   for participant in "$@"; do
     args+=(--participant "$(identity_public_key "${participant}")")
   done
-  initial_board "${scenario}" | buzz_as "${moderator}" "${args[@]}" >"${output}"
+  initial_board "${scenario}" | cf_as "${moderator}" "${args[@]}" >"${output}"
   local session_id
   session_id="$(jq -r '.meeting_id // empty' "${output}")"
   [[ "${session_id}" =~ ^[0-9a-f-]{36}$ ]] || fail "${scenario} Create did not return a UUID"
@@ -482,10 +482,10 @@ moderator_abort_session="$(meeting_id_for moderator_abort)"
 admin_abort_session="$(meeting_id_for admin_abort)"
 
 set +e
-buzz_as outsider meetings board get --meeting "${mixed_session}" \
+cf_as outsider meetings board get --meeting "${mixed_session}" \
   >"${run_dir}/logs/security/outsider-read.log" 2>&1
 outsider_read_status=$?
-buzz_as outsider meetings board unchanged --meeting "${mixed_session}" \
+cf_as outsider meetings board unchanged --meeting "${mixed_session}" \
   >"${run_dir}/logs/security/outsider-write.log" 2>&1
 outsider_write_status=$?
 set -e
@@ -506,7 +506,7 @@ curl -fsS -H "Host: ${relay_host}" "http://127.0.0.1:${relay_port}/_readiness" \
   >"${run_dir}/preflight/relay-create-disabled-readiness.json"
 
 set +e
-initial_board mixed | buzz_as mixed-moderator meetings create \
+initial_board mixed | cf_as mixed-moderator meetings create \
   --policy moderated-board-v1 \
   --title 'Create-disabled rejection probe' \
   --board - \
@@ -661,7 +661,7 @@ submit_human_request() {
   local role="$1"
   local session_id="$2"
   local label="$3"
-  buzz_as "${role}" meetings floor request --meeting "${session_id}" \
+  cf_as "${role}" meetings floor request --meeting "${session_id}" \
     >"${run_dir}/logs/meetings/${label}-request.json"
   LAST_REQUEST_ID="$(jq -r '.request_id // empty' "${run_dir}/logs/meetings/${label}-request.json")"
   [[ "${LAST_REQUEST_ID}" =~ ^[0-9a-f]{64}$ ]] || fail "${label} did not return a request ID"
@@ -692,7 +692,7 @@ complete_human_request() {
     sleep 0.1
   done
   [[ "${offer_id}" =~ ^[0-9a-f]{64}$ ]] || fail "${label} Human Offer timed out"
-  buzz_as "${role}" meetings offer ack --meeting "${session_id}" --offer "${offer_id}" \
+  cf_as "${role}" meetings offer ack --meeting "${session_id}" --offer "${offer_id}" \
     >"${run_dir}/logs/meetings/${label}-ack.json"
   local -a say_args=(meetings say --meeting "${session_id}" --content "${content}")
   if [[ -n "${handoff_target}" ]]; then
@@ -702,7 +702,7 @@ complete_human_request() {
       --handoff-reason 'Please answer this qualification question with one independent protocol observation.'
     )
   fi
-  buzz_as "${role}" "${say_args[@]}" >"${run_dir}/logs/meetings/${label}-say.json"
+  cf_as "${role}" "${say_args[@]}" >"${run_dir}/logs/meetings/${label}-say.json"
   LAST_SPEECH_ID="$(jq -r '.speech_event_id // empty' "${run_dir}/logs/meetings/${label}-say.json")"
   [[ "${LAST_SPEECH_ID}" =~ ^[0-9a-f]{64}$ ]] || fail "${label} did not return a speech ID"
 }
@@ -809,7 +809,7 @@ done
 log "all eight Agent identities exercised ${model} through codex-acp 1.1.7"
 
 log "triggering the independent admin/security abort"
-buzz_as supervisor moderation ban \
+cf_as supervisor moderation ban \
   --pubkey "$(identity_public_key admin-human)" \
   --reason 'Meeting V2 qualification security revocation' \
   >"${run_dir}/logs/security/admin-ban.json"
@@ -859,7 +859,7 @@ post_end_revision_change=0
 [[ "${post_end_before}" == "${post_end_after}" ]] || post_end_revision_change=1
 
 set +e
-buzz_as mixed-moderator meetings board unchanged --meeting "${mixed_session}" \
+cf_as mixed-moderator meetings board unchanged --meeting "${mixed_session}" \
   >"${run_dir}/logs/security/post-end-write.log" 2>&1
 post_end_write_status=$?
 set -e

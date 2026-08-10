@@ -51,7 +51,7 @@
 //!   `dismiss` audits as `dismiss_report` and `escalate` as `escalate` (both
 //!   unprefixed — escalate must stay queryable for the platform-safety lane).
 //!
-//! Lane ownership: L6 (Quinn) — plus `buzz-cli` `moderation` command group.
+//! Lane ownership: L6 (Quinn) — plus `carryforth-cli` `moderation` command group.
 //! The `ingest.rs` routing entries (scope map + `is_global_only_kind` +
 //! direct-processing dispatch) for 9040–9044 belong to L3 (Perci):
 //! coordinate, don't edit ingest.rs.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start an isolated Relay database and process, then run the real Project View
-# protocol E2E. The test invokes the packaged `buzz` CLI as a subprocess.
+# protocol E2E. The test invokes the packaged `cf` CLI as a subprocess.
 
 set -euo pipefail
 
@@ -85,12 +85,12 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
 
 if [[ "${PROJECT_VIEW_E2E_NO_BUILD:-0}" != "1" ]]; then
   if [[ "${profile}" == "dev" ]]; then
-    cargo build -p buzz-relay -p buzz-cli -p buzz-admin
+    cargo build -p buzz-relay -p carryforth-cli -p buzz-admin
   else
-    cargo build --profile "${profile}" -p buzz-relay -p buzz-cli -p buzz-admin
+    cargo build --profile "${profile}" -p buzz-relay -p carryforth-cli -p buzz-admin
   fi
 fi
-for binary in buzz-relay buzz buzz-admin; do
+for binary in buzz-relay cf buzz-admin; do
   if [[ ! -x "${bin_dir}/${binary}" ]]; then
     echo "Project View E2E: missing executable ${bin_dir}/${binary}" >&2
     exit 1
@@ -136,7 +136,7 @@ fi
 
 export DATABASE_URL="${database_url}"
 export PROJECT_VIEW_E2E_RELAY_URL="${relay_url}"
-export PROJECT_VIEW_E2E_BUZZ_BIN="${bin_dir}/buzz"
+export PROJECT_VIEW_E2E_CF_BIN="${bin_dir}/cf"
 export PROJECT_VIEW_E2E_ADMIN_BIN="${bin_dir}/buzz-admin"
 export PROJECT_VIEW_E2E_RELAY_PRIVATE_KEY="${relay_private_key}"
 export PROJECT_VIEW_E2E_OWNER_PRIVATE_KEY="${owner_private_key}"

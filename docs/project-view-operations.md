@@ -178,9 +178,9 @@ is a client-generated UUID v4.
 Submit it through the current CLI:
 
 ```bash
-BUZZ_RELAY_URL=https://relay.example.com \
-BUZZ_PRIVATE_KEY=nsec1... \
-  buzz --format compact project-view init-v3 --command initialize-v3.json
+CARRYFORTH_RELAY_URL=https://relay.example.com \
+CARRYFORTH_PRIVATE_KEY=nsec1... \
+  cf --format compact project-view init-v3 --command initialize-v3.json
 ```
 
 The CLI uses the bootstrap marker to discover this one closed initialization
@@ -211,13 +211,13 @@ NIP-11 must advertise exactly `buzz-project-view-v3` for Project View, and
 for read smoke:
 
 ```bash
-BUZZ_RELAY_URL=https://relay.example.com \
-BUZZ_PRIVATE_KEY=nsec1... \
-  buzz --format compact project-view get
+CARRYFORTH_RELAY_URL=https://relay.example.com \
+CARRYFORTH_PRIVATE_KEY=nsec1... \
+  cf --format compact project-view get
 
-BUZZ_RELAY_URL=https://relay.example.com \
-BUZZ_PRIVATE_KEY=nsec1... \
-  buzz --format compact roles current
+CARRYFORTH_RELAY_URL=https://relay.example.com \
+CARRYFORTH_PRIVATE_KEY=nsec1... \
+  cf --format compact roles current
 ```
 
 ## Existing Communities and explicit migration

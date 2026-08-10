@@ -2,7 +2,7 @@
 
 Each provisioned identity is a full ``buzz-acp`` → ``buzz-agent`` →
 ``buzz-dev-mcp`` process tree launched *inside* the task container — the same
-binaries and the same MCP toolset (shell, file tools, the ``buzz`` CLI on
+binaries and the same MCP toolset (shell, file tools, the ``cf`` CLI on
 PATH) that the desktop app gives a Buzz agent. The harness stays outside:
 it provisions, uploads the pinned binaries, posts the task as the trial
 user, and observes the channel until the orchestrator publishes DONE.
@@ -74,7 +74,7 @@ class BuzzContainerRuntime:
         buzz_acp_binary: str = "buzz-acp",
         buzz_agent_binary: str = "buzz-agent",
         buzz_dev_mcp_binary: str = "buzz-dev-mcp",
-        buzz_cli_binary: str = "buzz",
+        cf_binary: str = "cf",
         relay_gateway: str = "",
         forwarder_binary: str = "relay-forwarder",
         max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS,
@@ -93,7 +93,7 @@ class BuzzContainerRuntime:
         self.buzz_agent_binary = buzz_agent_binary
         self.buzz_dev_mcp_binary = buzz_dev_mcp_binary
         # Host build used for user/provisioning operations only:
-        self.buzz_cli_binary = buzz_cli_binary
+        self.cf_binary = cf_binary
         # Where the relay actually lives, as seen from inside the task
         # container (e.g. host.docker.internal:3600). When set, a loopback
         # forwarder bridges the agents' canonical relay address — the Host
@@ -127,12 +127,12 @@ class BuzzContainerRuntime:
             forwarder = await self._start_forwarder(environment, trial)
             if forwarder is not None:
                 infra.append(forwarder)
-            await self._buzz_json(
+            await self._cf_json(
                 trial.user, trial, "users", "set-profile", "--name",
                 trial.user.agent_id,
             )
             for credential in trial.credentials:
-                await self._buzz_json(
+                await self._cf_json(
                     credential, trial, "users", "set-profile", "--name",
                     credential.agent_id,
                 )
@@ -417,7 +417,7 @@ class BuzzContainerRuntime:
             if polls % LIVENESS_EVERY == 0:
                 await self._raise_for_dead_agents(environment, agents)
             polls += 1
-            messages = await self._buzz_json(
+            messages = await self._cf_json(
                 trial.user, trial,
                 "messages", "get", "--channel", trial.channel_id,
                 "--limit", "100",
@@ -479,7 +479,7 @@ class BuzzContainerRuntime:
         except Exception:  # noqa: BLE001 — best effort; env may be torn down
             pass
 
-    # -- Buzz CLI as the trial user / provisioning identities -------------------
+    # -- Carryforth CLI as the trial user / provisioning identities -------------
 
     @staticmethod
     async def _verify_m1_output(
@@ -505,37 +505,37 @@ class BuzzContainerRuntime:
     async def _send(
         self, credential: AgentCredential, trial: TrialHandle, content: str
     ) -> None:
-        await self._buzz_json(
+        await self._cf_json(
             credential, trial,
             "messages", "send", "--channel", trial.channel_id,
             "--content", content,
         )
 
-    async def _buzz_json(
+    async def _cf_json(
         self, credential: AgentCredential, trial: TrialHandle, *args: str
     ) -> Any:
         process = await asyncio.create_subprocess_exec(
-            self.buzz_cli_binary,
+            self.cf_binary,
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={
                 **os.environ,
-                "BUZZ_RELAY_URL": self._user_relay_url(trial),
-                "BUZZ_PRIVATE_KEY": credential.nostr_secret_key,
-                "BUZZ_AUTH_TAG": credential.nostr_auth_tag,
+                "CARRYFORTH_RELAY_URL": self._user_relay_url(trial),
+                "CARRYFORTH_PRIVATE_KEY": credential.nostr_secret_key,
+                "CARRYFORTH_AUTH_TAG": credential.nostr_auth_tag,
             },
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             raise RuntimeLaunchError(
-                f"buzz {shlex.join(args)} exited {process.returncode}: "
+                f"cf {shlex.join(args)} exited {process.returncode}: "
                 f"{stderr.decode(errors='replace').strip()}"
             )
         try:
             return json.loads(stdout)
         except json.JSONDecodeError as error:
-            raise RuntimeLaunchError("buzz returned invalid JSON") from error
+            raise RuntimeLaunchError("cf returned invalid JSON") from error
 
     @staticmethod
     def _user_relay_url(trial: TrialHandle) -> str:
@@ -640,6 +640,9 @@ class BuzzContainerRuntime:
             "BUZZ_RELAY_URL",
             "BUZZ_PRIVATE_KEY",
             "BUZZ_AUTH_TAG",
+            "CARRYFORTH_RELAY_URL",
+            "CARRYFORTH_PRIVATE_KEY",
+            "CARRYFORTH_AUTH_TAG",
             "BUZZ_ACP_CHANNELS",
             "BUZZ_ACP_MCP_COMMAND",
             "BUZZ_ACP_AGENT_COMMAND",

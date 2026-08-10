@@ -550,14 +550,15 @@ async fn eight_agents_complete_one_direct_action_lifecycle() {
     let (status, body) = post_event(&moderator, &end).await;
     assert_accepted(status, &body);
 
-    let terminal: (
+    type TerminalProjection = (
         String,
         Option<String>,
         Option<String>,
         String,
         Option<String>,
         Option<Vec<u8>>,
-    ) = sqlx::query_as(
+    );
+    let terminal: TerminalProjection = sqlx::query_as(
         "SELECT session.status, session.terminal_outcome, session.summary, runtime.runtime_phase, \
                     run.terminal_status, run.completion_event_id \
              FROM meeting_sessions session \
