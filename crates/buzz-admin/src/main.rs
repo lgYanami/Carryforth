@@ -25,6 +25,7 @@ mod project_context;
 mod project_document;
 mod project_runtime;
 mod project_view;
+mod semantic;
 
 use std::sync::Arc;
 
@@ -112,6 +113,11 @@ enum Command {
         #[command(subcommand)]
         command: meeting_community_read::MeetingCommunityReadCommand,
     },
+    /// Inspect and operate the derived Project Context semantic index.
+    Semantic {
+        #[command(subcommand)]
+        command: semantic::SemanticCommand,
+    },
     /// Emit kind:39000/39002 events for channels missing them.
     ///
     /// Channels created via direct SQL (seed scripts, pre-migration data) won't
@@ -184,6 +190,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::ProjectDocument { command } => project_document::run(command).await,
         Command::ProjectRuntime { command } => project_runtime::run(command).await,
         Command::MeetingCommunityRead { command } => meeting_community_read::run(command).await,
+        Command::Semantic { command } => semantic::run(command).await,
         Command::ReconcileChannels { relay_key } => {
             reconcile_channels(relay_key).await?;
             Ok(0)

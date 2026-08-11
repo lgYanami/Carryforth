@@ -77,6 +77,8 @@ pub mod reaction;
 pub mod relay_members;
 /// Replica freshness fence for keyset-cursor read routing.
 pub mod replica_fence;
+/// Project Context semantic-index deployment probes and derived state.
+pub mod semantic;
 /// Thread metadata persistence.
 pub mod thread;
 /// Per-community usage rollup queries for Prometheus gauges.

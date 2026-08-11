@@ -398,6 +398,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
             project_context_ok,
             meeting_community_read_ok,
             meeting_v2_ok,
+            semantic_ok,
         ) = tokio::join!(
             state.db.ping(),
             async { state.redis_pool.get().await.is_ok() },
@@ -442,6 +443,13 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .await
                     .unwrap_or(false)
             },
+            async {
+                state
+                    .db
+                    .semantic_deployment_ready(state.config.semantic_worker.enabled)
+                    .await
+                    .unwrap_or(false)
+            },
         );
         (
             pg_ok,
@@ -451,6 +459,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
             project_context_ok,
             meeting_community_read_ok,
             meeting_v2_ok,
+            semantic_ok,
         )
     };
 
@@ -462,9 +471,10 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         project_context_ok,
         meeting_community_read_ok,
         meeting_v2_ok,
+        semantic_ok,
     ) = tokio::time::timeout(Duration::from_secs(2), check)
         .await
-        .unwrap_or((false, false, false, false, false, false, false));
+        .unwrap_or((false, false, false, false, false, false, false, false));
 
     if pg_ok
         && redis_ok
@@ -473,10 +483,11 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         && project_context_ok
         && meeting_community_read_ok
         && meeting_v2_ok
+        && semantic_ok
     {
         (
             StatusCode::OK,
-            Json(json!({"status": "ready", "meeting_v2": true})),
+            Json(json!({"status": "ready", "meeting_v2": true, "semantic": true})),
         )
             .into_response()
     } else {
@@ -490,7 +501,8 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                 "project_document": project_document_ok,
                 "project_context": project_context_ok,
                 "meeting_community_read": meeting_community_read_ok,
-                "meeting_v2": meeting_v2_ok
+                "meeting_v2": meeting_v2_ok,
+                "semantic": semantic_ok
             })),
         )
             .into_response()

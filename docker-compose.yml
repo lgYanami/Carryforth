@@ -2,7 +2,7 @@ name: buzz
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:0.8.5-pg17-bookworm@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
     container_name: buzz-postgres
     environment:
       POSTGRES_USER: buzz
@@ -13,6 +13,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/initdb/001-pgvector.sql:/docker-entrypoint-initdb.d/001-pgvector.sql:ro
     networks:
       - buzz-net
     healthcheck:

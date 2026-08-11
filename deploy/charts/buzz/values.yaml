@@ -271,6 +271,12 @@ persistence:
 # points this subchart at that same Secret/key so server and client agree.
 postgresql:
   enabled: false
+  image:
+    registry: docker.io
+    repository: pgvector/pgvector
+    tag: "0.8.5-pg17-bookworm@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0"
+    imagePullPolicy: IfNotPresent
+    useHardenedImage: false
   auth:
     database: buzz
     username: buzz
@@ -280,6 +286,10 @@ postgresql:
   persistence:
     enabled: true
     size: 10Gi
+  initdb:
+    scripts:
+      001-pgvector.sql: |
+        CREATE EXTENSION IF NOT EXISTS vector;
 externalPostgresql:
   url: ""                        # postgres://user:pass@host:5432/db — placeholder example, sadscan:disable np.postgres.1
 

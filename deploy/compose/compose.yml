@@ -47,7 +47,7 @@ services:
       - buzz-net
 
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:0.8.5-pg17-bookworm@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-buzz}
       POSTGRES_USER: ${POSTGRES_USER:-buzz}
@@ -55,6 +55,7 @@ services:
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - buzz-postgres-data:/var/lib/postgresql/data
+      - ../postgres/initdb/001-pgvector.sql:/docker-entrypoint-initdb.d/001-pgvector.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s

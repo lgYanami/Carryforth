@@ -473,6 +473,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if state.config.semantic_worker.enabled {
+        if !state.db.semantic_schema_ready().await? {
+            anyhow::bail!(
+                "BUZZ_SEMANTIC_WORKER_ENABLED requires the pgvector semantic schema; \
+                 run buzz-admin semantic preflight and migrations first"
+            );
+        }
+        tokio::spawn(buzz_relay::semantic_runtime::run(Arc::clone(&state)));
+    } else {
+        info!("Project Context semantic worker disabled");
+    }
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When

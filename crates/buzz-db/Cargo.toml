@@ -14,7 +14,9 @@ buzz-project-document = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-audit = { workspace = true }
+buzz-semantic = { workspace = true }
 sqlx        = { workspace = true }
+pgvector    = { workspace = true }
 tokio       = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

@@ -40,6 +40,8 @@ pub mod push_runtime;
 pub mod router;
 /// Trusted managed-runtime recovery scheduler.
 pub mod runtime_supervision;
+/// Derived Project Context semantic worker and approved provider adapter.
+pub mod semantic_runtime;
 /// Shared application state.
 pub mod state;
 pub mod storage_sweep;

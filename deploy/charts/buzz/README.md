@@ -116,6 +116,15 @@ in PostgreSQL; there is no Pod-local enable environment variable. See the
 [Project View operations runbook](../../../docs/project-view-operations.md) for
 enable, monitoring, signer rotation, and the two rollback boundaries.
 
+The first Project Context semantic-schema rollout also requires decoupled
+migration. PostgreSQL 17 and pgvector 0.8.5 must already be installed and pass
+`buzz-admin semantic preflight`; the migration intentionally does not install
+extensions. The bundled quickstart PostgreSQL image and new-volume init script
+provide pgvector automatically, while existing PVCs require the operator to
+install the extension explicitly. Keep every Community semantic capability off
+until its model generation has been rebuilt and verified. See the
+[semantic pgvector operations runbook](../../../docs/semantic-pgvector-operations.md).
+
 ## Backups
 
 Save these. Losing any of them is data loss. See NOTES.txt printed by `helm install` for the live list:
