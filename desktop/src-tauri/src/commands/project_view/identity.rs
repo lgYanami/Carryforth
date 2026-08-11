@@ -12,7 +12,7 @@ use crate::relay::{
 
 use super::{
     integrity_error, ProjectViewIdentity, ProjectViewSchema, PROJECT_CONTEXT_EXTENSION,
-    PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
+    PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION, PROJECT_VIEW_V3_EXTENSION, SEMANTIC_QUERY_HTTP_EXTENSION,
 };
 
 const PROJECT_CONTEXT_EDGE_EXTENSION: &str = buzz_project_context_pkg::PROJECT_CONTEXT_CAPABILITY;
@@ -33,7 +33,14 @@ pub(crate) async fn read_identity_at(
     state: &AppState,
     api_base_url: &str,
 ) -> Result<Option<ProjectViewIdentity>, String> {
-    let info = read_nip11_at(state, api_base_url).await?;
+    read_identity_at_with_client(api_base_url, &state.http_client).await
+}
+
+pub(crate) async fn read_identity_at_with_client(
+    api_base_url: &str,
+    client: &reqwest::Client,
+) -> Result<Option<ProjectViewIdentity>, String> {
+    let info = read_nip11_at(api_base_url, client).await?;
     let runtime_ready = info
         .supported_extensions
         .iter()
@@ -68,6 +75,10 @@ pub(crate) async fn read_identity_at(
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_CONTEXT_EDGE_EXTENSION),
+        semantic_query_http_available: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == SEMANTIC_QUERY_HTTP_EXTENSION),
     }))
 }
 
@@ -77,7 +88,7 @@ pub(crate) async fn read_project_document_identity_at(
     state: &AppState,
     api_base_url: &str,
 ) -> Result<Option<PublicKey>, String> {
-    let info = read_nip11_at(state, api_base_url).await?;
+    let info = read_nip11_at(api_base_url, &state.http_client).await?;
     if !info
         .supported_extensions
         .iter()
@@ -88,11 +99,13 @@ pub(crate) async fn read_project_document_identity_at(
     parse_relay_self(&info, "Project Document").map(Some)
 }
 
-async fn read_nip11_at(state: &AppState, api_base_url: &str) -> Result<Nip11Document, String> {
+async fn read_nip11_at(
+    api_base_url: &str,
+    client: &reqwest::Client,
+) -> Result<Nip11Document, String> {
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/info", api_base_url.trim_end_matches('/'));
-    let response = state
-        .http_client
+    let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/nostr+json")
         .send()

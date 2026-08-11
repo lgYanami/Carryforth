@@ -2,7 +2,11 @@ import { useEffect, useRef, useState } from "react";
 
 import { relayClient } from "@/shared/api/relayClient";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
-import { applyCommunity, getDefaultRelayUrl } from "@/shared/api/tauri";
+import {
+  applyCommunity,
+  getDefaultRelayUrl,
+  type AppliedWorkspaceIdentity,
+} from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { getOverrides } from "@/shared/features";
 import { resetMediaCaches } from "@/shared/lib/mediaUrl";
@@ -59,7 +63,12 @@ function resetCommunityState({
 }
 
 type CommunityInitResult =
-  | { isReady: true; needsSetup: false; appliedKey: string }
+  | {
+      isReady: true;
+      needsSetup: false;
+      appliedKey: string;
+      appliedWorkspace: AppliedWorkspaceIdentity;
+    }
   | {
       isReady: false;
       needsSetup: true;
@@ -98,8 +107,12 @@ export function useCommunityInit(
   // same-relay reconnect during onboarding must not cancel that work, while an
   // actual relay boundary must clear both the queue and its presentation probe.
   const appliedRelayUrlRef = useRef<string | null>(null);
+  // Identity replacement is also a trust boundary even when the Community and
+  // Relay stay the same. Re-applying publishes a fresh native workspace token,
+  // and avatar work captured under the previous caller must not survive it.
+  const appliedPubkeyRef = useRef<string | null>(null);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: we intentionally depend on specific properties (id/relayUrl/token/reposDir) — depending on the whole object would trigger resets on name-only changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: we intentionally depend on backend-relevant properties rather than the whole object, which would trigger resets on name-only changes
   useEffect(() => {
     let cancelled = false;
 
@@ -161,11 +174,13 @@ export function useCommunityInit(
         }
         resetCommunityState({
           resetAvatarState:
-            appliedRelayUrlRef.current !== activeCommunity.relayUrl,
+            appliedRelayUrlRef.current !== activeCommunity.relayUrl ||
+            appliedPubkeyRef.current !== (activeCommunity.pubkey ?? null),
         });
       }
       hasInitializedRef.current = true;
       appliedRelayUrlRef.current = activeCommunity.relayUrl;
+      appliedPubkeyRef.current = activeCommunity.pubkey ?? null;
 
       // Apply community config to the Tauri backend.
       //
@@ -176,13 +191,15 @@ export function useCommunityInit(
       // and re-applied it on every reload, which silently overwrote any
       // imported key. `loadCommunities()` strips lingering `nsec` fields from
       // legacy entries; this site refuses to apply one even if present.
+      let appliedWorkspace: AppliedWorkspaceIdentity;
       try {
-        await applyCommunity(
+        appliedWorkspace = await applyCommunity(
           activeCommunity.relayUrl,
           undefined,
           activeCommunity.token,
           activeCommunity.reposDir,
           getOverrides().agentManagedProfiles === true,
+          communityKey,
         );
       } catch (error) {
         // A bad `repos_dir` no longer reaches here — `apply_workspace` treats
@@ -238,6 +255,7 @@ export function useCommunityInit(
           isReady: true,
           needsSetup: false,
           appliedKey: communityKey,
+          appliedWorkspace,
         });
       }
     }
@@ -252,6 +270,7 @@ export function useCommunityInit(
     activeCommunity?.relayUrl,
     activeCommunity?.token,
     activeCommunity?.reposDir,
+    activeCommunity?.pubkey,
     _isSharedIdentity,
     communityKey,
   ]);

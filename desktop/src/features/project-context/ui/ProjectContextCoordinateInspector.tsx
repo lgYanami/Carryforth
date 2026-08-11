@@ -265,6 +265,7 @@ export function ProjectContextCoordinateInspector({
   onOpenProjectView,
   onSelectEdge,
   onShowIncident,
+  showIncidentDisabled = false,
   projectViewResult,
   result,
 }: {
@@ -274,6 +275,7 @@ export function ProjectContextCoordinateInspector({
   onOpenProjectView: (objectId: string) => void;
   onSelectEdge: (edgeKey: string) => void;
   onShowIncident: (coordinate: ProjectContextCoordinate) => void;
+  showIncidentDisabled?: boolean;
   projectViewResult?: ProjectViewLoadResult;
   result: ProjectContextQueryResult;
 }) {
@@ -335,6 +337,7 @@ export function ProjectContextCoordinateInspector({
         <Button
           className="mt-3 w-full"
           data-testid="project-context-show-incident"
+          disabled={showIncidentDisabled}
           onClick={() => onShowIncident(coordinate)}
           size="sm"
           type="button"
@@ -343,6 +346,11 @@ export function ProjectContextCoordinateInspector({
           <Network />
           Show incident Context
         </Button>
+        {showIncidentDisabled ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            Clear the semantic result before changing the structural query.
+          </p>
+        ) : null}
       </section>
 
       {detail.state === "tombstoned" ? (

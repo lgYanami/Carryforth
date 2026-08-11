@@ -235,24 +235,10 @@ pub async fn import_identity(
         let store = crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
         crate::app_state::persist_imported_identity(store, &keys, &key_path, &data_dir)?;
 
-        // Update in-memory keys BEFORE clearing recovery flags. The Release
-        // stores below pair with Acquire loads in get_identity: a reader
-        // observing false is guaranteed to see the updated keys.
         let pubkey = keys.public_key();
-        *state.keys.lock().map_err(|e| e.to_string())? = keys;
-
-        // Clear both recovery flags — an import is valid in either lost or
-        // keyring-locked state and resolves both. In the locked case the
-        // keyring is unreachable, so persist_imported_identity already fell
-        // back to identity.key; on the next Unreachable boot the file is
-        // loaded directly and when the keyring returns the adoption path
-        // picks it up.
-        state
-            .identity_lost
-            .store(false, std::sync::atomic::Ordering::Release);
-        state
-            .keyring_locked
-            .store(false, std::sync::atomic::Ordering::Release);
+        // Clear both recovery flags and rotate any applied-workspace token in
+        // the same transition that installs the new caller identity.
+        state.replace_runtime_identity(keys, false, false)?;
 
         let pubkey_hex = pubkey.to_hex();
         let display_name = truncated_display_name(&pubkey)?;
@@ -319,12 +305,9 @@ pub async fn persist_current_identity(
         let store = crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
         crate::app_state::persist_imported_identity(store, &keys, &key_path, &data_dir)?;
 
-        // Keys are already the live identity — only clear identity_lost.
-        // Release pairs with Acquire in get_identity so readers see
-        // consistent state.
-        state
-            .identity_lost
-            .store(false, std::sync::atomic::Ordering::Release);
+        // Keys are already the live identity, but publish the now-signable
+        // tuple atomically and rotate any applied-workspace token.
+        state.replace_runtime_identity(keys.clone(), false, false)?;
 
         let pubkey = keys.public_key();
         let pubkey_hex = pubkey.to_hex();

@@ -12,9 +12,13 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::app_state::AppState;
-use crate::relay::{query_relay, query_relay_at_with_keys_typed, RelayHttpErrorCategory};
+use crate::relay::{
+    query_relay, query_relay_at_with_keys_and_client_typed, query_relay_at_with_keys_typed,
+    RelayHttpError, RelayHttpErrorCategory,
+};
 
 pub(crate) const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
+pub(crate) const SEMANTIC_QUERY_HTTP_EXTENSION: &str = "buzz-project-context-semantic-query-http";
 const SNAPSHOT_PAGE_SIZE: usize = 500;
 const SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 
@@ -35,6 +39,8 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) project_document_supported: bool,
     /// Whether the independent Project Context Edge capability is ready.
     pub(crate) project_context_edge_supported: bool,
+    /// Whether semantic Project Context HTTP query readiness is advertised.
+    pub(crate) semantic_query_http_available: bool,
 }
 
 impl ProjectViewIdentity {
@@ -125,13 +131,17 @@ pub async fn get_project_view(state: State<'_, AppState>) -> Result<ProjectViewL
 
 mod identity;
 use identity::read_identity;
-pub(crate) use identity::{read_identity_at, read_project_document_identity_at};
+pub(crate) use identity::{
+    read_identity_at, read_identity_at_with_client, read_project_document_identity_at,
+};
 mod role_history;
 pub use role_history::*;
 mod v3;
-pub(crate) use v3::fetch_consistent_verified_v3_snapshot_at;
 pub use v3::ProjectViewRoleContinuityV3;
 use v3::{fetch_consistent_v3_snapshot, read_v3_meta, V3ProjectSnapshot};
+pub(crate) use v3::{
+    fetch_consistent_verified_v3_snapshot_at, read_verified_v3_meta_at_with_client,
+};
 
 fn read_error_message(error: ProjectViewReadError) -> String {
     match error {
@@ -214,28 +224,42 @@ pub(crate) async fn query_project_view_at_with_keys(
 ) -> ProjectViewReadResult<Vec<Event>> {
     query_relay_at_with_keys_typed(state, api_base_url, filters, keys, None)
         .await
-        .map_err(|error| match error.category {
-            RelayHttpErrorCategory::Forbidden => ProjectViewReadError::Forbidden,
-            RelayHttpErrorCategory::Conflict => {
-                conflict_error("Project View changed during snapshot pagination")
-            }
-            RelayHttpErrorCategory::Connect
-            | RelayHttpErrorCategory::Timeout
-            | RelayHttpErrorCategory::RateLimited
-            | RelayHttpErrorCategory::Unavailable => {
-                ProjectViewReadError::Unavailable(error.message)
-            }
-            RelayHttpErrorCategory::Http
-                if error
-                    .status
-                    .is_some_and(|status| (500..=504).contains(&status)) =>
-            {
-                ProjectViewReadError::Unavailable(error.message)
-            }
-            RelayHttpErrorCategory::Http
-            | RelayHttpErrorCategory::Malformed
-            | RelayHttpErrorCategory::Internal => ProjectViewReadError::Other(error.message),
-        })
+        .map_err(map_project_view_http_error)
+}
+
+/// Query a pinned Project View through an explicit HTTP redirect policy.
+pub(crate) async fn query_project_view_at_with_keys_and_client(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    keys: &Keys,
+    filters: &[serde_json::Value],
+) -> ProjectViewReadResult<Vec<Event>> {
+    query_relay_at_with_keys_and_client_typed(client, api_base_url, filters, keys, None)
+        .await
+        .map_err(map_project_view_http_error)
+}
+
+fn map_project_view_http_error(error: RelayHttpError) -> ProjectViewReadError {
+    match error.category {
+        RelayHttpErrorCategory::Forbidden => ProjectViewReadError::Forbidden,
+        RelayHttpErrorCategory::Conflict => {
+            conflict_error("Project View changed during snapshot pagination")
+        }
+        RelayHttpErrorCategory::Connect
+        | RelayHttpErrorCategory::Timeout
+        | RelayHttpErrorCategory::RateLimited
+        | RelayHttpErrorCategory::Unavailable => ProjectViewReadError::Unavailable(error.message),
+        RelayHttpErrorCategory::Http
+            if error
+                .status
+                .is_some_and(|status| (500..=504).contains(&status)) =>
+        {
+            ProjectViewReadError::Unavailable(error.message)
+        }
+        RelayHttpErrorCategory::Http
+        | RelayHttpErrorCategory::Malformed
+        | RelayHttpErrorCategory::Internal => ProjectViewReadError::Other(error.message),
+    }
 }
 fn conflict_error(message: impl Into<String>) -> ProjectViewReadError {
     ProjectViewReadError::Conflict(message.into())

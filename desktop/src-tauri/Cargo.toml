@@ -93,6 +93,7 @@ buzz_project_document_pkg = { package = "buzz-project-document", path = "../../c
 buzz_project_view_pkg = { package = "buzz-project-view", path = "../../crates/buzz-project-view" }
 buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona" }
 buzz_sdk_pkg = { package = "buzz-sdk", path = "../../crates/buzz-sdk" }
+buzz_semantic_query_pkg = { package = "buzz-semantic-query", path = "../../crates/buzz-semantic-query" }
 buzz_agent_pkg = { package = "buzz-agent", path = "../../crates/buzz-agent" }
 iroh = { version = "1.0.2", optional = true }
 mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "c441ea7f328692b18b7f49ad819c7b1a603cbdcb", package = "mesh-llm-sdk", default-features = false, features = ["client", "serving"], optional = true }

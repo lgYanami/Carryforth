@@ -17,6 +17,73 @@ use crate::SdkError;
 
 const RESULT_MARKER: &str = "buzz-project-context-semantic-result";
 
+/// Canonical semantic graph HTTP request and the exact serialized body.
+///
+/// The exact bytes are the only bytes that may be supplied both to the
+/// `POST /query` request body and to the NIP-98 payload hash.  Consumers must
+/// not reserialize [`Self::request`] after signing: even an equivalent JSON
+/// encoding would break the Relay's request-binding proof.
+#[derive(Clone)]
+pub struct SemanticGraphHttpQueryRequest {
+    /// Validated, canonical request embedded in the exclusive query filter.
+    pub request: SemanticGraphQuery,
+    /// Byte-for-byte JSON body for the authenticated `POST /query` attempt.
+    pub exact_body: Vec<u8>,
+}
+
+impl std::fmt::Debug for SemanticGraphHttpQueryRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticGraphHttpQueryRequest")
+            .field("request", &"<redacted>")
+            .field("request_id", &self.request.request_id)
+            .field(
+                "exact_body",
+                &format_args!("<redacted:{} bytes>", self.exact_body.len()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticGraphQueryFilter<'a> {
+    kinds: [u32; 1],
+    authors: [String; 1],
+    #[serde(rename = "#p")]
+    caller: [String; 1],
+    limit: u8,
+    buzz_project_context_semantic: &'a SemanticGraphQuery,
+}
+
+/// Validate and serialize the one canonical semantic graph `/query` filter.
+///
+/// The returned body is exactly one JSON filter whose only keys are `kinds`,
+/// `authors`, `#p`, `limit`, and `buzz_project_context_semantic`. The Relay
+/// author and authenticated caller are derived from the supplied public keys;
+/// callers cannot inject alternate filter fields or identities.
+pub fn build_semantic_graph_http_query_request(
+    request: SemanticGraphQuery,
+    expected_relay: &PublicKey,
+    authenticated_caller: &PublicKey,
+) -> Result<SemanticGraphHttpQueryRequest, SdkError> {
+    let request = request
+        .validate_and_canonicalize()
+        .map_err(|error| SdkError::InvalidInput(format!("invalid semantic query: {error}")))?;
+    let filter = SemanticGraphQueryFilter {
+        kinds: [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
+        authors: [expected_relay.to_hex()],
+        caller: [authenticated_caller.to_hex()],
+        limit: 1,
+        buzz_project_context_semantic: &request,
+    };
+    let exact_body = serde_json::to_vec(&[filter])
+        .map_err(|error| SdkError::InvalidInput(format!("serialize semantic query: {error}")))?;
+    Ok(SemanticGraphHttpQueryRequest {
+        request,
+        exact_body,
+    })
+}
+
 /// The authenticated HTTP transcript and request expected by a result verifier.
 ///
 /// `project_id` must come from host resolution. `exact_authenticated_body` is
@@ -267,6 +334,8 @@ fn invalid_projection(message: impl Into<String>) -> SdkError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use buzz_core::kind::KIND_HTTP_AUTH;
     use buzz_core::{CommunityId, Keys};
     use buzz_project_context::{canonicalize_coordinates, EdgeKey, ProjectContextCoordinate};
@@ -300,8 +369,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_semantic_graph_query_result, parse_semantic_graph_query_result,
-        SemanticGraphHttpRequestObservation, RESULT_MARKER,
+        build_semantic_graph_http_query_request, build_semantic_graph_query_result,
+        parse_semantic_graph_query_result, SemanticGraphHttpRequestObservation, RESULT_MARKER,
     };
 
     struct Fixture {
@@ -770,6 +839,70 @@ mod tests {
         assert!(!rendered.contains(&fixture.request.problem));
         assert!(!rendered
             .contains(std::str::from_utf8(&fixture.body).expect("request body fixture is UTF-8")));
+    }
+
+    #[test]
+    fn http_query_request_is_canonical_closed_and_redacted() {
+        let relay = Keys::generate();
+        let caller = Keys::generate();
+        let mut request = SemanticGraphQuery {
+            request_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            problem: "  secret release problem  ".to_owned(),
+            initial_coordinates: vec![coordinate(ProjectViewObjectType::Issue, 22)],
+            context_coordinates: vec![coordinate(ProjectViewObjectType::Role, 21)],
+            lifecycle_filter: LifecycleFilter::AllCurrent,
+            budget: SemanticGraphQueryBudget::default(),
+        };
+        request
+            .initial_coordinates
+            .push(request.initial_coordinates[0].clone());
+
+        let prepared = build_semantic_graph_http_query_request(
+            request,
+            &relay.public_key(),
+            &caller.public_key(),
+        )
+        .expect("valid semantic query request");
+        assert_eq!(prepared.request.problem, "secret release problem");
+        assert_eq!(prepared.request.initial_coordinates.len(), 1);
+
+        let [filter]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&prepared.exact_body)
+            .expect("canonical HTTP body")
+            .try_into()
+            .expect("one filter");
+        assert_eq!(
+            filter
+                .as_object()
+                .expect("filter object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "#p",
+                "authors",
+                "buzz_project_context_semantic",
+                "kinds",
+                "limit",
+            ])
+        );
+        assert_eq!(
+            filter["authors"],
+            serde_json::json!([relay.public_key().to_hex()])
+        );
+        assert_eq!(
+            filter["#p"],
+            serde_json::json!([caller.public_key().to_hex()])
+        );
+        assert!(filter["buzz_project_context_semantic"]
+            .get("schema_version")
+            .is_none());
+
+        let rendered = format!("{prepared:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("secret release problem"));
+        assert!(!rendered
+            .contains(std::str::from_utf8(&prepared.exact_body).expect("body must be UTF-8")));
     }
 
     #[test]

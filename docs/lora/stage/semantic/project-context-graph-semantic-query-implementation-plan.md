@@ -26,8 +26,10 @@
 > exact 检索灰度和后续 ANN 退出门
 >
 > 明确排除：正文 chunk、Runtime 自由文本、Edge summary / embedding、Coordinate 自有 embedding、
-> LLM / cross-encoder rerank、Desktop、历史 Revision 检索、NIP-50 改造、自动修改 canonical summary、
-> 独立图数据库、首版生产 ANN
+> LLM / cross-encoder rerank、Desktop consumer（由
+> [Desktop Project Context 语义路径查询计划](./desktop/project-context-semantic-query-desktop-implementation-plan.md)
+> 独立交付，不属于本计划 Phase 0–6 的完成条件）、历史 Revision 检索、NIP-50 改造、自动修改
+> canonical summary、独立图数据库、首版生产 ANN
 
 ## 0. 当前交付状态
 

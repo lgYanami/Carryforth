@@ -48,6 +48,18 @@ export function ProjectContextCoordinateNode({
   const Icon = coordinateIcon(data);
   const isTombstoned = data.coordinate.state === "tombstoned";
   const isUnavailable = data.coordinate.state === "unavailable";
+  const semanticDescription = [
+    data.semanticRoot ? "Semantic root" : undefined,
+    data.semanticTerminal ? "Semantic path end" : undefined,
+    !data.semanticRoot &&
+    !data.semanticTerminal &&
+    data.semanticEmphasis === "route"
+      ? "In semantic route"
+      : undefined,
+    data.semanticEmphasis === "member" ? "Semantic path member" : undefined,
+  ]
+    .filter(Boolean)
+    .join(", ");
   const style = {
     "--project-context-island-hue": data.hue,
   } as CSSProperties;
@@ -65,6 +77,9 @@ export function ProjectContextCoordinateNode({
       data-island={data.islandIndex}
       data-lifecycle={data.coordinate.state}
       data-query-anchor={data.queryAnchor}
+      data-semantic-emphasis={data.semanticEmphasis}
+      data-semantic-root={data.semanticRoot}
+      data-semantic-terminal={data.semanticTerminal}
       data-testid={`project-context-coordinate-${data.coordinate.coordinateKey}`}
       style={style}
     >
@@ -74,8 +89,24 @@ export function ProjectContextCoordinateNode({
           Query anchor
         </span>
       ) : null}
+      {data.semanticRoot ? (
+        <span
+          aria-hidden
+          className="project-context-semantic-marker project-context-semantic-marker--root absolute -top-2.5 left-2 z-10 rounded-full px-2 py-0.5 text-3xs font-bold uppercase tracking-wider"
+        >
+          Semantic root
+        </span>
+      ) : null}
+      {data.semanticTerminal ? (
+        <span
+          aria-hidden
+          className="project-context-semantic-marker project-context-semantic-marker--terminal absolute -bottom-2.5 right-2 z-10 rounded-full px-2 py-0.5 text-3xs font-bold uppercase tracking-wider"
+        >
+          Path end
+        </span>
+      ) : null}
       <button
-        aria-label={`${data.queryAnchor ? "Query anchor, " : ""}${isTombstoned ? "Tombstoned, " : isUnavailable ? "Unavailable, " : ""}Select ${data.coordinate.typeLabel} ${data.coordinate.displayTitle}`}
+        aria-label={`${semanticDescription ? `${semanticDescription}, ` : ""}${data.queryAnchor ? "Query anchor, " : ""}${isTombstoned ? "Tombstoned, " : isUnavailable ? "Unavailable, " : ""}Select ${data.coordinate.typeLabel} ${data.coordinate.displayTitle}`}
         aria-pressed={data.selected}
         className="nodrag nopan flex h-full w-full items-start gap-3 rounded-xl px-3 py-3 text-left outline-none"
         type="button"

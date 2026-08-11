@@ -52,6 +52,7 @@ import type {
   RawConnectAcpRuntimeResult,
 } from "@/shared/api/tauriAgentAuth";
 import type {
+  AppliedWorkspaceIdentity,
   RawAcpRuntimeCatalogEntry,
   RawInstallRuntimeResult,
   RuntimeFileConfigSubset,
@@ -73,6 +74,10 @@ import type {
   ProjectContextErrorPayload,
   ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
+import type {
+  SemanticProjectContextErrorPayload,
+  SemanticProjectContextQueryResult,
+} from "@/shared/api/tauriProjectContextSemantic";
 import type {
   CreateMeetingInput,
   CreateMeetingResult,
@@ -192,6 +197,15 @@ export type MockProjectContextReadStep = {
   error?: ProjectContextErrorPayload | null;
   /** A trusted result for this read, overriding query and Relay fixtures. */
   result?: ProjectContextQueryResult;
+};
+
+export type MockProjectContextSemanticQueryStep = {
+  /** Per-query latency, overriding the persistent semantic query delay. */
+  delayMs?: number;
+  /** A structured native failure for this query; null explicitly succeeds. */
+  error?: SemanticProjectContextErrorPayload | null;
+  /** An exact trusted display DTO, including identity echoes for race tests. */
+  result?: SemanticProjectContextQueryResult;
 };
 
 type MockMeetingSeed = {
@@ -380,6 +394,17 @@ type E2eConfig = {
     projectContextReadError?: ProjectContextErrorPayload;
     /** Success/failure sequence for successive trusted Context reads. */
     projectContextReadSequence?: MockProjectContextReadStep[];
+    /** Trusted, body-free Project Context semantic query result. */
+    projectContextSemantic?: SemanticProjectContextQueryResult;
+    /** Community-isolated semantic results keyed by the pinned Relay URL. */
+    projectContextSemanticByRelayUrl?: Record<
+      string,
+      SemanticProjectContextQueryResult
+    >;
+    projectContextSemanticDelayMs?: number;
+    projectContextSemanticError?: SemanticProjectContextErrorPayload;
+    /** Success/failure sequence for successive semantic queries. */
+    projectContextSemanticSequence?: MockProjectContextSemanticQueryStep[];
     /** Verified Project Document catalog and immutable revision fixtures. */
     projectDocument?: MockProjectDocumentState;
     /** Community-isolated Document fixtures keyed by applied Relay URL. */
@@ -1290,6 +1315,26 @@ declare global {
     /** Replace and rewind the trusted Project Context read sequence. */
     __BUZZ_E2E_SET_PROJECT_CONTEXT_READ_SEQUENCE__?: (
       sequence: MockProjectContextReadStep[],
+    ) => void;
+    /** Trusted semantic query calls, including the Relay pinned at invocation. */
+    __BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?: Array<{
+      payload: unknown;
+      relayUrl: string;
+    }>;
+    /** Latest identity returned by the mocked atomic workspace apply. */
+    __BUZZ_E2E_APPLIED_WORKSPACE__?: AppliedWorkspaceIdentity;
+    /** Replace the trusted semantic result for one Relay. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC__?: (
+      result: SemanticProjectContextQueryResult,
+      relayUrl?: string,
+    ) => void;
+    /** Set or clear the structured semantic query error. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC_ERROR__?: (
+      error?: SemanticProjectContextErrorPayload,
+    ) => void;
+    /** Replace and rewind the semantic success/failure sequence. */
+    __BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC_SEQUENCE__?: (
+      sequence: MockProjectContextSemanticQueryStep[],
     ) => void;
     /** Emit an untrusted Context projection hint through the mock live socket. */
     __BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__?: (input?: {
@@ -4289,6 +4334,7 @@ const mockReminderEvents: RelayEvent[] = [];
 let mockRelayMembers: RawRelayMember[] = [];
 const mockSockets = new Map<number, MockSocket>();
 let mockAppliedRelayUrl = DEFAULT_RELAY_WS_URL;
+let mockAppliedWorkspaceGeneration = 0;
 let mockWebsocketSendMutexWedged = false;
 let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
@@ -10484,6 +10530,7 @@ function disconnectMockSocket(id: number) {
 }
 
 let mockProjectContextReadSequenceIndex = 0;
+let mockProjectContextSemanticSequenceIndex = 0;
 let mockProjectDocumentSequence = 1;
 
 function projectDocumentState(
@@ -10683,6 +10730,8 @@ export function maybeInstallE2eTauriMocks() {
 
   mockClosedChannelLiveSubscription = false;
   mockAppliedRelayUrl = getRelayWsUrl(config);
+  mockAppliedWorkspaceGeneration = 0;
+  window.__BUZZ_E2E_APPLIED_WORKSPACE__ = undefined;
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
     ? { ...config.mock.globalAgentConfig }
     : null;
@@ -10836,8 +10885,10 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_MUTATIONS__ = [];
   window.__BUZZ_E2E_PROJECT_VIEW_ROLE_HISTORY_REQUESTS__ = [];
   window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ = [];
+  window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__ = [];
   window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ = [];
   mockProjectContextReadSequenceIndex = 0;
+  mockProjectContextSemanticSequenceIndex = 0;
   mockProjectDocumentSequence = 1;
   window.__BUZZ_E2E_SET_PROJECT_VIEW__ = (result, relayUrl) => {
     if (!config.mock) {
@@ -10904,6 +10955,39 @@ export function maybeInstallE2eTauriMocks() {
     }
     config.mock.projectContextReadSequence = structuredClone(sequence);
     mockProjectContextReadSequenceIndex = 0;
+  };
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC__ = (result, relayUrl) => {
+    if (!config.mock) {
+      throw new Error(
+        "Mock Project Context semantic query is unavailable in relay mode.",
+      );
+    }
+    const targetRelayUrl = relayUrl ?? mockAppliedRelayUrl;
+    if (config.mock.projectContextSemanticByRelayUrl && targetRelayUrl) {
+      config.mock.projectContextSemanticByRelayUrl[targetRelayUrl] =
+        structuredClone(result);
+    } else {
+      config.mock.projectContextSemantic = structuredClone(result);
+    }
+  };
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC_ERROR__ = (error) => {
+    if (!config.mock) {
+      throw new Error(
+        "Mock Project Context semantic query is unavailable in relay mode.",
+      );
+    }
+    config.mock.projectContextSemanticError = error
+      ? structuredClone(error)
+      : undefined;
+  };
+  window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC_SEQUENCE__ = (sequence) => {
+    if (!config.mock) {
+      throw new Error(
+        "Mock Project Context semantic query is unavailable in relay mode.",
+      );
+    }
+    config.mock.projectContextSemanticSequence = structuredClone(sequence);
+    mockProjectContextSemanticSequenceIndex = 0;
   };
   window.__BUZZ_E2E_EMIT_PROJECT_CONTEXT_EVENT__ = (input) => {
     const result =
@@ -11229,10 +11313,22 @@ export function maybeInstallE2eTauriMocks() {
             window.setTimeout(resolve, applyDelayMs),
           );
         }
-        mockAppliedRelayUrl =
-          (payload as { relayUrl?: string } | null)?.relayUrl ??
-          mockAppliedRelayUrl;
-        return;
+        const input = payload as {
+          communityKey?: string;
+          relayUrl?: string;
+        } | null;
+        mockAppliedRelayUrl = input?.relayUrl ?? mockAppliedRelayUrl;
+        mockAppliedWorkspaceGeneration += 1;
+        const appliedWorkspace = {
+          communityKey:
+            input?.communityKey ??
+            `e2e-unknown-community-${mockAppliedWorkspaceGeneration}`,
+          appliedWorkspaceToken: `e2e-workspace-${mockAppliedWorkspaceGeneration}`,
+          callerPubkey: identity?.pubkey ?? DEFAULT_MOCK_IDENTITY.pubkey,
+        } satisfies AppliedWorkspaceIdentity;
+        window.__BUZZ_E2E_APPLIED_WORKSPACE__ =
+          structuredClone(appliedWorkspace);
+        return appliedWorkspace;
       }
       case "get_profile":
         return handleGetProfile(activeConfig);
@@ -12939,6 +13035,59 @@ export function maybeInstallE2eTauriMocks() {
           communityKey: input.communityKey,
           query: structuredClone(input.query),
         };
+      }
+      case "query_project_context_semantic": {
+        // Capture the Relay before any delay so a concurrent Community switch
+        // cannot make this in-flight request appear to have targeted the new
+        // workspace in E2E assertions.
+        const requestRelayUrl = mockAppliedRelayUrl;
+        window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?.push({
+          payload: structuredClone(payload),
+          relayUrl: requestRelayUrl,
+        });
+        const sequence = activeConfig?.mock?.projectContextSemanticSequence;
+        const step = sequence?.length
+          ? sequence[
+              Math.min(
+                mockProjectContextSemanticSequenceIndex,
+                sequence.length - 1,
+              )
+            ]
+          : undefined;
+        if (step) {
+          mockProjectContextSemanticSequenceIndex += 1;
+        }
+        const delayMs =
+          step?.delayMs ??
+          activeConfig?.mock?.projectContextSemanticDelayMs ??
+          0;
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        if (step?.error) {
+          throw structuredClone(step.error);
+        }
+        if (!step && activeConfig?.mock?.projectContextSemanticError) {
+          throw structuredClone(activeConfig.mock.projectContextSemanticError);
+        }
+        const result =
+          step?.result ??
+          activeConfig?.mock?.projectContextSemanticByRelayUrl?.[
+            requestRelayUrl
+          ] ??
+          activeConfig?.mock?.projectContextSemantic;
+        if (!result) {
+          throw {
+            code: "unsupported",
+            message:
+              "This Community does not support Project Context semantic query.",
+            retryable: false,
+          } satisfies SemanticProjectContextErrorPayload;
+        }
+        // Return the fixture exactly. Tests must be able to inject a stale
+        // token/caller/Project/Relay echo and prove TS response acceptance
+        // fails closed rather than having the mock repair the mismatch.
+        return structuredClone(result);
       }
       case "get_project_document_meta": {
         recordProjectDocumentCall(command, payload);

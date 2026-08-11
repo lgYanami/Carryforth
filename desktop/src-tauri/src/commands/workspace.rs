@@ -54,6 +54,15 @@ pub struct ActiveWorkspaceInfo {
     pubkey: String,
 }
 
+/// Native acceptance identity published by one completed workspace apply.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedWorkspaceInfo {
+    community_key: String,
+    applied_workspace_token: String,
+    caller_pubkey: String,
+}
+
 /// Returns the current active workspace info (relay URL + pubkey).
 #[tauri::command]
 pub fn get_active_workspace(state: State<'_, AppState>) -> Result<ActiveWorkspaceInfo, String> {
@@ -105,14 +114,21 @@ pub async fn apply_workspace(
     nsec: Option<String>,
     repos_dir: Option<String>,
     agent_managed_profiles: Option<bool>,
+    community_key: String,
     app: AppHandle,
-) -> Result<(), String> {
+) -> Result<AppliedWorkspaceInfo, String> {
     // Fail before any key, relay, filesystem, or runtime mutation. In a
     // local-only binary this also prevents a stale persisted remote community
     // from becoming an active backend workspace.
     let relay_url = relay::validate_workspace_relay_url(&relay_url)?;
+    if community_key.trim().is_empty()
+        || community_key.as_bytes().contains(&0)
+        || community_key.len() > 1024
+    {
+        return Err("invalid community key".to_owned());
+    }
     let restore_app = app.clone();
-    tokio::task::spawn_blocking(move || {
+    let applied = tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
 
         // ── Validate before mutating ──────────────────────────────────────────
@@ -144,20 +160,15 @@ pub async fn apply_workspace(
         };
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
+        // Serialize with import/persist identity, then publish relay + caller +
+        // opaque Community token through one workspace transition boundary.
+        let _identity_guard = state.identity_mutation.lock().map_err(|e| e.to_string())?;
         state.meeting_action_renewals.cancel_all();
         state.meeting_grant_renewals.cancel_all();
-        {
-            let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
-            *override_guard = Some(relay_url);
-        }
+        let applied = state.apply_workspace_transition(community_key, relay_url, parsed_keys)?;
         // Reset the Rust-side admission gate when switching workspace/community,
         // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
         crate::relay_admission::reset_gate_for_workspace_change();
-
-        if let Some(keys) = parsed_keys {
-            let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
-            *keys_guard = keys;
-        }
 
         // Keep the backend-side reconcile guard aligned with the frontend
         // experiment before launch-time restore can spawn any agents. Missing
@@ -188,7 +199,11 @@ pub async fn apply_workspace(
 
         try_regenerate_nest(&app);
 
-        Ok::<(), String>(())
+        Ok::<AppliedWorkspaceInfo, String>(AppliedWorkspaceInfo {
+            community_key: applied.community_key,
+            applied_workspace_token: applied.applied_workspace_token,
+            caller_pubkey: applied.caller.to_hex(),
+        })
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
@@ -241,5 +256,5 @@ pub async fn apply_workspace(
         });
     }
 
-    Ok(())
+    Ok(applied)
 }

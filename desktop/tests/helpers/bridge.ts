@@ -15,7 +15,14 @@ import type {
   ProjectContextErrorPayload,
   ProjectContextQueryResult,
 } from "../../src/shared/api/tauriProjectContext";
-import type { MockProjectDocumentState } from "../../src/testing/e2eBridge";
+import type {
+  SemanticProjectContextErrorPayload,
+  SemanticProjectContextQueryResult,
+} from "../../src/shared/api/tauriProjectContextSemantic";
+import type {
+  MockProjectContextSemanticQueryStep,
+  MockProjectDocumentState,
+} from "../../src/testing/e2eBridge";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
 export const TEST_IDENTITIES = {
@@ -195,6 +202,17 @@ type MockBridgeOptions = {
   projectContextReadDelayMs?: number;
   projectContextReadDelayMsByRelayUrl?: Record<string, number>;
   projectContextReadError?: ProjectContextErrorPayload;
+  /** Trusted, body-free Project Context semantic query result. */
+  projectContextSemantic?: SemanticProjectContextQueryResult;
+  /** Community-isolated semantic results keyed by the pinned Relay URL. */
+  projectContextSemanticByRelayUrl?: Record<
+    string,
+    SemanticProjectContextQueryResult
+  >;
+  projectContextSemanticDelayMs?: number;
+  projectContextSemanticError?: SemanticProjectContextErrorPayload;
+  /** Success/failure sequence for successive semantic query attempts. */
+  projectContextSemanticSequence?: MockProjectContextSemanticQueryStep[];
   projectDocument?: MockProjectDocumentState;
   projectDocumentsByRelayUrl?: Record<string, MockProjectDocumentState>;
   projectDocumentReadDelayMs?: number;

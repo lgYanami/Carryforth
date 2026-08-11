@@ -38,6 +38,7 @@ import { KeyringLockedScreen } from "@/features/onboarding/ui/KeyringLockedScree
 import { RelaunchRequiredScreen } from "@/features/onboarding/ui/RelaunchRequiredScreen";
 import { ResetFailedScreen } from "@/features/onboarding/ui/ResetFailedScreen";
 import { useCommunityInit } from "@/features/communities/useCommunityInit";
+import { AppliedWorkspaceProvider } from "@/features/communities/AppliedWorkspaceContext";
 import { useNestNotifications } from "@/features/communities/useNestNotifications";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
@@ -489,7 +490,11 @@ function CommunityApp({
   // a one-render race where React sees the new active community while the
   // Tauri backend is still configured for the previous one.
   const communityApplied =
-    community.isReady && community.appliedKey === communityKey;
+    community.isReady &&
+    community.appliedKey === communityKey &&
+    currentPubkey !== null &&
+    community.appliedWorkspace.callerPubkey.toLowerCase() ===
+      currentPubkey.toLowerCase();
   useLayoutEffect(() => {
     if (communityApplied) {
       completeCommunityViewTransition();
@@ -498,24 +503,26 @@ function CommunityApp({
   if (appContent === null && (!transaction || isEnteringCurtain)) {
     appContent = communityApplied ? (
       <CommunityQueryProvider key={communityKey}>
-        <AppReady
-          isCommunitySwitch={isCommunitySwitch}
-          key={communityKey}
-          isSharedIdentity={sharedIdentity}
-        />
-        {showBootSplashOverlay ? (
-          <div
-            aria-hidden="true"
-            className={cn(
-              "fixed inset-0 z-50 transition-opacity",
-              bootSplashPhase === "fading" ? "opacity-0" : "opacity-100",
-            )}
-            data-testid="boot-splash-overlay"
-            style={{ transitionDuration: `${BOOT_SPLASH_FADE_MS}ms` }}
-          >
-            <AppLoadingGate />
-          </div>
-        ) : null}
+        <AppliedWorkspaceProvider value={community.appliedWorkspace}>
+          <AppReady
+            isCommunitySwitch={isCommunitySwitch}
+            key={communityKey}
+            isSharedIdentity={sharedIdentity}
+          />
+          {showBootSplashOverlay ? (
+            <div
+              aria-hidden="true"
+              className={cn(
+                "fixed inset-0 z-50 transition-opacity",
+                bootSplashPhase === "fading" ? "opacity-0" : "opacity-100",
+              )}
+              data-testid="boot-splash-overlay"
+              style={{ transitionDuration: `${BOOT_SPLASH_FADE_MS}ms` }}
+            >
+              <AppLoadingGate />
+            </div>
+          ) : null}
+        </AppliedWorkspaceProvider>
       </CommunityQueryProvider>
     ) : isCommunitySwitch ? (
       <CommunitySwitchGate />

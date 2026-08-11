@@ -85,6 +85,9 @@ export function ProjectContextInspector({
   projectViewResult,
   result,
   selection,
+  semanticRelationDocumentIds,
+  semanticRootRelationDocumentIds,
+  showIncidentDisabled = false,
 }: {
   onClose: () => void;
   onFocusSelection: () => void;
@@ -96,6 +99,9 @@ export function ProjectContextInspector({
   projectViewResult?: ProjectViewLoadResult;
   result: ProjectContextQueryResult;
   selection: ProjectContextRouteSelection;
+  semanticRelationDocumentIds?: ReadonlySet<string>;
+  semanticRootRelationDocumentIds?: ReadonlySet<string>;
+  showIncidentDisabled?: boolean;
 }) {
   useEscapeKey(onClose);
   const inspectorWidth = useProjectContextInspectorWidth();
@@ -148,6 +154,7 @@ export function ProjectContextInspector({
             onShowIncident={onShowIncident}
             projectViewResult={projectViewResult}
             result={result}
+            showIncidentDisabled={showIncidentDisabled}
           />
         ) : (
           <ProjectContextEdgeInspector
@@ -155,6 +162,8 @@ export function ProjectContextInspector({
             onOpenDocument={onOpenDocument}
             onSelectCoordinate={(key) => onSelect({ kind: "coordinate", key })}
             result={result}
+            semanticRelationDocumentIds={semanticRelationDocumentIds}
+            semanticRootRelationDocumentIds={semanticRootRelationDocumentIds}
           />
         )}
       </AuxiliaryPanelBody>

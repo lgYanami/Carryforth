@@ -5,6 +5,8 @@ import type {
   ProjectContextQuery,
   ProjectContextQueryResult,
 } from "../../src/shared/api/tauriProjectContext";
+import type { SemanticProjectContextQueryResult } from "../../src/shared/api/tauriProjectContextSemantic";
+import type { AppliedWorkspaceIdentity } from "../../src/shared/api/tauri";
 import type { MeetingSnapshot } from "../../src/shared/api/tauriMeetings";
 import type {
   ProjectDocument,
@@ -712,6 +714,86 @@ function inspectorResult(): ProjectContextQueryResult {
   };
 }
 
+function semanticCapableInspectorResult(): ProjectContextQueryResult {
+  const result = inspectorResult();
+  return {
+    ...result,
+    context: {
+      ...result.context,
+      semanticQueryAvailable: true,
+    },
+  };
+}
+
+function semanticResult(
+  workspace: AppliedWorkspaceIdentity,
+  requestId = "60000000-0000-4000-8000-000000000001",
+): SemanticProjectContextQueryResult {
+  return {
+    communityKey: workspace.communityKey,
+    appliedWorkspaceToken: workspace.appliedWorkspaceToken,
+    callerPubkey: workspace.callerPubkey,
+    requestId,
+    projectId: PROJECT_ID,
+    relayPubkey: RELAY,
+    projectContextRevision: 7,
+    snapshotObservedAt: "2026-08-11T08:00:00Z",
+    completionReason: "frontier_exhausted",
+    exhaustedDimensions: [],
+    coverage: {
+      authorizedGraphSources: 8,
+      currentIndexedGraphSources: 8,
+      titleOnlySources: 0,
+      rootsReturned: 1,
+      pathsReturned: 1,
+      omittedInitialCoordinates: 0,
+      omittedContextCoordinates: 0,
+      indexCoveragePartial: 0,
+      omittedForResponseBudget: {
+        automaticRoots: 0,
+        paths: 0,
+        summaries: 0,
+      },
+    },
+    inputOutcomes: {
+      initial: [],
+      context: [],
+    },
+    roots: [
+      {
+        rootId: "semantic-root-1",
+        coordinateEntrypoints: [`requirement:${REQUIREMENT_ID}`],
+        contextDocumentEntrypoints: [],
+      },
+    ],
+    paths: [
+      {
+        pathId: "semantic-path-1",
+        rootId: "semantic-root-1",
+        branchStopReason: "frontier_exhausted",
+        hops: [
+          {
+            ordinal: 0,
+            edgeKey: "1".repeat(64),
+            completeCoordinateKeys: [
+              `goal:${GOAL_ID}`,
+              `requirement:${REQUIREMENT_ID}`,
+              `resource:${RESOURCE_ID}`,
+            ],
+            currentContextDocumentIds: [
+              CONTEXT_DOCUMENT_A_ID,
+              CONTEXT_DOCUMENT_B_ID,
+            ],
+            enteredFromCoordinateKey: `requirement:${REQUIREMENT_ID}`,
+            selectedContextDocumentId: CONTEXT_DOCUMENT_A_ID,
+            continuedToCoordinateKey: `resource:${RESOURCE_ID}`,
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function twoIslandResult(): ProjectContextQueryResult {
   const base = contextResult();
   return {
@@ -869,6 +951,51 @@ async function openProjectContext(page: import("@playwright/test").Page) {
   await expect(page).toHaveURL(/#\/project-context$/);
 }
 
+async function seedSemanticResult(
+  page: import("@playwright/test").Page,
+  input?: { delayedByMs?: number; requestId?: string },
+) {
+  await expect
+    .poll(() =>
+      page.evaluate(() => window.__BUZZ_E2E_APPLIED_WORKSPACE__ ?? null),
+    )
+    .not.toBeNull();
+  const workspace = await page.evaluate(
+    () => window.__BUZZ_E2E_APPLIED_WORKSPACE__ ?? null,
+  );
+  if (!workspace) throw new Error("Mock workspace identity was not applied.");
+  const result = semanticResult(workspace, input?.requestId);
+  const installed = await page.evaluate(
+    ({ delayedByMs, semantic }) => {
+      if (delayedByMs !== undefined) {
+        window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC_SEQUENCE__?.([
+          { delayMs: delayedByMs, result: semantic },
+        ]);
+      } else {
+        window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC__?.(semantic);
+      }
+      return Boolean(
+        delayedByMs !== undefined
+          ? window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC_SEQUENCE__
+          : window.__BUZZ_E2E_SET_PROJECT_CONTEXT_SEMANTIC__,
+      );
+    },
+    { delayedByMs: input?.delayedByMs, semantic: result },
+  );
+  expect(installed).toBe(true);
+  return { result, workspace };
+}
+
+async function waitForSemanticOverlay(page: import("@playwright/test").Page) {
+  await expect(page.getByTestId("project-context-graph")).toHaveAttribute(
+    "data-semantic-overlay",
+    "active",
+  );
+  await expect(
+    page.getByTestId("project-context-semantic-legend"),
+  ).toBeVisible();
+}
+
 async function seedCommunities(page: import("@playwright/test").Page) {
   await page.addInitScript(
     ({ active, communities }) => {
@@ -943,6 +1070,243 @@ test("sidebar order, active route, and default All query reach the trusted graph
       JSON.stringify(call.payload).includes('"type":"contains_all"'),
     ),
   ).toBe(true);
+});
+
+test("semantic query submits problem-only and explicit Coordinate roles through the closed native payload", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await installMockBridge(page, {
+    projectContext: semanticCapableInspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  const { workspace } = await seedSemanticResult(page);
+
+  const problem = page.getByTestId("project-context-semantic-problem");
+  const run = page.getByTestId("project-context-semantic-run");
+  await expect(run).toBeDisabled();
+  await problem.fill("  Why did the release issue keep recurring?  ");
+  await expect(run).toBeEnabled();
+  await run.click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+  const problemOnlyCall = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?.[0],
+  );
+  expect(problemOnlyCall?.relayUrl).toBe(COMMUNITY_A.relayUrl);
+  expect(problemOnlyCall?.payload).toEqual({
+    input: {
+      communityKey: workspace.communityKey,
+      appliedWorkspaceToken: workspace.appliedWorkspaceToken,
+      problem: "Why did the release issue keep recurring?",
+      initialCoordinates: [],
+      contextCoordinates: [],
+    },
+  });
+  await waitForSemanticOverlay(page);
+
+  const semanticBar = page.getByTestId("project-context-semantic-query-bar");
+  await semanticBar.locator("details > summary").click();
+  await page.getByTestId("project-context-semantic-initial-picker").click();
+  const initialSearch = page.getByTestId(
+    "project-context-semantic-initial-search",
+  );
+  await initialSearch.fill("Keep Context relationships verifiable");
+  await initialSearch.press("Enter");
+  await initialSearch.press("Escape");
+  await expect(
+    page
+      .getByTestId("project-context-semantic-initial-chips")
+      .locator(`[data-coordinate-key="requirement:${REQUIREMENT_ID}"]`),
+  ).toBeVisible();
+
+  await page.getByTestId("project-context-semantic-context-picker").click();
+  const contextSearch = page.getByTestId(
+    "project-context-semantic-context-search",
+  );
+  await contextSearch.fill("Project Context contract");
+  await contextSearch.press("Enter");
+  await contextSearch.press("Escape");
+  await expect(
+    page
+      .getByTestId("project-context-semantic-context-chips")
+      .locator(`[data-coordinate-key="resource:${RESOURCE_ID}"]`),
+  ).toBeVisible();
+
+  await run.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?.length ?? 0,
+      ),
+    )
+    .toBe(2);
+  const explicitInputCall = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?.[1],
+  );
+  expect(explicitInputCall?.payload).toEqual({
+    input: {
+      communityKey: workspace.communityKey,
+      appliedWorkspaceToken: workspace.appliedWorkspaceToken,
+      problem: "Why did the release issue keep recurring?",
+      initialCoordinates: [
+        {
+          type: "project_view_object",
+          objectType: "requirement",
+          objectId: REQUIREMENT_ID,
+        },
+      ],
+      contextCoordinates: [
+        {
+          type: "project_view_object",
+          objectType: "resource",
+          objectId: RESOURCE_ID,
+        },
+      ],
+    },
+  });
+  expect(
+    Object.keys(
+      (explicitInputCall?.payload as { input: Record<string, unknown> }).input,
+    ).sort(),
+  ).toEqual(
+    [
+      "appliedWorkspaceToken",
+      "communityKey",
+      "contextCoordinates",
+      "initialCoordinates",
+      "problem",
+    ].sort(),
+  );
+});
+
+test("semantic overlay survives Coordinate, Edge, pane, and Escape selection until explicit Cancel", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await installMockBridge(page, {
+    projectContext: semanticCapableInspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  await seedSemanticResult(page);
+  await page
+    .getByTestId("project-context-semantic-problem")
+    .fill("Which reasoning path explains the recurring release issue?");
+  await page.getByTestId("project-context-semantic-run").click();
+  await waitForSemanticOverlay(page);
+
+  const graph = page.getByTestId("project-context-graph");
+  const requirement = page.getByTestId(
+    `project-context-coordinate-requirement:${REQUIREMENT_ID}`,
+  );
+  const resource = page.getByTestId(
+    `project-context-coordinate-resource:${RESOURCE_ID}`,
+  );
+  const traversedEdge = page.getByTestId(
+    `project-context-edge-${"1".repeat(64)}`,
+  );
+  const outsideEdge = page.getByTestId(
+    `project-context-edge-${"2".repeat(64)}`,
+  );
+  await expect(requirement).toHaveAttribute("data-semantic-root", "true");
+  await expect(resource).toHaveAttribute("data-semantic-terminal", "true");
+  await expect(traversedEdge).toHaveAttribute(
+    "data-semantic-emphasis",
+    "route",
+  );
+  await expect(outsideEdge).toHaveAttribute(
+    "data-semantic-emphasis",
+    "outside",
+  );
+
+  await requirement.click();
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await expect(graph).toHaveAttribute("data-semantic-overlay", "active");
+
+  await traversedEdge.click();
+  const edgeInspector = page.getByTestId("project-context-edge-inspector");
+  await expect(edgeInspector).toBeVisible();
+  await expect(
+    edgeInspector.getByText("Semantic path relation", { exact: true }),
+  ).toBeVisible();
+  await expect(graph).toHaveAttribute("data-semantic-overlay", "active");
+
+  await graph.locator(".react-flow__pane").click({
+    force: true,
+    position: { x: 8, y: 8 },
+  });
+  await expect(page.getByTestId("project-context-inspector")).toHaveCount(0);
+  await expect(graph).toHaveAttribute("data-semantic-overlay", "active");
+
+  await resource.click();
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("project-context-inspector")).toHaveCount(0);
+  await expect(graph).toHaveAttribute("data-semantic-overlay", "active");
+  await expect(
+    page.getByTestId("project-context-semantic-legend"),
+  ).toBeVisible();
+
+  await page.getByTestId("project-context-semantic-cancel").click();
+  await expect(graph).not.toHaveAttribute("data-semantic-overlay", "active");
+  await expect(page.getByTestId("project-context-semantic-legend")).toHaveCount(
+    0,
+  );
+  await expect(requirement).toHaveAttribute("data-semantic-root", "false");
+  await expect(traversedEdge).toHaveAttribute("data-semantic-emphasis", "none");
+});
+
+test("Cancel fences a delayed semantic response so it cannot revive the overlay", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectContext: semanticCapableInspectorResult(),
+    projectDocument: inspectorDocumentState(),
+    projectView: inspectorProjectView(),
+  });
+  await openProjectContext(page);
+  await seedSemanticResult(page, {
+    delayedByMs: 500,
+    requestId: "60000000-0000-4000-8000-000000000002",
+  });
+  await page
+    .getByTestId("project-context-semantic-problem")
+    .fill("Why did this delayed issue recur?");
+  await page.getByTestId("project-context-semantic-run").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_CONTEXT_SEMANTIC_CALLS__?.length ?? 0,
+      ),
+    )
+    .toBe(1);
+
+  await page.getByTestId("project-context-semantic-cancel").click();
+  await expect(
+    page.getByTestId("project-context-semantic-active-badge"),
+  ).toHaveCount(0);
+  await page.waitForTimeout(700);
+  await expect(page.getByTestId("project-context-graph")).not.toHaveAttribute(
+    "data-semantic-overlay",
+    "active",
+  );
+  await expect(page.getByTestId("project-context-semantic-legend")).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByTestId("project-context-semantic-active-badge"),
+  ).toHaveCount(0);
+  await expect(page.getByTestId("project-context-semantic-run")).toBeEnabled();
 });
 
 test("Project View Coordinate Inspector is read-only, responsive, and restores graph focus", async ({

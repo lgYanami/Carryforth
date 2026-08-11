@@ -646,6 +646,7 @@ pub fn run() {
             get_project_view,
             get_project_view_role_history,
             query_project_context,
+            query_project_context_semantic,
             get_project_document_meta,
             list_project_documents,
             get_project_document,

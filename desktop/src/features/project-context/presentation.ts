@@ -9,12 +9,18 @@ import type {
   ProjectContextIslandLayout,
   ProjectContextLayout,
 } from "@/features/project-context/layout";
+import type { ProjectContextSemanticOverlay } from "@/features/project-context/semanticOverlay";
 
 export type ProjectContextGraphTarget =
   | { kind: "coordinate"; key: string }
   | { kind: "edge"; key: string };
 
 export type ProjectContextEmphasis = "normal" | "active" | "dimmed";
+export type ProjectContextSemanticEmphasis =
+  | "none"
+  | "outside"
+  | "member"
+  | "route";
 
 export type ProjectContextIslandNodeData = {
   kind: "island";
@@ -29,6 +35,9 @@ export type ProjectContextCoordinateNodeData = {
   islandIndex: number;
   hue: number;
   queryAnchor: boolean;
+  semanticEmphasis: ProjectContextSemanticEmphasis;
+  semanticRoot: boolean;
+  semanticTerminal: boolean;
   selected: boolean;
 };
 
@@ -38,6 +47,8 @@ export type ProjectContextHubNodeData = {
   emphasis: ProjectContextEmphasis;
   islandIndex: number;
   hue: number;
+  semanticEmphasis: ProjectContextSemanticEmphasis;
+  semanticRoot: boolean;
   selected: boolean;
 };
 
@@ -48,6 +59,7 @@ export type ProjectContextSpokeData = {
   emphasis: ProjectContextEmphasis;
   islandIndex: number;
   hue: number;
+  semanticEmphasis: ProjectContextSemanticEmphasis;
 };
 
 export type ProjectContextIslandFlowNode = Node<
@@ -118,6 +130,44 @@ function activeKeys(
   return { coordinates, hubs };
 }
 
+function coordinateSemanticPresentation(
+  coordinateKey: string,
+  overlay: ProjectContextSemanticOverlay | null,
+): {
+  emphasis: ProjectContextSemanticEmphasis;
+  root: boolean;
+  terminal: boolean;
+} {
+  if (!overlay || overlay.boundsTargetIds.length === 0) {
+    return { emphasis: "none", root: false, terminal: false };
+  }
+  const root = overlay.rootCoordinateKeys.has(coordinateKey);
+  const terminal = overlay.terminalCoordinateKeys.has(coordinateKey);
+  if (root || terminal || overlay.routeCoordinateKeys.has(coordinateKey)) {
+    return { emphasis: "route", root, terminal };
+  }
+  if (overlay.memberCoordinateKeys.has(coordinateKey)) {
+    return { emphasis: "member", root, terminal };
+  }
+  return { emphasis: "outside", root, terminal };
+}
+
+function hubSemanticPresentation(
+  edgeKey: string,
+  overlay: ProjectContextSemanticOverlay | null,
+): {
+  emphasis: ProjectContextSemanticEmphasis;
+  root: boolean;
+} {
+  if (!overlay || overlay.boundsTargetIds.length === 0) {
+    return { emphasis: "none", root: false };
+  }
+  const root = overlay.rootEdgeKeys.has(edgeKey);
+  if (overlay.edgeKeys.has(edgeKey)) return { emphasis: "route", root };
+  if (root) return { emphasis: "member", root };
+  return { emphasis: "outside", root };
+}
+
 /**
  * Adapt canonical graph and layout data to immutable React Flow elements.
  * A selected Edge highlights exactly its Hub, Spokes, and Coordinate set.
@@ -126,6 +176,7 @@ export function buildProjectContextFlowElements(
   graph: ProjectContextGraphModel,
   layout: ProjectContextLayout,
   target: ProjectContextGraphTarget | null,
+  semanticOverlay: ProjectContextSemanticOverlay | null = null,
 ): ProjectContextFlowElements {
   const coordinateById = new Map(
     graph.coordinates.map((coordinate) => [coordinate.id, coordinate]),
@@ -159,6 +210,10 @@ export function buildProjectContextFlowElements(
     if (layoutNode.kind === "coordinate") {
       const coordinate = coordinateById.get(layoutNode.id);
       if (!coordinate) continue;
+      const semantic = coordinateSemanticPresentation(
+        coordinate.coordinateKey,
+        semanticOverlay,
+      );
       nodes.push({
         id: coordinate.id,
         type: "contextCoordinate",
@@ -174,6 +229,9 @@ export function buildProjectContextFlowElements(
           islandIndex: layoutNode.islandIndex,
           hue,
           queryAnchor: anchorKeys.has(coordinate.coordinateKey),
+          semanticEmphasis: semantic.emphasis,
+          semanticRoot: semantic.root,
+          semanticTerminal: semantic.terminal,
           selected:
             target?.kind === "coordinate" &&
             target.key === coordinate.coordinateKey,
@@ -188,6 +246,7 @@ export function buildProjectContextFlowElements(
 
     const hub = hubById.get(layoutNode.id);
     if (!hub) continue;
+    const semantic = hubSemanticPresentation(hub.edgeKey, semanticOverlay);
     nodes.push({
       id: hub.id,
       type: "contextHub",
@@ -199,6 +258,8 @@ export function buildProjectContextFlowElements(
         emphasis: emphasis(active.hubs.has(hub.edgeKey), target),
         islandIndex: layoutNode.islandIndex,
         hue,
+        semanticEmphasis: semantic.emphasis,
+        semanticRoot: semantic.root,
         selected: target?.kind === "edge" && target.key === hub.edgeKey,
       },
       draggable: false,
@@ -232,6 +293,12 @@ export function buildProjectContextFlowElements(
           ),
           islandIndex: hubLayout.islandIndex,
           hue: projectContextIslandHue(hubLayout.islandIndex),
+          semanticEmphasis:
+            semanticOverlay && semanticOverlay.boundsTargetIds.length > 0
+              ? semanticOverlay.edgeKeys.has(spoke.edgeKey)
+                ? "member"
+                : "outside"
+              : "none",
         },
         deletable: false,
         domAttributes: { "aria-hidden": true },
