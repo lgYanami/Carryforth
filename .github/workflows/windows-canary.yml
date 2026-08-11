@@ -4,7 +4,7 @@ name: Windows Canary
 # a tag, GitHub Release, or auto-updater artifact. The installer is available
 # only as a short-lived GitHub Actions artifact for explicit testing.
 #
-# Design notes vs. signed-macos-canary.yml:
+# Design notes vs. the macOS community canary:
 #   - No mesh-llm: release-windows doesn't build it.
 #   - pnpm store restore/save pattern mirrors ci.yml:149-196.
 on:
@@ -16,7 +16,6 @@ permissions:
 jobs:
   build:
     name: Build Windows canary
-    if: github.repository == 'block/buzz'
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
@@ -37,6 +36,10 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+
+      - name: Refuse redistribution while release assets are blocked
+        shell: bash
+        run: ./scripts/check-release-asset-inventory.sh --release
 
       # The Windows runner ships with rustup preinstalled; rust-toolchain.toml
       # in the repo root pins the channel (1.95.0) automatically. We only need
@@ -104,9 +107,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
-          cd src-tauri && cargo update --workspace
+        run: cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
 
       - name: Generate non-updating bundle config
         shell: bash
@@ -122,12 +123,12 @@ jobs:
       - name: Build sidecars
         shell: bash
         run: |
-          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p carryforth-cli
+          cargo build --locked --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p carryforth-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
 
       - name: Build Windows NSIS installer (unsigned)
         shell: bash
-        run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --config src-tauri/tauri.canary.conf.json
+        run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --config src-tauri/tauri.canary.conf.json -- --locked
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
@@ -147,7 +148,7 @@ jobs:
       - name: Upload Windows canary installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-windows-canary-${{ github.sha }}
+          name: carryforth-windows-community-canary-${{ github.sha }}
           path: ${{ steps.artifact.outputs.exe }}
           if-no-files-found: error
           retention-days: 7

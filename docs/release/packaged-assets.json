@@ -1,0 +1,220 @@
+{
+  "schema_version": 2,
+  "release_obligation_evidence_schema": "carryforth.release-obligation-evidence/v1",
+  "scope": "First public Carryforth Desktop, Local Relay OCI image, and cf CLI release surface",
+  "generated_at_source_date": "2026-08-11",
+  "filesystem_assets": [
+    {
+      "id": "carryforth-app-glyph",
+      "path_pattern": "desktop/public/carryforth.svg",
+      "tracked_file_count": 1,
+      "tree_sha256": "428a09326e29d4b60a0c947375842d8853efe3f06672c4e9ef6f6c8bf5b54773",
+      "classification": "Carryforth project artwork",
+      "license": "Apache-2.0",
+      "release_status": "cleared",
+      "provenance": "Created in Carryforth commit 8d02a4750e5cf0ac690ffe712341217f1994b063."
+    },
+    {
+      "id": "carryforth-wordmark",
+      "path_pattern": "desktop/public/landing/carryforth-wordmark.svg",
+      "tracked_file_count": 1,
+      "tree_sha256": "823596553de01c90eca9d05ec4328d07286daacc7d81add259d23efa402a69ab",
+      "classification": "Carryforth project artwork",
+      "license": "Apache-2.0",
+      "release_status": "cleared",
+      "provenance": "Created in Carryforth commit 8d02a4750e5cf0ac690ffe712341217f1994b063. The SVG names Inter as a rendering preference but does not embed a font file."
+    },
+    {
+      "id": "carryforth-generated-platform-icons",
+      "path_pattern": "desktop/src-tauri/icons/**",
+      "tracked_file_count": 53,
+      "tree_sha256": "fe7cf9d1df132002fd50c480f88c6d243cfd1b7d76285a64572133a10c796823",
+      "classification": "Carryforth project artwork and generated renditions",
+      "license": "Apache-2.0",
+      "release_status": "cleared",
+      "provenance": "The preferred source is desktop/src-tauri/icons/carryforth-source.svg, created in Carryforth commit 8d02a4750e5cf0ac690ffe712341217f1994b063. The PNG, ICO, ICNS, Android, and iOS files in this tree are generated renditions of that source."
+    },
+    {
+      "id": "procedural-card-texture",
+      "path_pattern": "desktop/src/shared/ui/assets/card-texture.png",
+      "tracked_file_count": 1,
+      "tree_sha256": "14e89ccfa9a533fa00654f210621cff5c7cef4cc36d1bed5227f07af0755079d",
+      "classification": "Generated project artwork",
+      "license": "Apache-2.0",
+      "release_status": "cleared",
+      "provenance": "Generated entirely from the procedural SVG recipe in desktop/scripts/texture-card/generate-card-texture.mjs, introduced with the output in upstream Apache-2.0 commit 7873135a0bf843116102796a1671bb4141c4ed23. No external source image is read by the generator."
+    },
+    {
+      "id": "emerge-tools-pow-effect",
+      "path_pattern": "desktop/public/pow/**",
+      "tracked_file_count": 7,
+      "tree_sha256": "f2c4fed19076f3f87c0d3cb864e16c95d06b5709041667c8a4a2e060ce28a46b",
+      "classification": "Third-party animation and sound assets",
+      "license": "MIT",
+      "release_status": "cleared",
+      "provenance": "Byte-identical copies of poof1@3x.png through poof5@3x.png and Example/Pow Example/Sounds/plop.m4a from EmergeTools/Pow commit 1b4b1dda28c50b95f0872927ee2226fe8b58950e. desktop/public/pow/LICENSE.txt contains the Emerge Tools MIT license and is delivered beside the assets. Introduced upstream in commit d4cd919b8506469f0bfd68100f13cdf16d3e76bc."
+    },
+    {
+      "id": "runtime-provider-logos",
+      "path_pattern": "desktop/public/runtime-icons/**",
+      "tracked_file_count": 3,
+      "tree_sha256": "36faddf39bb8689cf7449f9fc2e7c7d4425fc685efaa580cb814765dcc1fa1ed",
+      "classification": "Third-party provider marks",
+      "license": "UNRESOLVED",
+      "release_status": "blocked",
+      "provenance": "Introduced in upstream PR block/buzz#2026, merge commit 2b0f5e9f8029c0baf01cd06bbca92080e8966c6c. The PR does not record the source or redistribution/trademark terms for claude.png or codex.png. goose.svg contains paths traceable to aaif-goose/goose artwork, but this repository does not carry an asset-specific notice or an approved downstream trademark-use record."
+    },
+    {
+      "id": "onboarding-provider-logos",
+      "path_pattern": "desktop/src/features/onboarding/assets/harness-logos/**",
+      "tracked_file_count": 3,
+      "tree_sha256": "ec4d42eca723df341e530ee36cedb0d541cfd068dede71084c5ae54a081bfeac",
+      "classification": "Third-party provider marks",
+      "license": "UNRESOLVED",
+      "release_status": "blocked",
+      "provenance": "Introduced in upstream PR block/buzz#2039, merge commit 66a0f7bcb905bc81bbf97e794a25e7ec7241d40d. The PR describes provider logos but gives no source, copyright license, or trademark-use terms for chatgpt.png, claude.png, or goose.png."
+    },
+    {
+      "id": "starter-team-character-art",
+      "path_pattern": "desktop/public/onboarding/starter-team/**",
+      "tracked_file_count": 3,
+      "tree_sha256": "87adb156a9b2fe519ce6aa5147b6102d1f108c196f2c95e627838192f388968f",
+      "classification": "Upstream character artwork",
+      "license": "UNRESOLVED",
+      "release_status": "blocked",
+      "provenance": "Introduced in upstream PR block/buzz#2032, merge commit 1aab50e950f2b7ef75cc6ec6e6055de681a4bff7. The PR says the APNGs were assembled from Wes's Fizz, Honey, and Bumble frame sequences, but it does not include the source frames, an asset license, an ownership attestation, or a downstream trademark/character-use grant."
+    },
+    {
+      "id": "notification-sounds-and-waveforms",
+      "path_pattern": "desktop/public/sounds/**",
+      "tracked_file_count": 24,
+      "tree_sha256": "b6aa832a6b38abc130df139c5e9b8764585ac92471341ddccbf4ab4f56b466a3",
+      "classification": "Audio assets and generated waveform derivatives",
+      "license": "UNRESOLVED",
+      "release_status": "blocked",
+      "provenance": "Introduced in upstream PR block/buzz#968, merge commit 4e4dc723e4cc1969efe9a8cc8d6e0e95a8e2d695. The PR documents waveform generation from the MP3 PCM data but gives no source or license for the twelve MP3 files. The SVG waveforms inherit the unresolved provenance of their source audio."
+    }
+  ],
+  "font_dependencies": [
+    {
+      "id": "inter-variable-font",
+      "coordinate": "@fontsource-variable/inter@5.2.8",
+      "classification": "Third-party font dependency emitted into the Vite bundle",
+      "license": "OFL-1.1",
+      "release_status": "blocked",
+      "provenance": "desktop/package.json and pnpm-lock.yaml resolve @fontsource-variable/inter 5.2.8. Its package LICENSE identifies Copyright 2016 The Inter Project Authors and the SIL Open Font License 1.1.",
+      "blocker": "The OFL copyright and license text are not yet staged into the installed Desktop package or a bundled third-party notice artifact."
+    }
+  ],
+  "packaged_programs": [
+    {
+      "id": "carryforth-desktop",
+      "artifact_name": "Carryforth Desktop",
+      "source_package": "desktop/src-tauri",
+      "destinations": ["deb", "AppImage"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "buzz-acp-sidecar",
+      "artifact_name": "binaries/buzz-acp",
+      "source_package": "buzz-acp",
+      "destinations": ["Desktop sidecar"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "buzz-agent-sidecar",
+      "artifact_name": "binaries/buzz-agent",
+      "source_package": "buzz-agent",
+      "destinations": ["Desktop sidecar"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "buzz-dev-mcp-sidecar",
+      "artifact_name": "binaries/buzz-dev-mcp",
+      "source_package": "buzz-dev-mcp",
+      "destinations": ["Desktop sidecar"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "git-credential-nostr-sidecar",
+      "artifact_name": "binaries/git-credential-nostr",
+      "source_package": "git-credential-nostr",
+      "destinations": ["Desktop sidecar"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "cf-cli",
+      "artifact_name": "binaries/cf",
+      "source_package": "carryforth-cli",
+      "destinations": ["Desktop sidecar", "standalone cf archive"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "local-relay",
+      "artifact_name": "buzz-relay",
+      "source_package": "buzz-relay",
+      "destinations": ["Local Relay OCI image"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "relay-admin-tool",
+      "artifact_name": "buzz-admin",
+      "source_package": "buzz-admin",
+      "destinations": ["Local Relay OCI image"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    },
+    {
+      "id": "pair-relay-tool",
+      "artifact_name": "buzz-pair-relay",
+      "source_package": "buzz-pair-relay",
+      "destinations": ["Local Relay OCI image"],
+      "license": "Apache-2.0",
+      "release_status": "cleared"
+    }
+  ],
+  "release_obligations": [
+    {
+      "id": "binary-dependency-license-and-sbom-evidence",
+      "release_status": "blocked",
+      "description": "The project programs are Apache-2.0, but their resolved Cargo, pnpm, native/system, and AppImage dependency closures still need a generated license report and tag-bound SBOM included with the release. The Rust dependency closure also needs a locked RustSec audit with archived tag-bound evidence. Package-level Apache metadata alone is not a license inventory or vulnerability gate for the linked binaries."
+    },
+    {
+      "id": "relay-runtime-container-provenance",
+      "release_status": "blocked",
+      "description": "Dockerfile currently resolves rust:1.95-bookworm and debian:bookworm-slim by mutable tags and installs unversioned apt packages. Pin release base images by digest and emit the final OCI package/SBOM inventory before publication. The build-only Rust image also needs provenance even though it is not shipped as a layer."
+    },
+    {
+      "id": "bundle-identity-and-data-migration",
+      "release_status": "blocked",
+      "description": "The Tauri bundle still uses the legacy xyz.block.buzz.app identifier to protect existing local identity and app data. Public Desktop packages remain blocked until a Carryforth-owned reverse-DNS identifier and a fail-closed copy/readback migration preserve keyring identity, Community, messages, Agents, Project revisions, Documents, Context, and Meetings without cleaning the legacy store."
+    },
+    {
+      "id": "owner-signed-project-capability-bootstrap",
+      "release_status": "blocked",
+      "description": "The published local bootstrap must use the initialized Community Owner identity to idempotently enable and canonically read back the Project View v3, Project Document, Project Context Edge, and Meeting capabilities. A development database that was bootstrapped by hand is not release evidence."
+    },
+    {
+      "id": "existing-data-upgrade-migration-readback",
+      "release_status": "blocked",
+      "description": "Human maintainers must freeze an immutable supported upgrade baseline. The published upgrade path must run against a recoverable copy of that baseline and prove before/after equality for identity, Community, messages, managed Agents, schema and migration state, Project revisions, Documents, Context Edges, and Meeting history without deleting or rewriting the source data."
+    },
+    {
+      "id": "clean-room-published-artifact-e2e",
+      "release_status": "blocked",
+      "description": "A clean machine with no Block access, repository checkout, pre-existing app data, or private credentials must install only the published Desktop, Relay, cf, and local-stack artifacts; initialize an Owner Community; exercise messages, a managed Agent, Project View, Documents, Project Context, and a naturally completed 4-6-round Meeting; restart and read the state back; and repeat with legacy service domains blocked."
+    },
+    {
+      "id": "human-private-reporting-and-release-governance",
+      "release_status": "blocked",
+      "description": "Human maintainers must publish stable private security and conduct-reporting routes and record the release governance decisions that implementation agents cannot invent: accountable maintainers, official artifact namespace and retention, supported platforms, signing identities and custodians, key rotation and loss handling, and the immutable upgrade baseline."
+    }
+  ]
+}

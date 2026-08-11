@@ -1,4 +1,4 @@
-# Buzz — development task runner
+# Carryforth — development task runner
 
 set dotenv-load := true
 
@@ -52,7 +52,7 @@ setup: bootstrap
 start:
     ./scripts/dev-start.sh
 
-# Force-rebuild Buzz executables, then start the local stack
+# Force-rebuild Carryforth executables, then start the local stack
 rebuild-start:
     ./scripts/dev-rebuild-start.sh
 
@@ -76,8 +76,8 @@ hooks:
     git config --local core.hooksPath "$HOOKS_DIR"
     lefthook install --force
 
-# Wipe development state and recreate a clean environment. Installed Buzz is preserved.
-[confirm("This will DELETE all development data and preserve installed Buzz. Continue? (y/N)")]
+# Wipe development state and recreate a clean environment. Installed Carryforth is preserved.
+[confirm("This will DELETE all development data and preserve installed Carryforth. Continue? (y/N)")]
 reset:
     ./scripts/dev-reset.sh --yes
 
@@ -104,7 +104,16 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+check: open-source-release-surface-check carryforth-local-deployment-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+
+# Keep the public Carryforth release surface free of retired vendor endpoints
+# and internal-only package coordinates. Release jobs add --release-source.
+open-source-release-surface-check:
+    ./scripts/check-open-source-release-surface.sh
+
+# Validate local bootstrap and upgrade safety without starting or deleting data.
+carryforth-local-deployment-test:
+    ./scripts/test-carryforth-local-deployment.sh
 
 # Keep the Agent-first CLI on its one-way Carryforth/cf cutover.
 cf-cli-cutover-check:
@@ -545,7 +554,7 @@ test-integration:
 test-meeting-backend:
     ./scripts/run-meeting-backend-tests.sh
 
-# Buzz shared compute e2e: current desktop discovery/admission logic and
+# Carryforth shared compute e2e: current desktop discovery/admission logic and
 # Playwright UI coverage.
 mesh-e2e:
     cargo test --manifest-path {{desktop_dir}}/src-tauri/Cargo.toml --features mesh-llm mesh_llm --lib
@@ -554,7 +563,7 @@ mesh-e2e:
 # Reset only development state, seed deterministic local channels, and launch
 # the mesh-enabled desktop with the repository's public Tyler test identity.
 # This is for local verification only; never point this identity at staging/prod.
-[confirm("This will reset development data, preserve installed Buzz, then launch a seeded mesh dev app. Continue? (y/N)")]
+[confirm("This will reset development data, preserve installed Carryforth, then launch a seeded mesh dev app. Continue? (y/N)")]
 mesh-dev-fresh:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -577,7 +586,7 @@ mesh-e2e-hardware:
     cargo run -p buzz-relay --example mesh_serve_client_smoke
 
 # Three isolated node processes: trusted member joins and infers; stranger is rejected.
-# Uses temp homes and explicit mesh owner keystores. Never reads the Buzz Keychain.
+# Uses temp homes and explicit mesh owner keystores. Never reads the Carryforth keyring.
 mesh-e2e-admission:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -942,7 +951,7 @@ release-desktop *ARGS:
     fi
     just _release-pr desktop "$VERSION"
 
-# Open or update the relay release PR (ghcr.io/block/buzz image)
+# Open or update the Carryforth Relay release PR
 release-relay *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -975,7 +984,7 @@ _release-pr lane version:
             CHANGELOG="CHANGELOG.md"
             ADD_FILES=(desktop/package.json desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock pnpm-lock.yaml CHANGELOG.md)
             LOG_PATHS=(desktop/ crates/buzz-core/ crates/buzz-persona/ crates/buzz-sdk/ crates/buzz-agent/)
-            ARTIFACT="Buzz Desktop" ;;
+            ARTIFACT="Carryforth Desktop" ;;
         relay)
             BRANCH_PREFIX="relay-release"
             TAG_FETCH='relay-v*'
@@ -985,7 +994,7 @@ _release-pr lane version:
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
             LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/carryforth-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
-            ARTIFACT="Buzz Relay" ;;
+            ARTIFACT="Carryforth Relay" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"
             exit 1 ;;
@@ -1107,7 +1116,7 @@ _release-pr lane version:
 
 # ─── Agent Harness ────────────────────────────────────────────────────────────
 
-# Run a goose agent connected to a Buzz relay (foreground)
+# Run a goose agent connected to a Carryforth Relay (foreground)
 goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BUZZ_PRIVATE_KEY":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1126,7 +1135,7 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BU
 
 # ─── Benchmarking ─────────────────────────────────────────────────────────────
 
-# Run the Buzz orchestra benchmark — leaderboard-eligible by default (TB 2.1, k=5, Sonnet+Haiku). Stands up its own Docker stack; --gui opens a live spectator desktop app; other flags pass to benchmark.py (--dataset/--path, --include-task, --attempts, --manifest, --dry-run, ...)
+# Run the Carryforth orchestra benchmark — leaderboard-eligible by default (TB 2.1, k=5, Sonnet+Haiku). Stands up its own Docker stack; --gui opens a live spectator desktop app; other flags pass to benchmark.py (--dataset/--path, --include-task, --attempts, --manifest, --dry-run, ...)
 benchmark *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail

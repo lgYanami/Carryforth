@@ -490,7 +490,7 @@ test("does not teleport upward when user abandons fetch by jumping to bottom", a
 
 const REAL_BUZZ_BUGS_IMAGE_SHA =
   "ff2862080bac3d009f97cad4bb94e6efec328eaaee058a405e854acd49fc1483";
-const REAL_BUZZ_BUGS_IMAGE_URL = `https://sprout-oss.stage.blox.sqprod.co/media/${REAL_BUZZ_BUGS_IMAGE_SHA}.png`;
+const REAL_BUZZ_BUGS_IMAGE_URL = `https://relay.example.invalid/media/${REAL_BUZZ_BUGS_IMAGE_SHA}.png`;
 const REAL_BUZZ_BUGS_IMAGE_TAG = [
   "imeta",
   `url ${REAL_BUZZ_BUGS_IMAGE_URL}`,

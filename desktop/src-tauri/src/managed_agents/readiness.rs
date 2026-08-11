@@ -1642,7 +1642,7 @@ mod goose_file_config_tests {
         let mut extra = BTreeMap::new();
         extra.insert(
             "DATABRICKS_HOST".to_string(),
-            "https://block.cloud.databricks.com".to_string(),
+            "https://workspace.cloud.databricks.com".to_string(),
         );
         let cfg = RuntimeFileConfig {
             provider: Some("databricks".to_string()),

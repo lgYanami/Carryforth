@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ACP harness that bridges Buzz events to AI agents"
+homepage.workspace = true
+description = "ACP harness that bridges Carryforth events to AI agents"
 
 [lib]
 name = "buzz_acp"

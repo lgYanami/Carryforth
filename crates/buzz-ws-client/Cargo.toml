@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Shared NIP-42 WebSocket client for Carryforth tools"
 
 [dependencies]
 nostr = { workspace = true }

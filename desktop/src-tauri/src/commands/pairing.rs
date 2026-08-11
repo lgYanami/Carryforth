@@ -625,12 +625,10 @@ mod pairing_relay_tests {
 
     #[test]
     fn main_relay_pairing_uses_main_relay_url() {
-        let resolved = resolve_pairing_relay_url(
-            "wss://sprout-oss.stage.blox.sqprod.co",
-            PairingRelay::MainRelay,
-        )
-        .expect("resolve main pairing relay");
+        let resolved =
+            resolve_pairing_relay_url("wss://relay.example.invalid", PairingRelay::MainRelay)
+                .expect("resolve main pairing relay");
 
-        assert_eq!(resolved, "wss://sprout-oss.stage.blox.sqprod.co");
+        assert_eq!(resolved, "wss://relay.example.invalid");
     }
 }

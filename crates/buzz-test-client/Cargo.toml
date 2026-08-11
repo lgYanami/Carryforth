@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Integration test client and E2E test suite for Buzz"
+homepage.workspace = true
+description = "Integration test client and E2E test suite for Carryforth"
 
 [dependencies]
 anyhow = { workspace = true }

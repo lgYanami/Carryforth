@@ -1,63 +1,27 @@
-# Buzz Docker Compose deployment
+# Retired legacy Compose bundle
 
-This is the single-node/VPS deployment bundle. It is intentionally separate from
-the root `docker-compose.yml`, which remains local development infrastructure.
+`deploy/compose` is retained only as a source-history tombstone for the former
+Buzz/Block production deployment. It is **not** a supported or runnable
+Carryforth deployment path.
 
-## Quick start
+The wrapper rejects every operational command, and `compose.yml` intentionally
+defines no services. This prevents an old checkout, copied `.env`, or direct
+`docker compose up` from pulling a floating legacy image or mutating an existing
+database. These files do not remove or migrate any historical containers,
+volumes, databases, or application data.
+
+Use the local-only Carryforth stack instead:
 
 ```bash
-cd deploy/compose
-cp .env.example .env
-$EDITOR .env       # replace every CHANGE_ME value
+cd deploy/local
+./run.sh init --image "$(cat RELAY_IMAGE)"
 ./run.sh start
 ```
 
-For a public VPS with automatic Let's Encrypt certificates:
+Follow [the local deployment guide](../local/README.md) for pinned Relay image
+requirements, backup guidance, upgrades, and first-use initialization. Do not
+copy settings from this retired directory into `deploy/local`.
 
-```bash
-cd deploy/compose
-BUZZ_COMPOSE_TLS=true ./run.sh start
-```
-
-The bootstrap script should eventually replace manual `.env` editing for normal
-users. It is responsible for generating stable secrets and, optionally, an owner
-keypair.
-
-## Production notes
-
-- Requires Docker Compose v2.24.4 or newer; the TLS override uses Compose's
-  `!reset` tag to remove the direct relay port when Caddy terminates HTTPS.
-- Default `BUZZ_IMAGE` tracks `ghcr.io/block/buzz:main` for early testing. Pin it to `ghcr.io/block/buzz:sha-<7>` or a semver release tag for production once available.
-- Keep `BUZZ_RELAY_PRIVATE_KEY`, `BUZZ_GIT_HOOK_HMAC_SECRET`, database/Redis,
-  and S3 secrets stable across restarts.
-- `RELAY_OWNER_PUBKEY` is intentionally not prefixed with `BUZZ_`; it must be a
-  64-character hex Nostr pubkey when closed relay mode is enabled.
-- `BUZZ_AUTO_MIGRATE` is opt-in. Set `BUZZ_AUTO_MIGRATE=true` or run
-  `buzz-admin migrate` before starting the relay when bootstrapping a fresh
-  database. Auto-migration requires an image that includes embedded SQLx
-  migrations.
-- For the first Project View rollout, keep `BUZZ_AUTO_MIGRATE=false`, replace
-  the Relay container with the Project View-capable image, run that image's
-  `buzz-admin migrate`, and only then run
-  `buzz-admin project-view enable --community <host>`. The database flag is
-  shared by all Relay processes; there is no per-container enable flag. Follow
-  the [Project View operations runbook](../../docs/project-view-operations.md)
-  for monitoring, signer rotation, disable, and rollback.
-- The stack uses Postgres, Redis, MinIO, and a git data volume because
-  those are real Buzz dependencies today. Minimal mode can simplify this later.
-
-Run `./run.sh backup-hint` for the backup checklist.
-
-## Validation
-
-Before sharing an install link publicly, verify a fresh install with:
-
-```bash
-cd deploy/compose
-cp .env.example .env
-$EDITOR .env
-./run.sh config
-./run.sh start
-curl -fsS "http://127.0.0.1:$(grep -E '^BUZZ_HTTP_PORT=' .env | cut -d= -f2-)/_liveness"
-./run.sh status
-```
+`./run.sh help` prints this retirement notice. Commands such as `start`, `stop`,
+`upgrade`, `config`, and member administration fail closed without invoking
+Docker.

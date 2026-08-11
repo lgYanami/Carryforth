@@ -4,7 +4,7 @@ name: Linux Canary
 # creating a tag, GitHub Release, or auto-updater artifact. Artifacts are
 # available as a short-lived GitHub Actions artifact for explicit testing.
 #
-# Design notes vs. signed-macos-canary.yml:
+# Design notes vs. the macOS community canary:
 #   - fix-appimage.sh is run without signing env vars; the script detects
 #     their absence and skips re-signing, repacking only (documented inline).
 #   - mold linker added (rui314/setup-mold) to reduce link time, matching
@@ -19,7 +19,6 @@ permissions:
 jobs:
   build:
     name: Build Linux canary
-    if: github.repository == 'block/buzz'
     runs-on: ubuntu-latest
     container: ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
     timeout-minutes: 60
@@ -82,6 +81,9 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Refuse redistribution while release assets are blocked
+        run: ./scripts/check-release-asset-inventory.sh --release
 
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
 
@@ -150,9 +152,7 @@ jobs:
       - name: Patch canary version
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
-          cd src-tauri && cargo update --workspace
+        run: cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
 
       - name: Generate non-updating bundle config
         run: |
@@ -166,11 +166,11 @@ jobs:
 
       - name: Build sidecars
         run: |
-          cargo build --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p carryforth-cli
+          cargo build --locked --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p carryforth-cli
           ./scripts/bundle-sidecars.sh
 
       - name: Build Linux Tauri app
-        run: cd desktop && pnpm tauri build --ci --bundles deb,appimage --config src-tauri/tauri.canary.conf.json
+        run: cd desktop && pnpm tauri build --ci --bundles deb,appimage --config src-tauri/tauri.canary.conf.json -- --locked
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
@@ -219,7 +219,7 @@ jobs:
       - name: Upload Linux canary packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-linux-canary-${{ github.sha }}
+          name: carryforth-linux-community-canary-${{ github.sha }}
           path: |
             ${{ steps.artifacts.outputs.deb }}
             ${{ steps.artifacts.outputs.appimage }}

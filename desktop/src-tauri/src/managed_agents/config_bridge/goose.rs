@@ -268,7 +268,7 @@ extensions:
     #[test]
     fn databricks_host_without_explicit_provider_infers_databricks() {
         let yaml = r#"
-DATABRICKS_HOST: https://block-lakehouse-production.cloud.databricks.com/
+DATABRICKS_HOST: https://example-workspace.cloud.databricks.com/
 GOOSE_TELEMETRY_ENABLED: false
 "#;
         let cfg = parse_goose_config(yaml).unwrap();
@@ -278,7 +278,7 @@ GOOSE_TELEMETRY_ENABLED: false
         // typical config — flat key, no active_provider.
         assert_eq!(
             cfg.extra.get("DATABRICKS_HOST").map(|s| s.as_str()),
-            Some("https://block-lakehouse-production.cloud.databricks.com/"),
+            Some("https://example-workspace.cloud.databricks.com/"),
             "flat DATABRICKS_HOST must be stored as 'DATABRICKS_HOST' in extra"
         );
     }
@@ -304,7 +304,7 @@ DATABRICKS_HOST: https://dbc.example.com
     fn explicit_provider_wins_over_databricks_inference() {
         let yaml = r#"
 GOOSE_PROVIDER: anthropic
-DATABRICKS_HOST: https://block-lakehouse-production.cloud.databricks.com/
+DATABRICKS_HOST: https://example-workspace.cloud.databricks.com/
 "#;
         let cfg = parse_goose_config(yaml).unwrap();
         assert_eq!(cfg.provider.as_deref(), Some("anthropic"));

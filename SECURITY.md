@@ -4,17 +4,21 @@
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-If you discover a security vulnerability in Buzz, please report it by emailing
-**buzz@block.xyz**. Include as much detail as possible:
+Report suspected Carryforth vulnerabilities through GitHub's
+[private vulnerability reporting form](https://github.com/lgYanami/Carryforth/security/advisories/new).
+Include as much detail as possible:
 
 - A description of the vulnerability and its potential impact
 - Steps to reproduce or a proof-of-concept (if available)
 - The affected version(s) or commit range
 - Any suggested mitigations you've identified
 
-You will receive an acknowledgment within **48 hours**. We aim to provide a
-full response — including a timeline for a fix — within **7 days** of initial
-contact. We'll keep you informed as we work toward a resolution.
+If the private reporting form is unavailable, do not fall back to a public
+issue. The repository owner must enable private vulnerability reporting or
+publish a durable private security contact before the first stable release.
+No security email address or response-time service level has been selected by
+the Carryforth maintainers yet; this document intentionally does not inherit or
+guess one.
 
 We ask that you:
 
@@ -30,11 +34,14 @@ We will credit reporters in release notes unless you prefer to remain anonymous.
 
 | Version | Supported |
 |---------|-----------|
-| `main` (latest) | ✅ Active |
-| Previous releases | ⚠️ Best-effort; upgrade recommended |
+| `main` (source) | ✅ Active development |
+| Independent stable releases | ❌ Not published yet |
+| Upstream Buzz releases | ❌ Not supported as Carryforth releases |
 
-Buzz is pre-1.0. We do not maintain long-term support branches at this stage.
-All security fixes land on `main` first.
+Carryforth is pre-1.0. We do not maintain long-term support branches at this
+stage. Security fixes land on the current development branch first. A future
+release policy must identify exact supported versions rather than inheriting an
+upstream promise.
 
 ---
 
@@ -53,12 +60,13 @@ REST endpoints authenticate via
 the client signs a `kind:27235` event containing the request URL and method.
 The relay verifies the Schnorr signature and extracts the pubkey.
 
-### Authorization — Channel Membership as the Gate
+### Authorization — Community, Channel, and Governance Boundaries
 
-Channel membership is the **only** access control mechanism. There are no
-separate ACL lists or capability taxonomies. If a principal (human or agent)
-is a member of a channel, they can read and write to it. If they are not a
-member, the relay rejects their requests — even if they are authenticated.
+Community membership and member level establish the principal's base authority.
+Channel membership scopes channel visibility and messaging. Project View,
+Documents, Project Context, managed Agents, and Meetings add their own
+well-defined governance and lifecycle checks. Authentication alone never grants
+access to community data.
 
 Private channels are invisible to non-members: they do not appear in channel
 listings, and subscription filters for private channel events return nothing
@@ -75,7 +83,7 @@ for SOX-grade compliance and eDiscovery.
 
 ### Desktop Secret Storage — OS Keyring
 
-The Buzz desktop app stores nsec private keys in the operating system keyring
+The Carryforth desktop app stores nsec private keys in the operating system keyring
 rather than in plaintext files: macOS Keychain, Windows Credential Manager, or
 the Linux Secret Service (`gnome-keyring` / `kwallet` via D-Bus). This covers
 both the human identity key and every managed-agent key.
@@ -113,8 +121,11 @@ controllers.
 
 ### Dependency Management
 
-We use `cargo audit` in CI to scan for known vulnerabilities in dependencies.
-`#![deny(unsafe_code)]` is enforced across all crates — no unsafe Rust.
+`#![deny(unsafe_code)]` is enforced across all crates — no unsafe Rust. A
+locked RustSec dependency audit and archived release evidence remain required
+before the first public release; the current CI workflow does not yet provide
+that gate. See the open-source release-surface plan for the corresponding
+release blocker.
 
 ---
 

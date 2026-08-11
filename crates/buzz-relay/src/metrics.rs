@@ -14,7 +14,10 @@
 //! recorded by [`track_metrics`] middleware on the app router. Buzz-specific
 //! metrics are recorded inline at their call sites.
 
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{MatchedPath, Request},
@@ -64,8 +67,18 @@ const FANOUT_BUCKETS: [f64; 9] = [0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0,
 /// Must be called from within a Tokio runtime.
 /// Panics if a recorder is already installed or the port is in use.
 pub fn install(port: u16, gauge_idle_timeout_secs: u64) {
+    install_on(([0, 0, 0, 0], port).into(), gauge_idle_timeout_secs);
+}
+
+/// Install the global metrics recorder on an explicit socket address.
+///
+/// Local-only deployments use this entry point to keep the exporter on the
+/// same interface as the application listener. Must be called from within a
+/// Tokio runtime and panics if a recorder is already installed or the address
+/// is in use.
+pub fn install_on(bind_addr: SocketAddr, gauge_idle_timeout_secs: u64) {
     let (recorder, exporter) = PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], port))
+        .with_http_listener(bind_addr)
         // Remove gauge series that the relay intentionally stops emitting.
         .idle_timeout(
             MetricKindMask::GAUGE,

@@ -1,31 +1,45 @@
 ---
-name: 🐛 Bug Report
-about: Thank you for taking the time, please report a reproducible bug
-title: "[Bug] <Bug Title Here>"
+name: Bug report
+about: Report a reproducible Carryforth defect
+title: "[Bug] "
 labels: bug
-assignees: add codeowner's @name here 
+assignees: ""
 
 ---
 
-**Describe the bug**
-*A clear and concise description of what the bug is.*
+## Description
 
-**To Reproduce:**
-*Steps to reproduce the behavior:*
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+Describe the defect and its user impact.
 
-**Expected behavior:**
-*A clear and concise description of what you expected to happen.*
+## Steps to reproduce
 
-**Supporting Material**
-*If applicable, add screenshots, output log and/or other documentation to help explain your problem.*
+1.
+2.
+3.
 
-**Environment (please complete the following information):**
- - OS: [ex: iOS]
- - Version 
+## Expected behavior
 
-**Additional context**
-Add any other context that you feel is relevant about the problem here.
+What should have happened?
+
+## Environment
+
+- OS and version:
+- Carryforth version or commit:
+- Installation method (source/package/container):
+- Relay and Desktop logs, with secrets removed:
+
+## Data-safety and regression details
+
+- Did the issue affect an existing local identity, Community, database,
+  app-data directory, Agent state, or Docker volume?
+- Is the issue reproducible on an explicit scratch environment?
+- What was the last known working version?
+
+## Additional context
+
+Attach screenshots or minimal logs if useful. Remove private keys, tokens,
+authentication tags, message content not intended for disclosure, and personal
+information.
+
+> Do not report security vulnerabilities here. Use the private process in
+> [SECURITY.md](../../SECURITY.md).

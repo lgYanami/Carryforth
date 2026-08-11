@@ -1,13 +1,19 @@
 [project]
 name = "harbor-buzz-testbed"
 version = "0.1.0"
-description = "Trial provisioning and local Buzz stack tooling for harbor-buzz-orchestra"
+description = "Experimental trial provisioning and local Carryforth stack tooling"
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
     "harbor-buzz-orchestra",
     "coincurve>=20",
     "psycopg[binary]>=3.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lgYanami/Carryforth"
+Repository = "https://github.com/lgYanami/Carryforth"
+Issues = "https://github.com/lgYanami/Carryforth/issues"
 
 [build-system]
 requires = ["hatchling"]

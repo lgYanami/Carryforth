@@ -1,5 +1,11 @@
 # Buzz Push Gateway deployment
 
+> **Source-only upstream record.** Push is not part of the first Carryforth
+> release. The Carryforth Relay does not advertise NIP-PL, rejects new push
+> leases, and does not start a matcher or delivery worker. This document and
+> the gateway source/migrations are retained for protocol history; they are not
+> an enablement runbook for a Carryforth deployment.
+
 `buzz-push-gateway` is the standalone public APNs last hop intended for `push.buzz.xyz`. Build it with `Dockerfile.push-gateway`; do not run it in the relay image or give relays APNs credentials.
 
 ## Network and health
@@ -72,22 +78,19 @@ Alerting rules ship as an opt-in prometheus-operator `PrometheusRule` (`promethe
 
 ## Relay configuration
 
-Relays default `BUZZ_PUSH_GATEWAY_DELIVERY_URL` to the exact public delivery URL
-`https://push.buzz.xyz/v1/deliveries/apns`. Operators can override it with
-another exact HTTPS `/v1/deliveries/apns` URL, or explicitly disable NIP-PL push
-by setting the variable to an empty string. When enabled, the relay advertises
-its host-scoped NIP-PL descriptor in NIP-11 and starts the matcher and delivery
-worker. Relays retain lease matching, authorization, coalescing, durable
-jobs/retries, and generation checks; they receive only opaque capabilities and
-never APNs tokens or provider credentials.
+The first Carryforth Relay has no push configuration. Legacy
+`BUZZ_PUSH_GATEWAY_DELIVERY_URL`, `BUZZ_PUSH_GATEWAY_TIMEOUT_MS`, and
+`BUZZ_PUSH_EXECUTOR_KEY_ID` values are ignored and cannot enable delivery. The
+Relay does not advertise the NIP-PL descriptor, start matcher/delivery workers,
+or accept new kind `30350` leases. Historical tables, migrations, protocol
+documents, and already stored events are retained without destructive cleanup.
 
 ## Relay integration status
 
-The operational relay integration is complete: per-origin event matching with
-read-authorization checks, durable enqueue, send-time revalidation, and NIP-98
-delivery run whenever the gateway URL is enabled. End-to-end use still requires
-the client App Attest enrollment/delegation flow to place a gateway-issued opaque
-capability—not a raw APNs token—into the encrypted relay lease.
+The former Buzz integration remains available only as source history. It has no
+compiled runtime entry point in the Carryforth Relay. Reintroducing self-hosted
+Push requires a separate product, privacy, packaging, and migration design; it
+must not be implemented by restoring a legacy environment-variable toggle.
 
 ## Helm production inputs
 
@@ -107,23 +110,16 @@ Kubernetes does not restart pods when referenced Secret bytes change. AEAD or AP
 
 ## Gateway chart release
 
-The gateway chart has a collision-free release lane separate from the main
-`buzz` chart. To publish version `X.Y.Z`, update both `version` and `appVersion`
-in `deploy/charts/buzz-push-gateway/Chart.yaml`, validate the chart, and open a
-same-repository PR whose branch is exactly `push-chart-release/X.Y.Z`:
+The inherited Push Gateway chart is source-only in Carryforth. It has no public
+publisher, auto-tag workflow, supported image, or Carryforth release channel.
+Its render test may still be used while reviewing or extracting the historical
+implementation:
 
 ```bash
 deploy/charts/buzz-push-gateway/tests/render.sh
-git switch -c push-chart-release/X.Y.Z
-git add deploy/charts/buzz-push-gateway/Chart.yaml
-git commit -m "release: push gateway chart X.Y.Z"
-git push -u origin push-chart-release/X.Y.Z
 ```
 
-When that PR merges, `.github/workflows/auto-tag-on-release-pr-merge.yml`
-creates `push-chart-vX.Y.Z` and dispatches
-`.github/workflows/push-gateway-helm-chart.yml` with that immutable tag and bare
-version. The publisher verifies the checked-out commit is the tag target and the
-chart version equals `X.Y.Z` before pushing
-`oci://ghcr.io/block/buzz/charts/buzz-push-gateway`. A manually pushed
-`push-chart-vX.Y.Z` tag is the documented rescue path and runs the same checks.
+Do not publish the inherited image/chart coordinates as Carryforth artifacts.
+A future self-hosted Push product would require a separate protocol, privacy,
+asset, deployment, and release design; it is not a hidden switch in the local
+Relay.

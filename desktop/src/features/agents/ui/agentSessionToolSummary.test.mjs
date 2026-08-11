@@ -88,7 +88,7 @@ test("buildCompactToolSummary formats shell command preview", () => {
 
 test("buildCompactToolSummary formats view_image thumbnail source", () => {
   const source =
-    "https://sprout-oss.stage.blox.sqprod.co/media/ffd1b2721f2d52e19f0ca2be9aa7842cdec5b4e0215aaab2a67c26a2a76a6a83.png";
+    "https://relay.example.invalid/media/ffd1b2721f2d52e19f0ca2be9aa7842cdec5b4e0215aaab2a67c26a2a76a6a83.png";
   const summary = buildCompactToolSummary(
     makeTool({
       toolName: "buzz-dev-mcp__view_image",

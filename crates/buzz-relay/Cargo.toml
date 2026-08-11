@@ -1,15 +1,16 @@
 [package]
 name = "buzz-relay"
 default-run = "buzz-relay"
-# Independent version: buzz-relay ships as a pinnable artifact
-# (ghcr.io/block/buzz), released on its own cadence via `just release-relay`.
+# Independent version: buzz-relay is packaged as the Carryforth Relay artifact
+# and released on its own cadence.
 # It does NOT inherit the workspace version.
 version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "WebSocket relay server for the Buzz communications platform"
+homepage.workspace = true
+description = "WebSocket Relay server for the Carryforth collaboration platform"
 
 [[bin]]
 name = "buzz-relay"

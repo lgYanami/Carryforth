@@ -1,11 +1,11 @@
-# Contributing to Buzz
+# Contributing to Carryforth
 
-Welcome, and thank you for your interest in contributing! Buzz is an
+Welcome, and thank you for your interest in contributing! Carryforth is an
 open-source project and we're glad you're here. This guide will help you
 get from zero to a merged pull request.
 
-If you have questions that aren't answered here, open a GitHub Discussion or
-reach out in the community channels.
+If you have questions that aren't answered here, open a scoped issue in the
+[Carryforth repository](https://github.com/lgYanami/Carryforth/issues).
 
 ---
 
@@ -17,7 +17,7 @@ reach out in the community channels.
 4. [Code Style](#code-style)
 5. [Making a Pull Request](#making-a-pull-request)
 6. [Architecture Overview](#architecture-overview)
-7. [Ecosystem](#ecosystem)
+7. [Repository and upstream](#repository-and-upstream)
 8. [How to Add a New Event Kind](#how-to-add-a-new-event-kind)
 9. [How to Add a New MCP Tool](#how-to-add-a-new-mcp-tool)
 10. [How to Add a New API Endpoint](#how-to-add-a-new-api-endpoint)
@@ -28,8 +28,15 @@ reach out in the community channels.
 ## Code of Conduct
 
 This project follows the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md).
-By participating you agree to uphold these standards. Please report
-unacceptable behavior to **conduct@buzz-relay.org**.
+By participating you agree to uphold these standards.
+
+The project has not yet published a dedicated private conduct-reporting
+address. Do not put sensitive conduct reports in a public issue. Until a Human
+maintainer records a private project contact here, use GitHub's
+[Report Abuse](https://support.github.com/contact/report-abuse) channel for
+conduct occurring on GitHub and contact the repository owner through an
+available private GitHub profile channel. Selecting a durable private project
+contact remains a release-blocking maintainer decision.
 
 ---
 
@@ -39,9 +46,9 @@ unacceptable behavior to **conduct@buzz-relay.org**.
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Rust | 1.88+ | Install via [rustup](https://rustup.rs/) |
-| Node.js | 24+ | Required for desktop app commands and `just ci` |
-| pnpm | 10+ | Required for desktop app commands and `just ci` |
+| Rust | 1.95.0 (Hermit-pinned; workspace MSRV 1.88) | Install via [rustup](https://rustup.rs/) when not using Hermit |
+| Node.js | 24.14.0 (Hermit-pinned) | Required for desktop app commands and `just ci` |
+| pnpm | 11.4.0 (Hermit-pinned) | Required for desktop app commands and `just ci` |
 | Flutter | 3.41+ | Required for mobile app — install via [flutter.dev](https://docs.flutter.dev/get-started/install) |
 | Docker | 24+ | For Postgres, Redis, MinIO |
 | `just` | latest | Task runner — `cargo install just` |
@@ -65,8 +72,8 @@ versions in the table above.
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/block/buzz.git
-cd buzz
+git clone https://github.com/lgYanami/Carryforth.git
+cd Carryforth
 
 # 2. Activate Hermit (optional but recommended)
 . ./bin/activate-hermit
@@ -103,7 +110,7 @@ For a detached one-command workflow with lifecycle tracking:
 
 ```bash
 ./scripts/dev-start.sh          # start containers + relay + desktop
-./scripts/dev-rebuild-start.sh  # force-rebuild Buzz executables, then start
+./scripts/dev-rebuild-start.sh  # force-rebuild Carryforth executables, then start
 ./scripts/dev-stop.sh           # stop app + containers; preserve all data
 ```
 
@@ -122,7 +129,7 @@ just desktop-dev  # terminal 2 — Vite dev server only (no Tauri shell)
 
 ```bash
 just down    # Stop app + Docker containers, keep containers and data
-just reset   # Wipe all dev state and recreate it; installed Buzz is preserved
+just reset   # DESTRUCTIVE: wipe all dev state and recreate it
 ```
 
 Development desktop state uses separate bundle identifiers
@@ -324,23 +331,17 @@ to existing clients.
 
 ---
 
-## Ecosystem
+## Repository and upstream
 
-Buzz is developed across multiple repositories. This repo (`block/buzz`)
-is the open-source home for all application code — the relay, desktop app,
-mobile app, CLI, and agent harness. Internal repositories handle
-enterprise-signed builds and infrastructure deployment.
+[`lgYanami/Carryforth`](https://github.com/lgYanami/Carryforth) is the
+canonical public repository. Fork it, open a pull request against its default
+branch, and use only public dependencies and workflows. Contributors do not
+need Block organization access or internal infrastructure.
 
-See [AGENTS.md § Ecosystem](AGENTS.md#ecosystem) for the full repo table and
-dependency diagram.
-
-**External contributors:** Fork `block/buzz`, open a PR, and CI runs
-automatically. No special access is required.
-
-**Block team members:** See the internal
-[sprout-releases CONTRIBUTING.md](https://github.com/squareup/sprout-releases/blob/main/CONTRIBUTING.md)
-for team access setup, onboarding, and the full repo inventory. See
-[RELEASING.md](RELEASING.md) for the release process.
+Carryforth is derived from Apache-2.0-licensed Buzz source. Preserve upstream
+copyright and provenance when moving or modifying inherited code; see
+[UPSTREAM.md](UPSTREAM.md). Internal `buzz-*` crate and protocol identifiers
+remain intentionally compatible and must not be mechanically renamed.
 
 ---
 
@@ -450,7 +451,7 @@ If an HTTP endpoint is still necessary:
 
 ## License and CLA
 
-Buzz is licensed under the **Apache License, Version 2.0**. See
+Carryforth is licensed under the **Apache License, Version 2.0**. See
 [LICENSE](LICENSE) for the full text.
 
 By submitting a pull request, you agree that your contribution is licensed
@@ -461,5 +462,5 @@ their sign-off. When in doubt, check with your legal team.
 
 ---
 
-*Thank you for contributing to Buzz. Every bug report, documentation fix,
-and code contribution makes the project better for everyone. 🐝*
+*Thank you for contributing to Carryforth. Every bug report, documentation
+fix, and code contribution makes the project better for everyone.*

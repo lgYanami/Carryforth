@@ -4,8 +4,11 @@
 name = "buzz-desktop"
 version = "0.4.25"
 description = "Carryforth desktop app"
-authors = ["you"]
+authors = ["Carryforth contributors"]
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lgYanami/Carryforth"
+homepage = "https://github.com/lgYanami/Carryforth"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

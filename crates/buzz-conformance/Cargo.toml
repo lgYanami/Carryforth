@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Runtime trace schema + independent replay checker for MultiTenantRelay.tla"
 
 # Independence rule (skill: skill-runtime-formal-compliance):

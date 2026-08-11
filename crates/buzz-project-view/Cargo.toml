@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pure domain model and mutation reducer for Buzz Project View"
+homepage.workspace = true
+description = "Pure domain model and mutation reducer for Carryforth Project View"
 
 [dependencies]
 buzz-core = { workspace = true }

@@ -46,7 +46,9 @@ sidecars/
 # a Cargo workspace member, so cargo-chef needs its manifest. Markdown files
 # inside crates (Cargo.toml `readme = ...`) likewise need to be present to
 # avoid manifest warnings; the savings from excluding them are negligible.
-docs/
+docs/**
+!docs/release/
+!docs/release/THIRD_PARTY_ASSETS.md
 
 # Old Dockerfile noise (this Dockerfile is THE source of truth now)
 docker-compose.yml

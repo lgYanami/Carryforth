@@ -465,23 +465,39 @@ impl From<String> for AcceptError {
     }
 }
 
-/// Fully validate, provision, and atomically persist one kind:30350 lease.
+/// Reject a kind:30350 push lease on the Carryforth local Relay.
+///
+/// Push is deliberately outside the first public Carryforth release surface.
+/// Keeping this explicit rejection preserves historical event and migration
+/// compatibility without retaining a runtime path to the hosted Buzz gateway.
 pub async fn accept(
+    _tenant: &buzz_core::TenantContext,
+    _state: &std::sync::Arc<crate::state::AppState>,
+    _event: &Event,
+    _now: i64,
+) -> Result<buzz_db::push::AcceptLeaseOutcome, AcceptError> {
+    Err(AcceptError::Validation("push not supported".to_string()))
+}
+
+// Retain the strict parser and persistence implementation as source-level
+// protocol history. It is intentionally private and unreachable from the
+// Carryforth Relay binary; a future self-hosted push design requires a new,
+// separately reviewed product phase rather than toggling this code at runtime.
+#[allow(dead_code)]
+async fn accept_legacy_push_lease(
     tenant: &buzz_core::TenantContext,
     state: &std::sync::Arc<crate::state::AppState>,
     event: &Event,
     now: i64,
+    executor_key_id: &str,
 ) -> Result<buzz_db::push::AcceptLeaseOutcome, AcceptError> {
     const MAX_LEASE_TTL: i64 = 30 * 24 * 60 * 60;
     const ALLOWED_SKEW: i64 = 120;
     const MAX_CONTENT: usize = 65_536;
     const MAX_PLAINTEXT: usize = 32_768;
     const MAX_ACTIVE_LEASES: i64 = 16;
-    if state.config.push_gateway_delivery_url.is_none() {
-        return Err(AcceptError::Validation("push not supported".to_string()));
-    }
     let envelope = validate_envelope(event, now, ALLOWED_SKEW, MAX_LEASE_TTL, MAX_CONTENT)?;
-    if envelope.executor_key_id != state.config.push_executor_key_id {
+    if envelope.executor_key_id != executor_key_id {
         return Err(AcceptError::Validation("unknown executor key".to_string()));
     }
     let plaintext = nostr::nips::nip44::decrypt(
@@ -695,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_trigger_allowlist_matches_advertised_push_kinds() {
+    fn historical_migration_trigger_allowlist_matches_push_kinds() {
         let kinds = PUSH_KINDS
             .iter()
             .map(u64::to_string)
@@ -705,7 +721,7 @@ mod tests {
         let migration = include_str!("../../../../migrations/0018_push_match_queue.sql");
         assert!(
             migration.contains(&predicate),
-            "migration trigger must use PUSH_KINDS exactly: {predicate}"
+            "historical migration trigger must use PUSH_KINDS exactly: {predicate}"
         );
     }
 

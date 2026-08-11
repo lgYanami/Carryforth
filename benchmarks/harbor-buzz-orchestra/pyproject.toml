@@ -1,13 +1,19 @@
 [project]
 name = "harbor-buzz-orchestra"
 version = "0.1.0"
-description = "Harbor custom agent for Buzz-coordinated multi-agent benchmarks"
+description = "Experimental Harbor agent for Carryforth-coordinated multi-agent benchmarks"
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
     "harbor>=0.16.1,<0.18",
     "pydantic>=2.11",
     "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lgYanami/Carryforth"
+Repository = "https://github.com/lgYanami/Carryforth"
+Issues = "https://github.com/lgYanami/Carryforth/issues"
 
 [build-system]
 requires = ["hatchling"]

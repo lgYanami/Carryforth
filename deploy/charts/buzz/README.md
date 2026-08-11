@@ -1,4 +1,12 @@
-# Buzz Helm Chart
+# Legacy Buzz Helm Chart (source-only)
+
+> **Not a Carryforth release or supported deployment path.** This upstream
+> chart remains in the repository for source history and template validation.
+> It still targets the retired Buzz image/namespace and must not be used as a
+> Carryforth quickstart or production installer. Use
+> [`deploy/local`](../../local/README.md) for the current local-only product
+> surface. A future Kubernetes release requires its own Carryforth migration,
+> image, security, and clean-room qualification.
 
 [Buzz](https://github.com/block/buzz) is a Nostr-based messaging platform for human–agent collaboration: a single relay binary serving WebSocket + REST + web UI, backed by PostgreSQL, Redis, and S3-compatible object storage.
 
@@ -9,7 +17,7 @@ This chart has two operating profiles selected by values:
 | **Production** (default) | Self-hosted multi-tenant, regulated, or GitOps-managed | External managed Postgres/Redis/S3, `secrets.existingSecret:`, no chart-side autogen, HA-capable (`replicaCount ≥ 2`) |
 | **Quickstart** (eval) | Eval, single-node, one-off demo | In-cluster Postgres + Redis + MinIO subcharts/Deployments, chart auto-generates relay + service secrets, single replica |
 
-## Quickstart (eval only)
+## Historical Quickstart (Buzz eval only; unsupported)
 
 ```sh
 helm install buzz oci://ghcr.io/block/buzz/charts/buzz --version 0.1.0 \
@@ -139,24 +147,16 @@ Save these. Losing any of them is data loss. See NOTES.txt printed by `helm inst
   currently stands up real Redis and S3 rather than the relay's single-node
   fallbacks. (Full-text search already runs in Postgres, so no separate search
   service is provisioned.)
-- **Cosign signing of the published chart** is a follow-up (the relay image is
-  attested via `actions/attest-build-provenance`; the chart is not yet). The
-  chart itself is published to GHCR — see [Releasing](#releasing).
+- **Chart publication is not part of the first Carryforth release.** The relay
+  image is attested via `actions/attest-build-provenance`, while this retained
+  Helm source is linted and rendered only.
 
-## Releasing
+## Release status
 
-The chart is published to GHCR as an OCI artifact at
-`oci://ghcr.io/block/buzz/charts/buzz` by the `helm chart` workflow
-(`.github/workflows/helm-chart.yml`), versioned independently of the desktop app
-and the relay image via its own `chart-v*` tags. Every PR/`main` push still
-lints, unit-tests, and render-checks the chart; only a `chart-v*` tag publishes,
-so an in-progress `main` can never overwrite a released version.
-
-To cut a release, push a `chart-release/<version>` branch whose `<version>`
-matches `Chart.yaml`'s `version`; merging it auto-tags `chart-v<version>` and
-dispatches the publish job (same lane machinery as the desktop and relay
-releases — see `.github/workflows/auto-tag-on-release-pr-merge.yml`). The publish
-job fails loudly if the tag version and `Chart.yaml` version disagree.
+This chart is source-only in the first Carryforth release. The
+`.github/workflows/helm-chart.yml` workflow performs lint, unit-test, and render
+validation but has no registry credentials, tag trigger, or publish job. Do not
+describe a local `helm package` result as an official Carryforth artifact.
 
 ## Development
 

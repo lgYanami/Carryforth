@@ -135,10 +135,11 @@ async fn main() -> anyhow::Result<()> {
 
     let usage_interval_secs = usage_metrics_interval_secs();
     let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
-    relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
+    let metrics_addr = std::net::SocketAddr::new(config.bind_addr.ip(), config.metrics_port);
+    relay_metrics::install_on(metrics_addr, usage_idle_timeout_secs);
     metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
     info!(
-        port = config.metrics_port,
+        bind_addr = %metrics_addr,
         idle_timeout_secs = usage_idle_timeout_secs,
         "Prometheus metrics exporter started"
     );
@@ -721,17 +722,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // NIP-PL matcher and worker are enabled as one unit. Lease acceptance is
-    // already disabled without the exact gateway URL, so discovery and runtime
-    // cannot advertise or accumulate work for an undeliverable configuration.
-    if state.config.push_gateway_delivery_url.is_some() {
-        tokio::spawn(buzz_relay::push_runtime::run_matcher(Arc::clone(&state)));
-        tokio::spawn(buzz_relay::push_runtime::run_delivery_worker(Arc::clone(
-            &state,
-        )));
-        info!("NIP-PL push matcher and delivery worker started");
-    }
-
     // NIP-ER reminder scheduler — polls for due reminders and publishes them
     // to Redis pub/sub for cross-pod fan-out. Each pod's existing
     // subscribe_local consumer picks them up and applies the author-only gate.
@@ -1143,8 +1133,8 @@ async fn run_periodic_until_cancelled<Tick, TickFuture>(
 /// ┌─────────────────────────────────────────────────────────┐
 /// │  Listener 1: TCP BUZZ_BIND_ADDR:3000  (app router)   │
 /// │  Listener 2: UDS BUZZ_UDS_PATH        (app, optional)│
-/// │  Listener 3: TCP 0.0.0.0:8080           (health only)  │
-/// │  Listener 4: TCP 0.0.0.0:9102           (metrics, via  │
+/// │  Listener 3: TCP BUZZ_BIND_ADDR IP:8080  (health only)  │
+/// │  Listener 4: TCP BUZZ_BIND_ADDR IP:9102  (metrics, via  │
 /// │              PrometheusBuilder — already bound)         │
 /// │                                                         │
 /// │  SIGTERM → shutting_down=true → readiness 503           │
@@ -1158,10 +1148,11 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
+    let health_addr = std::net::SocketAddr::new(config.bind_addr.ip(), config.health_port);
+    let health_listener = tokio::net::TcpListener::bind(health_addr)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
-    info!(port = config.health_port, "Health probe listener started");
+        .map_err(|e| anyhow::anyhow!("Failed to bind health listener {health_addr}: {e}"))?;
+    info!(bind_addr = %health_addr, "Health probe listener started");
     tokio::spawn(async move {
         axum::serve(health_listener, health_router).await.ok();
     });

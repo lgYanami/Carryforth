@@ -1,6 +1,13 @@
 {
   "name": "buzz-workspace",
   "private": true,
+  "description": "Carryforth local-first human and AI-agent collaboration monorepo",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/lgYanami/Carryforth#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lgYanami/Carryforth.git"
+  },
   "packageManager": "pnpm@11.4.0",
   "scripts": {
     "check": "pnpm -r check"

@@ -338,7 +338,7 @@ export function deriveCommunityName(relayUrl: string): string {
       return "Local Dev";
     }
     const parts = host.split(".");
-    // Detect staging environments (e.g. buzz-oss.stage.blox.sqprod.co)
+    // Detect staging environments (e.g. relay.staging.example.invalid)
     if (parts.some((p) => p === "stage" || p === "staging")) {
       return "Local Dev";
     }

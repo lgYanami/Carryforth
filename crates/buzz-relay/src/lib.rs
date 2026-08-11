@@ -34,8 +34,6 @@ pub mod metrics;
 pub mod nip11;
 /// NIP-01 client/relay message parsing.
 pub mod protocol;
-/// Durable NIP-PL matcher and delivery worker.
-pub mod push_runtime;
 /// Axum router construction.
 pub mod router;
 /// Trusted managed-runtime recovery scheduler.

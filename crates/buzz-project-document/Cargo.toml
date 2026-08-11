@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pure protocol and domain types for Buzz Project Documents"
+homepage.workspace = true
+description = "Pure protocol and domain types for Carryforth Project Documents"
 
 [dependencies]
 buzz-core = { workspace = true }

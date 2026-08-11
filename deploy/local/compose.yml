@@ -1,0 +1,152 @@
+name: carryforth-local
+
+services:
+  relay:
+    image: ${CARRYFORTH_RELAY_IMAGE:?run ./run.sh init --image <pinned-image> first}
+    network_mode: host
+    environment:
+      BUZZ_BIND_ADDR: 127.0.0.1:3000
+      RELAY_URL: ws://localhost:3000
+      BUZZ_HEALTH_PORT: ${CARRYFORTH_HEALTH_PORT:-18080}
+      BUZZ_METRICS_PORT: ${CARRYFORTH_METRICS_PORT:-19102}
+      DATABASE_URL: postgres://${POSTGRES_USER:-carryforth}:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD}@127.0.0.1:${CARRYFORTH_POSTGRES_PORT:-55432}/${POSTGRES_DB:-carryforth}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?missing REDIS_PASSWORD}@127.0.0.1:${CARRYFORTH_REDIS_PORT:-56379}
+      BUZZ_S3_ENDPOINT: http://127.0.0.1:${CARRYFORTH_MINIO_PORT:-59000}
+      BUZZ_S3_ACCESS_KEY: ${CARRYFORTH_S3_ACCESS_KEY:?missing CARRYFORTH_S3_ACCESS_KEY}
+      BUZZ_S3_SECRET_KEY: ${CARRYFORTH_S3_SECRET_KEY:?missing CARRYFORTH_S3_SECRET_KEY}
+      BUZZ_S3_BUCKET: ${CARRYFORTH_S3_BUCKET:-carryforth-media}
+      BUZZ_MEDIA_BASE_URL: http://localhost:3000/media
+      BUZZ_GIT_REPO_PATH: /data/git
+      BUZZ_GIT_HOOK_HMAC_SECRET: ${CARRYFORTH_GIT_HOOK_HMAC_SECRET:?missing CARRYFORTH_GIT_HOOK_HMAC_SECRET}
+      BUZZ_RELAY_PRIVATE_KEY: ${CARRYFORTH_RELAY_PRIVATE_KEY:?missing CARRYFORTH_RELAY_PRIVATE_KEY}
+      BUZZ_REQUIRE_AUTH_TOKEN: "false"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      BUZZ_ALLOW_NIP_OA_AUTH: "true"
+      BUZZ_AUTO_MIGRATE: "true"
+      BUZZ_MEETING_V1_CREATE_ENABLED: "false"
+      BUZZ_MEETING_V2_CREATE_ENABLED: "true"
+      BUZZ_MEETING_V2_DIRECT_ACTIONS_CREATE_ENABLED: "true"
+      BUZZ_MEETING_COMMUNITY_READ_ENABLED: "true"
+      RUST_LOG: buzz_relay=info,buzz_db=info,buzz_auth=info,buzz_pubsub=info,tower_http=info
+    volumes:
+      - carryforth-git-data:/data/git
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/${CARRYFORTH_HEALTH_PORT:-18080}; printf \"GET /_readiness HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 20s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-carryforth}
+      POSTGRES_USER: ${POSTGRES_USER:-carryforth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - 127.0.0.1:${CARRYFORTH_POSTGRES_PORT:-55432}:5432
+    volumes:
+      - carryforth-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - carryforth-local
+
+  redis:
+    image: redis:7.4.5-alpine
+    command:
+      ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?missing REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?missing REDIS_PASSWORD}
+    ports:
+      - 127.0.0.1:${CARRYFORTH_REDIS_PORT:-56379}:6379
+    volumes:
+      - carryforth-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - carryforth-local
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${CARRYFORTH_S3_ACCESS_KEY:?missing CARRYFORTH_S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${CARRYFORTH_S3_SECRET_KEY:?missing CARRYFORTH_S3_SECRET_KEY}
+    ports:
+      - 127.0.0.1:${CARRYFORTH_MINIO_PORT:-59000}:9000
+    volumes:
+      - carryforth-minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - carryforth-local
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      CARRYFORTH_S3_ACCESS_KEY: ${CARRYFORTH_S3_ACCESS_KEY:?missing CARRYFORTH_S3_ACCESS_KEY}
+      CARRYFORTH_S3_SECRET_KEY: ${CARRYFORTH_S3_SECRET_KEY:?missing CARRYFORTH_S3_SECRET_KEY}
+      CARRYFORTH_S3_BUCKET: ${CARRYFORTH_S3_BUCKET:-carryforth-media}
+    entrypoint: >
+      /bin/sh -euc '
+        mc alias set local http://minio:9000 "$${CARRYFORTH_S3_ACCESS_KEY}" "$${CARRYFORTH_S3_SECRET_KEY}"
+        mc mb --ignore-existing "local/$${CARRYFORTH_S3_BUCKET}"
+        mc anonymous set none "local/$${CARRYFORTH_S3_BUCKET}"
+      '
+    restart: "no"
+    networks:
+      - carryforth-local
+
+volumes:
+  carryforth-postgres-data:
+    labels:
+      io.carryforth.volume: postgres
+  carryforth-redis-data:
+    labels:
+      io.carryforth.volume: redis
+  carryforth-minio-data:
+    labels:
+      io.carryforth.volume: minio
+  carryforth-git-data:
+    labels:
+      io.carryforth.volume: git
+
+networks:
+  carryforth-local:
+    driver: bridge
+    labels:
+      io.carryforth.network: local

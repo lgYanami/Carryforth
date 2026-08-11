@@ -2,6 +2,14 @@
   "name": "carryforth",
   "private": true,
   "version": "0.4.25",
+  "description": "Carryforth local-first desktop client",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/lgYanami/Carryforth#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lgYanami/Carryforth.git",
+    "directory": "desktop"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

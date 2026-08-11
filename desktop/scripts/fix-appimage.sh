@@ -4,10 +4,6 @@
 #
 # Usage: fix-appimage.sh <path-to.AppImage>
 #
-# Set TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD to
-# re-sign after repacking (CI release builds). Without them the script
-# repacks but skips signing, which is fine for local testing.
-#
 # Set APPIMAGETOOL_RUNTIME_FILE to a pre-downloaded AppImage type2 runtime to
 # avoid appimagetool fetching one from its mutable `continuous` tag (CI pins
 # this; unset is fine for local testing).
@@ -54,12 +50,7 @@ if [[ ! -f "$1" ]]; then
 fi
 
 APPIMAGE_ABS="$(realpath "$1")"
-APPIMAGE_DIR="$(dirname "$APPIMAGE_ABS")"
 APPIMAGE_NAME="$(basename "$APPIMAGE_ABS")"
-
-# Locate the desktop/ directory (this script lives at desktop/scripts/).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DESKTOP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Detect multiarch triplet for GStreamer plugin path.
 case "$(uname -m)" in
@@ -126,33 +117,4 @@ APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$(uname -m)" appimagetool \
   "${RUNTIME_ARGS[@]}" \
   "$WORKDIR/squashfs-root" "$APPIMAGE_ABS"
 
-# Re-sign after repack so the updater can verify the artifact.
-# Tauri 2.11 with createUpdaterArtifacts=true produces two possible formats:
-#   New: <name>.AppImage + <name>.AppImage.sig   (sign the AppImage directly)
-#   Old: <name>.AppImage.tar.gz + .tar.gz.sig    (tar-wrapped, then signed)
-# We handle both: always re-sign the AppImage; if a .tar.gz sibling exists
-# alongside it, recreate it from the freshly repacked AppImage and re-sign that.
-# Our release config pins createUpdaterArtifacts: true (build-release-config.mjs),
-# so the tar.gz branch is dead in CI today — kept deliberately because the
-# workflow's artifact-locate step prefers a tar.gz when one exists; dropping
-# this branch could publish a stale tarball containing the unfixed AppImage.
-if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
-  # `tauri signer sign` reads TAURI_SIGNING_PRIVATE_KEY and
-  # TAURI_SIGNING_PRIVATE_KEY_PASSWORD from the environment (same as the
-  # macOS jobs in release.yml) — never pass the password via argv, where
-  # it would be visible in /proc/<pid>/cmdline.
-  echo "==> Re-signing AppImage"
-  (cd "$DESKTOP_DIR" && pnpm tauri signer sign "$APPIMAGE_ABS")
-
-  TARBALL="$APPIMAGE_ABS.tar.gz"
-  if [[ -f "$TARBALL" ]]; then
-    echo "==> Recreating updater archive $TARBALL"
-    tar -czf "$TARBALL" -C "$APPIMAGE_DIR" "$APPIMAGE_NAME"
-    echo "==> Re-signing updater archive"
-    (cd "$DESKTOP_DIR" && pnpm tauri signer sign "$TARBALL")
-  fi
-else
-  echo "==> TAURI_SIGNING_PRIVATE_KEY not set — skipping signing (local build)"
-fi
-
-echo "==> Done: $APPIMAGE_ABS"
+echo "==> Done: $APPIMAGE_ABS (unsigned community artifact)"

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "NIP-GS git commit/tag signing program using Nostr secp256k1 keys"
 readme = "README.md"
 publish = false  # internal workspace tool, not published to crates.io

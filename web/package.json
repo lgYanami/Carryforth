@@ -2,6 +2,14 @@
   "name": "buzz-web",
   "private": true,
   "version": "0.1.0",
+  "description": "Experimental Carryforth web client; not part of the first supported release",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/lgYanami/Carryforth#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lgYanami/Carryforth.git",
+    "directory": "web"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

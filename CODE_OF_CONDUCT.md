@@ -59,8 +59,14 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-**conduct@buzz-relay.org**.
+reported privately to the Carryforth repository maintainer through an available
+private GitHub profile channel. For conduct occurring on GitHub, reporters may
+also use GitHub's [Report Abuse](https://support.github.com/contact/report-abuse)
+channel. Do not include sensitive personal information in a public issue.
+
+Carryforth has not yet published a dedicated private conduct-reporting address.
+Selecting and recording that durable contact is a release-blocking Human
+maintainer decision; no upstream address remains authorized for this project.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

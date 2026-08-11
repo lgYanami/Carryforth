@@ -53,7 +53,10 @@ pub struct RelayInfo {
     /// Draft/extension protocol identifiers supported by this relay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_extensions: Option<Vec<String>>,
-    /// NIP-PL executor descriptor. Present only when push delivery is configured.
+    /// Reserved NIP-PL executor descriptor field.
+    ///
+    /// Carryforth leaves this absent because Push is outside the supported
+    /// local Relay release surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push: Option<serde_json::Value>,
     /// URL of the relay software repository.
@@ -170,15 +173,15 @@ impl RelayInfo {
         }
 
         Self {
-            name: "Buzz Relay".to_string(),
-            description: "Buzz — private team communication relay".to_string(),
+            name: "Carryforth Relay".to_string(),
+            description: "Local-first collaboration relay for Carryforth".to_string(),
             icon: icon.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             pubkey: None,
             contact: None,
             supported_nips,
             supported_extensions: Some(supported_extensions),
             push: None,
-            software: "https://github.com/block/buzz".to_string(),
+            software: "https://github.com/lgYanami/Carryforth".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             limitation: Some(relay_limitation(max_message_length)),
             pairing_relay_url: pairing_relay_url.map(str::to_string),
@@ -197,52 +200,6 @@ pub async fn relay_info_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     axum::response::Json(nip11_document(&state, raw_host).await)
-}
-
-fn push_descriptor(
-    push_configured: bool,
-    relay_url: &str,
-    executor_key_id: &str,
-    relay_keypair: &nostr::Keys,
-    tenant_host: Option<&str>,
-) -> Option<serde_json::Value> {
-    let host = tenant_host?;
-    push_configured.then_some(())?;
-    let scheme = if relay_url.starts_with("wss://") {
-        "wss"
-    } else {
-        "ws"
-    };
-    Some(serde_json::json!({
-        "origin": format!("{scheme}://{host}"),
-        "keys": [{
-            "id": executor_key_id,
-            "pubkey": relay_keypair.public_key().to_hex(),
-            "current": true
-        }],
-        "app_profiles": [
-            {"id": "buzz-ios-production", "transport": "apns"},
-            {"id": "buzz-ios-sandbox", "transport": "apns"}
-        ],
-        "push_kinds": crate::handlers::push_lease::PUSH_KINDS,
-        "urgent_kinds": crate::handlers::push_lease::URGENT_KINDS,
-        "h_grammar": "uuid-v4-lowercase",
-        "class_support": {"apns": ["silent", "default", "time_sensitive"]},
-        "limitation": {
-            "max_lease_ttl": 2592000,
-            "max_leases_per_pubkey": 16,
-            "max_subscriptions_per_lease": 16,
-            "max_kinds": 16,
-            "max_authors": 20,
-            "max_h": 50,
-            "max_tag_values": 20,
-            "max_ignore": 8,
-            "max_content_len": 65536,
-            "max_plaintext_len": 32768,
-            "max_endpoint_len": 4096,
-            "max_string_len": 512
-        }
-    }))
 }
 
 /// Builds the served NIP-11 document for a request arriving on `raw_host`.
@@ -297,26 +254,6 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         state.config.meeting_v2_direct_actions_create_enabled,
         meeting_summary_runtime_ready(state, meeting_v2_ready).await,
     );
-    let tenant_host = if state.config.push_gateway_delivery_url.is_some() {
-        crate::tenant::bind_community(&state.db, raw_host)
-            .await
-            .ok()
-            .map(|tenant| tenant.host().to_owned())
-    } else {
-        None
-    };
-    if let Some(push) = push_descriptor(
-        state.config.push_gateway_delivery_url.is_some(),
-        &state.config.relay_url,
-        &state.config.push_executor_key_id,
-        &state.relay_keypair,
-        tenant_host.as_deref(),
-    ) {
-        info.supported_extensions
-            .get_or_insert_default()
-            .push("nip-pl".to_string());
-        info.push = Some(push);
-    }
     info
 }
 
@@ -632,18 +569,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {
-        let keys = nostr::Keys::generate();
+    fn carryforth_relay_info_does_not_advertise_push() {
+        let info = RelayInfo::build(None, None, false, false, 1024, None);
+        assert!(info.push.is_none());
         assert!(
-            push_descriptor(false, "ws://relay", "key", &keys, Some("tenant.example")).is_none()
-        );
-        assert!(push_descriptor(true, "ws://relay", "key", &keys, None).is_none());
-        let descriptor = push_descriptor(true, "ws://relay", "key", &keys, Some("tenant.example"))
-            .expect("configured push descriptor");
-        assert_eq!(descriptor["origin"], "ws://tenant.example");
-        assert_eq!(
-            descriptor["push_kinds"],
-            serde_json::json!(crate::handlers::push_lease::PUSH_KINDS)
+            info.supported_extensions
+                .as_ref()
+                .is_none_or(|extensions| !extensions.iter().any(|item| item == "nip-pl")),
+            "Carryforth must not advertise the disabled NIP-PL surface"
         );
     }
 
@@ -678,9 +611,14 @@ mod tests {
     }
 
     #[test]
-    fn build_advertises_buzz_repository_url() {
+    fn build_advertises_carryforth_product_identity() {
         let info = RelayInfo::build(None, None, false, false, DEFAULT_MAX_FRAME_BYTES, None);
-        assert_eq!(info.software, "https://github.com/block/buzz");
+        assert_eq!(info.name, "Carryforth Relay");
+        assert_eq!(
+            info.description,
+            "Local-first collaboration relay for Carryforth"
+        );
+        assert_eq!(info.software, "https://github.com/lgYanami/Carryforth");
     }
 
     #[test]

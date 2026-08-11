@@ -1,7 +1,12 @@
 [package]
 name = "countdown-bot"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Example Carryforth channel bot that publishes a countdown"
 publish = false
 
 [dependencies]

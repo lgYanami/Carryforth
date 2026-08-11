@@ -2,9 +2,10 @@
 name = "buzz-persona"
 version = "0.1.0"
 edition = "2021"
-description = "Parser and loader for Buzz persona pack files (.persona.md)"
+description = "Parser and loader for Carryforth persona pack files (.persona.md)"
 license = "Apache-2.0"
-repository = "https://github.com/block/sprout"
+repository = "https://github.com/lgYanami/Carryforth"
+homepage = "https://github.com/lgYanami/Carryforth"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

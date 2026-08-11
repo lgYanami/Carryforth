@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Postgres event store and data access layer for Buzz"
+homepage.workspace = true
+description = "Postgres event store and data access layer for Carryforth"
 
 [dependencies]
 buzz-core = { workspace = true }

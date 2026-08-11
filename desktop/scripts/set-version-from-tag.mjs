@@ -18,6 +18,7 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
 const packageJsonPath = resolve(process.cwd(), "package.json");
 const tauriConfigPath = resolve(process.cwd(), "src-tauri/tauri.conf.json");
 const cargoTomlPath = resolve(process.cwd(), "src-tauri/Cargo.toml");
+const cargoLockPath = resolve(process.cwd(), "src-tauri/Cargo.lock");
 
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
 packageJson.version = version;
@@ -36,3 +37,20 @@ const updatedCargoToml = cargoToml.replace(
 );
 writeFileSync(cargoTomlPath, updatedCargoToml);
 console.log(`Set Cargo.toml to ${version}`);
+
+// Keep the root package entry in the checked-in lockfile synchronized without
+// invoking `cargo update`. A release build must never re-resolve dependencies;
+// only this workspace package's own version is allowed to change.
+const cargoLock = readFileSync(cargoLockPath, "utf8");
+const packageEntry =
+  /(\[\[package\]\]\nname = "buzz-desktop"\nversion = ")[^"]+("\n)/g;
+const matches = [...cargoLock.matchAll(packageEntry)];
+if (matches.length !== 1) {
+  console.error(
+    `Expected exactly one buzz-desktop package entry in Cargo.lock, found ${matches.length}`,
+  );
+  process.exit(1);
+}
+const updatedCargoLock = cargoLock.replace(packageEntry, `$1${version}$2`);
+writeFileSync(cargoLockPath, updatedCargoLock);
+console.log(`Set Cargo.lock local package entry to ${version}`);

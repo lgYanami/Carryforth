@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn intercepted_cloudflare_host_returns_some() {
-        let result = classify_intercepted_response("sqprod.cloudflareaccess.com", "text/html");
+        let result = classify_intercepted_response("tenant.cloudflareaccess.com", "text/html");
         assert!(result.is_some());
         let msg = result.unwrap();
         assert!(

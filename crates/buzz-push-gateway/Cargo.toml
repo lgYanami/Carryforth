@@ -1,11 +1,12 @@
 [package]
 name = "buzz-push-gateway"
-description = "Blind, capability-gated NIP-PL gateway for the Buzz mobile app"
+description = "Legacy NIP-PL push gateway retained as source; excluded from Carryforth local-only releases"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [lib]
 name = "buzz_push_gateway"
