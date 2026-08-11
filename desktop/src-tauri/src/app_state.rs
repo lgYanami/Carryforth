@@ -20,7 +20,7 @@ use crate::managed_agents::{
 use crate::meeting_runtime::{MeetingActionRenewalRuntime, MeetingGrantRenewalRuntime};
 
 mod workspace_transition;
-use workspace_transition::build_semantic_query_http_client;
+use workspace_transition::semantic_query_http_client_or_disabled;
 pub(crate) use workspace_transition::{
     AppliedWorkspaceCapture, AppliedWorkspaceCaptureError, WorkspaceTransitionState,
 };
@@ -34,8 +34,9 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// No-redirect client for the pinned semantic capability, Project identity,
     /// and byte-exact one-shot `/query` path. A redirect must never forward a
-    /// freshly minted NIP-98 header or change the URL covered by it.
-    pub semantic_query_http_client: reqwest::Client,
+    /// freshly minted NIP-98 header or change the URL covered by it. `None`
+    /// keeps semantic query fail-closed if this dedicated client cannot build.
+    pub semantic_query_http_client: Option<reqwest::Client>,
     /// A no-redirect client for authenticated relay media fetches (download,
     /// clipboard copy, snapshot, editor). Every caller pre-validates the URL
     /// origin, but the app-wide `http_client` follows redirects by default, so
@@ -217,10 +218,7 @@ pub fn build_app_state() -> AppState {
              redirect-following fallback would forward the minted media auth \
              header across origins (redirect-hop SSRF)",
         ),
-        semantic_query_http_client: build_semantic_query_http_client().expect(
-            "semantic_query_http_client must reject redirects; following one would change the \
-             authenticated URL and could forward its NIP-98 header",
-        ),
+        semantic_query_http_client: semantic_query_http_client_or_disabled(),
         relay_url_override: Mutex::new(None),
         workspace_transition: Mutex::new(WorkspaceTransitionState::default()),
         managed_agent_restore_pending: AtomicBool::new(false),

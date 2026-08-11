@@ -143,7 +143,7 @@ const LIVE_RETRY_BASE_MS = 1_000;
 const LIVE_RETRY_MAX_MS = 30_000;
 const NIP29_GROUP_METADATA_KIND = 39_000;
 const SEMANTIC_MEETING_FILTER_BATCH_SIZE = 64;
-const TRUSTED_REFRESH_OPTIONS = { throwOnError: true } as const;
+const CANONICAL_CONTEXT_REFRESH_OPTIONS = { throwOnError: true } as const;
 
 function chunks<T>(items: readonly T[], size: number): T[][] {
   const result: T[][] = [];
@@ -209,6 +209,10 @@ export function useProjectContextLiveSync(
     async (scopes: ReadonlySet<ProjectContextInvalidationScope>) => {
       const refreshes: Array<Promise<unknown>> = [];
       if (scopes.has("context")) {
+        // The canonical Context snapshot is the only refresh that gates the
+        // live-subscription state. Project View, Document, and Meeting reads
+        // below enrich pickers and inspectors; their failures stay on their
+        // own query surfaces and must not masquerade as a socket failure.
         refreshes.push(
           queryClient.invalidateQueries(
             {
@@ -216,71 +220,54 @@ export function useProjectContextLiveSync(
                 candidate.queryKey[0] === "project-context" &&
                 candidate.queryKey[1] === communityKey,
             },
-            TRUSTED_REFRESH_OPTIONS,
+            CANONICAL_CONTEXT_REFRESH_OPTIONS,
           ),
         );
         if (stableSemanticMeetingIds.length > 0) {
           refreshes.push(
-            queryClient.invalidateQueries(
-              { queryKey: channelsQueryKey },
-              TRUSTED_REFRESH_OPTIONS,
-            ),
-            queryClient.invalidateQueries(
-              {
-                predicate: (candidate) =>
-                  candidate.queryKey[0] === "meetings" &&
-                  candidate.queryKey[1] === (communityId ?? "no-community") &&
-                  (candidate.queryKey[2] === "directory" ||
-                    (candidate.queryKey[2] === "context-detail" &&
-                      typeof candidate.queryKey[3] === "string" &&
-                      stableSemanticMeetingIds.includes(
-                        candidate.queryKey[3],
-                      ))),
-              },
-              TRUSTED_REFRESH_OPTIONS,
-            ),
+            queryClient.invalidateQueries({ queryKey: channelsQueryKey }),
+            queryClient.invalidateQueries({
+              predicate: (candidate) =>
+                candidate.queryKey[0] === "meetings" &&
+                candidate.queryKey[1] === (communityId ?? "no-community") &&
+                (candidate.queryKey[2] === "directory" ||
+                  (candidate.queryKey[2] === "context-detail" &&
+                    typeof candidate.queryKey[3] === "string" &&
+                    stableSemanticMeetingIds.includes(candidate.queryKey[3]))),
+            }),
           );
         }
       }
       if (scopes.has("project_view")) {
         refreshes.push(
-          queryClient.invalidateQueries(
-            {
-              queryKey: ["project-view", communityId ?? "no-community"],
-            },
-            TRUSTED_REFRESH_OPTIONS,
-          ),
+          queryClient.invalidateQueries({
+            queryKey: ["project-view", communityId ?? "no-community"],
+          }),
         );
       }
       if (scopes.has("documents") || scopes.has("document_catalog")) {
         refreshes.push(
-          queryClient.invalidateQueries(
-            {
-              predicate: (candidate) => {
-                const root = candidate.queryKey[0];
-                return (
-                  (root === "project-document-meta" ||
-                    root === "project-documents") &&
-                  candidate.queryKey[1] === communityKey
-                );
-              },
+          queryClient.invalidateQueries({
+            predicate: (candidate) => {
+              const root = candidate.queryKey[0];
+              return (
+                (root === "project-document-meta" ||
+                  root === "project-documents") &&
+                candidate.queryKey[1] === communityKey
+              );
             },
-            TRUSTED_REFRESH_OPTIONS,
-          ),
+          }),
         );
       }
       if (scopes.has("documents")) {
         refreshes.push(
-          queryClient.invalidateQueries(
-            {
-              predicate: (candidate) =>
-                (candidate.queryKey[0] === "project-document-history" ||
-                  (candidate.queryKey[0] === "project-document" &&
-                    candidate.queryKey[6] === "current")) &&
-                candidate.queryKey[1] === communityKey,
-            },
-            TRUSTED_REFRESH_OPTIONS,
-          ),
+          queryClient.invalidateQueries({
+            predicate: (candidate) =>
+              (candidate.queryKey[0] === "project-document-history" ||
+                (candidate.queryKey[0] === "project-document" &&
+                  candidate.queryKey[6] === "current")) &&
+              candidate.queryKey[1] === communityKey,
+          }),
         );
       }
       await Promise.all(refreshes);

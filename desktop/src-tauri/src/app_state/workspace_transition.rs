@@ -69,11 +69,27 @@ pub(crate) struct WorkspaceTransitionState {
 pub(super) fn build_semantic_query_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        // Carryforth Desktop is local-only. System HTTP_PROXY/ALL_PROXY must
+        // never receive the NIP-98 header or semantic problem body.
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(45))
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(1)
         .redirect(reqwest::redirect::Policy::none())
         .build()
+}
+
+/// Build the dedicated semantic client or keep the capability disabled.
+pub(super) fn semantic_query_http_client_or_disabled() -> Option<reqwest::Client> {
+    match build_semantic_query_http_client() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            eprintln!(
+                "carryforth-desktop: semantic query HTTP client unavailable; queries remain disabled: {error}"
+            );
+            None
+        }
+    }
 }
 
 impl AppState {

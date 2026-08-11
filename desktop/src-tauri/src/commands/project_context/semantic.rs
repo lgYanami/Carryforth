@@ -58,16 +58,17 @@ async fn query_project_context_semantic_inner(
     let workspace = state
         .capture_applied_workspace(&submitted.community_key, &submitted.applied_workspace_token)
         .map_err(map_workspace_capture_error)?;
+    let semantic_client = state
+        .semantic_query_http_client
+        .as_ref()
+        .ok_or_else(SemanticProjectContextQueryError::internal)?;
 
     // Capability is observed afresh for every explicit run, over the pinned
     // no-redirect origin. The problem is not sent when this check fails.
-    let identity = read_identity_at_with_client(
-        &workspace.relay_http_origin,
-        &state.semantic_query_http_client,
-    )
-    .await
-    .map_err(|message| map_identity_error(&message))?
-    .ok_or_else(SemanticProjectContextQueryError::unsupported)?;
+    let identity = read_identity_at_with_client(&workspace.relay_http_origin, semantic_client)
+        .await
+        .map_err(|message| map_identity_error(&message))?
+        .ok_or_else(SemanticProjectContextQueryError::unsupported)?;
     if identity.schema != ProjectViewSchema::V3
         || !identity.runtime_ready
         || !identity.semantic_query_http_available
@@ -79,7 +80,7 @@ async fn query_project_context_semantic_inner(
         identity,
         &workspace.relay_http_origin,
         &workspace.keys,
-        &state.semantic_query_http_client,
+        semantic_client,
     )
     .await
     .map_err(map_project_view_error)?
@@ -121,8 +122,7 @@ async fn query_project_context_semantic_inner(
         )
         .map_err(|_| SemanticProjectContextQueryError::internal())?;
 
-    let response = state
-        .semantic_query_http_client
+    let response = semantic_client
         .post(query_url)
         .timeout(SEMANTIC_QUERY_TIMEOUT)
         .header("Authorization", authorization.authorization_header)

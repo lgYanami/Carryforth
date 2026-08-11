@@ -2821,7 +2821,7 @@ test("sequenced refresh failure keeps stale data and the next read recovers", as
   );
 });
 
-test("Community switch never paints the previous Project Context result", async ({
+test("local-only bootstrap never paints a stale alternate-port Project Context", async ({
   page,
 }) => {
   await seedCommunities(page);
@@ -2843,30 +2843,14 @@ test("Community switch never paints the previous Project Context result", async 
   await expect(
     page.getByTestId("project-context-result-counts"),
   ).toHaveAttribute("data-edge-count", "1");
-
-  await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-  await page.getByTestId("open-project-context").click();
-  await expect(page.getByTestId("project-context-loading")).toBeVisible();
-  await expect(page.getByTestId("project-context-result-counts")).toHaveCount(
-    0,
-  );
   await expect(
-    page.getByTestId("project-context-result-counts"),
-  ).toHaveAttribute("data-edge-count", "2");
-
-  await page
-    .getByTestId(`project-context-coordinate-requirement:${REQUIREMENT_ID}`)
-    .click();
-  await expect(page).toHaveURL(/selected=coordinate/);
-  await page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`).click();
-  await page.getByTestId("open-project-context").click();
-  await expect(page).toHaveURL(/#\/project-context$/);
-  await expect(page.getByTestId("project-context-loading")).toBeVisible();
-  await expect(page.getByTestId("project-context-result-counts")).toHaveCount(
-    0,
+    page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
+  ).toHaveCount(0);
+  const calls = await page.evaluate(
+    () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ ?? [],
   );
-  await expect(
-    page.getByTestId("project-context-result-counts"),
-  ).toHaveAttribute("data-edge-count", "1");
-  await expect(page).not.toHaveURL(/selected=/);
+  expect(calls.length).toBeGreaterThan(0);
+  expect(calls.every((call) => call.relayUrl === COMMUNITY_A.relayUrl)).toBe(
+    true,
+  );
 });

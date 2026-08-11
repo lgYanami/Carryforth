@@ -1,7 +1,119 @@
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use nostr::Keys;
 
 use super::{AppliedWorkspaceCaptureError, WorkspaceSigningEligibility};
 use crate::app_state::build_app_state;
+
+const SEMANTIC_PROXY_PROBE_CHILD: &str =
+    "app_state::workspace_transition::tests::semantic_proxy_probe_child";
+
+fn serve_probe(
+    listener: TcpListener,
+    hit: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    response: &'static [u8],
+) -> std::thread::JoinHandle<()> {
+    listener
+        .set_nonblocking(true)
+        .expect("set probe listener nonblocking");
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    hit.store(true, Ordering::Release);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(response);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept probe connection: {error}"),
+            }
+        }
+    })
+}
+
+#[test]
+fn semantic_query_client_bypasses_system_proxy() {
+    let target = TcpListener::bind("127.0.0.1:0").expect("bind direct target");
+    let target_addr = target.local_addr().expect("direct target address");
+    let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy trap");
+    let proxy_addr = proxy.local_addr().expect("proxy trap address");
+    let target_hit = Arc::new(AtomicBool::new(false));
+    let proxy_hit = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let target_server = serve_probe(
+        target,
+        Arc::clone(&target_hit),
+        Arc::clone(&stop),
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let proxy_server = serve_probe(
+        proxy,
+        Arc::clone(&proxy_hit),
+        Arc::clone(&stop),
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let proxy_url = format!("http://{proxy_addr}");
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", SEMANTIC_PROXY_PROBE_CHILD, "--nocapture"])
+        .env(
+            "CARRYFORTH_SEMANTIC_PROXY_PROBE_URL",
+            format!("http://localhost:{}/probe", target_addr.port()),
+        )
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .status()
+        .expect("run isolated proxy probe");
+    stop.store(true, Ordering::Release);
+    target_server.join().expect("join direct target");
+    proxy_server.join().expect("join proxy trap");
+
+    assert!(status.success(), "isolated semantic proxy probe failed");
+    assert!(
+        target_hit.load(Ordering::Acquire),
+        "semantic request did not reach the direct loopback target"
+    );
+    assert!(
+        !proxy_hit.load(Ordering::Acquire),
+        "semantic request leaked through the configured system proxy"
+    );
+}
+
+#[test]
+fn semantic_proxy_probe_child() {
+    let Ok(url) = std::env::var("CARRYFORTH_SEMANTIC_PROXY_PROBE_URL") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build proxy probe runtime");
+    let status = runtime.block_on(async {
+        super::build_semantic_query_http_client()
+            .expect("build semantic query client")
+            .get(url)
+            .send()
+            .await
+            .expect("send semantic proxy probe")
+            .status()
+    });
+    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+}
 
 #[test]
 fn applied_workspace_capture_is_exact_and_redacted() {
