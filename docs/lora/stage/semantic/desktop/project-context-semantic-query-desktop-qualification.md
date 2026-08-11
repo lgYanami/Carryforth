@@ -150,6 +150,12 @@ terminal Coordinate标记，执行Fit paths并等待动画结束后截图：
 真实Relay响应、Provider relevance、权限线性化、production LB或multi-pod运行资格。当前只有两张主题图；
 不能将其表述为semantic-only / semantic+selection四种独立截图均已完成。
 
+Carryforth集成分支在合入本提交后重新构建并运行同一两条E2E，产物均为`1131 × 951`，人工复核通过且
+hash distinct：light为`221ee902d6c472c4f68ee404e4be3a45a15f4f544bf84db87f63cf2a5251cc3c`，dark为
+`bd505532b29de929a15980796a9811463e0aa246664739a2c88e5ba3e59ab8ea`。上表继续保留基线提交
+`507790180`的原始资格证据；这组复验只证明Carryforth集成没有破坏D6视觉状态，不替代本报告列出的
+Provider、目标PostgreSQL、production LB或multi-pod阻断项。
+
 ## 4. Performance / soak 审计
 
 仓库原先只有兼容性、migration与3-vector correctness工具，没有可重复的exact-query性能runner。本次新增：

@@ -1,5 +1,27 @@
 \set ON_ERROR_STOP on
 
+\if :{?expected_database}
+\else
+\echo 'expected_database must be supplied by the qualification runner'
+\quit 1
+\endif
+\if :{?expected_user}
+\else
+\echo 'expected_user must be supplied by the qualification runner'
+\quit 1
+\endif
+
+SELECT (
+    current_database() = :'expected_database'
+    AND current_user = :'expected_user'
+    AND to_regnamespace('semantic_exact_qualification') IS NULL
+) AS qualification_target_ok \gset
+\if :qualification_target_ok
+\else
+\echo 'refusing a non-fresh or unexpected semantic qualification database'
+\quit 1
+\endif
+
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE SCHEMA semantic_exact_qualification;
 

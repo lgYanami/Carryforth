@@ -3,10 +3,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PGVECTOR_IMAGE="pgvector/pgvector@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0"
-QUALIFICATION_CONTAINER="buzz-semantic-exact-qualification-$$"
-QUALIFICATION_USER="buzz_semantic_exact"
-QUALIFICATION_PASSWORD="buzz_semantic_exact"
-QUALIFICATION_DATABASE="buzz_semantic_exact"
+QUALIFICATION_CONTAINER=""
+QUALIFICATION_OWNER_LABEL="io.carryforth.semantic-exact-qualification.owner"
+QUALIFICATION_OWNER_TOKEN="$$-${RANDOM}-${SECONDS}"
+QUALIFICATION_USER="carryforth_semantic_exact"
+QUALIFICATION_PASSWORD="carryforth_semantic_exact"
+QUALIFICATION_DATABASE="carryforth_semantic_exact"
 
 # The budget dimensions are frozen by buzz-semantic-query. Source counts are
 # an explicit repeatable local qualification scale, not a production capacity
@@ -14,7 +16,7 @@ QUALIFICATION_DATABASE="buzz_semantic_exact"
 MEDIUM_SOURCES="${SEMANTIC_QUALIFICATION_MEDIUM_SOURCES:-2000}"
 TARGET_SOURCES="${SEMANTIC_QUALIFICATION_TARGET_SOURCES:-10000}"
 DISTRACTOR_SOURCES="${SEMANTIC_QUALIFICATION_DISTRACTOR_SOURCES:-5000}"
-DEFAULT_CHANNELS=4
+REPRESENTATIVE_CHANNELS=4
 HARD_CAP_CHANNELS=9
 DEFAULT_RECALL=64
 HARD_CAP_RECALL=256
@@ -31,6 +33,22 @@ OUTPUT_DIR="${1:-${DEFAULT_OUTPUT_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 fail() {
   printf 'semantic exact-query qualification failed: %s\n' "$*" >&2
   exit 1
+}
+
+effective_docker_endpoint() {
+  if [[ -n "${DOCKER_CONTEXT:-}" ]]; then
+    docker context inspect "$DOCKER_CONTEXT" \
+      --format '{{(index .Endpoints "docker").Host}}'
+    return
+  fi
+  if [[ -n "${DOCKER_HOST:-}" ]]; then
+    printf '%s\n' "$DOCKER_HOST"
+    return
+  fi
+  local context
+  context="$(docker context show)" || fail "cannot resolve the active Docker context"
+  docker context inspect "$context" \
+    --format '{{(index .Endpoints "docker").Host}}'
 }
 
 require_positive_integer() {
@@ -64,16 +82,35 @@ if ((SOAK_JOBS > SOAK_CLIENTS)); then
   fail "SOAK_JOBS cannot exceed SOAK_CLIENTS"
 fi
 
+DOCKER_ENDPOINT="$(effective_docker_endpoint)"
+if [[ "$DOCKER_ENDPOINT" != unix://* ]]; then
+  fail "refusing non-local Docker endpoint: ${DOCKER_ENDPOINT}"
+fi
+# Pin every subsequent Docker operation, including EXIT cleanup, to the exact
+# local endpoint that passed the check. This prevents an active-context change
+# in another shell from redirecting part of the run to another daemon.
+unset DOCKER_CONTEXT
+export DOCKER_HOST="$DOCKER_ENDPOINT"
+
 # Refuse silent drift from the frozen query budget used to name the profiles.
-rg -q '^pub const MAX_CONTEXT_COORDINATES: usize = 8;$' \
+rg -Fqx 'pub const MAX_CONTEXT_COORDINATES: usize = 8;' \
   "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
   fail "MAX_CONTEXT_COORDINATES drifted from the hard-cap profile"
-rg -q '^pub const MAX_RECALL_PER_CHANNEL: u16 = 256;$' \
+rg -Fqx 'pub const MAX_QUERY_CHANNELS: usize = 1 + MAX_CONTEXT_COORDINATES;' \
+  "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
+  fail "MAX_QUERY_CHANNELS drifted from the hard-cap profile"
+rg -Fqx 'pub const MAX_RECALL_PER_CHANNEL: u16 = 256;' \
   "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
   fail "MAX_RECALL_PER_CHANNEL drifted from the hard-cap profile"
-rg -q '^    max_recall_per_channel: 64,$' \
+rg -Fqx 'pub const MAX_WALL_TIME_MS: u32 = 30_000;' \
+  "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
+  fail "MAX_WALL_TIME_MS drifted from the hard-cap profile"
+rg -Fqx '    max_recall_per_channel: 64,' \
   "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
   fail "default recall budget drifted from the qualification profile"
+rg -Fqx "SET LOCAL statement_timeout = '30s';" \
+  "${REPO_ROOT}/scripts/semantic-exact-query-qualification-pgbench.sql" ||
+  fail "pgbench statement timeout drifted from MAX_WALL_TIME_MS"
 
 if [[ -e "$OUTPUT_DIR" ]] && [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
   fail "output directory already exists and is not empty: ${OUTPUT_DIR}"
@@ -81,16 +118,69 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 cleanup() {
-  docker rm -f "$QUALIFICATION_CONTAINER" >/dev/null 2>&1 || true
+  local container="${QUALIFICATION_CONTAINER:-}"
+  if [[ -z "$container" ]]; then
+    return 0
+  fi
+  local owner
+  owner="$(
+    docker inspect \
+      --format '{{index .Config.Labels "io.carryforth.semantic-exact-qualification.owner"}}' \
+      "$container" 2>/dev/null || true
+  )"
+  if [[ "$owner" != "$QUALIFICATION_OWNER_TOKEN" ]]; then
+    printf 'semantic exact-query qualification: refusing to remove unowned container %s\n' \
+      "$container" >&2
+    return 1
+  fi
+  if ! docker rm -f -v "$container" >/dev/null 2>&1; then
+    printf 'semantic exact-query qualification: failed to remove owned container %s\n' \
+      "$container" >&2
+    return 1
+  fi
+  QUALIFICATION_CONTAINER=""
 }
-trap cleanup EXIT
 
-docker run -d \
-  --name "$QUALIFICATION_CONTAINER" \
-  -e POSTGRES_USER="$QUALIFICATION_USER" \
-  -e POSTGRES_PASSWORD="$QUALIFICATION_PASSWORD" \
-  -e POSTGRES_DB="$QUALIFICATION_DATABASE" \
-  "$PGVECTOR_IMAGE" >/dev/null
+cleanup_on_exit() {
+  local original_status=$?
+  trap - EXIT
+  if ! cleanup && ((original_status == 0)); then
+    original_status=1
+  fi
+  exit "$original_status"
+}
+trap cleanup_on_exit EXIT
+
+QUALIFICATION_CONTAINER="$(
+  docker run -d \
+    --rm \
+    --network none \
+    --label "${QUALIFICATION_OWNER_LABEL}=${QUALIFICATION_OWNER_TOKEN}" \
+    -e POSTGRES_USER="$QUALIFICATION_USER" \
+    -e POSTGRES_PASSWORD="$QUALIFICATION_PASSWORD" \
+    -e POSTGRES_DB="$QUALIFICATION_DATABASE" \
+    "$PGVECTOR_IMAGE"
+)"
+
+container_owner="$(
+  docker inspect \
+    --format '{{index .Config.Labels "io.carryforth.semantic-exact-qualification.owner"}}' \
+    "$QUALIFICATION_CONTAINER"
+)"
+container_network="$(
+  docker inspect --format '{{.HostConfig.NetworkMode}}' "$QUALIFICATION_CONTAINER"
+)"
+container_binds="$(
+  docker inspect --format '{{json .HostConfig.Binds}}' "$QUALIFICATION_CONTAINER"
+)"
+container_image="$(docker inspect --format '{{.Image}}' "$QUALIFICATION_CONTAINER")"
+expected_image="$(docker image inspect --format '{{.Id}}' "$PGVECTOR_IMAGE")"
+if [[ "$container_owner" != "$QUALIFICATION_OWNER_TOKEN" \
+  || "$container_network" != "none" \
+  || "$container_binds" != "null" \
+  || "$container_image" != "$expected_image" ]]; then
+  fail "qualification container ownership or isolation contract failed"
+fi
 
 for _attempt in $(seq 1 30); do
   if docker exec "$QUALIFICATION_CONTAINER" pg_isready \
@@ -119,6 +209,8 @@ psql_in_container() {
 
 setup_result="$({
   psql_in_container -qAt \
+    -v expected_database="$QUALIFICATION_DATABASE" \
+    -v expected_user="$QUALIFICATION_USER" \
     -v target_sources="$TARGET_SOURCES" \
     -v distractor_sources="$DISTRACTOR_SOURCES" \
     -f /tmp/semantic-exact-query-qualification-setup.sql
@@ -270,9 +362,9 @@ summarize_explain() {
 }
 
 summarize_explain \
-  medium-default "$MEDIUM_SOURCES" "$DEFAULT_CHANNELS" "$DEFAULT_RECALL" 4MB
+  medium-default "$MEDIUM_SOURCES" "$REPRESENTATIVE_CHANNELS" "$DEFAULT_RECALL" 4MB
 summarize_explain \
-  target-default "$TARGET_SOURCES" "$DEFAULT_CHANNELS" "$DEFAULT_RECALL" 4MB
+  target-default "$TARGET_SOURCES" "$REPRESENTATIVE_CHANNELS" "$DEFAULT_RECALL" 4MB
 summarize_explain \
   target-hard-cap "$TARGET_SOURCES" "$HARD_CAP_CHANNELS" "$HARD_CAP_RECALL" 4MB
 summarize_explain \
@@ -295,15 +387,19 @@ latency_summary_from_prefix() {
       ($values | length) as $count |
       def nearest_rank($fraction):
         $values[(((($count * $fraction) | ceil) - 1) | if . < 0 then 0 else . end)];
-      {
-        samples: $count,
-        min_ms: $values[0],
-        p50_ms: nearest_rank(0.50),
-        p95_ms: nearest_rank(0.95),
-        p99_ms: nearest_rank(0.99),
-        max_ms: $values[-1],
-        mean_ms: (($values | add) / $count)
-      }
+      if $count == 0 then
+        error("pgbench latency log contained no samples")
+      else
+        {
+          samples: $count,
+          min_ms: $values[0],
+          p50_ms: nearest_rank(0.50),
+          p95_ms: nearest_rank(0.95),
+          p99_ms: nearest_rank(0.99),
+          max_ms: $values[-1],
+          mean_ms: (($values | add) / $count)
+        }
+      end
     '
 }
 
@@ -356,9 +452,9 @@ run_latency_profile() {
 }
 
 run_latency_profile \
-  medium-default "$MEDIUM_SOURCES" "$DEFAULT_CHANNELS" "$DEFAULT_RECALL" "$MEDIUM_ITERATIONS"
+  medium-default "$MEDIUM_SOURCES" "$REPRESENTATIVE_CHANNELS" "$DEFAULT_RECALL" "$MEDIUM_ITERATIONS"
 run_latency_profile \
-  target-default "$TARGET_SOURCES" "$DEFAULT_CHANNELS" "$DEFAULT_RECALL" "$TARGET_ITERATIONS"
+  target-default "$TARGET_SOURCES" "$REPRESENTATIVE_CHANNELS" "$DEFAULT_RECALL" "$TARGET_ITERATIONS"
 run_latency_profile \
   target-hard-cap "$TARGET_SOURCES" "$HARD_CAP_CHANNELS" "$HARD_CAP_RECALL" "$HARD_CAP_ITERATIONS"
 
@@ -406,7 +502,7 @@ run_soak() {
       --exit-on-abort --max-tries=1 --failures-detailed \
       -l --log-prefix="/tmp/${prefix}" \
       -D requested_scale="$TARGET_SOURCES" \
-      -D requested_channels="$DEFAULT_CHANNELS" \
+      -D requested_channels="$REPRESENTATIVE_CHANNELS" \
       -D recall_per_channel="$DEFAULT_RECALL" \
       -f /tmp/semantic-exact-query-qualification-pgbench.sql \
       -U "$QUALIFICATION_USER" "$QUALIFICATION_DATABASE" \
@@ -462,10 +558,41 @@ run_soak() {
   local latency_json
   latency_json="$(latency_summary_from_prefix "$prefix")"
   local failed_transactions
-  failed_transactions="$(
-    awk '/^number of failed transactions:/ {print $5}' "$pgbench_output" | tail -n 1
+  local failed_line_count
+  failed_line_count="$(
+    awk '/^number of failed transactions:/ {count++} END {print count + 0}' \
+      "$pgbench_output"
   )"
-  failed_transactions="${failed_transactions:-0}"
+  if [[ "$failed_line_count" != "1" ]]; then
+    fail "${profile} pgbench output must contain exactly one failed-transaction line"
+  fi
+  failed_transactions="$(
+    awk '/^number of failed transactions:/ {print $5}' "$pgbench_output"
+  )"
+  if [[ ! "$failed_transactions" =~ ^[0-9]+$ ]]; then
+    fail "${profile} pgbench failed-transaction count is not an integer"
+  fi
+  local processed_transactions
+  local processed_line_count
+  processed_line_count="$(
+    awk '/^number of transactions actually processed:/ {count++} END {print count + 0}' \
+      "$pgbench_output"
+  )"
+  if [[ "$processed_line_count" != "1" ]]; then
+    fail "${profile} pgbench output must contain exactly one processed-transaction line"
+  fi
+  processed_transactions="$(
+    awk '/^number of transactions actually processed:/ {print $6}' "$pgbench_output"
+  )"
+  if [[ ! "$processed_transactions" =~ ^[0-9]+$ ]]; then
+    fail "${profile} pgbench processed-transaction count is not an integer"
+  fi
+  local latency_samples
+  latency_samples="$(jq -r '.samples' <<<"$latency_json")"
+  if [[ ! "$latency_samples" =~ ^[1-9][0-9]*$ \
+    || "$latency_samples" != "$processed_transactions" ]]; then
+    fail "${profile} latency samples do not match processed transactions"
+  fi
   local cpu_peak_percent
   cpu_peak_percent="$(
     awk '{gsub(/%/, "", $1); if ($1 + 0 > max) max=$1 + 0} END {print max + 0}' \
@@ -544,7 +671,7 @@ jq -n \
   --argjson medium_sources "$MEDIUM_SOURCES" \
   --argjson target_sources "$TARGET_SOURCES" \
   --argjson distractor_sources "$DISTRACTOR_SOURCES" \
-  --argjson default_channels "$DEFAULT_CHANNELS" \
+  --argjson representative_channels "$REPRESENTATIVE_CHANNELS" \
   --argjson hard_cap_channels "$HARD_CAP_CHANNELS" \
   --argjson default_recall "$DEFAULT_RECALL" \
   --argjson hard_cap_recall "$HARD_CAP_RECALL" \
@@ -566,7 +693,7 @@ jq -n \
         medium_sources: $medium_sources,
         target_sources: $target_sources,
         distractor_sources: $distractor_sources,
-        default_channels: $default_channels,
+        representative_channels: $representative_channels,
         hard_cap_channels: $hard_cap_channels,
         default_recall_per_channel: $default_recall,
         hard_cap_recall_per_channel: $hard_cap_recall
@@ -583,7 +710,7 @@ jq -n \
       post_soak_activity: $post_soak_activity,
       table_observation: $table_observation,
       qualification_boundary: {
-        closes_synthetic_exact_kernel_measurement: true,
+        records_one_local_synthetic_kernel_measurement: true,
         closes_target_community_slo: false,
         closes_full_canonical_sql_plan: false,
         closes_multi_pod_or_provider_soak: false,
@@ -601,4 +728,9 @@ jq -e '
 ' "${OUTPUT_DIR}/qualification.json" >/dev/null ||
   fail "final qualification structural checks did not pass"
 
+if ! cleanup; then
+  trap - EXIT
+  fail "qualification measurements passed but owned-container cleanup failed"
+fi
+trap - EXIT
 printf '%s\n' "${OUTPUT_DIR}/qualification.json"
