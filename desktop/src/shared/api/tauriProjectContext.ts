@@ -74,6 +74,8 @@ export type ProjectContextObservation = {
   updatedAt: string;
   metaEventId: string;
   capabilityEnabled: boolean;
+  /** Dynamic Relay readiness advertisement for the HTTP semantic query surface. */
+  semanticQueryAvailable?: boolean;
 };
 
 export type ProjectContextProjectViewObservation = {

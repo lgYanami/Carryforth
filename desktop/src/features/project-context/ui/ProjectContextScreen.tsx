@@ -21,6 +21,28 @@ import {
   buildProjectContextCoordinateOptions,
   type ProjectContextCoordinateOption,
 } from "@/features/project-context/queryModel";
+import {
+  semanticErrorFromUnknown,
+  semanticSourceFingerprint,
+} from "@/features/project-context/semanticScreenModel";
+import {
+  buildProjectContextSemanticOverlay,
+  semanticOverlayMatchesSubstrate,
+  type ProjectContextSemanticOverlay,
+} from "@/features/project-context/semanticOverlay";
+import {
+  nextSemanticAttemptToken,
+  semanticOverlayEligible,
+  semanticQueryRequiresAllContext,
+  semanticResultMatchesIdentity,
+  semanticSessionFreshness,
+  semanticSessionReducer,
+  createSemanticUiState,
+} from "@/features/project-context/semanticSession";
+import {
+  submitSemanticQueryDraft,
+  type SubmittedSemanticQueryDraft,
+} from "@/features/project-context/semanticQueryModel";
 import { focusProjectContextGraphTarget } from "@/features/project-context/focus";
 import type { ProjectContextRouteSelection } from "@/features/project-context/routeState";
 import { isAllProjectContextQuery } from "@/features/project-context/routeState";
@@ -31,6 +53,7 @@ import {
 } from "@/features/project-context/state";
 import { ProjectContextGraph } from "@/features/project-context/ui/ProjectContextGraph";
 import { ProjectContextInspector } from "@/features/project-context/ui/ProjectContextInspector";
+import { ProjectContextSemanticQueryBar } from "@/features/project-context/ui/ProjectContextSemanticQueryBar";
 import {
   type ProjectContextPickerSourceState,
   ProjectContextQueryBar,
@@ -41,15 +64,22 @@ import {
   ProjectContextLoadingState,
 } from "@/features/project-context/ui/ProjectContextStates";
 import {
+  ALL_PROJECT_CONTEXT_QUERY,
   useProjectContextLiveSync,
   useProjectContextQuery,
 } from "@/features/project-context/hooks";
+import { useAppliedWorkspaceIdentity } from "@/features/communities/AppliedWorkspaceContext";
 import { useProjectViewQuery } from "@/features/project-view/hooks";
 import { indexProjectViewObjects } from "@/features/project-view/model";
 import type {
   ProjectContextQuery,
   ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
+import {
+  queryProjectContextSemantic,
+  SemanticProjectContextError,
+  type SemanticProjectContextAcceptanceIdentity,
+} from "@/shared/api/tauriProjectContextSemantic";
 import {
   isRelayConnectionDegraded,
   useRelayConnection,
@@ -159,15 +189,21 @@ function ProjectContextHeader({
 }
 
 function ProjectContextGraphSlot({
+  fitSemanticPathsRequest,
   focusSelectionRequest,
   onSelectionChange,
   result,
   selection,
+  semanticFreshness,
+  semanticOverlay,
 }: {
+  fitSemanticPathsRequest: number;
   focusSelectionRequest: number;
   onSelectionChange: ValidProjectContextScreenProps["onSelectionChange"];
   result: ProjectContextQueryResult;
   selection: ProjectContextRouteSelection | null;
+  semanticFreshness: "snapshot" | "stale";
+  semanticOverlay: ProjectContextSemanticOverlay | null;
 }) {
   const documentCount = visibleContextDocumentCount(result);
   return (
@@ -208,10 +244,13 @@ function ProjectContextGraphSlot({
           data-testid="project-context-graph-slot"
         >
           <ProjectContextGraph
+            fitSemanticPathsRequest={fitSemanticPathsRequest}
             focusSelectionRequest={focusSelectionRequest}
             onSelectionChange={onSelectionChange}
             result={result}
             selection={selection}
+            semanticFreshness={semanticFreshness}
+            semanticOverlay={semanticOverlay}
           />
         </div>
       </div>
@@ -240,9 +279,146 @@ function ValidProjectContextScreen({
   selection,
 }: ValidProjectContextScreenProps) {
   const [focusSelectionRequest, setFocusSelectionRequest] = React.useState(0);
+  const [fitSemanticPathsRequest, setFitSemanticPathsRequest] =
+    React.useState(0);
+  const appliedWorkspace = useAppliedWorkspaceIdentity();
   const contextQuery = useProjectContextQuery(appliedQuery);
-  const liveStatus = useProjectContextLiveSync(contextQuery.data);
+  const failureKind = contextQuery.isError
+    ? projectContextFailureKind(contextQuery.error)
+    : undefined;
+  const verificationFailure = failureKind === "verification_failed";
+  const routeResult = verificationFailure ? undefined : contextQuery.data;
+  const fatalError =
+    contextQuery.isError && (!contextQuery.data || verificationFailure)
+      ? contextQuery.error
+      : undefined;
+  const routeRefreshError =
+    contextQuery.isError && contextQuery.data && !verificationFailure
+      ? contextQuery.error
+      : undefined;
+  const initialSemanticIdentity =
+    React.useMemo<SemanticProjectContextAcceptanceIdentity>(
+      () => ({
+        communityKey: appliedWorkspace.communityKey,
+        appliedWorkspaceToken: appliedWorkspace.appliedWorkspaceToken,
+        callerPubkey: appliedWorkspace.callerPubkey,
+        projectId: routeResult?.projectId ?? "",
+        relayPubkey: routeResult?.relayPubkey ?? "",
+      }),
+      [appliedWorkspace, routeResult?.projectId, routeResult?.relayPubkey],
+    );
+  const [semanticState, semanticDispatch] = React.useReducer(
+    semanticSessionReducer<ProjectContextSemanticOverlay>,
+    createSemanticUiState<ProjectContextSemanticOverlay>(
+      initialSemanticIdentity,
+    ),
+  );
+  const semanticNeedsAllContext =
+    semanticQueryRequiresAllContext(semanticState);
+  const allContextQuery = useProjectContextQuery(ALL_PROJECT_CONTEXT_QUERY, {
+    enabled: semanticNeedsAllContext,
+  });
+  const allContextFailureKind = allContextQuery.isError
+    ? projectContextFailureKind(allContextQuery.error)
+    : undefined;
+  const allContextResult =
+    allContextFailureKind === "verification_failed"
+      ? undefined
+      : allContextQuery.data;
+  const semanticIdentitySource = semanticNeedsAllContext
+    ? (allContextResult ?? routeResult)
+    : routeResult;
+  const semanticIdentity =
+    React.useMemo<SemanticProjectContextAcceptanceIdentity>(
+      () => ({
+        communityKey: appliedWorkspace.communityKey,
+        appliedWorkspaceToken: appliedWorkspace.appliedWorkspaceToken,
+        callerPubkey: appliedWorkspace.callerPubkey,
+        projectId: semanticIdentitySource?.projectId ?? "",
+        relayPubkey: semanticIdentitySource?.relayPubkey ?? "",
+      }),
+      [
+        appliedWorkspace,
+        semanticIdentitySource?.projectId,
+        semanticIdentitySource?.relayPubkey,
+      ],
+    );
+  React.useEffect(() => {
+    semanticDispatch({ type: "boundary_changed", identity: semanticIdentity });
+  }, [semanticIdentity]);
+  const observedCapabilityResult = semanticNeedsAllContext
+    ? (allContextResult ?? routeResult)
+    : routeResult;
+  const substrateIdentityMismatch = Boolean(
+    semanticNeedsAllContext &&
+      allContextResult &&
+      routeResult &&
+      (allContextResult.projectId !== routeResult.projectId ||
+        allContextResult.relayPubkey !== routeResult.relayPubkey),
+  );
+  const semanticSafetyFailure =
+    substrateIdentityMismatch ||
+    [failureKind, allContextFailureKind].some(
+      (kind) =>
+        kind === "restricted" ||
+        kind === "verification_failed" ||
+        kind === "unsupported",
+    );
+  const semanticAvailable =
+    !semanticSafetyFailure &&
+    observedCapabilityResult?.context.semanticQueryAvailable === true &&
+    semanticIdentity.projectId.length > 0 &&
+    semanticIdentity.relayPubkey.length > 0;
+  const trustedActive =
+    semanticState.active &&
+    semanticAvailable &&
+    semanticResultMatchesIdentity(
+      semanticState.active.verifiedDisplayResult,
+      semanticIdentity,
+    )
+      ? semanticState.active
+      : null;
+  const result = trustedActive ? allContextResult : routeResult;
+  const semanticMeetingIds = React.useMemo(() => {
+    if (!semanticNeedsAllContext) return [];
+    const ids = new Set<string>();
+    for (const detail of allContextResult?.coordinateDetails ?? []) {
+      if (detail.coordinate.type === "meeting") {
+        ids.add(detail.coordinate.meetingId);
+      }
+    }
+    const submittedDrafts: SubmittedSemanticQueryDraft[] = [];
+    if (trustedActive) submittedDrafts.push(trustedActive.submittedDraft);
+    if (
+      semanticState.attempt.status === "running" ||
+      semanticState.attempt.status === "pairing"
+    ) {
+      submittedDrafts.push(semanticState.attempt.submitted);
+    }
+    for (const submitted of submittedDrafts) {
+      for (const coordinate of [
+        ...submitted.initialCoordinates,
+        ...submitted.contextCoordinates,
+      ]) {
+        if (coordinate.type === "meeting") ids.add(coordinate.meetingId);
+      }
+    }
+    return [...ids].sort();
+  }, [
+    allContextResult?.coordinateDetails,
+    semanticNeedsAllContext,
+    semanticState.attempt,
+    trustedActive,
+  ]);
+  const liveStatus = useProjectContextLiveSync(
+    semanticNeedsAllContext ? (allContextResult ?? routeResult) : routeResult,
+    semanticMeetingIds,
+  );
   const relayConnection = useRelayConnection();
+  const semanticTransportUncertain =
+    relayConnection !== "connected" ||
+    liveStatus !== "live" ||
+    (semanticNeedsAllContext && allContextQuery.isError);
   const projectViewQuery = useProjectViewQuery();
   const documentMetaQuery = useProjectDocumentMeta();
   const documentsQuery = useProjectDocuments(documentMetaQuery.data);
@@ -272,27 +448,33 @@ function ValidProjectContextScreen({
     [meetingDirectoryQuery.data],
   );
   const meetingProfilesQuery = useUsersBatchQuery(meetingProfilePubkeys);
-  const failureKind = contextQuery.isError
-    ? projectContextFailureKind(contextQuery.error)
+  const displayedFatalError = trustedActive
+    ? allContextQuery.isError && !allContextResult
+      ? allContextQuery.error
+      : undefined
+    : fatalError;
+  const displayedFailureKind = displayedFatalError
+    ? projectContextFailureKind(displayedFatalError)
     : undefined;
-  const verificationFailure = failureKind === "verification_failed";
-  const result = verificationFailure ? undefined : contextQuery.data;
-  const fatalError =
-    contextQuery.isError && (!contextQuery.data || verificationFailure)
-      ? contextQuery.error
-      : undefined;
-  const refreshError =
-    contextQuery.isError && contextQuery.data && !verificationFailure
-      ? contextQuery.error
-      : undefined;
-  const refreshMessage = refreshError
-    ? projectContextErrorMessage(refreshError)
+  const displayedQueryPending = trustedActive
+    ? allContextQuery.isPending
+    : contextQuery.isPending;
+  const displayedRefreshError = semanticNeedsAllContext
+    ? allContextQuery.isError
+      ? allContextQuery.error
+      : undefined
+    : routeRefreshError;
+  const refreshMessage = displayedRefreshError
+    ? projectContextErrorMessage(displayedRefreshError)
     : undefined;
   const relayDegraded = isRelayConnectionDegraded(relayConnection);
+  const displayedQueryFetching = semanticNeedsAllContext
+    ? allContextQuery.isFetching
+    : contextQuery.isFetching;
   const syncState: "live" | "refreshing" | "stale" | undefined = result
     ? relayDegraded || refreshMessage || liveStatus === "retrying"
       ? "stale"
-      : contextQuery.isFetching || liveStatus === "connecting"
+      : displayedQueryFetching || liveStatus === "connecting"
         ? "refreshing"
         : liveStatus === "live"
           ? "live"
@@ -362,6 +544,224 @@ function ValidProjectContextScreen({
       (meetingIds.length === 0 || Boolean(meetingDirectoryQuery.data)),
   });
   const allContext = isAllProjectContextQuery(appliedQuery);
+  const retryingPairRef = React.useRef<string | null>(null);
+  const sourceFingerprintRef = React.useRef<{
+    requestId: string;
+    fingerprint: string;
+  } | null>(null);
+  const semanticAttemptInFlight =
+    semanticState.attempt.status === "running" ||
+    semanticState.attempt.status === "pairing";
+  const semanticActivityPresent =
+    semanticState.active !== null || semanticAttemptInFlight;
+
+  React.useEffect(() => {
+    if (semanticAvailable || !semanticActivityPresent) return;
+    semanticDispatch({ type: "capability_lost" });
+  }, [semanticActivityPresent, semanticAvailable]);
+
+  React.useEffect(() => {
+    if (!trustedActive) return;
+    semanticDispatch({
+      type: "transport_observed",
+      state: semanticTransportUncertain ? "uncertain" : "live",
+    });
+  }, [semanticTransportUncertain, trustedActive]);
+
+  React.useEffect(() => {
+    if (!trustedActive || !allContextResult) return;
+    semanticDispatch({
+      type: "topology_observed",
+      substrateRevision: allContextResult.context.contextRevision,
+    });
+  }, [allContextResult, trustedActive]);
+
+  React.useEffect(() => {
+    const attempt = semanticState.attempt;
+    if (attempt.status !== "pairing") return;
+    if (allContextQuery.isError && !allContextQuery.isFetching) {
+      semanticDispatch({
+        type: "native_failed",
+        token: attempt.token,
+        error: semanticErrorFromUnknown(allContextQuery.error),
+      });
+      return;
+    }
+    if (!allContextResult) return;
+    const substrateRevision = allContextResult.context.contextRevision;
+    const resultRevision = attempt.verifiedDisplayResult.projectContextRevision;
+    if (substrateRevision < resultRevision) {
+      if (allContextQuery.isFetching) return;
+      const retryKey = `${attempt.token}:${substrateRevision}`;
+      if (retryingPairRef.current !== retryKey) {
+        retryingPairRef.current = retryKey;
+        void allContextQuery.refetch();
+        return;
+      }
+      semanticDispatch({
+        type: "native_failed",
+        token: attempt.token,
+        error: new SemanticProjectContextError({
+          code: "conflict",
+          message:
+            "All Context has not reached the verified semantic result revision. Refresh and run the query again.",
+          retryable: true,
+        }),
+      });
+      return;
+    }
+    retryingPairRef.current = null;
+    const joined = buildProjectContextSemanticOverlay(
+      attempt.verifiedDisplayResult,
+      allContextResult,
+    );
+    semanticDispatch({
+      type: "pairing_observed",
+      token: attempt.token,
+      substrateRevision,
+      join: joined.ok
+        ? { status: "valid", overlay: joined.overlay }
+        : {
+            status: "invalid",
+            message: `Verified semantic paths no longer match All Context (${joined.reason}).`,
+          },
+    });
+  }, [
+    allContextQuery.error,
+    allContextQuery.isError,
+    allContextQuery.isFetching,
+    allContextQuery.refetch,
+    allContextResult,
+    semanticState.attempt,
+  ]);
+
+  const activeSourceFingerprint = React.useMemo(() => {
+    if (!trustedActive || !allContextResult) return undefined;
+    return semanticSourceFingerprint(
+      trustedActive,
+      allContextResult,
+      coordinateOptions,
+    );
+  }, [allContextResult, coordinateOptions, trustedActive]);
+  React.useEffect(() => {
+    const active = trustedActive;
+    if (!active || !activeSourceFingerprint) {
+      sourceFingerprintRef.current = null;
+      return;
+    }
+    if (sourceFingerprintRef.current?.requestId !== active.requestId) {
+      sourceFingerprintRef.current = {
+        requestId: active.requestId,
+        fingerprint: activeSourceFingerprint,
+      };
+      return;
+    }
+    semanticDispatch({
+      type: "source_refresh_observed",
+      fingerprintMatches:
+        sourceFingerprintRef.current.fingerprint === activeSourceFingerprint,
+    });
+  }, [activeSourceFingerprint, trustedActive]);
+
+  const semanticAttemptRef = React.useRef(0);
+  const semanticDraft = semanticState.draft;
+  const semanticGeneration = semanticState.generation;
+  React.useEffect(() => {
+    semanticAttemptRef.current = Math.max(
+      semanticAttemptRef.current,
+      semanticGeneration,
+    );
+  }, [semanticGeneration]);
+  const runSemanticQuery = React.useCallback(() => {
+    if (!semanticAvailable) return;
+    let submitted: SubmittedSemanticQueryDraft;
+    try {
+      submitted = submitSemanticQueryDraft(semanticDraft);
+    } catch (error) {
+      const token = Math.max(
+        ++semanticAttemptRef.current,
+        nextSemanticAttemptToken({ generation: semanticGeneration }),
+      );
+      semanticAttemptRef.current = token;
+      semanticDispatch({
+        type: "run_started",
+        token,
+        submitted: {
+          problem: semanticDraft.problem,
+          initialCoordinates: semanticDraft.initialCoordinates,
+          contextCoordinates: semanticDraft.contextCoordinates,
+        },
+      });
+      semanticDispatch({
+        type: "native_failed",
+        token,
+        error: semanticErrorFromUnknown(error),
+      });
+      return;
+    }
+    const token = Math.max(
+      ++semanticAttemptRef.current,
+      nextSemanticAttemptToken({ generation: semanticGeneration }),
+    );
+    semanticAttemptRef.current = token;
+    semanticDispatch({ type: "run_started", token, submitted });
+    void queryProjectContextSemantic(
+      {
+        communityKey: semanticIdentity.communityKey,
+        appliedWorkspaceToken: semanticIdentity.appliedWorkspaceToken,
+        problem: submitted.problem,
+        initialCoordinates: submitted.initialCoordinates,
+        contextCoordinates: submitted.contextCoordinates,
+      },
+      semanticIdentity,
+    ).then(
+      (semanticResult) =>
+        semanticDispatch({
+          type: "native_succeeded",
+          token,
+          result: semanticResult,
+        }),
+      (error) =>
+        semanticDispatch({
+          type: "native_failed",
+          token,
+          error: semanticErrorFromUnknown(error),
+        }),
+    );
+  }, [semanticAvailable, semanticDraft, semanticGeneration, semanticIdentity]);
+  const cancelSemanticQuery = React.useCallback(() => {
+    semanticAttemptRef.current += 1;
+    semanticDispatch({ type: "cancel" });
+  }, []);
+
+  const semanticStructuralJoinValid = Boolean(
+    trustedActive &&
+      result &&
+      semanticOverlayMatchesSubstrate(trustedActive.overlay, result),
+  );
+  const semanticOverlay =
+    trustedActive &&
+    result &&
+    semanticOverlayEligible(
+      semanticState,
+      result.context.contextRevision,
+      semanticStructuralJoinValid,
+    )
+      ? trustedActive.overlay
+      : null;
+  const semanticTopologyAdvanced = Boolean(
+    trustedActive &&
+      (semanticState.freshness.topology === "advanced" ||
+        allContextResult?.context.contextRevision !==
+          trustedActive.projectContextRevision),
+  );
+  const semanticFreshness =
+    trustedActive && (semanticTopologyAdvanced || semanticTransportUncertain)
+      ? "stale"
+      : semanticSessionFreshness(semanticState);
+  const displayedAllContext = result
+    ? isAllProjectContextQuery(result.query)
+    : allContext;
 
   React.useEffect(() => {
     if (!result || !selection) return;
@@ -392,8 +792,16 @@ function ValidProjectContextScreen({
       data-testid="project-context-screen"
     >
       <ProjectContextHeader
-        onRefresh={() => void contextQuery.refetch()}
-        refreshing={contextQuery.isFetching}
+        onRefresh={() =>
+          void (semanticNeedsAllContext
+            ? allContextQuery.refetch()
+            : contextQuery.refetch())
+        }
+        refreshing={
+          semanticNeedsAllContext
+            ? allContextQuery.isFetching
+            : contextQuery.isFetching
+        }
         result={result}
         syncBadge={syncBadge}
         syncState={syncState}
@@ -429,27 +837,63 @@ function ValidProjectContextScreen({
         meetingsState={meetingsState}
         onRun={onApplyQuery}
         projectViewState={projectViewState}
+        runDisabled={semanticNeedsAllContext}
+        runDisabledReason="Clear the semantic result before changing the structural query."
       />
 
-      {contextQuery.isPending ? <ProjectContextLoadingState /> : null}
-      {fatalError ? (
+      <ProjectContextSemanticQueryBar
+        active={trustedActive}
+        attempt={semanticState.attempt}
+        available={semanticAvailable}
+        canFit={Boolean(semanticOverlay?.boundsTargetIds.length)}
+        coordinateOptions={coordinateOptions}
+        documentsState={documentsState}
+        draft={semanticState.draft}
+        freshness={semanticFreshness}
+        meetingsState={meetingsState}
+        onCancel={cancelSemanticQuery}
+        onDraftChange={(draft) =>
+          semanticDispatch({ type: "draft_changed", draft })
+        }
+        onFit={() => setFitSemanticPathsRequest((current) => current + 1)}
+        onRun={runSemanticQuery}
+        overlayVisible={semanticOverlay !== null}
+        projectViewState={projectViewState}
+        topologyAdvanced={semanticTopologyAdvanced}
+      />
+
+      {displayedQueryPending ? <ProjectContextLoadingState /> : null}
+      {displayedFatalError ? (
         <ProjectContextFailureState
-          diagnostic={projectContextErrorMessage(fatalError)}
-          kind={failureKind ?? projectContextFailureKind(fatalError)}
-          onRetry={() => void contextQuery.refetch()}
-          retrying={contextQuery.isFetching}
+          diagnostic={projectContextErrorMessage(displayedFatalError)}
+          kind={
+            displayedFailureKind ??
+            projectContextFailureKind(displayedFatalError)
+          }
+          onRetry={() =>
+            void (trustedActive
+              ? allContextQuery.refetch()
+              : contextQuery.refetch())
+          }
+          retrying={
+            trustedActive ? allContextQuery.isFetching : contextQuery.isFetching
+          }
         />
       ) : null}
-      {result && allContext && result.context.activeEdgeCount === 0 ? (
+      {result && displayedAllContext && result.context.activeEdgeCount === 0 ? (
         <ProjectContextEmptyState />
       ) : null}
-      {result && (!allContext || result.context.activeEdgeCount > 0) ? (
+      {result &&
+      (!displayedAllContext || result.context.activeEdgeCount > 0) ? (
         <div className="flex min-h-0 flex-1 overflow-hidden">
           <ProjectContextGraphSlot
+            fitSemanticPathsRequest={fitSemanticPathsRequest}
             focusSelectionRequest={focusSelectionRequest}
             onSelectionChange={onSelectionChange}
             result={result}
             selection={selection}
+            semanticFreshness={semanticFreshness}
+            semanticOverlay={semanticOverlay}
           />
           {selection ? (
             <ProjectContextInspector
@@ -468,6 +912,21 @@ function ValidProjectContextScreen({
               projectViewResult={projectViewQuery.data}
               result={result}
               selection={selection}
+              semanticRelationDocumentIds={
+                selection.kind === "edge"
+                  ? semanticOverlay?.relationDocumentIdsByEdge.get(
+                      selection.key,
+                    )
+                  : undefined
+              }
+              semanticRootRelationDocumentIds={
+                selection.kind === "edge"
+                  ? semanticOverlay?.rootRelationDocumentIdsByEdge.get(
+                      selection.key,
+                    )
+                  : undefined
+              }
+              showIncidentDisabled={semanticNeedsAllContext}
             />
           ) : null}
         </div>

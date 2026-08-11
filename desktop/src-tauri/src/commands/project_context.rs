@@ -34,6 +34,8 @@ use crate::relay::{query_relay_at_with_keys_typed, relay_api_base_url_with_overr
 
 mod model;
 pub use model::*;
+mod semantic;
+pub use semantic::*;
 mod project_view_hydration;
 use project_view_hydration::hydrate_project_view;
 mod meeting_hydration;
@@ -639,6 +641,7 @@ async fn build_result(
             updated_at: snapshot.meta.projection.updated_at,
             meta_event_id: snapshot.meta.event_id.to_hex(),
             capability_enabled: context.identity.project_context_edge_supported,
+            semantic_query_available: context.identity.semantic_query_http_available,
         },
         query: query.to_dto(),
         project_view_observation: project_view.observation,

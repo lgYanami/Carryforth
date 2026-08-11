@@ -19,6 +19,12 @@ use crate::managed_agents::{
 };
 use crate::meeting_runtime::{MeetingActionRenewalRuntime, MeetingGrantRenewalRuntime};
 
+mod workspace_transition;
+use workspace_transition::build_semantic_query_http_client;
+pub(crate) use workspace_transition::{
+    AppliedWorkspaceCapture, AppliedWorkspaceCaptureError, WorkspaceTransitionState,
+};
+
 mod key_file;
 use crate::pending_writes::PendingWrites;
 pub(crate) use key_file::save_key_file;
@@ -26,6 +32,10 @@ pub(crate) use key_file::save_key_file;
 pub struct AppState {
     pub keys: Mutex<Keys>,
     pub http_client: reqwest::Client,
+    /// No-redirect client for the pinned semantic capability, Project identity,
+    /// and byte-exact one-shot `/query` path. A redirect must never forward a
+    /// freshly minted NIP-98 header or change the URL covered by it.
+    pub semantic_query_http_client: reqwest::Client,
     /// A no-redirect client for authenticated relay media fetches (download,
     /// clipboard copy, snapshot, editor). Every caller pre-validates the URL
     /// origin, but the app-wide `http_client` follows redirects by default, so
@@ -38,6 +48,10 @@ pub struct AppState {
     /// Workspace-provided relay URL override. Set by `apply_workspace` on app
     /// init and takes priority over env vars and compile-time defaults.
     pub relay_url_override: Mutex<Option<String>>,
+    /// Atomic boundary for Community, relay, caller, and signability changes.
+    /// Semantic requests clone one complete tuple from this lock and never
+    /// reconstruct it from the legacy independent mutexes.
+    pub(crate) workspace_transition: Mutex<WorkspaceTransitionState>,
     /// Set during backend setup when managed agents are eligible for launch
     /// restore. `apply_workspace` consumes it after installing the workspace
     /// relay and identity, so agents never start against the fallback relay.
@@ -203,7 +217,12 @@ pub fn build_app_state() -> AppState {
              redirect-following fallback would forward the minted media auth \
              header across origins (redirect-hop SSRF)",
         ),
+        semantic_query_http_client: build_semantic_query_http_client().expect(
+            "semantic_query_http_client must reject redirects; following one would change the \
+             authenticated URL and could forward its NIP-98 header",
+        ),
         relay_url_override: Mutex::new(None),
+        workspace_transition: Mutex::new(WorkspaceTransitionState::default()),
         managed_agent_restore_pending: AtomicBool::new(false),
         managed_agent_profile_reconcile_enabled: AtomicBool::new(true),
         shutdown_started: AtomicBool::new(false),
@@ -369,18 +388,13 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
 
     let resolved = load_or_create_identity(&data_dir)?;
-    // Write keys before setting the recovery flags (Release) so any thread
-    // that reads a flag as false with Acquire is guaranteed to see the keys.
-    *state.keys.lock().map_err(|e| e.to_string())? = resolved.keys;
-    state.identity_lost.store(
+    // Publish keys and recovery eligibility through the same transition
+    // boundary used by later workspace and identity changes.
+    state.replace_runtime_identity(
+        resolved.keys,
         resolved.recovery == RecoveryState::Lost,
-        std::sync::atomic::Ordering::Release,
-    );
-    state.keyring_locked.store(
         resolved.recovery == RecoveryState::KeyringLocked,
-        std::sync::atomic::Ordering::Release,
-    );
-    Ok(())
+    )
 }
 
 #[path = "app_state_keyring.rs"]

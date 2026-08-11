@@ -1121,19 +1121,27 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
+export type AppliedWorkspaceIdentity = {
+  communityKey: string;
+  appliedWorkspaceToken: string;
+  callerPubkey: string;
+};
+
 export async function applyCommunity(
   relayUrl: string,
   nsec?: string,
   token?: string,
   reposDir?: string,
   agentManagedProfiles?: boolean,
-): Promise<void> {
-  await invokeTauri("apply_workspace", {
+  communityKey?: string,
+): Promise<AppliedWorkspaceIdentity> {
+  return invokeTauri<AppliedWorkspaceIdentity>("apply_workspace", {
     relayUrl,
     nsec: nsec ?? null,
     token: token ?? null,
     reposDir: reposDir ?? null,
     agentManagedProfiles: agentManagedProfiles ?? false,
+    communityKey: communityKey ?? "",
   });
 }
 

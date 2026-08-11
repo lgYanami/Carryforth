@@ -279,6 +279,7 @@ pub struct ProjectContextObservation {
     pub(super) updated_at: DateTime<Utc>,
     pub(super) meta_event_id: String,
     pub(super) capability_enabled: bool,
+    pub(super) semantic_query_available: bool,
 }
 
 /// Independent signed Project View observation used for coordinate details.

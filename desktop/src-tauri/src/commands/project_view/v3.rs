@@ -27,8 +27,9 @@ use crate::app_state::AppState;
 
 use super::{
     conflict_error, integrity_read_error, query_project_view, query_project_view_at_with_keys,
-    ProjectViewIdentity, ProjectViewMembershipMember, ProjectViewReadError, ProjectViewReadResult,
-    ProjectViewWorkResponsibility, SNAPSHOT_MAX_ATTEMPTS, SNAPSHOT_PAGE_SIZE,
+    query_project_view_at_with_keys_and_client, ProjectViewIdentity, ProjectViewMembershipMember,
+    ProjectViewReadError, ProjectViewReadResult, ProjectViewWorkResponsibility,
+    SNAPSHOT_MAX_ATTEMPTS, SNAPSHOT_PAGE_SIZE,
 };
 
 type CapturedQuery<'a> = Option<(&'a str, &'a Keys)>;
@@ -324,6 +325,37 @@ pub(super) async fn read_v3_meta(
     identity: ProjectViewIdentity,
 ) -> ProjectViewReadResult<Option<V3MetaProjection>> {
     read_v3_meta_with_query(state, identity, None).await
+}
+
+/// Read and verify only the current Project View v3 metadata identity through
+/// a caller-supplied no-redirect HTTP client.
+pub(crate) async fn read_verified_v3_meta_at_with_client(
+    identity: ProjectViewIdentity,
+    api_base_url: &str,
+    keys: &Keys,
+    client: &reqwest::Client,
+) -> ProjectViewReadResult<Option<V3MetaProjection>> {
+    let events = query_project_view_at_with_keys_and_client(
+        client,
+        api_base_url,
+        keys,
+        &[json!({
+            "kinds": [KIND_PROJECT_VIEW_META],
+            "authors": [identity.relay_pubkey.to_hex()],
+            "#t": [PROJECT_VIEW_V3_META_TAG],
+            "limit": 2,
+        })],
+    )
+    .await?;
+    match events.as_slice() {
+        [] => Ok(None),
+        [event] => parse_meta_projection(event, &identity.relay_pubkey)
+            .map(Some)
+            .map_err(|error| integrity_read_error(error.to_string())),
+        _ => Err(integrity_read_error(
+            "v3 metadata query returned multiple current heads",
+        )),
+    }
 }
 
 async fn read_v3_meta_with_query(

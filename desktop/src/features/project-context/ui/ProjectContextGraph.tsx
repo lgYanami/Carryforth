@@ -1,7 +1,7 @@
 import "@xyflow/react/dist/style.css";
 import "./project-context-graph.css";
 
-import { Focus, Maximize2, Minus, Plus } from "lucide-react";
+import { Focus, Maximize2, Minus, Plus, Route } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 import * as React from "react";
 import {
@@ -32,6 +32,11 @@ import {
   type ProjectContextFlowNode,
   type ProjectContextGraphTarget,
 } from "@/features/project-context/presentation";
+import {
+  type ProjectContextSemanticFreshness,
+  type ProjectContextSemanticOverlay,
+  semanticOverlayMatchesSubstrate,
+} from "@/features/project-context/semanticOverlay";
 import { ProjectContextCoordinateNode } from "@/features/project-context/ui/ProjectContextCoordinateNode";
 import { ProjectContextEdgeHub } from "@/features/project-context/ui/ProjectContextEdgeHub";
 import { ProjectContextIsland } from "@/features/project-context/ui/ProjectContextIsland";
@@ -142,28 +147,35 @@ function applyGraphHover(
 
 type ProjectContextGraphInnerProps = {
   elements: ProjectContextFlowElements;
+  fitSemanticPathsRequest: number;
   focusSelectionRequest: number;
   graph: ReturnType<typeof buildProjectContextGraph>;
   layout: ReturnType<typeof layoutProjectContextGraph>;
   queryIdentity: string;
   selection: ProjectContextGraphTarget | null;
+  semanticFreshness: ProjectContextSemanticFreshness;
+  semanticOverlay: ProjectContextSemanticOverlay | null;
   textScale: number;
   onSelectionChange: (selection: ProjectContextGraphTarget | null) => void;
 };
 
 function ProjectContextGraphInner({
   elements,
+  fitSemanticPathsRequest,
   focusSelectionRequest,
   graph,
   layout,
   onSelectionChange,
   queryIdentity,
   selection,
+  semanticFreshness,
+  semanticOverlay,
   textScale,
 }: ProjectContextGraphInnerProps) {
   const shouldReduceMotion = useReducedMotion();
   const nodesInitialized = useNodesInitialized();
   const handledFocusSelectionRequest = React.useRef(0);
+  const handledFitSemanticPathsRequest = React.useRef(0);
   const graphRootRef = React.useRef<HTMLElement>(null);
   const { fitBounds, fitView, getViewport, setViewport, zoomIn, zoomOut } =
     useReactFlow<ProjectContextFlowNode, ProjectContextFlowEdge>();
@@ -178,10 +190,32 @@ function ProjectContextGraphInner({
         .join(";"),
     [layout.nodes],
   );
-  const hoverResetKey = `${layoutKey}:${selection?.kind ?? "none"}:${selection?.key ?? "none"}`;
+  const semanticGeneration = semanticOverlay
+    ? `${semanticOverlay.requestId}:${semanticOverlay.substrateIdentity}`
+    : "none";
+  const hoverResetKey = `${layoutKey}:${selection?.kind ?? "none"}:${selection?.key ?? "none"}:${semanticGeneration}`;
   const previousHoverResetKey = React.useRef<string | null>(null);
   const fittedQueryIdentity = React.useRef<string | null>(null);
+  const fittedSemanticGeneration = React.useRef<string | null>(null);
   const previousLayout = React.useRef({ layout, queryIdentity, textScale });
+  const semanticBounds = React.useMemo(() => {
+    if (!semanticOverlay) return null;
+    const targetIds = new Set(semanticOverlay.boundsTargetIds);
+    const targets = layout.nodes.filter((node) => targetIds.has(node.id));
+    if (targets.length === 0) return null;
+    const minX = Math.min(...targets.map((node) => node.x));
+    const minY = Math.min(...targets.map((node) => node.y));
+    const maxX = Math.max(...targets.map((node) => node.x + node.width));
+    const maxY = Math.max(...targets.map((node) => node.y + node.height));
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  }, [layout.nodes, semanticOverlay]);
+  const fitSemanticPaths = React.useCallback(() => {
+    if (!semanticBounds) return;
+    void fitBounds(semanticBounds, {
+      padding: 0.24,
+      duration,
+    });
+  }, [duration, fitBounds, semanticBounds]);
 
   React.useLayoutEffect(() => {
     const previous = previousLayout.current;
@@ -255,8 +289,46 @@ function ProjectContextGraphInner({
       return;
     }
     fittedQueryIdentity.current = queryIdentity;
+    if (semanticOverlay) return;
     void fitBounds(layout.bounds, { padding: 0.08, duration: 0 });
-  }, [fitBounds, layout.bounds, layoutKey, nodesInitialized, queryIdentity]);
+  }, [
+    fitBounds,
+    layout.bounds,
+    layoutKey,
+    nodesInitialized,
+    queryIdentity,
+    semanticOverlay,
+  ]);
+
+  React.useEffect(() => {
+    if (
+      !nodesInitialized ||
+      !semanticBounds ||
+      fittedSemanticGeneration.current === semanticGeneration
+    ) {
+      return;
+    }
+    fittedSemanticGeneration.current = semanticGeneration;
+    fitSemanticPaths();
+  }, [fitSemanticPaths, nodesInitialized, semanticBounds, semanticGeneration]);
+
+  React.useEffect(() => {
+    if (
+      !nodesInitialized ||
+      !semanticBounds ||
+      fitSemanticPathsRequest === 0 ||
+      fitSemanticPathsRequest === handledFitSemanticPathsRequest.current
+    ) {
+      return;
+    }
+    handledFitSemanticPathsRequest.current = fitSemanticPathsRequest;
+    fitSemanticPaths();
+  }, [
+    fitSemanticPaths,
+    fitSemanticPathsRequest,
+    nodesInitialized,
+    semanticBounds,
+  ]);
 
   React.useEffect(() => {
     if (previousHoverResetKey.current === hoverResetKey) return;
@@ -374,9 +446,15 @@ function ProjectContextGraphInner({
 
   return (
     <section
-      aria-describedby="project-context-graph-description"
+      aria-describedby={
+        semanticOverlay
+          ? "project-context-graph-description project-context-semantic-description"
+          : "project-context-graph-description"
+      }
       aria-label="Project Context graph canvas"
       className="project-context-graph relative min-h-0 flex-1 overflow-hidden bg-background/35"
+      data-semantic-freshness={semanticOverlay ? semanticFreshness : undefined}
+      data-semantic-overlay={semanticOverlay ? "active" : undefined}
       data-testid="project-context-graph"
       ref={graphRootRef}
     >
@@ -416,6 +494,24 @@ function ProjectContextGraphInner({
           size={1}
           variant={BackgroundVariant.Dots}
         />
+        {semanticOverlay ? (
+          <div
+            className="pointer-events-none absolute left-3 top-3 z-20 flex items-center gap-2 rounded-lg border border-border/70 bg-background/90 px-2.5 py-1.5 text-2xs font-medium shadow-sm backdrop-blur"
+            data-testid="project-context-semantic-legend"
+          >
+            <span
+              aria-hidden
+              className={`h-2.5 w-2.5 rounded-full border-2 ${
+                semanticFreshness === "stale"
+                  ? "border-amber-600 dark:border-amber-300"
+                  : "border-cyan-600 dark:border-cyan-300"
+              }`}
+            />
+            {semanticFreshness === "stale"
+              ? "Stale semantic snapshot"
+              : "Semantic paths"}
+          </div>
+        ) : null}
         <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 rounded-xl border border-border/70 bg-background/90 p-1 shadow-lg backdrop-blur">
           <Button
             aria-label="Zoom out"
@@ -482,6 +578,18 @@ function ProjectContextGraphInner({
               <Focus />
             </Button>
           ) : null}
+          {semanticOverlay && semanticBounds ? (
+            <Button
+              aria-label="Fit semantic paths"
+              data-testid="project-context-fit-semantic-paths"
+              onClick={fitSemanticPaths}
+              size="icon-xs"
+              type="button"
+              variant="ghost"
+            >
+              <Route />
+            </Button>
+          ) : null}
         </div>
         {selectedLabel ? (
           <div
@@ -497,6 +605,14 @@ function ProjectContextGraphInner({
         This is an undirected incidence graph. Node placement does not express
         source, target, order, importance, causality, or semantic similarity.
       </span>
+      {semanticOverlay ? (
+        <span className="sr-only" id="project-context-semantic-description">
+          {semanticOverlay.pathCount} semantic paths are shown as one undirected
+          highlighted subgraph with {semanticOverlay.edgeKeys.size} traversed
+          Context Edges and {semanticOverlay.rootCount} candidate roots. Items
+          outside the highlight are not declared irrelevant.
+        </span>
+      ) : null}
       <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
         <span className="rounded-full bg-background/75 px-2.5 py-1 text-2xs text-muted-foreground shadow-sm backdrop-blur">
           Pan · Scroll to zoom · Undirected · placement carries no rank or
@@ -508,17 +624,27 @@ function ProjectContextGraphInner({
           {selection.kind === "edge" ? "Context Edge" : "Coordinate"} selected.
         </div>
       ) : null}
+      {semanticOverlay ? (
+        <div className="sr-only" aria-live="polite" aria-atomic="true">
+          Semantic result active. {semanticOverlay.pathCount} paths and{" "}
+          {semanticOverlay.rootCount} roots shown.
+        </div>
+      ) : null}
     </section>
   );
 }
 
 /** Read-only query result graph; stable selection is owned by route state. */
 export function ProjectContextGraph({
+  fitSemanticPathsRequest = 0,
   focusSelectionRequest = 0,
   onSelectionChange,
   result,
   selection,
+  semanticFreshness = "snapshot",
+  semanticOverlay = null,
 }: {
+  fitSemanticPathsRequest?: number;
   focusSelectionRequest?: number;
   onSelectionChange: (
     selection: ProjectContextGraphTarget | null,
@@ -526,8 +652,18 @@ export function ProjectContextGraph({
   ) => void;
   result: ProjectContextQueryResult;
   selection: ProjectContextGraphTarget | null;
+  semanticFreshness?: ProjectContextSemanticFreshness;
+  semanticOverlay?: ProjectContextSemanticOverlay | null;
 }) {
   const textScale = useProjectContextTextScale();
+  const visibleSemanticOverlay = React.useMemo(
+    () =>
+      semanticOverlay &&
+      semanticOverlayMatchesSubstrate(semanticOverlay, result)
+        ? semanticOverlay
+        : null,
+    [result, semanticOverlay],
+  );
   const graph = React.useMemo(() => buildProjectContextGraph(result), [result]);
   const nextTopology = React.useMemo(
     () => buildProjectContextLayoutTopology(graph),
@@ -547,8 +683,14 @@ export function ProjectContextGraph({
     [geometry, graph, textScale],
   );
   const elements = React.useMemo(
-    () => buildProjectContextFlowElements(graph, layout, selection),
-    [graph, layout, selection],
+    () =>
+      buildProjectContextFlowElements(
+        graph,
+        layout,
+        selection,
+        visibleSemanticOverlay,
+      ),
+    [graph, layout, selection, visibleSemanticOverlay],
   );
   const contextDocumentCount = new Set(
     graph.hubs.flatMap((hub) => hub.contextDocumentIds),
@@ -614,12 +756,15 @@ export function ProjectContextGraph({
         </div>
         <ProjectContextGraphInner
           elements={elements}
+          fitSemanticPathsRequest={fitSemanticPathsRequest}
           focusSelectionRequest={focusSelectionRequest}
           graph={graph}
           layout={layout}
           onSelectionChange={onSelectionChange}
           queryIdentity={topology.queryIdentity}
           selection={selection}
+          semanticFreshness={semanticFreshness}
+          semanticOverlay={visibleSemanticOverlay}
           textScale={textScale}
         />
       </section>

@@ -8,6 +8,7 @@ import {
   projectContextCommunityKey,
   projectContextRelayOrigin,
   projectContextResultIdentity,
+  projectContextSemanticMeetingLiveFilters,
 } from "./hooks.ts";
 import {
   projectContextFailureKind,
@@ -135,4 +136,33 @@ test("screen failures retain closed structured distinctions", () => {
 
 test("visible Context Document counts deduplicate cross-edge bindings", () => {
   assert.equal(visibleContextDocumentCount(result), 2);
+});
+
+test("semantic Meeting metadata hints are Relay-authored, scoped, and chunked", () => {
+  const meetingIds = Array.from(
+    { length: 66 },
+    (_, index) => `meeting-${String(index).padStart(2, "0")}`,
+  ).reverse();
+  const relayPubkey = "A".repeat(64);
+  const filters = projectContextSemanticMeetingLiveFilters({
+    meetingIds: [meetingIds[0], ...meetingIds, ` ${meetingIds[1]} `],
+    nowSeconds: 100,
+    relayPubkey,
+  });
+
+  assert.equal(filters.length, 2);
+  assert.equal(filters[0]["#d"].length, 64);
+  assert.equal(filters[1]["#d"].length, 2);
+  assert.deepEqual(
+    filters.flatMap((filter) => filter["#d"]),
+    [...meetingIds].sort(),
+  );
+  for (const filter of filters) {
+    assert.deepEqual(filter.authors, [relayPubkey.toLowerCase()]);
+    assert.deepEqual(filter.kinds, [39000]);
+    assert.equal(filter.limit, 256);
+    assert.equal(filter.since, 95);
+    assert.equal(filter["#h"], undefined);
+    assert.equal(filter.kinds.includes(42113), false);
+  }
 });

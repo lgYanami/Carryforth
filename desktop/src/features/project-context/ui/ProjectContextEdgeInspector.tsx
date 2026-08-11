@@ -80,11 +80,15 @@ export function ProjectContextEdgeInspector({
   onOpenDocument,
   onSelectCoordinate,
   result,
+  semanticRelationDocumentIds,
+  semanticRootRelationDocumentIds,
 }: {
   edgeKey: string;
   onOpenDocument: (documentId: string) => void;
   onSelectCoordinate: (coordinateKey: string) => void;
   result: ProjectContextQueryResult;
+  semanticRelationDocumentIds?: ReadonlySet<string>;
+  semanticRootRelationDocumentIds?: ReadonlySet<string>;
 }) {
   const inspected = projectContextInspectedEdge(result, edgeKey);
 
@@ -161,6 +165,18 @@ export function ProjectContextEdgeInspector({
                           <span className="min-w-0 flex-1 truncate text-sm font-medium">
                             {document.title?.trim() || "Context Document"}
                           </span>
+                          {semanticRelationDocumentIds?.has(
+                            document.documentId,
+                          ) ? (
+                            <Badge variant="success">
+                              Semantic path relation
+                            </Badge>
+                          ) : null}
+                          {semanticRootRelationDocumentIds?.has(
+                            document.documentId,
+                          ) ? (
+                            <Badge variant="outline">Semantic root</Badge>
+                          ) : null}
                           {document.state === "tombstoned" ? (
                             <Badge variant="secondary">
                               <Archive className="mr-1 h-3 w-3" />

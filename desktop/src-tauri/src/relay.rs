@@ -1,9 +1,7 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
+use nostr::{JsonUtil, Keys};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 // nostr 0.36 alias — required for cross-version bridging with buzz-sdk.
 
@@ -11,6 +9,9 @@ use crate::app_state::AppState;
 
 mod managed_agent_profile;
 pub use managed_agent_profile::sync_managed_agent_capabilities;
+mod nip98;
+pub use nip98::{build_nip98_auth_header, build_nip98_auth_header_for_keys};
+pub(crate) use nip98::{build_nip98_auth_observation_for_keys, Nip98AuthorizationObservation};
 
 pub(crate) const LOCAL_RELAY_WS_URL: &str = "ws://localhost:3000";
 pub(crate) const LOCAL_ONLY_UNAVAILABLE: &str = "unavailable:desktop:local_only";
@@ -90,52 +91,6 @@ pub fn relay_http_base_url(relay_url: &str) -> String {
 
 pub fn relay_api_base_url() -> String {
     relay_http_base_url(LOCAL_RELAY_WS_URL)
-}
-
-// ── NIP-98 HTTP auth ────────────────────────────────────────────────────────
-
-pub fn build_nip98_auth_header(
-    method: &Method,
-    url: &str,
-    body: &[u8],
-    state: &AppState,
-) -> Result<String, String> {
-    let keys = state.keys.lock().map_err(|error| error.to_string())?;
-    build_nip98_auth_header_for_keys(&keys, method, url, body)
-}
-
-pub fn build_nip98_auth_header_for_keys(
-    keys: &Keys,
-    method: &Method,
-    url: &str,
-    body: &[u8],
-) -> Result<String, String> {
-    let payload_hash = hex::encode(Sha256::digest(body));
-
-    // Nonce ensures unique event IDs even for identical requests in the same second.
-    // Without this, rapid-fire calls (e.g. query → submit → re-query) with the same
-    // body produce identical NIP-98 event hashes and trigger relay replay detection.
-    let nonce_hex = uuid::Uuid::new_v4().to_string();
-
-    let tags = vec![
-        Tag::parse(vec!["u", url]).map_err(|error| format!("url tag failed: {error}"))?,
-        Tag::parse(vec!["method", method.as_str()])
-            .map_err(|error| format!("method tag failed: {error}"))?,
-        Tag::parse(vec!["payload", &payload_hash])
-            .map_err(|error| format!("payload tag failed: {error}"))?,
-        Tag::parse(vec!["nonce", &nonce_hex])
-            .map_err(|error| format!("nonce tag failed: {error}"))?,
-    ];
-
-    let event = EventBuilder::new(Kind::HttpAuth, "")
-        .tags(tags)
-        .sign_with_keys(keys)
-        .map_err(|error| format!("sign failed: {error}"))?;
-
-    Ok(format!(
-        "Nostr {}",
-        BASE64.encode(event.as_json().as_bytes())
-    ))
 }
 
 // ── Error handling ──────────────────────────────────────────────────────────
@@ -362,14 +317,34 @@ pub(crate) async fn query_relay_at_with_keys_typed(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<Vec<nostr::Event>, RelayHttpError> {
+    query_relay_at_with_keys_and_client_typed(
+        &state.http_client,
+        api_base_url,
+        filters,
+        keys,
+        auth_tag,
+    )
+    .await
+}
+
+/// Query one explicit Relay with caller-supplied redirect and timeout policy.
+///
+/// This keeps the same signed HTTP bridge and typed error contract while
+/// allowing trusted pinned-request paths to provide a no-redirect client.
+pub(crate) async fn query_relay_at_with_keys_and_client_typed(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+    keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<Vec<nostr::Event>, RelayHttpError> {
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/query", api_base_url);
     let body_bytes = serde_json::to_vec(filters)
         .map_err(|e| RelayHttpError::internal(format!("filter serialization failed: {e}")))?;
     let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)
         .map_err(RelayHttpError::internal)?;
-    let mut request = state
-        .http_client
+    let mut request = client
         .post(&url)
         .header("Authorization", auth)
         .header("Content-Type", "application/json");

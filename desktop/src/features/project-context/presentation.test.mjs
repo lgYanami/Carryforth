@@ -71,17 +71,186 @@ function emphasisByKey(elements, kind) {
   );
 }
 
+function semanticOverlay(overrides = {}) {
+  return {
+    communityKey: "community-0",
+    requestId: "request-0",
+    projectId: "project",
+    relayPubkey: "a".repeat(64),
+    projectContextRevision: 1,
+    substrateIdentity: "fixture",
+    pathCount: 1,
+    rootCount: 1,
+    edgeKeys: new Set(["edge-abc"]),
+    rootEdgeKeys: new Set(),
+    memberCoordinateKeys: new Set(["goal:c", "requirement:a", "resource:b"]),
+    routeCoordinateKeys: new Set(["goal:c", "requirement:a"]),
+    rootCoordinateKeys: new Set(["requirement:a"]),
+    terminalCoordinateKeys: new Set(["goal:c"]),
+    relationDocumentIdsByEdge: new Map([
+      ["edge-abc", new Set(["context-abc"])],
+    ]),
+    rootRelationDocumentIdsByEdge: new Map(),
+    boundsTargetIds: [
+      "coordinate:goal:c",
+      "coordinate:requirement:a",
+      "coordinate:resource:b",
+      "edge-hub:edge-abc",
+    ],
+    ...overrides,
+  };
+}
+
+function semanticByKey(elements, kind) {
+  return Object.fromEntries(
+    [...elements.nodes, ...elements.edges]
+      .filter((element) => element.data?.kind === kind)
+      .map((element) => {
+        const data = element.data;
+        if (kind === "coordinate") {
+          return [data.coordinate.coordinateKey, data.semanticEmphasis];
+        }
+        if (kind === "hub") {
+          return [data.hub.edgeKey, data.semanticEmphasis];
+        }
+        return [element.id, data.semanticEmphasis];
+      }),
+  );
+}
+
 test("no target leaves every graph element in its normal presentation", () => {
   const { graph, layout } = fixture();
   const elements = buildProjectContextFlowElements(graph, layout, null);
   for (const element of [...elements.nodes, ...elements.edges]) {
     if (element.data?.kind !== "island") {
       assert.equal(element.data?.emphasis, "normal");
+      assert.equal(element.data?.semanticEmphasis, "none");
     }
   }
   for (const edge of elements.edges) {
     assert.equal(edge.focusable, false);
     assert.equal(edge.domAttributes?.["aria-hidden"], true);
+  }
+});
+
+test("semantic path marks one complete Hyperedge without lighting an overlap Edge", () => {
+  const { graph, layout } = fixture();
+  const elements = buildProjectContextFlowElements(
+    graph,
+    layout,
+    null,
+    semanticOverlay(),
+  );
+
+  assert.deepEqual(semanticByKey(elements, "hub"), {
+    "edge-ab": "outside",
+    "edge-abc": "route",
+  });
+  assert.deepEqual(semanticByKey(elements, "coordinate"), {
+    "goal:c": "route",
+    "requirement:a": "route",
+    "resource:b": "member",
+  });
+  for (const edge of elements.edges) {
+    assert.equal(
+      edge.data?.semanticEmphasis,
+      edge.data?.edgeKey === "edge-abc" ? "member" : "outside",
+    );
+  }
+
+  const coordinates = elements.nodes.filter(
+    (node) => node.data.kind === "coordinate",
+  );
+  assert.equal(
+    coordinates.find(
+      (node) => node.data.coordinate.coordinateKey === "requirement:a",
+    )?.data.semanticRoot,
+    true,
+  );
+  assert.equal(
+    coordinates.find((node) => node.data.coordinate.coordinateKey === "goal:c")
+      ?.data.semanticTerminal,
+    true,
+  );
+});
+
+test("selection remains an independent axis for an item outside the semantic path", () => {
+  const { graph, layout } = fixture();
+  const elements = buildProjectContextFlowElements(
+    graph,
+    layout,
+    { kind: "edge", key: "edge-ab" },
+    semanticOverlay(),
+  );
+
+  const hubs = elements.nodes.filter((node) => node.data.kind === "hub");
+  const selectedOutside = hubs.find(
+    (node) => node.data.hub.edgeKey === "edge-ab",
+  );
+  const semanticRoute = hubs.find(
+    (node) => node.data.hub.edgeKey === "edge-abc",
+  );
+  assert.equal(selectedOutside?.data.emphasis, "active");
+  assert.equal(selectedOutside?.data.semanticEmphasis, "outside");
+  assert.equal(semanticRoute?.data.emphasis, "dimmed");
+  assert.equal(semanticRoute?.data.semanticEmphasis, "route");
+});
+
+test("zero-hop roots get markers without inventing a traversed Hyperedge", () => {
+  const { graph, layout } = fixture();
+  const overlay = semanticOverlay({
+    edgeKeys: new Set(),
+    rootEdgeKeys: new Set(["edge-ab"]),
+    memberCoordinateKeys: new Set(),
+    routeCoordinateKeys: new Set(),
+    rootCoordinateKeys: new Set(["resource:b"]),
+    terminalCoordinateKeys: new Set(),
+    pathCount: 0,
+  });
+  const elements = buildProjectContextFlowElements(
+    graph,
+    layout,
+    null,
+    overlay,
+  );
+
+  assert.deepEqual(semanticByKey(elements, "hub"), {
+    "edge-ab": "member",
+    "edge-abc": "outside",
+  });
+  assert.deepEqual(semanticByKey(elements, "coordinate"), {
+    "goal:c": "outside",
+    "requirement:a": "outside",
+    "resource:b": "route",
+  });
+  for (const edge of elements.edges) {
+    assert.equal(edge.data?.semanticEmphasis, "outside");
+  }
+});
+
+test("a valid empty semantic result does not dim the canonical graph", () => {
+  const { graph, layout } = fixture();
+  const overlay = semanticOverlay({
+    edgeKeys: new Set(),
+    rootEdgeKeys: new Set(),
+    memberCoordinateKeys: new Set(),
+    routeCoordinateKeys: new Set(),
+    rootCoordinateKeys: new Set(),
+    terminalCoordinateKeys: new Set(),
+    boundsTargetIds: [],
+    pathCount: 0,
+    rootCount: 0,
+  });
+  const elements = buildProjectContextFlowElements(
+    graph,
+    layout,
+    null,
+    overlay,
+  );
+  for (const element of [...elements.nodes, ...elements.edges]) {
+    if (element.data?.kind !== "island") {
+      assert.equal(element.data?.semanticEmphasis, "none");
+    }
   }
 });
 

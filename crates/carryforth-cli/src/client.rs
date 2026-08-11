@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT;
 use buzz_semantic_query::SemanticGraphQuery;
 use nostr::{EventBuilder, EventId, JsonUtil, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest, Sha256};
@@ -165,16 +164,6 @@ pub(crate) struct SemanticQueryOnceResponse {
     pub(crate) exact_body: Vec<u8>,
     /// Exact successful response body bytes.
     pub(crate) response_body: Vec<u8>,
-}
-
-#[derive(serde::Serialize)]
-struct SemanticGraphQueryFilter<'a> {
-    kinds: [u32; 1],
-    authors: [String; 1],
-    #[serde(rename = "#p")]
-    caller: [String; 1],
-    limit: u8,
-    buzz_project_context_semantic: &'a SemanticGraphQuery,
 }
 
 /// Result of the Project-command transport policy. An ambiguous outcome must
@@ -945,18 +934,17 @@ impl CarryforthClient {
         relay_pubkey: &PublicKey,
         request: SemanticGraphQuery,
     ) -> Result<SemanticQueryOnceResponse, CliError> {
-        let request = request
-            .validate_and_canonicalize()
-            .map_err(|error| CliError::Usage(format!("invalid semantic graph query: {error}")))?;
-        let filter = SemanticGraphQueryFilter {
-            kinds: [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
-            authors: [relay_pubkey.to_hex()],
-            caller: [self.public_key().to_hex()],
-            limit: 1,
-            buzz_project_context_semantic: &request,
-        };
-        let exact_body = serde_json::to_vec(&[filter])
-            .map_err(|error| CliError::Other(format!("filter serialization failed: {error}")))?;
+        let prepared = buzz_sdk::semantic_graph::build_semantic_graph_http_query_request(
+            request,
+            relay_pubkey,
+            &self.public_key(),
+        )
+        .map_err(|error| match error {
+            buzz_sdk::SdkError::InvalidInput(message) => CliError::Usage(message),
+            other => CliError::Other(format!("semantic filter serialization failed: {other}")),
+        })?;
+        let request = prepared.request;
+        let exact_body = prepared.exact_body;
         let url = format!("{}/query", self.relay_url);
         let authorization = sign_nip98_observed(&self.keys, "POST", &url, Some(&exact_body))?;
 
@@ -1902,10 +1890,7 @@ mod semantic_query_once_tests {
     use sha2::{Digest as _, Sha256};
     use uuid::Uuid;
 
-    use super::{
-        CarryforthClient, SemanticGraphQueryFilter, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
-        SEMANTIC_QUERY_ERROR_RESPONSE_BYTES, SEMANTIC_QUERY_TIMEOUT,
-    };
+    use super::{CarryforthClient, SEMANTIC_QUERY_ERROR_RESPONSE_BYTES, SEMANTIC_QUERY_TIMEOUT};
 
     #[derive(Clone)]
     struct CaptureState {
@@ -2025,14 +2010,16 @@ mod semantic_query_once_tests {
         query.context_coordinates = vec![ProjectContextCoordinate::Document { document_id }];
         query.lifecycle_filter = LifecycleFilter::TerminalOnly;
         query.budget.max_paths = 7;
-        let filter = SemanticGraphQueryFilter {
-            kinds: [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
-            authors: [relay.to_hex()],
-            caller: [caller.to_hex()],
-            limit: 1,
-            buzz_project_context_semantic: &query,
-        };
-        let value = serde_json::to_value(filter).expect("semantic filter wire");
+        let prepared = buzz_sdk::semantic_graph::build_semantic_graph_http_query_request(
+            query.clone(),
+            &relay,
+            &caller,
+        )
+        .expect("semantic filter wire");
+        let [value]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&prepared.exact_body)
+            .expect("semantic filter JSON")
+            .try_into()
+            .expect("one semantic filter");
         assert_eq!(
             value["buzz_project_context_semantic"]["problem"],
             query.problem
@@ -2110,7 +2097,10 @@ mod semantic_query_once_tests {
                 "limit",
             ])
         );
-        assert_eq!(filter["kinds"], json!([KIND_SEMANTIC_GRAPH_QUERY_RESULT]));
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT])
+        );
         assert_eq!(filter["authors"], json!([relay.public_key().to_hex()]));
         assert_eq!(filter["#p"], json!([caller.public_key().to_hex()]));
         assert_eq!(filter["limit"], json!(1));

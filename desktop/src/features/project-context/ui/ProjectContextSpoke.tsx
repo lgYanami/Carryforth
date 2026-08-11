@@ -34,6 +34,7 @@ export function ProjectContextSpoke({
       data-coordinate-key={data?.coordinateKey}
       data-edge-key={data?.edgeKey}
       data-emphasis={data?.emphasis ?? "normal"}
+      data-semantic-emphasis={data?.semanticEmphasis ?? "none"}
       data-testid={`project-context-spoke-${id}`}
       id={id}
       interactionWidth={interactionWidth ?? 28}

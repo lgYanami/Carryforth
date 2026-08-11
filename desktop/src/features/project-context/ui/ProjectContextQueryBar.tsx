@@ -1,4 +1,4 @@
-import { Archive, ChevronDown, CloudOff, Plus, Search, X } from "lucide-react";
+import { X } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -12,6 +12,10 @@ import {
 } from "@/features/project-context/queryModel";
 import type { ProjectContextQueryMode } from "@/features/project-context/routeState";
 import {
+  ProjectContextCoordinatePicker,
+  type ProjectContextPickerSourceState,
+} from "@/features/project-context/ui/ProjectContextCoordinatePicker";
+import {
   projectContextCoordinateKey,
   projectContextQueryKey,
   type ProjectContextQuery,
@@ -19,12 +23,8 @@ import {
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 
-export type ProjectContextPickerSourceState =
-  | "loading"
-  | "ready"
-  | "unavailable";
+export type { ProjectContextPickerSourceState } from "@/features/project-context/ui/ProjectContextCoordinatePicker";
 
 const MODES: Array<{ mode: ProjectContextQueryMode; label: string }> = [
   { mode: "all", label: "All Context" },
@@ -37,232 +37,6 @@ function modeLabel(mode: ProjectContextQueryMode) {
   return MODES.find((candidate) => candidate.mode === mode)?.label ?? mode;
 }
 
-function optionSearchText(option: ProjectContextCoordinateOption) {
-  return [
-    option.title,
-    option.typeLabel,
-    option.status,
-    option.description,
-    option.searchTerms,
-    option.coordinateKey,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLocaleLowerCase();
-}
-
-function CoordinatePicker({
-  closeOnSelect,
-  disabled,
-  documentsState,
-  meetingsState,
-  onSelect,
-  options,
-  projectViewState,
-  selectedKeys,
-}: {
-  closeOnSelect: boolean;
-  disabled: boolean;
-  documentsState: ProjectContextPickerSourceState;
-  meetingsState: ProjectContextPickerSourceState;
-  onSelect: (option: ProjectContextCoordinateOption) => void;
-  options: ProjectContextCoordinateOption[];
-  projectViewState: ProjectContextPickerSourceState;
-  selectedKeys: ReadonlySet<string>;
-}) {
-  const [open, setOpen] = React.useState(false);
-  const [search, setSearch] = React.useState("");
-  const [highlightedIndex, setHighlightedIndex] = React.useState(0);
-  const filtered = React.useMemo(() => {
-    const query = search.trim().toLocaleLowerCase();
-    return options.filter(
-      (option) =>
-        !selectedKeys.has(option.coordinateKey) &&
-        (!query || optionSearchText(option).includes(query)),
-    );
-  }, [options, search, selectedKeys]);
-
-  React.useEffect(() => {
-    if (!disabled) return;
-    setOpen(false);
-    setSearch("");
-    setHighlightedIndex(0);
-  }, [disabled]);
-
-  function handleOpenChange(next: boolean) {
-    setOpen(next);
-    if (!next) {
-      setSearch("");
-      setHighlightedIndex(0);
-    }
-  }
-
-  function selectOption(option: ProjectContextCoordinateOption) {
-    if (disabled || selectedKeys.has(option.coordinateKey)) return;
-    if (closeOnSelect) handleOpenChange(false);
-    onSelect(option);
-    if (!closeOnSelect) {
-      setSearch("");
-      setHighlightedIndex(0);
-    }
-  }
-
-  function moveHighlight(direction: 1 | -1) {
-    if (filtered.length === 0) return;
-    setHighlightedIndex(
-      (current) => (current + direction + filtered.length) % filtered.length,
-    );
-  }
-
-  function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      moveHighlight(1);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      moveHighlight(-1);
-    } else if (event.key === "Enter") {
-      event.preventDefault();
-      const option = filtered[highlightedIndex];
-      if (option) selectOption(option);
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      handleOpenChange(false);
-    }
-  }
-
-  return (
-    <Popover onOpenChange={handleOpenChange} open={open}>
-      <PopoverTrigger asChild>
-        <Button
-          aria-expanded={open}
-          className="justify-between"
-          data-testid="project-context-coordinate-picker"
-          disabled={disabled}
-          role="combobox"
-          size="sm"
-          type="button"
-          variant="outline"
-        >
-          <Plus />
-          Add Coordinate
-          <ChevronDown className="ml-1 h-3.5 w-3.5" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        align="start"
-        className="w-[min(30rem,var(--radix-popover-content-available-width))] overflow-hidden p-0"
-        onOpenAutoFocus={(event) => event.preventDefault()}
-      >
-        <div className="flex items-center gap-2 border-b border-border/70 px-3 py-2">
-          <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <input
-            aria-label="Search Project Context Coordinates"
-            autoCapitalize="none"
-            autoComplete="off"
-            autoCorrect="off"
-            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-            data-testid="project-context-coordinate-search"
-            onChange={(event) => {
-              setSearch(event.target.value);
-              setHighlightedIndex(0);
-            }}
-            onKeyDown={handleKeyDown}
-            placeholder="Search title, type, status, or ID…"
-            ref={(element) => element?.focus()}
-            spellCheck={false}
-            value={search}
-          />
-        </div>
-        <div
-          className="max-h-80 overflow-y-auto overscroll-contain p-1"
-          role="listbox"
-        >
-          {(["project_view", "documents", "meetings"] as const).map((group) => {
-            const groupOptions = filtered.filter(
-              (option) => option.group === group,
-            );
-            const sourceState =
-              group === "project_view"
-                ? projectViewState
-                : group === "documents"
-                  ? documentsState
-                  : meetingsState;
-            const label =
-              group === "project_view"
-                ? "Project View"
-                : group === "documents"
-                  ? "Documents"
-                  : "Meetings";
-            if (groupOptions.length === 0 && sourceState === "ready") {
-              return null;
-            }
-            return (
-              <section className="py-1" key={group}>
-                <div className="flex items-center justify-between px-2 py-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  <span>{label}</span>
-                  {sourceState !== "ready" ? (
-                    <span className="normal-case tracking-normal">
-                      {sourceState === "loading" ? "Loading…" : "Unavailable"}
-                    </span>
-                  ) : null}
-                </div>
-                {groupOptions.map((option) => {
-                  const index = filtered.indexOf(option);
-                  return (
-                    <button
-                      aria-selected={false}
-                      className={cn(
-                        "flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left transition-colors hover:bg-muted/55",
-                        index === highlightedIndex && "bg-muted/55",
-                      )}
-                      data-coordinate-key={option.coordinateKey}
-                      key={option.coordinateKey}
-                      onClick={() => selectOption(option)}
-                      onMouseEnter={() => setHighlightedIndex(index)}
-                      role="option"
-                      type="button"
-                    >
-                      <span className="min-w-0 flex-1">
-                        <span className="flex items-center gap-1.5">
-                          <span className="truncate text-sm font-medium">
-                            {option.title}
-                          </span>
-                          {option.state === "tombstoned" ? (
-                            <Archive className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                          ) : option.state === "unavailable" ? (
-                            <CloudOff className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                          ) : null}
-                        </span>
-                        <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                          {option.typeLabel}
-                          {option.status ? ` · ${option.status}` : ""}
-                          {option.description ? ` · ${option.description}` : ""}
-                        </span>
-                        <span className="mt-0.5 block truncate font-mono text-2xs text-muted-foreground">
-                          {option.coordinateKey}
-                        </span>
-                      </span>
-                    </button>
-                  );
-                })}
-              </section>
-            );
-          })}
-          {filtered.length === 0 &&
-          projectViewState !== "loading" &&
-          documentsState !== "loading" &&
-          meetingsState !== "loading" ? (
-            <p className="px-3 py-6 text-center text-sm text-muted-foreground">
-              No current-project Coordinates match.
-            </p>
-          ) : null}
-        </div>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
 /** Draft-first controls for the three domain query variants and All alias. */
 export function ProjectContextQueryBar({
   appliedQuery,
@@ -271,6 +45,8 @@ export function ProjectContextQueryBar({
   meetingsState,
   onRun,
   projectViewState,
+  runDisabled = false,
+  runDisabledReason,
 }: {
   appliedQuery: ProjectContextQuery;
   coordinateOptions: ProjectContextCoordinateOption[];
@@ -278,6 +54,8 @@ export function ProjectContextQueryBar({
   meetingsState: ProjectContextPickerSourceState;
   onRun: (query: ProjectContextQuery) => void;
   projectViewState: ProjectContextPickerSourceState;
+  runDisabled?: boolean;
+  runDisabledReason?: string;
 }) {
   const appliedKey = projectContextQueryKey(appliedQuery);
   const lastAppliedKey = React.useRef(appliedKey);
@@ -322,6 +100,7 @@ export function ProjectContextQueryBar({
   }
   const draftError = validation ?? conversionError;
   const dirty = draftKey !== appliedKey;
+  const blockingGuidance = runDisabled ? runDisabledReason : draftError;
 
   return (
     <section
@@ -352,7 +131,7 @@ export function ProjectContextQueryBar({
               </Button>
             ))}
           </fieldset>
-          <CoordinatePicker
+          <ProjectContextCoordinatePicker
             closeOnSelect={draft.mode === "incident"}
             disabled={
               draft.mode === "all" ||
@@ -390,7 +169,9 @@ export function ProjectContextQueryBar({
           </Badge>
           <Button
             data-testid="project-context-run-query"
-            disabled={Boolean(draftError) || !dirty || !draftQuery}
+            disabled={
+              runDisabled || Boolean(draftError) || !dirty || !draftQuery
+            }
             onClick={() => {
               if (draftQuery) onRun(draftQuery);
             }}
@@ -443,14 +224,14 @@ export function ProjectContextQueryBar({
         <p
           className={cn(
             "text-xs",
-            draftError
+            blockingGuidance
               ? "text-amber-700 dark:text-amber-300"
               : "text-muted-foreground",
           )}
           data-testid="project-context-query-guidance"
-          role={draftError ? "status" : undefined}
+          role={blockingGuidance ? "status" : undefined}
         >
-          {draftError ??
+          {blockingGuidance ??
             (draft.mode === "all"
               ? "All Context is the complete contains-all empty-set query."
               : "Editing this draft does not change the graph until you Run it.")}

@@ -2,6 +2,24 @@
   cursor: grab;
 }
 
+.project-context-graph {
+  --project-context-semantic-hue: 190;
+  --project-context-semantic-lightness: 38%;
+}
+
+.dark .project-context-graph {
+  --project-context-semantic-lightness: 70%;
+}
+
+.project-context-graph[data-semantic-freshness="stale"] {
+  --project-context-semantic-hue: 34;
+  --project-context-semantic-lightness: 46%;
+}
+
+.dark .project-context-graph[data-semantic-freshness="stale"] {
+  --project-context-semantic-lightness: 68%;
+}
+
 .project-context-graph .react-flow__pane.dragging {
   cursor: grabbing;
 }
@@ -276,6 +294,204 @@
 .project-context-spoke[data-hover-emphasis="dimmed"] {
   opacity: 0.2;
   stroke-width: 1.5;
+}
+
+/* Semantic retrieval is an independent presentation axis. These selectors
+   only match an active overlay, leaving the existing no-semantic contract
+   byte-for-byte equivalent at data-semantic-emphasis="none". */
+.project-context-coordinate[data-semantic-emphasis="outside"] {
+  opacity: 0.2;
+}
+
+.project-context-coordinate[data-semantic-emphasis="member"],
+.project-context-coordinate[data-semantic-emphasis="route"] {
+  opacity: 1;
+  outline: 1px solid
+    hsl(
+      var(--project-context-semantic-hue) 78%
+        var(--project-context-semantic-lightness) /
+      0.68
+    );
+  outline-offset: 0.18rem;
+}
+
+.project-context-coordinate[data-semantic-emphasis="route"] {
+  outline-width: 2px;
+  outline-offset: 0.24rem;
+}
+
+.project-context-coordinate[data-semantic-emphasis="outside"][data-emphasis="active"],
+.project-context-coordinate[data-semantic-emphasis="outside"][data-hover-emphasis="active"] {
+  opacity: 1;
+}
+
+.project-context-coordinate[data-semantic-emphasis="member"][data-emphasis="active"],
+.project-context-coordinate[data-semantic-emphasis="route"][data-emphasis="active"],
+.project-context-coordinate[data-semantic-emphasis="member"][data-hover-emphasis="active"],
+.project-context-coordinate[data-semantic-emphasis="route"][data-hover-emphasis="active"] {
+  outline-offset: 0.3rem;
+}
+
+.project-context-semantic-marker {
+  border: 1px solid
+    hsl(
+      var(--project-context-semantic-hue) 78%
+        var(--project-context-semantic-lightness) /
+      0.58
+    );
+  background: color-mix(
+    in srgb,
+    hsl(var(--background)) 78%,
+    hsl(
+        var(--project-context-semantic-hue) 78%
+          var(--project-context-semantic-lightness)
+      )
+      22%
+  );
+  color: hsl(
+    var(--project-context-semantic-hue) 78%
+      var(--project-context-semantic-lightness)
+  );
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.1);
+}
+
+.project-context-semantic-marker--terminal {
+  border-style: double;
+}
+
+.project-context-hub[data-semantic-emphasis="outside"] {
+  opacity: 0.18;
+}
+
+.project-context-hub[data-semantic-emphasis="member"],
+.project-context-hub[data-semantic-emphasis="route"] {
+  opacity: 1;
+}
+
+.project-context-hub[data-semantic-emphasis="member"]::after,
+.project-context-hub[data-semantic-emphasis="route"]::after {
+  position: absolute;
+  z-index: 5;
+  inset: 3%;
+  border: 1px solid
+    hsl(
+      var(--project-context-semantic-hue) 78%
+        var(--project-context-semantic-lightness) /
+      0.7
+    );
+  border-radius: 50%;
+  content: "";
+  pointer-events: none;
+}
+
+.project-context-hub[data-semantic-emphasis="route"]::after {
+  inset: -2%;
+  border-width: 2px;
+  box-shadow: 0 0 0 0.22rem
+    hsl(
+      var(--project-context-semantic-hue) 78%
+        var(--project-context-semantic-lightness) /
+      0.13
+    );
+}
+
+.project-context-hub[data-semantic-emphasis="outside"][data-emphasis="active"],
+.project-context-hub[data-semantic-emphasis="outside"][data-hover-emphasis="active"] {
+  opacity: 1;
+}
+
+.project-context-hub[data-semantic-emphasis="member"]
+  .project-context-hub__diamond,
+.project-context-hub[data-semantic-emphasis="route"]
+  .project-context-hub__diamond {
+  border-color: hsl(
+    var(--project-context-semantic-hue) 78%
+      var(--project-context-semantic-lightness) /
+    0.94
+  );
+}
+
+.project-context-hub[data-semantic-emphasis="member"][data-emphasis="active"]::after,
+.project-context-hub[data-semantic-emphasis="route"][data-emphasis="active"]::after,
+.project-context-hub[data-semantic-emphasis="member"][data-hover-emphasis="active"]::after,
+.project-context-hub[data-semantic-emphasis="route"][data-hover-emphasis="active"]::after {
+  filter: drop-shadow(
+    0 0 0.2rem hsl(var(--project-context-island-hue) 78% 48% / 0.9)
+  );
+}
+
+.project-context-spoke[data-semantic-emphasis="outside"] {
+  opacity: 0.1;
+  stroke-width: 1.5;
+}
+
+.project-context-spoke[data-semantic-emphasis="member"] {
+  stroke: hsl(
+    var(--project-context-semantic-hue) 78%
+      var(--project-context-semantic-lightness) /
+    0.96
+  );
+  stroke-width: 3;
+  opacity: 1;
+}
+
+.project-context-spoke[data-semantic-emphasis="outside"][data-emphasis="active"],
+.project-context-spoke[data-semantic-emphasis="outside"][data-hover-emphasis="active"] {
+  opacity: 1;
+}
+
+.project-context-spoke[data-semantic-emphasis="member"][data-emphasis="active"],
+.project-context-spoke[data-semantic-emphasis="member"][data-hover-emphasis="active"] {
+  stroke-width: 3.5;
+  filter: drop-shadow(
+    0 0 0.16rem hsl(var(--project-context-island-hue) 78% 48% / 0.9)
+  );
+}
+
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-coordinate[data-semantic-emphasis="outside"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-hub[data-semantic-emphasis="outside"] {
+  opacity: 0.72;
+}
+
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-spoke[data-semantic-emphasis="outside"] {
+  opacity: 0.42;
+}
+
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-coordinate[data-semantic-emphasis="outside"][data-emphasis="active"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-coordinate[data-semantic-emphasis="outside"][data-hover-emphasis="active"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-hub[data-semantic-emphasis="outside"][data-emphasis="active"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-hub[data-semantic-emphasis="outside"][data-hover-emphasis="active"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-spoke[data-semantic-emphasis="outside"][data-emphasis="active"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-spoke[data-semantic-emphasis="outside"][data-hover-emphasis="active"] {
+  opacity: 1;
+}
+
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-coordinate[data-semantic-emphasis="member"],
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-coordinate[data-semantic-emphasis="route"] {
+  outline-style: dashed;
+}
+
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-hub[data-semantic-emphasis="member"]::after,
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-hub[data-semantic-emphasis="route"]::after {
+  border-style: dashed;
+}
+
+.project-context-graph[data-semantic-freshness="stale"]
+  .project-context-spoke[data-semantic-emphasis="member"] {
+  stroke-dasharray: 0.35rem 0.28rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

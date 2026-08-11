@@ -307,6 +307,29 @@ async fn v1_and_v2_only_relays_are_unsupported_without_projection_queries() {
 }
 
 #[tokio::test]
+async fn semantic_query_availability_is_an_independent_nip11_capability() {
+    for (advertised, expected) in [(false, false), (true, true)] {
+        let mut extensions = vec![PROJECT_VIEW_V3_EXTENSION];
+        if advertised {
+            extensions.push(SEMANTIC_QUERY_HTTP_EXTENSION);
+        }
+        let fixture = IdentityServerState {
+            relay_pubkey: Keys::generate().public_key().to_hex(),
+            extensions,
+            queries: Arc::new(AtomicUsize::new(0)),
+            forbidden: false,
+        };
+        let url = spawn_identity_server(fixture).await;
+        let state = build_app_state();
+        let identity = read_identity_at(&state, &url)
+            .await
+            .expect("read NIP-11")
+            .expect("v3 identity");
+        assert_eq!(identity.semantic_query_http_available, expected);
+    }
+}
+
+#[tokio::test]
 async fn bootstrap_marker_returns_uninitialized_without_projection_queries() {
     let queries = Arc::new(AtomicUsize::new(0));
     let state_fixture = IdentityServerState {
