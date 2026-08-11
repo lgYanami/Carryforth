@@ -148,8 +148,11 @@ buzz-admin semantic activate --generation-id <generation-uuid>
 `verify` cannot pass on an unscanned empty catalog: a completed durable
 all-family rebuild is an independent cutover fence. A source write invalidates
 its old head synchronously, while encoding and activation remain asynchronous.
-The foundation release exposes no public semantic query, so activation only
-qualifies the derived generation for the later query design.
+Activation qualifies the derived generation for graph query, but it does not
+open a query route. Migration 0058 leaves both the per-Community query gate and
+the HTTP deployment master disabled. The supported local Compose stack also
+keeps graph query disabled; qualification currently requires a source-run
+deployment with the additional settings below.
 
 For immediate containment, run `buzz-admin semantic disable`. Currentness
 capture continues while disabled, but no new source text is claimed or sent to
@@ -157,3 +160,90 @@ the provider. Re-enable only after resuming/re-running rebuild, draining jobs,
 and verifying the generation. Retire and purge old generations only after the
 rollback observation window; use `semantic gc` for unreferenced retired or
 abandoned unit sets.
+
+## Semantic graph-query qualification
+
+Graph query is present but fail-closed by default. This section defines the
+safe order for a future qualified deployment; it is not evidence that the
+current build is production-qualified. Real-provider relevance, target-database
+latency and resource measurements, multi-instance routing attestation, soak,
+and an approved first-Community canary must all be completed before enabling
+query egress.
+
+Keep these gates closed while applying migration 0058 and preparing the
+Foundation generation:
+
+```text
+BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
+semantic_graph_query_enabled=false
+```
+
+Run the additive migration and inspect the closed state:
+
+```bash
+buzz-admin migrate
+buzz-admin semantic preflight
+buzz-admin semantic query-readiness
+```
+
+`query-readiness` must prove the active generation, exact non-zero current
+heads, Project Context structural reads, provider/model contract, stable Relay
+signer, virtual-kind storage constraint, and database prerequisites. If an
+upgrade reports historical zero-vector heads, keep query disabled and run:
+
+```bash
+buzz-admin semantic repair-query-vectors
+buzz-admin semantic status
+buzz-admin semantic query-readiness
+```
+
+Do not proceed until the worker has rebuilt every scheduled current head and a
+second repair is a no-op. This repair does not modify canonical Project View,
+Document, Meeting, or Project Context source data.
+
+After all query-capable Relay instances are deployed with the same deployment
+identifier, enumerate the exact instances currently routed by the load
+balancer. With every Community query gate still disabled, set
+`BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true`, create a short-lived fleet
+assertion, and immediately verify it:
+
+```bash
+buzz-admin semantic fleet-attest \
+  --inventory <current-lb-inventory.json> \
+  --expires-in-seconds 300 \
+  --acknowledge-current-routing-inventory
+buzz-admin semantic fleet-check
+buzz-admin semantic query-readiness
+```
+
+Only after the external qualification evidence is approved and all readiness
+fields pass may an operator explicitly authorize the first Community:
+
+```bash
+buzz-admin semantic query-enable --acknowledge-problem-egress
+```
+
+The acknowledgement authorizes only the query `problem` plus current
+source-owned title/summary overview to cross the configured semantic provider
+boundary. It does not authorize Document bodies, chunks, Meeting Board/Speech,
+topology, runtime hints, or other free text. Recheck readiness, fleet expiry,
+and NIP-11 after enabling; only the HTTP graph-query capability may be
+advertised.
+
+## Graph-query rollback
+
+Contain a query incident before rolling code back:
+
+```bash
+buzz-admin semantic query-disable
+buzz-admin semantic fleet-revoke
+buzz-admin semantic query-readiness
+```
+
+Then remove affected instances from routing or set
+`BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false`. Query rollback does not
+delete canonical data, advance a business revision, delete the active semantic
+generation, or stop ordinary Project Context reads. The Foundation indexing
+worker may continue; disabling it is a separate operator decision. Never put an
+older Relay that cannot parse the semantic raw extension back into routing
+while a Community query gate or reusable fleet assertion remains active.

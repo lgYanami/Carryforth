@@ -70,13 +70,25 @@ jobs:
               - 'Justfile'
             semantic:
               - 'crates/buzz-semantic/**'
+              - 'crates/buzz-semantic-query/**'
               - 'crates/buzz-db/src/semantic.rs'
+              - 'crates/buzz-db/src/semantic_query.rs'
+              - 'crates/buzz-db/src/semantic_fleet.rs'
               - 'crates/buzz-db/src/migration.rs'
               - 'crates/buzz-relay/src/semantic_runtime.rs'
+              - 'crates/buzz-relay/src/semantic_provider.rs'
+              - 'crates/buzz-relay/src/semantic_fleet.rs'
+              - 'crates/buzz-relay/src/semantic_graph_*.rs'
               - 'crates/buzz-relay/src/config.rs'
               - 'crates/buzz-relay/src/main.rs'
               - 'crates/buzz-relay/src/router.rs'
+              - 'crates/buzz-relay/src/api/bridge.rs'
               - 'crates/buzz-admin/src/semantic.rs'
+              - 'crates/buzz-sdk/src/semantic_graph.rs'
+              - 'crates/carryforth-cli/src/commands/project_context.rs'
+              - 'crates/carryforth-cli/src/commands/project_view_snapshot.rs'
+              - 'crates/buzz-acp/src/project_space.rs'
+              - 'crates/buzz-acp/src/base_prompt.md'
               - 'migrations/**'
               - 'schema/**'
               - 'scripts/test-semantic-*.sh'
@@ -1083,7 +1095,7 @@ jobs:
         run: just project-context-test-e2e-stage5
 
   semantic-foundation-integration:
-    name: Project Context Semantic Foundation
+    name: Project Context Semantic Foundation and Query
     runs-on: ubuntu-latest
     timeout-minutes: 35
     needs: [changes]

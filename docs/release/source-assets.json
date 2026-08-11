@@ -499,7 +499,7 @@
           },
           {
             "path": "Cargo.lock",
-            "sha256": "06a75c620e3abdb5cd49d42bfda71eb075fdb44a0e3d95e760dcd9cbfda80ac9"
+            "sha256": "35a9161b3623e67d1247d654376fe8cd87719cf7c72f1a234f5d7e36d7adfac3"
           }
         ],
         "recipe": "Encode a fixed 2x2 RGB pixel grid (red, red, green, green) with the pinned lossless WebP encoder.",
@@ -651,7 +651,7 @@
     {
       "id": "inline-crates-buzz-relay-src-nip11-1",
       "path": "crates/buzz-relay/src/nip11.rs",
-      "locators": ["653:19", "661:19", "666:19"],
+      "locators": ["731:19", "739:19", "744:19"],
       "media_type": "image/webp",
       "encoding": "base64",
       "decoded_sha256": "a40ff3d5900fb7698b8c865041347cb49eccedc8f93945f89629ad104aaecce4",

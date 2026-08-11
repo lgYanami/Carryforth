@@ -385,7 +385,7 @@ semantic-pgvector-test:
 semantic-migration-test:
     ./scripts/test-semantic-migrations.sh
 
-# Run all Project Context semantic-foundation quality gates.
+# Run all Project Context semantic Foundation and Query schema quality gates.
 semantic-test: semantic-pgvector-test semantic-migration-test
 
 # Run the real Relay + real cf CLI Project View end-to-end test.

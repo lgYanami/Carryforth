@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
-//! Pure semantic-index contracts for Buzz Project Context.
+//! Pure semantic-index contracts for Carryforth Project Context.
 //!
 //! The crate has no database, network, Project Context graph, or agent
 //! dependency. Canonical source adapters live in `buzz-db`; this crate only

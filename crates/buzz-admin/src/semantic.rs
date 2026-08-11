@@ -49,7 +49,7 @@ pub enum SemanticCommand {
     RepairQueryVectors,
     /// Enable graph-query egress for the configured Community.
     QueryEnable {
-        /// Explicitly acknowledge that problem and overview text may leave Buzz.
+        /// Explicitly acknowledge that problem and overview text may leave Carryforth.
         #[arg(long, default_value_t = false)]
         acknowledge_problem_egress: bool,
     },

@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
-//! NIP-01 WebSocket relay for Buzz private team communication.
+//! NIP-01 WebSocket relay for Carryforth private team communication.
 
 mod admission;
 

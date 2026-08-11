@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pure contracts and deterministic extraction for Buzz semantic indexing"
+description = "Pure contracts and deterministic extraction for Carryforth semantic indexing"
 
 [dependencies]
 serde = { workspace = true }
