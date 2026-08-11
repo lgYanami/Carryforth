@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -11,62 +12,9 @@ import 'package:nostr/nostr.dart' as nostr;
 import 'package:buzz/shared/relay/media_auth.dart';
 import 'package:buzz/shared/relay/media_upload.dart';
 
-final _pngBytes = Uint8List.fromList([
-  0x89,
-  0x50,
-  0x4e,
-  0x47,
-  0x0d,
-  0x0a,
-  0x1a,
-  0x0a,
-  0x00,
-  0x00,
-  0x00,
-  0x0d,
-  0x49,
-  0x48,
-  0x44,
-  0x52,
-]);
-
-final _jpegBytes = Uint8List.fromList([
-  0xff,
-  0xd8,
-  0xff,
-  0xdb,
-  0x00,
-  0x43,
-  0x00,
-  0x01,
-]);
-
-final _heicBytes = Uint8List.fromList([
-  0x00,
-  0x00,
-  0x00,
-  0x18,
-  0x66,
-  0x74,
-  0x79,
-  0x70,
-  0x68,
-  0x65,
-  0x69,
-  0x63,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x6d,
-  0x69,
-  0x66,
-  0x31,
-  0x68,
-  0x65,
-  0x69,
-  0x63,
-]);
+final _pngBytes = _testPngHeaderBytes();
+final _jpegBytes = _testJpegHeaderBytes();
+final _heicBytes = _testHeicHeaderBytes();
 
 class _NamedXFile extends XFile {
   final String _name;
@@ -77,164 +25,163 @@ class _NamedXFile extends XFile {
   String get name => _name;
 }
 
-final _gifBytes = Uint8List.fromList([
-  ...ascii.encode('GIF89a'),
-  0x02,
-  0x00,
-  0x02,
-  0x00,
-  0x80,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0xff,
-  0xff,
-  0xff,
-  0x21,
-  0xfe,
-  0x05,
-  ...ascii.encode('hello'),
-  0x00,
-  0x21,
-  0xff,
-  0x0b,
-  ...ascii.encode('NETSCAPE2.0'),
-  0x03,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0x21,
-  0xf9,
-  0x04,
-  0x00,
-  0x0a,
-  0x00,
-  0x00,
-  0x00,
-  0x2c,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x02,
-  0x00,
-  0x02,
-  0x00,
-  0x00,
-  0x02,
-  0x02,
-  0x44,
-  0x01,
-  0x00,
-  0x3b,
-]);
+final _gifBytes = _testAnimatedGifBytes();
+final _apngBytes = _testAnimatedPngBytes();
+final _staticPngWithActlPayloadBytes = _testStaticPngWithActlPayloadBytes();
+final _animatedWebpBytes = _testAnimatedWebpBytes();
 
-final _apngBytes = Uint8List.fromList([
-  0x89,
-  0x50,
-  0x4e,
-  0x47,
-  0x0d,
-  0x0a,
-  0x1a,
-  0x0a,
-  ..._testPngChunk('acTL', [0, 0, 0, 2, 0, 0, 0, 0]),
-  ..._testPngChunk('IEND', const []),
-]);
-
-List<int> _testPngChunk(String type, List<int> payload) {
-  return [
-    payload.length >> 24 & 0xff,
-    payload.length >> 16 & 0xff,
-    payload.length >> 8 & 0xff,
-    payload.length & 0xff,
-    ...ascii.encode(type),
-    ...payload,
-    0,
-    0,
-    0,
-    0,
-  ];
+Uint8List _testPngSignature() {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..addByte(0x89)
+    ..add(ascii.encode('PNG'))
+    ..addByte(0x0d)
+    ..addByte(0x0a)
+    ..addByte(0x1a)
+    ..addByte(0x0a);
+  return bytes.takeBytes();
 }
 
-final _staticPngWithActlPayloadBytes = Uint8List.fromList([
-  0x89,
-  0x50,
-  0x4e,
-  0x47,
-  0x0d,
-  0x0a,
-  0x1a,
-  0x0a,
-  0x00,
-  0x00,
-  0x00,
-  0x04,
-  0x49,
-  0x44,
-  0x41,
-  0x54,
-  0x61,
-  0x63,
-  0x54,
-  0x4c,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x49,
-  0x45,
-  0x4e,
-  0x44,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-]);
+Uint8List _testPngHeaderBytes() {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(_testPngSignature())
+    ..add(_uint32Bytes(13, Endian.big))
+    ..add(ascii.encode('IHDR'));
+  return bytes.takeBytes();
+}
 
-final _animatedWebpBytes = Uint8List.fromList([
-  0x52,
-  0x49,
-  0x46,
-  0x46,
-  0x16,
-  0x00,
-  0x00,
-  0x00,
-  0x57,
-  0x45,
-  0x42,
-  0x50,
-  0x56,
-  0x50,
-  0x38,
-  0x58,
-  0x0a,
-  0x00,
-  0x00,
-  0x00,
-  0x02,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-]);
+Uint8List _testJpegHeaderBytes() {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..addByte(0xff)
+    ..addByte(0xd8)
+    ..addByte(0xff)
+    ..addByte(0xdb)
+    ..add(_uint16Bytes(67, Endian.big))
+    ..add(_uint16Bytes(1, Endian.big));
+  return bytes.takeBytes();
+}
+
+Uint8List _testHeicHeaderBytes() {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(_uint32Bytes(24, Endian.big))
+    ..add(ascii.encode('ftyp'))
+    ..add(ascii.encode('heic'))
+    ..add(_uint32Bytes(0, Endian.big))
+    ..add(ascii.encode('mif1'))
+    ..add(ascii.encode('heic'));
+  return bytes.takeBytes();
+}
+
+Uint8List _testAnimatedGifBytes() {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(ascii.encode('GIF89a'))
+    ..add(_uint16Bytes(2, Endian.little))
+    ..add(_uint16Bytes(2, Endian.little))
+    ..addByte(0x80)
+    ..addByte(0)
+    ..addByte(0)
+    ..add(Uint8List(3))
+    ..add(Uint8List.fromList(List<int>.filled(3, 0xff)))
+    ..addByte(0x21)
+    ..addByte(0xfe)
+    ..addByte(5)
+    ..add(ascii.encode('hello'))
+    ..addByte(0)
+    ..addByte(0x21)
+    ..addByte(0xff)
+    ..addByte(11)
+    ..add(ascii.encode('NETSCAPE2.0'))
+    ..addByte(3)
+    ..addByte(1)
+    ..add(_uint16Bytes(0, Endian.little))
+    ..addByte(0)
+    ..addByte(0x21)
+    ..addByte(0xf9)
+    ..addByte(4)
+    ..addByte(0)
+    ..add(_uint16Bytes(10, Endian.little))
+    ..addByte(0)
+    ..addByte(0)
+    ..addByte(0x2c)
+    ..add(_uint16Bytes(0, Endian.little))
+    ..add(_uint16Bytes(0, Endian.little))
+    ..add(_uint16Bytes(2, Endian.little))
+    ..add(_uint16Bytes(2, Endian.little))
+    ..addByte(0)
+    ..addByte(2)
+    ..addByte(2)
+    ..addByte(0x44)
+    ..addByte(1)
+    ..addByte(0)
+    ..addByte(0x3b);
+  return bytes.takeBytes();
+}
+
+Uint8List _testAnimatedPngBytes() {
+  final animationControl = ByteData(8)..setUint32(0, 2, Endian.big);
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(_testPngSignature())
+    ..add(_testPngChunk('acTL', animationControl.buffer.asUint8List()))
+    ..add(_testPngChunk('IEND', Uint8List(0)));
+  return bytes.takeBytes();
+}
+
+Uint8List _testPngChunk(String type, List<int> payload) {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(_uint32Bytes(payload.length, Endian.big))
+    ..add(ascii.encode(type))
+    ..add(payload)
+    // CRC is deliberately zero in these signature-only protocol fixtures.
+    ..add(_uint32Bytes(0, Endian.big));
+  return bytes.takeBytes();
+}
+
+Uint8List _testStaticPngWithActlPayloadBytes() {
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(_testPngSignature())
+    ..add(_testPngChunk('IDAT', ascii.encode('acTL')))
+    ..add(_testPngChunk('IEND', Uint8List(0)));
+  return bytes.takeBytes();
+}
+
+Uint8List _testAnimatedWebpBytes() {
+  final extendedHeader = BytesBuilder(copy: false);
+  extendedHeader
+    ..addByte(0x02)
+    ..add(Uint8List(9));
+
+  final webpBody = BytesBuilder(copy: false);
+  webpBody
+    ..add(ascii.encode('WEBP'))
+    ..add(ascii.encode('VP8X'))
+    ..add(_uint32Bytes(10, Endian.little))
+    ..add(extendedHeader.takeBytes());
+  final body = webpBody.takeBytes();
+
+  final bytes = BytesBuilder(copy: false);
+  bytes
+    ..add(ascii.encode('RIFF'))
+    ..add(_uint32Bytes(body.length, Endian.little))
+    ..add(body);
+  return bytes.takeBytes();
+}
+
+Uint8List _uint16Bytes(int value, Endian endian) {
+  final data = ByteData(2)..setUint16(0, value, endian);
+  return data.buffer.asUint8List();
+}
+
+Uint8List _uint32Bytes(int value, Endian endian) {
+  final data = ByteData(4)..setUint32(0, value, endian);
+  return data.buffer.asUint8List();
+}
 
 const _mediaUploadPlatformChannel = MethodChannel('buzz/media_upload');
 

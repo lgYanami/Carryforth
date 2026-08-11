@@ -13,9 +13,6 @@ mod runtime_metadata;
 
 pub(crate) use runtime_metadata::KnownAcpRuntime;
 
-const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
-const CLAUDE_CODE_AVATAR_URL: &str = "https://anthropic.gallerycdn.vsassets.io/extensions/anthropic/claude-code/2.1.77/1773707456892/Microsoft.VisualStudio.Services.Icons.Default";
-const CODEX_AVATAR_URL: &str = "https://openai.gallerycdn.vsassets.io/extensions/openai/chatgpt/26.5313.41514/1773706730621/Microsoft.VisualStudio.Services.Icons.Default";
 const BUILT_IN_AGENT_AVATAR_URL: &str = "/carryforth.svg";
 
 fn common_binary_paths() -> &'static [PathBuf] {
@@ -67,7 +64,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         label: "Goose",
         commands: &["goose"],
         aliases: &[],
-        avatar_url: GOOSE_AVATAR_URL,
+        avatar_url: "",
         mcp_command: None,
         mcp_hooks: false,
         underlying_cli: Some("goose"),
@@ -101,7 +98,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         label: "Claude Code",
         commands: &["claude-agent-acp", "claude-code-acp"],
         aliases: &["claude-code", "claudecode"],
-        avatar_url: CLAUDE_CODE_AVATAR_URL,
+        avatar_url: "",
         mcp_command: None,
         mcp_hooks: false,
         underlying_cli: Some("claude"),
@@ -133,7 +130,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         label: "Codex",
         commands: &["codex-acp"],
         aliases: &[],
-        avatar_url: CODEX_AVATAR_URL,
+        avatar_url: "",
         mcp_command: Some("buzz-dev-mcp"),
         mcp_hooks: false,
         underlying_cli: Some("codex"),
@@ -1343,7 +1340,7 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
 
 pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
     let runtime = known_acp_runtime(command)?;
-    Some(runtime.avatar_url.to_string())
+    (!runtime.avatar_url.is_empty()).then(|| runtime.avatar_url.to_string())
 }
 
 #[cfg(test)]

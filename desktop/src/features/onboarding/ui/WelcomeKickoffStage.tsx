@@ -4,19 +4,12 @@ import {
   isWelcomeKickoffStageExiting,
   type WelcomeKickoffStagePhase,
 } from "@/features/onboarding/useWelcomeKickoffStage";
+import { STARTER_PERSONAS } from "@/features/onboarding/starterPersonas";
 import { cn } from "@/shared/lib/cn";
+import { StarterPersonaBadge } from "@/shared/ui/StarterPersonaBadge";
 
-type StageCharacter = {
-  name: string;
-  animationUrl: string;
-};
-
-/** Same animated APNGs the "Meet your starter team" onboarding step uses. */
-const STAGE_CHARACTERS: readonly StageCharacter[] = [
-  { name: "Fizz", animationUrl: "/onboarding/starter-team/fizz.png" },
-  { name: "Honey", animationUrl: "/onboarding/starter-team/honey.png" },
-  { name: "Bumble", animationUrl: "/onboarding/starter-team/bumble.png" },
-];
+/** Same code-rendered badges the "Meet your starter team" step uses. */
+const STAGE_CHARACTERS = STARTER_PERSONAS;
 
 const STAGE_EXIT_ANIMATION = "motion-kickoff-stage-exit";
 
@@ -62,13 +55,13 @@ export function WelcomeKickoffStage({
       onAnimationEnd={handleAnimationEnd}
     >
       {STAGE_CHARACTERS.map((character, index) => (
-        <img
-          alt=""
-          className="motion-kickoff-character-enter h-16 w-16 object-contain"
-          data-testid={`welcome-kickoff-stage-${character.name.toLowerCase()}`}
-          key={character.name}
-          src={character.animationUrl}
+        <StarterPersonaBadge
+          className="motion-kickoff-character-enter h-16 w-16"
+          displayName={character.displayName}
+          key={character.id}
+          personaId={character.id}
           style={{ "--stagger-index": index } as React.CSSProperties}
+          testId={`welcome-kickoff-stage-${character.displayName.toLowerCase()}`}
         />
       ))}
     </div>

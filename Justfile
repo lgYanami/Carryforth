@@ -115,6 +115,11 @@ current-product-surface-check:
 open-source-release-surface-check:
     ./scripts/check-open-source-release-surface.sh
 
+# Every media/font payload distributed by the current source tree must have
+# explicit provenance, including media embedded in source text as data URIs.
+source-asset-inventory-check:
+    node ./scripts/check-source-asset-inventory.mjs
+
 # Validate local bootstrap and upgrade safety without starting or deleting data.
 carryforth-local-deployment-test:
     ./scripts/test-carryforth-local-deployment.sh
@@ -837,8 +842,13 @@ mobile-fmt:
 mobile-fix:
     unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format . && flutter analyze
 
+# Verify Carryforth Mobile icon renditions and cross-platform media fixtures.
+mobile-assets-check:
+    node mobile/scripts/generate-carryforth-icons.mjs --check
+    node crates/buzz-media/tests/fixtures/check-fixtures.mjs
+
 # Run mobile lint and format checks
-mobile-check:
+mobile-check: mobile-assets-check
     unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format --output=none --set-exit-if-changed . && flutter analyze && node ./scripts/check-file-sizes.mjs
 
 # Run mobile tests

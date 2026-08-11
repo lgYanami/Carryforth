@@ -5,37 +5,33 @@ use super::{
     apply_agent_command_update, classify_runtime, codex_adapter_availability,
     codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
     effective_agent_command, find_nvm_default_bin, find_via_login_shell,
-    is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
-    parse_semver_tag, probe_codex_acp_major_version, record_agent_command,
-    refresh_login_shell_path, BUILT_IN_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL,
-    GOOSE_AVATAR_URL,
+    is_login_shell_path_uninit, is_safe_nvm_tag, known_acp_runtime_exact, managed_agent_avatar_url,
+    normalize_agent_args, parse_semver_tag, probe_codex_acp_major_version, record_agent_command,
+    refresh_login_shell_path, BUILT_IN_AGENT_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
 
 #[test]
-fn resolves_known_avatar_for_bare_command() {
-    let avatar_url = managed_agent_avatar_url("goose").expect("goose avatar should resolve");
-
-    assert_eq!(avatar_url, GOOSE_AVATAR_URL);
+fn external_runtime_does_not_supply_default_avatar() {
+    assert!(managed_agent_avatar_url("goose").is_none());
 }
 
 #[test]
-fn resolves_known_avatar_for_command_paths_and_aliases() {
+fn external_runtime_paths_and_aliases_do_not_supply_default_avatars() {
+    assert!(managed_agent_avatar_url("/usr/local/bin/codex-acp").is_none());
+    assert!(managed_agent_avatar_url("Claude Code").is_none());
+    assert!(managed_agent_avatar_url(r"C:\Tools\claude-agent-acp.exe").is_none());
+    assert!(managed_agent_avatar_url("/usr/local/bin/claude-code-acp").is_none());
+}
+
+#[test]
+fn runtime_catalog_metadata_only_supplies_the_product_owned_built_in_avatar() {
+    for runtime_id in ["goose", "claude", "codex"] {
+        assert_eq!(known_acp_runtime_exact(runtime_id).unwrap().avatar_url, "");
+    }
     assert_eq!(
-        managed_agent_avatar_url("/usr/local/bin/codex-acp"),
-        Some(CODEX_AVATAR_URL.to_string())
-    );
-    assert_eq!(
-        managed_agent_avatar_url("Claude Code"),
-        Some(CLAUDE_CODE_AVATAR_URL.to_string())
-    );
-    assert_eq!(
-        managed_agent_avatar_url(r"C:\Tools\claude-agent-acp.exe"),
-        Some(CLAUDE_CODE_AVATAR_URL.to_string())
-    );
-    assert_eq!(
-        managed_agent_avatar_url("/usr/local/bin/claude-code-acp"),
-        Some(CLAUDE_CODE_AVATAR_URL.to_string())
+        known_acp_runtime_exact("buzz-agent").unwrap().avatar_url,
+        BUILT_IN_AGENT_AVATAR_URL
     );
 }
 

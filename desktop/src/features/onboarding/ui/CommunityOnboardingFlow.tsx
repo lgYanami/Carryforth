@@ -8,6 +8,7 @@ import {
 } from "@/features/onboarding/communityOnboarding";
 import { initializeStarterChannels } from "@/features/onboarding/hooks";
 import { useClaimInvite } from "@/features/onboarding/useClaimInvite";
+import { selectStarterPersonas } from "@/features/onboarding/starterPersonas";
 import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
 import {
   takePendingWelcomeChannelForDirectEntry,
@@ -31,6 +32,7 @@ import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { Button } from "@/shared/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
+import { StarterPersonaBadge } from "@/shared/ui/StarterPersonaBadge";
 import { MembershipDenied } from "./MembershipDenied";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import {
@@ -48,12 +50,6 @@ function isRelayMembershipDeniedError(error: unknown): boolean {
     error.message.includes("invalid: you are not a relay member")
   );
 }
-
-const STARTER_PERSONA_ANIMATIONS: Record<string, string> = {
-  Fizz: "/onboarding/starter-team/fizz.png",
-  Honey: "/onboarding/starter-team/honey.png",
-  Bumble: "/onboarding/starter-team/bumble.png",
-};
 
 /** Fade duration for the "entering" curtain over the mounting app. */
 const ENTERING_CURTAIN_FADE_MS = 500;
@@ -182,16 +178,7 @@ export function CommunityOnboardingFlow({
   React.useEffect(() => {
     if (!isTeamIntroVisible) return;
     void listPersonas()
-      .then((personas) =>
-        setStarterPersonas(
-          ["Fizz", "Honey", "Bumble"].flatMap((name) => {
-            const persona = personas.find(
-              (candidate) => candidate.displayName === name,
-            );
-            return persona ? [persona] : [];
-          }),
-        ),
-      )
+      .then((personas) => setStarterPersonas(selectStarterPersonas(personas)))
       .catch(() => setStarterPersonas([]));
   }, [isTeamIntroVisible]);
 
@@ -617,27 +604,18 @@ export function CommunityOnboardingFlow({
                 {starterPersonas.length > 0 ? (
                   <div className="flex flex-wrap justify-center gap-8">
                     {starterPersonas.map((persona) => {
-                      const animationUrl =
-                        STARTER_PERSONA_ANIMATIONS[persona.displayName];
+                      const stableName = persona.id.replace("builtin:", "");
                       return (
                         <div
                           className="flex w-40 flex-col items-center gap-3"
                           key={persona.id}
                         >
-                          {animationUrl ? (
-                            <img
-                              alt={`${persona.displayName} animated character`}
-                              className="h-40 w-40 object-contain"
-                              data-testid={`starter-persona-${persona.displayName.toLowerCase()}`}
-                              src={animationUrl}
-                            />
-                          ) : (
-                            <ProfileAvatar
-                              avatarUrl={persona.avatarUrl}
-                              className="h-28 w-28 text-3xl"
-                              label={persona.displayName}
-                            />
-                          )}
+                          <StarterPersonaBadge
+                            className="h-40 w-40"
+                            displayName={persona.displayName}
+                            personaId={persona.id}
+                            testId={`starter-persona-${stableName}`}
+                          />
                           <span className="font-mono text-xs font-medium uppercase tracking-[0.15em]">
                             {persona.displayName}
                           </span>

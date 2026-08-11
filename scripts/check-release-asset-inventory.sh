@@ -141,15 +141,16 @@ asset_pathspecs=(
   "desktop/src-tauri/icons/**"
   "desktop/src/shared/ui/assets/card-texture.png"
   "desktop/public/pow/**"
-  "desktop/public/runtime-icons/**"
-  "desktop/src/features/onboarding/assets/harness-logos/**"
-  "desktop/public/onboarding/starter-team/**"
   "desktop/public/sounds/**"
 )
 
 mapfile -t tracked_assets < <(
   for pathspec in "${asset_pathspecs[@]}"; do
-    git ls-files -- "${pathspec}"
+    while IFS= read -r asset; do
+      if [[ -f "${asset}" ]]; then
+        printf '%s\n' "${asset}"
+      fi
+    done < <(git ls-files --cached --others --exclude-standard -- "${pathspec}")
   done | sort -u
 )
 mapfile -t inventory_patterns < <(

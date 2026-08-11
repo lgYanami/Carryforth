@@ -1,51 +1,60 @@
 # UIKit media fixtures
 
-These 2 x 2 fixtures were produced on an iOS simulator with UIKit, not by a generic image encoder.
+These fixtures contain only synthetic pixels. They were introduced in commit
+`37f15b20019169363b697aee41c99573b7bc3f24` and produced by UIKit on an iOS
+simulator, not copied from an external image. They are distributed under the
+repository's Apache-2.0 license.
+
+The input is now tracked at
+[`../source/pixel-grid-2x2.png`](../source/pixel-grid-2x2.png): two red pixels
+followed by two green pixels. Its standard-library-only Node generator defines
+every source pixel and can verify or reproduce the input offline:
+
+```sh
+node crates/buzz-media/tests/fixtures/source/generate-pixel-source.mjs --check
+node crates/buzz-media/tests/fixtures/source/generate-pixel-source.mjs --write
+```
+
+`GenerateFixtures.swift` is the authoritative UIKit re-encoding program. Exact
+encoded/sanitized hashes and the Mobile copy relationships are recorded in
+[`../fixture-manifest.json`](../fixture-manifest.json).
 
 ## Regeneration
 
-1. Create a small source image and run this program against the simulator SDK:
+1. Record the encoder environment alongside the change:
 
-   ```swift
-   import Foundation
-   import UIKit
-
-   let arguments = CommandLine.arguments
-   let source = try Data(contentsOf: URL(fileURLWithPath: arguments[1]))
-   guard
-     let image = UIImage(data: source),
-     let png = image.pngData(),
-     let jpeg = image.jpegData(compressionQuality: 1.0)
-   else {
-     fatalError("UIKit could not encode the source image")
-   }
-   try png.write(to: URL(fileURLWithPath: arguments[2]))
-   try jpeg.write(to: URL(fileURLWithPath: arguments[3]))
+   ```sh
+   xcodebuild -version
+   xcrun --sdk iphonesimulator --show-sdk-version
+   xcrun simctl list devices booted
    ```
 
-   Compile and run it with the active Xcode toolchain:
+2. Compile the tracked generator for the arm64 iOS 16.0 simulator target and
+   run it against the tracked source:
 
    ```sh
    SDK_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"
    xcrun --sdk iphonesimulator swiftc \
      -sdk "$SDK_PATH" \
      -target arm64-apple-ios16.0-simulator \
-     reencode.swift -o reencode
-   xcrun simctl spawn booted ./reencode \
-     source.png uikit-encoded.png uikit-encoded.jpg
+     crates/buzz-media/tests/fixtures/ios/GenerateFixtures.swift \
+     -o /tmp/carryforth-generate-ios-fixtures
+   xcrun simctl spawn booted /tmp/carryforth-generate-ios-fixtures \
+     "$PWD/crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.png" \
+     /tmp/uikit-encoded.png /tmp/uikit-encoded.jpg
    ```
 
-2. Copy the encoded files into both fixture directories:
+3. Copy the encoded files into this directory and into
+   `mobile/ios/RunnerTests/Fixtures/`. Run the production
+   `MediaSanitizer.scrubPng` and `scrubJpeg` paths to create both sanitized
+   outputs; do not substitute a different image encoder.
+4. Update only the matching iOS hashes in `../fixture-manifest.json`, then run:
 
    ```sh
-   cp uikit-encoded.png mobile/ios/RunnerTests/Fixtures/UIKitEncoded.png
-   cp uikit-encoded.jpg mobile/ios/RunnerTests/Fixtures/UIKitEncoded.jpg
-   cp uikit-encoded.png crates/buzz-media/tests/fixtures/ios/
-   cp uikit-encoded.jpg crates/buzz-media/tests/fixtures/ios/
+   node crates/buzz-media/tests/fixtures/check-fixtures.mjs
+   cargo test -p buzz-media test_ios_uikit
    ```
 
-3. Add a temporary Runner test that loads `UIKitEncoded.png` and `UIKitEncoded.jpg`, calls `MediaSanitizer.scrubPng` and `MediaSanitizer.scrubJpeg`, and writes those outputs to `uikit-sanitized.png` and `uikit-sanitized.jpg`. Run it once, copy the files here, then remove the temporary test.
-4. Run `cmp` on each encoded copy to confirm that the Runner and Rust fixtures are byte-identical.
-5. Run `cargo test -p buzz-media test_ios_uikit` to verify that UIKit's encoded output is rejected and the matching sanitizer output is accepted by the relay contract.
-
-Regenerate both encoded and sanitized pairs whenever UIKit encoding or `MediaSanitizer` changes. Do not update only the sanitized files, because the test is intended to cover the exact encoder-to-sanitizer boundary.
+The checker verifies that both UIKit PNGs decode to the exact tracked synthetic
+scanlines and that the Runner copies remain byte-identical. Regenerate encoded
+and sanitized pairs together whenever UIKit or `MediaSanitizer` changes.

@@ -175,7 +175,7 @@ class UserProfileSheet extends HookConsumerWidget {
                   text: shortPubkey(pubkey),
                   textStyle: context.textTheme.bodySmall?.copyWith(
                     color: context.colors.onSurfaceVariant,
-                    fontFamily: 'monospace',
+                    fontFamily: systemMonospaceFontFamily,
                   ),
                   onTap: () async {
                     await copyToClipboard(

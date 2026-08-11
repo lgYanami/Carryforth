@@ -36,6 +36,7 @@ fn merge_personas_adds_missing_built_ins() {
     assert!(changed);
     assert_eq!(records.len(), BUILT_IN_PERSONAS.len());
     assert!(records.iter().all(|record| record.is_builtin));
+    assert!(records.iter().all(|record| record.avatar_url.is_none()));
     assert!(records
         .iter()
         .any(|record| record.id == "builtin:fizz" && record.runtime.is_none()));

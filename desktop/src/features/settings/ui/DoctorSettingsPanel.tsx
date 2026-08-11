@@ -9,7 +9,6 @@ import {
   useGitBashPrerequisiteQuery,
   useInstallAcpRuntimeMutation,
 } from "@/features/agents/hooks";
-import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import type { AcpAuthMethod, AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { getInstallErrorMessage } from "@/shared/lib/installError";
 import { cn } from "@/shared/lib/cn";
@@ -33,20 +32,7 @@ import {
 import { SectionHeader } from "@/shared/ui/PageHeader";
 import { Spinner } from "@/shared/ui/spinner";
 import { Switch } from "@/shared/ui/switch";
-
-const RUNTIME_LOGO_URLS: Record<string, string> = {
-  "buzz-agent": "/carryforth.svg",
-  claude: "/runtime-icons/claude.png",
-  codex: "/runtime-icons/codex.png",
-  goose: "/runtime-icons/goose.svg",
-};
-
-const RUNTIME_LOGO_SCALE: Record<string, string> = {
-  "buzz-agent": "scale-110",
-  claude: "scale-110",
-  codex: "scale-110",
-  goose: "scale-125",
-};
+import { RuntimeGlyph } from "@/shared/ui/RuntimeGlyph";
 
 const RUNTIME_SORT_PRIORITY: Record<string, number> = {
   "buzz-agent": 0,
@@ -61,14 +47,10 @@ function runtimeInstallGuideLabel(runtime: AcpRuntimeCatalogEntry) {
 }
 
 function RuntimeLogo({ runtime }: { runtime: AcpRuntimeCatalogEntry }) {
-  const avatarUrl = RUNTIME_LOGO_URLS[runtime.id] ?? runtime.avatarUrl;
-
   return (
-    <ProfileAvatar
-      avatarUrl={avatarUrl}
-      className="h-9 w-9 rounded-xl bg-background shadow-none"
-      imageClassName={RUNTIME_LOGO_SCALE[runtime.id]}
-      label={runtime.label}
+    <RuntimeGlyph
+      className="h-9 w-9 rounded-xl bg-background p-1.5"
+      runtimeId={runtime.id}
       testId={`doctor-runtime-logo-${runtime.id}`}
     />
   );

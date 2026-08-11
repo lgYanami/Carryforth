@@ -133,7 +133,7 @@ const cache = new Map<SoundName, HTMLAudioElement>();
 function getAudio(name: SoundName): HTMLAudioElement {
   let audio = cache.get(name);
   if (!audio) {
-    audio = new Audio(`/sounds/${name}.mp3`);
+    audio = new Audio(`/sounds/${name}.wav`);
     cache.set(name, audio);
   }
   return audio;

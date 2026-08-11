@@ -131,7 +131,7 @@ class SettingsPage extends HookConsumerWidget {
                             subtitleStyle: context.textTheme.bodySmall
                                 ?.copyWith(
                                   color: context.colors.onSurfaceVariant,
-                                  fontFamily: 'GeistMono',
+                                  fontFamily: systemMonospaceFontFamily,
                                   fontSize: 11,
                                 ),
                             subtitleMaxLines: 2,

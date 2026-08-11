@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
@@ -89,7 +90,11 @@ class PairingPage extends HookConsumerWidget {
                     children: [
                       const Spacer(flex: 2),
 
-                      Image.asset('assets/images/buzz-icon.png', height: 64),
+                      SvgPicture.asset(
+                        'assets/images/carryforth.svg',
+                        height: 64,
+                        semanticsLabel: 'Carryforth',
+                      ),
                       const SizedBox(height: Grid.xs),
                       Text(
                         'Welcome to Buzz',
@@ -288,7 +293,7 @@ class _SasVerificationView extends StatelessWidget {
           child: Text(
             '${sasCode.substring(0, 3)} ${sasCode.substring(3)}',
             style: context.textTheme.displayMedium?.copyWith(
-              fontFamily: 'GeistMono',
+              fontFamily: systemMonospaceFontFamily,
               fontWeight: FontWeight.w700,
               letterSpacing: 8,
               color: context.colors.primary,

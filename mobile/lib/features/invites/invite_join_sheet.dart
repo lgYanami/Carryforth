@@ -62,7 +62,7 @@ class InviteJoinSheet extends ConsumerWidget {
               child: Text(
                 host,
                 style: context.textTheme.titleMedium?.copyWith(
-                  fontFamily: 'GeistMono',
+                  fontFamily: systemMonospaceFontFamily,
                   fontWeight: FontWeight.w700,
                 ),
               ),

@@ -1,0 +1,1160 @@
+{
+  "schema": "carryforth.source-assets/v1",
+  "scope": "Current tracked source tree only; Git history and release dependency closures are audited separately.",
+  "rights_profiles": {
+    "synthetic-inline-test-fixture": {
+      "classification": "test-fixture",
+      "license": "Apache-2.0",
+      "usage": ["source", "test"],
+      "copyright_holder": "Block, Inc. and Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "provenance": {
+        "description": "Small synthetic bytes authored directly in parser, transport, avatar, and UI tests; they are not copied from an external media asset.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "toolchain": "The Rust, Node, Playwright, or Flutter test harness named by each source path",
+        "recipe": "Literal one-pixel, short-text, minimal PNG, or minimal SVG fixture bytes encoded directly beside their assertions."
+      }
+    },
+    "countdown-bot-project-art": {
+      "classification": "project-art",
+      "license": "Apache-2.0",
+      "usage": ["source"],
+      "copyright_holder": "Block, Inc. and Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "provenance": {
+        "description": "Small clock SVG authored inline for the Apache-2.0 countdown-bot example.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "created_in_commit": "c6da3a72abfd112741cd9b665d2a847715383614"
+      }
+    },
+    "generated-inline-raster-test-fixture": {
+      "classification": "test-fixture",
+      "license": "Apache-2.0",
+      "usage": ["source", "test"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "provenance": {
+        "description": "Deterministic one-pixel raster fixture generated locally for source-level image transport and UI tests; no external media input is used.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "source": [
+          {
+            "path": "scripts/generate-inline-media-test-fixture.mjs",
+            "sha256": "02e34e6eca4e7050b94f5f4b2d0fca770b9cd2874915be8cc77ed0897fca104d"
+          }
+        ],
+        "generator": {
+          "path": "scripts/generate-inline-media-test-fixture.mjs",
+          "sha256": "02e34e6eca4e7050b94f5f4b2d0fca770b9cd2874915be8cc77ed0897fca104d",
+          "command": "node scripts/generate-inline-media-test-fixture.mjs --check"
+        },
+        "toolchain": "Hermit Node 24.14.0",
+        "toolchain_evidence": [
+          {
+            "path": "bin/hermit.hcl",
+            "sha256": "6f1d298c2359682160aa4418eadca51693780f152718fbb7b052b1f03cec8afe"
+          }
+        ],
+        "recipe": "Programmatic 1x1 opaque teal RGBA PNG assembled from fixed PNG chunks and an uncompressed DEFLATE block; no external media input."
+      }
+    }
+  },
+  "marker_profiles": {
+    "apache-source-text": {
+      "license": "Apache-2.0",
+      "usage": ["source", "docs", "desktop", "mobile", "test"],
+      "copyright_holder": "Block, Inc. and Carryforth contributors",
+      "status": "cleared",
+      "license_evidence": [
+        {
+          "path": "LICENSE",
+          "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+        }
+      ]
+    }
+  },
+  "entries": [
+    {
+      "id": "carryforth-shared-glyphs",
+      "classification": "project-art",
+      "license": "Apache-2.0",
+      "usage": ["source", "desktop"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "project-owned",
+      "paths": [
+        "admin-web/public/favicon.svg",
+        "desktop/public/carryforth.svg",
+        "web/src/assets/carryforth.svg"
+      ],
+      "file_count": 3,
+      "tree_sha256": "1c77bf4f528b17197aaa0d2cb616de1ee31750fafaf0b4331153ee8d1eac3b77",
+      "provenance": {
+        "description": "The Carryforth mark was created in the named Carryforth commit; the Admin and Web files are byte-identical source-tree copies of that project artwork.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "created_in_commit": "8d02a4750e5cf0ac690ffe712341217f1994b063"
+      }
+    },
+    {
+      "id": "carryforth-wordmark",
+      "classification": "project-art",
+      "license": "Apache-2.0",
+      "usage": ["source", "desktop"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "project-owned",
+      "paths": ["desktop/public/landing/carryforth-wordmark.svg"],
+      "file_count": 1,
+      "tree_sha256": "823596553de01c90eca9d05ec4328d07286daacc7d81add259d23efa402a69ab",
+      "declared_fonts": ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
+      "provenance": {
+        "description": "Carryforth wordmark project artwork. Font-family values are rendering preferences; the SVG embeds no font bytes.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "created_in_commit": "8d02a4750e5cf0ac690ffe712341217f1994b063"
+      }
+    },
+    {
+      "id": "carryforth-desktop-icon-renditions",
+      "classification": "project-art-rendition",
+      "license": "Apache-2.0",
+      "usage": ["source", "desktop", "package"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "project-owned",
+      "paths": [
+        "desktop/src-tauri/icons/128x128.png",
+        "desktop/src-tauri/icons/128x128@2x.png",
+        "desktop/src-tauri/icons/32x32.png",
+        "desktop/src-tauri/icons/64x64.png",
+        "desktop/src-tauri/icons/Square107x107Logo.png",
+        "desktop/src-tauri/icons/Square142x142Logo.png",
+        "desktop/src-tauri/icons/Square150x150Logo.png",
+        "desktop/src-tauri/icons/Square284x284Logo.png",
+        "desktop/src-tauri/icons/Square30x30Logo.png",
+        "desktop/src-tauri/icons/Square310x310Logo.png",
+        "desktop/src-tauri/icons/Square44x44Logo.png",
+        "desktop/src-tauri/icons/Square71x71Logo.png",
+        "desktop/src-tauri/icons/Square89x89Logo.png",
+        "desktop/src-tauri/icons/StoreLogo.png",
+        "desktop/src-tauri/icons/android/mipmap-hdpi/ic_launcher.png",
+        "desktop/src-tauri/icons/android/mipmap-hdpi/ic_launcher_foreground.png",
+        "desktop/src-tauri/icons/android/mipmap-hdpi/ic_launcher_round.png",
+        "desktop/src-tauri/icons/android/mipmap-mdpi/ic_launcher.png",
+        "desktop/src-tauri/icons/android/mipmap-mdpi/ic_launcher_foreground.png",
+        "desktop/src-tauri/icons/android/mipmap-mdpi/ic_launcher_round.png",
+        "desktop/src-tauri/icons/android/mipmap-xhdpi/ic_launcher.png",
+        "desktop/src-tauri/icons/android/mipmap-xhdpi/ic_launcher_foreground.png",
+        "desktop/src-tauri/icons/android/mipmap-xhdpi/ic_launcher_round.png",
+        "desktop/src-tauri/icons/android/mipmap-xxhdpi/ic_launcher.png",
+        "desktop/src-tauri/icons/android/mipmap-xxhdpi/ic_launcher_foreground.png",
+        "desktop/src-tauri/icons/android/mipmap-xxhdpi/ic_launcher_round.png",
+        "desktop/src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher.png",
+        "desktop/src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher_foreground.png",
+        "desktop/src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher_round.png",
+        "desktop/src-tauri/icons/carryforth-source.svg",
+        "desktop/src-tauri/icons/icon.icns",
+        "desktop/src-tauri/icons/icon.ico",
+        "desktop/src-tauri/icons/icon.png",
+        "desktop/src-tauri/icons/ios/AppIcon-20x20@1x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-20x20@2x-1.png",
+        "desktop/src-tauri/icons/ios/AppIcon-20x20@2x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-20x20@3x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-29x29@1x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-29x29@2x-1.png",
+        "desktop/src-tauri/icons/ios/AppIcon-29x29@2x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-29x29@3x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-40x40@1x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-40x40@2x-1.png",
+        "desktop/src-tauri/icons/ios/AppIcon-40x40@2x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-40x40@3x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-512@2x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-60x60@2x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-60x60@3x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-76x76@1x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-76x76@2x.png",
+        "desktop/src-tauri/icons/ios/AppIcon-83.5x83.5@2x.png"
+      ],
+      "file_count": 51,
+      "tree_sha256": "6ca0a9a8f75420a5af07c6254f30c0ad42df30b58517c0f325ea2f90c4c11a17",
+      "provenance": {
+        "description": "Platform renditions of Carryforth's canonical source SVG. The current ICNS container is provenance-bound but is not falsely claimed to be byte-reproducible with the current Tauri encoder.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "created_in_commit": "8d02a4750e5cf0ac690ffe712341217f1994b063",
+        "source": [
+          {
+            "path": "desktop/src-tauri/icons/carryforth-source.svg",
+            "sha256": "9add133405e9e056e78e479c772bc1178692e39f3fef27c0cb709961aed9edba"
+          }
+        ],
+        "reproducible": false
+      }
+    },
+    {
+      "id": "carryforth-mobile-icons",
+      "classification": "generated",
+      "license": "Apache-2.0",
+      "usage": ["source", "mobile", "package"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "project-owned",
+      "paths": [
+        "mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.png",
+        "mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png",
+        "mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png",
+        "mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.png",
+        "mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png",
+        "mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png",
+        "mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png",
+        "mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png",
+        "mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png",
+        "mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png",
+        "mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png",
+        "mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png",
+        "mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+        "mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png",
+        "mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png",
+        "mobile/assets/images/carryforth.svg",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-20x20@1x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-20x20@2x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-20x20@3x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-29x29@1x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-29x29@2x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-29x29@3x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-40x40@1x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-40x40@2x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-40x40@3x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-60x60@2x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-60x60@3x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-76x76@1x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-76x76@2x.png",
+        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-83.5x83.5@2x.png"
+      ],
+      "file_count": 31,
+      "tree_sha256": "6f534bd852bad168af10123b8494bcb7bb657d929a75cabd7dc8d193cbbcbecd",
+      "provenance": {
+        "description": "Deterministic Android and iOS renditions generated from Carryforth's canonical source SVG.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "source": [
+          {
+            "path": "desktop/src-tauri/icons/carryforth-source.svg",
+            "sha256": "9add133405e9e056e78e479c772bc1178692e39f3fef27c0cb709961aed9edba"
+          }
+        ],
+        "generator": {
+          "path": "mobile/scripts/generate-carryforth-icons.mjs",
+          "sha256": "595bb9bc431e1b8efa0c8f37ae60a8f3ac6bbc14e9177a3d698dba131431fe1c",
+          "command": "node mobile/scripts/generate-carryforth-icons.mjs --check"
+        },
+        "toolchain": "Hermit Node 24.14.0 and locked @tauri-apps/cli 2.11.2",
+        "toolchain_evidence": [
+          {
+            "path": "bin/hermit.hcl",
+            "sha256": "6f1d298c2359682160aa4418eadca51693780f152718fbb7b052b1f03cec8afe"
+          },
+          {
+            "path": "desktop/package.json",
+            "sha256": "f5364a52137a6da6bf7303bbe1c352f13d358a15aca7a882a51c07cca04a8da6"
+          },
+          {
+            "path": "pnpm-lock.yaml",
+            "sha256": "7c151732ee3c8aeb99168db7dd2773bd7feec65af35b8516a07f209df934735a"
+          }
+        ],
+        "recipe": "Render the canonical 1024 SVG at the manifest-declared Android and iOS dimensions, then verify every output hash.",
+        "reproducible": true
+      }
+    },
+    {
+      "id": "carryforth-notification-sounds",
+      "classification": "generated",
+      "license": "Apache-2.0",
+      "usage": ["source", "desktop", "package"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "paths": [
+        "desktop/public/sounds/bong.svg",
+        "desktop/public/sounds/bong.wav",
+        "desktop/public/sounds/boo.svg",
+        "desktop/public/sounds/boo.wav",
+        "desktop/public/sounds/dng.svg",
+        "desktop/public/sounds/dng.wav",
+        "desktop/public/sounds/doo.svg",
+        "desktop/public/sounds/doo.wav",
+        "desktop/public/sounds/doodone.svg",
+        "desktop/public/sounds/doodone.wav",
+        "desktop/public/sounds/doong.svg",
+        "desktop/public/sounds/doong.wav",
+        "desktop/public/sounds/doop.svg",
+        "desktop/public/sounds/doop.wav",
+        "desktop/public/sounds/flirl.svg",
+        "desktop/public/sounds/flirl.wav",
+        "desktop/public/sounds/flutter.svg",
+        "desktop/public/sounds/flutter.wav",
+        "desktop/public/sounds/oh-no.svg",
+        "desktop/public/sounds/oh-no.wav",
+        "desktop/public/sounds/ping.svg",
+        "desktop/public/sounds/ping.wav",
+        "desktop/public/sounds/unison.svg",
+        "desktop/public/sounds/unison.wav"
+      ],
+      "file_count": 24,
+      "tree_sha256": "d456f65f8d95aa990ae203cd4de302cdc630172e691956e24c4ed2899a9108e9",
+      "provenance": {
+        "description": "Original fixed-point PCM notification tones and PCM-derived SVG waveforms. The generator reads no legacy audio, sample pack, network resource, or system font.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "source": [
+          {
+            "path": "desktop/scripts/generate-notification-sounds.mjs",
+            "sha256": "b74f68fd9aae3bbca322363fc1aa08a784ac677943477e0f0da71db433145505"
+          }
+        ],
+        "generator": {
+          "path": "desktop/scripts/generate-notification-sounds.mjs",
+          "sha256": "b74f68fd9aae3bbca322363fc1aa08a784ac677943477e0f0da71db433145505",
+          "command": "node desktop/scripts/generate-notification-sounds.mjs --check"
+        },
+        "toolchain": "Hermit Node 24.14.0",
+        "toolchain_evidence": [
+          {
+            "path": "bin/hermit.hcl",
+            "sha256": "6f1d298c2359682160aa4418eadca51693780f152718fbb7b052b1f03cec8afe"
+          }
+        ],
+        "recipe": "Generate mono 48 kHz 16-bit little-endian PCM with fixed integer parameters and derive each waveform SVG from those samples.",
+        "reproducible": true
+      }
+    },
+    {
+      "id": "procedural-card-texture",
+      "classification": "project-art-rendition",
+      "license": "Apache-2.0",
+      "usage": ["source", "desktop", "package"],
+      "copyright_holder": "Block, Inc. and Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "paths": ["desktop/src/shared/ui/assets/card-texture.png"],
+      "file_count": 1,
+      "tree_sha256": "14e89ccfa9a533fa00654f210621cff5c7cef4cc36d1bed5227f07af0755079d",
+      "provenance": {
+        "description": "Project texture produced from an in-repository procedural SVG recipe. It is provenance-bound to the current bytes without claiming cross-browser screenshot reproducibility.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "created_in_commit": "7873135a0bf843116102796a1671bb4141c4ed23",
+        "source": [
+          {
+            "path": "desktop/scripts/texture-card/generate-card-texture.mjs",
+            "sha256": "93e26ec74278be132928d2e12ed0f4f6b084417772aa732844d033067e217d56"
+          }
+        ],
+        "reproducible": false
+      }
+    },
+    {
+      "id": "emerge-tools-pow-effect",
+      "classification": "third-party-media",
+      "license": "MIT",
+      "usage": ["source", "desktop", "package"],
+      "copyright_holder": "Emerge Tools, Inc.",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "paths": [
+        "desktop/public/pow/plop.m4a",
+        "desktop/public/pow/poof1@3x.png",
+        "desktop/public/pow/poof2@3x.png",
+        "desktop/public/pow/poof3@3x.png",
+        "desktop/public/pow/poof4@3x.png",
+        "desktop/public/pow/poof5@3x.png"
+      ],
+      "file_count": 6,
+      "tree_sha256": "598b4fe163223f7d7726ead72e3e8df38391f4cfe9e6078edc07b3a3a120a5f6",
+      "provenance": {
+        "description": "Byte-identical animation frames and sound from the immutable EmergeTools/Pow source revision; its MIT license is stored beside the media.",
+        "license_evidence": [
+          {
+            "path": "desktop/public/pow/LICENSE.txt",
+            "sha256": "bf8a18984e613f9a1d412cbf6ed6a2845447dd0ae9553ebfde6360aa518abd9b"
+          }
+        ],
+        "upstream": {
+          "url": "https://github.com/EmergeTools/Pow",
+          "ref": "1b4b1dda28c50b95f0872927ee2226fe8b58950e"
+        }
+      }
+    },
+    {
+      "id": "inter-mobile-fonts",
+      "classification": "third-party-font",
+      "license": "OFL-1.1",
+      "usage": ["source", "mobile", "package"],
+      "copyright_holder": "The Inter Project Authors",
+      "status": "cleared",
+      "trademark_status": "factual-text-only",
+      "paths": [
+        "mobile/assets/fonts/InterVariable-Italic.ttf",
+        "mobile/assets/fonts/InterVariable.ttf"
+      ],
+      "file_count": 2,
+      "tree_sha256": "dcd2bdd31a27aaaf3a33f505f3b001ce4378492520d62f70bce7286810416ab6",
+      "provenance": {
+        "description": "Inter Variable 4.001 font files (embedded name-table source revision git-9221beed3, resolved to the immutable upstream commit below) with the complete OFL-1.1 text stored alongside them.",
+        "license_evidence": [
+          {
+            "path": "mobile/assets/fonts/Inter-LICENSE.txt",
+            "sha256": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a"
+          }
+        ],
+        "upstream": {
+          "url": "https://github.com/rsms/inter",
+          "ref": "9221beed3e5b521ce94050ca542f568755c17c22"
+        }
+      }
+    },
+    {
+      "id": "synthetic-webp-upload-fixture",
+      "classification": "test-fixture",
+      "license": "Apache-2.0",
+      "usage": ["source", "test"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "paths": ["crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.webp"],
+      "file_count": 1,
+      "tree_sha256": "3215b559db7e290064752c581313ea37c13ab827ceaf615d6d6ba7e1c7b78cdd",
+      "provenance": {
+        "description": "Synthetic lossless WebP upload fixture generated from a fixed 2x2 red/green pixel grid without external media input.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "source": [
+          {
+            "path": "crates/buzz-media/examples/generate_synthetic_webp.rs",
+            "sha256": "16b12688813e0da51a2c68ff83802bed61a13d6fd05f7fe894f8aa4c34715e23"
+          }
+        ],
+        "generator": {
+          "path": "crates/buzz-media/examples/generate_synthetic_webp.rs",
+          "sha256": "16b12688813e0da51a2c68ff83802bed61a13d6fd05f7fe894f8aa4c34715e23",
+          "command": "cargo run --locked --offline -p buzz-media --example generate_synthetic_webp -- crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.webp"
+        },
+        "toolchain": "Rust 1.95.0 with image 0.25.10 pinned by Cargo.lock",
+        "toolchain_evidence": [
+          {
+            "path": "rust-toolchain.toml",
+            "sha256": "f93d36efbb7a45edf8197259661273bc5d22529eccd4ff6411a851bafa493398"
+          },
+          {
+            "path": "crates/buzz-media/Cargo.toml",
+            "sha256": "58d0cf71c0dffdd643d0726b92420a0a6a24915930f5e033de6c3d63e6d20256"
+          },
+          {
+            "path": "Cargo.lock",
+            "sha256": "6bbfef223236f76c5fd2ddacb82974c8556a3afb13146b920b411e999b3d84d8"
+          }
+        ],
+        "recipe": "Encode a fixed 2x2 RGB pixel grid (red, red, green, green) with the pinned lossless WebP encoder.",
+        "reproducible": true
+      }
+    },
+    {
+      "id": "android-media-sanitizer-fixtures",
+      "classification": "test-fixture",
+      "license": "Apache-2.0",
+      "usage": ["source", "mobile", "test"],
+      "copyright_holder": "Block, Inc. and Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "paths": [
+        "crates/buzz-media/tests/fixtures/android/bitmap-display-p3.jpg",
+        "crates/buzz-media/tests/fixtures/android/bitmap-display-p3.png",
+        "crates/buzz-media/tests/fixtures/android/bitmap-srgb.jpg",
+        "crates/buzz-media/tests/fixtures/android/bitmap-srgb.png",
+        "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-display-p3-sanitized.jpg",
+        "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-display-p3-sanitized.png",
+        "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-srgb-sanitized.jpg",
+        "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-srgb-sanitized.png",
+        "mobile/android/app/src/androidTest/resources/fixtures/android/bitmap-display-p3.png",
+        "mobile/android/app/src/androidTest/resources/fixtures/android/bitmap-srgb.png",
+        "mobile/android/app/src/test/resources/fixtures/android/bitmap-display-p3.jpg",
+        "mobile/android/app/src/test/resources/fixtures/android/bitmap-display-p3.png",
+        "mobile/android/app/src/test/resources/fixtures/android/bitmap-srgb.jpg",
+        "mobile/android/app/src/test/resources/fixtures/android/bitmap-srgb.png"
+      ],
+      "file_count": 14,
+      "tree_sha256": "8f318bc706426725aa5fc4a37d476666877f773d55c89e0bdc5cb613e2a77ab3",
+      "provenance": {
+        "description": "Synthetic 3x2 color grids generated by the tracked Android API 36 Bitmap recipe, sanitized by the product pipeline, and checked against exact duplicate-copy contracts.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "source": [
+          {
+            "path": "crates/buzz-media/tests/fixtures/fixture-manifest.json",
+            "sha256": "18357e9f51da1ef04108eda2f99ff4b3eff04cf62a3dfd45a0ea7a1c194346cf"
+          },
+          {
+            "path": "crates/buzz-media/tests/fixtures/check-fixtures.mjs",
+            "sha256": "1a1044ec63f7d3b27b8a1e10b8a455ab7c25d8c3f7e3451c6015618d949c4fdb"
+          }
+        ],
+        "generator": {
+          "path": "crates/buzz-media/tests/fixtures/android/GenerateFixtures.java",
+          "sha256": "a50e4fb73858aa24bd0741c1111b78d576a8aecd96ecc5ff2b19569f931e98fc",
+          "command": "Run GenerateFixtures.java on the documented Android 16 / API 36 emulator and verify with node crates/buzz-media/tests/fixtures/check-fixtures.mjs"
+        },
+        "toolchain": "Android 16 API 36 Bitmap.compress plus the tracked Carryforth sanitizer",
+        "recipe": "Programmatic red/green/blue/alpha pixel grids; no external image input."
+      }
+    },
+    {
+      "id": "ios-media-sanitizer-fixtures",
+      "classification": "test-fixture",
+      "license": "Apache-2.0",
+      "usage": ["source", "mobile", "test"],
+      "copyright_holder": "Block, Inc. and Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "not-applicable",
+      "paths": [
+        "crates/buzz-media/tests/fixtures/ios/uikit-encoded.jpg",
+        "crates/buzz-media/tests/fixtures/ios/uikit-encoded.png",
+        "crates/buzz-media/tests/fixtures/ios/uikit-sanitized.jpg",
+        "crates/buzz-media/tests/fixtures/ios/uikit-sanitized.png",
+        "crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.png",
+        "mobile/ios/RunnerTests/Fixtures/UIKitEncoded.jpg",
+        "mobile/ios/RunnerTests/Fixtures/UIKitEncoded.png"
+      ],
+      "file_count": 7,
+      "tree_sha256": "0cc52899acb2f20b2b845cd1bad5639b53ef38b7538c96c4c08d3cae96322aa7",
+      "provenance": {
+        "description": "Synthetic 2x2 color grid with tracked source bytes, UIKit encoding recipe, sanitizer derivatives, and exact cross-tree copy contracts.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "source": [
+          {
+            "path": "crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.png",
+            "sha256": "f9f6f6242ed1f67f46406ba5460abec04a8e954ef72217dc8010b98c6907cb2a"
+          },
+          {
+            "path": "crates/buzz-media/tests/fixtures/source/generate-pixel-source.mjs",
+            "sha256": "c87f6bafe37c64caebbd9ffc90e12a8b841157d450afff374b879a01ff21de61"
+          },
+          {
+            "path": "crates/buzz-media/tests/fixtures/fixture-manifest.json",
+            "sha256": "18357e9f51da1ef04108eda2f99ff4b3eff04cf62a3dfd45a0ea7a1c194346cf"
+          },
+          {
+            "path": "crates/buzz-media/tests/fixtures/check-fixtures.mjs",
+            "sha256": "1a1044ec63f7d3b27b8a1e10b8a455ab7c25d8c3f7e3451c6015618d949c4fdb"
+          }
+        ],
+        "generator": {
+          "path": "crates/buzz-media/tests/fixtures/ios/GenerateFixtures.swift",
+          "sha256": "c04aed611a2e7b83c09d2e46d28f8ff14707a86f1698cfe9383c0909d96c1936",
+          "command": "Run GenerateFixtures.swift with the documented iOS simulator SDK and verify with node crates/buzz-media/tests/fixtures/check-fixtures.mjs"
+        },
+        "toolchain": "Documented Xcode/iOS simulator UIKit encoder plus the tracked Carryforth sanitizer",
+        "recipe": "Programmatic 2x2 red/green source grid; no external image input."
+      }
+    }
+  ],
+  "embedded_data": [
+    {
+      "id": "inline-crates-buzz-agent-src-llm-1",
+      "path": "crates/buzz-agent/src/llm.rs",
+      "locators": ["1445:14", "1576:14"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "b29814cf5792e684cd75d6a7fce7a67a11887e312f87ca2ac2496d81f365ff72",
+      "decoded_bytes": 3,
+      "occurrences": 2,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-crates-buzz-dev-mcp-src-view-image-1",
+      "path": "crates/buzz-dev-mcp/src/view_image.rs",
+      "locators": ["903:36"],
+      "media_type": "image/png",
+      "encoding": "raw",
+      "decoded_sha256": "9e2d5cab4ab7b7884f981ce73de3b8ec64ac4b175c5dd3204063fefde60a740b",
+      "decoded_bytes": 17,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-crates-buzz-relay-src-handlers-relay-admin-1",
+      "path": "crates/buzz-relay/src/handlers/relay_admin.rs",
+      "locators": ["478:42"],
+      "media_type": "image/webp",
+      "encoding": "base64",
+      "decoded_sha256": "a40ff3d5900fb7698b8c865041347cb49eccedc8f93945f89629ad104aaecce4",
+      "decoded_bytes": 4,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-crates-buzz-relay-src-nip11-1",
+      "path": "crates/buzz-relay/src/nip11.rs",
+      "locators": ["653:19", "661:19", "666:19"],
+      "media_type": "image/webp",
+      "encoding": "base64",
+      "decoded_sha256": "a40ff3d5900fb7698b8c865041347cb49eccedc8f93945f89629ad104aaecce4",
+      "decoded_bytes": 4,
+      "occurrences": 3,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-tauri-src-commands-personas-snapshot-tests-1",
+      "path": "desktop/src-tauri/src/commands/personas/snapshot/tests.rs",
+      "locators": ["337:46", "348:15"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "ce7c4f52106d5f03ccda1154a0af16baa95d222e354ca62e5f32e5e53e8180a7",
+      "decoded_bytes": 2,
+      "occurrences": 2,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-lib-instanceinputfordefinition-test-1",
+      "path": "desktop/src/features/agents/lib/instanceInputForDefinition.test.mjs",
+      "locators": ["106:27", "128:19"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
+      "decoded_bytes": 2,
+      "occurrences": 2,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-agentsessionimagecontent-test-1",
+      "path": "desktop/src/features/agents/ui/agentSessionImageContent.test.mjs",
+      "locators": ["56:24", "60:28"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "ce7c4f52106d5f03ccda1154a0af16baa95d222e354ca62e5f32e5e53e8180a7",
+      "decoded_bytes": 2,
+      "occurrences": 2,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-agentsessiontoolitemhelpers-test-1",
+      "path": "desktop/src/features/agents/ui/agentSessionToolItemHelpers.test.mjs",
+      "locators": ["16:4"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-managedagentavatar-test-1",
+      "path": "desktop/src/features/agents/ui/managedAgentAvatar.test.mjs",
+      "locators": ["26:6"],
+      "media_type": "image/svg+xml",
+      "encoding": "percent",
+      "decoded_sha256": "8d9b4b794affc5daf4eafa12e0c6294ab31aaeed330886145676bd6b832e8b98",
+      "decoded_bytes": 46,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-managedagentavatar-test-2",
+      "path": "desktop/src/features/agents/ui/managedAgentAvatar.test.mjs",
+      "locators": ["58:6", "70:6"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+      "decoded_bytes": 1,
+      "occurrences": 2,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-managedagentavatar-test-3",
+      "path": "desktop/src/features/agents/ui/managedAgentAvatar.test.mjs",
+      "locators": ["74:6"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+      "decoded_bytes": 1,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-managedagentavatar-test-4",
+      "path": "desktop/src/features/agents/ui/managedAgentAvatar.test.mjs",
+      "locators": ["8:6"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "decoded_bytes": 5,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-snapshotavatarpng-test-1",
+      "path": "desktop/src/features/agents/ui/snapshotAvatarPng.test.mjs",
+      "locators": ["19:25"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "0f4636c78f65d3639ece5a064b5ae753e3408614a14fb18ab4d7540d2c248543",
+      "decoded_bytes": 4,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-agents-ui-snapshotavatarpng-test-2",
+      "path": "desktop/src/features/agents/ui/snapshotAvatarPng.test.mjs",
+      "locators": ["36:15", "50:25"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "d2eec0ce9d471cd09dc6ae160acae37f4ea10c9c3f478afcae6b70f84af0ffa2",
+      "decoded_bytes": 10,
+      "occurrences": 2,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-features-profile-lib-selfprofilestorage-test-1",
+      "path": "desktop/src/features/profile/lib/selfProfileStorage.test.mjs",
+      "locators": ["14:4"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-desktop-src-shared-lib-animatedavatar-test-1",
+      "path": "desktop/src/shared/lib/animatedAvatar.test.mjs",
+      "locators": ["40:29"],
+      "media_type": "image/svg+xml",
+      "encoding": "percent",
+      "decoded_sha256": "b12e0d83ce2357d80b89c57694814d0a3abdaf8c40724f2049af8b7f01b7812b",
+      "decoded_bytes": 11,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-tests-e2e-messaging-spec-1",
+      "path": "desktop/tests/e2e/messaging.spec.ts",
+      "locators": ["650:6"],
+      "media_type": "image/svg+xml",
+      "encoding": "percent",
+      "decoded_sha256": "e6535857c39df6859a2655c011a080acdee6161ebd1884dc934b243843fe8c3a",
+      "decoded_bytes": 118,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-desktop-tests-e2e-onboarding-spec-1",
+      "path": "desktop/tests/e2e/onboarding.spec.ts",
+      "locators": ["63:4"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-desktop-tests-e2e-profile-custom-emoji-status-spec-1",
+      "path": "desktop/tests/e2e/profile-custom-emoji-status.spec.ts",
+      "locators": ["10:4"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-desktop-tests-e2e-relay-connectivity-spec-1",
+      "path": "desktop/tests/e2e/relay-connectivity.spec.ts",
+      "locators": ["11:4"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-desktop-tests-e2e-video-attachment-spec-1",
+      "path": "desktop/tests/e2e/video-attachment.spec.ts",
+      "locators": ["32:4"],
+      "media_type": "image/svg+xml",
+      "encoding": "base64",
+      "decoded_sha256": "0ef29ec9d8ffcdaf5d52922e40de8f402d090d0ec0062ad4b86b86a31ed900a1",
+      "decoded_bytes": 203,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-examples-countdown-bot-src-main-1",
+      "path": "examples/countdown-bot/src/main.rs",
+      "locators": ["32:34"],
+      "media_type": "image/svg+xml",
+      "encoding": "percent",
+      "decoded_sha256": "16cdc88612030e485c4b057613fb4e81c0bbfe6177ecff4677d7955267b49502",
+      "decoded_bytes": 401,
+      "occurrences": 1,
+      "rights_profile": "countdown-bot-project-art"
+    },
+    {
+      "id": "inline-mobile-test-shared-relay-media-image-test-1",
+      "path": "mobile/test/shared/relay/media_image_test.dart",
+      "locators": ["15:6"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-mobile-test-shared-widgets-avatar-image-test-1",
+      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
+      "locators": ["10:8"],
+      "media_type": "image/svg+xml",
+      "encoding": "base64",
+      "decoded_sha256": "092af5696d2dedeebe85a63bdfeac64ae343f6f46071bedd548dea072211c803",
+      "decoded_bytes": 119,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    },
+    {
+      "id": "inline-mobile-test-shared-widgets-avatar-image-test-2",
+      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
+      "locators": ["14:8"],
+      "media_type": "image/png",
+      "encoding": "base64",
+      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
+      "decoded_bytes": 73,
+      "occurrences": 1,
+      "rights_profile": "generated-inline-raster-test-fixture"
+    },
+    {
+      "id": "inline-mobile-test-shared-widgets-avatar-image-test-3",
+      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
+      "locators": ["28:10"],
+      "media_type": "image/svg+xml",
+      "encoding": "percent",
+      "decoded_sha256": "97790016cebcabf65f5c07125511a92d7298e7d86c92da391c735a34b0ac7cd9",
+      "decoded_bytes": 246,
+      "occurrences": 1,
+      "rights_profile": "synthetic-inline-test-fixture"
+    }
+  ],
+  "data_uri_markers": [
+    {
+      "id": "marker-crates-buzz-agent-src-llm-1",
+      "path": "crates/buzz-agent/src/llm.rs",
+      "locators": ["1658:50"],
+      "statement_sha256": "a1e000337682a5ce90881fa011071e08eed18f70e57156840e7e8cadcbcadc58",
+      "statement_bytes": 25,
+      "occurrences": 1,
+      "marker_kind": "test-negative",
+      "purpose": "Opaque non-decodable image URL placeholder used to assert message ordering; it contains no media payload.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-crates-buzz-agent-src-llm-2",
+      "path": "crates/buzz-agent/src/llm.rs",
+      "locators": ["1659:50"],
+      "statement_sha256": "369f96b6625e5e35e681305b395fbfefe7a0843914db624dc77e2604d03828c0",
+      "statement_bytes": 25,
+      "occurrences": 1,
+      "marker_kind": "test-negative",
+      "purpose": "Opaque non-decodable image URL placeholder used to assert message ordering; it contains no media payload.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-crates-buzz-dev-mcp-src-view-image-1",
+      "path": "crates/buzz-dev-mcp/src/view_image.rs",
+      "locators": ["896:28"],
+      "statement_sha256": "e56e8cc834d6ac57671837ae1028aae6411139478c8defba7846b0f1642469c8",
+      "statement_bytes": 27,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs a valid PNG data URL at runtime from a locally generated one-pixel image for decoder round-trip coverage.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-crates-buzz-dev-mcp-src-view-image-2",
+      "path": "crates/buzz-dev-mcp/src/view_image.rs",
+      "locators": ["941:28"],
+      "statement_sha256": "5860c5ca3111670145bf5127fb56ada8a6137f0312651b0134febd7e9d87ef6e",
+      "statement_bytes": 28,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs an oversized all-A base64 payload at runtime to exercise the decoded-size limit; no media work is embedded.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-crates-buzz-relay-src-handlers-relay-admin-1",
+      "path": "crates/buzz-relay/src/handlers/relay_admin.rs",
+      "locators": ["497:34"],
+      "statement_sha256": "824408f797b6ec4ad16a8ab54db90c2d293f1248c9e4c005481bc073db55b38b",
+      "statement_bytes": 24,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs an oversized all-A workspace-icon URI at runtime to exercise the input-length limit; no media work is embedded.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-commands-personas-snapshot-1",
+      "path": "desktop/src-tauri/src/commands/personas/snapshot.rs",
+      "locators": ["427:14"],
+      "statement_sha256": "824408f797b6ec4ad16a8ab54db90c2d293f1248c9e4c005481bc073db55b38b",
+      "statement_bytes": 24,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test base64-encodes an in-memory generated PNG into a data URL for persona snapshot coverage.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-commands-qr-download-1",
+      "path": "desktop/src-tauri/src/commands/qr_download.rs",
+      "locators": ["39:51"],
+      "statement_sha256": "d3d9c5932439bc02f2820a6080be931ea78fff2a3db97437ebd543d332c6fa98",
+      "statement_bytes": 31,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs a PNG data URL from synthetic PNG-magic bytes for the positive decoder path.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-commands-qr-download-2",
+      "path": "desktop/src-tauri/src/commands/qr_download.rs",
+      "locators": ["46:47"],
+      "statement_sha256": "12b5088b51c37b75ad88986337c35279ff9fb368f909b37de35164a2e9b156b6",
+      "statement_bytes": 28,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs a JPEG-labelled URL from runtime-encoded PNG-magic bytes to reject the wrong MIME type.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-commands-qr-download-3",
+      "path": "desktop/src-tauri/src/commands/qr_download.rs",
+      "locators": ["49:47"],
+      "statement_sha256": "1d24ac5adcfc851097091afc53ae49100fad286bfee0f06078b13a520bd39022",
+      "statement_bytes": 31,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs a PNG-labelled URL from runtime-encoded non-PNG text bytes to reject the wrong content.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-commands-qr-download-4",
+      "path": "desktop/src-tauri/src/commands/qr_download.rs",
+      "locators": ["50:38"],
+      "statement_sha256": "e62b8c6a62cd521a0bb72b8cccb9d7edd0bd56202673a55a1487c701cfc5f1e8",
+      "statement_bytes": 33,
+      "occurrences": 1,
+      "marker_kind": "test-negative",
+      "purpose": "Deliberately malformed base64 PNG data URL used to exercise decoder rejection; it contains no media payload.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-commands-qr-download-5",
+      "path": "desktop/src-tauri/src/commands/qr_download.rs",
+      "locators": ["9:24"],
+      "statement_sha256": "8e726a09c196f96bcf104fd83a6a6278c5ccca1c0b841dd8ecef621b87acf56a",
+      "statement_bytes": 22,
+      "occurrences": 1,
+      "marker_kind": "runtime-constructor",
+      "purpose": "Runtime PNG data-URL prefix discriminator used before decoding generated QR export bytes.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-managed-agents-agent-snapshot-1",
+      "path": "desktop/src-tauri/src/managed_agents/agent_snapshot.rs",
+      "locators": ["121:30"],
+      "statement_sha256": "d098cbc9a8e4c04b6583bd7e941c7082b569402095b5e4bca7d40709a01d26cc",
+      "statement_bytes": 25,
+      "occurrences": 1,
+      "marker_kind": "contract-documentation",
+      "purpose": "Rustdoc documents the accepted inline avatar data-URL contract and size bound; the ellipsis is not payload.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-tauri-src-managed-agents-agent-snapshot-2",
+      "path": "desktop/src-tauri/src/managed_agents/agent_snapshot.rs",
+      "locators": ["591:27"],
+      "statement_sha256": "8e726a09c196f96bcf104fd83a6a6278c5ccca1c0b841dd8ecef621b87acf56a",
+      "statement_bytes": 22,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test asserts that a dynamically generated snapshot avatar uses the PNG data-URL prefix; no payload is embedded in this statement.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-features-agents-ui-managedagentavatar-test-1",
+      "path": "desktop/src/features/agents/ui/managedAgentAvatar.test.mjs",
+      "locators": ["47:6"],
+      "statement_sha256": "8e726a09c196f96bcf104fd83a6a6278c5ccca1c0b841dd8ecef621b87acf56a",
+      "statement_bytes": 22,
+      "occurrences": 1,
+      "marker_kind": "test-negative",
+      "purpose": "Empty base64 payload used to verify invalid inline avatars are omitted.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-features-agents-ui-managedagentavatar-1",
+      "path": "desktop/src/features/agents/ui/managedAgentAvatar.ts",
+      "locators": ["25:8"],
+      "statement_sha256": "205b0b75d800e5136c734374eb102ae86abb70c16262f57588de2410fe18f402",
+      "statement_bytes": 25,
+      "occurrences": 1,
+      "marker_kind": "contract-documentation",
+      "purpose": "Source comment documents the percent-encoded SVG avatar form; the abbreviated text is not payload.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-features-agents-ui-snapshotavatarpng-test-1",
+      "path": "desktop/src/features/agents/ui/snapshotAvatarPng.test.mjs",
+      "locators": ["43:6"],
+      "statement_sha256": "a411d473220c6cdcd5d8a1b818c307fa33d19c0f747be06f1b3cdc3d1e36c6ef",
+      "statement_bytes": 50,
+      "occurrences": 1,
+      "marker_kind": "test-dynamic",
+      "purpose": "Test constructs a valid percent-encoded SVG URI at runtime from a locally authored minimal SVG fixture.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-features-agents-ui-snapshotavatarpng-1",
+      "path": "desktop/src/features/agents/ui/snapshotAvatarPng.ts",
+      "locators": ["33:13"],
+      "statement_sha256": "4a2f3fbd121d5313ed94ad9707f173e3c2c517ebc7980b236a8a124b5e87362d",
+      "statement_bytes": 45,
+      "occurrences": 1,
+      "marker_kind": "runtime-constructor",
+      "purpose": "Runtime constructs a PNG data URL from bytes returned by the same-relay media fetch path.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-features-profile-ui-profileavatareditor-utils-1",
+      "path": "desktop/src/features/profile/ui/ProfileAvatarEditor.utils.ts",
+      "locators": ["60:39"],
+      "statement_sha256": "cb1194a041040250dd7ad18f022dee65f53fb50a0afd91a8133060992fa5122f",
+      "statement_bytes": 19,
+      "occurrences": 1,
+      "marker_kind": "runtime-constructor",
+      "purpose": "Runtime prefix used when constructing percent-encoded emoji SVG avatars.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-desktop-src-shared-lib-animatedavatar-test-1",
+      "path": "desktop/src/shared/lib/animatedAvatar.test.mjs",
+      "locators": ["63:8"],
+      "statement_sha256": "97449d4d8886c2246f4c35ca88f80bdd7851599196e1a52ad67fa24315c92e1d",
+      "statement_bytes": 61,
+      "occurrences": 1,
+      "marker_kind": "test-negative",
+      "purpose": "Deliberately malformed poster data URL used to verify animated-avatar parsing fails closed.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-docs-nips-nip-wp-1",
+      "path": "docs/nips/NIP-WP.md",
+      "locators": ["55:15"],
+      "statement_sha256": "47230d433737b25329f5e86df1c4951efc96f34e4fec4dc7d64e28bfbc2a58c6",
+      "statement_bytes": 26,
+      "occurrences": 1,
+      "marker_kind": "docs-placeholder",
+      "purpose": "Protocol JSON example uses an ellipsis placeholder for administrator-supplied WebP bytes; no payload is embedded.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-mobile-test-shared-widgets-avatar-image-test-1",
+      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
+      "locators": ["54:38"],
+      "statement_sha256": "e0a5e98866d366863b5d960b255e65a4e8c3eb24f662faa00f53718ec2c7b2cb",
+      "statement_bytes": 29,
+      "occurrences": 1,
+      "marker_kind": "test-negative",
+      "purpose": "Deliberately invalid base64 SVG URI used to verify fallback rendering.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-scripts-generate-inline-media-test-fixture-1",
+      "path": "scripts/generate-inline-media-test-fixture.mjs",
+      "locators": ["107:29"],
+      "statement_sha256": "8e726a09c196f96bcf104fd83a6a6278c5ccca1c0b841dd8ecef621b87acf56a",
+      "statement_bytes": 22,
+      "occurrences": 1,
+      "marker_kind": "runtime-constructor",
+      "purpose": "Offline fixture verification recognizes this PNG data-URL prefix when rejecting bare payloads; it does not construct or contain media bytes.",
+      "rights_profile": "apache-source-text"
+    },
+    {
+      "id": "marker-scripts-generate-inline-media-test-fixture-2",
+      "path": "scripts/generate-inline-media-test-fixture.mjs",
+      "locators": ["87:18"],
+      "statement_sha256": "a4944b761264a9dd88d913a70aba6fcf957862e2a11961220c5843a59e4726bf",
+      "statement_bytes": 47,
+      "occurrences": 1,
+      "marker_kind": "runtime-constructor",
+      "purpose": "Offline generator constructs the deterministic PNG data URL from locally generated fixture bytes.",
+      "rights_profile": "apache-source-text"
+    }
+  ]
+}

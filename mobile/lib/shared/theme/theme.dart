@@ -4,6 +4,7 @@ export 'app_colors.dart';
 export 'app_theme.dart';
 export 'color_scheme.dart';
 export 'grid.dart';
+export 'system_fonts.dart';
 export 'theme_catalog.dart';
 export 'theme_extensions.dart';
 export 'theme_provider.dart';

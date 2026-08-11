@@ -351,12 +351,10 @@ fn legacy_avatar_falls_back_to_relay_picture_without_persona() {
 }
 
 #[test]
-fn legacy_avatar_falls_back_to_command_icon_when_no_persona_or_relay() {
-    use crate::managed_agents::managed_agent_avatar_url;
-
+fn legacy_external_runtime_avatar_is_empty_without_persona_or_relay() {
     let resolved = resolve_legacy_avatar(None, None, "goose");
 
-    assert_eq!(resolved, managed_agent_avatar_url("goose").unwrap());
+    assert!(resolved.is_empty());
 }
 
 #[test]

@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 2
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         id: filter
         with:
@@ -141,6 +142,8 @@ jobs:
         run: scripts/test-release-ref-contract.sh
       - name: Current Carryforth product surface contract
         run: scripts/check-carryforth-current-product-surface.sh
+      - name: Current source asset provenance contract
+        run: node scripts/check-source-asset-inventory.mjs
       - name: Project View release contract
         run: scripts/test-project-view-release-contract.sh
       - name: Project View v3-only runtime contract

@@ -77,9 +77,6 @@ upload_fixture() {
 }
 
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/buzz-admin-feedback.XXXXXX")"
-search_image="${REPO_ROOT}/docs/assets/screenshots/media-comments.png"
-workspace_image="${REPO_ROOT}/docs/assets/screenshots/channel-thread.png"
-quality_image="${REPO_ROOT}/docs/assets/screenshots/channel-agents.png"
 composer_diagnostics="${fixture_dir}/composer-diagnostics.txt"
 workspace_diagnostics="${fixture_dir}/workspace-diagnostics.txt"
 trap 'rm -f "${composer_diagnostics}" "${workspace_diagnostics}"; rmdir "${fixture_dir}"' EXIT
@@ -90,9 +87,6 @@ printf '%s\n' "Carryforth feedback diagnostics" "area: workspace-switching" \
   "from: design" "to: engineering" \
   "result: previous_sidebar_visible_for_one_frame" > "${workspace_diagnostics}"
 
-search_image_hash="$(fixture_hash "${search_image}")"
-workspace_image_hash="$(fixture_hash "${workspace_image}")"
-quality_image_hash="$(fixture_hash "${quality_image}")"
 composer_diagnostics_hash="$(fixture_hash "${composer_diagnostics}")"
 workspace_diagnostics_hash="$(fixture_hash "${workspace_diagnostics}")"
 
@@ -102,9 +96,6 @@ if ! docker exec buzz-minio mc alias set local http://localhost:9000 \
   exit 1
 fi
 
-upload_fixture "${search_image}" "${search_image_hash}" png image/png 2000x1172
-upload_fixture "${workspace_image}" "${workspace_image_hash}" png image/png 2000x1172
-upload_fixture "${quality_image}" "${quality_image_hash}" png image/png 2000x1172
 upload_fixture "${composer_diagnostics}" "${composer_diagnostics_hash}" txt text/plain ""
 upload_fixture "${workspace_diagnostics}" "${workspace_diagnostics_hash}" txt text/plain ""
 
@@ -161,12 +152,12 @@ BEGIN
     event_created_at, received_at
   ) VALUES
     ('feed0000-0000-4000-8000-000000000001', local_community_id, decode(repeat('41', 32), 'hex'), decode(repeat('51', 32), 'hex'), 'bug', 'Unread counts return after reopening the desktop app.', '[["category", "bug"]]', now() - interval '20 minutes', now() - interval '19 minutes'),
-    ('feed0000-0000-4000-8000-000000000002', local_community_id, decode(repeat('42', 32), 'hex'), decode(repeat('52', 32), 'hex'), 'needs-work', E'Search needs clearer empty-state guidance.\n![image](http://localhost:3000/media/__SEARCH_IMAGE_HASH__.png)', '[["category", "needs-work"], ["imeta", "url http://localhost:3000/media/__SEARCH_IMAGE_HASH__.png", "m image/png", "x __SEARCH_IMAGE_HASH__", "size __SEARCH_IMAGE_SIZE__", "dim 2000x1172", "filename search-empty-state.png"]]', now() - interval '5 hours', now() - interval '5 hours'),
+    ('feed0000-0000-4000-8000-000000000002', local_community_id, decode(repeat('42', 32), 'hex'), decode(repeat('52', 32), 'hex'), 'needs-work', 'Search needs clearer empty-state guidance and more actionable recovery copy.', '[["category", "needs-work"]]', now() - interval '5 hours', now() - interval '5 hours'),
     ('feed0000-0000-4000-8000-000000000003', local_community_id, decode(repeat('43', 32), 'hex'), decode(repeat('53', 32), 'hex'), 'praise', 'The new channel switcher feels immediate.', '[["category", "praise"]]', now() - interval '1 day', now() - interval '1 day'),
     ('feed0000-0000-4000-8000-000000000004', local_community_id, decode(repeat('44', 32), 'hex'), decode(repeat('54', 32), 'hex'), 'bug', E'The composer froze after waking my laptop. Diagnostics attached.\n[feedback-diagnostics.txt](http://localhost:3000/media/__COMPOSER_DIAGNOSTICS_HASH__.txt)', '[["category", "bug"], ["imeta", "url http://localhost:3000/media/__COMPOSER_DIAGNOSTICS_HASH__.txt", "m text/plain", "x __COMPOSER_DIAGNOSTICS_HASH__", "size __COMPOSER_DIAGNOSTICS_SIZE__", "filename feedback-diagnostics.txt"]]', now() - interval '2 days', now() - interval '2 days'),
     ('feed0000-0000-4000-8000-000000000005', local_community_id, decode(repeat('45', 32), 'hex'), decode(repeat('55', 32), 'hex'), NULL, 'General feedback without a selected category or any attachments.', '[]', now() - interval '3 days', now() - interval '3 days'),
-    ('feed0000-0000-4000-8000-000000000006', local_community_id, decode(repeat('46', 32), 'hex'), decode(repeat('56', 32), 'hex'), 'needs-work', E'The sidebar briefly renders the previous workspace after switching. Screenshot and diagnostics attached.\n![image](http://localhost:3000/media/__WORKSPACE_IMAGE_HASH__.png)\n[feedback-diagnostics.txt](http://localhost:3000/media/__WORKSPACE_DIAGNOSTICS_HASH__.txt)', '[["category", "needs-work"], ["imeta", "url http://localhost:3000/media/__WORKSPACE_IMAGE_HASH__.png", "m image/png", "x __WORKSPACE_IMAGE_HASH__", "size __WORKSPACE_IMAGE_SIZE__", "dim 2000x1172", "filename workspace-flash.png"], ["imeta", "url http://localhost:3000/media/__WORKSPACE_DIAGNOSTICS_HASH__.txt", "m text/plain", "x __WORKSPACE_DIAGNOSTICS_HASH__", "size __WORKSPACE_DIAGNOSTICS_SIZE__", "filename feedback-diagnostics.txt"]]', now() - interval '5 days', now() - interval '5 days'),
-    ('feed0000-0000-4000-8000-000000000007', local_community_id, decode(repeat('47', 32), 'hex'), decode(repeat('57', 32), 'hex'), 'praise', E'Calls have been much more reliable this week. Attaching the quality graph that made the improvement obvious.\n![image](http://localhost:3000/media/__QUALITY_IMAGE_HASH__.png)', '[["category", "praise"], ["imeta", "url http://localhost:3000/media/__QUALITY_IMAGE_HASH__.png", "m image/png", "x __QUALITY_IMAGE_HASH__", "size __QUALITY_IMAGE_SIZE__", "dim 2000x1172", "filename huddle-quality.png"]]', now() - interval '8 days', now() - interval '8 days')
+    ('feed0000-0000-4000-8000-000000000006', local_community_id, decode(repeat('46', 32), 'hex'), decode(repeat('56', 32), 'hex'), 'needs-work', E'The sidebar briefly renders the previous workspace after switching. Diagnostics attached.\n[feedback-diagnostics.txt](http://localhost:3000/media/__WORKSPACE_DIAGNOSTICS_HASH__.txt)', '[["category", "needs-work"], ["imeta", "url http://localhost:3000/media/__WORKSPACE_DIAGNOSTICS_HASH__.txt", "m text/plain", "x __WORKSPACE_DIAGNOSTICS_HASH__", "size __WORKSPACE_DIAGNOSTICS_SIZE__", "filename feedback-diagnostics.txt"]]', now() - interval '5 days', now() - interval '5 days'),
+    ('feed0000-0000-4000-8000-000000000007', local_community_id, decode(repeat('47', 32), 'hex'), decode(repeat('57', 32), 'hex'), 'praise', 'Calls have been much more reliable this week; reconnects remained stable throughout the review window.', '[["category", "praise"]]', now() - interval '8 days', now() - interval '8 days')
   ON CONFLICT (event_id) DO UPDATE SET
     community_id = EXCLUDED.community_id,
     submitter_pubkey = EXCLUDED.submitter_pubkey,
@@ -178,17 +169,11 @@ BEGIN
 END $$;
 SQL
 
-sql="${sql//__SEARCH_IMAGE_HASH__/${search_image_hash}}"
-sql="${sql//__WORKSPACE_IMAGE_HASH__/${workspace_image_hash}}"
-sql="${sql//__QUALITY_IMAGE_HASH__/${quality_image_hash}}"
 sql="${sql//__COMPOSER_DIAGNOSTICS_HASH__/${composer_diagnostics_hash}}"
 sql="${sql//__WORKSPACE_DIAGNOSTICS_HASH__/${workspace_diagnostics_hash}}"
-sql="${sql//__SEARCH_IMAGE_SIZE__/$(fixture_size "${search_image}")}"
-sql="${sql//__WORKSPACE_IMAGE_SIZE__/$(fixture_size "${workspace_image}")}"
-sql="${sql//__QUALITY_IMAGE_SIZE__/$(fixture_size "${quality_image}")}"
 sql="${sql//__COMPOSER_DIAGNOSTICS_SIZE__/$(fixture_size "${composer_diagnostics}")}"
 sql="${sql//__WORKSPACE_DIAGNOSTICS_SIZE__/$(fixture_size "${workspace_diagnostics}")}"
 
 run_psql -v ON_ERROR_STOP=1 -c "${sql}"
 
-echo "Seeded 10 moderation reports, 7 feedback entries, and 5 attachments for the local admin dashboard."
+echo "Seeded 10 moderation reports, 7 feedback entries, and 2 text attachments for the local admin dashboard."

@@ -35,6 +35,8 @@ pre-commit:
       stage_fixed: true
     carryforth-product-surface:
       run: ./scripts/check-carryforth-current-product-surface.sh
+    carryforth-source-assets:
+      run: node ./scripts/check-source-asset-inventory.mjs
 
 pre-push:
   parallel: true

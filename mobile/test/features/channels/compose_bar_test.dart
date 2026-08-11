@@ -449,7 +449,7 @@ void main() {
       );
       expect(
         spans.singleWhere((span) => span.text == 'code').style.fontFamily,
-        'GeistMono',
+        systemMonospaceFontFamily,
       );
       expect(
         spans

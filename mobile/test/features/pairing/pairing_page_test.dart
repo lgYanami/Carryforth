@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/features/pairing/pairing_page.dart';
@@ -15,10 +16,12 @@ void main() {
         WidgetHelpers.testable(child: const PairingPage()),
       );
 
+      final logo = tester.widget<SvgPicture>(find.byType(SvgPicture));
       expect(
-        find.image(const AssetImage('assets/images/buzz-icon.png')),
-        findsOneWidget,
+        (logo.bytesLoader as SvgAssetLoader).assetName,
+        'assets/images/carryforth.svg',
       );
+      expect(logo.semanticsLabel, 'Carryforth');
       expect(find.text('Welcome to Buzz'), findsOneWidget);
       expect(find.text('Scan QR Code'), findsOneWidget);
       expect(find.text('or paste pairing code'), findsOneWidget);

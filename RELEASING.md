@@ -29,8 +29,9 @@ The packaged-asset gate is deliberately fail-closed. Its current blockers and
 provenance evidence are recorded in
 [`docs/release/THIRD_PARTY_ASSETS.md`](docs/release/THIRD_PARTY_ASSETS.md); do
 not publish by removing or weakening that gate. The inventory currently
-reports 12 blockers: five packaged asset/font entries and seven release
-obligations.
+reports eight blockers: the Inter packaged-license obligation and seven
+release obligations. The old Provider, Starter-Team, and notification assets
+have been removed or replaced with rights-cleared project outputs.
 
 The implementation and acceptance contract is maintained in
 [`docs/lora/stage/carryforth/open-source-release-surface-plan.md`](docs/lora/stage/carryforth/open-source-release-surface-plan.md).

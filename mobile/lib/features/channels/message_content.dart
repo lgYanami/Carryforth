@@ -564,7 +564,7 @@ class _MessageCodeBlock extends HookWidget {
     }
 
     final codeBaseStyle = TextStyle(
-      fontFamily: 'GeistMono',
+      fontFamily: systemMonospaceFontFamily,
       fontSize: 13,
       height: 1.5,
       color: context.colors.onSurface,

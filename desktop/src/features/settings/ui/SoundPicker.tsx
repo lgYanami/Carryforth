@@ -16,6 +16,8 @@ import {
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 
+import { listenForSoundPreviewStop, pauseSoundPreview } from "./soundPreview";
+
 function sortedSounds(recommended: SoundName): SoundName[] {
   const others = SOUND_NAMES.filter((n) => n !== recommended)
     .slice()
@@ -68,7 +70,7 @@ export function SoundPicker({
 
   function togglePreview() {
     if (isPlaying) {
-      audioRef.current?.pause();
+      pauseSoundPreview(audioRef.current);
       setIsPlaying(false);
       return;
     }
@@ -77,8 +79,7 @@ export function SoundPicker({
     audioRef.current = audio;
     setIsPlaying(true);
     const stop = () => setIsPlaying(false);
-    audio.addEventListener("ended", stop, { once: true });
-    audio.addEventListener("pause", stop, { once: true });
+    listenForSoundPreviewStop(audio, stop);
   }
 
   return (

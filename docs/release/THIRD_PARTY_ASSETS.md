@@ -4,6 +4,13 @@ Status: release audit in progress
 Inventory data: [`packaged-assets.json`](packaged-assets.json)  
 Gate: [`scripts/check-release-asset-inventory.sh`](../../scripts/check-release-asset-inventory.sh)
 
+The public Git tree has a separate, exhaustive inventory in
+[`source-assets.json`](source-assets.json), enforced by
+[`scripts/check-source-asset-inventory.mjs`](../../scripts/check-source-asset-inventory.mjs).
+That inventory covers tracked media files, media bytes embedded in source, and
+explicit data-URI constructors/placeholders. This document remains focused on
+what the future packaged artifacts carry.
+
 This document covers the non-code media, fonts, project binaries, and material
 container inputs on the first public Carryforth release surface:
 
@@ -44,21 +51,18 @@ clean release build must regenerate `dist`; it must not treat a stale local
 | --- | --- | --- | --- |
 | Carryforth app glyph and wordmark | `desktop/public/carryforth.svg`, `desktop/public/landing/carryforth-wordmark.svg` | Created in Carryforth commit `8d02a4750e5cf0ac690ffe712341217f1994b063` | Apache-2.0; cleared |
 | Carryforth application icons | `desktop/src-tauri/icons/**` | Preferred source is `carryforth-source.svg`; platform renditions were generated in the same Carryforth commit | Apache-2.0; cleared |
-| Card texture | `desktop/src/shared/ui/assets/card-texture.png` | Reproducible procedural SVG recipe in `desktop/scripts/texture-card/generate-card-texture.mjs`; generator reads no external image | Apache-2.0; cleared |
+| Card texture | `desktop/src/shared/ui/assets/card-texture.png` | Procedural in-repository SVG recipe in `desktop/scripts/texture-card/generate-card-texture.mjs`; current bytes are provenance-bound without claiming cross-browser screenshot reproducibility | Apache-2.0; cleared |
 | Poof animation and sound | `desktop/public/pow/**` | Exact upstream files from [EmergeTools/Pow at `1b4b1dda`](https://github.com/EmergeTools/Pow/tree/1b4b1dda28c50b95f0872927ee2226fe8b58950e); all six media hashes were verified byte-for-byte. The directory ships its copyright and MIT license. | MIT; cleared |
+| Runtime and Starter-Team glyphs | Code-native `RuntimeGlyph` and `StarterPersonaBadge` | Carryforth-owned neutral geometry; the old Provider marks, APNGs, and Rust-embedded character PNGs were removed. Stable runtime/persona IDs and labels remain unchanged. | Apache-2.0; cleared |
+| Notification audio and waveforms | `desktop/public/sounds/*.wav`, `desktop/public/sounds/*.svg` | Fixed-point integer generator in `desktop/scripts/generate-notification-sounds.mjs`; reads no legacy audio or other media input and verifies all outputs byte-for-byte | Apache-2.0; cleared |
 
 The Carryforth wordmark refers to Inter by font-family name but does not embed
 font bytes. Inter's separately bundled WOFF2 files are covered below.
 
-## Unresolved Desktop asset blockers
+## Remaining Desktop asset blocker
 
 | Blocker | Files | Known provenance | Missing evidence / required resolution |
 | --- | --- | --- | --- |
-| Runtime-provider marks | `desktop/public/runtime-icons/**` | Added by [block/buzz#2026](https://github.com/block/buzz/pull/2026), merge `2b0f5e9f…`. The Goose vector contains paths traceable to the official `aaif-goose/goose` artwork. | No recorded source or redistribution/trademark terms for the Claude or Codex PNGs; no bundled asset notice or approved downstream mark-use record for Goose. Replace all with Carryforth-owned generic runtime glyphs/text, or record authoritative license and trademark permission. |
-| Onboarding-provider marks | `desktop/src/features/onboarding/assets/harness-logos/**` | Added by [block/buzz#2039](https://github.com/block/buzz/pull/2039), merge `66a0f7bc…`. | No recorded source, copyright license, or trademark terms for ChatGPT, Claude, and Goose raster artwork. Replace or obtain and document permission. |
-| Starter-team character art | `desktop/public/onboarding/starter-team/**` | Added by [block/buzz#2032](https://github.com/block/buzz/pull/2032), merge `1aab50e9…`; the PR says APNGs were assembled from “Wes's” Fizz, Honey, and Bumble frame sequences. | Source frames, explicit ownership/redistribution attestation, and downstream character/trademark permission are absent. Replace with Carryforth-owned art or obtain a written provenance and license record. |
-| Notification audio | `desktop/public/sounds/*.mp3` | Added by [block/buzz#968](https://github.com/block/buzz/pull/968), merge `4e4dc723…`. | No source, creator, or license is recorded for the twelve audio files. Replace with newly commissioned/generated assets with source and license, or obtain proof of rights. |
-| Waveform thumbnails | `desktop/public/sounds/*.svg` | The PR generator derives them from the corresponding MP3 PCM data. | They inherit the unresolved provenance of the source audio; resolve or regenerate after replacing the audio. |
 | Inter Variable font | `@fontsource-variable/inter@5.2.8` emitted by Vite | Package license: Copyright 2016 The Inter Project Authors, SIL Open Font License 1.1. | OFL requires the copyright and license to accompany redistributed font software. Stage the OFL text in the installed Desktop/release notices and verify it exists inside both `.deb` and AppImage. |
 
 These entries are blockers for publishing the current Desktop artifact. A
@@ -187,16 +191,18 @@ The release form is stricter:
 ```
 
 It fails while any inventory entry or release obligation is `blocked`. There
-are currently **12** blockers: five packaged asset/font entries and seven
-release obligations. That is the expected result until every asset blocker has
-been replaced or licensed and every obligation has tag-bound evidence that
-passes the contract above.
+are currently **8** blockers: the packaged Inter license-notice obligation and
+seven release obligations. The removed Provider, Starter-Team, Sprout, legacy
+Mobile, screenshot, and notification assets are no longer blockers in the
+current tree. Git-history publication remains a separate task.
 
 ## Closure checklist
 
-- [ ] Replace or clear both Provider-logo groups.
-- [ ] Replace or clear Fizz, Honey, and Bumble art.
-- [ ] Replace or clear all notification MP3s and regenerate their waveforms.
+- [x] Replace both Provider-logo groups with neutral Carryforth code glyphs.
+- [x] Remove Starter-Team raster/embedded art while preserving stable persona
+      behavior and IDs.
+- [x] Replace all notification MP3s and waveforms with deterministic original
+      WAV/SVG outputs.
 - [ ] Bundle Inter's OFL copyright/license with `.deb` and AppImage.
 - [ ] Generate and publish license reports and SBOMs for Desktop, all sidecars,
       standalone `cf`, and the Relay image.

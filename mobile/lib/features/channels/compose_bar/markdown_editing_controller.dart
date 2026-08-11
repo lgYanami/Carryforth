@@ -229,7 +229,7 @@ class _MarkdownEditingController extends TextEditingController {
       _MarkdownStyle.inlineCode ||
       _MarkdownStyle.codeBlock => inheritedStyle.merge(
         TextStyle(
-          fontFamily: 'GeistMono',
+          fontFamily: systemMonospaceFontFamily,
           color: context.colors.onSurface,
           backgroundColor: context.colors.surface,
         ),

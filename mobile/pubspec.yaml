@@ -48,15 +48,10 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/images/buzz-icon.png
+    - assets/images/carryforth.svg
   fonts:
     - family: Inter
       fonts:
         - asset: assets/fonts/InterVariable.ttf
         - asset: assets/fonts/InterVariable-Italic.ttf
-          style: italic
-    - family: GeistMono
-      fonts:
-        - asset: assets/fonts/GeistMono-Variable.ttf
-        - asset: assets/fonts/GeistMono-Italic-Variable.ttf
           style: italic

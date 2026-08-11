@@ -49,6 +49,27 @@ for retired in \
   require_absent "$retired"
 done
 
+for retired_asset in \
+  desktop/public/runtime-icons \
+  desktop/src/features/onboarding/assets/harness-logos \
+  desktop/public/onboarding/starter-team \
+  desktop/src-tauri/src/managed_agents/persona_avatars.rs \
+  crates/buzz-agent/sprout-agent.png \
+  docs/assets/sprout.png \
+  docs/assets/sprout-icon.png \
+  docs/assets/screenshots \
+  mobile/assets/images/buzz-icon.png \
+  mobile/ios/Runner/Assets.xcassets/LaunchImage.imageset; do
+  require_absent "$retired_asset"
+done
+
+if compgen -G "$REPO_ROOT/desktop/public/sounds/*.mp3" >/dev/null; then
+  fail "legacy notification MP3 assets are still present"
+fi
+if compgen -G "$REPO_ROOT/mobile/assets/fonts/Geist*.ttf" >/dev/null; then
+  fail "unlicensed Geist font assets are still present"
+fi
+
 if [[ -d "$REPO_ROOT/deploy/compose" ]]; then
   actual_compose_files="$({
     shopt -s nullglob dotglob

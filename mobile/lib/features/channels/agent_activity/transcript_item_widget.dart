@@ -473,7 +473,7 @@ class _CodeBlock extends StatelessWidget {
           text,
           softWrap: false,
           style: context.textTheme.bodySmall?.copyWith(
-            fontFamily: 'monospace',
+            fontFamily: systemMonospaceFontFamily,
             fontSize: 11,
             color: isError
                 ? context.colors.error
