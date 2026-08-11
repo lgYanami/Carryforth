@@ -51,6 +51,7 @@ const COMMUNITY_B = {
   relayUrl: "ws://localhost:3001",
   addedAt: "2026-08-06T00:01:00.000Z",
 };
+const SEMANTIC_D6_SHOTS = "test-results/semantic-d6";
 
 function contextResult(input?: {
   capabilityEnabled?: boolean;
@@ -1308,6 +1309,59 @@ test("Cancel fences a delayed semantic response so it cannot revive the overlay"
   ).toHaveCount(0);
   await expect(page.getByTestId("project-context-semantic-run")).toBeEnabled();
 });
+
+for (const theme of [
+  { label: "light", storageValue: "buzz" },
+  { label: "dark", storageValue: "buzz-dark" },
+] as const) {
+  test(`semantic overlay D6 visual acceptance — ${theme.label}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.addInitScript(
+      ({ storageValue }) => {
+        window.localStorage.setItem("buzz-theme", storageValue);
+      },
+      { storageValue: theme.storageValue },
+    );
+    await installMockBridge(page, {
+      projectContext: semanticCapableInspectorResult(),
+      projectDocument: inspectorDocumentState(),
+      projectView: inspectorProjectView(),
+    });
+    await openProjectContext(page);
+    await seedSemanticResult(page);
+
+    await page
+      .getByTestId("project-context-semantic-problem")
+      .fill("Why did the release issue keep recurring after deployment?");
+    await page.getByTestId("project-context-semantic-run").click();
+    await waitForSemanticOverlay(page);
+    await expect(page.locator("html")).toHaveAttribute(
+      "data-buzz-theme",
+      theme.storageValue,
+    );
+    await expect(
+      page.getByTestId(
+        `project-context-coordinate-requirement:${REQUIREMENT_ID}`,
+      ),
+    ).toHaveAttribute("data-semantic-root", "true");
+    await expect(
+      page.getByTestId(`project-context-coordinate-resource:${RESOURCE_ID}`),
+    ).toHaveAttribute("data-semantic-terminal", "true");
+    await expect(
+      page.getByTestId(`project-context-edge-${"1".repeat(64)}`),
+    ).toHaveAttribute("data-semantic-emphasis", "route");
+
+    await page.getByTestId("project-context-semantic-fit").click();
+    await page.waitForTimeout(700);
+    await waitForAnimations(page);
+    await page.getByTestId("project-context-screen").screenshot({
+      animations: "disabled",
+      path: `${SEMANTIC_D6_SHOTS}/project-context-semantic-${theme.label}.png`,
+    });
+  });
+}
 
 test("Project View Coordinate Inspector is read-only, responsive, and restores graph focus", async ({
   page,

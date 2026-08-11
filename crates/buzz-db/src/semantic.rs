@@ -2316,6 +2316,52 @@ impl Db {
         Ok(affected == 1)
     }
 
+    /// Release a provider-admission-blocked claim without consuming a failure attempt.
+    ///
+    /// Claiming increments `attempts` before the worker reaches the shared provider
+    /// gate. A healthy lane-cadence conflict is capacity backpressure rather than an
+    /// encoder/provider failure, so this transition reverses exactly that increment
+    /// and can never poison the job. The exact claim/source epoch fence prevents an
+    /// obsolete worker from changing a newer durable job state.
+    pub async fn defer_semantic_claim_for_provider_admission(
+        &self,
+        lease: &SemanticJobLease,
+        retry_after: std::time::Duration,
+    ) -> Result<bool> {
+        if retry_after < std::time::Duration::from_millis(100)
+            || retry_after > std::time::Duration::from_secs(60)
+        {
+            return Err(DbError::InvalidData(
+                "semantic provider admission retry must be between 100ms and 60s".to_string(),
+            ));
+        }
+        let (family, subtype) = semantic_source_db_key(lease.source.kind);
+        let affected = sqlx::query(
+            "UPDATE semantic_index_jobs SET state='retry',attempts=GREATEST(attempts-1,0), \
+                    claim_id=NULL,lease_until=NULL,claimed_at=NULL,completed_at=NULL, \
+                    next_attempt_at=clock_timestamp()+make_interval(secs=>$8), \
+                    error_code='provider_busy',error_detail=NULL,updated_at=clock_timestamp() \
+             WHERE community_id=$1 AND generation_id=$2 AND source_family=$3 \
+               AND source_subtype=$4 AND source_id=$5 \
+               AND desired_invalidation_epoch=$6 AND claim_id=$7 AND state='claimed'",
+        )
+        .bind(lease.source.community_id)
+        .bind(lease.generation_id)
+        .bind(family)
+        .bind(subtype)
+        .bind(lease.source.source_id)
+        .bind(u64_to_i64(
+            lease.desired_invalidation_epoch,
+            "invalidation_epoch",
+        )?)
+        .bind(lease.claim_id)
+        .bind(retry_after.as_secs_f64())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
     /// Compute the exact current coverage gate for one generation.
     pub async fn semantic_generation_coverage(
         &self,
@@ -3625,9 +3671,9 @@ mod tests {
 
     use super::{
         vector_version_supported, CreateSemanticGeneration, SemanticActivationOutcome,
-        SemanticClaimObservationOutcome, SemanticPgvectorPreflight, SemanticProviderReservation,
-        SemanticProviderWorkload, SemanticRebuildScope, SemanticRebuildState, SemanticScanFamily,
-        SemanticWorkerEgressConfirmation,
+        SemanticClaimObservationOutcome, SemanticJobLease, SemanticPgvectorPreflight,
+        SemanticProviderReservation, SemanticProviderWorkload, SemanticRebuildScope,
+        SemanticRebuildState, SemanticScanFamily, SemanticWorkerEgressConfirmation,
     };
     use crate::{Db, DbConfig};
 
@@ -3655,6 +3701,24 @@ mod tests {
             cosine_distance_ok: true,
             halfvec_cast_ok: true,
             sqlx_2048_roundtrip_ok: true,
+        }
+    }
+
+    fn semantic_test_lease(
+        lease: &SemanticJobLease,
+        claim_id: Uuid,
+        desired_invalidation_epoch: u64,
+    ) -> SemanticJobLease {
+        SemanticJobLease {
+            source: lease.source.clone(),
+            generation_id: lease.generation_id,
+            desired_invalidation_epoch,
+            claim_id,
+            lease_until: lease.lease_until,
+            attempts: lease.attempts,
+            extractor_version: lease.extractor_version.clone(),
+            model_contract: lease.model_contract.clone(),
+            model_contract_digest: lease.model_contract_digest,
         }
     }
 
@@ -3940,11 +4004,61 @@ mod tests {
         db.reconcile_semantic_observation(&observation)
             .await
             .expect("reconcile");
-        let lease = db
+        let mut lease = db
             .claim_due_semantic_job(60)
             .await
             .expect("claim query")
             .expect("claimed job");
+        assert_eq!(lease.attempts, 1);
+        let stale_claim =
+            semantic_test_lease(&lease, Uuid::new_v4(), lease.desired_invalidation_epoch);
+        assert!(!db
+            .defer_semantic_claim_for_provider_admission(
+                &stale_claim,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .expect("stale claim id does not defer current claim"));
+        let stale_epoch =
+            semantic_test_lease(&lease, lease.claim_id, lease.desired_invalidation_epoch + 1);
+        assert!(!db
+            .defer_semantic_claim_for_provider_admission(
+                &stale_epoch,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .expect("stale source epoch does not defer current claim"));
+        for iteration in 0..10 {
+            assert_eq!(lease.attempts, 1, "lossless admission claim {iteration}");
+            assert!(db
+                .defer_semantic_claim_for_provider_admission(
+                    &lease,
+                    std::time::Duration::from_millis(100),
+                )
+                .await
+                .expect("defer provider admission"));
+            let (deferred_state, deferred_attempts): (String, i32) = sqlx::query_as(
+                "SELECT state,attempts FROM semantic_index_jobs \
+                 WHERE community_id=$1 AND generation_id=$2 \
+                   AND source_family='project_document' AND source_subtype='document' \
+                   AND source_id=$3",
+            )
+            .bind(community_id.as_uuid())
+            .bind(generation_id)
+            .bind(observation.identity.source_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deferred provider admission state");
+            assert_eq!(deferred_state, "retry");
+            assert_eq!(deferred_attempts, 0);
+            tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+            lease = db
+                .claim_due_semantic_job(60)
+                .await
+                .expect("reclaim deferred provider admission")
+                .expect("reclaimed deferred provider admission");
+        }
+        assert_eq!(lease.attempts, 1);
         assert_eq!(lease.source, observation.identity);
         assert_eq!(
             db.prepare_semantic_claim_observation(&lease, &observation)

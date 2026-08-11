@@ -48,6 +48,14 @@ export type SemanticQueryDraftValidation =
       problemBytes: number;
     };
 
+/** Format a verified semantic path/root count with the correct English number. */
+export function semanticGraphCountLabel(
+  count: number,
+  noun: "path" | "root",
+): string {
+  return `${count} ${count === 1 ? noun : `${noun}s`}`;
+}
+
 /** Start with an empty, Community-local in-memory semantic query draft. */
 export function createSemanticQueryDraft(): SemanticQueryDraft {
   return {

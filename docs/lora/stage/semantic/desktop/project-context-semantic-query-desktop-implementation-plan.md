@@ -1,11 +1,13 @@
 # Desktop Project Context 语义路径查询分阶段实现计划
 
-> 状态：Phase D0–D5 代码已交付并保持 feature-off；Phase D6 的真实 Relay、light / dark 截图、
-> 灰度与上游外部资格待完成；当前不构成 production-ready
+> 状态：Phase D0–D5 已提交；Phase D6 的本地 synthetic 性能资格、light / dark 语义路径截图、
+> local single-pod真实 Provider canary与feature-off / rollback已完成；known-negative仍产生候选，
+> relevance / floor质量校准、source / revision stale smoke及production LB / multi-pod qualification未完成；
+> 当前不构成 production-ready
 >
 > 日期：2026-08-11
 >
-> 代码基线：`feat/context-semantic` @ `b27829db3`
+> D0–D5 交付提交：`507790180 feat(desktop): add project context semantic paths`
 >
 > 上游查询计划：
 > [Project Context 图语义检索分阶段实现计划](../project-context-graph-semantic-query-implementation-plan.md)
@@ -1310,12 +1312,27 @@ Desktop-only 文件改动。
 - selected relation Document 标记准确；
 - 无 semantic session 时 current screenshots / presentation contract 不回归。
 
-### Phase D6：集成、真实 Relay 与灰度资格（待完成）
+### Phase D6：集成、真实 Relay 与灰度资格（进行中；local single-pod canary已完成）
+
+当前证据边界：
+
+- D0–D5 已由 `507790180 feat(desktop): add project context semantic paths` 提交；
+- 本地隔离 PostgreSQL / pgvector 合同、10,000 source synthetic exact-kernel benchmark以及light / dark
+  语义路径截图已经形成可复现证据；
+- local single-pod在受控feature窗口内完成9项真实Volcengine查询与Desktop Native全链路验签，随后完成
+  `query-disable`、fleet revoke、zero Provider reservation及canonical Incident read回归；
+- 真实查询的四类返回分数均无provisional floor违规，但known-negative仍返回6个roots / 12条paths，
+  relevance / floor质量校准未通过；source / revision stale smoke仍待补；
+- production LB inventory、multi-pod fleet / Provider contention与长soak没有部署证据，不能由本地canary或
+  synthetic benchmark替代。
+
+资格记录见：
+[Project Context Desktop 图语义查询资格报告](./project-context-semantic-query-desktop-qualification.md)。
 
 交付：
 
 - Native / TS / E2E 全矩阵；
-- light / dark 截图；
+- light / dark 语义路径截图；
 - actual semantic-enabled test Community smoke；
 - revision / source stale smoke；
 - Desktop runbook；
@@ -1331,6 +1348,17 @@ Desktop-only 文件改动。
 - Community switch本地立即清；Relay拒绝当前请求，或 Desktop重新观察到 revoke / 403 / capability off /
   trusted identity change后立即清；未观察期间只保留明确 snapshot且不宣称 current；
 - Desktop 全部质量门通过。
+
+已完成截图证据：
+
+| Theme | 路径 | SHA-256 |
+|---|---|---|
+| light | `desktop/test-results/semantic-d6/project-context-semantic-light.png` | `fe9634ab7f81e06dc27dd0e690a8633bbd04cbac76e038e2b17685fc6950103b` |
+| dark | `desktop/test-results/semantic-d6/project-context-semantic-dark.png` | `bd505532b29de929a15980796a9811463e0aa246664739a2c88e5ba3e59ab8ea` |
+
+两张图覆盖真实Desktop渲染的语义root、route Edge与terminal Coordinate，并已在截图前等待动画结束；
+它们不代表production Relay、Provider、LB或multi-pod资格已经通过。semantic-only / semantic+selection的
+交互状态仍由E2E合同覆盖；如发布验收要求四种状态各有独立视觉基线，须另行补图。
 
 ## 14. 测试矩阵
 

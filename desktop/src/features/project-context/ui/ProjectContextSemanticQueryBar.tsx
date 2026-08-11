@@ -3,6 +3,7 @@ import * as React from "react";
 
 import {
   removeSemanticQueryDraftCoordinate,
+  semanticGraphCountLabel,
   semanticQueryDraftMatchesSubmission,
   tryAddSemanticQueryDraftCoordinate,
   updateSemanticQueryDraftProblem,
@@ -412,10 +413,16 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
             <Badge variant="outline">
               {activeResult.coverage.pathsReturned === 0
                 ? "No paths"
-                : `${activeResult.coverage.pathsReturned} paths`}
+                : semanticGraphCountLabel(
+                    activeResult.coverage.pathsReturned,
+                    "path",
+                  )}
             </Badge>
             <Badge variant="outline">
-              {activeResult.coverage.rootsReturned} roots
+              {semanticGraphCountLabel(
+                activeResult.coverage.rootsReturned,
+                "root",
+              )}
             </Badge>
             <Badge variant="outline">
               Revision {activeResult.projectContextRevision}
@@ -471,7 +478,7 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
                     (topologyAdvanced
                       ? "Context changed after this semantic snapshot. Re-run to find paths in the current graph, or clear the result."
                       : activeResult
-                        ? `${activeResult.coverage.pathsReturned} paths ${overlayVisible ? "highlighted" : "retained but hidden because the graph changed"} from Context revision ${activeResult.projectContextRevision}.${dirty ? " Draft changes are not applied." : ""}`
+                        ? `${semanticGraphCountLabel(activeResult.coverage.pathsReturned, "path")} ${overlayVisible ? "highlighted" : "retained but hidden because the graph changed"} from Context revision ${activeResult.projectContextRevision}.${dirty ? " Draft changes are not applied." : ""}`
                         : "Cmd/Ctrl+Enter also runs the query. Results are routing candidates; open canonical sources before relying on them."))}
           </p>
           {active && overlayVisible && canFit ? (

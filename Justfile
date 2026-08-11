@@ -388,6 +388,10 @@ semantic-migration-test:
 # Run all Project Context semantic Foundation and Query schema quality gates.
 semantic-test: semantic-pgvector-test semantic-migration-test
 
+# Measure the exact-query kernel with content-free synthetic 2048-d vectors.
+semantic-query-qualification:
+    ./scripts/qualify-semantic-exact-query.sh
+
 # Run the real Relay + real cf CLI Project View end-to-end test.
 project-view-test-e2e:
     ./scripts/test-project-view-e2e.sh
