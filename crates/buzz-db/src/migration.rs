@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 57);
+        assert_eq!(migrations.len(), 58);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1415,6 +1415,46 @@ mod tests {
                 "migration 0057 must not contain {forbidden}"
             );
         }
+
+        assert_eq!(migrations[57].version, 58);
+        let semantic_query = migrations[57].sql.as_str();
+        for required in [
+            "ADD COLUMN semantic_graph_query_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "communities_semantic_graph_query_requires_index",
+            "CHECK (NOT semantic_graph_query_enabled OR semantic_index_enabled)",
+            "events_kind_not_semantic_graph_query_result",
+            "CHECK (kind <> 40912) NOT VALID",
+            "VALIDATE CONSTRAINT events_kind_not_semantic_graph_query_result",
+            "semantic_embeddings_nonzero_cosine",
+            "CHECK (vector_norm(embedding) > 0) NOT VALID",
+            "CREATE TABLE semantic_query_provider_admission",
+            "community_id UUID NOT NULL REFERENCES communities(id) ON DELETE NO ACTION",
+            "workload IN ('interactive_query', 'background_index')",
+            "CREATE TABLE semantic_graph_http_fleet_attestations",
+            "PRIMARY KEY (community_id, transport)",
+            "UNIQUE (community_id, attestation_id)",
+            "semantic_graph_http_fleet_inventory_shape_check",
+            "expires_at <= attested_at + INTERVAL '15 minutes'",
+        ] {
+            assert!(
+                semantic_query.contains(required),
+                "migration 0058 must contain {required}"
+            );
+        }
+        for forbidden in [
+            "CREATE EXTENSION",
+            "DROP EXTENSION",
+            "DROP TABLE",
+            "DROP COLUMN",
+            "TRUNCATE",
+            "DELETE FROM",
+            "UPDATE events",
+        ] {
+            assert!(
+                !semantic_query.contains(forbidden),
+                "migration 0058 must not contain {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -1432,6 +1472,13 @@ mod tests {
             "CREATE TABLE semantic_index_jobs",
             "CREATE TABLE semantic_rebuild_operations",
             "CREATE TABLE semantic_provider_rate_gates",
+            "semantic_graph_query_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "communities_semantic_graph_query_requires_index",
+            "events_kind_not_semantic_graph_query_result",
+            "semantic_embeddings_nonzero_cosine",
+            "CHECK (vector_norm(embedding) > 0)",
+            "CREATE TABLE semantic_query_provider_admission",
+            "CREATE TABLE semantic_graph_http_fleet_attestations",
             "CREATE FUNCTION semantic_mark_source_changed",
         ] {
             assert!(
@@ -1818,6 +1865,588 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn semantic_query_upgrade_is_additive_and_index_disable_is_atomic() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(57, &pool)
+            .await
+            .expect("apply migrations through semantic Foundation");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO communities (id,host,semantic_index_enabled) \
+             VALUES ($1,$2,TRUE)",
+        )
+        .bind(community_id)
+        .bind(format!(
+            "semantic-query-upgrade-{}.test",
+            community_id.simple()
+        ))
+        .execute(&pool)
+        .await
+        .expect("seed enabled Foundation Community");
+        sqlx::query(
+            "INSERT INTO semantic_provider_rate_gates \
+                 (community_id,provider,next_request_at) \
+             VALUES ($1,'deterministic_fake',clock_timestamp())",
+        )
+        .bind(community_id)
+        .execute(&pool)
+        .await
+        .expect("seed populated Foundation provider gate");
+        let generation_id = uuid::Uuid::new_v4();
+        let source_id = uuid::Uuid::new_v4();
+        let unit_set_id = uuid::Uuid::new_v4();
+        let encoder =
+            buzz_semantic::DeterministicFakeEncoder::new(2).expect("create migration-test encoder");
+        let model_contract = buzz_semantic::SemanticEncoder::contract(&encoder);
+        let contract_digest = model_contract
+            .digest()
+            .expect("digest migration-test model contract");
+        let source_identity = buzz_semantic::SemanticSourceIdentity {
+            community_id,
+            kind: buzz_semantic::SemanticSourceKind::ProjectDocument,
+            source_id,
+        };
+        let observation = buzz_semantic::CanonicalSemanticSourceObservation::new(
+            source_identity,
+            buzz_semantic::SemanticSourceBasis::ProjectDocument(
+                buzz_semantic::ProjectDocumentSourceBasis {
+                    document_revision: 1,
+                    source_change_id: buzz_semantic::Digest32::from_bytes([0x57_u8; 32]),
+                },
+            ),
+            buzz_semantic::SemanticEligibility::Eligible,
+            buzz_semantic::SemanticFilterMetadata {
+                lifecycle: buzz_semantic::SemanticLifecycleClass::Active,
+                source_status: Some("active".to_string()),
+            },
+            "Legacy vector".to_string(),
+            Some("Historical zero-vector fixture".to_string()),
+        )
+        .expect("construct historical semantic observation");
+        let source_basis =
+            serde_json::to_value(&observation.basis).expect("serialize historical source basis");
+        let snapshot_digest = observation.snapshot_digest;
+        let unit = buzz_semantic::extract_overview(&observation)
+            .expect("extract historical overview unit");
+        sqlx::query(
+            "INSERT INTO semantic_index_generations (\
+                 community_id,generation_id,extractor_version,input_contract_version,\
+                 provider,model,dimensions,distance_metric,normalization,\
+                 provider_boundary,model_contract_digest,created_by) \
+             VALUES ($1,$2,'overview-visible-text-v1','overview-v1','deterministic_fake',\
+                     'deterministic-fake-v1',2,'cosine','none',\
+                     'deterministic_fake',$3,'migration-test')",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(contract_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed populated Foundation generation");
+        sqlx::query(
+            "INSERT INTO semantic_sources (\
+                 community_id,source_family,source_subtype,source_id,eligibility,\
+                 lifecycle_class,source_basis,snapshot_digest,coverage_state) \
+             VALUES ($1,'project_document','document',$2,'eligible','active',\
+                     $3,$4,'current')",
+        )
+        .bind(community_id)
+        .bind(source_id)
+        .bind(&source_basis)
+        .bind(snapshot_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed populated Foundation source");
+        sqlx::query(
+            "INSERT INTO semantic_unit_sets (\
+                 community_id,unit_set_id,source_family,source_subtype,source_id,\
+                 source_invalidation_epoch,source_basis,source_snapshot_digest,\
+                 extractor_version,state,complete_unit_count,activated_at) \
+             VALUES ($1,$2,'project_document','document',$3,1,$4,$5,\
+                     'overview-visible-text-v1','active',1,clock_timestamp())",
+        )
+        .bind(community_id)
+        .bind(unit_set_id)
+        .bind(source_id)
+        .bind(&source_basis)
+        .bind(snapshot_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed populated Foundation unit set");
+        sqlx::query(
+            "INSERT INTO semantic_units (\
+                 community_id,unit_set_id,unit_key,ordinal,unit_kind,semantic_text,\
+                 semantic_text_digest,summary_coverage,extraction_provenance) \
+             VALUES ($1,$2,'overview',0,'overview',$3,$4,\
+                     'title_and_summary',$5)",
+        )
+        .bind(community_id)
+        .bind(unit_set_id)
+        .bind(&unit.text)
+        .bind(unit.semantic_text_digest.as_bytes().as_slice())
+        .bind(serde_json::to_value(&unit.identity).expect("serialize overview identity"))
+        .execute(&pool)
+        .await
+        .expect("seed populated Foundation overview");
+        sqlx::query(
+            "INSERT INTO semantic_embeddings (\
+                 community_id,unit_set_id,unit_key,generation_id,dimensions,\
+                 model_contract_digest,response_model,embedding) \
+             VALUES ($1,$2,'overview',$3,2,$4,'deterministic-fake-v1',\
+                     '[0,0]'::vector)",
+        )
+        .bind(community_id)
+        .bind(unit_set_id)
+        .bind(generation_id)
+        .bind(contract_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed historical zero vector accepted by Foundation");
+
+        MIGRATOR
+            .run(&pool)
+            .await
+            .expect("apply semantic query migration");
+        let query_enabled: bool =
+            sqlx::query_scalar("SELECT semantic_graph_query_enabled FROM communities WHERE id=$1")
+                .bind(community_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read additive query gate default");
+        assert!(!query_enabled);
+        let fleet_table_ready: bool = sqlx::query_scalar(
+            "SELECT to_regclass('semantic_graph_http_fleet_attestations') IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect additive fleet attestation table");
+        assert!(fleet_table_ready);
+        let fleet_attestation_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "WITH observed AS (SELECT clock_timestamp() AS at) \
+             INSERT INTO semantic_graph_http_fleet_attestations (\
+                 community_id,transport,attestation_id,deployment_id,runtime_digest,\
+                 inventory_digest,inventory,routing_inventory_acknowledged_at,\
+                 attested_at,expires_at,attested_by) \
+             SELECT $1,'http',$2,'deployment-a',$3,$4,\
+                    '{\"transport\":\"http\",\"deployment_id\":\"deployment-a\",\"instances\":[{\"instance_id\":\"relay-0\",\"runtime_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"http_ready\":true}]}'::jsonb,\
+                    at,at,at + interval '5 minutes','migration-test' FROM observed",
+        )
+        .bind(community_id)
+        .bind(fleet_attestation_id)
+        .bind([0_u8; 32].as_slice())
+        .bind([1_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("insert bounded fleet assertion");
+        let oversized_lifetime = sqlx::query(
+            "UPDATE semantic_graph_http_fleet_attestations \
+             SET expires_at=attested_at + interval '16 minutes' \
+             WHERE community_id=$1 AND transport='http'",
+        )
+        .bind(community_id)
+        .execute(&pool)
+        .await;
+        assert!(oversized_lifetime.is_err());
+
+        sqlx::query("UPDATE communities SET semantic_graph_query_enabled=TRUE WHERE id=$1")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .expect("enable query while Foundation index is enabled");
+        let invalid_disable =
+            sqlx::query("UPDATE communities SET semantic_index_enabled=FALSE WHERE id=$1")
+                .bind(community_id)
+                .execute(&pool)
+                .await;
+        assert!(invalid_disable.is_err());
+        let preserved: (bool, bool) = sqlx::query_as(
+            "SELECT semantic_index_enabled,semantic_graph_query_enabled \
+             FROM communities WHERE id=$1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("failed direct disable rolls back");
+        assert_eq!(preserved, (true, true));
+
+        let mut tx = pool.begin().await.expect("begin atomic semantic disable");
+        sqlx::query("SELECT id FROM communities WHERE id=$1 FOR UPDATE")
+            .bind(community_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock semantic Community");
+        sqlx::query("UPDATE communities SET semantic_graph_query_enabled=FALSE WHERE id=$1")
+            .bind(community_id)
+            .execute(&mut *tx)
+            .await
+            .expect("close query gate first");
+        sqlx::query("UPDATE communities SET semantic_index_enabled=FALSE WHERE id=$1")
+            .bind(community_id)
+            .execute(&mut *tx)
+            .await
+            .expect("close Foundation gate second");
+        tx.commit().await.expect("commit atomic semantic disable");
+
+        let constraint_states: (bool, bool) = sqlx::query_as(
+            "SELECT \
+                 (SELECT convalidated FROM pg_constraint \
+                  WHERE conrelid='events'::regclass \
+                    AND conname='events_kind_not_semantic_graph_query_result'), \
+                 (SELECT convalidated FROM pg_constraint \
+                  WHERE conrelid='semantic_embeddings'::regclass \
+                    AND conname='semantic_embeddings_nonzero_cosine')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect upgrade constraint validation state");
+        assert_eq!(constraint_states, (true, false));
+        let historical_zero_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM semantic_embeddings \
+             WHERE community_id=$1 AND vector_norm(embedding)=0",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("historical zero vector survives additive migration");
+        assert_eq!(historical_zero_count, 1);
+        let rejected_new_zero = sqlx::query(
+            "UPDATE semantic_embeddings SET embedding='[0,0]'::vector \
+             WHERE community_id=$1 AND unit_set_id=$2",
+        )
+        .bind(community_id)
+        .bind(unit_set_id)
+        .execute(&pool)
+        .await;
+        assert!(rejected_new_zero.is_err());
+
+        sqlx::query(
+            "UPDATE semantic_index_generations \
+             SET lifecycle='active',ready_at=clock_timestamp(),\
+                 activated_at=clock_timestamp() \
+             WHERE community_id=$1 AND generation_id=$2",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .execute(&pool)
+        .await
+        .expect("publish historical generation as active");
+        sqlx::query(
+            "UPDATE communities \
+             SET semantic_index_enabled=TRUE,semantic_active_generation_id=$2 \
+             WHERE id=$1",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .execute(&pool)
+        .await
+        .expect("publish historical active generation pointer");
+        sqlx::query(
+            "INSERT INTO semantic_source_generation_heads (\
+                 community_id,generation_id,source_family,source_subtype,source_id,\
+                 unit_set_id,source_invalidation_epoch,source_snapshot_digest,\
+                 complete_unit_count,complete_embedding_count) \
+             VALUES ($1,$2,'project_document','document',$3,$4,1,$5,1,1)",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(source_id)
+        .bind(unit_set_id)
+        .bind(snapshot_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("publish historical zero-vector head");
+        sqlx::query(
+            "INSERT INTO semantic_index_jobs (\
+                 community_id,generation_id,source_family,source_subtype,source_id,\
+                 desired_invalidation_epoch,state,attempts,next_attempt_at,completed_at) \
+             VALUES ($1,$2,'project_document','document',$3,1,'succeeded',2,\
+                     clock_timestamp(),clock_timestamp())",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .expect("seed completed historical active-generation job");
+
+        let rollback_generation_id = uuid::Uuid::new_v4();
+        let rollback_encoder = buzz_semantic::DeterministicFakeEncoder::new(3)
+            .expect("create rollback migration-test encoder");
+        let rollback_contract = buzz_semantic::SemanticEncoder::contract(&rollback_encoder);
+        let rollback_digest = rollback_contract
+            .digest()
+            .expect("digest rollback model contract");
+        sqlx::query(
+            "INSERT INTO semantic_index_generations (\
+                 community_id,generation_id,lifecycle,extractor_version,\
+                 input_contract_version,provider,model,dimensions,distance_metric,\
+                 normalization,provider_boundary,model_contract_digest,created_by,\
+                 ready_at,activated_at) \
+             VALUES ($1,$2,'rollback_ready','overview-visible-text-v1','overview-v1',\
+                     'deterministic_fake','deterministic-fake-v1',3,'cosine','none',\
+                     'deterministic_fake',$3,'migration-test',clock_timestamp(),\
+                     clock_timestamp())",
+        )
+        .bind(community_id)
+        .bind(rollback_generation_id)
+        .bind(rollback_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed rollback-ready generation");
+        sqlx::query(
+            "INSERT INTO semantic_embeddings (\
+                 community_id,unit_set_id,unit_key,generation_id,dimensions,\
+                 model_contract_digest,response_model,embedding) \
+             VALUES ($1,$2,'overview',$3,3,$4,'deterministic-fake-v1',\
+                     '[1,0,0]'::vector)",
+        )
+        .bind(community_id)
+        .bind(unit_set_id)
+        .bind(rollback_generation_id)
+        .bind(rollback_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed rollback-ready non-zero embedding");
+        sqlx::query(
+            "INSERT INTO semantic_source_generation_heads (\
+                 community_id,generation_id,source_family,source_subtype,source_id,\
+                 unit_set_id,source_invalidation_epoch,source_snapshot_digest,\
+                 complete_unit_count,complete_embedding_count) \
+             VALUES ($1,$2,'project_document','document',$3,$4,1,$5,1,1)",
+        )
+        .bind(community_id)
+        .bind(rollback_generation_id)
+        .bind(source_id)
+        .bind(unit_set_id)
+        .bind(snapshot_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("publish rollback-ready head");
+        sqlx::query(
+            "INSERT INTO semantic_index_jobs (\
+                 community_id,generation_id,source_family,source_subtype,source_id,\
+                 desired_invalidation_epoch,state,attempts,next_attempt_at,completed_at) \
+             VALUES ($1,$2,'project_document','document',$3,1,'succeeded',7,\
+                     clock_timestamp(),clock_timestamp())",
+        )
+        .bind(community_id)
+        .bind(rollback_generation_id)
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .expect("seed rollback-ready completed job");
+
+        let canonical_before: (i64, serde_json::Value, Vec<u8>) = sqlx::query_as(
+            "SELECT invalidation_epoch,source_basis,snapshot_digest \
+             FROM semantic_sources \
+             WHERE community_id=$1 AND source_family='project_document' \
+               AND source_subtype='document' AND source_id=$2",
+        )
+        .bind(community_id)
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot canonical currentness before repair");
+        let db = crate::Db::from_pool(pool.clone());
+        let community = buzz_core::CommunityId::from_uuid(community_id);
+        assert_eq!(
+            db.semantic_graph_query_readiness(community)
+                .await
+                .expect("historical zero vector is visible to readiness")
+                .non_queryable_current_heads,
+            1
+        );
+        let repaired = db
+            .repair_active_semantic_query_vectors(community)
+            .await
+            .expect("repair historical active-generation zero vector");
+        assert_eq!(repaired.active_generation_id, generation_id);
+        assert_eq!(repaired.current_heads_scanned, 1);
+        assert_eq!(repaired.queryable_current_heads, 0);
+        assert_eq!(repaired.zero_vector_current_heads, 1);
+        assert_eq!(repaired.other_nonqueryable_current_heads, 0);
+        assert_eq!(repaired.zero_vector_embeddings, 1);
+        assert_eq!(repaired.heads_invalidated, 1);
+        assert_eq!(repaired.jobs_created, 0);
+        assert_eq!(repaired.jobs_requeued, 1);
+        let canonical_after: (i64, serde_json::Value, Vec<u8>) = sqlx::query_as(
+            "SELECT invalidation_epoch,source_basis,snapshot_digest \
+             FROM semantic_sources \
+             WHERE community_id=$1 AND source_family='project_document' \
+               AND source_subtype='document' AND source_id=$2",
+        )
+        .bind(community_id)
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot canonical currentness after repair");
+        assert_eq!(canonical_after, canonical_before);
+        let active_head_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM semantic_source_generation_heads \
+             WHERE community_id=$1 AND generation_id=$2",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("active zero head removed");
+        assert_eq!(active_head_count, 0);
+        let detached_zero_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM semantic_embeddings \
+             WHERE community_id=$1 AND generation_id=$2 \
+               AND unit_set_id=$3 AND unit_key='overview' \
+               AND vector_norm(embedding)=0",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(unit_set_id)
+        .fetch_one(&pool)
+        .await
+        .expect("historical zero embedding remains detached from a query head");
+        assert_eq!(detached_zero_count, 1);
+        let active_job: (String, i64, bool) = sqlx::query_as(
+            "SELECT state,desired_invalidation_epoch,claim_id IS NULL \
+             FROM semantic_index_jobs \
+             WHERE community_id=$1 AND generation_id=$2 \
+               AND source_family='project_document' AND source_id=$3",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("active source job requeued");
+        assert_eq!(active_job, ("pending".to_string(), 1, true));
+        let rollback_state: (i64, String, i32, f64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*) FROM semantic_source_generation_heads \
+                  WHERE community_id=$1 AND generation_id=$2), \
+                 (SELECT state FROM semantic_index_jobs \
+                  WHERE community_id=$1 AND generation_id=$2 \
+                    AND source_family='project_document' AND source_id=$3), \
+                 (SELECT attempts FROM semantic_index_jobs \
+                  WHERE community_id=$1 AND generation_id=$2 \
+                    AND source_family='project_document' AND source_id=$3), \
+                 (SELECT vector_norm(embedding) FROM semantic_embeddings \
+                  WHERE community_id=$1 AND generation_id=$2 \
+                    AND unit_set_id=$4 AND unit_key='overview')",
+        )
+        .bind(community_id)
+        .bind(rollback_generation_id)
+        .bind(source_id)
+        .bind(unit_set_id)
+        .fetch_one(&pool)
+        .await
+        .expect("rollback-ready generation remains intact");
+        assert_eq!(rollback_state, (1, "succeeded".to_string(), 7, 1.0));
+
+        let repeated = db
+            .repair_active_semantic_query_vectors(community)
+            .await
+            .expect("repeat repair is idempotent");
+        assert_eq!(repeated.current_heads_scanned, 0);
+        assert_eq!(repeated.heads_invalidated, 0);
+        assert_eq!(repeated.jobs_created, 0);
+        assert_eq!(repeated.jobs_requeued, 0);
+
+        sqlx::query(
+            "DELETE FROM semantic_index_jobs \
+             WHERE community_id=$1 AND generation_id=$2 \
+               AND source_family='project_document' AND source_id=$3",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .expect("simulate a GC-removed completed active-generation job");
+        sqlx::query(
+            "INSERT INTO semantic_source_generation_heads (\
+                 community_id,generation_id,source_family,source_subtype,source_id,\
+                 unit_set_id,source_invalidation_epoch,source_snapshot_digest,\
+                 complete_unit_count,complete_embedding_count) \
+             VALUES ($1,$2,'project_document','document',$3,$4,1,$5,1,1)",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(source_id)
+        .bind(unit_set_id)
+        .bind(snapshot_digest.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("restore a historical zero head without its completed job");
+        let recreated = db
+            .repair_active_semantic_query_vectors(community)
+            .await
+            .expect("repair creates a missing exact source-generation job");
+        assert_eq!(recreated.zero_vector_current_heads, 1);
+        assert_eq!(recreated.heads_invalidated, 1);
+        assert_eq!(recreated.jobs_created, 1);
+        assert_eq!(recreated.jobs_requeued, 0);
+
+        let lease = db
+            .claim_due_semantic_job(60)
+            .await
+            .expect("claim repaired source job")
+            .expect("repaired source job is due");
+        assert_eq!(lease.generation_id, generation_id);
+        assert_eq!(
+            db.prepare_semantic_claim_observation(&lease, &observation)
+                .await
+                .expect("prepare repaired source observation"),
+            crate::semantic::SemanticClaimObservationOutcome::Ready
+        );
+        let inputs = [buzz_semantic::SemanticEncoderInput::from_unit(&unit)];
+        let encoded = buzz_semantic::SemanticEncoder::encode(&encoder, &inputs)
+            .await
+            .expect("re-encode repaired overview");
+        assert_eq!(
+            db.activate_semantic_claim(
+                &lease,
+                &observation,
+                std::slice::from_ref(&unit),
+                &encoded,
+            )
+            .await
+            .expect("reactivate repaired source"),
+            crate::semantic::SemanticActivationOutcome::Activated
+        );
+        let recovered = db
+            .repair_active_semantic_query_vectors(community)
+            .await
+            .expect("inspect recovered active generation");
+        assert_eq!(recovered.current_heads_scanned, 1);
+        assert_eq!(recovered.queryable_current_heads, 1);
+        assert_eq!(recovered.zero_vector_current_heads, 0);
+        assert_eq!(recovered.other_nonqueryable_current_heads, 0);
+        assert_eq!(recovered.heads_invalidated, 0);
+        assert_eq!(
+            db.semantic_graph_query_readiness(community)
+                .await
+                .expect("repaired active head passes readiness")
+                .non_queryable_current_heads,
+            0
+        );
+        let active_norm: f64 = sqlx::query_scalar(
+            "SELECT vector_norm(embedding) FROM semantic_embeddings \
+             WHERE community_id=$1 AND generation_id=$2 \
+               AND unit_set_id=$3 AND unit_key='overview'",
+        )
+        .bind(community_id)
+        .bind(generation_id)
+        .bind(unit_set_id)
+        .fetch_one(&pool)
+        .await
+        .expect("historical zero row replaced by worker activation");
+        assert!(active_norm > 0.0);
+    }
+
+    #[tokio::test]
     #[ignore = "requires Postgres and CREATE DATABASE"]
     async fn checked_in_schema_builds_project_view_without_a_migration_ledger() {
         let admin_url = isolated_test_database_url();
@@ -1848,14 +2477,17 @@ mod tests {
                 .await
                 .expect("inspect migration ledger");
         assert!(!has_ledger);
-        let (project_view_enabled, project_document_enabled, project_context_edge_enabled): (
-            bool,
-            bool,
-            bool,
-        ) = sqlx::query_as(
+        let (
+            project_view_enabled,
+            project_document_enabled,
+            project_context_edge_enabled,
+            semantic_index_enabled,
+            semantic_graph_query_enabled,
+        ): (bool, bool, bool, bool, bool) = sqlx::query_as(
             "INSERT INTO communities (id, host) VALUES ($1, $2) \
              RETURNING project_view_enabled, project_document_enabled, \
-                       project_context_edge_enabled",
+                       project_context_edge_enabled, semantic_index_enabled, \
+                       semantic_graph_query_enabled",
         )
         .bind(uuid::Uuid::new_v4())
         .bind(format!("schema-{}.test", uuid::Uuid::new_v4().simple()))
@@ -1865,6 +2497,8 @@ mod tests {
         assert!(!project_view_enabled);
         assert!(!project_document_enabled);
         assert!(!project_context_edge_enabled);
+        assert!(!semantic_index_enabled);
+        assert!(!semantic_graph_query_enabled);
         for relation in [
             "project_view_state",
             "project_view_objects",
@@ -1879,6 +2513,8 @@ mod tests {
             "project_context_edge_coordinates",
             "project_context_document_bindings",
             "project_context_edge_changes",
+            "semantic_query_provider_admission",
+            "semantic_graph_http_fleet_attestations",
         ] {
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                 .bind(format!("public.{relation}"))
@@ -1887,6 +2523,19 @@ mod tests {
                 .unwrap_or_else(|error| panic!("inspect {relation}: {error}"));
             assert!(exists, "{relation} must exist in checked-in schema");
         }
+        let query_constraints: (bool, bool) = sqlx::query_as(
+            "SELECT \
+                 (SELECT convalidated FROM pg_constraint \
+                  WHERE conrelid='events'::regclass \
+                    AND conname='events_kind_not_semantic_graph_query_result'), \
+                 (SELECT convalidated FROM pg_constraint \
+                  WHERE conrelid='semantic_embeddings'::regclass \
+                    AND conname='semantic_embeddings_nonzero_cosine')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect fresh semantic-query constraints");
+        assert_eq!(query_constraints, (true, true));
 
         pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -2237,7 +2886,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(58));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -2344,7 +2993,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade scratch database through 0051");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(58));
         let flags: Vec<(uuid::Uuid, bool, i16)> = sqlx::query_as(
             "SELECT id, project_view_enabled, project_view_schema_version \
              FROM communities ORDER BY id",
@@ -2555,7 +3204,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade scratch database through 0051");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(58));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -2633,7 +3282,7 @@ mod tests {
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(57));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(58));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -2721,7 +3370,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(58));
     }
 
     #[tokio::test]

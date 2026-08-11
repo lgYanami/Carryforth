@@ -868,7 +868,10 @@ claim latest due job
 → claim_id + lease_until fence
 → read current canonical source observation
 → extract complete unit set
-→ generate or reuse embeddings outside DB transaction
+→ reuse an exact embedding, or reserve Provider capacity and wait outside DB transaction
+→ after wait, atomically revalidate Community gate + exact generation contract/lifecycle
+  + exact claim/lease/current epoch + exact eligible source basis/snapshot
+→ commit one non-reusable egress permit and immediately hand off to Provider
 → stage unit set + embeddings
 → re-read source currentness
 → CAS activate complete source-generation head
@@ -885,7 +888,20 @@ claim latest due job
 - graceful shutdown；
 - stale claim不能 complete新claim；
 - source改变时旧结果不能激活；
+- Provider slot reservation只代表容量，不代表出域授权；
+- slot等待期间提交的capability关闭或canonical title / summary变化必须让最终短writer
+  `REPEATABLE READ`重验失败并保持零出域；已预约slot允许浪费，但不得复用；
+- 最终permit commit后除同步metrics外必须直接调用Provider，不得插入另一个await窗口；
 - retry不重复创建多个 current set。
+
+最终事务的并发合同是严格的 writer-first / permit-first 二选一：Foundation disable 与 permit 竞争同一
+Community row；Project View / Document 的 canonical writer 在 source trigger 中更新
+`semantic_sources`，Meeting 的 Session summary / End、Channel name / delete 与 runtime phase writer 也全部经同一
+trigger 更新该 row；trigger随后才coalesce job。permit按Community、generation、source、job顺序持有共享锁到
+commit。若writer先持锁并在permit的`REPEATABLE READ` snapshot建立后提交，PostgreSQL返回`40001`而不是让
+旧版本取得row lock，DB adapter把它归一为闭集`Unavailable`；若permit先持锁，writer等待permit commit，该
+Provider batch按permit-first线性化。自动化并发回归会先确认permit确实阻塞在Community/source writer上，再
+提交writer，并要求最终只返回`Unavailable`。
 
 ### 9.3 原子 unit-set 激活
 
@@ -915,6 +931,8 @@ claim latest due job
 - timeout、rate limit、batch和重试明确；
 - provider关闭或故障时source写入继续成功；
 - 未启用 Community的内容不能发送给provider。
+- Community gate、generation、claim / lease / epoch、source basis / snapshot / eligibility必须在
+  Provider等待之后的同一个最终transaction中全部通过，不能依赖等待前的observation或reservation。
 
 ### 9.6 Metrics 与可观测性
 
@@ -1194,7 +1212,8 @@ Semantic schema / DB故障
 9. Edge绑定三份Context Document时只存在三份Document语义，不存在第四份Edge语义；
 10. detach Context Document不删除它作为普通Document的embedding；
 11. provider停机时source写入继续成功，coverage进入missing / failed；
-12. worker在source并发更新后不能激活旧basis；
+12. worker在source并发更新后不能激活旧basis；若更新在Provider slot等待期间先提交，旧title / summary还必须
+    保持零Provider出域；
 13. Community A不能观察Community B的索引状态或向量；
 14. 清空semantic派生数据后能完整重建；
 15. generation切换和rollback不修改任何业务revision；

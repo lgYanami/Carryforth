@@ -79,6 +79,10 @@ pub mod relay_members;
 pub mod replica_fence;
 /// Project Context semantic-index deployment probes and derived state.
 pub mod semantic;
+/// Durable deployment-fleet fence for semantic graph HTTP queries.
+pub mod semantic_fleet;
+/// Current, authorized Project Context semantic graph exact reads.
+pub mod semantic_query;
 /// Thread metadata persistence.
 pub mod thread;
 /// Per-community usage rollup queries for Prometheus gauges.

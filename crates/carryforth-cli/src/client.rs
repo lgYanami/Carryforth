@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
+use buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT;
+use buzz_semantic_query::SemanticGraphQuery;
+use nostr::{EventBuilder, EventId, JsonUtil, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest, Sha256};
 
 use crate::error::CliError;
@@ -81,12 +83,17 @@ const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
 /// - `u` tag: the full request URL
 /// - `method` tag: HTTP method (GET, POST, PUT, DELETE)
 /// - `payload` tag: SHA-256 hex of the request body (if present)
-fn sign_nip98(
+struct Nip98Authorization {
+    header: String,
+    event_id: EventId,
+}
+
+fn sign_nip98_observed(
     keys: &Keys,
     method: &str,
     url: &str,
     body: Option<&[u8]>,
-) -> Result<String, CliError> {
+) -> Result<Nip98Authorization, CliError> {
     let mut tags = vec![
         Tag::parse(["u", url]).map_err(|e| CliError::Other(format!("tag error: {e}")))?,
         Tag::parse(["method", method]).map_err(|e| CliError::Other(format!("tag error: {e}")))?,
@@ -106,7 +113,19 @@ fn sign_nip98(
         .sign_with_keys(keys)
         .map_err(|e| CliError::Other(format!("NIP-98 signing failed: {e}")))?;
     let json = event.as_json();
-    Ok(format!("Nostr {}", B64.encode(json.as_bytes())))
+    Ok(Nip98Authorization {
+        header: format!("Nostr {}", B64.encode(json.as_bytes())),
+        event_id: event.id,
+    })
+}
+
+fn sign_nip98(
+    keys: &Keys,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> Result<String, CliError> {
+    sign_nip98_observed(keys, method, url, body).map(|authorization| authorization.header)
 }
 
 fn relay_server_tag(relay_url: &str) -> Option<String> {
@@ -128,6 +147,35 @@ const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
 /// Maximum seconds to honour a relay-provided `retry in Ns` hint from a 429.
 /// Defensive cap against pathological hints; real relay hints observed up to ~24 s.
 const RETRY_IN_MAX_SECS: u64 = 30;
+
+/// Dedicated total timeout for one non-replayed semantic graph query.
+const SEMANTIC_QUERY_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Independent cap for a non-success semantic query response body.
+const SEMANTIC_QUERY_ERROR_RESPONSE_BYTES: u64 = 16 * 1024;
+
+/// Byte-exact observation returned by one semantic HTTP attempt.
+#[derive(Debug)]
+pub(crate) struct SemanticQueryOnceResponse {
+    /// Canonical request serialized into the strict filter extension.
+    pub(crate) request: SemanticGraphQuery,
+    /// NIP-98 Event identity used for this exact attempt.
+    pub(crate) nip98_auth_event_id: EventId,
+    /// Exact bytes signed by NIP-98 and sent to `POST /query`.
+    pub(crate) exact_body: Vec<u8>,
+    /// Exact successful response body bytes.
+    pub(crate) response_body: Vec<u8>,
+}
+
+#[derive(serde::Serialize)]
+struct SemanticGraphQueryFilter<'a> {
+    kinds: [u32; 1],
+    authors: [String; 1],
+    #[serde(rename = "#p")]
+    caller: [String; 1],
+    limit: u8,
+    buzz_project_context_semantic: &'a SemanticGraphQuery,
+}
 
 /// Result of the Project-command transport policy. An ambiguous outcome must
 /// be resolved by an exact immutable revision read-back before it is reported
@@ -884,6 +932,87 @@ impl CarryforthClient {
         .await
     }
 
+    /// Send one semantic Project Context query exactly once.
+    ///
+    /// Unlike ordinary read helpers, this method never enters
+    /// [`Self::with_retry_body`]. It canonicalizes the closed request, builds
+    /// the exclusive single-filter extension, serializes the body once, signs
+    /// one NIP-98 Event over those exact bytes, and performs one HTTP attempt
+    /// with a fixed 45-second total timeout. Any connect, timeout, response,
+    /// body-transfer, or decode failure is returned without replay.
+    pub(crate) async fn semantic_query_once(
+        &self,
+        relay_pubkey: &PublicKey,
+        request: SemanticGraphQuery,
+    ) -> Result<SemanticQueryOnceResponse, CliError> {
+        let request = request
+            .validate_and_canonicalize()
+            .map_err(|error| CliError::Usage(format!("invalid semantic graph query: {error}")))?;
+        let filter = SemanticGraphQueryFilter {
+            kinds: [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
+            authors: [relay_pubkey.to_hex()],
+            caller: [self.public_key().to_hex()],
+            limit: 1,
+            buzz_project_context_semantic: &request,
+        };
+        let exact_body = serde_json::to_vec(&[filter])
+            .map_err(|error| CliError::Other(format!("filter serialization failed: {error}")))?;
+        let url = format!("{}/query", self.relay_url);
+        let authorization = sign_nip98_observed(&self.keys, "POST", &url, Some(&exact_body))?;
+
+        let response = self
+            .with_auth_tag(
+                self.http
+                    .post(&url)
+                    .timeout(SEMANTIC_QUERY_TIMEOUT)
+                    .header("Authorization", authorization.header)
+                    .header("Content-Type", "application/json")
+                    .body(exact_body.clone()),
+            )
+            .send()
+            .await?;
+        let status = response.status();
+        let response_limit = if status.is_success() {
+            u64::from(request.budget.max_response_bytes)
+        } else {
+            SEMANTIC_QUERY_ERROR_RESPONSE_BYTES
+        };
+        let response_body = read_bounded_semantic_query_response(response, response_limit)
+            .await
+            .map_err(|error| match error {
+                BoundedSemanticResponseError::Network(error) => CliError::Network(error),
+                BoundedSemanticResponseError::TooLarge if status.is_success() => CliError::Other(
+                    "invalid:semantic_graph_query:success_response_too_large".to_owned(),
+                ),
+                BoundedSemanticResponseError::TooLarge => CliError::Relay {
+                    status: status.as_u16(),
+                    body: "invalid:semantic_graph_query:error_response_too_large".to_owned(),
+                },
+            })?;
+        if !status.is_success() {
+            let raw = String::from_utf8_lossy(&response_body).into_owned();
+            let mut message = extract_relay_message_field(&raw).unwrap_or(raw);
+            if status == reqwest::StatusCode::FORBIDDEN
+                && std::env::var("CARRYFORTH_AUTH_TAG").is_ok()
+            {
+                message.push_str(
+                    " (CARRYFORTH_AUTH_TAG is set — it may be stale or revoked; try unsetting it)",
+                );
+            }
+            return Err(CliError::Relay {
+                status: status.as_u16(),
+                body: message,
+            });
+        }
+
+        Ok(SemanticQueryOnceResponse {
+            request,
+            nip98_auth_event_id: authorization.event_id,
+            exact_body,
+            response_body,
+        })
+    }
+
     /// Execute a one-shot count via the HTTP bridge.
     /// Returns the count as a JSON string.
     #[allow(dead_code)]
@@ -1566,6 +1695,42 @@ impl CarryforthClient {
     }
 }
 
+enum BoundedSemanticResponseError {
+    Network(reqwest::Error),
+    TooLarge,
+}
+
+async fn read_bounded_semantic_query_response(
+    mut response: reqwest::Response,
+    maximum: u64,
+) -> Result<Vec<u8>, BoundedSemanticResponseError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum)
+    {
+        return Err(BoundedSemanticResponseError::TooLarge);
+    }
+    let maximum = usize::try_from(maximum).map_err(|_| BoundedSemanticResponseError::TooLarge)?;
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(BoundedSemanticResponseError::Network)?
+    {
+        let remaining = maximum.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(BoundedSemanticResponseError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Normalize a relay URL: ws:// → http://, wss:// → https://, strip trailing slash.
 /// CARRYFORTH_RELAY_URL may be ws/wss (copied from MCP config).
 pub fn normalize_relay_url(url: &str) -> String {
@@ -1709,6 +1874,389 @@ pub fn normalize_write_response(raw: &str) -> String {
         }
     }
     raw.to_string()
+}
+
+#[cfg(test)]
+mod semantic_query_once_tests {
+    use std::collections::BTreeSet;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::{Body, Bytes};
+    use axum::extract::State;
+    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::{HeaderMap, Response, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use buzz_project_context::ProjectContextCoordinate;
+    use buzz_project_view::ProjectViewObjectType;
+    use buzz_semantic::Digest32;
+    use buzz_semantic_query::{
+        derive_http_request_binding, verify_http_request_binding, LifecycleFilter,
+        SemanticGraphQuery, SemanticGraphQueryBudget,
+    };
+    use futures_util::stream;
+    use nostr::{Event, JsonUtil, Keys};
+    use serde_json::{json, Value};
+    use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
+
+    use super::{
+        CarryforthClient, SemanticGraphQueryFilter, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+        SEMANTIC_QUERY_ERROR_RESPONSE_BYTES, SEMANTIC_QUERY_TIMEOUT,
+    };
+
+    #[derive(Clone)]
+    struct CaptureState {
+        count: Arc<AtomicUsize>,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        authorization: Arc<Mutex<Vec<String>>>,
+        status: StatusCode,
+        response_body: Arc<Vec<u8>>,
+        chunked_response: bool,
+    }
+
+    async fn capture_query(
+        State(state): State<CaptureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response<Body> {
+        state.count.fetch_add(1, Ordering::SeqCst);
+        state
+            .bodies
+            .lock()
+            .expect("body capture lock")
+            .push(body.to_vec());
+        state
+            .authorization
+            .lock()
+            .expect("authorization capture lock")
+            .push(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        let (response, body) = if state.chunked_response {
+            let chunks = state
+                .response_body
+                .chunks(3)
+                .map(|chunk| Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            (
+                Response::builder().status(state.status),
+                Body::from_stream(stream::iter(chunks)),
+            )
+        } else {
+            (
+                Response::builder()
+                    .status(state.status)
+                    .header(CONTENT_LENGTH, state.response_body.len()),
+                Body::from(state.response_body.as_ref().clone()),
+            )
+        };
+        response.body(body).expect("semantic fixture response")
+    }
+
+    async fn spawn_server(state: CaptureState) -> String {
+        let app = Router::new()
+            .route("/query", post(capture_query))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind semantic query server");
+        let address = listener.local_addr().expect("semantic server address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve semantic query fixture");
+        });
+        format!("http://{address}")
+    }
+
+    fn request(project_id: Uuid) -> SemanticGraphQuery {
+        SemanticGraphQuery {
+            request_id: Uuid::new_v4(),
+            project_id,
+            problem: "why did this incident recur?".to_owned(),
+            initial_coordinates: Vec::new(),
+            context_coordinates: Vec::new(),
+            lifecycle_filter: LifecycleFilter::AllCurrent,
+            budget: SemanticGraphQueryBudget::default(),
+        }
+    }
+
+    fn state(status: StatusCode) -> CaptureState {
+        CaptureState {
+            count: Arc::new(AtomicUsize::new(0)),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+            authorization: Arc::new(Mutex::new(Vec::new())),
+            status,
+            response_body: Arc::new(b"[]".to_vec()),
+            chunked_response: false,
+        }
+    }
+
+    fn state_with_response(
+        status: StatusCode,
+        response_body: Vec<u8>,
+        chunked_response: bool,
+    ) -> CaptureState {
+        CaptureState {
+            response_body: Arc::new(response_body),
+            chunked_response,
+            ..state(status)
+        }
+    }
+
+    #[test]
+    fn semantic_filter_wire_is_unversioned_closed_and_preserves_context_selectors() {
+        let relay = Keys::generate().public_key();
+        let caller = Keys::generate().public_key();
+        let mut query = request(Uuid::new_v4());
+        let issue_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        query.initial_coordinates = vec![ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Issue,
+            object_id: issue_id,
+        }];
+        query.context_coordinates = vec![ProjectContextCoordinate::Document { document_id }];
+        query.lifecycle_filter = LifecycleFilter::TerminalOnly;
+        query.budget.max_paths = 7;
+        let filter = SemanticGraphQueryFilter {
+            kinds: [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
+            authors: [relay.to_hex()],
+            caller: [caller.to_hex()],
+            limit: 1,
+            buzz_project_context_semantic: &query,
+        };
+        let value = serde_json::to_value(filter).expect("semantic filter wire");
+        assert_eq!(
+            value["buzz_project_context_semantic"]["problem"],
+            query.problem
+        );
+        assert_eq!(
+            value["buzz_project_context_semantic"]["lifecycle_filter"],
+            "terminal_only"
+        );
+        assert_eq!(
+            value["buzz_project_context_semantic"]["initial_coordinates"][0]["coordinate_type"],
+            "project_view_object"
+        );
+        assert_eq!(
+            value["buzz_project_context_semantic"]["context_coordinates"][0]["document_id"],
+            document_id.to_string()
+        );
+        assert_eq!(
+            value["buzz_project_context_semantic"]["budget"]["max_paths"],
+            7
+        );
+        assert!(value["buzz_project_context_semantic"]
+            .get("schema_version")
+            .is_none());
+        assert_eq!(
+            value
+                .as_object()
+                .expect("filter object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "#p",
+                "authors",
+                "buzz_project_context_semantic",
+                "kinds",
+                "limit",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_query_freezes_exact_filter_auth_event_and_binding_observation() {
+        let state = state(StatusCode::OK);
+        let url = spawn_server(state.clone()).await;
+        let caller = Keys::generate();
+        let relay = Keys::generate();
+        let project_id = Uuid::new_v4();
+        let client = CarryforthClient::new(url, caller.clone(), None, None).expect("client");
+        let response = client
+            .semantic_query_once(&relay.public_key(), request(project_id))
+            .await
+            .expect("one semantic request");
+
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        let bodies = state.bodies.lock().expect("body capture lock");
+        assert_eq!(bodies.as_slice(), [response.exact_body.as_slice()]);
+        let filters: Vec<Value> =
+            serde_json::from_slice(&response.exact_body).expect("strict filter body");
+        let [filter] = filters.as_slice() else {
+            panic!("semantic body must contain one filter");
+        };
+        let keys = filter
+            .as_object()
+            .expect("filter object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "#p",
+                "authors",
+                "buzz_project_context_semantic",
+                "kinds",
+                "limit",
+            ])
+        );
+        assert_eq!(filter["kinds"], json!([KIND_SEMANTIC_GRAPH_QUERY_RESULT]));
+        assert_eq!(filter["authors"], json!([relay.public_key().to_hex()]));
+        assert_eq!(filter["#p"], json!([caller.public_key().to_hex()]));
+        assert_eq!(filter["limit"], json!(1));
+        assert_eq!(
+            filter["buzz_project_context_semantic"],
+            serde_json::to_value(&response.request).expect("request value")
+        );
+        drop(bodies);
+
+        let authorization = state
+            .authorization
+            .lock()
+            .expect("authorization capture lock")[0]
+            .clone();
+        let encoded = authorization
+            .strip_prefix("Nostr ")
+            .expect("NIP-98 authorization scheme");
+        let event_json =
+            String::from_utf8(base64::Engine::decode(&super::B64, encoded).expect("NIP-98 base64"))
+                .expect("NIP-98 UTF-8");
+        let auth_event = Event::from_json(event_json).expect("NIP-98 Event");
+        auth_event.verify().expect("NIP-98 signature");
+        assert_eq!(auth_event.id, response.nip98_auth_event_id);
+        let auth_tags = auth_event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice())
+            .collect::<Vec<_>>();
+        assert!(auth_tags.iter().any(|tag| *tag == ["method", "POST"]));
+        let payload = hex::encode(Sha256::digest(&response.exact_body));
+        assert!(auth_tags
+            .iter()
+            .any(|tag| *tag == ["payload", payload.as_str()]));
+
+        let binding = derive_http_request_binding(
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("derive exact binding");
+        verify_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("verify exact binding");
+        let mut changed = response.exact_body.clone();
+        changed.push(b' ');
+        assert!(verify_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &changed,
+        )
+        .is_err());
+        assert_eq!(response.response_body, b"[]");
+        assert_eq!(SEMANTIC_QUERY_TIMEOUT, std::time::Duration::from_secs(45));
+    }
+
+    #[tokio::test]
+    async fn semantic_query_does_not_retry_a_transient_relay_status() {
+        let state = state(StatusCode::SERVICE_UNAVAILABLE);
+        let url = spawn_server(state.clone()).await;
+        let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+        let error = client
+            .semantic_query_once(&Keys::generate().public_key(), request(Uuid::new_v4()))
+            .await
+            .expect_err("503 must be returned without replay");
+        assert!(matches!(
+            error,
+            crate::error::CliError::Relay { status: 503, .. }
+        ));
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .authorization
+                .lock()
+                .expect("authorization capture lock")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_query_rejects_success_content_length_above_request_budget_once() {
+        let state = state_with_response(StatusCode::OK, b"oversized".to_vec(), false);
+        let url = spawn_server(state.clone()).await;
+        let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+        let mut query = request(Uuid::new_v4());
+        query.budget.max_response_bytes = 4;
+        let error = client
+            .semantic_query_once(&Keys::generate().public_key(), query)
+            .await
+            .expect_err("oversized successful Content-Length must fail closed");
+        assert!(matches!(
+            error,
+            crate::error::CliError::Other(ref message)
+                if message == "invalid:semantic_graph_query:success_response_too_large"
+        ));
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_query_enforces_stream_limit_without_content_length_once() {
+        let state = state_with_response(StatusCode::OK, b"oversized".to_vec(), true);
+        let url = spawn_server(state.clone()).await;
+        let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+        let mut query = request(Uuid::new_v4());
+        query.budget.max_response_bytes = 4;
+        let error = client
+            .semantic_query_once(&Keys::generate().public_key(), query)
+            .await
+            .expect_err("oversized chunked success response must fail closed");
+        assert!(matches!(
+            error,
+            crate::error::CliError::Other(ref message)
+                if message == "invalid:semantic_graph_query:success_response_too_large"
+        ));
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_query_caps_non_success_body_independently_without_retry() {
+        let error_body = vec![b'x'; SEMANTIC_QUERY_ERROR_RESPONSE_BYTES as usize + 1];
+        let state = state_with_response(StatusCode::SERVICE_UNAVAILABLE, error_body, false);
+        let url = spawn_server(state.clone()).await;
+        let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+        let mut query = request(Uuid::new_v4());
+        query.budget.max_response_bytes = 1;
+        let error = client
+            .semantic_query_once(&Keys::generate().public_key(), query)
+            .await
+            .expect_err("oversized error response must fail closed");
+        assert!(matches!(
+            error,
+            crate::error::CliError::Relay {
+                status: 503,
+                ref body,
+            } if body == "invalid:semantic_graph_query:error_response_too_large"
+        ));
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[cfg(test)]

@@ -4898,6 +4898,7 @@ mod agent_draft_prompt_tests {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("| `cf project-context` |"));
         for command in [
+            "`semantic-query`",
             "`exact`",
             "`incident`",
             "`contains-all`",

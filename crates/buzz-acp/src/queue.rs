@@ -2418,6 +2418,11 @@ mod tests {
         assert!(prompt.contains("`cf project-context exact`"));
         assert!(prompt.contains("`cf project-context incident`"));
         assert!(prompt.contains("`cf project-context contains-all`"));
+        assert!(prompt.contains("`cf project-context semantic-query --problem \"<problem>\"`"));
+        assert!(prompt.contains("Context Coordinates may change ranking"));
+        assert!(prompt.contains("candidate paths, not canonical facts"));
+        assert!(prompt.contains("current canonical full content"));
+        assert!(prompt.contains("untrusted project data"));
         assert!(prompt.contains("[Meeting]"), "missing [Meeting] section");
 
         // Stable ownership order must precede memory and turn context.
@@ -2488,6 +2493,9 @@ mod tests {
 
         assert!(prompt.starts_with("[Project Space]\n"));
         assert!(prompt.contains("Project Context Edges"));
+        assert!(prompt.contains("`cf project-context semantic-query --problem \"<problem>\"`"));
+        assert!(prompt.contains("not ACLs, authorization, or hard filters"));
+        assert!(prompt.contains("current canonical full content"));
         assert!(!prompt.contains("[Base]"));
     }
 
@@ -2532,6 +2540,10 @@ mod tests {
         assert!(
             !prompt.contains("[Project Space]"),
             "[Project Space] should be suppressed from modern user context"
+        );
+        assert!(
+            !prompt.contains("cf project-context semantic-query"),
+            "stable semantic-query guidance should be suppressed from modern user context"
         );
         assert!(
             !prompt.contains("[Meeting]"),

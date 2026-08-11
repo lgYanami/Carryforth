@@ -24,6 +24,8 @@ pub(crate) const SUPPORTED_NIPS: &[u32] = &[1, 2, 10, 11, 16, 17, 23, 25, 29, 33
 pub(crate) const NIP_RELAY_MEMBERSHIP: u32 = 43;
 const PROJECT_CONTEXT_EXTENSION: &str = "buzz-project-context-v1";
 const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
+pub(crate) const SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION: &str =
+    "buzz-project-context-semantic-query-http";
 pub(crate) const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
 pub(crate) const MEETING_V2_CREATE_EXTENSION: &str = "buzz-meeting-v2-create";
 pub(crate) const MEETING_V2_DIRECT_ACTIONS_EXTENSION: &str = "buzz-meeting-v2-direct-actions";
@@ -32,6 +34,27 @@ pub(crate) const MEETING_V2_DIRECT_ACTIONS_CREATE_EXTENSION: &str =
 pub(crate) const MEETING_SUMMARY_EXTENSION: &str = "buzz-meeting-summary-v1";
 /// Community-wide Meeting history/read authorization contract.
 pub(crate) const MEETING_COMMUNITY_READ_EXTENSION: &str = "buzz-meeting-community-read-v1";
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticGraphHttpCapabilityFacts {
+    database_ready: bool,
+    query_enabled: bool,
+    project_context_ready: bool,
+    deployment_master: bool,
+    stable_signer: bool,
+    provider_available: bool,
+    fleet_attested: bool,
+}
+
+const fn semantic_graph_http_capability_ready(facts: SemanticGraphHttpCapabilityFacts) -> bool {
+    facts.database_ready
+        && facts.query_enabled
+        && facts.project_context_ready
+        && facts.deployment_master
+        && facts.stable_signer
+        && facts.provider_available
+        && facts.fleet_attested
+}
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,10 +254,17 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         MEETING_COMMUNITY_READ_EXTENSION,
         meeting_community_read_ready,
     );
+    let project_context_edge_ready =
+        project_context_edge_ready_for_host(state, raw_host, meeting_community_read_ready).await;
     append_extension(
         &mut info,
         PROJECT_CONTEXT_CAPABILITY,
-        project_context_edge_ready_for_host(state, raw_host, meeting_community_read_ready).await,
+        project_context_edge_ready,
+    );
+    append_extension(
+        &mut info,
+        SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+        semantic_graph_query_http_ready_for_host(state, raw_host, project_context_edge_ready).await,
     );
     append_project_document_extension(
         &mut info,
@@ -314,6 +344,54 @@ async fn project_context_edge_ready_for_host(
             tracing::warn!(
                 community_id = %tenant.community(),
                 "Project Context Edge NIP-11 readiness failed closed: {error}"
+            );
+            false
+        }
+    }
+}
+
+async fn semantic_graph_query_http_ready_for_host(
+    state: &crate::state::AppState,
+    raw_host: &str,
+    project_context_ready: bool,
+) -> bool {
+    let deployment_master = state.config.semantic_graph_query_http_available;
+    let stable_signer = state.config.relay_private_key.is_some();
+
+    if !deployment_master || !stable_signer || !project_context_ready {
+        return false;
+    }
+
+    let provider_available = matches!(state.semantic_provider(), Ok(Some(_)));
+    if !provider_available {
+        return false;
+    }
+    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
+        return false;
+    };
+    let fleet_attested =
+        crate::semantic_fleet::semantic_graph_http_fleet_ready(state, tenant.community()).await;
+    if !fleet_attested {
+        return false;
+    }
+    match state
+        .db
+        .semantic_graph_query_readiness(tenant.community())
+        .await
+    {
+        Ok(readiness) => semantic_graph_http_capability_ready(SemanticGraphHttpCapabilityFacts {
+            database_ready: readiness.database_ready(),
+            query_enabled: readiness.query_enabled,
+            project_context_ready,
+            deployment_master,
+            stable_signer,
+            provider_available,
+            fleet_attested,
+        }),
+        Err(error) => {
+            tracing::warn!(
+                community_id = %tenant.community(),
+                "Semantic graph HTTP NIP-11 readiness failed closed: {error}"
             );
             false
         }
@@ -835,6 +913,81 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn semantic_graph_http_capability_requires_every_readiness_fence() {
+        let ready = SemanticGraphHttpCapabilityFacts {
+            database_ready: true,
+            query_enabled: true,
+            project_context_ready: true,
+            deployment_master: true,
+            stable_signer: true,
+            provider_available: true,
+            fleet_attested: true,
+        };
+        assert!(semantic_graph_http_capability_ready(ready));
+        for blocked in [
+            SemanticGraphHttpCapabilityFacts {
+                database_ready: false,
+                ..ready
+            },
+            SemanticGraphHttpCapabilityFacts {
+                query_enabled: false,
+                ..ready
+            },
+            SemanticGraphHttpCapabilityFacts {
+                project_context_ready: false,
+                ..ready
+            },
+            SemanticGraphHttpCapabilityFacts {
+                deployment_master: false,
+                ..ready
+            },
+            SemanticGraphHttpCapabilityFacts {
+                stable_signer: false,
+                ..ready
+            },
+            SemanticGraphHttpCapabilityFacts {
+                provider_available: false,
+                ..ready
+            },
+            SemanticGraphHttpCapabilityFacts {
+                fleet_attested: false,
+                ..ready
+            },
+        ] {
+            assert!(!semantic_graph_http_capability_ready(blocked));
+        }
+    }
+
+    #[test]
+    fn semantic_graph_http_advertisement_stays_fail_closed_when_fleet_check_fails() {
+        let mut info = RelayInfo::build(
+            Some("0000000000000000000000000000000000000000000000000000000000000001"),
+            None,
+            false,
+            true,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+        );
+        append_extension(
+            &mut info,
+            SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+            semantic_graph_http_capability_ready(SemanticGraphHttpCapabilityFacts {
+                database_ready: true,
+                query_enabled: true,
+                project_context_ready: true,
+                deployment_master: true,
+                stable_signer: true,
+                provider_available: true,
+                fleet_attested: false,
+            }),
+        );
+        assert!(!info
+            .supported_extensions
+            .unwrap_or_default()
+            .contains(&SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION.to_owned()));
     }
 
     #[test]

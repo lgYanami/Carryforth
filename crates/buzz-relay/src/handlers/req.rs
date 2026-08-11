@@ -9,7 +9,7 @@ use buzz_core::filter::filters_match;
 use buzz_core::kind::{
     has_indexed_d_tag, is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM,
     KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_PERSONA, KIND_PROJECT_CONTEXT_EDGE_BINDING,
-    P_GATED_KINDS, RESULT_GATED_KINDS,
+    KIND_SEMANTIC_GRAPH_QUERY_RESULT, P_GATED_KINDS, RESULT_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -40,6 +40,16 @@ pub(crate) const FILTER_QUERY_CONCURRENCY: usize = 4;
 // reconsidering pool contention (see docs above). Compile-time — violating
 // the range fails the build.
 const _: () = assert!(FILTER_QUERY_CONCURRENCY >= 2 && FILTER_QUERY_CONCURRENCY <= 8);
+
+/// Return whether an ordinary filter explicitly requests the response-only
+/// semantic graph virtual result kind.
+pub(crate) fn filter_explicitly_requests_semantic_graph_result(filter: &Filter) -> bool {
+    filter.kinds.as_ref().is_some_and(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| u32::from(kind.as_u16()) == KIND_SEMANTIC_GRAPH_QUERY_RESULT)
+    })
+}
 
 /// Result of the uncached, request-local Meeting reader gate.
 pub(crate) struct MeetingReadScope {
@@ -234,6 +244,21 @@ pub async fn handle_req(
             }
         }
     };
+
+    // The semantic graph result kind is a response-only HTTP virtual Event,
+    // never an ordinary WS subscription target. Kindless/by-id requests are
+    // still protected by the result-level delivery gate.
+    if filters
+        .iter()
+        .any(filter_explicitly_requests_semantic_graph_result)
+    {
+        board_read_observation.failed();
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:semantic_graph_query:http_only",
+        ));
+        return;
+    }
 
     let project_context_can_match = filters
         .iter()

@@ -520,6 +520,39 @@ Community member identity，不把 Role Assignment 或 Runtime fence 当作 Docu
 证明同一 signed command 已提交后报告成功；否则返回 exit 2
 `delivery_unknown`，调用者不得自动重签重发。
 
+### 6.14 Project Context semantic query
+
+The command is available only when NIP-11 advertises
+`buzz-project-context-semantic-query-http` and a canonical Relay `self` key.
+It resolves the current Project identity from the verified Project View v3
+snapshot before sending the query.
+
+```bash
+cf project-context semantic-query \
+  --problem "why did this release incident recur?" | jq .
+
+cf --format compact project-context semantic-query \
+  --problem "which work explains this requirement?" \
+  --initial-coordinate "requirement:${REQUIREMENT_ID}" \
+  --context-coordinate "work:${WORK_ID}" \
+  --lifecycle non-terminal \
+  --max-semantic-roots 4 \
+  --max-hops-per-path 2 | jq -c .
+```
+
+The unversioned output wrapper is `{result,read_commands}`. `result` is the
+unchanged SDK-verified, Relay-signed closed result DTO. `read_commands` is an
+unsigned deterministic convenience projection derived from returned canonical
+identities; it is sorted and deduplicated and must not be treated as signed
+result content. `--format compact` changes JSON whitespace only.
+
+A semantic query can incur Provider cost. The CLI serializes and NIP-98-signs
+the strict single-filter body once, sends exactly one HTTP attempt with a
+45-second total timeout, and never enters the ordinary `/query` retry loop.
+Timeout, body loss, 429, 502, 503, or 504 therefore returns an error without an
+automatic replay. A user-initiated rerun creates a new request UUID and auth
+Event.
+
 ---
 
 ## 7. Error Path Testing

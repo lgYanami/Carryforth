@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_i32, has_indexed_d_tag, is_ephemeral, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED,
+    KIND_HUDDLE_STARTED, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -395,6 +395,10 @@ pub(crate) async fn retire_projection_head_in_tx(
 /// Uses `QueryBuilder` for dynamic filter composition — avoids string concatenation
 /// while keeping all user values in bind parameters.
 pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEvent>> {
+    let semantic_graph_result_kind =
+        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
+            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_string())
+        })?;
     // Composite cursor requires both halves.
     if q.before_id.is_some() && q.until.is_none() {
         return Err(DbError::InvalidData(
@@ -454,6 +458,8 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND e.deleted_at IS NULL AND m.pubkey_hex = ");
         b.push_bind(p_hex.to_ascii_lowercase());
+        b.push(" AND e.kind <> ");
+        b.push_bind(semantic_graph_result_kind);
         b
     } else {
         let mut b = QueryBuilder::new(
@@ -462,6 +468,8 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
         );
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND deleted_at IS NULL");
+        b.push(" AND kind <> ");
+        b.push_bind(semantic_graph_result_kind);
         b
     };
 
@@ -679,6 +687,17 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
 
     let channel_id: Option<Uuid> = row.try_get("channel_id")?;
 
+    let semantic_graph_result_kind =
+        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
+            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_string())
+        })?;
+    // Defense in depth for generic by-id/import/read paths. Kind 40912 is a
+    // response-local virtual Event and must stay unreadable even if a corrupt
+    // backup or manual write bypassed the validated storage constraint.
+    if kind_i32 == semantic_graph_result_kind {
+        return Ok(None);
+    }
+
     // kind is stored as i32 (Postgres INT) but Nostr uses u16. Values > 65535 are corrupt.
     let kind_u16 = u16::try_from(kind_i32)
         .map_err(|_| DbError::InvalidData(format!("kind out of u16 range: {kind_i32}")))?;
@@ -714,6 +733,10 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
 ///
 /// Uses the same filter logic as `query_events` but returns only the count.
 pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
+    let semantic_graph_result_kind =
+        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
+            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_string())
+        })?;
     // Empty list means "match nothing" — return 0 immediately.
     if q.kinds.as_deref().is_some_and(|k| k.is_empty()) {
         return Ok(0);
@@ -752,11 +775,15 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND e.deleted_at IS NULL AND m.pubkey_hex = ");
         b.push_bind(p_hex.to_ascii_lowercase());
+        b.push(" AND e.kind <> ");
+        b.push_bind(semantic_graph_result_kind);
         b
     } else {
         let mut b = QueryBuilder::new("SELECT COUNT(*) as cnt FROM events WHERE community_id = ");
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND deleted_at IS NULL");
+        b.push(" AND kind <> ");
+        b.push_bind(semantic_graph_result_kind);
         b
     };
 

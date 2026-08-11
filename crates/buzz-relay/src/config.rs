@@ -58,7 +58,7 @@ pub struct SemanticWorkerConfig {
     pub request_model: Option<String>,
     /// Hard timeout for one provider request.
     pub request_timeout: Duration,
-    /// Minimum interval between provider requests in this process.
+    /// Minimum interval between provider requests at the shared DB gate.
     pub request_interval: Duration,
     /// Durable claim lease duration.
     pub claim_seconds: u16,
@@ -281,6 +281,16 @@ pub struct Config {
     /// Derived Project Context semantic worker/provider configuration.
     pub semantic_worker: SemanticWorkerConfig,
 
+    /// Deployment master for the semantic graph query HTTP runtime.
+    ///
+    /// This does not enable any Community and defaults to false. Community DB
+    /// readiness and the deployment fleet attestation remain separate gates.
+    pub semantic_graph_query_http_available: bool,
+    /// Deployment identity that must match the current operator fleet assertion.
+    pub semantic_graph_query_deployment_id: Option<String>,
+    /// Exact control-plane instance identity for this Relay Pod.
+    pub semantic_graph_query_instance_id: Option<String>,
+
     /// Optional override for ephemeral channel TTL (in seconds).
     /// When set, any channel created with a TTL tag will use this value instead
     /// of the client-provided one. Useful for testing ephemeral expiry quickly.
@@ -426,6 +436,58 @@ fn parse_bool(name: &str, default: bool) -> Result<bool, ConfigError> {
 
 fn parse_optional_bool(name: &str) -> Result<bool, ConfigError> {
     parse_bool(name, false)
+}
+
+fn parse_semantic_query_identity(name: &'static str) -> Result<Option<String>, ConfigError> {
+    let raw = match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "{name} must be valid UTF-8: {error}"
+            )));
+        }
+    };
+    validate_semantic_query_identity(name, raw)
+}
+
+fn validate_semantic_query_identity(
+    name: &'static str,
+    raw: Option<String>,
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
+        })
+    {
+        return Err(ConfigError::InvalidValue(format!(
+            "{name} must use the 1..=128 byte deployment identity grammar"
+        )));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn require_semantic_query_fleet_identities(
+    deployment_master: bool,
+    deployment_id: Option<&str>,
+    instance_id: Option<&str>,
+) -> Result<(), ConfigError> {
+    if deployment_master && (deployment_id.is_none() || instance_id.is_none()) {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE requires non-empty \
+             BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID and \
+             BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_git_repo_path(
@@ -856,6 +918,17 @@ impl Config {
             ));
         }
         let semantic_worker_enabled = parse_bool("BUZZ_SEMANTIC_WORKER_ENABLED", false)?;
+        let semantic_graph_query_http_available =
+            parse_bool("BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE", false)?;
+        let semantic_graph_query_deployment_id =
+            parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID")?;
+        let semantic_graph_query_instance_id =
+            parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")?;
+        require_semantic_query_fleet_identities(
+            semantic_graph_query_http_available,
+            semantic_graph_query_deployment_id.as_deref(),
+            semantic_graph_query_instance_id.as_deref(),
+        )?;
         let semantic_api_key = std::env::var("BUZZ_SEMANTIC_API_KEY")
             .ok()
             .map(|value| value.trim().to_string())
@@ -926,12 +999,20 @@ impl Config {
                 )
             })?;
         if semantic_worker_enabled
+            && u64::from(semantic_claim_seconds) <= semantic_request_timeout_secs
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_SEMANTIC_CLAIM_SECS must exceed BUZZ_SEMANTIC_REQUEST_TIMEOUT_SECS"
+                    .to_string(),
+            ));
+        }
+        if (semantic_worker_enabled || semantic_graph_query_http_available)
             && (semantic_api_key.is_none()
                 || semantic_base_url.is_none()
                 || semantic_request_model.is_none())
         {
             return Err(ConfigError::InvalidValue(
-                "BUZZ_SEMANTIC_WORKER_ENABLED requires provider key, base URL, and request model"
+                "semantic worker/query runtime requires provider key, base URL, and request model"
                     .to_string(),
             ));
         }
@@ -1067,6 +1148,9 @@ impl Config {
             runtime_supervision_batch_limit,
             runtime_supervision_claim_secs,
             semantic_worker,
+            semantic_graph_query_http_available,
+            semantic_graph_query_deployment_id,
+            semantic_graph_query_instance_id,
             ephemeral_ttl_override,
             git_repo_path,
             git_pack_cache_path,
@@ -1093,6 +1177,30 @@ mod tests {
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn semantic_query_fleet_identities_use_closed_grammar() {
+        assert_eq!(
+            validate_semantic_query_identity("TEST", Some(" prod/relay-0 ".to_owned()))
+                .expect("identity"),
+            Some("prod/relay-0".to_owned())
+        );
+        assert!(validate_semantic_query_identity("TEST", Some("relay 0".to_owned())).is_err());
+        assert!(validate_semantic_query_identity("TEST", Some("中".to_owned())).is_err());
+        assert_eq!(
+            validate_semantic_query_identity("TEST", Some("  ".to_owned())).expect("blank"),
+            None
+        );
+        assert!(require_semantic_query_fleet_identities(true, None, Some("relay-0")).is_err());
+        assert!(require_semantic_query_fleet_identities(true, Some("deployment-a"), None).is_err());
+        assert!(require_semantic_query_fleet_identities(
+            true,
+            Some("deployment-a"),
+            Some("relay-0")
+        )
+        .is_ok());
+        assert!(require_semantic_query_fleet_identities(false, None, None).is_ok());
+    }
 
     #[test]
     fn defaults_are_valid() {

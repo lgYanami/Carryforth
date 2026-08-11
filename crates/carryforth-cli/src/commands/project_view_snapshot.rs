@@ -42,6 +42,8 @@ pub(crate) const PROJECT_CONTEXT_EDGE_EXTENSION: &str =
     buzz_project_context::PROJECT_CONTEXT_CAPABILITY;
 const LEGACY_PROJECT_CONTEXT_EDGE_EXTENSION: &str = "buzz-project-context-edge-v1";
 pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
+pub(crate) const SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION: &str =
+    "buzz-project-context-semantic-query-http";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_OBJECT_PAGE_SIZE: usize = 500;
 const ENTITY_PAGE_SIZE: usize = 500;
@@ -64,6 +66,7 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) context_edge_enabled: bool,
     pub(crate) context_edge_migration_required: bool,
     pub(crate) document_enabled: bool,
+    pub(crate) semantic_query_http_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +158,10 @@ fn identity_from_nip11(
             .supported_extensions
             .iter()
             .any(|extension| extension == PROJECT_DOCUMENT_EXTENSION),
+        semantic_query_http_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION),
     })
 }
 
@@ -684,6 +691,7 @@ mod tests {
         identity_from_nip11, is_managed_runtime_value, runtime_fence_from_file,
         runtime_fence_from_legacy_env, v3_identity_from_nip11, Nip11Document, ProjectViewSchema,
         PROJECT_CONTEXT_EDGE_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
+        SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
     };
     use buzz_project_view::v2::RuntimeFence;
     use nostr::Keys;
@@ -742,6 +750,19 @@ mod tests {
         .expect("read frozen Project Context v1 identity");
         assert!(!context_v1.context_edge_enabled);
         assert!(context_v1.context_edge_migration_required);
+
+        let semantic = identity_from_nip11(
+            Nip11Document {
+                supported_extensions: vec![
+                    PROJECT_VIEW_V3_EXTENSION.to_owned(),
+                    SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION.to_owned(),
+                ],
+                relay_self: Some(Keys::generate().public_key().to_hex()),
+            },
+            ProjectViewSchema::V3,
+        )
+        .expect("read semantic query identity");
+        assert!(semantic.semantic_query_http_enabled);
     }
 
     #[test]

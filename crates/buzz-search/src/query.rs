@@ -8,7 +8,7 @@
 //!
 //! See conformance row 50.
 
-use buzz_core::CommunityId;
+use buzz_core::{kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT, CommunityId};
 use sqlx::{PgPool, QueryBuilder, Row};
 use uuid::Uuid;
 
@@ -240,6 +240,10 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     qb.push(" AS query) AS search_query WHERE community_id = ");
     qb.push_bind(*query.community.as_uuid());
     qb.push(" AND deleted_at IS NULL AND search_tsv @@ search_query.query");
+    // Kind 40912 is a response-local virtual Event. Keep FTS fail-closed even
+    // if a corrupt import bypasses the validated Event-store constraint.
+    qb.push(" AND kind <> ");
+    qb.push_bind(KIND_SEMANTIC_GRAPH_QUERY_RESULT as i32);
 
     // Channel scope — see `ChannelScope` doc for the four-case mapping. The
     // emitted SQL fragments are identical to the legacy 2x2 tuple for the

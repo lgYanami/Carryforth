@@ -64,6 +64,9 @@ pub enum SemanticError {
         /// Index of the invalid value.
         index: usize,
     },
+    /// Cosine similarity is undefined for an all-zero embedding.
+    #[error("embedding must have non-zero L2 norm")]
+    ZeroNormEmbedding,
     /// A deterministic internal contract could not be serialized.
     #[error("semantic contract serialization failed")]
     Serialization,
@@ -617,7 +620,7 @@ impl SemanticModelContract {
     }
 }
 
-/// Validated finite embedding values.
+/// Validated finite, non-zero embedding values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingVector {
     values: Vec<f32>,
@@ -639,6 +642,13 @@ impl EmbeddingVector {
             .find(|(_, value)| !value.is_finite())
         {
             return Err(SemanticError::NonFiniteEmbedding { index });
+        }
+        let squared_l2_norm = values
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>();
+        if squared_l2_norm == 0.0 {
+            return Err(SemanticError::ZeroNormEmbedding);
         }
         Ok(Self { values })
     }

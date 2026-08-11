@@ -32,11 +32,15 @@ use deadpool_redis;
 use crate::audio::AudioRoomManager;
 use crate::config::Config;
 use crate::connection::ConnectionSubscriptions;
+use crate::semantic_provider::{SemanticProviderConfigError, VolcengineSemanticProvider};
 use crate::subscription::SubscriptionRegistry;
 
 pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
 type SlidingWindowCounter = (u32, Instant);
 type ScopedRateLimiter = DashMap<ScopedPubkeyKey, SlidingWindowCounter>;
+type SemanticProviderCell =
+    std::sync::OnceLock<Result<Option<VolcengineSemanticProvider>, SemanticProviderConfigError>>;
+const SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT: usize = 8;
 
 /// Per-connection entry in the connection manager.
 struct ConnEntry {
@@ -509,6 +513,10 @@ impl Default for ConnectionManager {
 pub struct AppState {
     /// Relay configuration.
     pub config: Arc<Config>,
+    semantic_provider: Arc<SemanticProviderCell>,
+    /// Process-local bound on in-flight semantic graph queries. The
+    /// distributed Provider gate remains authoritative across Relay pods.
+    pub(crate) semantic_graph_query_semaphore: Arc<Semaphore>,
     /// Database connection pool.
     pub db: Db,
     /// Redis pool for readiness health checks.
@@ -673,6 +681,9 @@ impl AppState {
         let max_connections = config.max_connections;
         let max_concurrent_handlers = config.max_concurrent_handlers;
         let search_arc = Arc::new(search);
+        let semantic_provider = Arc::new(std::sync::OnceLock::new());
+        let semantic_graph_query_semaphore =
+            Arc::new(Semaphore::new(SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT));
 
         let audit_arc = audit.into().map(Arc::new);
         let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
@@ -737,6 +748,8 @@ impl AppState {
         let audit_enabled = audit_arc.is_some();
         let state = Self {
             config: Arc::new(config),
+            semantic_provider,
+            semantic_graph_query_semaphore,
             db,
             redis_pool,
             audit: audit_arc,
@@ -842,6 +855,20 @@ impl AppState {
     /// must no-op to today's behavior. Set once by `main.rs` after boot.
     pub fn mesh(&self) -> Option<&crate::mesh_boot::MeshHandle> {
         self.mesh.get()
+    }
+
+    /// Return the single process-wide semantic Provider client, constructing
+    /// it independently of the worker/query runtime switches on first use.
+    pub fn semantic_provider(
+        &self,
+    ) -> Result<Option<&VolcengineSemanticProvider>, &SemanticProviderConfigError> {
+        match self
+            .semantic_provider
+            .get_or_init(|| VolcengineSemanticProvider::from_config(&self.config.semantic_worker))
+        {
+            Ok(provider) => Ok(provider.as_ref()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Record an event ID as locally-published for dedup, scoped to the

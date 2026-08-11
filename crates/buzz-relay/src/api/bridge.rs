@@ -14,16 +14,37 @@ use base64::Engine;
 use serde_json::Value;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
+use buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT;
 use buzz_core::TenantContext;
 use buzz_db::project_document::{
     ProjectDocumentActiveHeadsPageRequest, ProjectDocumentHistoryPageRequest,
+};
+use buzz_db::semantic_query::{
+    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleasePermit,
+    SemanticGraphQueryReleaseRequest,
 };
 use buzz_sdk::project_view_v3::{
     PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE, PROJECT_VIEW_V3_ENTITY_TAG,
     PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
 };
+use buzz_semantic::Digest32;
+use buzz_semantic_query::{
+    budget_profile_digest, derive_http_request_binding, ranking_contract_digest,
+    SemanticGraphQuery, SemanticGraphQueryError, SemanticGraphQueryObservations,
+};
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
+use crate::semantic_graph_observability::{
+    record_query_error, record_query_outcome, stage_timer, SemanticGraphMetricStage,
+    SemanticGraphQueryMetricError, SemanticGraphQueryMetricResult,
+    SemanticGraphResultMetricSnapshot,
+};
+use crate::semantic_graph_query::SemanticGraphRootQueryError;
+use crate::semantic_graph_response::{
+    pack_semantic_graph_response, sign_packed_semantic_graph_response, PackedSemanticGraphResponse,
+    SemanticGraphResponsePackingError, SemanticGraphResponsePackingInput,
+    SignedSemanticGraphResponse,
+};
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
@@ -132,6 +153,30 @@ pub(crate) fn verify_bridge_auth_with_options(
     }
 
     Err(api_error(StatusCode::UNAUTHORIZED, "missing Nostr auth"))
+}
+
+/// Observe the payload tag on an already-verified NIP-98 Authorization Event.
+///
+/// This is only an additional exact-body gate; it never authenticates the
+/// Event. Callers must first succeed through [`verify_bridge_auth`].
+fn verified_bridge_nip98_has_payload(headers: &HeaderMap) -> bool {
+    let Some(encoded) = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Nostr "))
+    else {
+        return false;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(event) = serde_json::from_slice::<nostr::Event>(&bytes) else {
+        return false;
+    };
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.kind() == nostr::TagKind::Payload)
 }
 
 /// Check NIP-98 replay and record the event ID atomically.
@@ -317,6 +362,473 @@ enum ProjectDocumentPageRequest {
         before_revision: Option<u64>,
         limit: u16,
     },
+}
+
+const SEMANTIC_GRAPH_QUERY_EXTENSION: &str = "buzz_project_context_semantic";
+
+/// Parse the exclusive HTTP semantic-query filter extension.
+///
+/// This parser runs against the preserved raw JSON before any ordinary filter
+/// classification. It deliberately returns only the closed, canonical request;
+/// the authenticated body and NIP-98 Event identity remain owned by the bridge
+/// caller for request-binding verification during execution.
+pub(crate) fn parse_semantic_graph_http_query(
+    raw_filters: &[Value],
+    relay_pubkey: &nostr::PublicKey,
+    authenticated_caller: &nostr::PublicKey,
+) -> Result<Option<SemanticGraphQuery>, (StatusCode, Json<Value>)> {
+    let extension_count = raw_filters
+        .iter()
+        .filter(|filter| filter.get(SEMANTIC_GRAPH_QUERY_EXTENSION).is_some())
+        .count();
+    if extension_count == 0 {
+        if raw_filters
+            .iter()
+            .any(raw_filter_explicitly_requests_semantic_graph_result)
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported:semantic_graph_query:exclusive_http_filter_required",
+            ));
+        }
+        return Ok(None);
+    }
+    if extension_count != 1 || raw_filters.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:exactly_one_filter_required",
+        ));
+    }
+
+    let raw = raw_filters[0].as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:filter_must_be_object",
+        )
+    })?;
+    const ALLOWED_OUTER: &[&str] = &[
+        "kinds",
+        "authors",
+        "#p",
+        "limit",
+        SEMANTIC_GRAPH_QUERY_EXTENSION,
+    ];
+    if raw.keys().any(|key| !ALLOWED_OUTER.contains(&key.as_str())) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:unsupported_outer_field",
+        ));
+    }
+    if raw.get("kinds") != Some(&serde_json::json!([KIND_SEMANTIC_GRAPH_QUERY_RESULT]))
+        || raw.get("authors") != Some(&serde_json::json!([relay_pubkey.to_hex()]))
+        || raw.get("#p") != Some(&serde_json::json!([authenticated_caller.to_hex()]))
+        || raw.get("limit") != Some(&serde_json::json!(1))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:exact_kind_author_caller_and_limit_required",
+        ));
+    }
+
+    let extension = raw.get(SEMANTIC_GRAPH_QUERY_EXTENSION).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:request_required",
+        )
+    })?;
+    let request_bytes = serde_json::to_vec(extension).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:closed_request",
+        )
+    })?;
+    let request = SemanticGraphQuery::parse_json(&request_bytes).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:closed_request",
+        )
+    })?;
+    Ok(Some(request))
+}
+
+fn raw_filter_explicitly_requests_semantic_graph_result(raw: &Value) -> bool {
+    raw.get("kinds")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| kind == &serde_json::json!(KIND_SEMANTIC_GRAPH_QUERY_RESULT))
+        })
+}
+
+async fn execute_semantic_graph_http_query(
+    state: &AppState,
+    tenant: &TenantContext,
+    exact_authenticated_body: &[u8],
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    query: SemanticGraphQuery,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _timer = stage_timer(SemanticGraphMetricStage::Total);
+    let result = execute_semantic_graph_http_query_inner(
+        state,
+        tenant,
+        exact_authenticated_body,
+        authenticated_caller,
+        nip98_auth_event_id,
+        query,
+    )
+    .await;
+    record_query_outcome(if result.is_ok() {
+        SemanticGraphQueryMetricResult::Success
+    } else {
+        SemanticGraphQueryMetricResult::Error
+    });
+    result
+}
+
+async fn execute_semantic_graph_http_query_inner(
+    state: &AppState,
+    tenant: &TenantContext,
+    exact_authenticated_body: &[u8],
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    query: SemanticGraphQuery,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !crate::semantic_fleet::semantic_graph_http_fleet_ready(state, tenant.community()).await {
+        record_query_error(
+            SemanticGraphMetricStage::Root,
+            SemanticGraphQueryMetricError::Readiness,
+        );
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:readiness",
+        ));
+    }
+    if state.config.relay_private_key.is_none() {
+        record_query_error(
+            SemanticGraphMetricStage::Root,
+            SemanticGraphQueryMetricError::StableSigner,
+        );
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:stable_signer",
+        ));
+    }
+
+    let caller_bytes = authenticated_caller.to_bytes();
+    let request_binding_digest = derive_http_request_binding(
+        *tenant.community().as_uuid(),
+        &caller_bytes,
+        Digest32::from_bytes(nip98_auth_event_id),
+        exact_authenticated_body,
+    )
+    .map_err(|error| {
+        record_query_error(
+            SemanticGraphMetricStage::Root,
+            SemanticGraphQueryMetricError::RequestBinding,
+        );
+        map_semantic_contract_error(error)
+    })?;
+    let session = crate::semantic_graph_query::begin_semantic_graph_root_query(
+        state,
+        tenant.community(),
+        &caller_bytes,
+        query.clone(),
+    )
+    .await
+    .map_err(map_semantic_root_query_error)?;
+    let traversal = crate::semantic_graph_traversal::complete_semantic_graph_traversal(session)
+        .await
+        .map_err(map_semantic_root_query_error)?;
+    require_semantic_traversal_identity(
+        traversal.request_id,
+        traversal.project_id,
+        &query,
+        tenant.community(),
+    )?;
+    let absolute_deadline = traversal.absolute_deadline;
+    require_semantic_absolute_deadline(absolute_deadline)?;
+    let observations = semantic_graph_query_observations(&traversal.ticket)
+        .map_err(map_semantic_contract_error)?;
+    let packed = pack_semantic_graph_response(
+        SemanticGraphResponsePackingInput {
+            query,
+            request_binding_digest,
+            observations,
+            input_observations: traversal.input_observations,
+            roots: traversal.roots,
+            paths: traversal.paths,
+            coverage: traversal.coverage,
+            completion_reason: traversal.completion_reason,
+            exhausted_dimensions: traversal.exhausted_dimensions,
+        },
+        &state.relay_keypair.public_key(),
+        &authenticated_caller,
+        // HTTP returns the measured `[Event]` as the complete JSON payload;
+        // there is no additional application envelope outside these bytes.
+        state.config.max_frame_bytes,
+    )
+    .map_err(map_semantic_response_packing_error)?;
+    let result_metrics = SemanticGraphResultMetricSnapshot::from_result(&packed.result);
+
+    require_semantic_absolute_deadline(absolute_deadline)?;
+    let postflight_timer = stage_timer(SemanticGraphMetricStage::Postflight);
+    let (Some(deployment_id), Some(instance_id)) = (
+        state.config.semantic_graph_query_deployment_id.as_deref(),
+        state.config.semantic_graph_query_instance_id.as_deref(),
+    ) else {
+        record_query_error(
+            SemanticGraphMetricStage::Postflight,
+            SemanticGraphQueryMetricError::Readiness,
+        );
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:readiness",
+        ));
+    };
+    let release = tokio::time::timeout_at(
+        absolute_deadline,
+        state
+            .db
+            .confirm_semantic_graph_query_release(SemanticGraphQueryReleaseRequest {
+                community_id: tenant.community(),
+                reader_pubkey: &caller_bytes,
+                expected_projection_pubkey: &state.relay_keypair.public_key(),
+                deployment_id,
+                instance_id,
+            }),
+    )
+    .await
+    .map_err(|_| {
+        record_query_error(
+            SemanticGraphMetricStage::Postflight,
+            SemanticGraphQueryMetricError::DeadlineExceeded,
+        );
+        semantic_query_deadline_error()
+    })?
+    .map_err(|_| {
+        record_query_error(
+            SemanticGraphMetricStage::Postflight,
+            SemanticGraphQueryMetricError::PostflightUnavailable,
+        );
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:postflight",
+        )
+    })?;
+    let release_permit = match release {
+        SemanticGraphQueryReleaseConfirmation::Permitted(permit) => permit,
+        SemanticGraphQueryReleaseConfirmation::Denied => {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::PostflightDenied,
+            );
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "restricted:semantic_graph_query:authorization_changed",
+            ));
+        }
+        SemanticGraphQueryReleaseConfirmation::FleetUnavailable => {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::Readiness,
+            );
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:semantic_graph_query:readiness",
+            ));
+        }
+    };
+    drop(postflight_timer);
+    require_semantic_absolute_deadline(absolute_deadline)?;
+
+    // This is the first and only point at which a verifiable result Event is
+    // created. The single-use Stage D permit is consumed synchronously with no
+    // intervening await, and the Event remains response-local.
+    let signed =
+        sign_released_semantic_graph_response(release_permit, packed, &state.relay_keypair)
+            .map_err(map_semantic_response_packing_error)?;
+    require_semantic_absolute_deadline(absolute_deadline)?;
+    let response = serde_json::from_slice(&signed.event_array_bytes).map_err(|_| {
+        record_query_error(
+            SemanticGraphMetricStage::Signing,
+            SemanticGraphQueryMetricError::Serialization,
+        );
+        internal_error("semantic graph response serialization failed")
+    })?;
+    result_metrics.record_success(signed.event_array_bytes.len());
+    Ok(Json(response))
+}
+
+fn sign_released_semantic_graph_response(
+    _release_permit: SemanticGraphQueryReleasePermit,
+    packed: PackedSemanticGraphResponse,
+    relay_keys: &nostr::Keys,
+) -> Result<SignedSemanticGraphResponse, SemanticGraphResponsePackingError> {
+    sign_packed_semantic_graph_response(packed, relay_keys)
+}
+
+fn semantic_graph_query_observations(
+    ticket: &buzz_db::semantic_query::SemanticGraphQueryTicket,
+) -> Result<SemanticGraphQueryObservations, SemanticGraphQueryError> {
+    Ok(SemanticGraphQueryObservations {
+        semantic_generation_id: ticket.generation.generation_id,
+        source_generation_contract_digest: ticket.query_fences.source_generation_contract_digest,
+        embedding_space_fence: ticket.query_fences.embedding_space_fence,
+        query_contract_digest: ticket.query_fences.query_contract_digest,
+        ranking_contract_digest: ranking_contract_digest()?,
+        budget_profile_digest: budget_profile_digest()?,
+        extractor_version: ticket.generation.extractor_version.clone(),
+        project_context_revision: ticket.project_context_revision,
+        snapshot_observed_at: ticket.observed_at,
+    })
+}
+
+fn require_semantic_traversal_identity(
+    traversal_request_id: uuid::Uuid,
+    traversal_project_id: uuid::Uuid,
+    query: &SemanticGraphQuery,
+    host_project_id: buzz_core::CommunityId,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if traversal_request_id != query.request_id
+        || traversal_project_id != query.project_id
+        || traversal_project_id != *host_project_id.as_uuid()
+    {
+        record_query_error(
+            SemanticGraphMetricStage::Traversal,
+            SemanticGraphQueryMetricError::Contract,
+        );
+        return Err(internal_error(
+            "semantic graph traversal identity disagrees with its authenticated request",
+        ));
+    }
+    Ok(())
+}
+
+fn require_semantic_absolute_deadline(
+    absolute_deadline: tokio::time::Instant,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if tokio::time::Instant::now() >= absolute_deadline {
+        record_query_error(
+            SemanticGraphMetricStage::Total,
+            SemanticGraphQueryMetricError::DeadlineExceeded,
+        );
+        return Err(semantic_query_deadline_error());
+    }
+    Ok(())
+}
+
+fn semantic_query_deadline_error() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::GATEWAY_TIMEOUT,
+        "timeout:semantic_graph_query:query_deadline_exceeded",
+    )
+}
+
+fn map_semantic_root_query_error(error: SemanticGraphRootQueryError) -> (StatusCode, Json<Value>) {
+    match error {
+        SemanticGraphRootQueryError::QueryDisabled => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:query_disabled",
+        ),
+        SemanticGraphRootQueryError::InvalidProject => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:project_binding",
+        ),
+        SemanticGraphRootQueryError::ProcessBusy => api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy:semantic_graph_query:process_admission",
+        ),
+        SemanticGraphRootQueryError::QueryProviderBusy => api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy:semantic_graph_query:query_provider_busy",
+        ),
+        SemanticGraphRootQueryError::QueryFleetUnavailable => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:readiness",
+        ),
+        SemanticGraphRootQueryError::QueryEncoderUnavailable => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:query_encoder_unavailable",
+        ),
+        SemanticGraphRootQueryError::SemanticGenerationChanged => api_error(
+            StatusCode::CONFLICT,
+            "conflict:semantic_graph_query:semantic_generation_changed",
+        ),
+        SemanticGraphRootQueryError::ContextSourceChanged => api_error(
+            StatusCode::CONFLICT,
+            "conflict:semantic_graph_query:context_source_changed",
+        ),
+        SemanticGraphRootQueryError::AuthorizationChanged => api_error(
+            StatusCode::FORBIDDEN,
+            "restricted:semantic_graph_query:authorization_changed",
+        ),
+        SemanticGraphRootQueryError::QueryDeadlineExceeded => semantic_query_deadline_error(),
+        SemanticGraphRootQueryError::Database(_) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:database",
+        ),
+        SemanticGraphRootQueryError::Contract(error) => map_semantic_contract_error(error),
+    }
+}
+
+fn map_semantic_contract_error(error: SemanticGraphQueryError) -> (StatusCode, Json<Value>) {
+    match error {
+        SemanticGraphQueryError::RequestTooLarge { .. }
+        | SemanticGraphQueryError::InvalidJson(_)
+        | SemanticGraphQueryError::InvalidUuid { .. }
+        | SemanticGraphQueryError::BlankProblem
+        | SemanticGraphQueryError::NulText { .. }
+        | SemanticGraphQueryError::ProblemTooLarge { .. }
+        | SemanticGraphQueryError::TooManyCoordinates { .. }
+        | SemanticGraphQueryError::InvalidCoordinate { .. }
+        | SemanticGraphQueryError::BudgetOutOfRange { .. } => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:closed_request",
+        ),
+        SemanticGraphQueryError::ProviderInputTooLarge { .. } => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_graph_query:problem_input_unsupported",
+        ),
+        SemanticGraphQueryError::ProviderRateLimited { .. } => api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy:semantic_graph_query:query_provider_busy",
+        ),
+        SemanticGraphQueryError::ProviderTransport
+        | SemanticGraphQueryError::ProviderRetryable { .. }
+        | SemanticGraphQueryError::ProviderRejected { .. }
+        | SemanticGraphQueryError::ProviderResponse => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:query_encoder_unavailable",
+        ),
+        SemanticGraphQueryError::InvalidScore(_)
+        | SemanticGraphQueryError::InvalidState(_)
+        | SemanticGraphQueryError::Serialization => {
+            internal_error("semantic graph query contract failed")
+        }
+    }
+}
+
+fn map_semantic_response_packing_error(
+    error: SemanticGraphResponsePackingError,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        SemanticGraphResponsePackingError::ResponseTooLarge { .. } => api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large:semantic_graph_query:response_too_large",
+        ),
+        SemanticGraphResponsePackingError::RelaySignerChanged => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable:semantic_graph_query:stable_signer",
+        ),
+        SemanticGraphResponsePackingError::InvalidInput(_)
+        | SemanticGraphResponsePackingError::Signing
+        | SemanticGraphResponsePackingError::SizeEstimateDrift { .. }
+        | SemanticGraphResponsePackingError::Serialization => {
+            internal_error("semantic graph response packing failed")
+        }
+    }
 }
 
 fn parse_project_document_page_request(
@@ -1935,6 +2447,67 @@ async fn query_events_authed(
     // depth_limit, feed_types) that nostr::Filter silently drops.
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    // A semantic payload is strict-parsed only after a content-free Project
+    // Context read decision. This prevents an unauthorized caller from using
+    // detailed inner-schema failures as a Project semantic-query oracle while
+    // still allowing generic malformed JSON to receive the normal bridge 400.
+    if raw_filters
+        .iter()
+        .any(|filter| filter.get(SEMANTIC_GRAPH_QUERY_EXTENSION).is_some())
+    {
+        // This supplement to the already-verified caller auth must precede
+        // authorization: an unsigned exact body cannot probe even the
+        // content-free Project Context read decision.
+        if event_id_bytes == [0_u8; 32] || !verified_bridge_nip98_has_payload(headers) {
+            return Err(api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized:semantic_graph_query:exact_body_nip98_required",
+            ));
+        }
+        match crate::handlers::community_private::project_context_read_decision(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            &[],
+            None,
+        )
+        .await
+        .map_err(|_| internal_error("Project Context authorization lookup failed"))?
+        {
+            crate::handlers::community_private::ProjectContextReadDecision::Allowed => {}
+            crate::handlers::community_private::ProjectContextReadDecision::Restricted => {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted:semantic_graph_query:authorization_required",
+                ));
+            }
+            crate::handlers::community_private::ProjectContextReadDecision::Unavailable(_) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable:semantic_graph_query:readiness",
+                ));
+            }
+        }
+    }
+
+    // Recognize and execute the exclusive semantic extension before typed
+    // ordinary Filter parsing can silently discard it. Its kind-40912 Event is
+    // virtual and returns only through this request.
+    if let Some(query) =
+        parse_semantic_graph_http_query(&raw_filters, &state.relay_keypair.public_key(), &pubkey)?
+    {
+        return execute_semantic_graph_http_query(
+            state,
+            tenant,
+            body,
+            pubkey,
+            event_id_bytes,
+            query,
+        )
+        .await;
+    }
+
     let filters: Vec<nostr::Filter> = raw_filters
         .iter()
         .map(|v| serde_json::from_value(v.clone()))
@@ -2809,6 +3382,16 @@ async fn count_events_authed(
 
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    if filters
+        .iter()
+        .any(crate::handlers::req::filter_explicitly_requests_semantic_graph_result)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported:semantic_graph_query:count",
+        ));
+    }
 
     if filters.iter().any(|filter| {
         crate::handlers::project_view::filter_is_exclusively_project_view(filter)
@@ -3891,6 +4474,223 @@ mod tests {
             .expect("sign auth event")
             .id
             .to_bytes()
+    }
+
+    fn semantic_query_fixture(project_id: uuid::Uuid) -> SemanticGraphQuery {
+        SemanticGraphQuery {
+            request_id: uuid::Uuid::new_v4(),
+            project_id,
+            problem: "  why did this incident recur?  ".to_owned(),
+            initial_coordinates: Vec::new(),
+            context_coordinates: Vec::new(),
+            lifecycle_filter: buzz_semantic_query::LifecycleFilter::AllCurrent,
+            budget: buzz_semantic_query::SemanticGraphQueryBudget::default(),
+        }
+    }
+
+    fn semantic_filter_fixture(
+        relay: &nostr::PublicKey,
+        caller: &nostr::PublicKey,
+        request: &SemanticGraphQuery,
+    ) -> Value {
+        serde_json::json!({
+            "kinds": [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
+            "authors": [relay.to_hex()],
+            "#p": [caller.to_hex()],
+            "limit": 1,
+            SEMANTIC_GRAPH_QUERY_EXTENSION: request,
+        })
+    }
+
+    #[test]
+    fn semantic_http_filter_parser_accepts_only_the_exact_closed_envelope() {
+        let relay = Keys::generate().public_key();
+        let caller = Keys::generate().public_key();
+        let request = semantic_query_fixture(uuid::Uuid::new_v4());
+        let filter = semantic_filter_fixture(&relay, &caller, &request);
+        let parsed = parse_semantic_graph_http_query(&[filter], &relay, &caller)
+            .expect("parse exact semantic filter")
+            .expect("semantic extension");
+        assert_eq!(
+            parsed,
+            request
+                .validate_and_canonicalize()
+                .expect("canonical request")
+        );
+        assert_eq!(parsed.problem, "why did this incident recur?");
+
+        let ordinary = serde_json::json!({"kinds": [1], "limit": 1});
+        assert!(
+            parse_semantic_graph_http_query(&[ordinary], &relay, &caller)
+                .expect("ordinary filter")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn semantic_http_filter_parser_rejects_wrong_exact_bindings_and_mixed_filters() {
+        let relay = Keys::generate().public_key();
+        let caller = Keys::generate().public_key();
+        let request = semantic_query_fixture(uuid::Uuid::new_v4());
+        let exact = semantic_filter_fixture(&relay, &caller, &request);
+
+        let mut wrong_kind = exact.clone();
+        wrong_kind["kinds"] = serde_json::json!([1]);
+        let mut wrong_author = exact.clone();
+        wrong_author["authors"] = serde_json::json!([Keys::generate().public_key().to_hex()]);
+        let mut wrong_caller = exact.clone();
+        wrong_caller["#p"] = serde_json::json!([Keys::generate().public_key().to_hex()]);
+        let mut wrong_limit = exact.clone();
+        wrong_limit["limit"] = serde_json::json!(2);
+        for invalid in [wrong_kind, wrong_author, wrong_caller, wrong_limit] {
+            assert!(parse_semantic_graph_http_query(&[invalid], &relay, &caller).is_err());
+        }
+
+        assert!(parse_semantic_graph_http_query(
+            &[exact.clone(), serde_json::json!({"kinds": [1]})],
+            &relay,
+            &caller,
+        )
+        .is_err());
+
+        let mut mixed = exact;
+        mixed
+            .as_object_mut()
+            .expect("semantic filter object")
+            .insert("buzz_project_view".to_owned(), serde_json::json!({}));
+        assert!(parse_semantic_graph_http_query(&[mixed], &relay, &caller).is_err());
+    }
+
+    #[test]
+    fn semantic_http_filter_parser_rejects_unknown_fields_and_ordinary_40912() {
+        let relay = Keys::generate().public_key();
+        let caller = Keys::generate().public_key();
+        let request = semantic_query_fixture(uuid::Uuid::new_v4());
+
+        let mut unknown_outer = semantic_filter_fixture(&relay, &caller, &request);
+        unknown_outer
+            .as_object_mut()
+            .expect("semantic filter object")
+            .insert("search".to_owned(), serde_json::json!("incident"));
+        assert!(parse_semantic_graph_http_query(&[unknown_outer], &relay, &caller).is_err());
+
+        let mut unknown_inner = semantic_filter_fixture(&relay, &caller, &request);
+        unknown_inner[SEMANTIC_GRAPH_QUERY_EXTENSION]
+            .as_object_mut()
+            .expect("semantic request object")
+            .insert("schema_version".to_owned(), serde_json::json!(1));
+        let (status, body) = parse_semantic_graph_http_query(&[unknown_inner], &relay, &caller)
+            .expect_err("unknown request field must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid:semantic_graph_query:closed_request");
+        assert!(!body.to_string().contains("schema_version"));
+
+        let ordinary_virtual = serde_json::json!({
+            "kinds": [KIND_SEMANTIC_GRAPH_QUERY_RESULT],
+            "authors": [relay.to_hex()],
+            "#p": [caller.to_hex()],
+            "limit": 1,
+        });
+        let (status, body) = parse_semantic_graph_http_query(&[ordinary_virtual], &relay, &caller)
+            .expect_err("ordinary 40912 must remain unsupported");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "unsupported:semantic_graph_query:exclusive_http_filter_required"
+        );
+    }
+
+    #[test]
+    fn semantic_extension_requires_exact_body_nip98_authentication() {
+        let keys = Keys::generate();
+        let url = "https://relay.example/query";
+        let without_payload = build_nip98_event_json(&keys, url, "POST");
+        assert!(!verified_bridge_nip98_has_payload(&nip98_auth_headers(
+            &without_payload
+        )));
+
+        let payload = "11".repeat(32);
+        let with_payload = EventBuilder::new(Kind::HttpAuth, "")
+            .tags([
+                Tag::parse(["u", url]).expect("u tag"),
+                Tag::parse(["method", "POST"]).expect("method tag"),
+                Tag::parse(["payload", payload.as_str()]).expect("payload tag"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign NIP-98 event");
+        let event_json = serde_json::to_string(&with_payload).expect("serialize NIP-98 event");
+        assert!(verified_bridge_nip98_has_payload(&nip98_auth_headers(
+            &event_json
+        )));
+    }
+
+    #[test]
+    fn semantic_endpoint_errors_have_closed_status_and_content_free_codes() {
+        let (status, body) =
+            map_semantic_root_query_error(SemanticGraphRootQueryError::SemanticGenerationChanged);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "conflict:semantic_graph_query:semantic_generation_changed"
+        );
+
+        let (status, body) =
+            map_semantic_root_query_error(SemanticGraphRootQueryError::QueryFleetUnavailable);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "unavailable:semantic_graph_query:readiness");
+
+        let (status, body) =
+            map_semantic_contract_error(SemanticGraphQueryError::ProviderInputTooLarge {
+                observed: 42,
+                maximum: 41,
+            });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "invalid:semantic_graph_query:problem_input_unsupported"
+        );
+
+        let (status, body) = map_semantic_response_packing_error(
+            SemanticGraphResponsePackingError::ResponseTooLarge { maximum: 1 },
+        );
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body["error"],
+            "too_large:semantic_graph_query:response_too_large"
+        );
+    }
+
+    #[test]
+    fn semantic_traversal_identity_is_bound_to_request_and_host() {
+        let project_id = uuid::Uuid::new_v4();
+        let request = semantic_query_fixture(project_id);
+        let host = buzz_core::CommunityId::from_uuid(project_id);
+        require_semantic_traversal_identity(request.request_id, request.project_id, &request, host)
+            .expect("matching traversal identity");
+
+        let mismatches = [
+            (uuid::Uuid::new_v4(), request.project_id, host),
+            (request.request_id, uuid::Uuid::new_v4(), host),
+            (
+                request.request_id,
+                request.project_id,
+                buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
+            ),
+        ];
+        for (traversal_request_id, traversal_project_id, host_project_id) in mismatches {
+            let (status, body) = require_semantic_traversal_identity(
+                traversal_request_id,
+                traversal_project_id,
+                &request,
+                host_project_id,
+            )
+            .expect_err("identity mismatch must fail closed");
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body["error"], "internal server error");
+            let encoded = serde_json::to_string(&body.0).expect("error body serializes");
+            assert!(!encoded.contains(&request.request_id.to_string()));
+            assert!(!encoded.contains(&request.project_id.to_string()));
+        }
     }
 
     #[test]
