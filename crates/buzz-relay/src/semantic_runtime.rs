@@ -87,6 +87,35 @@ async fn process_claim(
     let result = process_claim_inner(state, provider, &lease).await;
     if let Err(error) = result {
         let code = semantic_error_code(&error);
+        if matches!(
+            semantic_claim_failure_class(&error),
+            SemanticClaimFailureClass::LosslessProviderAdmission
+        ) {
+            match state
+                .db
+                .defer_semantic_claim_for_provider_admission(
+                    &lease,
+                    state.config.semantic_worker.request_interval,
+                )
+                .await
+            {
+                Err(defer_error) => warn!(
+                    error = %defer_error,
+                    error_code = code,
+                    "semantic provider admission defer failed"
+                ),
+                Ok(true) => {
+                    metrics::counter!("buzz_semantic_jobs_deferred_total", "reason" => code)
+                        .increment(1);
+                    warn!(error_code = code, "semantic claim admission deferred");
+                }
+                Ok(false) => warn!(
+                    error_code = code,
+                    "semantic claim changed before provider admission defer"
+                ),
+            }
+            return;
+        }
         let retry_after = semantic_retry_after(&error, lease.attempts);
         if let Err(retry_error) = state
             .db
@@ -162,18 +191,34 @@ async fn process_claim_inner(
                     chrono::Duration::from_std(state.config.semantic_worker.request_timeout)
                         .map_err(|_| SemanticWorkerError::Contract)?;
                 let latest_start_at = lease.lease_until - provider_budget;
-                let reservation = state
-                    .db
-                    .try_reserve_semantic_provider_slot_until(
-                        buzz_core::CommunityId::from_uuid(lease.source.community_id),
-                        &lease.model_contract.provider,
-                        SemanticProviderWorkload::BackgroundIndex,
-                        state.config.semantic_worker.request_interval,
+                let reservation = loop {
+                    let reservation = state
+                        .db
+                        .try_reserve_semantic_provider_slot_until(
+                            buzz_core::CommunityId::from_uuid(lease.source.community_id),
+                            &lease.model_contract.provider,
+                            SemanticProviderWorkload::BackgroundIndex,
+                            state.config.semantic_worker.request_interval,
+                            latest_start_at,
+                        )
+                        .await?;
+                    if !matches!(reservation, SemanticProviderReservation::Busy) {
+                        break reservation;
+                    }
+                    if state.shutting_down.load(Ordering::Relaxed) {
+                        return Err(SemanticWorkerError::ProviderAdmissionShutdown);
+                    }
+                    let Some(wait) = provider_admission_retry_delay(
+                        chrono::Utc::now(),
                         latest_start_at,
-                    )
-                    .await?;
+                        state.config.semantic_worker.request_interval,
+                    ) else {
+                        return Err(SemanticWorkerError::ProviderAdmissionDeadline);
+                    };
+                    tokio::time::sleep(wait).await;
+                };
                 let SemanticProviderReservation::Reserved { wait } = reservation else {
-                    return Err(SemanticWorkerError::ProviderBusy);
+                    return Err(SemanticWorkerError::ProviderAdmissionDeadline);
                 };
                 tokio::time::sleep(wait).await;
                 let _egress_permit = match state
@@ -246,8 +291,10 @@ enum SemanticWorkerError {
     Semantic(#[from] SemanticError),
     #[error("configured provider is unavailable")]
     ProviderUnavailable,
-    #[error("provider admission is busy")]
-    ProviderBusy,
+    #[error("provider admission deadline was exhausted")]
+    ProviderAdmissionDeadline,
+    #[error("provider admission stopped during shutdown")]
+    ProviderAdmissionShutdown,
     #[error("job contract does not match the worker")]
     Contract,
 }
@@ -256,7 +303,8 @@ fn semantic_error_code(error: &SemanticWorkerError) -> &'static str {
     match error {
         SemanticWorkerError::Database(_) => "database",
         SemanticWorkerError::ProviderUnavailable => "provider_unavailable",
-        SemanticWorkerError::ProviderBusy => "provider_busy",
+        SemanticWorkerError::ProviderAdmissionDeadline
+        | SemanticWorkerError::ProviderAdmissionShutdown => "provider_busy",
         SemanticWorkerError::Contract => "contract_mismatch",
         SemanticWorkerError::Semantic(SemanticError::ProviderRateLimited { .. }) => {
             "provider_rate_limited"
@@ -273,6 +321,22 @@ fn semantic_error_code(error: &SemanticWorkerError) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticClaimFailureClass {
+    LosslessProviderAdmission,
+    RetryableFailure,
+}
+
+fn semantic_claim_failure_class(error: &SemanticWorkerError) -> SemanticClaimFailureClass {
+    match error {
+        SemanticWorkerError::ProviderAdmissionDeadline
+        | SemanticWorkerError::ProviderAdmissionShutdown => {
+            SemanticClaimFailureClass::LosslessProviderAdmission
+        }
+        _ => SemanticClaimFailureClass::RetryableFailure,
+    }
+}
+
 fn semantic_retry_after(error: &SemanticWorkerError, attempts: u32) -> u32 {
     if let SemanticWorkerError::Semantic(SemanticError::ProviderRateLimited {
         retry_after_seconds: Some(seconds),
@@ -283,9 +347,26 @@ fn semantic_retry_after(error: &SemanticWorkerError, attempts: u32) -> u32 {
     2_u32.saturating_pow(attempts.min(10)).min(900)
 }
 
+fn provider_admission_retry_delay(
+    now: chrono::DateTime<chrono::Utc>,
+    latest_start_at: chrono::DateTime<chrono::Utc>,
+    interval: Duration,
+) -> Option<Duration> {
+    let remaining = (latest_start_at - now).to_std().ok()?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(interval.min(remaining))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{semantic_error_code, semantic_retry_after, SemanticWorkerError};
+    use std::time::Duration;
+
+    use super::{
+        provider_admission_retry_delay, semantic_claim_failure_class, semantic_error_code,
+        semantic_retry_after, SemanticClaimFailureClass, SemanticWorkerError,
+    };
     use buzz_semantic::SemanticError;
 
     #[test]
@@ -295,5 +376,58 @@ mod tests {
         });
         assert_eq!(semantic_error_code(&error), "provider_rate_limited");
         assert_eq!(semantic_retry_after(&error, 1), 123);
+    }
+
+    #[test]
+    fn provider_admission_wait_is_bounded_by_the_claim_deadline() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            provider_admission_retry_delay(
+                now,
+                now + chrono::Duration::seconds(5),
+                Duration::from_secs(1),
+            ),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            provider_admission_retry_delay(
+                now,
+                now + chrono::Duration::milliseconds(40),
+                Duration::from_secs(1),
+            ),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            provider_admission_retry_delay(now, now, Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            provider_admission_retry_delay(
+                now,
+                now - chrono::Duration::milliseconds(1),
+                Duration::from_secs(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn deadline_and_shutdown_use_lossless_provider_admission_defer() {
+        for error in [
+            SemanticWorkerError::ProviderAdmissionDeadline,
+            SemanticWorkerError::ProviderAdmissionShutdown,
+        ] {
+            assert_eq!(
+                semantic_claim_failure_class(&error),
+                SemanticClaimFailureClass::LosslessProviderAdmission
+            );
+            assert_eq!(semantic_error_code(&error), "provider_busy");
+        }
+        assert_eq!(
+            semantic_claim_failure_class(&SemanticWorkerError::Semantic(
+                SemanticError::ProviderTransport
+            )),
+            SemanticClaimFailureClass::RetryableFailure
+        );
     }
 }

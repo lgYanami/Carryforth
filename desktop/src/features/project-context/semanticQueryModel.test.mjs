@@ -5,6 +5,7 @@ import {
   addSemanticQueryDraftCoordinate,
   createSemanticQueryDraft,
   removeSemanticQueryDraftCoordinate,
+  semanticGraphCountLabel,
   semanticQueryDraftMatchesSubmission,
   submitSemanticQueryDraft,
   tryAddSemanticQueryDraftCoordinate,
@@ -15,6 +16,13 @@ import {
 const coordinate = (index) => ({
   type: "document",
   documentId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+});
+
+test("semantic graph counts use singular only for exactly one", () => {
+  assert.equal(semanticGraphCountLabel(0, "path"), "0 paths");
+  assert.equal(semanticGraphCountLabel(1, "path"), "1 path");
+  assert.equal(semanticGraphCountLabel(2, "path"), "2 paths");
+  assert.equal(semanticGraphCountLabel(1, "root"), "1 root");
 });
 
 test("draft validation trims problem and supports empty optional roles", () => {
