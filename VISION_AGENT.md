@@ -1,5 +1,10 @@
 # Vision: buzz-agent + buzz-dev-mcp
 
+> **Historical upstream vision.** The `buzz-*` names below remain valid binary
+> coordinates, while references to Buzz as the product preserve upstream
+> history. See [README.md](README.md) for Carryforth's current local-only
+> product and support boundary.
+
 ## The Problem
 
 A coding agent should be small enough to hold in your head. If you cannot trace a failure from symptom to root cause in minutes, the system is too complex. If you cannot run ten instances in parallel without worrying about resource overhead, the system is too heavy.

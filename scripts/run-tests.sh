@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run-tests.sh — Run Buzz test suite
+# run-tests.sh — Run the Carryforth test suite
 # =============================================================================
 # Usage:
 #   ./scripts/run-tests.sh              # run all tests (default)
@@ -198,9 +198,6 @@ run_unit_tests() {
 
   run_test_step "Project Context Relay privacy tests" \
     cargo test -p buzz-relay --lib project_context -- --nocapture
-
-  run_test_step "buzz-push-gateway tests" \
-    cargo test -p buzz-push-gateway -- --nocapture
 
   # ACP owns the Meeting runtime and its privacy-safe wire/log boundary. Run
   # the complete lib suite so cross-cutting tests are not orphaned by a name

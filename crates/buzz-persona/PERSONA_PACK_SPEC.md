@@ -3,7 +3,7 @@
 ## 1. Overview & Goals
 
 A **Persona Pack** is a portable, self-contained bundle that defines one or more AI agent personas
-for deployment in Buzz. It is a **superset of the [Open Plugin Spec](https://open-plugin-spec.org)**
+for deployment in Carryforth. It is a **superset of the [Open Plugin Spec](https://open-plugin-spec.org)**
 — every valid Persona Pack is also a valid OPS package, but not vice versa.
 
 A pack contains: personas (identity + system prompt), skills (on-demand instruction sets), MCP
@@ -11,7 +11,7 @@ server config, pack-level instructions, lifecycle hooks, and distribution metada
 
 ### Design Goals
 
-1. **Portable** — zip file or git repo; no Buzz tooling required to inspect
+1. **Portable** — zip file or git repo; no Carryforth tooling required to inspect
 2. **Composable** — skills and MCP servers shared across agents; per-agent overrides additive
 3. **OPS-compatible** — discoverable by any OPS-compatible tool
 4. **Harness-honest** — explicit about what the agent runtime does vs. what buzz-acp does
@@ -21,7 +21,7 @@ server config, pack-level instructions, lifecycle hooks, and distribution metada
 ## 2. Open Plugin Spec Compatibility
 
 A Persona Pack is a valid OPS package. The `.plugin/plugin.json` manifest follows the OPS schema,
-and Buzz-specific extensions live alongside the OPS fields at the top level. Since the Open
+and Carryforth-specific extensions live alongside the OPS fields at the top level. Since the Open
 Plugin Spec defines no model configuration fields, there are no collisions. OPS consumers safely
 ignore unknown fields.
 
@@ -33,7 +33,7 @@ ignore unknown fields.
   "id": "com.example.meadow-security-team",
   "name": "Meadow Security Team",
   "version": "1.2.0",
-  "description": "A four-agent security review team for Buzz.",
+  "description": "A four-agent security review team for Carryforth.",
   "author": "Meadow Engineering",
   "license": "MIT",
   "homepage": "https://github.com/example/meadow-security-team",
@@ -88,10 +88,10 @@ none of them override it.
 
 - **OPS consumers**: see standard metadata; safely ignore unknown fields including `personas`,
   `defaults`, `pack_instructions`, `mcp_config`, and `hooks_config`.
-- **Buzz**: reads both OPS fields and the Buzz-specific fields; `personas` is authoritative.
-- **Version negotiation**: `engines.buzz` specifies minimum required Buzz version; buzz-acp
+- **Carryforth**: reads both OPS fields and the Carryforth-specific fields; `personas` is authoritative.
+- **Version negotiation**: `engines.buzz` specifies minimum required Carryforth version; buzz-acp
   rejects packs requiring a newer version.
-- **Extension mechanism**: Buzz-specific fields sit at the top level of `plugin.json` alongside
+- **Extension mechanism**: Carryforth-specific fields sit at the top level of `plugin.json` alongside
   OPS fields. No OPS core field is overloaded.
 - **`defaults`**: ignored entirely by OPS consumers. buzz-acp resolves it at deploy time before
   constructing per-persona configurations (see Section 10 and Section 12).
@@ -175,7 +175,7 @@ mcp_servers:
     env:
       SEMGREP_TOKEN: "${SEMGREP_TOKEN}"
 
-# === Behavioral Config (Buzz-specific) ===
+# === Behavioral Config (Carryforth-specific) ===
 subscribe:
   - "#security-reviews"
   - "#code-reviews"
@@ -202,7 +202,7 @@ You are Lep, a security-focused code reviewer on the Meadow team.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | ✅ | Machine name / agent ID. Lowercase, no spaces, unique within pack. |
-| `display_name` | string | ✅ | Human-readable name shown in Buzz UI. |
+| `display_name` | string | ✅ | Human-readable name shown in Carryforth UI. |
 | `avatar` | string | ❌ | Pack-relative path to avatar image. |
 | `description` | string | ✅ | One-line description. |
 | `version` | string | ❌ | Semver. Defaults to pack version if omitted. |
@@ -255,7 +255,7 @@ Each message delivered to the agent runtime includes these sections in order:
 [Thread/Conversation Context]
 <recent message history, if applicable>
 
-[Buzz event]
+[Carryforth event]
 <the triggering message or event>
 ```
 
@@ -265,12 +265,12 @@ The `[Base]` layer is compiled into buzz-acp and is **identical for every agent*
 
 | Content | Purpose |
 |---------|---------|
-| Platform identity | Tells the agent it is running inside Buzz and what that means |
+| Platform identity | Tells the agent it is running inside Carryforth and what that means |
 | MCP tool reference | Documents the tools available via the connected MCP servers |
 | Workspace layout | Describes `$AGENT_CWD`, skill discovery paths, and file conventions |
 | Message polling | Explains how to check for new messages proactively |
 
-Pack authors do not write or configure the `[Base]` layer — it is maintained by the Buzz team
+Pack authors do not write or configure the `[Base]` layer — it is maintained by the Carryforth team
 and updated in buzz-acp releases.
 
 **Disabling or customizing the base layer**: Set `BUZZ_ACP_NO_BASE_PROMPT` to omit the `[Base]`
@@ -300,7 +300,7 @@ What belongs in `[System]`:
 - How to use MCP tools (covered by `[Base]`)
 - How to poll for new messages or use the `since` parameter (covered by `[Base]`)
 - Workspace layout or skill loading mechanics (covered by `[Base]`)
-- That the agent is running inside Buzz (covered by `[Base]`)
+- That the agent is running inside Carryforth (covered by `[Base]`)
 
 Focus persona prompts on what makes this agent unique: its role, personality, domain expertise,
 and team-specific protocols.
@@ -574,7 +574,7 @@ buzz-acp means no hooks fire.
 ## 10. Behavioral Configuration
 
 The behavioral config fields in a persona's frontmatter control how the agent participates in
-Buzz conversations. These are all Buzz-specific — the agent runtime has no awareness of them. They sit
+Carryforth conversations. These are all Carryforth-specific — the agent runtime has no awareness of them. They sit
 at the top level of the frontmatter alongside identity fields like `name` and `description`.
 
 ### Pack Defaults
@@ -641,7 +641,7 @@ wins):
 ```
 1. Operator env vars           — e.g. GOOSE_MODEL, GOOSE_PROVIDER (agent-runtime-specific)
                                  already set in the parent process environment
-2. Desktop UI per-agent        — overrides set in the Buzz desktop app per-agent settings
+2. Desktop UI per-agent        — overrides set in the Carryforth desktop app per-agent settings
 3. Per-persona frontmatter     — behavioral config fields set directly in the persona's frontmatter
 4. Pack-level defaults         — the `defaults` object in plugin.json
 5. Built-in defaults           — buzz-acp's hardcoded fallback values
@@ -805,7 +805,7 @@ broadcast_replies: false
 
 ### Channel Name `#` Convention
 
-The `#` prefix in `subscribe` entries is a **display convention only**. Channel names in the Buzz
+The `#` prefix in `subscribe` entries is a **display convention only**. Channel names in the Carryforth
 relay are stored and queried **without** the `#` prefix. buzz-acp strips the leading `#` before
 making any relay API calls. `"#security-reviews"` and `"security-reviews"` are equivalent in this
 field.
@@ -825,35 +825,40 @@ variables injected into the child process at spawn time:
 | `temperature: 0.3` | `GOOSE_TEMPERATURE=0.3` | Read by agent runtime at startup |
 | `max_context_tokens: 128000` | `GOOSE_CONTEXT_LIMIT=128000` | Read by agent runtime at startup |
 
-If `model` is omitted from both the persona frontmatter and `defaults`, buzz-acp does not set
+If `model` is omitted from both the persona frontmatter and `defaults`, `buzz-acp` does not set
 `GOOSE_PROVIDER` or `GOOSE_MODEL`, and the agent runtime uses its configured operator default.
 
-> **Implementation note**: `AcpClient::spawn` accepts per-persona env vars via the `extra_env` parameter. buzz-acp checks `std::env::var(key)` before injecting each var — if the parent environment already has the key set, injection is skipped (operator precedence, level 1).
+> **Implementation note**: `AcpClient::spawn` accepts per-persona env vars via the `extra_env` parameter. `buzz-acp` checks `std::env::var(key)` before injecting each var — if the parent environment already has the key set, injection is skipped (operator precedence, level 1).
 
 See the Canonical Behavioral Config Field Schema table above for the full field reference.
 
 > **Built-in defaults note**: The "Built-in Default" column in the Canonical Behavioral Config
-> Field Schema table lists buzz-acp's built-in fallbacks (precedence level 5). If `defaults` is
+> Field Schema table lists `buzz-acp`'s built-in fallbacks (precedence level 5). If `defaults` is
 > present in `plugin.json`, those values take precedence over the built-in defaults (level 4 >
 > level 5). The built-in defaults only apply when neither the persona nor the pack defaults specify
 > a value.
 
-All fields are consumed entirely by buzz-acp. None are passed to the agent runtime directly — they are projected as env vars or used by the harness's subscription/dispatch logic.
+All fields are consumed entirely by `buzz-acp`. None are passed to the agent runtime directly — they are projected as env vars or used by the harness's subscription/dispatch logic.
 
 ---
 
 ## 11. Distribution
 
-### Phase 1: Zip File
+### Current local tooling
 
-A pack is distributed as a `.buzzpack` file (zip archive):
+The current `cf` surface validates and inspects unpacked local pack directories:
 
 ```bash
 cf pack validate ./my-pack
-cf pack ./my-pack --output my-pack-1.2.0.buzzpack
-buzz install ./my-pack-1.2.0.buzzpack
-buzz install https://example.com/releases/my-pack-1.2.0.buzzpack
+cf pack inspect ./my-pack
 ```
+
+Packaging and installation are not implemented. In particular, there is no
+current `buzz install`, `cf pack install`, or hosted registry command. The
+subsections below freeze a possible future archive/storage format; they are not
+operator instructions or a supported distribution surface.
+
+### Future archive format
 
 #### Pack Integrity (Required)
 
@@ -876,13 +881,10 @@ Phase 1 installs record the installed pack in `pack.lock` alongside the pack dir
 }
 ```
 
-### Phase 2: Git Repository
+### Future Git source format
 
-```bash
-buzz install github:example/meadow-security-team
-buzz install github:example/meadow-security-team@v1.2.0
-buzz install git+https://gitlab.example.com/team/pack.git
-```
+Potential sources include pinned GitHub or GitLab repositories, but no current
+Carryforth command installs a pack from Git.
 
 `pack.lock` for git installs records the resolved commit SHA:
 
@@ -897,19 +899,21 @@ buzz install git+https://gitlab.example.com/team/pack.git
 }
 ```
 
-### Phase 3: App Store UI
+### Future registry UI
 
-A Buzz-hosted registry and in-app browser for discovering and installing packs. API-compatible
-with OPS registries. Details TBD.
+A future, independently reviewed Carryforth registry and in-app browser could
+discover and install packs. No hosted registry or fallback is currently
+provided. Details remain TBD.
 
 ### Installed Pack Location
 
-Installed packs live at `~/.buzz/packs/<pack-id>/`. buzz-acp reads packs from this location
-at agent startup.
+The retained compatibility design places installed packs at
+`~/.buzz/packs/<pack-id>/`. `buzz-acp` reads this storage coordinate at agent
+startup; changing it requires a separate lossless migration.
 
 ### Desktop App Import
 
-The Buzz desktop app can import persona packs via the Import button:
+The Carryforth desktop app can import persona packs via the Import button:
 
 - **My Agents → Import**: Accepts `.persona.md` files (individual personas) or `.zip` files
   (persona packs detected by `.plugin/plugin.json`). Pack zips are resolved in a temp directory;

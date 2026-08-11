@@ -1,5 +1,10 @@
 # Buzz — Your Project, Your Domain
 
+> **Historical upstream vision.** This document preserves the inherited Buzz
+> hosted-domain narrative. Carryforth currently supports a local-only source
+> workflow and does not claim the hosted surface described below. See
+> [README.md](README.md) for the current product boundary.
+
 `myproject.com` is your workspace. Not a GitHub org page that happens to have your
 name on it. Not a Discord server that Discord could delete tomorrow. Your domain.
 Your relay. One thing.

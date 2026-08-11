@@ -33,7 +33,7 @@ const GOOSE_AVAILABLE = {
 /** buzz-agent is always available and has no auth step. */
 const BUZZ_AGENT_AVAILABLE = {
   id: "buzz-agent",
-  label: "Buzz Agent",
+  label: "Carryforth Agent",
   avatar_url: "",
   availability: "available",
   command: "buzz-agent",
@@ -41,7 +41,7 @@ const BUZZ_AGENT_AVAILABLE = {
   default_args: [],
   mcp_command: "buzz-dev-mcp",
   install_hint: "",
-  install_instructions_url: "https://github.com/block/buzz",
+  install_instructions_url: "https://github.com/lgYanami/Carryforth",
   can_auto_install: false,
   underlying_cli_path: null,
   node_required: false,

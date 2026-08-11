@@ -63,7 +63,7 @@ jobs:
               - 'docs/nips/NIP-PD.md'
               - 'docs/lora/stage/document/**'
               - 'docs/project-view-operations.md'
-              - 'deploy/charts/buzz/**'
+              - 'deploy/local/**'
               - 'deploy/compose/**'
               - 'Justfile'
             project-view:
@@ -88,7 +88,7 @@ jobs:
               - 'docs/lora/stage/bug/project-view-v3-*.md'
               - 'docs/lora/stage/meeting/**'
               - 'docs/project-view-operations.md'
-              - 'deploy/charts/buzz/**'
+              - 'deploy/local/**'
               - 'deploy/compose/**'
               - 'Dockerfile'
               - 'Justfile'
@@ -139,6 +139,8 @@ jobs:
               - '.github/workflows/ci.yml'
       - name: Release workflow source contract
         run: scripts/test-release-ref-contract.sh
+      - name: Current Carryforth product surface contract
+        run: scripts/check-carryforth-current-product-surface.sh
       - name: Project View release contract
         run: scripts/test-project-view-release-contract.sh
       - name: Project View v3-only runtime contract

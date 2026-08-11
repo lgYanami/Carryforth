@@ -1,7 +1,8 @@
-# Harbor Buzz Orchestra
+# Harbor Carryforth Orchestra
 
 A stock-Harbor custom agent that runs a manifest-defined team through the real
-Buzz stack. Harbor sees one `BuzzOrchestraAgent`; behind that adapter, one
+Carryforth stack. Harbor sees one compatibility-named `BuzzOrchestraAgent`;
+behind that adapter, one
 orchestrator and N workers coordinate over the production relay/Postgres.
 Each agent runs *inside* the Harbor task container as the same
 `buzz-acp` → `buzz-agent` → `buzz-dev-mcp` process tree the desktop app
@@ -38,9 +39,9 @@ environment variables. The adapter contains no fixed roster or model.
 
 ## Run
 
-With the production compose stack and model endpoints already running, execute
-one task (`-p`), a directory of tasks, or replace `-p` with Harbor's dataset and
-task selectors:
+With a compatible Carryforth Relay/Postgres provisioner and model endpoints
+already running, execute one task (`-p`), a directory of tasks, or replace
+`-p` with Harbor's dataset and task selectors:
 
 ```bash
 uv run --project benchmarks/harbor-buzz-orchestra/testbed harbor run --yes -p <TASK_OR_DIRECTORY> --agent harbor_buzz_orchestra:BuzzOrchestraAgent --agent-kwarg manifest=<CONDITION.yaml> --agent-kwarg provisioner_factory=harbor_buzz_testbed:provisioner_from_dict --agent-kwarg provisioner_config=<PROVISIONER.json> --agent-kwarg endpoint_config=<ENDPOINTS.json> --agent-kwarg artifact_root=benchmarks/harbor-buzz-orchestra --agent-kwarg buzz_acp_binary=<LINUX_BIN>/buzz-acp --agent-kwarg buzz_agent_binary=<LINUX_BIN>/buzz-agent --agent-kwarg buzz_dev_mcp_binary=<LINUX_BIN>/buzz-dev-mcp --agent-kwarg cf_binary=target/debug/cf --agent-kwarg run_id="bench-$(date -u +%Y%m%dT%H%M%SZ)" --agent-timeout-multiplier 15 --n-concurrent 1
@@ -57,20 +58,27 @@ is not an orchestration requirement. Some TB graders install dependencies from
 public package registries at verification time — run benchmarks off networks
 that block those installs (e.g. corporate VPNs).
 
-Each trial gets fresh keys and a private Buzz channel. The provisioner archives
-rather than deletes that channel, leaving the relay/Postgres event timeline
-and the per-agent acp/agent logs (downloaded into the trial's `buzz/`
-artifacts) available for analysis.
+Each trial gets fresh keys and a private Carryforth channel. The provisioner
+archives rather than deletes that channel, leaving the relay/Postgres event
+timeline and the per-agent acp/agent logs (downloaded into the compatibility-
+named trial `buzz/` artifact directory) available for analysis.
 
 ## Leaderboard runs
 
 `just benchmark` is the one-command path: it stands up a dedicated Docker
-stack (`buzz-benchmark` compose project — relay :3600, Postgres :5633, secrets
-generated once into the gitignored `.benchmark/`), applies the benchmark
-schema, and defaults to leaderboard-eligible settings (Terminal-Bench 2.1,
-5 attempts per problem, the Sonnet+Haiku team). All selectors pass through:
+stack from the self-contained `testbed/compose.benchmark.yml` manifest
+(`buzz-benchmark` compatibility project name — relay :3600, Postgres :5633,
+metrics :9602, secrets generated once into the gitignored `.benchmark/`). It
+does not depend on the retired `deploy/compose` surface. The harness applies
+its benchmark schema and defaults to leaderboard-eligible settings
+(Terminal-Bench 2.1, 5 attempts per problem, the Sonnet+Haiku team). It has no
+registry fallback: set `CARRYFORTH_BENCHMARK_IMAGE` to an explicitly built
+local or Carryforth Relay image before running it. All selectors pass through:
 
 ```bash
+export CARRYFORTH_BENCHMARK_IMAGE=carryforth-relay:local
+# Recommended when multiple checkouts share one Docker engine:
+export CARRYFORTH_BENCHMARK_PROJECT=carryforth-benchmark-my-checkout
 just benchmark                                   # full TB 2.1, k=5
 just benchmark --path <TASK_DIR> -k 1            # one local task, one attempt
 just benchmark -i "cobol*" --attempts 3          # dataset subset
@@ -80,9 +88,17 @@ just benchmark --gui                             # watch the run live
 One pinned user identity fronts the whole benchmark environment: it owns
 every trial channel (named after the task) and posts every task prompt, and
 trial channels are kept rather than archived. `--gui` adds that user to the
-relay membership list and opens the Buzz desktop app logged in as them, so
-channels fill the sidebar as the run progresses — watch, don't type; a human
-message mid-trial would taint the run. `just benchmark-down` stops the stack.
+relay membership list and opens the Carryforth desktop app logged in as them,
+so channels fill the sidebar as the run progresses — watch, don't type; a
+human message mid-trial would taint the run. `just benchmark-down` stops the
+stack.
+
+The legacy-compatible default Compose project is `buzz-benchmark`. If its
+Postgres credentials belong to another checkout, ordinary startup fails closed
+without deleting volumes. Select a checkout-unique
+`CARRYFORTH_BENCHMARK_PROJECT` to isolate the run. `--fresh` deletes volumes
+and GUI state, so it is accepted only with an explicit, non-default project
+name and prints that exact scope before deletion.
 
 Networking: the relay is host-header tenant-bound, so agents must dial its
 canonical address (`ws://localhost:3600`) even from inside a task container.

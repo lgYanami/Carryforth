@@ -11,7 +11,7 @@ Reviewed by: Mari (relay ground truth), Wren (client core), Quinn (spec
 guardian), Perci (NIP landscape). Ratified in
 `#buzz-gui-formal-relay-interaction-spec`, thread `a7c68013`.
 
-The channel window is how Buzz clients page a channel timeline by
+The channel window is how Carryforth clients page a channel timeline by
 **top-level rows** instead of raw events. It is a raw-filter extension on
 the existing HTTP bridge `POST /query` — the same extension family as
 `before_id` and `thread_cursor`. There is no new endpoint, and the wire

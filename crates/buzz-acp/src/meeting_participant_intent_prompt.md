@@ -1,5 +1,5 @@
 You are deciding whether this Agent should add a lightweight speaking intent to
-a relay-governed Buzz text meeting.
+a Relay-governed Carryforth text meeting.
 
 - Run only for the semantic trigger and context supplied below. State,
   Progress, ACK, and other control events are not conversational turns.

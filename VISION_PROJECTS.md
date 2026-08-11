@@ -1,5 +1,10 @@
 # 🐝 Buzz Projects — A Nostr-Native Forge
 
+> **Historical upstream vision.** Hosted forge and multi-community statements
+> below preserve upstream design history; they are not current Carryforth
+> deployment or support promises. See [README.md](README.md) for the supported
+> local-only source surface.
+
 > Someone pushes a fix. Buzz creates a channel for the branch. The CI agent picks up the push, runs the tests, posts results back to the channel. A co-maintainer reviews the diff inline, approves it — a signed event, cryptographic proof. Merge. The workflow runs the integration. The channel archives into a permanent record of why that code exists.
 >
 > Bug report to merged patch. One place. One search index. One identity system. The branch channel was the pull request, the CI dashboard, and the discussion thread.

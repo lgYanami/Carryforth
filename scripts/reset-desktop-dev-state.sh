@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Remove desktop state owned by development bundle identifiers only.
-# Production state (`xyz.block.buzz.app`, `~/.buzz`, and `buzz-desktop`) is
+# Installed Carryforth state at the compatibility coordinates
+# (`xyz.block.buzz.app`, `~/.buzz`, and `buzz-desktop`) is
 # deliberately outside every deletion pattern in this script.
 set -euo pipefail
 
@@ -61,9 +62,9 @@ esac
 remove_path "$HOME/.buzz-dev"
 remove_path "$HOME/.sprout-dev"
 
-# A fresh dev nest must not re-import the installed app's ~/.buzz contents on
+# A fresh dev nest must not re-import the installed app's compatibility nest on
 # its next boot. The sentinel is the same one used by migrate_dev_nest().
 mkdir -p "$HOME/.buzz-dev"
 : > "$HOME/.buzz-dev/.dev-nest-migrated"
 
-log "Development desktop state removed; production Buzz state was not touched"
+log "Development desktop state removed; installed Carryforth state was not touched"

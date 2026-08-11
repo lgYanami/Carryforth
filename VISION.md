@@ -1,5 +1,11 @@
 # 🐝 Buzz — The relay is the workspace
 
+> **Historical upstream vision.** This document preserves the product narrative
+> inherited from Buzz and may describe hosted, multi-tenant, Web, Mobile, or
+> other surfaces outside Carryforth's current local-only support boundary. It
+> is not the current Carryforth roadmap; start with [README.md](README.md) and
+> the reviewed plans under `docs/lora/stage/carryforth/`.
+
 > An engineer is debugging a production incident at 2am. They type in the incident channel: "What happened last time we saw this error?"
 >
 > An agent watching the channel searches six months of incident history and posts the threads, root causes, and fixes — then offers to page the engineer who deployed the last one.

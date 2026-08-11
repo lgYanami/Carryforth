@@ -33,7 +33,7 @@ cp .env.example .env             # one-time
 just setup                       # start Docker services, run migrations
 ```
 
-> **Already running Buzz Desktop?** Desktop uses the same Docker container
+> **Already running Carryforth Desktop?** Desktop uses the same Docker container
 > names (`buzz-postgres`, `buzz-redis`) and the same
 > default ports (`:5432`, `:6379`). `just setup` will reuse those
 > services, so **your test relay writes into Desktop's database**. That's
@@ -42,7 +42,7 @@ just setup                       # start Docker services, run migrations
 > dev stack on a different Compose project
 > (`COMPOSE_PROJECT_NAME=buzz-dev docker compose …`).
 
-`just reset` wipes all local data and starts over — **including Buzz
+`just reset` wipes all local data and starts over — **including Carryforth
 Desktop's data** if its services are sharing your dev stack (see callout
 above).
 
@@ -93,8 +93,8 @@ The relay starts in dev mode (`BUZZ_REQUIRE_AUTH_TOKEN=false`). The startup
 log emits a WARN about this — that's expected for local testing. See the env
 vars table at the bottom if you need to lock it down.
 
-> **Already running Buzz Desktop (or another relay) on `:3000` / `:8080` /
-> `:9102`?** Buzz binds three ports — main, health, metrics — and any of
+> **Already running Carryforth Desktop (or another Relay) on `:3000` / `:8080` /
+> `:9102`?** Carryforth Relay binds three ports — main, health, metrics — and any of
 > them can collide. Use a separate terminal per role and export the right
 > vars in each:
 >
@@ -117,7 +117,7 @@ vars table at the bottom if you need to lock it down.
 >
 > Every snippet later in this doc shows the defaults. When you see
 > `localhost:3000` / `:8080` in a code block, mentally substitute your
-> overrides — or the CLI will end up talking to Buzz Desktop's relay.
+> overrides — or the CLI will end up talking to Carryforth Desktop's Relay.
 
 > **Ignore `just setup`'s "Next steps" banner.** It still prints
 > `just relay` (a debug build). Use `buzz-relay` from step 2 here —

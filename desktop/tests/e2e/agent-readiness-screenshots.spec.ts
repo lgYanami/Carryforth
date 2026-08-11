@@ -233,15 +233,15 @@ test.describe("agent readiness gate screenshots", () => {
       acpRuntimesCatalog: [
         {
           id: "buzz-agent",
-          label: "Buzz Agent",
+          label: "Carryforth Agent",
           avatar_url: "",
           availability: "available",
           command: "buzz-agent",
           binary_path: "/usr/local/bin/buzz-agent",
           default_args: [],
           mcp_command: "buzz-dev-mcp",
-          install_hint: "Ships with the Buzz desktop app.",
-          install_instructions_url: "https://github.com/block/buzz",
+          install_hint: "Ships with Carryforth Desktop.",
+          install_instructions_url: "https://github.com/lgYanami/Carryforth",
           can_auto_install: false,
           underlying_cli_path: null,
         },

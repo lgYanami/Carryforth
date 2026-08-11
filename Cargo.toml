@@ -3,7 +3,6 @@ members = [
     "crates/buzz-relay",
     "crates/buzz-core",
     "crates/buzz-conformance",
-    "crates/buzz-push-gateway",
     "crates/buzz-db",
     "crates/buzz-pubsub",
     "crates/buzz-auth",

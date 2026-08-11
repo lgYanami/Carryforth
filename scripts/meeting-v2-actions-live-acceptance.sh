@@ -135,7 +135,7 @@ for port in "${relay_port}" "${health_port}" "${metrics_port}"; do
     fail "port ${port} is already in use"
   fi
 done
-for binary in buzz buzz-acp buzz-admin buzz-relay; do
+for binary in cf buzz-acp buzz-admin buzz-relay; do
   [[ -x "target/release/${binary}" ]] || fail "missing release binary: target/release/${binary}"
 done
 

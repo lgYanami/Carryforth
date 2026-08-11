@@ -1,6 +1,6 @@
 # Read-only deployment moderation dashboard
 
-Buzz can expose a private, deployment-wide read-only dashboard from the existing
+Carryforth can expose a private, deployment-wide read-only dashboard from the existing
 relay process. It shows open moderation reports and recent product feedback.
 
 Configure `BUZZ_ADMIN_HOST` to activate the dashboard. A private ingress limits

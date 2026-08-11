@@ -1,11 +1,6 @@
-import buzzAppIcon from "@/assets/app-icon@3x.png";
+import carryforthAppIcon from "@/assets/carryforth.svg";
 import { claimInviteInBrowser } from "@/features/invite/invite-api";
-import {
-  BUZZ_RELEASES_URL,
-  type BuzzDownloadPlatform,
-  detectBuzzDownloadPlatform,
-  resolveBuzzDownloadUrlForPlatform,
-} from "@/shared/lib/buzz-download";
+import { CARRYFORTH_SOURCE_BUILD_URL } from "@/shared/lib/carryforth-source";
 import { hasNip07Provider } from "@/shared/lib/nostr-signer";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { Button } from "@/shared/ui/button";
@@ -34,37 +29,10 @@ export function InvitePage({ code }: { code: string }) {
   const [document, setDocument] = React.useState<PolicyDocument | null>(null);
   const [ageConfirmed, setAgeConfirmed] = React.useState(false);
   const [agreementConfirmed, setAgreementConfirmed] = React.useState(false);
-  const [opening, setOpening] = React.useState(false);
   const [joiningBrowser, setJoiningBrowser] = React.useState(false);
   const [browserJoinError, setBrowserJoinError] = React.useState<string | null>(
     null,
   );
-  const [downloadUrl, setDownloadUrl] = React.useState(BUZZ_RELEASES_URL);
-  const [needsMacChoice, setNeedsMacChoice] = React.useState(false);
-  const [showMacChoice, setShowMacChoice] = React.useState(false);
-  const [choosingMacDownload, setChoosingMacDownload] = React.useState(false);
-  const choosingMacDownloadRef = React.useRef(false);
-  const downloadTriggerRef = React.useRef<HTMLAnchorElement>(null);
-
-  React.useEffect(() => {
-    let active = true;
-    detectBuzzDownloadPlatform(navigator).then(async (platform) => {
-      if (!active) return;
-      if (
-        platform.operatingSystem === "macos" &&
-        platform.architecture === "unknown"
-      ) {
-        setNeedsMacChoice(true);
-        return;
-      }
-      const url = await resolveBuzzDownloadUrlForPlatform(platform);
-      if (active) setDownloadUrl(url);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
   React.useEffect(() => {
     fetch("/api/join-policy")
       .then(async (response) => {
@@ -90,18 +58,6 @@ export function InvitePage({ code }: { code: string }) {
     return ((await response.json()) as { receipt: string }).receipt;
   };
 
-  const openInvite = async () => {
-    setOpening(true);
-    try {
-      const receipt = await acceptPolicy();
-      const query = new URLSearchParams({ relay, code });
-      if (receipt) query.set("policy_receipt", receipt);
-      window.location.href = `buzz://join?${query.toString()}`;
-    } finally {
-      setOpening(false);
-    }
-  };
-
   const joinInBrowser = async () => {
     setBrowserJoinError(null);
     setJoiningBrowser(true);
@@ -121,7 +77,6 @@ export function InvitePage({ code }: { code: string }) {
   const browserSigningAvailable = hasNip07Provider();
   const disabled =
     policy === undefined ||
-    opening ||
     joiningBrowser ||
     Boolean(policy?.age_attestation_required && !ageConfirmed) ||
     Boolean(
@@ -137,38 +92,6 @@ export function InvitePage({ code }: { code: string }) {
   );
   const showDocument = (title: string, markdown: string) =>
     setDocument({ title, markdown });
-  const closeMacChoice = React.useCallback(() => {
-    setShowMacChoice(false);
-    window.setTimeout(() => downloadTriggerRef.current?.focus());
-  }, []);
-  const chooseMacDownload = async (
-    event: React.MouseEvent<HTMLAnchorElement>,
-    platform: BuzzDownloadPlatform,
-  ) => {
-    event.preventDefault();
-    if (choosingMacDownloadRef.current) return;
-    choosingMacDownloadRef.current = true;
-    setChoosingMacDownload(true);
-    const downloadWindow = window.open("about:blank", "_blank");
-    if (downloadWindow) downloadWindow.opener = null;
-    setShowMacChoice(false);
-    try {
-      const url = await resolveBuzzDownloadUrlForPlatform(platform);
-      downloadWindow?.location.replace(url);
-    } finally {
-      choosingMacDownloadRef.current = false;
-      setChoosingMacDownload(false);
-    }
-  };
-
-  React.useEffect(() => {
-    if (!showMacChoice) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeMacChoice();
-    };
-    window.document.addEventListener("keydown", closeOnEscape);
-    return () => window.document.removeEventListener("keydown", closeOnEscape);
-  }, [closeMacChoice, showMacChoice]);
 
   return (
     <div
@@ -183,7 +106,11 @@ export function InvitePage({ code }: { code: string }) {
             className="h-12 w-12 overflow-hidden bg-black"
             style={{ borderRadius: "22.37%" }}
           >
-            <img alt="Buzz" className="h-full w-full" src={buzzAppIcon} />
+            <img
+              alt="Carryforth"
+              className="h-full w-full"
+              src={carryforthAppIcon}
+            />
           </div>
           <h1 className="mt-4 text-2xl font-semibold tracking-tight text-black">
             You&apos;re invited to
@@ -221,34 +148,15 @@ export function InvitePage({ code }: { code: string }) {
                 {joiningBrowser ? "Joining…" : "Join in browser"}
               </Button>
             ) : null}
-            {policy === null ? (
-              <Button
-                asChild
-                className={`h-10 w-full ${
-                  browserSigningAvailable
-                    ? "border border-black bg-white text-black hover:bg-black/5"
-                    : "bg-black text-white hover:bg-black/90 focus-visible:ring-black"
-                }`}
+            {!browserSigningAvailable ? (
+              <p
+                className="rounded-xl border border-black/10 bg-black/[0.03] p-3 text-sm leading-5 text-black/60"
+                data-testid="desktop-invite-handoff-unavailable"
               >
-                <a
-                  href={`buzz://join?relay=${encodeURIComponent(relay)}&code=${encodeURIComponent(code)}`}
-                >
-                  Accept invite in Buzz
-                </a>
-              </Button>
-            ) : (
-              <Button
-                className={`h-10 w-full disabled:cursor-not-allowed disabled:bg-black/30 disabled:text-white/70 ${
-                  browserSigningAvailable
-                    ? "border border-black bg-white text-black hover:bg-black/5"
-                    : "bg-black text-white hover:bg-black/90 focus-visible:ring-black"
-                }`}
-                disabled={disabled}
-                onClick={openInvite}
-              >
-                Accept invite in Buzz
-              </Button>
-            )}
+                Desktop invite handoff is not available from this source-only
+                web client. Install a NIP-07 browser signer to join here.
+              </p>
+            ) : null}
             {browserJoinError ? (
               <p className="text-sm text-red-700" role="alert">
                 {browserJoinError}
@@ -257,97 +165,17 @@ export function InvitePage({ code }: { code: string }) {
           </div>
         </div>
         <p className="flex h-[3.125rem] items-center justify-center rounded-2xl bg-white text-sm text-black/60">
-          Don&apos;t have the app?{" "}
+          Need Carryforth Desktop?{" "}
           <a
-            aria-expanded={needsMacChoice ? showMacChoice : undefined}
-            aria-haspopup={needsMacChoice ? "dialog" : undefined}
             className="ml-1 font-medium text-black underline-offset-4 hover:text-black/70 hover:underline focus-visible:underline"
-            href={downloadUrl}
-            ref={downloadTriggerRef}
-            rel="noreferrer"
+            href={CARRYFORTH_SOURCE_BUILD_URL}
+            rel="noopener noreferrer"
             target="_blank"
-            onClick={(event) => {
-              if (!needsMacChoice) return;
-              event.preventDefault();
-              setShowMacChoice(true);
-            }}
           >
-            Download it now
+            Build it from source
           </a>
         </p>
       </div>
-
-      {showMacChoice && (
-        <div
-          aria-label="Which Mac do you have?"
-          aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 text-left"
-          role="dialog"
-          onMouseDown={(event) => {
-            if (event.currentTarget === event.target) closeMacChoice();
-          }}
-        >
-          <div className="w-full max-w-lg rounded-3xl bg-white p-7 text-black shadow-xl sm:p-9">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2 className="text-2xl font-semibold tracking-tight">
-                  Which Mac do you have?
-                </h2>
-                <p className="mt-2 text-sm text-black/60">
-                  Choose based on when your Mac was released.
-                </p>
-              </div>
-              <button
-                aria-label="Close"
-                className="text-2xl leading-none text-black/60 hover:text-black"
-                type="button"
-                onClick={closeMacChoice}
-              >
-                ×
-              </button>
-            </div>
-            <div className="mt-6 grid gap-3">
-              <a
-                aria-disabled={choosingMacDownload}
-                className="rounded-2xl border border-black p-5 text-black no-underline hover:bg-black hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black aria-disabled:pointer-events-none aria-disabled:opacity-50"
-                href={BUZZ_RELEASES_URL}
-                onClick={(event) =>
-                  void chooseMacDownload(event, {
-                    operatingSystem: "macos",
-                    architecture: "arm64",
-                  })
-                }
-              >
-                <strong className="block text-lg">Newer Mac</strong>
-                <span className="mt-1 block text-sm">
-                  2021 or later, or a late-2020 Mac with an Apple M1 chip
-                </span>
-              </a>
-              <a
-                aria-disabled={choosingMacDownload}
-                className="rounded-2xl border border-black p-5 text-black no-underline hover:bg-black hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black aria-disabled:pointer-events-none aria-disabled:opacity-50"
-                href={BUZZ_RELEASES_URL}
-                onClick={(event) =>
-                  void chooseMacDownload(event, {
-                    operatingSystem: "macos",
-                    architecture: "x64",
-                  })
-                }
-              >
-                <strong className="block text-lg">Older Mac</strong>
-                <span className="mt-1 block text-sm">
-                  2019 or earlier, or a 2020 Mac with an Intel processor
-                </span>
-              </a>
-            </div>
-            <p className="mt-5 text-sm leading-5">
-              <strong>Not sure?</strong> Open the Apple menu and choose{" "}
-              <strong>About This Mac</strong>. “Chip: Apple M…” means Newer Mac.
-              “Processor: Intel” means Older Mac.
-            </p>
-          </div>
-        </div>
-      )}
 
       {document && (
         <div

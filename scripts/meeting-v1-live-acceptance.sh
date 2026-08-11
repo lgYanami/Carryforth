@@ -5,7 +5,7 @@
 # This runner intentionally keeps protocol observation and control separate:
 #   - one authenticated WebSocket subscription records Relay-signed State per Session;
 #   - read-only PostgreSQL checks drive time-sensitive Human ACK automation;
-#   - all canonical actions still go through the public Buzz CLI/Relay path.
+#   - all canonical actions still go through the public cf/Relay path.
 #
 # Usage:
 #   scripts/meeting-v1-live-acceptance.sh C6 [artifact-root]
@@ -742,7 +742,7 @@ agent_team_instructions() {
   printf '%s\n' \
     "你正在参加 ${tier} 的真实 Meeting V1 验收（Meeting ${meeting_index}，身份 ${role}）。" \
     "$role_focus" \
-    "会议只做讨论与只读调查；可以使用工具读取仓库和运行只读命令，但不要修改文件、Git、Buzz 项目状态、第三方系统或网络资源。" \
+    "会议只做讨论与只读调查；可以使用工具读取仓库和运行只读命令，但不要修改文件、Git、Carryforth 项目状态、第三方系统或网络资源。" \
     "Intent 只概括为什么现在值得发言。获得 Grant 后再组织发言，保持结论具体、可核验且避免重复；有明确提问对象时使用 directed handoff 并说明原因。"
 }
 

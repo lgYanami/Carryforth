@@ -49,11 +49,11 @@ load_env() {
     set +o allexport
   fi
 
-  # Smooth the local rename path for developers with a pre-Buzz .env copied
+  # Smooth the local storage-compatibility path for developers with an older .env copied
   # from .env.example. Only rewrite the old default values; custom values stay
   # untouched.
   if [[ "${DATABASE_URL:-}" == "postgres://sprout:sprout_dev@localhost:5432/sprout" ]]; then
-    warn "Migrating legacy default DATABASE_URL from sprout to buzz for this setup run"
+    warn "Migrating the legacy default DATABASE_URL to Carryforth's compatible local database coordinate for this setup run"
     DATABASE_URL="postgres://buzz:buzz_dev@localhost:5432/buzz"
   fi
   if [[ "${PGUSER:-}" == "sprout" ]]; then PGUSER="buzz"; fi
@@ -76,7 +76,7 @@ cleanup_legacy_sprout_containers() {
     return
   fi
 
-  warn "Stopping/removing legacy sprout-* dev containers so buzz-* containers can bind the standard ports"
+  warn "Stopping/removing legacy sprout-* dev containers so Carryforth's compatible local containers can bind the standard ports"
   echo "${legacy_containers}" | xargs docker stop >/dev/null 2>&1 || true
   echo "${legacy_containers}" | xargs docker rm >/dev/null 2>&1 || true
   success "Legacy sprout-* containers removed (volumes preserved)"
@@ -182,7 +182,7 @@ success "Git hooks installed"
 
 echo ""
 echo -e "${GREEN}=======================================================${NC}"
-echo -e "${GREEN}  Buzz dev environment is ready!${NC}"
+echo -e "${GREEN}  Carryforth dev environment is ready!${NC}"
 echo -e "${GREEN}=======================================================${NC}"
 echo ""
 echo -e "  ${BLUE}Postgres${NC}    ${DATABASE_URL}"

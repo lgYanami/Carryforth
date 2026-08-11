@@ -1,5 +1,10 @@
 # Multi-tenant Conformance Checklist
 
+> **Historical upstream conformance record.** Carryforth currently supports a
+> single local Relay and does not ship a hosted multi-tenant deployment. This
+> checklist is retained to preserve the protocol and isolation analysis; it is
+> not a current product or deployment promise.
+
 This document is the source-vs-model checklist for adding first-class communities
 without changing the observed behavior of a single-community Buzz deployment.
 

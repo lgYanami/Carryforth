@@ -273,11 +273,11 @@ impl SetupPayload {
                 // help. Don't send the user there.
                 "Fix the config file(s) and restart the agent.".to_string()
             } else if any_external {
-                // Mixed: some Buzz-managed fields, some external config.
-                "Open Edit Agent in the Buzz app for the Buzz-managed fields; fix the external CLI config files manually and restart the agent.".to_string()
+                // Mixed: some Carryforth-managed fields, some external config.
+                "Open Edit Agent in Carryforth for the Carryforth-managed fields; fix the external CLI config files manually and restart the agent.".to_string()
             } else {
-                // All Buzz-managed — original footer unchanged.
-                "Open Edit Agent in the Buzz app to set these.".to_string()
+                // All Carryforth-managed.
+                "Open Edit Agent in Carryforth to set these.".to_string()
             };
 
             format!(
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn setup_payload_deserializes_git_bash_requirement() {
         let payload: SetupPayload = serde_json::from_str(
-            r#"{"agent_name":"Buzz Agent","agent_pubkey":"test","requirements":[{"surface":"git_bash"}]}"#,
+            r#"{"agent_name":"Carryforth Agent","agent_pubkey":"test","requirements":[{"surface":"git_bash"}]}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn nudge_body_git_bash_copy_points_to_agent_runtimes() {
         let payload = SetupPayload {
-            agent_name: "Buzz Agent".to_string(),
+            agent_name: "Carryforth Agent".to_string(),
             agent_pubkey: "test".to_string(),
             requirements: vec![RequirementPayload::GitBash],
         };
@@ -849,7 +849,7 @@ mod tests {
 
     #[test]
     fn nudge_body_mixed_requirements_uses_split_footer() {
-        // Mixed list: one Buzz-managed env key + one external config invalid.
+        // Mixed list: one Carryforth-managed env key + one external config invalid.
         // Footer must address both sides.
         let payload = SetupPayload {
             agent_name: "Codex".to_string(),
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn nudge_body_all_buzz_managed_retains_original_footer() {
-        // Pure Buzz-managed requirements → original "Open Edit Agent" footer unchanged.
+        // Pure Carryforth-managed requirements → "Open Edit Agent" footer.
         let payload = SetupPayload {
             agent_name: "Fizz".to_string(),
             agent_pubkey: "test".to_string(),
@@ -884,7 +884,7 @@ mod tests {
         };
         let body = payload.nudge_body();
         assert!(
-            body.contains("Open Edit Agent in the Buzz app to set these."),
+            body.contains("Open Edit Agent in Carryforth to set these."),
             "all-managed nudge must use the original Edit Agent footer; got: {body:?}"
         );
     }

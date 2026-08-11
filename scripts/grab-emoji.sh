@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# grab-emoji.sh — Register custom Slack emoji in Buzz
+# grab-emoji.sh — Register custom Slack emoji in Carryforth
 #
-# Looks up each emoji name in your Slack workspace and registers it in Buzz
-# via `cf emoji set`, making it available as :name: in the Buzz emoji picker.
+# Looks up each emoji name in your Slack workspace and registers it in
+# Carryforth via `cf emoji set`, making it available as :name: in the emoji picker.
 #
 # Usage:
-#   SLACK_TOKEN=xoxp-... ./scripts/grab-emoji.sh [--name <buzz-name>] <emoji-name> [emoji-name ...]
+#   SLACK_TOKEN=xoxp-... ./scripts/grab-emoji.sh [--name <shortcode>] <emoji-name> [emoji-name ...]
 #
 # Options:
-#   --name <buzz-name>  Override the shortcode used in Buzz (only valid with a single emoji)
+#   --name <shortcode>  Override the Carryforth shortcode (only valid with a single emoji)
 #
 # Env:
 #   SLACK_TOKEN  — Slack user token (xoxp-...) with emoji:read scope
 #
 # Output:
-#   name → registered as :name: in Buzz   on success
+#   name → registered as :name: in Carryforth   on success
 #   name → ERROR: reason                  on failure (script continues to next emoji)
 
 set -euo pipefail
@@ -24,12 +24,12 @@ CACHE_TTL=86400  # 24 hours in seconds
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
-BUZZ_NAME=""
+SHORTCODE_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)
-      BUZZ_NAME="$2"
+      SHORTCODE_OVERRIDE="$2"
       shift 2
       ;;
     --)
@@ -49,11 +49,11 @@ done
 # ── Preflight checks ──────────────────────────────────────────────────────────
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: SLACK_TOKEN=xoxp-... $0 [--name <buzz-name>] <emoji-name> [emoji-name ...]" >&2
+  echo "Usage: SLACK_TOKEN=xoxp-... $0 [--name <shortcode>] <emoji-name> [emoji-name ...]" >&2
   exit 1
 fi
 
-if [[ -n "$BUZZ_NAME" && $# -ne 1 ]]; then
+if [[ -n "$SHORTCODE_OVERRIDE" && $# -ne 1 ]]; then
   echo "ERROR: --name can only be used when specifying a single emoji" >&2
   exit 1
 fi
@@ -63,8 +63,8 @@ if [[ -z "${SLACK_TOKEN:-}" ]]; then
   exit 1
 fi
 
-if ! command -v buzz &>/dev/null; then
-  echo "ERROR: 'buzz' not found in PATH. Install the Buzz CLI and retry." >&2
+if ! command -v cf &>/dev/null; then
+  echo "ERROR: 'cf' not found in PATH. Build the Carryforth CLI and retry." >&2
   exit 1
 fi
 
@@ -148,7 +148,7 @@ _resolve_url() {
 
 for emoji_name in "$@"; do
   # Use --name override if provided, otherwise use the Slack emoji name
-  buzz_shortcode="${BUZZ_NAME:-$emoji_name}"
+  shortcode="${SHORTCODE_OVERRIDE:-$emoji_name}"
 
   # Resolve URL
   emoji_url=$(_resolve_url "$emoji_name") || {
@@ -156,11 +156,11 @@ for emoji_name in "$@"; do
     continue
   }
 
-  # Register in Buzz
-  set_output=$(cf emoji set --shortcode "$buzz_shortcode" --url "$emoji_url" 2>&1) || {
+  # Register in Carryforth
+  set_output=$(cf emoji set --shortcode "$shortcode" --url "$emoji_url" 2>&1) || {
     echo "${emoji_name} → ERROR: cf emoji set failed — ${set_output}"
     continue
   }
 
-  echo "${emoji_name} → registered as :${buzz_shortcode}: in Buzz"
+  echo "${emoji_name} → registered as :${shortcode}: in Carryforth"
 done

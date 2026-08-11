@@ -49,14 +49,14 @@ Prints all derived cryptographic values from the NIP-AB spec's fixed test keys. 
 buzz-pair test-vectors
 ```
 
-## Testing Against a Local Buzz Relay
+## Testing Against a Local Carryforth Relay
 
-The CLI supports NIP-42 authentication, so it works with Buzz relays out of the box.
+The CLI supports NIP-42 authentication, so it works with Carryforth Relays out of the box.
 
 ### Prerequisites
 
 - Docker running (for Postgres, Redis, etc.)
-- Buzz relay built: `cargo build --release -p buzz-relay`
+- Carryforth Relay compatibility binary built: `cargo build --release -p buzz-relay`
 
 ### Start the relay
 

@@ -109,8 +109,16 @@ def test_forbidden_flags_are_not_accepted(tmp_path):
     for flag in FORBIDDEN_FLAGS:
         with pytest.raises(SystemExit):
             run_leaderboard.parse_args(
-                ["--dataset", "d", "--attempts", "5",
-                 "--agent-bin-dir", str(tmp_path), flag, "1"]
+                [
+                    "--dataset",
+                    "d",
+                    "--attempts",
+                    "5",
+                    "--agent-bin-dir",
+                    str(tmp_path),
+                    flag,
+                    "1",
+                ]
             )
 
 
@@ -119,7 +127,9 @@ def test_metadata_template_matches_harbor_schema(args, tmp_path):
 
     path = run_leaderboard.write_metadata_template(args, tmp_path)
     loaded = load_metadata(path)
-    assert loaded["agent_org_display_name"] == "Block"
+    assert loaded["agent_url"] == "https://github.com/lgYanami/Carryforth"
+    assert loaded["agent_display_name"] == "Carryforth Orchestra (unit-test)"
+    assert loaded["agent_org_display_name"] == "Carryforth"
     assert [m["model_name"] for m in loaded["models"]] == ["frontier", "fast"]
     assert loaded["models"][0]["model_org_display_name"] == "Anthropic"
     assert loaded["models"][1]["model_provider"] == "FILL_ME"

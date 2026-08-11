@@ -1,14 +1,14 @@
 # Project View v3 operations
 
 This is the operational runbook for the current Project View runtime. Relay,
-Desktop, ACP, and `buzz` use schema v3 only. Older schema payloads are accepted
+Desktop, ACP, and `cf` use schema v3 only. Older schema payloads are accepted
 only by explicitly named operator migration/recovery tools; they are never an
 ordinary read, write, discovery, or client fallback path.
 
 Project View uses the existing Relay, PostgreSQL, Redis, Nostr protocol, and
 `buzz-admin`. `communities.project_view_enabled` is the central runtime gate.
-Do not add `BUZZ_PROJECT_VIEW_ENABLED`: a per-Pod flag would make a rolling
-deployment inconsistent.
+Do not add `BUZZ_PROJECT_VIEW_ENABLED`: a per-process flag would make the
+runtime inconsistent.
 
 The normal greenfield lifecycle is:
 
@@ -28,55 +28,42 @@ the checked operator enable can publish the capability.
 
 ## Prerequisites
 
-- Pin one immutable Relay image containing `buzz-relay`, `buzz-admin`, and the
-  matching `buzz` CLI.
+- Build one source revision containing `buzz-relay`, `buzz-admin`, and the
+  matching `cf` CLI. Carryforth does not currently ship a Kubernetes or Helm
+  deployment surface.
 - Back up PostgreSQL and record the restore point. All normal schema changes are
   forward-only and additive; never delete Project View rows to roll back an
   application binary.
-- Keep `BUZZ_RELAY_PRIVATE_KEY` stable and identical on every Relay Pod. Its
-  public key signs every Project View projection.
+- Keep `BUZZ_RELAY_PRIVATE_KEY` stable for the Local Relay. Its public key signs
+  every Project View projection.
 - Identify the normalized Community host used by NIP-11 and
-  `buzz-admin --community`; examples below use `relay.example.com`.
+  `buzz-admin --community`; examples below use `localhost:3000`.
 - Identify a current direct Human owner/admin public key. That identity signs
   `init-v3` and receives an initial admin Role Assignment.
 
-For Kubernetes examples, `$POD` is one Pod from the fully rolled Deployment:
+## Source-first activation
+
+### 1. Build the complete v3 binary set
+
+Activate the repository toolchain and build the Relay, operator CLI, and agent
+CLI from the same locked source revision:
 
 ```bash
-POD="$(kubectl -n buzz get pod \
-  -l app.kubernetes.io/name=buzz \
-  -o jsonpath='{.items[0].metadata.name}')"
+. ./bin/activate-hermit
+cargo build --locked -p buzz-relay -p buzz-admin -p carryforth-cli
 ```
 
-## Server-first rollout
-
-### 1. Roll the complete v3 binary set with automatic migration disabled
-
-Set Helm `migrate.autoMigrate=false` (or `BUZZ_AUTO_MIGRATE=false` in Compose),
-deploy the immutable image, and verify that every Pod has the same digest:
-
-```bash
-helm upgrade buzz oci://ghcr.io/block/buzz/charts/buzz \
-  --reuse-values \
-  --set image.tag=sha-abcdef0 \
-  --set migrate.autoMigrate=false
-kubectl -n buzz rollout status deployment/buzz
-kubectl -n buzz get pods \
-  -l app.kubernetes.io/name=buzz \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
-```
-
-Do not deploy a new Relay with an older Desktop/ACP/CLI runtime and rely on a
+Do not start a new Relay with an older Desktop/ACP/CLI runtime and rely on a
 compatibility fallback. All first-party surfaces move together and the static
 v3 runtime gate enforces that boundary.
 
 ### 2. Apply and verify the current schema
 
-Run migration from the same immutable image:
+Run migration with the operator binary built from that revision:
 
 ```bash
-kubectl -n buzz exec "$POD" -- buzz-admin migrate
-kubectl -n buzz exec "$POD" -- buzz-admin project-view status
+./target/debug/buzz-admin migrate
+./target/debug/buzz-admin project-view status --community localhost:3000
 ```
 
 Treat the status columns as a one-way lifecycle, not interchangeable feature
@@ -103,8 +90,8 @@ WHERE table_schema = 'public'
   AND column_name = 'project_view_schema_version';
 ```
 
-The default must be `3`. Also verify the release image without touching a
-shared database:
+The default must be `3`. Also verify the current source revision without
+touching a shared database:
 
 ```bash
 ./scripts/check-project-view-v3-runtime.sh
@@ -124,8 +111,8 @@ receipt:
 
 ```bash
 BUZZ_PRIVATE_KEY=nsec1... \
-  buzz-admin project-view prepare-v3 \
-    --community relay.example.com \
+  ./target/debug/buzz-admin project-view prepare-v3 \
+    --community localhost:3000 \
     --idempotency-key pv3-prepare-2026-08-07 \
     --operator-pubkey npub1...
 ```
@@ -178,7 +165,7 @@ is a client-generated UUID v4.
 Submit it through the current CLI:
 
 ```bash
-CARRYFORTH_RELAY_URL=https://relay.example.com \
+CARRYFORTH_RELAY_URL=ws://localhost:3000 \
 CARRYFORTH_PRIVATE_KEY=nsec1... \
   cf --format compact project-view init-v3 --command initialize-v3.json
 ```
@@ -191,7 +178,7 @@ capability remains absent until checked enable. Confirm `project_revision=1`, `p
 `project_view_schema_version=3`, and `project_view_enabled=false`:
 
 ```bash
-buzz-admin project-view status --community relay.example.com
+./target/debug/buzz-admin project-view status --community localhost:3000
 ```
 
 ### 5. Checked enable and smoke
@@ -201,9 +188,9 @@ continuity history, metadata, membership snapshot, signatures, exact tags, and
 projection pointers:
 
 ```bash
-buzz-admin project-view enable --community relay.example.com
-buzz-admin project-view status --community relay.example.com
-curl -fsS https://relay.example.com/info | jq '.supported_extensions, .self'
+./target/debug/buzz-admin project-view enable --community localhost:3000
+./target/debug/buzz-admin project-view status --community localhost:3000
+curl -fsS http://localhost:3000/info | jq '.supported_extensions, .self'
 ```
 
 NIP-11 must advertise exactly `buzz-project-view-v3` for Project View, and
@@ -211,11 +198,11 @@ NIP-11 must advertise exactly `buzz-project-view-v3` for Project View, and
 for read smoke:
 
 ```bash
-CARRYFORTH_RELAY_URL=https://relay.example.com \
+CARRYFORTH_RELAY_URL=ws://localhost:3000 \
 CARRYFORTH_PRIVATE_KEY=nsec1... \
   cf --format compact project-view get
 
-CARRYFORTH_RELAY_URL=https://relay.example.com \
+CARRYFORTH_RELAY_URL=ws://localhost:3000 \
 CARRYFORTH_PRIVATE_KEY=nsec1... \
   cf --format compact roles current
 ```
@@ -261,10 +248,10 @@ buzz_project_document_migration_required_communities
 ```
 
 Alert immediately when either migration-required gauge is non-zero. It means an
-active Community has an old Project View schema enabled: deployment readiness
+active Community has an old Project View schema enabled: Relay readiness
 is deliberately false and no first-party runtime will fall back to that major.
 Disable the affected capability, freeze it, and run the explicit operator
-cutover. All-disabled legacy Communities remain deployment-ready so that the
+cutover. All-disabled legacy Communities remain Relay-ready so that the
 same current binary can perform that migration. Also alert when schema
 readiness becomes `0` on an enabled Community, internal or unavailable mutation
 results persist, projection dispatch errors increase, or conflicts remain
@@ -310,8 +297,8 @@ WHERE e.id IS NULL;
 Disable first when writes, signatures, or projections are suspect:
 
 ```bash
-buzz-admin project-view disable --community relay.example.com
-buzz-admin project-view status --community relay.example.com
+./target/debug/buzz-admin project-view disable --community localhost:3000
+./target/debug/buzz-admin project-view status --community localhost:3000
 ```
 
 Disable takes the exclusive Community advisory lock. After it commits, no
@@ -330,8 +317,9 @@ reproject command:
 2. Wait for `maintenance ack-probe`, then `maintenance freeze`.
 3. Run `maintenance reproject` with the new protected key file and expected
    public key.
-4. Run `maintenance verify`, update the Secret, roll all Pods, and confirm the
-   new NIP-11 `self`.
+4. Run `maintenance verify`, replace the protected local key configuration,
+   restart the Local Relay and its first-party clients, and confirm the new
+   NIP-11 `self`.
 5. Run `maintenance resume`; checked readiness re-enables only a valid v3
    Community.
 

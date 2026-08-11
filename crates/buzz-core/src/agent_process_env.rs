@@ -1,4 +1,4 @@
-//! Environment-variable names shared by Desktop, ACP, and the Buzz CLI.
+//! Environment-variable names shared by Desktop, ACP, and the `cf` CLI.
 //!
 //! The values intentionally have separate responsibilities: Desktop ownership
 //! identifies which app instance may reap a process, while managed Runtime mode

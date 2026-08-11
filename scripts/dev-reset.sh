@@ -6,7 +6,7 @@
 #
 # Stops all services, removes development desktop state and ALL local service
 # volumes (data is lost!), brings everything back up fresh, and runs migrations.
-# Installed Buzz state is preserved.
+# Installed Carryforth state at the stable compatibility coordinates is preserved.
 # =============================================================================
 set -euo pipefail
 
@@ -31,7 +31,7 @@ cd "${REPO_ROOT}"
 
 if [[ "${1:-}" != "--yes" ]]; then
   echo -e "${YELLOW}WARNING: This will DELETE all development data (desktop state, postgres, minio volumes).${NC}"
-  echo -e "   Installed Buzz app state and its production keyring are preserved."
+  echo -e "   Installed Carryforth app state and its stable keyring are preserved."
   echo -e "   Redis data is ephemeral and always wiped on restart."
   echo ""
   read -r -p "Are you sure? [y/N] " confirm
@@ -48,7 +48,7 @@ fi
 
 log "Removing desktop development state..."
 "${SCRIPT_DIR}/reset-desktop-dev-state.sh"
-success "Desktop development state removed (installed Buzz state preserved)"
+success "Desktop development state removed (installed Carryforth state preserved)"
 
 # ---- Tear down --------------------------------------------------------------
 

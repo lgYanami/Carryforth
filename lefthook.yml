@@ -33,6 +33,8 @@ pre-commit:
       glob: ["mobile/**"]
       run: just mobile-fix
       stage_fixed: true
+    carryforth-product-surface:
+      run: ./scripts/check-carryforth-current-product-surface.sh
 
 pre-push:
   parallel: true

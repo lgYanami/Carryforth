@@ -1,5 +1,9 @@
 # 🛡️ Buzz Moderation — Your community, your rules
 
+> **Historical upstream vision.** This document preserves the inherited Buzz
+> moderation narrative and is not the current Carryforth release roadmap. The
+> current source and support boundary is defined in [README.md](README.md).
+
 > Someone spams #general at midnight. A member taps **Report** — a category, an optional note, done. The report doesn't appear in anyone's feed; it lands in a queue only the community's owners and admins can see. In the morning an admin opens the queue, finds three reports against the same account, deletes the messages, and times the account out for a day. The room sees an honest marker where the spam was. The author gets a message explaining why. The reporter gets a message saying it was handled. Nobody else saw anything.
 
 A Buzz community is a trust group with its own rules, and rules only matter if the people who own the room can enforce them. Buzz moderation gives community owners and admins the full loop: members report, the community's own owners and admins see and act, the relay enforces, and everyone affected hears the truth about what happened. The relay provides the mechanics — queue, authority, enforcement, audit, notices. The community provides the judgment. Buzz doesn't decide what your rules are; it makes sure you can actually have them.

@@ -15,9 +15,31 @@ if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# The screenshot branch and PR comment must target the current Carryforth
+# fork. Never silently send contributor artifacts to the upstream project.
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
+ORIGIN_REPO="$(printf '%s' "$ORIGIN_URL" | sed -nE \
+  's#^(https://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+/[^/]+?)(\.git)?$#\2#p')"
+ORIGIN_REPO="${ORIGIN_REPO%.git}"
+REPO="${CARRYFORTH_GITHUB_REPOSITORY:-$ORIGIN_REPO}"
+REPO="${REPO%.git}"
+ORIGIN_REPO_NORMALIZED="$(printf '%s' "$ORIGIN_REPO" | tr '[:upper:]' '[:lower:]')"
+REPO_NORMALIZED="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "error: cannot derive a GitHub repository from origin; set CARRYFORTH_GITHUB_REPOSITORY=owner/repo" >&2
+  exit 1
+fi
+if [[ -n "$ORIGIN_REPO" && "$REPO_NORMALIZED" != "$ORIGIN_REPO_NORMALIZED" ]]; then
+  echo "error: CARRYFORTH_GITHUB_REPOSITORY does not match the GitHub origin repository" >&2
+  exit 1
+fi
+if [[ "$REPO_NORMALIZED" == "block/buzz" ]]; then
+  echo "error: refusing to post Carryforth screenshots to the upstream block/buzz repository" >&2
+  exit 1
+fi
+
 GH_USER=$(gh api user --jq .login)
 BRANCH="agent-screenshots/${GH_USER}"
-REPO="block/buzz"
 
 mapfile -t PNGS < <(find "$PNG_DIR" -maxdepth 1 -name "*.png" -type f | sort)
 if [[ ${#PNGS[@]} -eq 0 ]]; then

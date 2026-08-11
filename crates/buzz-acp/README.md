@@ -1,11 +1,13 @@
 # buzz-acp
 
-ACP harness that connects AI agents to Buzz. The harness listens for @mentions on the relay, prompts your agent, and the agent replies using the Buzz CLI.
+ACP harness that connects AI agents to Carryforth. The harness listens for
+@mentions on the local Relay, prompts your agent, and the agent replies using
+the `cf` CLI.
 
 ```
-Buzz Relay ──WS──→ buzz-acp ──stdio──→ Your Agent
+Carryforth Relay ──WS──→ buzz-acp ──stdio──→ Your Agent
                                                │
-                                          Buzz CLI
+                                            cf CLI
                                        (send_message, etc.)
 ```
 
@@ -13,7 +15,7 @@ Supports any agent that speaks [ACP](https://agentclientprotocol.com/) over stdi
 
 ## Prerequisites
 
-- A running Buzz relay (`just relay` starts Docker services automatically, or use a hosted instance)
+- A running local Carryforth Relay (`just relay` starts the development dependencies)
 - A Nostr keypair for the agent (see [Generating Keys](#generating-keys))
 
 Build:
@@ -25,7 +27,8 @@ export PATH="$PWD/target/release:$PATH"
 
 ## Generating Keys
 
-Each agent needs a Nostr keypair — this is the agent's identity in Buzz. Use `buzz-admin` to mint one:
+Each agent needs a Nostr keypair — this is the agent's identity in Carryforth.
+Use `buzz-admin` to mint one:
 
 ```bash
 cargo run -p buzz-admin -- mint-token --name "my-agent" --scopes "messages:read,messages:write,channels:read"
@@ -41,7 +44,9 @@ The harness discovers channels by querying the relay with the agent's authentica
 
 By default, the harness discovers only channels the agent is a **member** of (`GET /api/channels?member=true`). When the agent is added to a new channel, the membership notification subscription auto-subscribes to it.
 
-**Private channels** require explicit membership. The relay doesn't yet have a REST/event API for managing channel members — this is a known gap. For now, use `create_channel` via the Buzz CLI to create new channels (the creator is automatically a member).
+**Private channels** require explicit membership. Use the current `cf channels`
+commands for channel operations; the creator is automatically a member of a
+new channel.
 
 ## Quick Start (goose)
 
@@ -53,7 +58,10 @@ export GOOSE_MODE=auto
 buzz-acp
 ```
 
-That's it. The harness spawns `goose acp`, connects to the relay, discovers channels, and starts listening. When someone @mentions the agent, goose receives the message and can reply using the Buzz CLI that the harness configures automatically.
+That's it. The harness spawns `goose acp`, connects to the Relay, discovers
+channels, and starts listening. When someone @mentions the agent, goose
+receives the message and can reply using the `cf` CLI that the harness
+configures automatically.
 
 ## Running with Codex
 
@@ -245,7 +253,7 @@ Forum event kinds:
 2. **Channel discovery** — Queries the relay REST API for accessible channels, subscribes to each.
 3. **Event loop** — Listens for @mention events (kind 9 with the agent's pubkey in a `#p` tag). Events queue per channel.
 4. **Prompting** — When events are pending and no prompt is in flight for that channel, drains all queued events for the oldest channel into a single batched prompt via ACP `session/prompt`.
-5. **Agent response** — The agent processes the prompt and uses the Buzz CLI (`send_message`, `get_messages`, etc.) to interact with Buzz.
+5. **Agent response** — The agent processes the prompt and uses `cf` to interact with Carryforth.
 6. **Recovery** — If the agent crashes, the harness respawns it. If the relay disconnects, the harness reconnects with a `since` filter to avoid missing events.
 
 Each channel has at most one prompt in flight. Multiple channels can be processed concurrently when agents > 1.

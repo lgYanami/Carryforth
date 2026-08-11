@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Sprig — one deploy-anywhere multicall binary for the Buzz ACP
+# Build Sprig — one deploy-anywhere multicall binary for the Carryforth ACP
 # harness, agent, and developer MCP. The archive exposes these command names:
 #
 #   sprig            implementation binary
@@ -142,7 +142,7 @@ to one multicall binary so shared Rust runtime/TLS code is stored only once.
 Commands:
 
 - `sprig` — prints usage/version. Invoke a personality by one of the links below.
-- `buzz-acp` — ACP harness that bridges Buzz channel events to an
+- `buzz-acp` — ACP harness that bridges Carryforth channel events to an
   ACP-compliant agent over stdio.
 - `buzz-agent` — ACP-compliant agent (spawns MCP servers, calls LLMs).
 - `buzz-dev-mcp` — Developer MCP server (shell, str_replace, todo) and

@@ -11,9 +11,7 @@ retirement_notice() {
 deploy/compose is retired and cannot operate containers.
 
 Use the supported local-only Carryforth stack instead:
-  cd deploy/local
-  ./run.sh init --image "$(cat RELAY_IMAGE)"
-  ./run.sh start
+  follow README.md "Build and run from source" from the repository root
 
 No containers, volumes, databases, or application data were changed.
 MSG

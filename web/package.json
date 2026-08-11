@@ -1,5 +1,5 @@
 {
-  "name": "buzz-web",
+  "name": "carryforth-web",
   "private": true,
   "version": "0.1.0",
   "description": "Experimental Carryforth web client; not part of the first supported release",

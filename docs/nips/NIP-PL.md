@@ -13,6 +13,11 @@ Push Leases
 
 `draft` `optional` `relay`
 
+> **Carryforth compatibility note:** this inherited draft and its event kinds
+> remain for historical canonical-data interpretation only. Carryforth does
+> not advertise or execute NIP-PL, and the former hosted Push Gateway profile
+> is not a current build, deployment, or fallback target.
+
 **Depends on**: NIP-01, NIP-11, NIP-40 (expiration), NIP-42 (authentication), NIP-44 (encryption). Interacts with NIP-46 (remote signers) and NIP-59 (gift wrap, never decrypted by executors).
 
 ## Abstract

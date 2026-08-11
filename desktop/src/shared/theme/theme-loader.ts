@@ -26,8 +26,8 @@ export const BUZZ_THEME_NAME = "buzz";
  * this theme too; the `.dark` root class selects the dark gradient values.
  *
  * Buzz and Buzz Dark are paired in {@link THEME_PAIRS}, so the picker shows a
- * combined "Buzz" tile under System mode (follow-OS) plus a single "Buzz" tile
- * under Light and a "Buzz Dark" tile under Dark.
+ * combined Carryforth tile under System mode (follow-OS), plus the matching
+ * Carryforth Light and Dark tiles.
  */
 export const BUZZ_DARK_THEME_NAME = "buzz-dark";
 

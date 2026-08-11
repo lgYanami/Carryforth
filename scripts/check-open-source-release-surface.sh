@@ -52,6 +52,7 @@ require_file "docs/release/THIRD_PARTY_ASSETS.md"
 require_file "docs/release/packaged-assets.json"
 require_file "scripts/check-public-package-metadata.py"
 require_file "scripts/check-release-asset-inventory.sh"
+require_file "scripts/check-carryforth-current-product-surface.sh"
 require_file "scripts/test-retired-compose-entrypoint.sh"
 
 if ! jq -e '
@@ -208,6 +209,7 @@ if [[ ${#failures[@]} -ne 0 ]]; then
 fi
 
 "$REPO_ROOT/scripts/check-public-package-metadata.py"
+"$REPO_ROOT/scripts/check-carryforth-current-product-surface.sh"
 "$REPO_ROOT/scripts/test-retired-compose-entrypoint.sh"
 
 if [[ $RELEASE_SOURCE -eq 1 ]]; then

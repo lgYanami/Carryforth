@@ -1405,7 +1405,7 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// 6. `[Channel Canvas]` — if channel canvas metadata is set
 /// 7. `[Context]` — scope, channel name, and contextual hints for the agent
 /// 8. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 9. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 9. `[Event]` / `[Carryforth events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1547,7 +1547,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             )
         } else {
             format!(
-                "[Buzz event: {}]\n{}",
+                "[Carryforth event: {}]\n{}",
                 be.prompt_tag,
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             )
@@ -1560,7 +1560,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
                 batch.events.len()
             )
         } else {
-            format!("[Buzz events — {} events]", batch.events.len())
+            format!("[Carryforth events — {} events]", batch.events.len())
         };
         let mut s = header;
         for (i, be) in batch.events.iter().enumerate() {
@@ -1902,7 +1902,7 @@ mod tests {
         // Should contain [Context] section before the event.
         assert!(prompt.contains("[Context]"));
         assert!(prompt.contains("Scope: channel"));
-        assert!(prompt.contains("[Buzz event: @mention]\n"));
+        assert!(prompt.contains("[Carryforth event: @mention]\n"));
         assert!(prompt.contains(&format!("Channel: {}", ch)));
         assert!(prompt.contains(&format!("From: {}", npub)));
         assert!(prompt.contains("Content: Hello @agent"));
@@ -2222,7 +2222,7 @@ mod tests {
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
 
         assert!(prompt.contains("[Context]"));
-        assert!(prompt.contains("[Buzz events — 3 events]"));
+        assert!(prompt.contains("[Carryforth events — 3 events]"));
         assert!(prompt.contains("--- Event 1 (tag-a) ---"));
         assert!(prompt.contains("--- Event 2 (tag-b) ---"));
         assert!(prompt.contains("--- Event 3 (tag-c) ---"));

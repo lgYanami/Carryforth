@@ -34,10 +34,9 @@ Use `cargo run -p carryforth-cli --` or the built binary at `target/debug/cf`.
 
 ## 3. Start the Relay
 
-In a separate terminal:
+From the Carryforth repository root, in a separate terminal:
 
 ```bash
-cd REPOS/buzz-nostr
 set -a && source .env && set +a
 cargo run -p buzz-relay
 ```

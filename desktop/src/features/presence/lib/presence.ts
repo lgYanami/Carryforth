@@ -37,7 +37,7 @@ export function mergePresenceUpdate(
 }
 
 // Away means "human not at the machine" (Slack/Discord semantics), never
-// "Buzz is not the focused window". OS-wide idle is authoritative when the
+// "Carryforth is not the focused window". OS-wide idle is authoritative when the
 // platform exposes it; otherwise fall back to in-app activity.
 export const PRESENCE_IDLE_TIMEOUT_MS = 10 * 60_000;
 

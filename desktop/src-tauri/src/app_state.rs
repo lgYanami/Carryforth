@@ -117,7 +117,7 @@ pub struct AppState {
     pub session_config_cache: Mutex<HashMap<ManagedAgentRuntimeKey, SessionConfigCache>>,
     /// IOKit power assertion state — prevents idle sleep while agents run.
     pub prevent_sleep: Arc<Mutex<crate::prevent_sleep::PreventSleepState>>,
-    /// In-process mesh-llm node started by Buzz Desktop.
+    /// In-process mesh-llm node started by Carryforth Desktop.
     #[cfg(feature = "mesh-llm")]
     pub mesh_llm_runtime: AsyncMutex<Option<crate::mesh_llm::DesktopMeshRuntime>>,
     /// Runtime-owned shared-compute coordinator. It publishes member-signed

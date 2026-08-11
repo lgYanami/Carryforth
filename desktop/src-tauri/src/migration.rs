@@ -1,4 +1,4 @@
-//! Worktree data sync and on-launch reconciliation for the Buzz desktop app.
+//! Worktree data sync and on-launch reconciliation for Carryforth Desktop.
 //!
 //! **Worktree sync** (`sync_shared_agent_data`): Per-launch symlink creation
 //! from the current worktree data directory to the canonical dev data

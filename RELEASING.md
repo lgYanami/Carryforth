@@ -46,9 +46,10 @@ The first release is expected to contain independently versioned artifacts for:
 | Agent CLI | workspace / `crates/carryforth-cli/Cargo.toml` | `cf-<version>-<target>` |
 | Local deployment | release manifest | version-pinned bootstrap/compose bundle (not yet stable) |
 
-The first formal support matrix is Linux-focused. Web, Mobile, Push Gateway,
-Helm, benchmarks, and other retained source trees are not automatically
-release artifacts.
+The first formal support matrix is Linux-focused. Web, Mobile, benchmarks, and
+other retained source trees are not automatically release artifacts. The
+inherited Helm/Kubernetes and hosted Push Gateway executables are retired and
+are not Carryforth release targets.
 
 Internal crate and binary names may still use `buzz-*` for compatibility. A
 public artifact may package those binaries, but the artifact name, user-facing

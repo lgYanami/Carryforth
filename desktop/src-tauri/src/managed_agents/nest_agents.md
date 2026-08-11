@@ -1,4 +1,4 @@
-# Buzz Nest
+# Carryforth Nest
 
 Your persistent workspace. Created once by the Carryforth desktop app. The static content above the managed-section markers is regenerated on upgrades — add custom notes below the markers or in separate files.
 

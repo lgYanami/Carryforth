@@ -24,12 +24,12 @@ import {
 } from "../mock-repos";
 import type { CommitInfo, ReadmeResult, TreeEntry } from "../git-client";
 import { useGitTree, useGitLog, useGitReadme } from "../use-git-browse";
-import { ConnectButton } from "./ConnectButton";
 import { PubkeyAvatar } from "./PubkeyAvatar";
 import { RepoRefsSection } from "./RepoRefsSection";
 import { RepoTreeSection } from "./RepoTreeSection";
 import { RepoCommitsSection } from "./RepoCommitsSection";
 import { RepoReadmeSection } from "./RepoReadmeSection";
+import { SourceBuildButton } from "./SourceBuildButton";
 
 function CopyableUrl({ url }: { url: string }) {
   const [copied, setCopied] = useState(false);
@@ -270,9 +270,9 @@ export function RepoDetailPage() {
         {/* Back link */}
         <BackToRepositories mockPreview={preview} />
 
-        {/* Mobile-only connect button */}
+        {/* Mobile-only source-build link */}
         <div className="mt-4 lg:hidden">
-          <ConnectButton className="w-full" />
+          <SourceBuildButton className="w-full" />
         </div>
 
         {/* Header */}
@@ -386,8 +386,7 @@ export function RepoDetailPage() {
       {/* Sidebar */}
       <aside className="hidden w-72 shrink-0 border-l border-black/10 pl-8 dark:border-white/10 lg:block">
         <div className="space-y-6">
-          {/* Open in Buzz */}
-          <ConnectButton className="w-full" />
+          <SourceBuildButton className="w-full" />
 
           {/* People */}
           <div>

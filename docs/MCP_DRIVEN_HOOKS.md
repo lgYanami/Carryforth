@@ -2,7 +2,7 @@
 
 ## Overview
 
-Buzz-agent supports lifecycle hooks — MCP tools that the agent calls at
+The `buzz-agent` compatibility binary supports lifecycle hooks — MCP tools that the agent calls at
 defined points in its execution loop. Any MCP server can participate by
 exposing tools with the `_` prefix. Hooks are invisible to the LLM, advisory
 to the agent, and operator-configured.

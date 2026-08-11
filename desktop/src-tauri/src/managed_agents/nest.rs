@@ -1,7 +1,7 @@
-//! Buzz Nest — persistent agent workspace at `~/.buzz`.
+//! Carryforth Nest — persistent agent workspace at the compatible `~/.buzz` path.
 //!
 //! Creates a shared knowledge directory on first launch so every
-//! Buzz-spawned agent starts with orientation (AGENTS.md) and a
+//! Carryforth-spawned agent starts with orientation (AGENTS.md) and a
 //! place to accumulate research, plans, and logs across sessions.
 //!
 //! Static template content in AGENTS.md (above the managed-section markers)
@@ -51,7 +51,7 @@ const CARRYFORTH_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
-const NEST_AGENTS_VERSION: u32 = 4;
+const NEST_AGENTS_VERSION: u32 = 5;
 
 /// Template content version for SKILL.md.
 /// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
@@ -137,7 +137,7 @@ pub fn nest_is_dev() -> bool {
     nest_dir().map(|p| path_is_dev_nest(&p)).unwrap_or(false)
 }
 
-/// Creates the Buzz nest at `~/.buzz` if it doesn't already exist.
+/// Creates the Carryforth nest at the compatible `~/.buzz` path if needed.
 ///
 /// Delegates to [`ensure_nest_at`] with the resolved nest directory.
 /// Returns an error string if the home directory cannot be resolved.
@@ -146,7 +146,7 @@ pub fn ensure_nest() -> Result<(), String> {
     ensure_nest_at(&root)
 }
 
-/// Creates a Buzz nest at the given `root` path.
+/// Creates a Carryforth nest at the given `root` path.
 ///
 /// - Creates the root directory and all subdirectories.
 /// - Writes `AGENTS.md` only if it doesn't already exist.

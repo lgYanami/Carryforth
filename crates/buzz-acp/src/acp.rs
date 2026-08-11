@@ -2846,7 +2846,7 @@ mod tests {
             "sess_abc123",
             &[
                 "/goal ship it",
-                "[Buzz event: @mention]\nContent: @Eva /goal ship it",
+                "[Carryforth event: @mention]\nContent: @Eva /goal ship it",
             ],
         );
         let prompt = params["prompt"].as_array().unwrap();

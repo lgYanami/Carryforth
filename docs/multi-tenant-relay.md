@@ -1,5 +1,10 @@
 # Multi-Tenant Buzz Relay: A Formal Specification
 
+> **Historical upstream deployment specification.** Carryforth's current
+> supported source workflow is a single local Relay. This document is retained
+> for protocol and isolation analysis; it is not a current hosted or
+> multi-tenant deployment promise.
+
 `draft`
 
 ## Abstract
@@ -673,15 +678,13 @@ Each axiom is *admitted* per deployment, not assumed universally:
      (≈ 83 RPS sustained at the current capacity); above that, LRU eviction can
      release an entry while its signed `created_at` is still inside the window,
      and a replay slips through.
-  2. **Per-pod scope.** The seen-set is `Arc<AppState>`-scoped, not cross-pod, so
-     the same replayed event reaching two pods succeeds once on each. P3 therefore
-     requires *either* NIP-98 mints be pod-sticky on `event_id` *or* the seen-set
-     be shared across pods (e.g. Redis with the same atomic insert-if-absent
-     semantics and TTL ≥ 120 s). The chart default (`replicaCount: 1`) satisfies
-     this gate today; the shipped HA examples (`replicaCount: 3` in
-     `deploy/charts/buzz/examples/argocd-app.yaml:27` and
-     `deploy/charts/buzz/examples/flux-helmrelease.yaml:35`) are
-     P3-non-conforming as shipped unless the operator adds one of:
+  2. **Per-process scope.** The seen-set is `Arc<AppState>`-scoped, not shared, so
+     the same replayed event reaching two processes succeeds once on each. P3
+     therefore requires *either* NIP-98 mints be process-sticky on `event_id`
+     *or* the seen-set be shared across processes (e.g. Redis with the same
+     atomic insert-if-absent semantics and TTL ≥ 120 s). Carryforth currently
+     ships no supported multi-replica deployment manifest; any future
+     multi-replica design is non-conforming unless it adds one of:
      - **(a)** an ingress annotation hashing upstream selection on a header stable
        across replays — `nginx.ingress.kubernetes.io/upstream-hash-by:
        "$http_authorization"` works for today's NIP-98 HTTP path, since the signed

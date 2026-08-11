@@ -2,8 +2,8 @@ import { Users } from "lucide-react";
 import { useMemo } from "react";
 
 import type { Repo } from "../use-repos";
-import { ConnectButton } from "./ConnectButton";
 import { PubkeyAvatar } from "./PubkeyAvatar";
+import { SourceBuildButton } from "./SourceBuildButton";
 
 const MAX_AVATARS = 20;
 
@@ -24,8 +24,7 @@ export function OrgSidebar({ repos }: { repos: Repo[] }) {
 
   return (
     <div className="space-y-6">
-      {/* Open in Buzz */}
-      <ConnectButton className="w-full" />
+      <SourceBuildButton className="w-full" />
 
       {/* People section */}
       {uniquePubkeys.length > 0 && (

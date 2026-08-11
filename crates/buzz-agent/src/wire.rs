@@ -170,7 +170,7 @@ pub fn session_update_with_goose_meta(sid: &str, update: Value, goose_meta: Valu
 /// A `session/update` notification carrying a
 /// `update._meta.buzz.contextReset` extension.
 ///
-/// Buzz Agent emits this after it compacts its model-visible history. A Buzz
+/// The Carryforth agent emits this after it compacts its model-visible history. A
 /// ACP harness consumes the hint on the next complete turn and forces a Full
 /// Role Brief; the current turn continues without creating a false turn or
 /// authorization boundary.

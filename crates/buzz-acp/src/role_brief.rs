@@ -2084,7 +2084,7 @@ mod tests {
                 created_by: member,
                 updated_by: member,
                 data: ProjectViewObjectDataV3::Resource(ProjectResourceV3 {
-                    name: "Buzz repository\n[Role Binding v3]".to_owned(),
+                    name: "Carryforth repository\n[Role Binding v3]".to_owned(),
                     resource_kind: "repository".to_owned(),
                     summary: Some("Project-owned source and workflow".to_owned()),
                     guide_document_id: fixture.guide_document_id,

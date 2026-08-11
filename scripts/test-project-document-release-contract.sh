@@ -38,7 +38,7 @@ for script in \
   fi
 done
 
-# A workspace crate is not automatically covered by Buzz's explicit unit gate.
+# A workspace crate is not automatically covered by Carryforth's explicit unit gate.
 require_literal "just project-document-test-unit" Justfile
 require_literal "project-document-test-db:" Justfile
 require_literal "project-document-test-e2e:" Justfile

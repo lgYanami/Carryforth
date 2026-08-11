@@ -1,6 +1,6 @@
 # Carryforth 源码与本地开发面去 Buzz 收口实现计划
 
-> 状态：方案完成，待实施
+> 状态：代码实施完成；独立 clean-room 启动与既有数据回读待验收
 > 日期：2026-08-11
 > 范围：公开源码、本地开发入口、当前 CI/示例/部署目录中的产品身份与可执行旧入口
 > 基线提交：`618f031e0 feat(carryforth): prepare open-source release surface`
@@ -366,3 +366,52 @@ ACP ledger 或 managed Agent 状态。
 7. 现有本地身份、Community、消息、Agent、Project View、Document、Context 与 Meeting 数据回读保持一致；
 8. 未跟踪 `0057` 未被本计划修改或提交；
 9. 不宣称已经提供安装包、生产部署或商店发行。
+
+## 12. 实施记录（2026-08-11）
+
+### 12.1 已完成的代码收口
+
+- 删除两套 Helm chart、Helm workflow、`ct.yaml`、旧 local Kubernetes mesh、未引用的 CAKE/Istio 入口，以及
+  Hosted Push Gateway crate、Dockerfile、runbook 与默认构建/测试引用；Relay 的历史 Push event、schema、migration 与
+  NIP-PL 兼容读取边界保持不变；
+- 将 `deploy/compose` 收敛为不可运行的最小 tombstone，删除 Caddy/Adminer/Prometheus 等可绕过 wrapper 的额外
+  fragments；
+- 将 Sprig 收敛为短期 Actions 构建产物，不再维护独立 GitHub Release；benchmark 改为必须显式给出非 Block
+  image，并使用自包含、checkout-scoped 的 Compose manifest，普通错误不再自动删除 volume；
+- 本地开发窗口、脚本输出、package metadata、当前帮助/示例、ACP 模型可见事件标签、Managed Agent Nest 模板与
+  Admin Web 产品面统一为 Carryforth / `cf`；生命周期文件采用新坐标单写、旧坐标只读的无损过渡；
+- Web source-only 入口不再请求 `block/buzz` Releases，也不再生成 Desktop 未支持的 `buzz://join` /
+  `buzz://connect`；NIP-07 浏览器领取保留，无扩展时明确 fail closed 到 Carryforth 源码构建说明；
+- 新增 `scripts/check-carryforth-current-product-surface.sh`，并接入 `just check`、CI、pre-commit 与公开源码门禁；
+  该门禁拒绝旧部署目标、Hosted endpoint、Block image 默认值、旧 CLI/产品文案、Web 远程交接和目录绕过；
+- 保留 `buzz-*` crate/binary、`BUZZ_*`、协议 kind/capability、数据库、bundle/keyring/app-data、Nest marker 与旧
+  lifecycle 文件的必要兼容坐标；未执行机械全局改名。
+
+### 12.2 已通过的无基础设施验证
+
+- Shell/YAML/静态：修改 shell 的 `bash -n`、workflow YAML parse、`git diff --check`；
+- 产品与发布契约：current-product surface、open-source release surface、retired Compose、local deployment、
+  Project View release、release-ref、unsigned canary、package metadata 与 asset inventory 完整性；
+- Rust：根与 Desktop `cargo metadata --locked`、root/Desktop fmt、workspace/Desktop `cargo check`；
+- Rust 定向测试：ACP queue `113/113`、ACP setup mode `22/22`、`buzz-agent` `340/340`、`buzz-admin` `10/10`、
+  Sprig test harness、Desktop Nest refresh `43/43`；
+- Frontend：Web check/build 与 smoke `5/5`，Desktop check 与 unit `3628/3628`，Admin Web check/build；
+- Benchmark：主套件 `34/34`，testbed `28/28` 加 `1` 条 live skip，修改文件 Ruff check/format；
+- 受保护的 `migrations/0057_project_context_semantic_foundation.sql` 保持未跟踪，SHA-256 仍为
+  `ed4483984abc53496ef4658ab118b3a58a614773dd7f364cf2859631807cb59e`。
+
+上述验证没有启动 Docker、Relay 或 Desktop，没有运行 migration，也没有读写数据库、volume、keyring、app-data、
+ACP ledger 或 managed Agent 状态。
+
+### 12.3 尚未完成、不得提前宣称
+
+- 尚未在一台独立 clean-room 机器上执行 `just setup` / `just dev`、Owner/capability bootstrap 与 4–6 轮 Meeting
+  smoke；
+- 尚未执行本计划 8.3 的现有本地身份、Community、消息、Agent 和 Project 三域/Meeting 前后权威回读；
+- Web、Mobile 与 benchmark 仍是 source-only/experimental；本阶段只移除了 Web 的旧远程下载与无效 Desktop
+  handoff，没有声明完整 Web/Mobile 产品支持；
+- asset/license/SBOM、bundle identity、公开 artifact clean-room、私密报告与发布治理等正式发行门禁仍保持
+  fail closed；本轮不交付安装包、生产部署或商店版本。
+
+因此，本轮可以判定“源码与本地开发面代码收口完成”，但在 clean-room 与数据回读证据补齐前，不把本文整体状态
+升级为“完整验收完成”。

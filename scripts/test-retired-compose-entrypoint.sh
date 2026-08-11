@@ -24,8 +24,9 @@ export RETIRED_COMPOSE_DOCKER_LOG="$tmp_dir/docker.log"
 
 help_output="$(PATH="$tmp_dir:$PATH" "$ENTRYPOINT" help)"
 if [[ "$help_output" != *"deploy/compose is retired"* ]] ||
-  [[ "$help_output" != *"deploy/local"* ]]; then
-  echo "retired Compose help does not point to deploy/local" >&2
+  [[ "$help_output" != *"README.md"* ]] ||
+  [[ "$help_output" != *"Build and run from source"* ]]; then
+  echo "retired Compose help does not point to the source-build guide" >&2
   exit 1
 fi
 
@@ -39,8 +40,9 @@ for command in start up stop down restart pull upgrade logs status ps config bac
     exit 1
   fi
   if [[ "$output" != *"deploy/compose is retired"* ]] ||
-    [[ "$output" != *"deploy/local"* ]]; then
-    echo "retired Compose command '$command' omitted the migration destination" >&2
+    [[ "$output" != *"README.md"* ]] ||
+    [[ "$output" != *"Build and run from source"* ]]; then
+    echo "retired Compose command '$command' omitted the source-build guide" >&2
     exit 1
   fi
 done

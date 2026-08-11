@@ -178,7 +178,7 @@ fn buzz_marker_entry(instance_id: &str) -> Vec<u8> {
 /// Check if a running process is one of *our* managed agents: it must carry
 /// `BUZZ_MANAGED_AGENT=<instance_id>` in its environment, where `instance_id`
 /// is this desktop instance's id. A process stamped with a *different* instance
-/// id belongs to another live Buzz app and must never be reaped here.
+/// id belongs to another live Carryforth app and must never be reaped here.
 #[cfg(target_os = "macos")]
 pub(crate) fn process_has_buzz_marker(pid: u32, instance_id: &str) -> bool {
     let marker = buzz_marker_entry(instance_id);
@@ -587,7 +587,7 @@ pub(super) const PROC_PIDTBSDINFO: libc::c_int = 3;
 /// (`instance_id`) that isn't in `skip_pids`. This catches orphans that escaped
 /// PID-file-based cleanup (e.g. agent workers spawned with their own process
 /// group whose parent harness already exited and had its PID file removed),
-/// while leaving another live Buzz instance's agents untouched.
+/// while leaving another live Carryforth instance's agents untouched.
 #[cfg(target_os = "macos")]
 pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32]) {
     let my_uid = unsafe { libc::getuid() };
@@ -956,7 +956,7 @@ fn extract_buzz_marker_value(_pid: u32) -> Option<String> {
 }
 
 /// Check if a Buzz desktop process is still alive for the given instance ID.
-/// Scans all user-owned processes named "Buzz" or "buzz-desktop" and checks
+/// Scans compatibility-named user processes ("Buzz" or "buzz-desktop") and checks
 /// whether any has the identifier in its command-line args (KERN_PROCARGS2 buffer
 /// includes both argv and environ — the `--config` JSON from `tauri dev` contains
 /// the identifier string).

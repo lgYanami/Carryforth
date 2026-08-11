@@ -51,8 +51,9 @@ Carryforth 源码仓库
 | 本地依赖栈 | 版本固定、可重复启动、数据默认持久化 |
 | Project 系统 | Project View、Document、Project Context、Meeting |
 
-源码仓库可以继续包含 Web、Mobile、Push Gateway、Helm、benchmark 和历史兼容代码，但它们不自动成为首发的
-“受支持产品”。README、Release Notes 和下载页面不得把未完成 clean-room 验收的组件描述为正式发行物。
+源码仓库可以继续包含 Web、Mobile、benchmark 和历史兼容代码，但它们不自动成为首发的“受支持产品”。继承的
+Helm/Kubernetes 与 hosted Push Gateway executable 由后续的源码/本地开发面收口计划从活动树退役，不再以可执行
+清单保存历史。README、Release Notes 和下载页面不得把未完成 clean-room 验收的组件描述为正式发行物。
 
 当前 Relay 构建会内嵌 Web/Admin 资源，因此只把目录标记为 source-only 还不够。首发 Relay image 必须使用不打包、
 不提供 Web/Admin 产品页面的构建/路由配置，只保留 Relay 必要的协议与健康检查 HTTP surface。若实现上无法拆分，
@@ -79,7 +80,7 @@ macOS、Windows、Mobile 或商店发行只有在各自的签名、bundle identi
 - 不提供本地失败后自动回退到公共 Relay 的路径；
 - 不一次性重命名所有 `buzz-*` Rust crate、数据库表、Nostr kind、capability 或历史 event；
 - 不改写旧 migration、历史事故文档或已有 canonical 数据；
-- 不把 Web、Mobile、Push Gateway、Helm 和 benchmark 强行纳入首发支持承诺；
+- 不把 Web、Mobile 和 benchmark 强行纳入首发支持承诺；
 - 不承诺多个 Harness 使用同一个 Agent 私钥时的 active-active 协调；
 - 不把 Agent 模型供应商的帐号/API key 与 Carryforth 本地身份混为一体。
 
@@ -109,14 +110,14 @@ macOS、Windows、Mobile 或商店发行只有在各自的签名、bundle identi
 并指向 `block/buzz` 的 `buzz-desktop-latest`。这会让已从日常 Desktop 产品面移除的旧 updater 在正式构建时重新出现；
 必须删除这条 release-time 注入路径，而不只是检查当前开发配置。
 
-### 3.3 Relay 仍有默认外部服务
+### 3.3 旧 Push 外连必须保持退役
 
-Relay 的 Push 配置默认指向 `push.buzz.xyz`，Push Gateway 也对该域名有固定约束。即使不传消息正文，设备 endpoint、
-installation grant、Relay pubkey 等元数据也不应在 Carryforth local-only 默认配置中发往旧供应方。
+初始审计发现 Relay Push 与独立 Push Gateway 固定指向 `push.buzz.xyz`。即使不传消息正文，设备 endpoint、
+installation grant、Relay pubkey 等元数据也不应在 Carryforth local-only 配置中发往旧供应方。
 
-首发必须做到：Carryforth Local Relay 不创建任何 Push 外连，首发部署也不启动 Push Gateway，并且不暴露通过
-environment、build flag 或 Desktop 设置重新启用它的路径。未来若另立产品阶段重新设计 self-hosted Push，必须经过
-独立方案与隐私审查，不属于本计划保留的兼容开关。
+当前 Local Relay 已不创建 Push 外连。源码与本地开发面的后续收口还必须退役 Push Gateway executable、Docker
+入口和部署 runbook，并且不暴露通过 environment、build flag 或 Desktop 设置重新启用旧 hosted Push 的路径。
+未来若另立产品阶段重新设计 self-hosted Push，必须经过独立方案与隐私审查。
 
 ### 3.4 Desktop 安装包不能独立形成可用产品
 
@@ -269,8 +270,8 @@ binary 的后续重命名不能改变当前 wire/storage 合同。
 5. 建立一台没有 Block VPN、凭据、内部 DNS 和旧 app-data 的 clean-room runner；
 6. 记录当前公开构建失败点、默认外连和内部域名基线；
 7. 为选定升级基线建立只读证据：pubkey、Community、消息、Agent、数据库 schema、三域 revision 与 Meeting 数量；
-8. 把 Web/Mobile/Push/Helm/benchmark 标记为 supported、experimental 或 source-only，并验证 Relay artifact 没有
-   偷带 source-only 产品页面；
+8. 把 Web/Mobile/benchmark 标记为 supported、experimental 或 source-only，退役 Push/Helm executable，并验证
+   Relay artifact 没有偷带 source-only 产品页面；
 9. 与选定上游基线完成一次同步与许可证 review，提交完整 migration 链，确保 RC source 没有未跟踪文件。
 
 阶段门禁：发布范围不再依赖团队成员的隐式理解，clean-room 构建失败能稳定复现。
@@ -289,7 +290,7 @@ binary 的后续重命名不能改变当前 wire/storage 合同。
 
 ### 阶段二：默认外连与内部依赖清零
 
-1. 在 Carryforth 首发构建中直接关闭 Relay Push，不暴露启用开关，首发 compose 不启动 Push Gateway；
+1. 在 Carryforth 首发构建中直接关闭 Relay Push，不暴露启用开关，并从活动源码/部署面退役 Push Gateway；
 2. 删除当前产品面的 Buzz/Builderlab/updater/远程 Community URL 与 fallback；
 3. 从公开 lockfile、workflow、脚本和示例中移除 Block Artifactory、内部 ECR、Blox、sqprod 等坐标；
 4. 在纯公网源重新生成需要随首发保留的 lockfile；不属于首发的 benchmark 可移出默认构建/发行面；
@@ -348,7 +349,7 @@ bundle identity 迁移只约束**进入当前支持矩阵的平台**。首发最
 6. Release workflow 从 Tauri/Cargo 配置读取产品名，不再硬编码 `.app` 名；
 7. fork 的 PR 与 tag 构建必须能运行只读验证，不尝试推送到 Block namespace；
 8. 删除 `build-release-config.mjs` 与 release environment 对旧 updater 的再注入，并隔离不再属于当前产品的
-   Mobile/private release 和 Push Gateway 发布 job；
+   Mobile/private release；Push Gateway 发布 job 与 executable 直接退役；
 9. 对最终安装包解包扫描并做运行时网络审计，证明 release-only 配置没有重新带入旧 updater、Buzz URL 或
    `Buzz.app` 产物名。
 
@@ -491,7 +492,7 @@ Carryforth 控制面默认不出网区分开；若未来承诺 air-gap，需要�
 9. 打包资产与依赖的来源、许可和安全扫描通过；
 10. clean-room 端到端验收覆盖消息、Agent、Project 三域与 Meeting，并保留脱敏证据；
 11. release、rebuild、migration 和测试脚本均有数据安全门禁；
-12. 未通过的 Web、Mobile、Push、Helm 或平台构建没有被宣传为受支持发行物。
+12. 未通过的 Web、Mobile 或平台构建没有被宣传为受支持发行物，Push/Helm executable 不存在于当前活动面。
 
 完成这些条件后，后续再分别规划 runtime binary/env 去 Buzz 化、内部 crate 命名整理、Web/Mobile 产品面以及可选
 self-hosted Push；这些后续工作不得反向改变本阶段建立的 local-only、无损升级和公开可复现边界。

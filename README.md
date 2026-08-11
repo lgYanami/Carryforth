@@ -38,10 +38,11 @@ The first supported release surface is intentionally narrow:
 - the `cf` agent-first CLI;
 - channels, messages, Project View, Documents, Project Context, and Meetings.
 
-The `web/`, `mobile/`, push-gateway, Helm, and benchmark trees are currently
-source-only or experimental. Their presence in the repository is not a release
-or support commitment. In particular, Carryforth local-only releases do not use
-the legacy hosted community, account, updater, or push services.
+The `web/`, `mobile/`, and benchmark trees are currently source-only or
+experimental. Their presence in the repository is not a release or support
+commitment. The inherited Helm/Kubernetes and hosted Push Gateway executables
+have been retired from the active source tree. Carryforth local-only builds do
+not use the legacy hosted community, account, updater, or push services.
 
 The release-readiness work and its data-safety boundaries are tracked in
 [the open-source release surface plan](docs/lora/stage/carryforth/open-source-release-surface-plan.md).

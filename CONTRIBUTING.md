@@ -114,9 +114,12 @@ For a detached one-command workflow with lifecycle tracking:
 ./scripts/dev-stop.sh           # stop app + containers; preserve all data
 ```
 
-The detached process log is written to `target/dev-lifecycle/buzz-dev.log`.
-The same commands are available as `just start`, `just rebuild-start`, and
-`just stop`.
+The detached process log is written to
+`target/dev-lifecycle/carryforth-dev.log`. The lifecycle scripts can still
+recognize an existing process recorded in the legacy `buzz-dev.pid` /
+`buzz-dev.log` coordinates, but new runs write only the Carryforth filenames
+and do not modify the legacy files. The same commands are available as
+`just start`, `just rebuild-start`, and `just stop`.
 
 For a split-terminal workflow (relay logs visible separately from Vite output):
 
@@ -132,11 +135,12 @@ just down    # Stop app + Docker containers, keep containers and data
 just reset   # DESTRUCTIVE: wipe all dev state and recreate it
 ```
 
-Development desktop state uses separate bundle identifiers
-(`xyz.block.buzz.app.dev` and per-worktree variants), a separate keyring service
-(`buzz-desktop-dev`), and `~/.buzz-dev`. `just reset` removes those dev-only
-locations and the local Docker volumes. It does not touch the installed app's
-`xyz.block.buzz.app` data, `buzz-desktop` keyring service, or `~/.buzz` nest.
+For storage compatibility, development desktop state continues to use separate
+bundle identifiers (`xyz.block.buzz.app.dev` and per-worktree variants), a
+separate keyring service (`buzz-desktop-dev`), and `~/.buzz-dev`. `just reset`
+removes those dev-only locations and the local Docker volumes. It does not
+touch the installed app's `xyz.block.buzz.app` data, `buzz-desktop` keyring
+service, or `~/.buzz` nest.
 
 ---
 
@@ -283,8 +287,10 @@ required. The scope (in parentheses) is optional but encouraged.
    If a test is impractical, explain why in the PR description.
 
 3. **Documented** — public APIs, new event kinds, new MCP tools, and new
-   config variables are documented. Update `README.md`, `AGENTS.md`, or
-   `VISION.md` as appropriate.
+   config variables are documented. Update `README.md`, `AGENTS.md`, or the
+   current design documents under `docs/` as appropriate. Root `VISION*.md`
+   files preserve upstream historical product narratives and are not the
+   current Carryforth roadmap.
 
 4. **CI passing** — `just ci` passes locally before you push.
 

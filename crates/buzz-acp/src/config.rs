@@ -234,7 +234,7 @@ pub struct AuthenticateArgs {
 #[derive(Debug, Parser)]
 #[command(
     name = "buzz-acp",
-    about = "ACP harness that bridges Buzz events to AI agents"
+    about = "ACP harness that bridges Carryforth events to AI agents"
 )]
 pub struct CliArgs {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
@@ -405,7 +405,7 @@ pub struct CliArgs {
     pub no_memory: bool,
 
     /// Disable the [Base] platform-context section prepended to every prompt.
-    /// When set, agents receive only the persona [System] prompt with no Buzz orientation.
+    /// When set, agents receive only the persona [System] prompt with no Carryforth orientation.
     #[arg(long, env = "BUZZ_ACP_NO_BASE_PROMPT")]
     pub no_base_prompt: bool,
 

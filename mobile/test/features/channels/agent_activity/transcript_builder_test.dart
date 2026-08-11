@@ -89,7 +89,7 @@ void main() {
     expect(tool.result, 'posted #activity-test-channel');
   });
 
-  test('parses buzz prompt text into user message and metadata', () {
+  test('parses Carryforth prompt text into user message and metadata', () {
     final items = buildTranscript([
       ObserverFrame(
         seq: 1,
@@ -102,7 +102,7 @@ void main() {
             'prompt': [
               {
                 'content':
-                    '[Buzz event: stream message]\n'
+                    '[Carryforth event: stream message]\n'
                     'Content: @claude can you do that again?\n\n'
                     '[Channel]\n'
                     '#activity-test-channel',
@@ -122,6 +122,53 @@ void main() {
     expect(items[1], isA<MetadataItem>());
     expect((items[1] as MetadataItem).sections, hasLength(2));
   });
+
+  test('continues to parse legacy Buzz event headers', () {
+    final items = buildTranscript([
+      _promptFrame(
+        '[Buzz event: direct message]\n'
+        'Content: legacy transcript content',
+      ),
+    ]);
+
+    expect(items, hasLength(2));
+    final message = items[0] as MessageItem;
+    expect(message.role, 'user');
+    expect(message.title, 'Direct Message');
+    expect(message.text, 'legacy transcript content');
+    expect(
+      (items[1] as MetadataItem).sections.single.title,
+      'Buzz event: direct message',
+    );
+  });
+
+  test('uses Carryforth event as the default title when kind is absent', () {
+    final items = buildTranscript([
+      _promptFrame('[Carryforth event]\nContent: current transcript content'),
+    ]);
+
+    expect(items, hasLength(2));
+    final message = items[0] as MessageItem;
+    expect(message.title, 'Carryforth event');
+    expect(message.text, 'current transcript content');
+  });
+}
+
+ObserverFrame _promptFrame(String content) {
+  return ObserverFrame(
+    seq: 1,
+    timestamp: _timestamp(1),
+    kind: 'acp_write',
+    turnId: 'turn-1',
+    payload: {
+      'method': 'session/prompt',
+      'params': {
+        'prompt': [
+          {'content': content},
+        ],
+      },
+    },
+  );
 }
 
 ObserverFrame _updateFrame({

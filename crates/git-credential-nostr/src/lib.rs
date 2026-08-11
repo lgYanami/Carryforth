@@ -71,7 +71,7 @@ fn load_key() -> Result<String, String> {
     Ok(raw.trim().to_string())
 }
 
-/// Load the NIP-OA owner attestation injected by Buzz Desktop/ACP.
+/// Load the NIP-OA owner attestation injected by Carryforth Desktop/ACP.
 ///
 /// The tag must be part of the signed NIP-98 event: Git's credential protocol
 /// can return an Authorization value, but it cannot add a separate HTTP header.

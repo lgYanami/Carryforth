@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Stop the local app, force-rebuild Buzz executable packages, and start again.
+# Stop the local app, force-rebuild Carryforth executable packages, and start again.
 #
-# Dependency build caches are retained; only Buzz-owned executable artifacts
+# Dependency build caches are retained; only Carryforth-owned executable artifacts
 # are cleaned. Docker containers and all data volumes remain untouched.
 set -euo pipefail
 
@@ -12,7 +12,7 @@ log() { printf '[dev-rebuild] %s\n' "$*"; }
 
 cd "${REPO_ROOT}"
 
-log "停止现有 Buzz 应用进程（Docker 保持运行）..."
+log "停止现有 Carryforth 应用进程（Docker 保持运行）..."
 "${SCRIPT_DIR}/dev-stop.sh" --app-only
 
 # shellcheck disable=SC1091
@@ -28,7 +28,7 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
   set +o allexport
 fi
 
-log "清理 Buzz 可执行程序的构建产物（保留依赖缓存）..."
+log "清理 Carryforth 可执行程序的构建产物（保留依赖缓存）..."
 cargo clean \
   -p buzz-relay \
   -p buzz-admin \

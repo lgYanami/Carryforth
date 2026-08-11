@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# start-relay-for-tests.sh — Start the Buzz relay and its backing services
+# start-relay-for-tests.sh — Start the Carryforth Relay and its backing services
 # =============================================================================
 # Shared script for CI jobs that need a running relay. Starts docker compose
 # services, waits for health, applies the schema, builds the relay, starts it,

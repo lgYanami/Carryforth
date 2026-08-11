@@ -1,5 +1,10 @@
 # Vision: The Agent Activity Feed
 
+> **Historical upstream vision.** This design record retains inherited Buzz
+> product terminology. It is useful as implementation context, but is not the
+> current Carryforth roadmap or a promise that every described surface is
+> supported. See [README.md](README.md) for the current boundary.
+
 ## The Problem
 
 When you delegate work to an agent, you are trusting a process you cannot see. The activity feed is the window into that process — but a window is only useful if you can read it at a glance. A raw input/output dump is not a window; it is a transcript you have to decode. It forces you to *parse* before you can *judge*.

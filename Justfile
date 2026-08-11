@@ -104,7 +104,11 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: open-source-release-surface-check carryforth-local-deployment-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+check: current-product-surface-check open-source-release-surface-check carryforth-local-deployment-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+
+# Keep contributor-facing product and local-development surfaces on Carryforth.
+current-product-surface-check:
+    ./scripts/check-carryforth-current-product-surface.sh
 
 # Keep the public Carryforth release surface free of retired vendor endpoints
 # and internal-only package coordinates. Release jobs add --release-source.
@@ -322,9 +326,6 @@ test-unit:
         # Project Context Stage 1 freezes the pure domain, wire contract, and
         # fail-closed Relay registration before canonical storage exists.
         just project-context-test-unit
-        # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
-        # contract/race tests run in the dedicated CI job below.
-        cargo nextest run -p buzz-push-gateway
         # ACP owns the Meeting runtime and its privacy-safe wire/log boundary.
         # Run the full lib suite so cross-cutting ACP regressions are not
         # accidentally excluded by a Meeting-only name filter.
@@ -371,7 +372,7 @@ project-view-test-db:
 test-migrations:
     ./scripts/test-project-view-migrations.sh
 
-# Run the real Relay + real buzz CLI Project View end-to-end test.
+# Run the real Relay + real cf CLI Project View end-to-end test.
 project-view-test-e2e:
     ./scripts/test-project-view-e2e.sh
 
@@ -678,7 +679,7 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
             if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
                 echo "Error: $name port $port is already in use; refusing to launch desktop against a stale relay." >&2
                 lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2 || true
-                echo "Stop the process above (often a stale buzz-relay) and rerun: just dev" >&2
+                echo "Stop the process above (often a stale Carryforth Relay process, buzz-relay) and rerun: just dev" >&2
                 exit 1
             fi
         done
@@ -712,7 +713,7 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     relay_ready=false
     for _ in $(seq 1 120); do
         if ! kill -0 "$RELAY_PID" 2>/dev/null; then
-            echo "Error: buzz-relay exited during startup; refusing to launch desktop." >&2
+            echo "Error: Carryforth Relay (buzz-relay) exited during startup; refusing to launch desktop." >&2
             wait "$RELAY_PID" || true
             exit 1
         fi
@@ -723,7 +724,7 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
         sleep 0.5
     done
     if [[ "$relay_ready" != true ]]; then
-        echo "Error: buzz-relay did not become healthy within 60 seconds; refusing to launch desktop." >&2
+        echo "Error: Carryforth Relay (buzz-relay) did not become healthy within 60 seconds; refusing to launch desktop." >&2
         exit 1
     fi
     cd {{desktop_dir}}
@@ -734,9 +735,7 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     FEATURES=(); [[ -n "{{mesh}}" ]] && FEATURES=(--features mesh-llm)
     pnpm exec tauri dev ${FEATURES[@]+"${FEATURES[@]}"} --config "$BUZZ_TAURI_CONFIG" {{ARGS}}
 
-# Run only the local-only desktop app. No relay, database, Docker, migrations,
-# or .env are started; the app waits for ws://localhost:3000 and never falls
-# back to a remote Community.
+# Run local-only Desktop without starting Relay/Docker; waits for ws://localhost:3000 and never falls back remotely.
 desktop-standalone *ARGS: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
@@ -993,7 +992,7 @@ _release-pr lane version:
             TAG_PREFIX="relay-v"
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
-            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/carryforth-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/charts/buzz/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
+            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/carryforth-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
             ARTIFACT="Carryforth Relay" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"
@@ -1135,7 +1134,7 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BU
 
 # ─── Benchmarking ─────────────────────────────────────────────────────────────
 
-# Run the Carryforth orchestra benchmark — leaderboard-eligible by default (TB 2.1, k=5, Sonnet+Haiku). Stands up its own Docker stack; --gui opens a live spectator desktop app; other flags pass to benchmark.py (--dataset/--path, --include-task, --attempts, --manifest, --dry-run, ...)
+# Run the Carryforth orchestra benchmark — requires CARRYFORTH_BENCHMARK_IMAGE; use a unique CARRYFORTH_BENCHMARK_PROJECT per checkout.
 benchmark *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1145,4 +1144,23 @@ benchmark *ARGS:
 
 # Stop the benchmark Docker stack (state and channels are kept)
 benchmark-down:
-    docker compose --project-name buzz-benchmark down
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STATE_DIR="{{justfile_directory()}}/benchmarks/harbor-buzz-orchestra/.benchmark"
+    COMPOSE_FILE="{{justfile_directory()}}/benchmarks/harbor-buzz-orchestra/testbed/compose.benchmark.yml"
+    if [[ ! -f "$STATE_DIR/.env" ]]; then
+        echo "No Carryforth benchmark stack state found; nothing to stop."
+        exit 0
+    fi
+    PROJECT=$(sed -n 's/^CARRYFORTH_BENCHMARK_PROJECT=//p' "$STATE_DIR/.env" | tail -n 1)
+    PROJECT="${PROJECT:-buzz-benchmark}"
+    if [[ ! "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        echo "Invalid benchmark project scope in $STATE_DIR/.env; refusing Docker operation." >&2
+        exit 2
+    fi
+    docker compose \
+        --project-name "$PROJECT" \
+        --project-directory "$STATE_DIR" \
+        --env-file "$STATE_DIR/.env" \
+        -f "$COMPOSE_FILE" \
+        down

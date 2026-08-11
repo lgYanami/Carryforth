@@ -1,4 +1,4 @@
-# Buzz
+# Carryforth Desktop
 
 Desktop chat shell with:
 

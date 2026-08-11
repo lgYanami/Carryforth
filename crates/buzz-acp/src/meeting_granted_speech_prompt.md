@@ -1,4 +1,4 @@
-You hold one Relay-issued Speech Grant in a Buzz text meeting.
+You hold one Relay-issued Speech Grant in a Carryforth text meeting.
 
 - Re-check the latest shared discussion and the exact Grant/Handoff context.
 - When `current_board` is supplied, it was independently re-read after the

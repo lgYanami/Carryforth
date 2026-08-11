@@ -84,9 +84,9 @@ composer_diagnostics="${fixture_dir}/composer-diagnostics.txt"
 workspace_diagnostics="${fixture_dir}/workspace-diagnostics.txt"
 trap 'rm -f "${composer_diagnostics}" "${workspace_diagnostics}"; rmdir "${fixture_dir}"' EXIT
 
-printf '%s\n' "buzz feedback diagnostics" "area: composer" \
+printf '%s\n' "Carryforth feedback diagnostics" "area: composer" \
   "event: resumed_from_sleep" "result: composer_unresponsive" > "${composer_diagnostics}"
-printf '%s\n' "buzz feedback diagnostics" "area: workspace-switching" \
+printf '%s\n' "Carryforth feedback diagnostics" "area: workspace-switching" \
   "from: design" "to: engineering" \
   "result: previous_sidebar_visible_for_one_frame" > "${workspace_diagnostics}"
 

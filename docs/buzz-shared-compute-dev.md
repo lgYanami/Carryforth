@@ -1,14 +1,14 @@
-# Buzz shared compute: local GUI verification
+# Carryforth shared compute: local GUI verification
 
 This runbook verifies the actual desktop path used by the built-in **Fizz** agent:
 
-`Buzz Desktop → buzz-acp → buzz-agent → MeshLLM SDK → local/remote compute`
+`Carryforth Desktop → buzz-acp → buzz-agent → MeshLLM SDK → local/remote compute`
 
 It does not use a substitute agent harness.
 
 ## Before starting
 
-Run from the `block/buzz` repository root on the mesh-enabled branch.
+Run from the Carryforth repository root on a mesh-enabled branch.
 
 For a completely fresh, deterministic local state, use:
 
@@ -18,18 +18,18 @@ just mesh-dev-fresh
 ```
 
 This removes development app data, the development keyring entry,
-`~/.buzz-dev`, and local Docker volumes; it preserves the installed Buzz app's
-data, production keyring, and `~/.buzz`. The first dev page load also clears
+`~/.buzz-dev`, and local Docker volumes; it preserves installed Carryforth data
+at the compatibility app/keyring paths and `~/.buzz`. The first dev page load also clears
 only that dev server origin's WebKit storage, so saved fields from an earlier
 run cannot leak into the fresh state. It then seeds local channels and starts
 the mesh-enabled desktop with the repository's public Tyler test identity.
 That identity is a fixture and must never be pointed at staging or production.
 
-If using `mesh-dev-fresh`, the clean window opens at **Welcome to Buzz**. Join
+If using `mesh-dev-fresh`, the clean window opens at **Welcome to Carryforth**. Join
 the seeded local community before continuing:
 
 1. Click **Join a community**.
-2. Use any local name, such as **Local Buzz**.
+2. Use any local name, such as **Local Carryforth**.
 3. Set **Community URL** to `ws://localhost:3000` and join.
 4. Complete the short profile setup if it appears.
 
@@ -43,7 +43,7 @@ Free the development ports if a previous run was interrupted:
 lsof -nP -iTCP:3000 -iTCP:8080 -iTCP:9102 -iTCP:9337 -iTCP:3131
 ```
 
-Stop only stale Buzz/MeshLLM processes shown by that command. Do not leave a
+Stop only stale Carryforth/MeshLLM processes shown by that command. Do not leave a
 standalone `mesh-llm` process using `9337` or `3131`; the desktop owns those
 ports during this test.
 
@@ -55,7 +55,7 @@ just mesh=1 dev
 ```
 
 Keep that terminal open. The first run may build/install the native runtime and
-take several minutes. Wait for the Buzz window to open and for the terminal to
+take several minutes. Wait for the Carryforth window to open and for the terminal to
 stop printing build progress.
 
 Using plain `just dev` is not sufficient: the Compute UI and embedded MeshLLM
@@ -76,14 +76,14 @@ runtime are behind the `mesh-llm` feature.
 5. Wait until the card says it is sharing/running. Do not start Fizz while the
    card says downloading, preparing, or starting.
 
-Buzz may download the model on first use. The model picker ranks models for the
+Carryforth may download the model on first use. The model picker ranks models for the
 current hardware; avoid entering a model the card marks too large.
 
 ## 3. Make shared compute the agent default
 
 1. Open **Agents** from the left sidebar.
 2. In **Agent defaults**, set **Default LLM provider** to
-   **Buzz shared compute**.
+   **Carryforth shared compute**.
 3. Set **Default model** to **Default (auto)**.
 4. Click **Save defaults** and wait for **Saved**.
 
@@ -114,14 +114,14 @@ agent is running. Once stopped, the profile action becomes **Respawn** and the
 avatar badge becomes a play button.
 
 To create a separate test agent, choose **New agent → New agent**, use
-**buzz-agent** as the runtime, **Buzz shared compute** as the LLM provider,
+**buzz-agent** as the runtime, **Carryforth shared compute** as the LLM provider,
 **Default (auto)** as the model, and **This computer** under **Run on**. Shared
 compute is an LLM provider; do not select a remote compute backend as the run
 location merely because its name mentions mesh.
 
 ## 5. Optional diagnostics
 
-While Buzz is running:
+While Carryforth is running:
 
 ```bash
 # The desktop should own both ports.
@@ -142,14 +142,14 @@ causes are:
 - the model is still downloading or preparing;
 - Fizz is not a member of the channel;
 - defaults were changed but not saved;
-- no current Buzz membership snapshot is available (admission fails closed).
+- no current Carryforth membership snapshot is available (admission fails closed).
 
 ## Security boundary
 
-Buzz publishes member-signed discovery notes through an ordinary relay-supported
+Carryforth publishes member-signed discovery notes through an ordinary Relay-supported
 NIP-51 event. The note includes a MeshLLM-key signature binding the member to the
 advertised MeshLLM node identity, plus a second signature over the exact endpoint
-tokens in the note. Current Buzz membership controls which node identities are
+tokens in the note. Current Carryforth membership controls which node identities are
 admitted. A serving target is selectable only when its endpoint signature is
 valid, its invite token decodes as a bounded Iroh endpoint, and every advertised
 relay URL matches this machine's locally configured Iroh relay policy.
@@ -159,9 +159,9 @@ for direct QUIC only, or to a comma-separated HTTPS allowlist for custom relays.
 Plain HTTP is accepted only for loopback development relays. Remote status notes
 cannot expand this local allowlist.
 
-MeshLLM—not the Buzz relay—carries inference over direct QUIC or its encrypted
+MeshLLM—not the Carryforth Relay—carries inference over direct QUIC or its encrypted
 iroh relays and enforces the owner allowlist. The dependency is pinned to the
 post-v0.72.2 admission fix that prevents a non-member with a leaked invite token
 from using passive inference streams. MeshLLM v0.73.1 still performs its owner
 check during gossip after transport connection; authenticating before any gossip
-is an upstream protocol change and is not claimed by the Buzz-side checks above.
+is an upstream protocol change and is not claimed by the Carryforth-side checks above.

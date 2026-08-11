@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Static packaging/deployment contract for the server-first Project View
+# Static packaging/deployment contract for the source-first Project View
 # release. Runtime behavior is covered by the dedicated DB/migration/E2E gates.
 
 set -euo pipefail
@@ -107,23 +107,27 @@ require_literal "buzz_project_document_migration_required_communities" crates/bu
 require_literal "project_view_migration_required_count" crates/buzz-db/src/project_view.rs
 require_literal "project_document_migration_required_count" crates/buzz-db/src/project_document.rs
 
-# Kubernetes and Compose must use the centralized database flag. A Pod-local
-# Project View env flag would make mixed-version rollouts unsafe.
-require_literal "BUZZ_RELAY_PRIVATE_KEY" deploy/charts/buzz/templates/deployment.yaml
-require_literal "secretKeyRef" deploy/charts/buzz/templates/deployment.yaml
-require_literal "BUZZ_AUTO_MIGRATE" deploy/charts/buzz/templates/deployment.yaml
-if rg -n "BUZZ_PROJECT_VIEW_ENABLED" deploy/charts/buzz deploy/compose; then
-  echo "Project View release contract: do not add a Pod-local Project View flag" >&2
+# The only active local deployment surface must use one stable Relay identity
+# and the centralized database migration gate. A process-local Project View
+# switch would make restarts and mixed developer binaries unsafe.
+require_literal "CARRYFORTH_RELAY_PRIVATE_KEY" deploy/local/compose.yml
+require_literal "BUZZ_RELAY_PRIVATE_KEY" deploy/local/compose.yml
+require_literal "BUZZ_AUTO_MIGRATE" deploy/local/compose.yml
+if rg -n "BUZZ_PROJECT_VIEW_ENABLED" deploy/local deploy/compose; then
+  echo "Project View release contract: do not add a process-local Project View flag" >&2
   exit 1
 fi
 
-# The runbook must retain the one-way v3 operational safety boundary.
-require_literal "Server-first rollout" docs/project-view-operations.md
+# The runbook must retain the source-build boundary and the one-way v3
+# operational safety contract without reviving the retired Helm deployment.
+require_literal "Source-first activation" docs/project-view-operations.md
+require_literal "cargo build --locked -p buzz-relay -p buzz-admin -p carryforth-cli" docs/project-view-operations.md
+require_literal "buzz-admin migrate" docs/project-view-operations.md
+require_literal "buzz-admin project-view status" docs/project-view-operations.md
 require_literal "buzz-admin project-view enable" docs/project-view-operations.md
 require_literal "buzz-admin project-view disable" docs/project-view-operations.md
 require_literal "After any Project View mutation has been accepted" docs/project-view-operations.md
 require_literal "forward-fix the current schema-v3 runtime" docs/project-view-operations.md
-require_literal "BUZZ_AUTO_MIGRATE=false" docs/project-view-operations.md
 require_literal "buzz-project-view-v3-bootstrap" docs/project-view-operations.md
 require_literal "buzz-admin project-view prepare-v3" docs/project-view-operations.md
 require_literal "cf --format compact project-view init-v3" docs/project-view-operations.md

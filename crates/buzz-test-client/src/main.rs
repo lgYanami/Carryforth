@@ -1,4 +1,4 @@
-//! `buzz-test-cli` — Manual testing CLI for the Buzz relay.
+//! `buzz-test-cli` — Manual testing CLI for the Carryforth Relay.
 //!
 //! # Usage
 //!
@@ -17,7 +17,7 @@
 //!
 //! Send a message:
 //! ```text
-//! buzz-test-cli --channel my-channel --send "Hello, Buzz!"
+//! buzz-test-cli --channel my-channel --send "Hello, Carryforth!"
 //! ```
 //!
 //! Subscribe and watch events:
@@ -213,7 +213,7 @@ fn parse_args(args: &[String]) -> CliOpts {
 
 fn print_help() {
     println!(
-        r#"buzz-test-cli — Manual testing CLI for the Buzz relay
+        r#"buzz-test-cli — Manual testing CLI for the Carryforth Relay
 
 USAGE:
     buzz-test-cli [OPTIONS]
@@ -228,7 +228,7 @@ OPTIONS:
 
 EXAMPLES:
     # Send a message to a channel
-    buzz-test-cli --channel my-channel --send "Hello, Buzz!"
+    buzz-test-cli --channel my-channel --send "Hello, Carryforth!"
 
     # Subscribe and watch live events
     buzz-test-cli --channel my-channel --subscribe

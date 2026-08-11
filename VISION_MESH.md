@@ -1,5 +1,10 @@
 # 🕸️ Buzz Mesh — Your community is your compute
 
+> **Historical upstream vision.** This document preserves an inherited,
+> experimental product narrative. It is not part of Carryforth's current
+> local-only support commitment. See [README.md](README.md) and the current
+> Carryforth plans before treating any workflow here as operator guidance.
+
 > A small team runs their project on one Buzz relay. Three of them have GPUs that sit idle most of the day — a gaming PC, a laptop, a workstation under a desk. One flips a toggle: *Share compute.* The others point their agents at it. Now the whole team's coding agents answer from a capable model running on hardware they already own. No API keys. No cloud bill. Every prompt runs inside the relay community they already chose to trust.
 
 A Buzz community is a trust group. The people in it already know each other — that shared membership is a decision they've already made. Buzz Mesh turns that decision into shared AI compute: the idle GPUs scattered across your community become one pool, usable by every agent in the community, gated by the membership you already have. And because the pool is many machines, not one, the community can run models larger and more capable than any one member could load alone. More intelligence becomes reachable when the group works as a group.

@@ -13,7 +13,7 @@ if [[ ! -f "$MARKDOWN_FILE" ]]; then
   exit 1
 fi
 
-# Buzz/relay media URLs often render in Buzz but fail in GitHub PR markdown
+# Carryforth/Relay media URLs can render locally but fail in GitHub PR markdown
 # because GitHub's Camo proxy fetches them anonymously. PR screenshots should
 # be hosted through scripts/post-screenshots.sh or another GitHub-safe host.
 relay_media_pattern='https?://[^][()<>[:space:]"'"'"']*/media/[0-9a-fA-F]{64}\.(png|jpe?g|webp|gif)'
@@ -31,7 +31,7 @@ fi
 
 if [[ -s "$tmp_matches" ]]; then
   matches=$(sort -u "$tmp_matches")
-  echo "error: PR markdown contains Buzz/relay media URLs that may not render on GitHub:" >&2
+  echo "error: PR markdown contains Carryforth/Relay media URLs that may not render on GitHub:" >&2
   printf '%s\n' "$matches" >&2
   echo >&2
   echo "Upload screenshots with scripts/post-screenshots.sh, then use its GitHub-safe image URLs in the PR body/comment." >&2

@@ -1,10 +1,10 @@
-# Using Third-Party Nostr Clients with Buzz
+# Using Third-Party Nostr Clients with Carryforth
 
-Buzz is a Nostr relay that speaks NIP-29 (relay-based groups) natively. Third-party Nostr clients connect directly to `buzz-relay` using NIP-29 and NIP-42 authentication. The old NIP-28 compatibility proxy has been removed.
+Carryforth uses a Nostr Relay that speaks NIP-29 (Relay-based groups) natively. Third-party Nostr clients connect directly to the compatibility binary `buzz-relay` using NIP-29 and NIP-42 authentication. The old NIP-28 compatibility proxy has been removed.
 
 ## Community scope
 
-Buzz treats the relay URL/domain as authoritative for the community. Today's
+Carryforth treats the Relay URL/domain as authoritative for the Community. The current
 single-relay deployment has exactly one community behind that URL, so existing
 NIP-29 clients keep using the same WebSocket URL, event kinds, tags, and
 HTTP/media/git paths. In a multi-community deployment, each community is reached
@@ -71,8 +71,8 @@ PGPASSWORD=buzz_dev psql -h localhost -U buzz -d buzz -c \
 | **NIP-17 DMs (gift wrap)** | ✅ | kind:1059 accepted with ephemeral signing keys. Stored community-globally (`channel_id=None` inside the connected community). Delivered via `#p`-filtered subscriptions. Not indexed in search. |
 | **DM discovery** | ✅ | DM creation emits kind:39000 (with `hidden` tag) + kind:44100 membership notifications. NIP-29 clients discover DMs via standard group discovery flow. |
 | **Join request (kind:9021)** | ✅ | Open channels only. Adds member, emits system message + group discovery events + kind:44100 membership notification. Private channels rejected at ingest. |
-| **Edits (kind:40003)** | ⚠️ | Works on the wire but Buzz-only — no standard NIP-29 client renders these |
-| **Rich content (kind:40002)** | ⚠️ | Works on the wire but Buzz-only — no standard NIP-29 client renders these |
+| **Edits (kind:40003)** | ⚠️ | Works on the wire but Carryforth-specific — no standard NIP-29 client renders these |
+| **Rich content (kind:40002)** | ⚠️ | Works on the wire but Carryforth-specific — no standard NIP-29 client renders these |
 
 ### What Doesn't Work
 
@@ -106,7 +106,7 @@ All discovery events include a `d` tag set to the channel UUID (NIP-29 addressab
 
 | Kind | Tags | Content |
 |------|------|---------|
-| **39000** | `d=<uuid>`, `name`, `closed` (always); `about` (if description non-empty); `private` (if applicable); `hidden` (DM channels only) | Group metadata. **Note:** `closed` is always emitted per NIP-29 convention (Buzz channels require explicit membership), but open channels are still readable/writable by non-members at runtime. The tag reflects the membership model, not access enforcement. |
+| **39000** | `d=<uuid>`, `name`, `closed` (always); `about` (if description non-empty); `private` (if applicable); `hidden` (DM channels only) | Group metadata. **Note:** `closed` is always emitted per NIP-29 convention (Carryforth channels require explicit membership), but open channels are still readable/writable by non-members at runtime. The tag reflects the membership model, not access enforcement. |
 | **39001** | `d=<uuid>`, `p` tags with role label (`owner`, `admin`) | Admin list |
 | **39002** | `d=<uuid>`, `p` tags for all members | Member list |
 

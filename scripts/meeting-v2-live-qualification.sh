@@ -168,7 +168,7 @@ resolve_codex_acp() {
 }
 
 codex_acp_bin="$(resolve_codex_acp)" || fail \
-  "@agentclientprotocol/codex-acp 1.1.7 is not installed in PATH or Buzz node-tools"
+  "@agentclientprotocol/codex-acp 1.1.7 is not installed in PATH or the compatibility node-tools directory"
 codex_acp_package="$(cd "$(dirname "${codex_acp_bin}")/.." && pwd)/package.json"
 [[ -f "${codex_acp_package}" ]] || fail "could not locate codex-acp package.json"
 jq -e '.name == "@agentclientprotocol/codex-acp" and .version == "1.1.7"' \
@@ -534,7 +534,7 @@ team_instructions() {
       printf '%s\n' \
         '这是 Meeting V2 mixed 真实 Provider 验收。你是普通参会 Agent。' \
         '首次 Intent Turn 提交一个简短且具体的贡献；获得 Grant 或 directed handoff 后给出有界回答。' \
-        '不得调用 Buzz 命令，不修改文件、Git、Project View、任务或任何外部系统。'
+        '不得调用 Carryforth/cf 写命令，不修改文件、Git、Project View、任务或任何外部系统。'
       ;;
     all_agent:all-moderator)
       printf '%s\n' \

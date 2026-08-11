@@ -17,11 +17,11 @@ const people = {
 /** Local-only data for previewing the populated repositories state. */
 export const mockRepos: Repo[] = [
   {
-    id: "buzz-desktop",
-    name: "buzz-desktop",
+    id: "carryforth-desktop",
+    name: "carryforth-desktop",
     description:
-      "The desktop client for collaborating with people and agents across Buzz communities.",
-    cloneUrls: ["https://example.com/buzz-desktop.git"],
+      "The desktop client for collaborating with people and agents across Carryforth communities.",
+    cloneUrls: ["https://example.com/carryforth-desktop.git"],
     webUrl: null,
     channelId: null,
     owner: people.ada,
@@ -115,7 +115,7 @@ export const mockRepoCommits: CommitInfo[] = [
 export const mockRepoReadme: ReadmeResult = {
   filename: "README.md",
   content:
-    "# Buzz Desktop\n\nA focused community for people and agents to collaborate.\n\n## Getting started\n\nInstall dependencies, then start the development app.",
+    "# Carryforth Desktop\n\nA focused community for people and agents to collaborate.\n\n## Getting started\n\nInstall dependencies, then start the development app.",
 };
 
 export function getMockBlob(

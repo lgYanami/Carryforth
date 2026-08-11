@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""One-command benchmark: bring up the Buzz stack in Docker and run it.
+"""One-command benchmark: bring up the Carryforth stack in Docker and run it.
 
 ``just benchmark`` wraps this script. Defaults are leaderboard-eligible out
 of the box (Terminal-Bench 2.1, 5 attempts per problem, the Sonnet+Haiku
 team); every ``run_leaderboard.py`` selector passes through unchanged. The
 script owns everything around the run:
 
-- A dedicated ``buzz-benchmark`` compose project reusing the production
-  bundle (``deploy/compose/compose.yml``) plus the benchmark port overlay,
-  on its own ports (relay :3600, Postgres :5633, metrics :9602) so it never
-  collides with a dev stack. Secrets and identities are generated once into
-  the gitignored ``.benchmark/`` state dir and reused across runs.
+- A dedicated ``buzz-benchmark`` compatibility-named Compose project using a
+  self-contained benchmark manifest, on its own ports (relay :3600, Postgres
+  :5633, metrics :9602) so it never collides with a dev stack. Secrets and
+  identities are generated once into the gitignored ``.benchmark/`` state dir
+  and reused across runs.
 - One pinned *user* identity for the whole benchmark environment: it owns
   every trial channel and posts every task, like one human running many
   teams. Channels are kept (not archived) after each trial.
-- ``--gui`` adds that user to the relay membership list and opens the Buzz
+- ``--gui`` adds that user to the relay membership list and opens the Carryforth
   desktop app logged in as them, so a human can watch the teams work live.
 
 Run inside the testbed environment (the just recipe does this):
@@ -29,6 +29,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -41,14 +42,13 @@ REPO_ROOT = PACKAGE_ROOT.parents[1]
 STATE_DIR = PACKAGE_ROOT / ".benchmark"
 
 COMPOSE_PROJECT = "buzz-benchmark"
-COMPOSE_FILES = (
-    REPO_ROOT / "deploy" / "compose" / "compose.yml",
-    PACKAGE_ROOT / "testbed" / "compose.benchmark.yml",
-)
+COMPOSE_PROJECT_ENV = "CARRYFORTH_BENCHMARK_PROJECT"
+COMPOSE_FILES = (PACKAGE_ROOT / "testbed" / "compose.benchmark.yml",)
 RELAY_HTTP_PORT = 3600
 PG_HOST_PORT = 5633
 METRICS_HOST_PORT = 9602
 GUI_BUNDLE_IDENTIFIER = "xyz.block.buzz.app.benchmark"
+BENCHMARK_IMAGE_ENV = "CARRYFORTH_BENCHMARK_IMAGE"
 
 DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"
 DEFAULT_ATTEMPTS = 5
@@ -84,51 +84,76 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     problems = parser.add_mutually_exclusive_group()
     problems.add_argument(
-        "--dataset", "-d", default=None,
+        "--dataset",
+        "-d",
+        default=None,
         help=f"Registry dataset (default: {DEFAULT_DATASET})",
     )
     problems.add_argument(
         "--path", "-p", type=Path, help="Local task or dataset directory"
     )
     parser.add_argument(
-        "--include-task", "-i", action="append", default=[],
+        "--include-task",
+        "-i",
+        action="append",
+        default=[],
         help="Task name to include (glob, repeatable)",
     )
     parser.add_argument(
-        "--exclude-task", "-x", action="append", default=[],
+        "--exclude-task",
+        "-x",
+        action="append",
+        default=[],
         help="Task name to exclude (glob, repeatable)",
     )
     parser.add_argument(
-        "--attempts", "-k", type=int, default=DEFAULT_ATTEMPTS,
+        "--attempts",
+        "-k",
+        type=int,
+        default=DEFAULT_ATTEMPTS,
         help=f"Runs per problem (default: {DEFAULT_ATTEMPTS}, the leaderboard requirement)",
     )
     parser.add_argument(
-        "--manifest", type=Path, default=DEFAULT_MANIFEST,
+        "--manifest",
+        type=Path,
+        default=DEFAULT_MANIFEST,
         help=f"Team manifest YAML (default: {DEFAULT_MANIFEST.name})",
     )
     parser.add_argument(
-        "--endpoint-config", type=Path, default=DEFAULT_ENDPOINTS,
+        "--endpoint-config",
+        type=Path,
+        default=DEFAULT_ENDPOINTS,
         help=f"Endpoint provider/API-key mapping (default: {DEFAULT_ENDPOINTS.name})",
     )
-    parser.add_argument("--n-concurrent", "-n", type=int, default=4, help="Concurrent trials")
+    parser.add_argument(
+        "--n-concurrent", "-n", type=int, default=4, help="Concurrent trials"
+    )
     parser.add_argument(
         "--jobs-dir", type=Path, default=PACKAGE_ROOT / "jobs", help="Job output root"
     )
-    parser.add_argument("--job-name", default=None, help="Job name (default: lb-<condition>-<UTC>)")
     parser.add_argument(
-        "--upload", action="store_true", help="Upload to Harbor Hub when the job finishes"
+        "--job-name", default=None, help="Job name (default: lb-<condition>-<UTC>)"
     )
     parser.add_argument(
-        "--gui", action="store_true",
-        help="Open the Buzz desktop app as the benchmark user to watch the run live",
+        "--upload",
+        action="store_true",
+        help="Upload to Harbor Hub when the job finishes",
     )
     parser.add_argument(
-        "--fresh", action="store_true",
+        "--gui",
+        action="store_true",
+        help="Open the Carryforth desktop app as the benchmark user to watch the run live",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
         help="Reset first: drop the stack's Docker volumes and the benchmark "
-             "GUI's app state (keys in state.json are kept)",
+        "GUI's app state (keys in state.json are kept); requires an explicit "
+        "non-default CARRYFORTH_BENCHMARK_PROJECT",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Print the underlying harbor command and exit (no stack bring-up)",
     )
     return parser.parse_args(argv)
@@ -181,9 +206,25 @@ def print_user_identity(state: dict[str, str]) -> None:
 
 def write_env_file(state: dict[str, str]) -> Path:
     """Compose interpolation env — regenerated from state on every run."""
+    image = os.environ.get(BENCHMARK_IMAGE_ENV, "").strip()
+    if not image:
+        raise SystemExit(
+            f"{BENCHMARK_IMAGE_ENV} is required; set it to an explicitly built "
+            "local or Carryforth Relay image (for example carryforth-relay:local)"
+        )
+    if image.casefold().startswith("ghcr.io/block/"):
+        raise SystemExit(
+            f"{BENCHMARK_IMAGE_ENV} must not use the retired Block registry; "
+            "build or select a Carryforth Relay image explicitly"
+        )
     env_path = STATE_DIR / ".env"
     lines = {
-        "BUZZ_IMAGE": os.environ.get("BUZZ_IMAGE", "ghcr.io/block/buzz:main"),
+        "CARRYFORTH_BENCHMARK_PROJECT": compose_project(),
+        # The benchmark manifest retains this interpolation key as a runtime
+        # compatibility coordinate. The current operator-facing input is the
+        # explicit Carryforth variable above; there is deliberately no remote
+        # image fallback.
+        "BUZZ_IMAGE": image,
         "BUZZ_DOMAIN": "localhost",
         "RELAY_URL": f"ws://localhost:{RELAY_HTTP_PORT}",
         "BUZZ_MEDIA_BASE_URL": f"http://localhost:{RELAY_HTTP_PORT}/media",
@@ -217,14 +258,11 @@ def write_env_file(state: dict[str, str]) -> Path:
 
 def postgres_dsn(state: dict[str, str]) -> str:
     return (
-        f"postgresql://buzz:{state['postgres_password']}"
-        f"@127.0.0.1:{PG_HOST_PORT}/buzz"
+        f"postgresql://buzz:{state['postgres_password']}@127.0.0.1:{PG_HOST_PORT}/buzz"
     )
 
 
-def write_provisioner_config(
-    state: dict[str, str], endpoint_config: Path
-) -> Path:
+def write_provisioner_config(state: dict[str, str], endpoint_config: Path) -> Path:
     """Resolve per-endpoint API keys from the environment and write the
     provisioner config: pinned user, keep-channels teardown."""
     endpoints = json.loads(endpoint_config.read_text())
@@ -260,12 +298,24 @@ def write_provisioner_config(
 # -- docker stack ------------------------------------------------------------
 
 
+def compose_project() -> str:
+    """Return the explicit Compose scope or the legacy-compatible default."""
+    project = os.environ.get(COMPOSE_PROJECT_ENV, COMPOSE_PROJECT).strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+        raise SystemExit(f"{COMPOSE_PROJECT_ENV} must match [a-z0-9][a-z0-9_-]*")
+    return project
+
+
 def compose_command(*args: str) -> list[str]:
     command = [
-        "docker", "compose",
-        "--project-name", COMPOSE_PROJECT,
-        "--project-directory", str(STATE_DIR),
-        "--env-file", str(STATE_DIR / ".env"),
+        "docker",
+        "compose",
+        "--project-name",
+        compose_project(),
+        "--project-directory",
+        str(STATE_DIR),
+        "--env-file",
+        str(STATE_DIR / ".env"),
     ]
     for file in COMPOSE_FILES:
         command += ["-f", str(file)]
@@ -286,29 +336,41 @@ def stale_credential_volume(state: dict[str, str]) -> bool:
 
 
 def bring_up_stack(state: dict[str, str]) -> None:
-    """Compose bring-up (idempotent), self-healing the one known-fatal
-    failure: a stale Postgres volume from a different clone. Nothing in
-    that volume is usable (we can't even authenticate to it), so drop the
-    volumes and retry once rather than aborting with instructions."""
+    """Bring up the stack without mutating volumes on credential conflict."""
     try:
         subprocess.run(compose_command("up", "-d", "--wait"), check=True)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as error:
         if not stale_credential_volume(state):
             raise
-        print(
-            "benchmark Postgres volume was initialized by a different "
-            "checkout's .benchmark/ state — dropping the stale volumes and "
-            "retrying..."
-        )
-        subprocess.run(compose_command("down", "-v"), check=True)
-        subprocess.run(compose_command("up", "-d", "--wait"), check=True)
+        project = compose_project()
+        raise SystemExit(
+            f"benchmark Compose project {project!r} uses credentials from a "
+            "different checkout; refusing to delete its volumes. Set "
+            f"{COMPOSE_PROJECT_ENV} to a checkout-unique name and retry. "
+            "Only use --fresh with that explicit non-default scope when its "
+            "benchmark evidence may be deleted."
+        ) from error
 
 
 def reset_environment() -> None:
     """--fresh: drop the stack's Docker volumes and the benchmark GUI's
     app state, together — GUI records (workspaces, read state) only stay
     coherent as long as the database they reference exists. Keys in
-    ``state.json`` are kept, so the same nsec works after the reset."""
+    ``state.json`` are kept, so the same nsec works after the reset. Refuse
+    the machine-global compatibility project: destructive reset requires an
+    explicit checkout-specific scope."""
+    project = compose_project()
+    if COMPOSE_PROJECT_ENV not in os.environ or project == COMPOSE_PROJECT:
+        raise SystemExit(
+            f"--fresh requires an explicit non-default {COMPOSE_PROJECT_ENV}; "
+            "refusing to delete volumes in the machine-global compatibility "
+            f"project {COMPOSE_PROJECT!r}"
+        )
+    print(
+        f"WARNING: --fresh is deleting Docker volumes for benchmark project "
+        f"{project!r}.",
+        file=sys.stderr,
+    )
     subprocess.run(compose_command("down", "-v"), check=True)
     if sys.platform == "darwin":
         for domain in ("WebKit", "Caches", "Application Support"):
@@ -360,7 +422,9 @@ def linux_triple() -> str:
     """The musl triple matching the Docker engine that runs task containers."""
     arch = subprocess.run(
         ["docker", "version", "--format", "{{.Server.Arch}}"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
     try:
         return {
@@ -385,22 +449,32 @@ def ensure_agent_binaries() -> Path:
     targets = AGENT_BINARIES + (FORWARDER_BINARY,)
     if all((bin_dir / name).is_file() for name in targets):
         return bin_dir
-    print(f"Linux agent binaries missing — cross-building for {triple} "
-          f"in {RUST_IMAGE} (first run only, ~2 min)...")
+    print(
+        f"Linux agent binaries missing — cross-building for {triple} "
+        f"in {RUST_IMAGE} (first run only, ~2 min)..."
+    )
     LINUX_TARGET_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "cargo-registry").mkdir(exist_ok=True)
     packages = [arg for name in AGENT_BINARIES for arg in ("-p", name)]
     forwarder_src = FORWARDER_SOURCE.relative_to(REPO_ROOT)
     subprocess.run(
         [
-            "docker", "run", "--rm",
-            "-v", f"{REPO_ROOT}:/src:ro",
-            "-v", f"{LINUX_TARGET_DIR}:/target",
-            "-v", f"{STATE_DIR / 'cargo-registry'}:/usr/local/cargo/registry",
-            "-e", "CARGO_TARGET_DIR=/target",
-            "-w", "/src",
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{REPO_ROOT}:/src:ro",
+            "-v",
+            f"{LINUX_TARGET_DIR}:/target",
+            "-v",
+            f"{STATE_DIR / 'cargo-registry'}:/usr/local/cargo/registry",
+            "-e",
+            "CARGO_TARGET_DIR=/target",
+            "-w",
+            "/src",
             RUST_IMAGE,
-            "sh", "-c",
+            "sh",
+            "-c",
             "apk add --no-cache musl-dev >/dev/null && "
             f"cargo build --release --locked --target {triple} "
             + " ".join(packages)
@@ -420,7 +494,7 @@ def ensure_agent_binaries() -> Path:
 
 
 def launch_gui(state: dict[str, str]) -> subprocess.Popen:
-    """Open the Buzz desktop app logged in as the benchmark user.
+    """Open the Carryforth desktop app logged in as the benchmark user.
 
     The relay runs closed (membership required), so the user pubkey is first
     added to the relay membership list via buzz-admin inside the container —
@@ -429,8 +503,13 @@ def launch_gui(state: dict[str, str]) -> subprocess.Popen:
     """
     subprocess.run(
         compose_command(
-            "exec", "-T", "relay",
-            "buzz-admin", "add-member", "--pubkey", state["user_pubkey"],
+            "exec",
+            "-T",
+            "relay",
+            "buzz-admin",
+            "add-member",
+            "--pubkey",
+            state["user_pubkey"],
         ),
         check=True,
     )
@@ -445,12 +524,20 @@ def launch_gui(state: dict[str, str]) -> subprocess.Popen:
         ["rustc", "-vV"], capture_output=True, text=True, check=True
     ).stdout
     triple = next(
-        line.split(": ", 1)[1] for line in target.splitlines() if line.startswith("host: ")
+        line.split(": ", 1)[1]
+        for line in target.splitlines()
+        if line.startswith("host: ")
     )
     sidecar_dir = desktop_dir / "src-tauri" / "binaries"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
     binaries = ensure_binaries()
-    for name in ("buzz-acp", "buzz-agent", "buzz-dev-mcp", "git-credential-nostr", "cf"):
+    for name in (
+        "buzz-acp",
+        "buzz-agent",
+        "buzz-dev-mcp",
+        "git-credential-nostr",
+        "cf",
+    ):
         stub = sidecar_dir / f"{name}-{triple}"
         if not stub.exists():
             stub.touch()
@@ -459,7 +546,7 @@ def launch_gui(state: dict[str, str]) -> subprocess.Popen:
     real_cli.chmod(0o755)
 
     print(
-        f"Opening Buzz GUI as the benchmark user ({state['user_pubkey'][:16]}…).\n"
+        f"Opening Carryforth GUI as the benchmark user ({state['user_pubkey'][:16]}…).\n"
         "Watch, don't type — a message from you mid-trial would taint the run."
     )
     # Distinct bundle identifier: the desktop app persists workspaces (incl.
@@ -469,7 +556,7 @@ def launch_gui(state: dict[str, str]) -> subprocess.Popen:
     # workspace silently shadows the benchmark relay. An identifier of our own
     # keeps that state isolated both ways.
     tauri_config = json.dumps(
-        {"identifier": GUI_BUNDLE_IDENTIFIER, "productName": "Buzz Benchmark"}
+        {"identifier": GUI_BUNDLE_IDENTIFIER, "productName": "Carryforth Benchmark"}
     )
     return subprocess.Popen(
         ["pnpm", "exec", "tauri", "dev", "--config", tauri_config],
@@ -498,11 +585,16 @@ def leaderboard_argv(
     for pattern in args.exclude_task:
         argv += ["--exclude-task", pattern]
     argv += [
-        "--attempts", str(args.attempts),
-        "--manifest", str(args.manifest),
-        "--endpoint-config", str(args.endpoint_config),
-        "--provisioner-config", str(provisioner_config),
-        "--agent-bin-dir", str(agent_bin_dir),
+        "--attempts",
+        str(args.attempts),
+        "--manifest",
+        str(args.manifest),
+        "--endpoint-config",
+        str(args.endpoint_config),
+        "--provisioner-config",
+        str(provisioner_config),
+        "--agent-bin-dir",
+        str(agent_bin_dir),
         # The relay as reachable from inside a task container: Docker's
         # host alias, bridged to the canonical localhost address by the
         # uploaded forwarder. Override the alias with
@@ -511,8 +603,10 @@ def leaderboard_argv(
         "--relay-gateway",
         f"{os.environ.get('BUZZ_BENCHMARK_DOCKER_HOST', 'host.docker.internal')}"
         f":{RELAY_HTTP_PORT}",
-        "--n-concurrent", str(args.n_concurrent),
-        "--jobs-dir", str(args.jobs_dir),
+        "--n-concurrent",
+        str(args.n_concurrent),
+        "--jobs-dir",
+        str(args.jobs_dir),
     ]
     if args.job_name:
         argv += ["--job-name", args.job_name]

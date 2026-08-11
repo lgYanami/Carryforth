@@ -2,13 +2,13 @@ import { BookMarked, GitBranch } from "lucide-react";
 import { toast } from "sonner";
 import { useEffect, useMemo, useState } from "react";
 
-import buzzAppIcon from "@/assets/app-icon@3x.png";
+import carryforthAppIcon from "@/assets/carryforth.svg";
 import { Input } from "@/shared/ui/input";
 import { mockRepos } from "../mock-repos";
 import { useRepos } from "../use-repos";
-import { ConnectButton } from "./ConnectButton";
 import { OrgSidebar } from "./OrgSidebar";
 import { RepoListItem } from "./RepoListItem";
+import { SourceBuildButton } from "./SourceBuildButton";
 
 type SortOrder = "newest" | "oldest" | "name";
 
@@ -53,16 +53,20 @@ function CommunityEmptyState() {
           className="h-16 w-16 overflow-hidden bg-black"
           style={{ borderRadius: "22.37%" }}
         >
-          <img alt="Buzz" className="h-full w-full" src={buzzAppIcon} />
+          <img
+            alt="Carryforth"
+            className="h-full w-full"
+            src={carryforthAppIcon}
+          />
         </div>
         <h1 className="mt-6 text-2xl font-semibold tracking-tight text-black dark:text-white">
           This community is empty
         </h1>
         <p className="mt-2 max-w-md text-sm leading-relaxed text-black/60 dark:text-white/60">
-          Repositories pushed to this community will show up here. Open this
-          community in the Buzz desktop app to start pushing code.
+          Repositories pushed to this community will show up here. Build and run
+          Carryforth Desktop from source to connect and start pushing code.
         </p>
-        <ConnectButton className="mt-6" />
+        <SourceBuildButton className="mt-6" />
       </div>
     </div>
   );
@@ -149,9 +153,9 @@ export function ReposPage() {
     <div className="flex w-full flex-1 gap-8 bg-[#F3F3F3] px-4 py-8 dark:bg-[#171717]">
       {/* Main content */}
       <div className="min-w-0 flex-1">
-        {/* Mobile-only connect button */}
+        {/* Mobile-only source-build link */}
         <div className="mb-4 lg:hidden">
-          <ConnectButton className="w-full" />
+          <SourceBuildButton className="w-full" />
         </div>
 
         <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold text-black dark:text-white">

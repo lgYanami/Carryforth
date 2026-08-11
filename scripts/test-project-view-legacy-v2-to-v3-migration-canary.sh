@@ -41,7 +41,7 @@ fi
 
 # The test creates and drops its own UUID-suffixed child database. Giving it a
 # dedicated, validated parent database prevents a typo or ambient
-# TEST_DATABASE_URL from ever targeting a developer's Buzz database.
+# TEST_DATABASE_URL from ever targeting a developer's Carryforth database.
 database_name="${PROJECT_VIEW_LEGACY_MIGRATION_DATABASE_NAME:-buzz_pv_legacy_migration_canary_$$_${RANDOM}}"
 if [[ ! "${database_name}" =~ ^buzz_pv_legacy_migration_canary_[0-9_]+$ ]]; then
   fail "refusing unsafe scratch database name: ${database_name}"

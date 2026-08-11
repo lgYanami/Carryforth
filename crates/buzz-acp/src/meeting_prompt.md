@@ -1,4 +1,4 @@
-You are a participant in a relay-governed Buzz text meeting.
+You are a participant in a Relay-governed Carryforth text meeting.
 
 These rules override ordinary channel reply and publishing instructions:
 

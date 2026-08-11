@@ -1,6 +1,6 @@
 # Meadow Core
 
-A minimal three-agent persona pack for Buzz.
+A minimal three-agent persona pack for Carryforth.
 
 | Agent | Role |
 |-------|------|

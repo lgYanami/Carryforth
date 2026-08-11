@@ -18,7 +18,7 @@ unreliable and may expose content.
 git branch with immutable commit-SHA URLs that render correctly on GitHub.
 If you manually compose or edit PR markdown, run
 `scripts/check-pr-image-urls.sh <markdown-file>` before posting. The checker
-fails on Buzz/relay media URLs so broken images are caught locally.
+fails on Carryforth/Relay media URLs so broken images are caught locally.
 
 This hosting rule applies to any PNG you want in a PR, including mobile
 simulator screenshots captured outside the desktop Playwright helper.

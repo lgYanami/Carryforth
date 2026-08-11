@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop the local Buzz app and its Docker containers without deleting anything.
+# Stop the local Carryforth app and its Docker containers without deleting anything.
 #
 # Usage:
 #   ./scripts/dev-stop.sh             # app + docker compose stop
@@ -9,7 +9,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 STATE_DIR="${BUZZ_DEV_STATE_DIR:-${REPO_ROOT}/target/dev-lifecycle}"
-PID_FILE="${STATE_DIR}/buzz-dev.pid"
+PID_FILE="${STATE_DIR}/carryforth-dev.pid"
+LEGACY_PID_FILE="${STATE_DIR}/buzz-dev.pid"
 MODE="all"
 
 log() { printf '[dev-stop] %s\n' "$*"; }
@@ -88,7 +89,7 @@ terminate_dev_leader() {
   pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]')"
   sid="$(ps -o sid= -p "${pid}" 2>/dev/null | tr -d '[:space:]')"
 
-  log "停止 Buzz 进程组（PID ${pid}）..."
+  log "停止 Carryforth 进程组（PID ${pid}）..."
   if [[ "${pgid}" == "${pid}" || "${sid}" == "${pid}" ]]; then
     kill -TERM -- "-${pgid}" 2>/dev/null || true
     if ! wait_for_group_exit "${pgid}"; then
@@ -108,19 +109,32 @@ terminate_dev_leader() {
 }
 
 stop_tracked_process() {
-  local pid="" args=""
+  local pid="" args="" candidate_pid_file stopped=false stopped_pid=""
 
-  [[ -f "${PID_FILE}" ]] || return 1
-  pid="$(tr -d '[:space:]' <"${PID_FILE}")"
-  args="$(ps -o args= -p "${pid}" 2>/dev/null || true)"
-  if [[ ! "${args}" =~ (^|/)just[[:space:]]+dev([[:space:]]|$) ]] ||
-    ! terminate_dev_leader "${pid}"; then
-    warn "忽略无效或已过期的 PID 文件"
-    rm -f "${PID_FILE}"
-    return 1
-  fi
-  rm -f "${PID_FILE}"
-  return 0
+  for candidate_pid_file in "${PID_FILE}" "${LEGACY_PID_FILE}"; do
+    [[ -f "${candidate_pid_file}" ]] || continue
+    pid="$(tr -d '[:space:]' <"${candidate_pid_file}")"
+    args="$(ps -o args= -p "${pid}" 2>/dev/null || true)"
+    if [[ "${pid}" == "${stopped_pid}" ]]; then
+      continue
+    fi
+    if [[ "${args}" =~ (^|/)just[[:space:]]+dev([[:space:]]|$) ]] &&
+      terminate_dev_leader "${pid}"; then
+      # Never mutate the legacy coordinate. A later invocation will ignore its
+      # stale PID after the exact checkout/process validation fails.
+      if [[ "${candidate_pid_file}" == "${PID_FILE}" ]]; then
+        rm -f "${PID_FILE}"
+      fi
+      stopped=true
+      stopped_pid="${pid}"
+      continue
+    fi
+    if [[ "${candidate_pid_file}" == "${PID_FILE}" ]]; then
+      warn "忽略无效或已过期的 Carryforth PID 文件"
+      rm -f "${PID_FILE}"
+    fi
+  done
+  [[ "${stopped}" == "true" ]]
 }
 
 stop_untracked_process() {
@@ -180,12 +194,12 @@ elif stop_untracked_process; then
   app_stopped=true
 fi
 if stop_leftover_binaries; then
-  log "已停止遗留的 Buzz 可执行进程"
+  log "已停止遗留的 Carryforth 可执行进程"
   app_stopped=true
 fi
 
 if [[ "${app_stopped}" != "true" ]]; then
-  log "未发现正在运行的 Buzz 应用进程"
+  log "未发现正在运行的 Carryforth 应用进程"
 fi
 
 if [[ "${MODE}" == "app-only" ]]; then

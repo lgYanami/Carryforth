@@ -78,7 +78,8 @@ button {
 
 .brand-mark svg {
   width: 1.7rem;
-  fill: currentColor;
+  fill: none;
+  stroke: currentColor;
 }
 
 nav {

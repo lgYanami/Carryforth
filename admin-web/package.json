@@ -1,5 +1,5 @@
 {
-  "name": "buzz-admin-web",
+  "name": "carryforth-admin-web",
   "private": true,
   "version": "0.1.0",
   "description": "Experimental Carryforth Relay admin UI; not part of the first supported release",

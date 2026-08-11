@@ -119,7 +119,7 @@ Two operations act on `R`:
 - **Push(R, Δ)** — receive-pack. Δ is a set of requested ref updates
   `refname ↦ (old_id, new_id)`.
 
-**The manifest pointer is the sole source of truth.** In Buzz, a successful
+**The manifest pointer is the sole source of truth.** In Carryforth, a successful
 push may also publish a relay event (kind:30618) so subscribers learn refs moved.
 That event is a *derived notification*, never the commit point: a push has
 happened iff `M_R` was CAS-swapped (A3), regardless of whether — or when — any
